@@ -381,8 +381,33 @@
 - ~~`cost` / `credits_cost` 与 `usage` 的关系~~ → 响应同时给出，`cost` 为实际扣费；差额属账号折扣（§3.3）✅
 - ~~`Idempotency-Key` 是否定义~~ → **机器 Schema 明确声明**（§3.4）✅
 - **异步状态取值集合** —— 本次实测见到的终态为 `completed`；完整集合仍以两份文档的**并集**处理（未知取值继续轮询，不得当失败）。**未逐一实测**，属 ② 层实现时按并集容错即可，不阻塞；
-- **`image_urls` 图生图路径** —— 未测（本渠道 `gpt-image-2.5-flare` 的目录条目声明支持 Image to Image）；
+- **`image_urls` 图生图路径** —— **已实现**（见 §3.7），但**没有任何真实计费实测**；
 - **`sunburst` 型号** —— 未测（目录中已确认在册，`endpoint_types` 与 flare 相同）。
+
+### 3.7 参考图与遮罩：必须先上传（**文档已结清，未做真实计费实测**）
+
+原始材料：`out-reference/apimart/uploads-images.cn.md`（上传页，2026-09-19 抓取）。
+
+| 事实 | 值 |
+| --- | --- |
+| 上传端点 | `POST /v1/uploads/images`，`multipart/form-data`，字段名 `file` |
+| 接受格式 / 上限 | JPEG、PNG、WebP、GIF；单张 ≤ **20MB** |
+| 返回 | `{url, filename, content_type, bytes, created_at}`；`url` 有效期 **72 小时** |
+| 生成请求里的参考图 | `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），**只接受公网可访问 URL** |
+| 遮罩 | `mask_url`（字符串），必须与 `image_urls` 同用，尺寸须与第一张参考图一致 |
+
+**两处文档冲突，平台的取法**：
+
+1. 上传页的 Python 示例把 `image_urls` 写成 `[{"url": …}]`（对象数组）。机器 Schema、生成页字段说明与三个示例、`gpt-image-2.5` 中文页**都指向字符串数组** ⇒ 平台发**字符串数组**（`out-reference/apimart/uploads-images.cn.md` 末尾备注）。
+2. 上传页声明生成接口**不再接受 base64**，生成页仍写「支持 `base64 data URI`、可与 URL 混填」⇒ 平台取**更严的一侧**：一律先上传换 URL，不在生成请求里塞 base64。
+
+**平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。
+
+**发布状态：这两条分支尚未开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 目前只有 `prompt_only`。按 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再以新 Schema 修订发布」，要放开需要一次经用户授权的受控调用，先把上面两处冲突与上传接口的真实行为验掉。链路本身（上传 → 回填 URL → 提交）已实现，并有假上游端到端用例。
+
+**参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`，`AssetBinding.native_parameter_path` 就是这些原生参数路径（`/image_urls/0`、`/mask_url`）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩、其余一律拒绝（发布期与运行期共用同一个函数）。
+
+**未做**：本渠道的图生图路径**没有任何真实计费实测**（未获授权）；实现只由**进程内假上游**端到端验证。
 
 ## 4. 不跨渠道合并（原写法的更正）
 

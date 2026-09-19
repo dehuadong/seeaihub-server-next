@@ -40,6 +40,10 @@ _Avoid_: 重试、Job
 经平台授权和校验、由对象存储承载的输入或输出媒体引用。
 _Avoid_: 外部 URL、Base64 字符串
 
+**Asset Binding**:
+把一张输入 Asset 绑到某个**厂商原生参数路径**上的记录（`native_parameter_path`、`asset_id`、`position`）。路径的第一段是**该厂商自己的字段名**（APIMart 的 `image_urls`、`mask_url`；AIHubMix 的 `image`、`mask`），平台不做跨厂商改名；路径带第二段表示该参数是数组（`/image_urls/0`）。平台只在**一处**判定这个参数装的是参考图还是遮罩：名字以 `image` 开头的是参考图、名字含 `mask` 的是遮罩、**其余一律拒绝**（宁可拒绝也不猜；发布期校验与运行期用的是同一个函数）。依据 `docs/adr/0002`、`docs/adr/0008`。
+_Avoid_: 统一图片字段、Canonical image 参数
+
 **Metering Evidence**:
 Provider 成功响应或账单中可核验的计量事实，不包含平台价格计算结果。对账标识**不属于**本词条的一部分——它由 Generation Attempt 自己承载，见 `Generation Attempt`。
 _Avoid_: 费用、估算值
