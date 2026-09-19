@@ -514,6 +514,11 @@ pub struct RefundReconciliationCommand {
     pub actor: String,
 }
 
+/// 一个待人工处置的对账案例。
+///
+/// `provider_trace_id` 是**人工去上游核对的依据**（任务式上游的 task id；
+/// 逐请求式上游的响应头标识）。没有它，对账的人不知道该查哪个任务——
+/// 所以它必须出现在列表里，而不是只能去翻数据库。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationCaseView {
     pub id: Uuid,
@@ -521,6 +526,7 @@ pub struct ReconciliationCaseView {
     pub attempt_id: AttemptId,
     pub account_id: AccountId,
     pub reason: String,
+    pub provider_trace_id: Option<String>,
     pub created_at: DateTime<Utc>,
 }
 

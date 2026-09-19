@@ -1199,9 +1199,11 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
         let rows = sqlx::query(
             r#"
-            SELECT rc.id, rc.job_id, rc.attempt_id, j.account_id, rc.reason, rc.created_at
+            SELECT rc.id, rc.job_id, rc.attempt_id, j.account_id, rc.reason, rc.created_at,
+                   a.provider_trace_id
             FROM operations.reconciliation_cases rc
             JOIN generation.jobs j ON j.id = rc.job_id
+            LEFT JOIN generation.attempts a ON a.id = rc.attempt_id
             WHERE rc.status = 'open'
             ORDER BY rc.created_at
             "#,
@@ -1217,6 +1219,7 @@ impl HubRepository for PgHubRepository {
                     attempt_id: AttemptId(row.try_get("attempt_id").map_err(database_error)?),
                     account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
                     reason: row.try_get("reason").map_err(database_error)?,
+                    provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
                     created_at: row.try_get("created_at").map_err(database_error)?,
                 })
             })

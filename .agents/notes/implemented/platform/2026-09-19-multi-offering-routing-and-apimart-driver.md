@@ -54,6 +54,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 7. **上传失败的分类不实**：`upload_failure` 曾把"生成任务可证明未受理"标成 `NotRetryable`（"确定性拒绝"）。三态里对应的是 `SafeBeforeAcceptance`（`docs/adr/0011`），已改正并补测试；`code`/`message` 仍按 `error.code` 保留。
 8. **凭据类失败被误判成"受理状态不确定"**（零费用探测发现）：APIMart 的 401 信封里 `error.code` 是**空字符串**，只有 `type: "apimart_error"`，于是"只依据 `error.code`"这条规则会把一个明确没进到生成的请求送进人工对账。已加一条兜底：**凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝**，**5xx 仍不看状态码**（`build_request_failed` 会以 500 承载参数错误）。
 9. **渠道事实里把 `APIMART_API_KEY` 写成"不存在"**：实际 User 与 Machine 级都有，当时只看了进程环境。已更正——这条错误会让读者以为受控验证根本做不了。
+10. **对账时没有 task id 可用**（用户问"task_id 跨调用恢复是什么"时查出来）：APIMart 的 task id **只在成功路径**落库（`CompleteJob`），提交成功后如果轮询/取图失败，这个 id 直接丢掉——于是进对账的 Job **连"该去上游查哪个任务"都没有线索**，人工对账是盲的。已补：Driver 在提交后的每一步失败上都附上 task id（`with_task_id`，不改 code/message/`retry_safety`），并把它挂到 `/admin/reconciliation-cases` 的返回里，让人工能看到。**注意这仍不是"跨调用恢复"**——拿 task id 自动去补齐结果属于独立工作项（见"已知限制"）。
 
 第 4 项在实现评审中两次被质疑、两次都按 ADR 收紧了声明；第 1–4、7 项由实现评审（Standards / Spec 双轴）发现，第 5、6、8、9 项为自行核对发现（第 8 项来自零费用路由探测）。
 
@@ -90,6 +91,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 - APIMart 的**图生图/遮罩分支已开放并已受控实测**（2026-09-19，见上）；仍未测的是 `sunburst` 的图生图（与 flare 同渠道族、同端点、同参数面）、`base64` 路径，以及 20MB / 16 张 / 256MB 这些**边界**——代码已按文档上限拒绝（单张 20MB + 单次总量 256MB），但没有逐个压测。
 - **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。
-- `task_id` 不用于跨调用恢复（需新增列与拆分端口，属独立工作项）；
-- 火山方舟/Seedream、直连 OpenAI、多图与 `stream`/`tools` 不在本阶段；
+- **`task_id` 不用于跨调用恢复**：现在只做到"失败时把 task id 留下、对账的人能查到"（见上第 10 条）。**拿它自动去补齐结果**需要改造 Attempt 模型——`generation.attempts` 有 `UNIQUE (job_id)`（一个 Job 只能一个 Attempt），且状态机只允许 `reconciliation_required → failed`、**不允许 → succeeded**（有测试钉着，理由是不确定是否已产生费用时不能自作主张，见 `docs/adr/0007`/`0011`）。要做属于独立工作项。
+- 火山方舟/Seedream、直连 OpenAI **用户 2026-09-19 明确暂不做**（先把两家渠道跑通；`docs/adr/0014` 第 3、4 条不变）；多图与 `stream`/`tools` 同样不在本阶段；
+- 平台**对外价**等运营后台管理设计定了再考虑（工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；
 - 第 16–18 条验收条件已标为过期，其若要恢复需先结清非 USD 计价或金额型证据。

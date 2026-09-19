@@ -447,12 +447,29 @@ impl ImageAdapter for ApimartImageAdapter {
         // 1) 提交。**这一步之后绝不能重发**（规划 §4：创建请求绝不重发）；
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
         let task_id = self.submit(&request, &uploaded, credential).await?;
-        // 2) 轮询到终态。任务查询是幂等读，其瞬时失败在传输层已归类为
-        //    AcceptanceUnknown（不重试），由平台按"已确认生成但未取到"处理。
-        let task = self.poll(&task_id, credential).await?;
+        // 2) 提交之后的每一步，都把这个 task id 附在错误上：对账的人至少能拿它去上游查。
+        self.finish(&task_id, credential)
+            .await
+            .map_err(|error| with_task_id(error, &task_id))
+    }
+}
+
+impl ApimartImageAdapter {
+    /// 提交**已经成功**之后的部分：轮询到终态 → 抽计量 → 取图。
+    ///
+    /// 单独拆出来，是为了让"给失败附上 task id"这件事只有一处
+    /// （见 [`with_task_id`]）——这一段的任何失败都会进对账，没有 task id 就查不了。
+    async fn finish(
+        &self,
+        task_id: &str,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderSuccess, AdapterError> {
+        // 轮询到终态。任务查询是幂等读，其瞬时失败在传输层已归类为
+        // AcceptanceUnknown（不重试），由平台按"已确认生成但未取到"处理。
+        let task = self.poll(task_id, credential).await?;
         let usage = task.usage()?;
-        let digest = task.response_digest(&task_id);
-        // 3) 取图。结果 URL 带 expires_at，必须立刻下载并转存。
+        let digest = task.response_digest(task_id);
+        // 取图。结果 URL 带 expires_at，必须立刻下载并转存。
         let mut images = Vec::new();
         let mut total_output_bytes = 0_usize;
         for url in task.image_urls()? {
@@ -479,9 +496,27 @@ impl ImageAdapter for ApimartImageAdapter {
             usage,
             // 对账标识：任务式上游的 task id。只写入 attempts.provider_trace_id 供人工对账，
             // **不用于跨调用自动恢复**（规划 §4/§5.3 的统一边界）。
-            provider_trace_id: Some(task_id),
+            provider_trace_id: Some(task_id.to_owned()),
             response_digest: digest,
         })
+    }
+}
+
+/// 给"提交之后"的失败补上 task id，**不改** `code` / `message` / `retry_safety`。
+///
+/// 为什么需要：进对账的 Job 只能靠人工去上游查，而查的依据就是这个 task id。
+/// 提交成功后它就在手里——不附上的话，`attempts.provider_trace_id` 会是空的，
+/// 对账的人连"该查哪个任务"都不知道。（**这才是"对账标识"的用途**；
+/// 拿它自动去补齐结果属于"跨调用恢复"，本阶段不做。）
+fn with_task_id(error: AdapterError, task_id: &str) -> AdapterError {
+    match error {
+        AdapterError::Provider(mut provider) => {
+            if provider.trace_id.is_none() {
+                provider.trace_id = Some(task_id.to_owned());
+            }
+            AdapterError::Provider(provider)
+        }
+        other => other,
     }
 }
 
@@ -1243,6 +1278,40 @@ mod tests {
         // 同为"无 code"的 5xx 仍然是不确定：状态码只在凭据类上兜底。
         let error = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, br#"{"error":{}}"#);
         assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
+    }
+
+    #[test]
+    fn post_acceptance_failures_carry_the_task_id_for_reconciliation() {
+        // 提交成功之后失败：task id 是人工对账的唯一线索，必须附上。
+        let raw = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, &envelope(500, "boom"));
+        let adjusted = after_acceptance(AdapterError::Provider(raw));
+        match with_task_id(adjusted, "task_abc") {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.trace_id.as_deref(), Some("task_abc"));
+                // 分类与 code 不被这条补丁改变。
+                assert_eq!(provider.retry_safety, RetrySafety::AcceptanceUnknown);
+                assert_eq!(provider.code, "500");
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+        // 已经有 trace id 的不覆盖；非 Provider 错误原样返回。
+        let mut existing = provider_error("x", "y".to_owned(), RetrySafety::AcceptanceUnknown);
+        if let AdapterError::Provider(provider) = &mut existing {
+            provider.trace_id = Some("from-upstream".to_owned());
+        }
+        match with_task_id(existing, "task_abc") {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.trace_id.as_deref(), Some("from-upstream"));
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+        assert!(matches!(
+            with_task_id(
+                AdapterError::UnsupportedInput("nope".to_owned()),
+                "task_abc"
+            ),
+            AdapterError::UnsupportedInput(_)
+        ));
     }
 
     #[test]

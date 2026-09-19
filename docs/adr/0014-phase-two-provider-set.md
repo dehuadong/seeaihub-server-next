@@ -2,8 +2,9 @@
 
 **决策**（2026-09-19，第二阶段的规划范围）：
 
-> **实施顺序说明（2026-09-19 追加，不改本决策）**：本 ADR 定的是**候选集合**这一决策，**不定实施顺序**。第二阶段的**规划层范围收口**（`#2` 规划 §7.5）决定**先落 AIHubMix**，APIMart **连同其 Driver 一并推迟**，原因是 `APIMART_API_KEY` 在三级环境中均不存在、其验证无法推进。
-> 因此：**本 ADR 第 2 条的候选集合仍然成立**（APIMart 仍是既定的第二 Provider），但**在 APIMart 具备凭证并通过受控验证之前，不得开始其 Driver 实现，也不得声称「同一 Vendor Model 多 Provider 路由」已被验证**。收口的代价见规划 §7.5。
+> **实施顺序说明（2026-09-19 追加，不改本决策）**：本 ADR 定的是**候选集合**这一决策，**不定实施顺序**。第二阶段的**规划层范围收口**（`#2` 规划 §7.5）决定**先落 AIHubMix**，APIMart **连同其 Driver 一并推迟**，原因是 `APIMART_API_KEY` 在三级环境中均不存在、其验证无法推进。当时由此推出一条约束：**在 APIMart 具备凭证并通过受控验证之前，不得开始其 Driver 实现**。
+> **事实更正（2026-09-19 同日稍后）**：上述两条事实前提**都已不成立**——`APIMART_API_KEY` 在 User 与 Machine 级**都存在**（当时只看了进程环境，见 `docs/facts/channel-facts.md` §1.1）；APIMart Driver **已实现并完成受控验证**（文生图 + 参考图/遮罩，见同文件 §5.3/§5.6），两条分支已开放。因此那条"不得开始实现"的约束**已随事实消失**。
+> **没有变的两条**（用户 2026-09-19 再次确认）：**直连 OpenAI** 与**火山方舟 / Seedream** 暂不做，先把这两家渠道跑通——与下面第 3、4 条一致。
 
 1. **Vendor 固定为 `OpenAI`**，本阶段纳入两款 Vendor Model：`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`（退役 `gpt-image-2` 见 [0013](./0013-retire-gpt-image-2-use-2-5-models.md)）。
 2. **首批候选 Provider 为两家：AIHubMix 与 APIMart**。两者供应**同名**的上述两款模型，因此构成「**同一 Vendor Model 由两个不同 Provider 供应**」的真实样本——这正是工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的核心命题。

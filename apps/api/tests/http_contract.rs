@@ -603,6 +603,7 @@ struct DriverHarness {
     database_url: String,
     database_name: String,
     base_url: String,
+    admin_token: String,
     api_key: String,
     pool: PgPool,
     calls: UpstreamCalls,
@@ -643,6 +644,7 @@ impl DriverHarness {
             database_url,
             database_name,
             base_url,
+            admin_token,
             api_key,
             pool,
             calls,
@@ -1303,8 +1305,67 @@ async fn unknown_task_status_keeps_polling_instead_of_failing() {
     outcome.harness.cleanup().await;
 }
 
+/// 提交之后失败（轮询始终不通）必须进对账，**并且留下 task id**。
+///
+/// 对账的人能做的唯一一件事就是拿这个 id 去上游查；没有它，对账就是盲的。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
+    // 查询永远 500：有界重试耗尽后仍失败 ⇒ 已确认生成、但取不到结果 ⇒ 对账。
+    let behaviour = UpstreamBehaviour {
+        query_failures: 99,
+        ..UpstreamBehaviour::default()
+    };
+    let outcome = run_driver_attempt(behaviour).await;
+    assert_eq!(
+        outcome.job_state, "reconciliation_required",
+        "a post-acceptance failure must go to reconciliation"
+    );
+    assert_eq!(
+        outcome.submits, 1,
+        "the create request must never be resent, not even for reconciliation"
+    );
+
+    let trace_id: Option<String> =
+        sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE job_id = $1")
+            .bind(outcome.job_id)
+            .fetch_one(&outcome.harness.pool)
+            .await
+            .expect("attempt row");
+    assert_eq!(
+        trace_id.as_deref(),
+        Some("task-contract-1"),
+        "the upstream task id must survive into the attempt so a human can look it up"
+    );
+
+    // 而且它必须能从**对账列表接口**看到，而不是只能翻数据库。
+    let cases: Value = Client::new()
+        .get(format!(
+            "{}/admin/reconciliation-cases",
+            outcome.harness.base_url
+        ))
+        .bearer_auth(&outcome.harness.admin_token)
+        .send()
+        .await
+        .expect("reconciliation cases")
+        .json()
+        .await
+        .expect("cases JSON");
+    let case = cases
+        .as_array()
+        .and_then(|list| list.first())
+        .expect("one open reconciliation case");
+    assert_eq!(
+        case["provider_trace_id"].as_str(),
+        Some("task-contract-1"),
+        "the case list must expose the trace id, got {case}"
+    );
+    outcome.harness.cleanup().await;
+}
+
 struct DriverOutcome {
     job_state: String,
+    job_id: Uuid,
     submits: usize,
     polls: usize,
     harness: DriverHarness,
@@ -1314,11 +1375,12 @@ struct DriverOutcome {
 async fn run_driver_attempt(behaviour: UpstreamBehaviour) -> DriverOutcome {
     let harness = DriverHarness::start(&["prompt_only"], behaviour).await;
     let key = format!("driver-{}", Uuid::new_v4());
-    let (_, job_state) = harness
+    let (job_id, job_state) = harness
         .run_job(route_request(harness.model, &key, "driver prompt"))
         .await;
     DriverOutcome {
         job_state,
+        job_id,
         submits: harness.count("POST", "/v1/images/generations"),
         polls: harness.count("GET", "/v1/tasks/"),
         harness,
