@@ -17,10 +17,12 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, GeneratedImage, ImageAdapter, PreparedImageRequest,
-    ProviderCallError, ProviderCredential, ProviderSuccess, RetrySafety,
+    ProviderCallError, ProviderCredential, ProviderSuccess, ResolvedAsset, RetrySafety,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
-use seeai_domain::{ImageBranch, TokenUsage};
+use seeai_domain::{
+    AssetParameterKind, ImageBranch, TokenUsage, asset_parameter_name, set_native_parameter_at_path,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -66,13 +68,18 @@ impl AdapterFactory for ApimartAdapterFactory {
                 "mask_url",
             ],
             supported_extra_parameters: &[],
-            // **本阶段只声明文生图**。参考图与遮罩不能用平台内的资产引用表达：
-            // 上游 `image_urls` 要求**公网可访问的 HTTP(S) URL**，本地资产必须先经
-            // `POST /v1/uploads/images` 换成可用 url（见 `docs/facts/channel-facts.md` §3.2）。
-            // 那条上传链路**未实现也未实测**，因此这里不声明、运行时显式拒绝——
-            // 发布期据此会把候选的 `allowed_branches` 收窄到 `prompt_only`，
-            // 使"声明的能力"与"Driver 真能做的"一致。
-            supported_branches: &[ImageBranch::PromptOnly],
+            // 参考图与遮罩走 `POST /v1/uploads/images`：上游要求**公网可访问的 HTTP(S) URL**，
+            // 且明确不再接受在生成请求里直接传 base64。因此 Driver 先把平台资产上传换 url，
+            // 再用 url 组装生成请求（同样属 ② 层内部实现，不外泄到平台）。
+            //
+            // 注意：这里声明的是**本 Driver 已实现的能力面**，不等于"已获准发布"。
+            // 两个 APIMart 发布素材当前仍只开放 `prompt_only`——按 `docs/adr/0002`，
+            // 未经真实 wire 验证的能力不开（见 `config/bootstrap/apimart-*.json` 的 `_status`）。
+            supported_branches: &[
+                ImageBranch::PromptOnly,
+                ImageBranch::ImageConditioned,
+                ImageBranch::Masked,
+            ],
             max_images: 16,
         })
     }
@@ -178,13 +185,83 @@ impl ApimartImageAdapter {
             .map_err(|error| AdapterError::Configuration(error.to_string()))
     }
 
+    /// 把平台资产上传到上游，换取可用于生成请求的公网 URL。
+    ///
+    /// 上游明确不再接受在生成请求里直接传 base64，参考图与遮罩必须先上传。
+    /// 这些上传都发生在**提交生成任务之前**，因此任何失败都只能推出同一个结论：
+    /// 生成任务**可证明未受理**（`SafeBeforeAcceptance`）——按失败处置、释放预授权，
+    /// 不进对账。至于那次上传请求本身有没有被上游受理，与平台的处置无关：
+    /// 上传没有需要人工对账的副作用。
+    async fn upload_assets(
+        &self,
+        assets: &[ResolvedAsset],
+        credential: &ProviderCredential,
+    ) -> Result<Vec<UploadedAsset>, AdapterError> {
+        // 上游另有一条"单次请求上传总量"上限，先按平台侧能算出的部分挡住。
+        let total: usize = assets.iter().map(|asset| asset.bytes.len()).sum();
+        ensure_total_upload_within_limit(total)?;
+        let mut uploaded = Vec::with_capacity(assets.len());
+        for asset in assets {
+            uploaded.push(self.upload_asset(asset, credential).await?);
+        }
+        Ok(uploaded)
+    }
+
+    async fn upload_asset(
+        &self,
+        asset: &ResolvedAsset,
+        credential: &ProviderCredential,
+    ) -> Result<UploadedAsset, AdapterError> {
+        if asset.bytes.len() > MAX_UPLOAD_BYTES {
+            return Err(AdapterError::UnsupportedInput(format!(
+                "asset {} exceeds the provider upload limit of {MAX_UPLOAD_BYTES} bytes",
+                asset.sha256
+            )));
+        }
+        let part = reqwest::multipart::Part::bytes(asset.bytes.to_vec())
+            .file_name(upload_filename(asset))
+            .mime_str(&asset.media_type)
+            .map_err(|error| {
+                AdapterError::UnsupportedInput(format!(
+                    "unsupported asset media type {}: {error}",
+                    asset.media_type
+                ))
+            })?;
+        let form = reqwest::multipart::Form::new().part("file", part);
+        let response = self
+            .client
+            .post(self.endpoint("v1/uploads/images")?)
+            .bearer_auth(credential.expose())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(upload_transport_error)?;
+        // 上传失败 ⇒ 生成任务可证明未受理（释放预授权），不是对账。
+        let body = read_body(response).await.map_err(upload_failure)?;
+        let parsed: UploadResponse = serde_json::from_slice(&body).map_err(|error| {
+            upload_failure(provider_error(
+                "provider_response_invalid",
+                error.to_string(),
+                RetrySafety::SafeBeforeAcceptance,
+            ))
+        })?;
+        // 这个 URL 会被原样写进生成请求，因此先确认它真的是个 http(s) 地址。
+        let url = validate_uploaded_url(&parsed.url).map_err(upload_failure)?;
+        Ok(UploadedAsset {
+            url,
+            native_parameter_path: asset.native_parameter_path.clone(),
+            position: asset.position,
+        })
+    }
+
     /// 提交生成请求，返回 `task_id`。
     async fn submit(
         &self,
         request: &PreparedImageRequest,
+        uploaded: &[UploadedAsset],
         credential: &ProviderCredential,
     ) -> Result<String, AdapterError> {
-        let body = generation_body(request)?;
+        let body = generation_body(request, uploaded)?;
         let response = self
             .client
             .post(self.endpoint("v1/images/generations")?)
@@ -359,19 +436,17 @@ impl ImageAdapter for ApimartImageAdapter {
         request: PreparedImageRequest,
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError> {
-        // 参考图/遮罩需要公网可访问的 URL，平台本地资产必须先上传换取 url
-        // （`POST /v1/uploads/images`）。那条链路未实现，因此显式拒绝，而不是
-        // 把 `asset://…` 当成 URL 发出去让上游拒绝。
-        if request.branch != ImageBranch::PromptOnly || !request.assets.is_empty() {
-            return Err(AdapterError::UnsupportedInput(
-                "the APIMart driver is published for text-to-image only; reference images and masks \
-                 require uploading the asset to the provider first"
-                    .to_owned(),
-            ));
-        }
+        // 0) 参考图与遮罩：上游只接受**公网可访问的 URL**（且不再接受 base64），
+        //    因此先把平台资产上传换 url。失败时生成任务**尚未提交**，处置是失败，
+        //    不是对账——预授权照常释放。
+        let uploaded = if request.assets.is_empty() {
+            Vec::new()
+        } else {
+            self.upload_assets(&request.assets, credential).await?
+        };
         // 1) 提交。**这一步之后绝不能重发**（规划 §4：创建请求绝不重发）；
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
-        let task_id = self.submit(&request, credential).await?;
+        let task_id = self.submit(&request, &uploaded, credential).await?;
         // 2) 轮询到终态。任务查询是幂等读，其瞬时失败在传输层已归类为
         //    AcceptanceUnknown（不重试），由平台按"已确认生成但未取到"处理。
         let task = self.poll(&task_id, credential).await?;
@@ -410,7 +485,10 @@ impl ImageAdapter for ApimartImageAdapter {
     }
 }
 
-fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError> {
+fn generation_body(
+    request: &PreparedImageRequest,
+    uploaded: &[UploadedAsset],
+) -> Result<Value, AdapterError> {
     let mut object = Map::new();
     object.insert(
         "model".to_owned(),
@@ -436,9 +514,48 @@ fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError
             object.insert(field.to_owned(), value.clone());
         }
     }
-    // 参考图与遮罩不在此组装：它们需要公网可访问的 URL，而本阶段只声明文生图
-    // （见 descriptor 与 execute 的说明）。`execute` 会在到达这里之前拒绝那些分支。
+    // 参考图与遮罩用**上传后拿到的公网 URL**回填到它们各自的参数路径。
+    // 参数名（`image_urls`、`mask_url`）由 Profile 声明，Driver 不自己决定名字。
+    // 认不出的路径直接报错：宁可失败，也不能把一张图悄悄丢掉。
+    for asset in uploaded {
+        if asset.kind().is_none() {
+            return Err(AdapterError::UnsupportedInput(format!(
+                "asset binding path {} is not an image parameter this driver recognises",
+                asset.native_parameter_path
+            )));
+        }
+    }
+    let mut images: Vec<&UploadedAsset> = uploaded
+        .iter()
+        .filter(|asset| asset.kind() == Some(AssetParameterKind::Image))
+        .collect();
+    // 按调用方给的位置排序（`sort_by_key` 稳定，同位置时保持绑定顺序），
+    // 与平台注入资产占位符时的数组顺序一致。
+    images.sort_by_key(|asset| asset.position);
+    for asset in images {
+        insert_url_at_path(&mut object, &asset.native_parameter_path, &asset.url)?;
+    }
+    if let Some(mask) = uploaded
+        .iter()
+        .find(|asset| asset.kind() == Some(AssetParameterKind::Mask))
+    {
+        insert_url_at_path(&mut object, &mask.native_parameter_path, &mask.url)?;
+    }
     Ok(Value::Object(object))
+}
+
+/// 把 URL 写到 `native_parameter_path` 指向的位置。
+///
+/// 写入规则（标量赋值 / 数组追加）与平台注入资产占位符时共用同一份实现
+/// （[`set_native_parameter_at_path`]），不允许两边各判一套。
+fn insert_url_at_path(
+    object: &mut Map<String, Value>,
+    path: &str,
+    url: &str,
+) -> Result<(), AdapterError> {
+    set_native_parameter_at_path(object, path, Value::String(url.to_owned()))
+        .map(|_| ())
+        .map_err(AdapterError::UnsupportedInput)
 }
 
 fn required_string(parameters: &Value, pointer: &str) -> Result<Value, AdapterError> {
@@ -692,6 +809,89 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
     }
 }
 
+/// 上传接口的文件大小上限（上游文档：20MB）。
+const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
+/// 单次生成请求里参考图的总量上限（上游文档：256MB）。
+const MAX_TOTAL_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
+
+/// 一次请求里所有参考图的字节总量是否在上游允许范围内。
+fn ensure_total_upload_within_limit(total: usize) -> Result<(), AdapterError> {
+    if total > MAX_TOTAL_UPLOAD_BYTES {
+        return Err(AdapterError::UnsupportedInput(format!(
+            "assets total {total} bytes, above the provider limit of {MAX_TOTAL_UPLOAD_BYTES} bytes"
+        )));
+    }
+    Ok(())
+}
+
+/// 已上传到上游的资产：拿到公网 URL 后回填进生成请求。
+#[derive(Debug, Clone)]
+struct UploadedAsset {
+    url: String,
+    native_parameter_path: String,
+    position: u16,
+}
+
+impl UploadedAsset {
+    /// 这个资产装的是参考图还是遮罩——判定与平台用的是同一个函数。
+    fn kind(&self) -> Option<AssetParameterKind> {
+        AssetParameterKind::classify(asset_parameter_name(&self.native_parameter_path))
+    }
+}
+
+#[derive(Debug, Deserialize)]
+struct UploadResponse {
+    url: String,
+}
+
+/// 上传接口的失败分类：它发生在**生成任务提交之前**，因此一律按"可证明未受理"
+/// 处理（失败并释放预授权），而不是像生成那样进对账。
+///
+/// 这里**只改 `retry_safety`，不改 `code`/`message`**：`code` 仍由
+/// [`parse_provider_error`] 按 `error.code` 判定（上游上传失败的错误体多数没有
+/// `error.code`，只有 `type`/`message`，429 例外）。两件事不冲突——生成侧"错误分类
+/// 只依据 `error.code`"说的是**创建请求**的分类，而这里的结论来自"创建请求根本没发出去"。
+fn upload_failure(error: AdapterError) -> AdapterError {
+    match error {
+        AdapterError::Provider(provider) => provider_error(
+            &provider.code,
+            provider.message,
+            RetrySafety::SafeBeforeAcceptance,
+        ),
+        other => other,
+    }
+}
+
+fn upload_transport_error(error: reqwest::Error) -> AdapterError {
+    provider_error(
+        "provider_transport_error",
+        error.to_string(),
+        RetrySafety::SafeBeforeAcceptance,
+    )
+}
+
+/// 上传返回的 URL 会被原样写进生成请求，因此必须是可用的 http(s) 绝对地址。
+fn validate_uploaded_url(raw: &str) -> Result<String, AdapterError> {
+    match Url::parse(raw) {
+        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(raw.to_owned()),
+        _ => Err(provider_error(
+            "provider_response_invalid",
+            format!("upload response carried no usable http(s) url: {raw}"),
+            RetrySafety::SafeBeforeAcceptance,
+        )),
+    }
+}
+
+/// 上传时的文件名。上游按扩展名与 MIME 判定类型，因此按媒体类型给一个规整的名字。
+fn upload_filename(asset: &ResolvedAsset) -> String {
+    let extension = match asset.media_type.as_str() {
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        _ => "png",
+    };
+    format!("asset-{}.{extension}", asset.sha256)
+}
 fn provider_error(code: &str, message: String, retry_safety: RetrySafety) -> AdapterError {
     ProviderCallError {
         code: code.to_owned(),
@@ -956,42 +1156,151 @@ mod tests {
     }
 
     #[test]
-    fn descriptor_only_publishes_text_to_image() {
-        // 参考图/遮罩需要公网可访问的 URL，而本地资产必须先经 `POST /v1/uploads/images`
-        // 换取可用 url——那条链路未实现也未实测。因此**不得**声明这两条分支，
-        // 否则就是把"没做到的"说成"支持的"。
+    fn descriptor_declares_the_edit_branches_now_that_upload_exists() {
+        // 参考图与遮罩以前被拒绝，因为上游只收公网可访问的 URL，而我们没有上传链路。
+        // 上传实现之后三条分支都可以声明了。
         let descriptor = ApimartAdapterFactory
             .descriptor(ADAPTER_KEY)
             .expect("descriptor is declared");
         assert_eq!(
             descriptor.supported_branches,
-            &[ImageBranch::PromptOnly],
-            "only text-to-image may be declared until asset upload is implemented"
+            &[
+                ImageBranch::PromptOnly,
+                ImageBranch::ImageConditioned,
+                ImageBranch::Masked
+            ]
         );
     }
 
+    #[test]
+    fn upload_filename_follows_the_media_type() {
+        let asset = |media_type: &str| ResolvedAsset {
+            native_parameter_path: "/images/0".to_owned(),
+            position: 0,
+            media_type: media_type.to_owned(),
+            sha256: "abc123".to_owned(),
+            bytes: Bytes::from_static(b"image"),
+        };
+        assert_eq!(upload_filename(&asset("image/jpeg")), "asset-abc123.jpg");
+        assert_eq!(upload_filename(&asset("image/webp")), "asset-abc123.webp");
+        assert_eq!(upload_filename(&asset("image/gif")), "asset-abc123.gif");
+        assert_eq!(upload_filename(&asset("image/png")), "asset-abc123.png");
+    }
+
+    #[test]
+    fn upload_failures_are_safe_before_acceptance() {
+        // 上传发生在提交生成任务之前，所以它的失败不是"受理状态不确定"，
+        // 而是**可证明未受理**（`SafeBeforeAcceptance`）——本阶段同样映射为
+        // 失败并释放预授权（`docs/adr/0011`），但不该被标成"确定性拒绝"。
+        let raw = parse_provider_error(
+            StatusCode::BAD_REQUEST,
+            br#"{"error":{"message":"unsupported image type","type":"invalid_request_error"}}"#,
+        );
+        // `parse_provider_error` 只看 `error.code`；这份错误体没有 code，所以是"不确定"。
+        assert_eq!(raw.retry_safety, RetrySafety::AcceptanceUnknown);
+        match upload_failure(AdapterError::Provider(raw)) {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.retry_safety, RetrySafety::SafeBeforeAcceptance);
+                // code 与 message 原样保留：平台仍能看出这是哪一类失败。
+                assert_eq!(provider.code, "invalid_request_error");
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+    }
+
     #[tokio::test]
-    async fn execute_rejects_reference_images_rather_than_sending_asset_refs() {
-        // 即使发布期校验被绕过，运行时也必须拒绝：绝不能把 `asset://…` 当作 URL 发出去。
-        let adapter = ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(5))
-            .expect("adapter config");
-        let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    async fn upload_transport_failures_are_safe_before_acceptance() {
+        // 连不上上游：生成任务同样从未发出 ⇒ 可证明未受理，不是"不确定"。
+        let error = reqwest::Client::new()
+            .get("http://127.0.0.1:1/never")
+            .send()
+            .await
+            .expect_err("nothing listens on port 1");
+        match upload_transport_error(error) {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.retry_safety, RetrySafety::SafeBeforeAcceptance);
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn uploaded_urls_must_be_absolute_http_addresses() {
+        assert_eq!(
+            validate_uploaded_url("https://upload.example/a.png").expect("https is fine"),
+            "https://upload.example/a.png"
+        );
+        for bad in ["", "asset://abc", "file:///etc/passwd", "not a url"] {
+            assert!(
+                validate_uploaded_url(bad).is_err(),
+                "`{bad}` must not be forwarded into the generation request"
+            );
+        }
+    }
+
+    #[test]
+    fn total_upload_size_is_capped_like_the_per_file_limit() {
+        assert!(ensure_total_upload_within_limit(MAX_TOTAL_UPLOAD_BYTES).is_ok());
+        assert!(ensure_total_upload_within_limit(MAX_TOTAL_UPLOAD_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn generation_body_refuses_asset_paths_it_cannot_classify() {
+        // 受理期已经会拒 `/seed_image` 这类路径；这里再兜一层——绝不静默丢掉一张图。
         let request = PreparedImageRequest {
             provider_model_id: "gpt-image-2.5-flare".to_owned(),
             branch: ImageBranch::ImageConditioned,
             native_parameters: serde_json::json!({"prompt": "x"}),
-            assets: vec![seeai_adapter_sdk::ResolvedAsset {
-                native_parameter_path: "/images/0".to_owned(),
-                position: 0,
-                media_type: "image/png".to_owned(),
-                sha256: "abc".to_owned(),
-                bytes: Bytes::from_static(b"image"),
-            }],
+            assets: Vec::new(),
         };
-        let error = adapter
-            .execute(request, &credential)
-            .await
-            .expect_err("reference images must be rejected");
-        assert!(error.to_string().contains("text-to-image only"), "{error}");
+        let uploaded = vec![UploadedAsset {
+            url: "https://up.example/a.png".to_owned(),
+            native_parameter_path: "/seed_image".to_owned(),
+            position: 0,
+        }];
+        let error = generation_body(&request, &uploaded).expect_err("unknown path must fail");
+        assert!(error.to_string().contains("/seed_image"), "{error}");
+    }
+
+    #[test]
+    fn generation_body_uses_the_uploaded_urls_at_their_parameter_paths() {
+        let request = PreparedImageRequest {
+            provider_model_id: "gpt-image-2.5-flare".to_owned(),
+            branch: ImageBranch::Masked,
+            native_parameters: serde_json::json!({"prompt": "edit this"}),
+            assets: Vec::new(),
+        };
+        // 故意打乱顺序：装配时按位置排序，线上数组顺序必须与调用方一致。
+        let uploaded = vec![
+            UploadedAsset {
+                url: "https://up.example/second.png".to_owned(),
+                native_parameter_path: "/image_urls/1".to_owned(),
+                position: 1,
+            },
+            UploadedAsset {
+                url: "https://up.example/mask.png".to_owned(),
+                native_parameter_path: "/mask_url".to_owned(),
+                position: 0,
+            },
+            UploadedAsset {
+                url: "https://up.example/first.png".to_owned(),
+                native_parameter_path: "/image_urls/0".to_owned(),
+                position: 0,
+            },
+        ];
+        let body = generation_body(&request, &uploaded).expect("body");
+        assert_eq!(
+            body["image_urls"],
+            serde_json::json!([
+                "https://up.example/first.png",
+                "https://up.example/second.png"
+            ]),
+            "参考图必须保持调用方顺序，且只能是上传后的公网 URL"
+        );
+        assert_eq!(body["mask_url"], "https://up.example/mask.png");
+        assert!(
+            !body.to_string().contains("asset://"),
+            "本地资产引用绝不能出现在上行请求里"
+        );
     }
 }

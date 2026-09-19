@@ -114,6 +114,109 @@ pub struct AssetBinding {
     pub position: u16,
 }
 
+impl AssetBinding {
+    /// 原生参数的**名字**：路径的第一段。
+    pub fn parameter_name(&self) -> &str {
+        asset_parameter_name(&self.native_parameter_path)
+    }
+
+    /// 路径是否指向数组元素（`/image_urls/0`）。
+    pub fn is_array(&self) -> bool {
+        asset_parameter_is_array(&self.native_parameter_path)
+    }
+
+    /// 这个绑定装的是参考图还是遮罩；`None` 表示指向的平台不认识的参数。
+    pub fn kind(&self) -> Option<AssetParameterKind> {
+        AssetParameterKind::classify(self.parameter_name())
+    }
+}
+
+/// 资产绑定能装的两类图片输入。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum AssetParameterKind {
+    /// 参考图（图生图/编辑的输入图）。
+    Image,
+    /// 遮罩。
+    Mask,
+}
+
+impl AssetParameterKind {
+    /// 按**参数名**判定这个原生参数装的是哪一类图片。
+    ///
+    /// 这是平台唯一的一处命名约定（与发布期校验用的是同一个函数，因此运行期与发布期
+    /// 不会各判一套）：名字里含 `mask` 的就是遮罩，以 `image` 开头的就是参考图，
+    /// **其余一律不认**——宁可拒绝，也不猜。参数名本身仍是厂商自己的字段名
+    /// （`docs/adr/0002`：平台不建立跨厂商的统一参数名）。
+    ///
+    /// 已知代价：厂商若用 `reference_images` 这类不以 `image` 开头的名字，平台会拒绝绑定；
+    /// 那时应当把"哪个原生参数装图片"变成 Profile 里的显式声明，而不是在这里加名字特例。
+    pub fn classify(parameter_name: &str) -> Option<Self> {
+        if is_mask_parameter_name(parameter_name) {
+            Some(Self::Mask)
+        } else if is_image_parameter_name(parameter_name) {
+            Some(Self::Image)
+        } else {
+            None
+        }
+    }
+}
+
+/// 资产绑定路径（`/image_urls/0`）的第一段：厂商原生参数名。
+pub fn asset_parameter_name(path: &str) -> &str {
+    path.trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
+}
+
+/// 资产绑定路径是否指向数组元素（带非空的第二段）。
+///
+/// 运行期（Driver 回填 URL）与受理期（平台注入资产占位符）用的是这一个判定，
+/// 不允许两边各判一套。
+pub fn asset_parameter_is_array(path: &str) -> bool {
+    path.trim_start_matches('/')
+        .split('/')
+        .nth(1)
+        .is_some_and(|index| !index.is_empty())
+}
+
+/// 参数名是否表示"这是参考图"：以 `image` 开头（`image`、`images`、`image_urls`）。
+pub fn is_image_parameter_name(name: &str) -> bool {
+    name.starts_with("image")
+}
+
+/// 参数名是否表示"这是遮罩"：名字里含 `mask`（`mask`、`mask_url`）。
+pub fn is_mask_parameter_name(name: &str) -> bool {
+    name.contains("mask")
+}
+
+/// 把一个值写到 `native_parameter_path` 指向的位置，返回被写入的参数名。
+///
+/// 受理期（平台注入 `asset://…` 占位符）与运行期（Driver 回填上传后的 URL）都走这里，
+/// 因此"标量赋值 / 数组追加"这两种形状只有一处实现。
+pub fn set_native_parameter_at_path(
+    object: &mut serde_json::Map<String, Value>,
+    path: &str,
+    value: Value,
+) -> Result<String, String> {
+    let name = asset_parameter_name(path);
+    if name.is_empty() {
+        return Err(format!("asset binding path {path} names no parameter"));
+    }
+    if asset_parameter_is_array(path) {
+        let mut items = object
+            .remove(name)
+            .and_then(|existing| existing.as_array().cloned())
+            .unwrap_or_default();
+        items.push(value);
+        object.insert(name.to_owned(), Value::Array(items));
+    } else {
+        object.insert(name.to_owned(), value);
+    }
+    Ok(name.to_owned())
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateImageGeneration {
     pub account_id: AccountId,
@@ -126,15 +229,23 @@ pub struct CreateImageGeneration {
 }
 
 impl CreateImageGeneration {
+    /// 这个请求属于哪条图片分支。
+    ///
+    /// 认不出的绑定路径**直接拒绝**，不当作"没有绑定"：静默忽略会让一张图悄悄不生效。
     pub fn branch(&self) -> Result<ImageBranch, DomainError> {
-        let has_image = self.asset_bindings.iter().any(|binding| {
-            binding.native_parameter_path == "/image"
-                || binding.native_parameter_path.starts_with("/images/")
-        });
-        let has_mask = self
-            .asset_bindings
-            .iter()
-            .any(|binding| binding.native_parameter_path == "/mask");
+        let mut has_image = false;
+        let mut has_mask = false;
+        for binding in &self.asset_bindings {
+            match binding.kind() {
+                Some(AssetParameterKind::Image) => has_image = true,
+                Some(AssetParameterKind::Mask) => has_mask = true,
+                None => {
+                    return Err(DomainError::UnsupportedAssetParameter(
+                        binding.native_parameter_path.clone(),
+                    ));
+                }
+            }
+        }
         match (has_image, has_mask) {
             (false, false) => Ok(ImageBranch::PromptOnly),
             (true, false) => Ok(ImageBranch::ImageConditioned),
@@ -335,6 +446,8 @@ pub struct GenerationJob {
 pub enum DomainError {
     #[error("mask requires an image asset")]
     MaskRequiresImage,
+    #[error("unsupported asset parameter path {0}")]
+    UnsupportedAssetParameter(String),
     #[error("invalid job transition from {from} to {to}")]
     InvalidStateTransition { from: JobState, to: JobState },
     #[error("provider usage fields are inconsistent")]
@@ -398,6 +511,75 @@ mod tests {
             max_cost_microusd: 20_000,
         };
         assert_eq!(command.branch(), Err(DomainError::MaskRequiresImage));
+    }
+
+    #[test]
+    fn recognises_vendor_specific_asset_paths() {
+        // 参数名是厂商自己的（`ADR-0002`）：APIMart 的参考图叫 `image_urls`、
+        // 遮罩叫 `mask_url`，平台不做统一改名。
+        let binding = |path: &str, position: u16| AssetBinding {
+            native_parameter_path: path.to_owned(),
+            asset_id: AssetId::new(),
+            position,
+        };
+        let command = |bindings: Vec<AssetBinding>| CreateImageGeneration {
+            account_id: AccountId::new(),
+            native_model_id: "gpt-image-2.5-flare".to_owned(),
+            native_parameters: serde_json::json!({"prompt": "test"}),
+            asset_bindings: bindings,
+            idempotency_key: "test-key".to_owned(),
+            max_cost_microusd: 20_000,
+        };
+        let images = binding("/image_urls/0", 0);
+        assert_eq!(images.parameter_name(), "image_urls");
+        assert!(images.is_array());
+        assert_eq!(images.kind(), Some(AssetParameterKind::Image));
+
+        let mask = binding("/mask_url", 0);
+        assert_eq!(mask.parameter_name(), "mask_url");
+        assert!(!mask.is_array());
+        assert_eq!(mask.kind(), Some(AssetParameterKind::Mask));
+
+        assert_eq!(
+            command(vec![binding("/image_urls/0", 0)]).branch(),
+            Ok(ImageBranch::ImageConditioned)
+        );
+        assert_eq!(
+            command(vec![binding("/image_urls/0", 0), binding("/mask_url", 0)]).branch(),
+            Ok(ImageBranch::Masked)
+        );
+        assert_eq!(
+            command(vec![binding("/mask_url", 0)]).branch(),
+            Err(DomainError::MaskRequiresImage)
+        );
+    }
+
+    #[test]
+    fn refuses_binding_paths_whose_parameter_it_does_not_recognise() {
+        // 认不出就拒绝：静默忽略会让某张图悄悄不生效。
+        let command = CreateImageGeneration {
+            account_id: AccountId::new(),
+            native_model_id: "gpt-image-2.5-flare".to_owned(),
+            native_parameters: serde_json::json!({"prompt": "test"}),
+            asset_bindings: vec![AssetBinding {
+                native_parameter_path: "/seed_image".to_owned(),
+                asset_id: AssetId::new(),
+                position: 0,
+            }],
+            idempotency_key: "test-key".to_owned(),
+            max_cost_microusd: 20_000,
+        };
+        assert_eq!(
+            command.branch(),
+            Err(DomainError::UnsupportedAssetParameter(
+                "/seed_image".to_owned()
+            ))
+        );
+        // 遮罩判定优先：名字里既有 `image` 又有 `mask` 的，按遮罩算。
+        assert_eq!(
+            AssetParameterKind::classify("image_mask"),
+            Some(AssetParameterKind::Mask)
+        );
     }
 
     #[test]

@@ -6,9 +6,10 @@ use seeai_adapter_sdk::{
     ProviderSuccess, ResolvedAsset, RetrySafety,
 };
 use seeai_domain::{
-    AccountId, AssetBinding, AssetId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch,
-    JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, PriceRates,
-    PublishedOffering, PublishedRevision, RuntimeRevisionId,
+    AccountId, AssetBinding, AssetId, AssetParameterKind, AttemptId, CreateImageGeneration,
+    GenerationJob, ImageBranch, JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId,
+    PriceRates, PublishedOffering, PublishedRevision, RuntimeRevisionId, is_image_parameter_name,
+    is_mask_parameter_name, set_native_parameter_at_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -1000,12 +1001,16 @@ fn validate_restrictions_within_profile(
         for branch in branches {
             let (name, described) = match branch.as_str() {
                 Some("prompt_only") => ("prompt_only", declares("prompt")),
-                // 图生图/编辑需要参考图输入，Profile 必须声明 `image` 或 `images`。
-                Some("image_conditioned") => ("image_conditioned", {
-                    declares("image") || declares("images") || declares("image_urls")
-                }),
-                // 遮罩编辑还需要遮罩输入。
-                Some("masked") => ("masked", declares("mask") || declares("mask_url")),
+                // 图生图/编辑需要参考图输入：Profile 必须声明一个名字以 `image`
+                // 开头的参数（`image`/`images`/`image_urls`）。
+                Some("image_conditioned") => {
+                    ("image_conditioned", declares_image_parameter(schema))
+                }
+                // 遮罩编辑还需要遮罩输入，且遮罩不能脱离参考图。
+                Some("masked") => (
+                    "masked",
+                    declares_image_parameter(schema) && declares_mask_parameter(schema),
+                ),
                 Some(other) => {
                     return Err(ApplicationError::Validation(format!(
                         "restriction contains an unknown image branch {other}"
@@ -1039,28 +1044,55 @@ fn validate_restrictions_within_profile(
     Ok(())
 }
 
+/// Profile 是否声明了参考图参数。
+///
+/// 与运行期用的是**同一个判定**（[`is_image_parameter_name`]），因此"发布期允许的分支"
+/// 与"运行期认得的绑定路径"不会各判一套。
+fn declares_image_parameter(schema: &Value) -> bool {
+    declared_image_maximum(schema) > 0
+}
+
+/// Profile 是否声明了遮罩参数（名字含 `mask`）。
+fn declares_mask_parameter(schema: &Value) -> bool {
+    declared_properties(schema)
+        .is_some_and(|properties| properties.keys().any(|name| is_mask_parameter_name(name)))
+}
+
+fn declared_properties(schema: &Value) -> Option<&serde_json::Map<String, Value>> {
+    schema.get("properties").and_then(Value::as_object)
+}
+
 /// Profile 对参考图数量的声明上限。
 ///
-/// 只看**数组形式**的 `images`/`image_urls`（它们在 JSON Schema 里用 `maxItems` 表达上界）；
-/// 单值形式（`image`/`mask`）按 1 计。没有任何参考图声明时上限为 0——没有那一项，
-/// 就不该允许带图请求。
+/// 只看名字以 `image` 开头的参数（与运行期的绑定判定是同一个函数）：数组形式取
+/// `maxItems`；只有单值形式（`image`）时按 1 计；声明了数组却没写 `maxItems`
+/// 视为**没有承诺上限**，也就不能支撑任何 `max_images > 0` 的限制
+/// （限制只能收窄，不能凭空放宽）。
 fn declared_image_maximum(schema: &Value) -> u64 {
-    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+    let Some(properties) = declared_properties(schema) else {
         return 0;
     };
-    for name in ["images", "image_urls"] {
-        if let Some(maximum) = properties
-            .get(name)
-            .and_then(|field| field.get("maxItems"))
-            .and_then(Value::as_u64)
-        {
-            return maximum;
+    let mut scalar = false;
+    let mut maximum = 0_u64;
+    for (name, field) in properties {
+        if !is_image_parameter_name(name) {
+            continue;
+        }
+        match field.get("type").and_then(Value::as_str) {
+            Some("array") => {
+                maximum = maximum.max(field.get("maxItems").and_then(Value::as_u64).unwrap_or(0));
+            }
+            Some("string") => scalar = true,
+            _ => {}
         }
     }
-    if properties.contains_key("image") || properties.contains_key("mask") {
-        return 1;
+    if maximum > 0 {
+        maximum
+    } else if scalar {
+        1
+    } else {
+        0
     }
-    0
 }
 
 fn validate_adapter_compatibility(
@@ -1261,17 +1293,8 @@ impl GenerationService {
                 .repository
                 .get_asset(command.account_id, binding.asset_id)
                 .await?;
-            match binding.native_parameter_path.as_str() {
-                path if path == "/image" || path.starts_with("/images/") => {
-                    if !matches!(asset.role.as_str(), "image" | "output") {
-                        return Err(ApplicationError::Validation(format!(
-                            "asset {} cannot be used as an image",
-                            asset.id
-                        )));
-                    }
-                    image_dimensions.get_or_insert((asset.width, asset.height));
-                }
-                "/mask" => {
+            match binding.kind() {
+                Some(AssetParameterKind::Mask) => {
                     if asset.role != "mask" {
                         return Err(ApplicationError::Validation(format!(
                             "asset {} is not a mask",
@@ -1280,7 +1303,21 @@ impl GenerationService {
                     }
                     mask_dimensions = Some((asset.width, asset.height));
                 }
-                _ => {}
+                Some(AssetParameterKind::Image) => {
+                    if !matches!(asset.role.as_str(), "image" | "output") {
+                        return Err(ApplicationError::Validation(format!(
+                            "asset {} cannot be used as an image",
+                            asset.id
+                        )));
+                    }
+                    image_dimensions.get_or_insert((asset.width, asset.height));
+                }
+                None => {
+                    return Err(ApplicationError::Validation(format!(
+                        "unsupported asset parameter path {}",
+                        binding.native_parameter_path
+                    )));
+                }
             }
         }
         if let Some(mask_dimensions) = mask_dimensions
@@ -1637,10 +1674,7 @@ fn validate_restrictions(
     }
     let image_count = bindings
         .iter()
-        .filter(|binding| {
-            binding.native_parameter_path == "/image"
-                || binding.native_parameter_path.starts_with("/images/")
-        })
+        .filter(|binding| binding.kind() == Some(AssetParameterKind::Image))
         .count();
     let max_images = restrictions
         .get("max_images")
@@ -1686,34 +1720,14 @@ fn inject_asset_placeholder(
     object: &mut Map<String, Value>,
     binding: &AssetBinding,
 ) -> Result<(), ApplicationError> {
-    match binding.native_parameter_path.as_str() {
-        "/image" => {
-            object.insert(
-                "image".to_owned(),
-                Value::String(format!("asset://{}", binding.asset_id)),
-            );
-        }
-        "/mask" => {
-            object.insert(
-                "mask".to_owned(),
-                Value::String(format!("asset://{}", binding.asset_id)),
-            );
-        }
-        path if path.starts_with("/images/") => {
-            let mut images = object
-                .remove("images")
-                .and_then(|value| value.as_array().cloned())
-                .unwrap_or_default();
-            images.push(Value::String(format!("asset://{}", binding.asset_id)));
-            object.insert("images".to_owned(), Value::Array(images));
-        }
-        path => {
-            return Err(ApplicationError::Validation(format!(
-                "unsupported asset binding path {path}"
-            )));
-        }
-    }
-    Ok(())
+    // 写入规则（标量赋值 / 数组追加）与 Driver 回填 URL 时共用同一份实现。
+    set_native_parameter_at_path(
+        object,
+        &binding.native_parameter_path,
+        Value::String(format!("asset://{}", binding.asset_id)),
+    )
+    .map(|_| ())
+    .map_err(ApplicationError::Validation)
 }
 
 fn request_hash(command: &CreateImageGeneration) -> Result<String, ApplicationError> {
@@ -2119,6 +2133,45 @@ mod tests {
     }
 
     #[test]
+    fn restriction_follows_the_vendors_own_parameter_names() {
+        // 平台不统一改名（`ADR-0002`）：APIMart 的参考图字段叫 `image_urls`、
+        // 遮罩叫 `mask_url`。判定办法是名字约定——参考图以 `image` 开头，遮罩含 `mask`。
+        let vendor_names = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "image_urls": {"type": "array", "items": {"type": "string"}, "maxItems": 16},
+                "mask_url": {"type": "string"}
+            }),
+            serde_json::json!({
+                "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
+                "max_images": 16
+            }),
+        );
+        assert!(validate_restrictions_within_profile(&vendor_names).is_ok());
+        // 声明了遮罩却没有任何参考图参数：`masked` 不成立（遮罩不能脱离参考图）。
+        let mask_without_image = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "mask_url": {"type": "string"}
+            }),
+            serde_json::json!({"allowed_branches": ["masked"]}),
+        );
+        assert!(validate_restrictions_within_profile(&mask_without_image).is_err());
+        // 数组形式没写 `maxItems` ＝ Profile 没有承诺上限，不能据它接受 `max_images`。
+        let unbounded = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "image_urls": {"type": "array", "items": {"type": "string"}}
+            }),
+            serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 16}),
+        );
+        assert!(validate_restrictions_within_profile(&unbounded).is_err());
+    }
+
+    #[test]
     fn normalize_rejects_unsupported_price_formula() {
         // 本阶段只启用 token_rates；其余形态（例如 adr/0012 的金额口径）必须显式拒绝，
         // 而不是静默落库成一个它并不支持的计价形态。
@@ -2182,6 +2235,48 @@ mod tests {
             max_cost_microusd: 20_000,
         };
         assert!(validate_native_request(&command, &offering()).is_ok());
+    }
+
+    #[test]
+    fn injects_array_bindings_into_the_vendors_own_array_parameter() {
+        // 路径的第二段表示"要塞进数组"，而参数名取自路径第一段——厂商叫 `image_urls`
+        // 就写进 `image_urls`，平台不替它改名。
+        let mut vendor = offering();
+        vendor.capability_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string", "minLength": 1},
+                "image_urls": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "mask_url": {"type": "string"}
+            }
+        });
+        let command = CreateImageGeneration {
+            account_id: AccountId::new(),
+            native_model_id: "gpt-image-2".to_owned(),
+            native_parameters: serde_json::json!({"prompt": "hello"}),
+            asset_bindings: vec![
+                AssetBinding {
+                    native_parameter_path: "/image_urls/0".to_owned(),
+                    asset_id: AssetId::new(),
+                    position: 0,
+                },
+                AssetBinding {
+                    native_parameter_path: "/mask_url".to_owned(),
+                    asset_id: AssetId::new(),
+                    position: 0,
+                },
+            ],
+            idempotency_key: "request-0004".to_owned(),
+            max_cost_microusd: 20_000,
+        };
+        assert!(validate_native_request(&command, &vendor).is_ok());
+        // 声明里没有的路径：拒掉，而不是静默丢掉这张图。
+        let mut unknown = command.clone();
+        unknown.asset_bindings[0].native_parameter_path = "/images/0".to_owned();
+        assert!(validate_native_request(&unknown, &vendor).is_err());
     }
 
     #[test]

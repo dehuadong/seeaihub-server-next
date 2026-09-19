@@ -1,7 +1,7 @@
 {
   "_comment": "APIMart 供给 gpt-image-2.5-flare 的运行时发布素材（新形状）。来源见 docs/facts/channel-facts.md §3。",
-  "_status": "草案 · 未发布。需「执行实现」授权后方可用于生产；未做图生图与 sunburst 的实测。",
-  "_evidence": "受控实测（out-reference/apimart/controlled-probe-2026-09-19.json）：任务成功响应含四分项 usage，input_tokens_details 区分 text/image。机器 Schema 明确 Idempotency-Key。",
+  "_status": "草案 · 未发布。文生图已受控实测。图生图/遮罩的链路**已实现并有端到端测试**，但**只开放 prompt_only**：按 docs/adr/0002「未证实的参数不开启」，`image_urls` 的取值形态（实时 Schema 写 string[]，上传页示例写对象数组）与上传接口的真实行为都还没经真实 wire 验证，验证通过后再以新修订放开这两条分支。",
+  "_evidence": "受控实测（out-reference/apimart/controlled-probe-2026-09-19.json）：任务成功响应含四分项 usage，input_tokens_details 区分 text/image。机器 Schema 明确 Idempotency-Key，并声明 `image_urls`（string[]）与 `mask_url`。参考图/遮罩的上传合同见 docs/facts/channel-facts.md §3.7，原始材料 out-reference/apimart/uploads-images.cn.md。",
   "_channel_differences": "本渠道与 AIHubMix 的差异全部落在 ② Adapter Driver：上游是任务式（提交→轮询→取图），参数在顶层（无 extra 包装），base_url 为 api.apib.ai。",
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-flare",

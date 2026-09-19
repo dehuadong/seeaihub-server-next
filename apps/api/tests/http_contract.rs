@@ -45,100 +45,19 @@ type UpstreamCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn apimart_driver_executes_task_flow_against_local_upstream() {
-    let (database_url, database_name) = isolated_database_url().await;
-    let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let upstream = start_fake_upstream(calls.clone()).await;
-    let upstream_base = format!("http://127.0.0.1:{}", upstream.port);
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
-    let port = listener.local_addr().expect("test address").port();
-    drop(listener);
-    let base_url = format!("http://127.0.0.1:{port}");
-    let admin_token = format!("driver-admin-{}", Uuid::new_v4());
-    let asset_root = std::env::temp_dir().join(format!("seeai-driver-{}", Uuid::new_v4()));
-    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
-        .env("DATABASE_URL", &database_url)
-        .env("API_BIND", format!("127.0.0.1:{port}"))
-        .env("ADMIN_TOKEN", &admin_token)
-        .env("ASSET_STORE", "local")
-        .env("ASSET_LOCAL_ROOT", &asset_root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("API process should start");
-    let _process = ApiProcess {
-        child,
-        asset_root: asset_root.clone(),
-    };
-    let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
-    let account = create_account(&client, &base_url, &admin_token).await;
-    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("contract database");
-
-    // 发布一个指向假上游的 APIMart 供给。
-    let model = "driver-model";
-    let mut draft = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
-    draft["base_url"] = Value::String(upstream_base.clone());
-    draft["credential_env"] = Value::String("APIMART_API_KEY".to_owned());
-    let published = publish_candidates(&client, &base_url, &admin_token, model, vec![draft]).await;
-    assert_eq!(published, StatusCode::OK, "publication must succeed");
-
-    // 受理一个 Job。
+    let harness = DriverHarness::start(&["prompt_only"], UpstreamBehaviour::default()).await;
+    let model = harness.model;
     let key = format!("driver-{}", Uuid::new_v4());
-    let created = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&route_request(model, &key, "driver prompt"))
-        .send()
-        .await
-        .expect("generation accepted");
-    assert_eq!(created.status(), StatusCode::ACCEPTED);
-    let created: Value = created.json().await.expect("job JSON");
-    let job_id = Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID");
-
-    // 启动真实 Worker（独立包的二进制，按当前 profile 定位）跑一次。
-    let mut worker = Command::new(worker_binary())
-        .env("DATABASE_URL", &database_url)
-        .env("WORKER_ID", "driver-contract-worker")
-        .env("WORKER_POLL_INTERVAL_MS", "200")
-        .env("WORKER_LEASE_SECONDS", "300")
-        .env("PROVIDER_TIMEOUT_SECONDS", "60")
-        .env("ASSET_STORE", "local")
-        .env("ASSET_LOCAL_ROOT", &asset_root)
-        .env("APIMART_API_KEY", "contract-test-key")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("worker process should start");
-
-    // 等 Job 进入终态。
-    let mut state = String::new();
-    for _ in 0..600 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        state = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("job state");
-        if matches!(
-            state.as_str(),
-            "succeeded" | "failed" | "reconciliation_required"
-        ) {
-            break;
-        }
-    }
-    let _ = worker.kill();
-    let _ = worker.wait();
+    let (job_id, state) = harness
+        .run_job(route_request(model, &key, "driver prompt"))
+        .await;
     assert_eq!(state, "succeeded", "the driver flow must settle the job");
 
     // 计量证据：四分项 usage 落到 attempts.metering_evidence。
     let evidence: Value =
         sqlx::query_scalar("SELECT metering_evidence FROM generation.attempts WHERE job_id = $1")
             .bind(job_id)
-            .fetch_one(&pool)
+            .fetch_one(&harness.pool)
             .await
             .expect("metering evidence");
     assert_eq!(evidence["usage"]["input_text_tokens"], 14);
@@ -150,14 +69,14 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
     let result_assets: Vec<Uuid> =
         sqlx::query_scalar("SELECT result_asset_ids FROM generation.jobs WHERE id = $1")
             .bind(job_id)
-            .fetch_one(&pool)
+            .fetch_one(&harness.pool)
             .await
             .expect("result assets");
     assert_eq!(result_assets.len(), 1, "one generated image must be stored");
     let (media_type, byte_count): (String, i64) = {
         let row = sqlx::query("SELECT media_type, byte_count FROM generation.assets WHERE id = $1")
             .bind(result_assets[0])
-            .fetch_one(&pool)
+            .fetch_one(&harness.pool)
             .await
             .expect("asset row");
         (
@@ -173,7 +92,7 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
     let trace_id: Option<String> =
         sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE job_id = $1")
             .bind(job_id)
-            .fetch_one(&pool)
+            .fetch_one(&harness.pool)
             .await
             .expect("attempt trace id");
     assert_eq!(
@@ -183,18 +102,12 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
     );
 
     // Driver 的线上请求：只提交一次，且参数在顶层（无 extra 包装）。
-    let calls = calls.lock().expect("calls lock").clone();
-    let submits = calls
-        .iter()
-        .filter(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
-        .count();
-    assert_eq!(submits, 1, "the create request must never be resent");
-    let submit_body = calls
-        .iter()
-        .find(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
-        .map(|(_, _, body)| body.clone())
-        .expect("submit body");
-    let submit_body: Value = serde_json::from_str(&submit_body).expect("submit body is JSON");
+    assert_eq!(
+        harness.count("POST", "/v1/images/generations"),
+        1,
+        "the create request must never be resent"
+    );
+    let submit_body = harness.submit_body();
     assert_eq!(submit_body["model"], model);
     assert_eq!(submit_body["prompt"], "driver prompt");
     assert!(
@@ -203,36 +116,173 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
     );
     // 第 24 条「不改写原生字段」：线上请求体的键，名字与 Profile 声明**逐字相同**，
     // 且不出现 Profile 未声明的字段（含内部包装字段）。
-    let material: Value = serde_json::from_str(include_str!(
-        "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
-    ))
-    .expect("APIMart material parses");
-    let declared = material["offerings"][0]["capability_schema"]["properties"]
-        .as_object()
-        .expect("declared properties");
-    let sent = submit_body.as_object().expect("sent body object");
-    for name in sent.keys() {
+    harness.assert_only_declared_fields();
+    assert!(
+        harness.count("GET", "/v1/tasks/") >= 1,
+        "the driver must poll the task at least once"
+    );
+    harness.cleanup().await;
+}
+
+/// 参考图路径：Driver 必须先把平台资产上传换取公网 URL，再用 URL 组装生成请求。
+///
+/// 本地资产引用（`asset://…`）是平台内部标识，**绝不能**出现在上行请求里。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn apimart_driver_uploads_reference_images_before_submitting() {
+    let harness = DriverHarness::start(
+        &["prompt_only", "image_conditioned"],
+        UpstreamBehaviour::default(),
+    )
+    .await;
+    let model = harness.model;
+
+    // 先经平台接口上传一张参考图（真实路径，不是直接写库）。
+    let asset_id = harness
+        .upload_input_asset("image", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+
+    let key = format!("driver-reference-{}", Uuid::new_v4());
+    let mut request = route_request(model, &key, "edit this image");
+    // 绑定路径用的是**厂商自己的字段名**（APIMart 收 `image_urls`，平台不做统一改名）。
+    request["asset_bindings"] = json!([
+        {"native_parameter_path": "/image_urls/0", "asset_id": asset_id, "position": 0}
+    ]);
+    let (_, state) = harness.run_job(request).await;
+    assert_eq!(state, "succeeded", "the reference-image flow must succeed");
+
+    // 每张参考图上传一次（不是零次、也不是每张多次）。
+    assert_eq!(
+        harness.count("POST", "/v1/uploads/images"),
+        1,
+        "each reference image must be uploaded exactly once"
+    );
+    let submit_body = harness.submit_body();
+    let image_urls = submit_body["image_urls"]
+        .as_array()
+        .expect("image_urls must be an array");
+    assert_eq!(image_urls.len(), 1, "one reference image was bound");
+    let uploaded_url = image_urls[0]
+        .as_str()
+        .expect("image_urls entries are strings");
+    assert!(
+        uploaded_url.starts_with("http://127.0.0.1:"),
+        "the generation request must carry the uploaded public URL, got {uploaded_url}"
+    );
+    // 第 24 条同样适用于带图请求：上线字段必须全是 Profile 声明过的。
+    harness.assert_only_declared_fields();
+    for (_, _, body) in harness.recorded() {
         assert!(
-            declared.contains_key(name),
-            "the driver sent `{name}`, which the profile does not declare"
+            !body.contains("asset://"),
+            "a local asset reference leaked onto the wire: {body}"
         );
     }
-    for name in ["model", "prompt"] {
-        assert!(
-            sent.contains_key(name),
-            "the driver must send `{name}` verbatim"
-        );
-    }
-    let polls = calls
-        .iter()
-        .filter(|(method, path, _)| method == "GET" && path.starts_with("/v1/tasks/"))
-        .count();
-    assert!(polls >= 1, "the driver must poll the task at least once");
-    drop_isolated_database(&database_name).await;
+    harness.cleanup().await;
+}
+
+/// 遮罩路径（`mask_url`）与参考图一样要先上传，且两者必须各就各位。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn apimart_driver_uploads_reference_image_and_mask_together() {
+    let harness = DriverHarness::start(
+        &["prompt_only", "image_conditioned", "masked"],
+        UpstreamBehaviour::default(),
+    )
+    .await;
+    let model = harness.model;
+
+    // 尺寸必须一致，否则平台在受理期就会拒绝（遮罩尺寸须与输入图相同）。
+    let image_id = harness
+        .upload_input_asset("image", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+    let mask_id = harness
+        .upload_input_asset("mask", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+
+    let key = format!("driver-mask-{}", Uuid::new_v4());
+    let mut request = route_request(model, &key, "masked edit");
+    request["asset_bindings"] = json!([
+        {"native_parameter_path": "/image_urls/0", "asset_id": image_id, "position": 0},
+        {"native_parameter_path": "/mask_url", "asset_id": mask_id, "position": 0}
+    ]);
+    let (_, state) = harness.run_job(request).await;
+    assert_eq!(state, "succeeded", "the masked edit must succeed");
+
+    // 两张图各上传一次。
+    assert_eq!(
+        harness.count("POST", "/v1/uploads/images"),
+        2,
+        "the reference image and the mask must each be uploaded once"
+    );
+    let submit_body = harness.submit_body();
+    let image_urls = submit_body["image_urls"]
+        .as_array()
+        .expect("image_urls must be an array");
+    assert_eq!(image_urls.len(), 1, "one reference image was bound");
+    let mask_url = submit_body["mask_url"]
+        .as_str()
+        .expect("mask_url must be a string");
+    assert!(
+        mask_url.starts_with("http://127.0.0.1:"),
+        "the mask must travel as an uploaded public URL, got {mask_url}"
+    );
+    assert_ne!(
+        mask_url,
+        image_urls[0].as_str().unwrap_or_default(),
+        "the mask and the reference image are different uploads"
+    );
+    harness.assert_only_declared_fields();
+    harness.cleanup().await;
+}
+
+/// 上传失败 = 生成任务**可证明未受理**：Job 走失败、预授权释放，不进对账。
+///
+/// 这与"提交之后出错进对账"是两条路径，不能混为一谈。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn upload_failure_fails_the_job_instead_of_asking_for_reconciliation() {
+    let behaviour = UpstreamBehaviour {
+        upload_failure_status: 400,
+        ..UpstreamBehaviour::default()
+    };
+    let harness = DriverHarness::start(&["prompt_only", "image_conditioned"], behaviour).await;
+    let model = harness.model;
+    let asset_id = harness
+        .upload_input_asset("image", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+
+    let key = format!("driver-upload-failure-{}", Uuid::new_v4());
+    let mut request = route_request(model, &key, "edit this image");
+    request["asset_bindings"] = json!([
+        {"native_parameter_path": "/image_urls/0", "asset_id": asset_id, "position": 0}
+    ]);
+    let (job_id, state) = harness.run_job(request).await;
+    assert_eq!(
+        state, "failed",
+        "an upload failure happens before the create request, so the job is simply failed"
+    );
+    // 生成请求根本没发出去。
+    assert_eq!(
+        harness.count("POST", "/v1/images/generations"),
+        0,
+        "the create request must not be sent when the reference image could not be uploaded"
+    );
+    // 预授权释放：这台 Job 的 hold 不再是 active。
+    let hold_status: String =
+        sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the job must have a hold");
+    assert_eq!(
+        hold_status, "released",
+        "a pre-acceptance failure must release the hold"
+    );
+    harness.cleanup().await;
 }
 
 struct FakeUpstream {
-    port: u16,
+    base_url: String,
     _handle: tokio::task::JoinHandle<()>,
 }
 
@@ -243,10 +293,8 @@ struct UpstreamBehaviour {
     query_failures: usize,
     /// 任务查询先返回这么多次未在文档中出现的状态，之后才 completed —— 覆盖"未知状态继续轮询"。
     unknown_status_times: usize,
-}
-
-async fn start_fake_upstream(calls: UpstreamCalls) -> FakeUpstream {
-    start_fake_upstream_with(calls, UpstreamBehaviour::default()).await
+    /// 非 0 时，资产上传接口固定返回这个错误状态码 —— 覆盖"上传失败即确定未受理"。
+    upload_failure_status: u16,
 }
 
 async fn start_fake_upstream_with(
@@ -259,6 +307,7 @@ async fn start_fake_upstream_with(
     let port = listener.local_addr().expect("addr").port();
     // 查询行为按调用次数推进：第 n 次查询按 behaviour 决定失败/未知状态/正常。
     let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let upload_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -267,13 +316,16 @@ async fn start_fake_upstream_with(
             let calls = calls.clone();
             let behaviour = behaviour.clone();
             let query_count = query_count.clone();
+            let upload_count = upload_count.clone();
             tokio::spawn(async move {
-                let _ = serve_fake_upstream(&mut socket, calls, behaviour, query_count).await;
+                let _ =
+                    serve_fake_upstream(&mut socket, calls, behaviour, query_count, upload_count)
+                        .await;
             });
         }
     });
     FakeUpstream {
-        port,
+        base_url: format!("http://127.0.0.1:{port}"),
         _handle: handle,
     }
 }
@@ -283,6 +335,7 @@ async fn serve_fake_upstream(
     calls: UpstreamCalls,
     behaviour: UpstreamBehaviour,
     query_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    upload_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -321,6 +374,44 @@ async fn serve_fake_upstream(
     };
     if let Ok(mut calls) = calls.lock() {
         calls.push((method.clone(), path.clone(), body));
+    }
+
+    // 资产上传：参考图/遮罩先换公网 URL。这个分支必须在生成分支之前判断，
+    // 而且它的失败**不**代表"生成可能已发生"——生成任务此时还没提交。
+    if method == "POST" && path == "/v1/uploads/images" {
+        let index = upload_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if behaviour.upload_failure_status != 0 {
+            // 上游上传失败的错误体只有 type 与 message，**没有** error.code。
+            let payload = serde_json::to_vec(&json!({
+                "error": {"type": "invalid_request_error", "message": "unsupported image type"}
+            }))
+            .expect("upload failure body");
+            let head = format!(
+                "HTTP/1.1 {} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                behaviour.upload_failure_status,
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await?;
+            socket.write_all(&payload).await?;
+            socket.flush().await?;
+            return Ok(());
+        }
+        let payload = serde_json::to_vec(&json!({
+            "url": format!("http://127.0.0.1:{}/uploaded-{index}.png", port_of(socket)),
+            "filename": format!("asset-{index}.png"),
+            "content_type": "image/png",
+            "bytes": PNG_FIXTURE.len(),
+            "created_at": 1_790_000_000u64
+        }))
+        .expect("upload body");
+        let head = format!(
+            "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            payload.len()
+        );
+        socket.write_all(head.as_bytes()).await?;
+        socket.write_all(&payload).await?;
+        socket.flush().await?;
+        return Ok(());
     }
 
     let (content_type, payload) = if method == "POST" && path.ends_with("/images/generations") {
@@ -477,6 +568,224 @@ async fn drop_isolated_database(name: &str) {
     .execute(&admin)
     .await;
     admin.close().await;
+}
+
+/// 一个可用的平台 API 进程：`Drop` 时结束它并清掉资产目录。
+fn start_api(database_url: &str, asset_root: &std::path::Path) -> (String, String, ApiProcess) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let base_url = format!("http://127.0.0.1:{port}");
+    let admin_token = format!("driver-admin-{}", Uuid::new_v4());
+    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
+        .env("DATABASE_URL", database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", &admin_token)
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", asset_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("API process should start");
+    let process = ApiProcess {
+        child,
+        asset_root: asset_root.to_path_buf(),
+    };
+    (base_url, admin_token, process)
+}
+
+/// 驱动端到端验证的公共装置。
+///
+/// 起一个**进程内假上游**与一个指向它的 API 进程，发布一条 APIMart 供给，
+/// 并在需要时用真实 Worker 把 Job 跑到终态。全程不产生任何外部调用。
+struct DriverHarness {
+    model: &'static str,
+    database_url: String,
+    database_name: String,
+    base_url: String,
+    api_key: String,
+    pool: PgPool,
+    calls: UpstreamCalls,
+    asset_root: PathBuf,
+    /// 保持 API 进程存活；丢弃即结束它。
+    _api: ApiProcess,
+    /// 保持假上游的监听任务存活。
+    _upstream: FakeUpstream,
+}
+
+impl DriverHarness {
+    const MODEL: &'static str = "driver-model";
+
+    /// 起装置并发布一条供给。`branches` 决定 Profile 声明哪些入口。
+    async fn start(branches: &[&str], behaviour: UpstreamBehaviour) -> Self {
+        let (database_url, database_name) = isolated_database_url().await;
+        let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
+        let asset_root = std::env::temp_dir().join(format!("seeai-driver-{}", Uuid::new_v4()));
+        let (base_url, admin_token, process) = start_api(&database_url, &asset_root);
+        let client = Client::new();
+        wait_until_ready(&client, &base_url).await;
+        let account = create_account(&client, &base_url, &admin_token).await;
+        let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+        let pool = PgPool::connect(&database_url)
+            .await
+            .expect("contract database");
+
+        let mut draft = candidate("APIMart", "apimart-image-v1", branches);
+        draft["base_url"] = Value::String(upstream.base_url.clone());
+        draft["credential_env"] = Value::String("APIMART_API_KEY".to_owned());
+        let published =
+            publish_candidates(&client, &base_url, &admin_token, Self::MODEL, vec![draft]).await;
+        assert_eq!(published, StatusCode::OK, "publication must succeed");
+
+        Self {
+            model: Self::MODEL,
+            database_url,
+            database_name,
+            base_url,
+            api_key,
+            pool,
+            calls,
+            asset_root,
+            _api: process,
+            _upstream: upstream,
+        }
+    }
+
+    /// 通过平台接口上传一个输入资产，返回它的 id。
+    ///
+    /// 走真实 HTTP 路径而不是直接写库：输入资产的解析结果（尺寸、角色）
+    /// 正是创建 Job 时被校验的东西。
+    async fn upload_input_asset(&self, role: &str, bytes: Vec<u8>, media_type: &str) -> Uuid {
+        let response = Client::new()
+            .post(format!("{}/v1/assets", self.base_url))
+            .bearer_auth(&self.api_key)
+            .header("content-type", media_type)
+            .header("x-asset-role", role)
+            .body(bytes)
+            .send()
+            .await
+            .expect("input asset upload");
+        assert_eq!(
+            response.status(),
+            StatusCode::CREATED,
+            "input asset upload must succeed"
+        );
+        let asset: Value = response.json().await.expect("asset JSON");
+        Uuid::parse_str(asset["id"].as_str().expect("asset id")).expect("asset UUID")
+    }
+
+    /// 受理一个 Job（尚未启动 Worker），返回它的 id。
+    async fn accept(&self, request: Value) -> Uuid {
+        let created = Client::new()
+            .post(format!("{}/v1/image-generations", self.base_url))
+            .bearer_auth(&self.api_key)
+            .json(&request)
+            .send()
+            .await
+            .expect("generation accepted");
+        let status = created.status();
+        let body = created.text().await.expect("job JSON");
+        assert_eq!(status, StatusCode::ACCEPTED, "generation rejected: {body}");
+        let created: Value = serde_json::from_str(&body).expect("job JSON");
+        Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID")
+    }
+
+    /// 起真实 Worker 并把 Job 跑到终态，返回 (job_id, 终态)。
+    async fn run_job(&self, request: Value) -> (Uuid, String) {
+        let job_id = self.accept(request).await;
+        // Worker 是**独立包**的二进制，按当前 profile 定位（见 `worker_binary`）。
+        let mut worker = Command::new(worker_binary())
+            .env("DATABASE_URL", &self.database_url)
+            .env("WORKER_ID", "driver-contract-worker")
+            .env("WORKER_POLL_INTERVAL_MS", "200")
+            .env("WORKER_LEASE_SECONDS", "300")
+            .env("PROVIDER_TIMEOUT_SECONDS", "60")
+            .env("ASSET_STORE", "local")
+            .env("ASSET_LOCAL_ROOT", &self.asset_root)
+            .env("APIMART_API_KEY", "contract-test-key")
+            .stdout(Stdio::null())
+            .stderr(Stdio::null())
+            .spawn()
+            .expect("worker process should start");
+
+        let mut state = String::new();
+        for _ in 0..600 {
+            tokio::time::sleep(Duration::from_millis(200)).await;
+            state = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+                .bind(job_id)
+                .fetch_one(&self.pool)
+                .await
+                .expect("job state");
+            if matches!(
+                state.as_str(),
+                "succeeded" | "failed" | "reconciliation_required"
+            ) {
+                break;
+            }
+        }
+        let _ = worker.kill();
+        let _ = worker.wait();
+        (job_id, state)
+    }
+
+    /// 假上游记录下来的请求（方法、路径、请求体）。
+    fn recorded(&self) -> Vec<(String, String, String)> {
+        self.calls.lock().expect("calls lock").clone()
+    }
+
+    /// 记录下来的生成请求体。
+    fn submit_body(&self) -> Value {
+        let raw = self
+            .recorded()
+            .into_iter()
+            .find(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
+            .map(|(_, _, body)| body)
+            .expect("the driver must submit a generation request");
+        serde_json::from_str(&raw).expect("submit body is JSON")
+    }
+
+    fn count(&self, method: &str, path_prefix: &str) -> usize {
+        self.recorded()
+            .iter()
+            .filter(|(call_method, path, _)| call_method == method && path.starts_with(path_prefix))
+            .count()
+    }
+
+    /// 线上请求体里不允许出现 Profile 未声明的字段（含内部包装字段）。
+    ///
+    /// 校验对象是 `config/bootstrap/apimart-gpt-image-2.5-flare.json` 里那份**真实** Profile：
+    /// 契约要求请求体的键名与 Profile 声明逐字相同（验收第 24 条）。
+    fn assert_only_declared_fields(&self) {
+        let material: Value = serde_json::from_str(include_str!(
+            "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
+        ))
+        .expect("APIMart material parses");
+        let declared = material["offerings"][0]["capability_schema"]["properties"]
+            .as_object()
+            .expect("declared properties");
+        let submit_body = self.submit_body();
+        let sent = submit_body.as_object().expect("sent body object");
+        for name in sent.keys() {
+            assert!(
+                declared.contains_key(name),
+                "the driver sent `{name}`, which the profile does not declare"
+            );
+        }
+        for name in ["model", "prompt"] {
+            assert!(
+                sent.contains_key(name),
+                "the driver must send `{name}` verbatim"
+            );
+        }
+    }
+
+    async fn cleanup(&self) {
+        // 先放掉自己的连接，再去删库：否则 DROP 只能靠 `WITH (FORCE)` 强踢，
+        // 偶尔会留下一次性库。
+        self.pool.close().await;
+        drop_isolated_database(&self.database_name).await;
+    }
 }
 
 #[tokio::test]
@@ -953,6 +1262,7 @@ async fn transient_query_failure_is_retried_and_the_job_still_succeeds() {
     let behaviour = UpstreamBehaviour {
         query_failures: 1,
         unknown_status_times: 0,
+        ..UpstreamBehaviour::default()
     };
     let outcome = run_driver_attempt(behaviour).await;
     assert_eq!(
@@ -968,7 +1278,7 @@ async fn transient_query_failure_is_retried_and_the_job_still_succeeds() {
         "expected at least two queries (one failure + one success), got {}",
         outcome.polls
     );
-    outcome.cleanup().await;
+    outcome.harness.cleanup().await;
 }
 
 /// 第 10 条：未在文档中出现的状态值必须**继续轮询**，不得当失败。
@@ -978,6 +1288,7 @@ async fn unknown_task_status_keeps_polling_instead_of_failing() {
     let behaviour = UpstreamBehaviour {
         query_failures: 0,
         unknown_status_times: 1,
+        ..UpstreamBehaviour::default()
     };
     let outcome = run_driver_attempt(behaviour).await;
     assert_eq!(
@@ -989,119 +1300,28 @@ async fn unknown_task_status_keeps_polling_instead_of_failing() {
         "the driver must keep polling after an unknown status, got {} queries",
         outcome.polls
     );
-    outcome.cleanup().await;
+    outcome.harness.cleanup().await;
 }
 
 struct DriverOutcome {
     job_state: String,
     submits: usize,
     polls: usize,
-    database_name: String,
+    harness: DriverHarness,
 }
 
-impl DriverOutcome {
-    async fn cleanup(&self) {
-        drop_isolated_database(&self.database_name).await;
-    }
-}
-
-/// 起 API + 假上游 + 真实 Worker，让一个 Job 走完整个驱动流程，返回它的结局。
+/// 起 API + 假上游 + 真实 Worker，让一个文生图 Job 走完整个驱动流程，返回它的结局。
 async fn run_driver_attempt(behaviour: UpstreamBehaviour) -> DriverOutcome {
-    let (database_url, database_name) = isolated_database_url().await;
-    let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
-    let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
-    let upstream_base = format!("http://127.0.0.1:{}", upstream.port);
-
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
-    let port = listener.local_addr().expect("test address").port();
-    drop(listener);
-    let base_url = format!("http://127.0.0.1:{port}");
-    let admin_token = format!("driver-admin-{}", Uuid::new_v4());
-    let asset_root = std::env::temp_dir().join(format!("seeai-driver-{}", Uuid::new_v4()));
-    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
-        .env("DATABASE_URL", &database_url)
-        .env("API_BIND", format!("127.0.0.1:{port}"))
-        .env("ADMIN_TOKEN", &admin_token)
-        .env("ASSET_STORE", "local")
-        .env("ASSET_LOCAL_ROOT", &asset_root)
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("API process should start");
-    let _process = ApiProcess {
-        child,
-        asset_root: asset_root.clone(),
-    };
-    let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
-    let account = create_account(&client, &base_url, &admin_token).await;
-    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("contract database");
-    let model = "driver-model";
-    let mut draft = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
-    draft["base_url"] = Value::String(upstream_base);
-    draft["credential_env"] = Value::String("APIMART_API_KEY".to_owned());
-    let published = publish_candidates(&client, &base_url, &admin_token, model, vec![draft]).await;
-    assert_eq!(published, StatusCode::OK, "publication must succeed");
-
+    let harness = DriverHarness::start(&["prompt_only"], behaviour).await;
     let key = format!("driver-{}", Uuid::new_v4());
-    let created = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&route_request(model, &key, "driver prompt"))
-        .send()
-        .await
-        .expect("generation accepted");
-    assert_eq!(created.status(), StatusCode::ACCEPTED);
-    let created: Value = created.json().await.expect("job JSON");
-    let job_id = Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID");
-
-    let mut worker = Command::new(worker_binary())
-        .env("DATABASE_URL", &database_url)
-        .env("WORKER_ID", "driver-contract-worker")
-        .env("WORKER_POLL_INTERVAL_MS", "200")
-        .env("WORKER_LEASE_SECONDS", "300")
-        .env("PROVIDER_TIMEOUT_SECONDS", "60")
-        .env("ASSET_STORE", "local")
-        .env("ASSET_LOCAL_ROOT", &asset_root)
-        .env("APIMART_API_KEY", "contract-test-key")
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("worker process should start");
-
-    let mut job_state = String::new();
-    for _ in 0..600 {
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        job_state = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("job state");
-        if matches!(
-            job_state.as_str(),
-            "succeeded" | "failed" | "reconciliation_required"
-        ) {
-            break;
-        }
-    }
-    let _ = worker.kill();
-    let _ = worker.wait();
-
-    let calls = calls.lock().expect("calls lock").clone();
+    let (_, job_state) = harness
+        .run_job(route_request(harness.model, &key, "driver prompt"))
+        .await;
     DriverOutcome {
         job_state,
-        submits: calls
-            .iter()
-            .filter(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
-            .count(),
-        polls: calls
-            .iter()
-            .filter(|(method, path, _)| method == "GET" && path.starts_with("/v1/tasks/"))
-            .count(),
-        database_name,
+        submits: harness.count("POST", "/v1/images/generations"),
+        polls: harness.count("GET", "/v1/tasks/"),
+        harness,
     }
 }
 
@@ -1116,10 +1336,17 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
         .iter()
         .any(|branch| matches!(*branch, "image_conditioned" | "masked"));
     if declares_image {
-        properties["image"] = json!({"type": "string", "minLength": 1});
+        // 字段名必须落在 Adapter 声明的参数面里（APIMart 收的是 `image_urls`，
+        // 没有 `image` 这个顶层参数），否则发布期会以"不支持该原生参数"拒绝。
+        properties["image_urls"] = json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 1
+        });
     }
     if branches.contains(&"masked") {
-        properties["mask"] = json!({"type": "string", "minLength": 1});
+        properties["mask_url"] = json!({"type": "string"});
     }
     json!({
         "provider_kind": provider_kind,
