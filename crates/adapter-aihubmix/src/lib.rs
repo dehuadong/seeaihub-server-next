@@ -691,6 +691,7 @@ mod tests {
         }
     }
 
+    /// 发布素材现在是"数组形式"：Profile 与 restrictions 在 `offerings[0]` 内。
     fn published_config() -> Value {
         serde_json::from_str(include_str!(
             "../../../config/bootstrap/aihubmix-gpt-image-2.json"
@@ -698,14 +699,19 @@ mod tests {
         .expect("bootstrap config should parse")
     }
 
+    fn published_offering(config: &Value) -> &Value {
+        &config["offerings"][0]
+    }
+
     #[test]
     fn accepts_bootstrap_capability_contract() {
         let config = published_config();
+        let offering = published_offering(&config);
         AihubmixAdapterFactory
             .validate_publication(
-                ADAPTER_KEY,
-                &config["capability_schema"],
-                &config["restrictions"],
+                offering["adapter_key"].as_str().expect("adapter key"),
+                &offering["capability_schema"],
+                &offering["restrictions"],
             )
             .expect("bootstrap contract should be executable");
     }
@@ -713,13 +719,14 @@ mod tests {
     #[test]
     fn rejects_schema_with_wrong_prompt_type() {
         let mut config = published_config();
-        config["capability_schema"]["properties"]["prompt"]["type"] =
+        config["offerings"][0]["capability_schema"]["properties"]["prompt"]["type"] =
             Value::String("integer".to_owned());
+        let offering = published_offering(&config).clone();
         let error = AihubmixAdapterFactory
             .validate_publication(
                 ADAPTER_KEY,
-                &config["capability_schema"],
-                &config["restrictions"],
+                &offering["capability_schema"],
+                &offering["restrictions"],
             )
             .expect_err("wrong prompt type must be rejected");
         assert!(error.contains("prompt"));

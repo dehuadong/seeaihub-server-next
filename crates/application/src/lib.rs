@@ -312,7 +312,10 @@ fn select_candidate(
         )));
     }
     let revision_id = candidates[0].runtime_revision_id;
-    let mut considered = Vec::with_capacity(candidates.len());
+    // 先算出**每一个**候选的取舍，再挑第一个合格的。这样 `considered` 记录的是完整的
+    // 取舍画面（每个候选各自的 priority 与 eligible），而不是"评估到命中为止"的部分清单
+    // ——它是判定记录，不是求值轨迹。
+    let mut evaluated = Vec::with_capacity(candidates.len());
     for candidate in candidates {
         let published = candidate.clone().into_published();
         let mut skip_reason = None;
@@ -321,22 +324,30 @@ fn select_candidate(
         } else if let Err(error) = validate_native_request(command, &published) {
             skip_reason = Some(error.to_string());
         }
-        let eligible = skip_reason.is_none();
-        considered.push(ConsideredCandidate {
+        evaluated.push((published, skip_reason));
+    }
+    let considered: Vec<ConsideredCandidate> = candidates
+        .iter()
+        .zip(&evaluated)
+        .map(|(candidate, (_, skip_reason))| ConsideredCandidate {
             offering_id: candidate.offering_id,
             provider_kind: candidate.provider_kind.clone(),
             routing_priority: candidate.routing_priority,
-            eligible,
-            skip_reason,
-        });
-        if eligible {
-            let decision = RoutingDecision {
-                runtime_revision_id: candidate.runtime_revision_id,
-                chosen_offering_id: candidate.offering_id,
-                considered,
-            };
-            return Ok((published, decision));
-        }
+            eligible: skip_reason.is_none(),
+            skip_reason: skip_reason.clone(),
+        })
+        .collect();
+    if let Some(index) = evaluated
+        .iter()
+        .position(|(_, skip_reason)| skip_reason.is_none())
+    {
+        let (published, _) = evaluated.swap_remove(index);
+        let decision = RoutingDecision {
+            runtime_revision_id: revision_id,
+            chosen_offering_id: published.offering_id,
+            considered,
+        };
+        return Ok((published, decision));
     }
     let reasons = considered
         .iter()

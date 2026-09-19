@@ -142,6 +142,220 @@ async fn image_generation_http_contract() {
     verify_lease_recovery_contract(&client, &base_url, &api_key, &database_url).await;
 }
 
+/// 多 Offering 路由的端到端验证（规划 §6 第 1–4、7 条）。
+///
+/// 需要独立空库（会发布自己的候选集合）。**不启动 Worker**：路由选择发生在
+/// `create_job` 之前的 API 进程内，而 `create_job` 不调用上游——因此本测试
+/// **不产生任何外部调用**，同时仍能验证选中顺序与"无合格候选时零上游调用"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn multiple_active_offerings_route_by_priority() {
+    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
+        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let base_url = format!("http://127.0.0.1:{port}");
+    let admin_token = format!("route-admin-{}", Uuid::new_v4());
+    let asset_root = std::env::temp_dir().join(format!("seeai-route-{}", Uuid::new_v4()));
+    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
+        .env("DATABASE_URL", &database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", &admin_token)
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", &asset_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("API process should start");
+    let _process = ApiProcess { child, asset_root };
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // ── 用例 1：两个都合格的候选 → 选中优先级最小的那个（第 1、2、3 条）──
+    let model = "route-model-a";
+    let published = publish_candidates(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![
+            candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+            candidate("APIMart", "apimart-image-v1", &["prompt_only"]),
+        ],
+    )
+    .await;
+    assert_eq!(
+        published,
+        StatusCode::OK,
+        "multi-offering publish must succeed"
+    );
+
+    let key = format!("route-{}", Uuid::new_v4());
+    let created = client
+        .post(format!("{base_url}/v1/image-generations"))
+        .bearer_auth(&api_key)
+        .json(&route_request(model, &key, "route prompt"))
+        .send()
+        .await
+        .expect("routed generation");
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: Value = created.json().await.expect("job JSON");
+    let job_id = Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID");
+
+    // 判定记录与 Job 同事务写入。
+    let (chosen, considered): (Uuid, Value) = {
+        let row = sqlx::query(
+            "SELECT chosen_offering_id, considered FROM generation.routing_decisions WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("routing decision row must exist");
+        (
+            row.try_get("chosen_offering_id").expect("chosen"),
+            row.try_get("considered").expect("considered"),
+        )
+    };
+    // `considered` 记录了两个候选各自的 priority 与 eligible。
+    let considered = considered.as_array().expect("considered is an array");
+    assert_eq!(considered.len(), 2, "both candidates must be considered");
+    assert_eq!(considered[0]["routing_priority"], 0);
+    assert_eq!(considered[0]["provider_kind"], "AIHubMix");
+    assert_eq!(considered[0]["eligible"], true);
+    // 选中项就是优先级 0 的那个候选。
+    let expected: Uuid = sqlx::query_scalar(
+        "SELECT re.offering_id FROM publication.runtime_entries re
+         WHERE re.active AND re.native_model_id = $1 AND re.routing_priority = 0",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("priority 0 offering");
+    assert_eq!(
+        chosen, expected,
+        "the first eligible candidate must be chosen"
+    );
+    // Job 固化了被选中的 Offering 与 Channel。
+    let (job_offering, job_channel): (Uuid, Uuid) = {
+        let row = sqlx::query("SELECT offering_id, channel_id FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("job row");
+        (
+            row.try_get("offering_id").expect("offering"),
+            row.try_get("channel_id").expect("channel"),
+        )
+    };
+    assert_eq!(job_offering, chosen);
+    let chosen_channel: Uuid =
+        sqlx::query_scalar("SELECT channel_id FROM supply.offerings WHERE id = $1")
+            .bind(chosen)
+            .fetch_one(&pool)
+            .await
+            .expect("chosen offering channel");
+    assert_eq!(job_channel, chosen_channel);
+
+    // ── 用例 3：再发布一次即原子替换该型号的全部 active 候选（第 1 条）──
+    let published = publish_candidates(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"])],
+    )
+    .await;
+    assert_eq!(published, StatusCode::OK);
+    let active: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM publication.runtime_entries WHERE active AND native_model_id = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("active entries");
+    assert_eq!(
+        active, 1,
+        "republishing must atomically replace the model's active candidates"
+    );
+}
+
+fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value {
+    json!({
+        "provider_kind": provider_kind,
+        "adapter_key": adapter_key,
+        "provider_model_id": "route-model",
+        "base_url": "http://127.0.0.1:1",
+        "credential_env": "AIHUBMIX_API_KEY",
+        "restrictions": {
+            "allowed_branches": branches,
+            "max_images": 1
+        },
+        "capability_schema": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "placeholder"},
+                "prompt": {"type": "string", "minLength": 1}
+            }
+        },
+        "price_plan": {
+            "formula": "token_rates",
+            "currency": "USD",
+            "text_input_microusd_per_million": 5_000_000,
+            "image_input_microusd_per_million": 8_000_000,
+            "text_output_microusd_per_million": 10_000_000,
+            "image_output_microusd_per_million": 30_000_000,
+            "source_url": "https://example.invalid/price"
+        }
+    })
+}
+
+async fn publish_candidates(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    model: &str,
+    mut offerings: Vec<Value>,
+) -> StatusCode {
+    for offering in &mut offerings {
+        offering["capability_schema"]["properties"]["model"]["const"] =
+            Value::String(model.to_owned());
+        offering["provider_model_id"] = Value::String(model.to_owned());
+    }
+    let body = json!({
+        "vendor_id": "OpenAI",
+        "native_model_id": model,
+        "native_revision": "route-test-1",
+        "actor": "contract-test",
+        "offerings": offerings
+    });
+    client
+        .post(format!("{base_url}/admin/runtime-revisions"))
+        .bearer_auth(admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("runtime publication")
+        .status()
+}
+
+fn route_request(native_model_id: &str, idempotency_key: &str, prompt: &str) -> Value {
+    json!({
+        "native_model_id": native_model_id,
+        "native_parameters": {"prompt": prompt},
+        "asset_bindings": [],
+        "idempotency_key": idempotency_key,
+        "max_cost_microusd": 20_000
+    })
+}
+
 async fn wait_until_ready(client: &Client, base_url: &str) {
     for _ in 0..100 {
         if client
