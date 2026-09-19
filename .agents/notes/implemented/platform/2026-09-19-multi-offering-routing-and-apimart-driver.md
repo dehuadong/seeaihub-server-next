@@ -67,7 +67,9 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 敏感信息未入库：**不保存**真实图片 URL 与 task id，原始响应只留本机临时目录。据此，两个 APIMart 发布素材的 `allowed_branches` 已加上 `image_conditioned` / `masked`。
 
-**结算口径的第一手核对（2026-09-19，用户提供上游账单面板）**：上游控制台的"详情"面板自己写明 `Base cost` = 各分项 token × 费率之和，`Actual cost = Base × Group ratio 0.8 × Channel ratio 1 × Discount ratio 1`。两次调用**逐位对上**：29/1024/196 ⇒ Base `$0.014217` ⇒ Actual `$0.011374`，而**平台侧 capture 正好是 14217 microusd**（= Base）；另一支 33/1024/196 ⇒ Base `$0.014237` ⇒ Actual `$0.011390`。⇒ 对外计费用的是已发布单价（= 上游 list 价），20% 折扣留在平台侧。面板还暴露两件之前不知道的事：**缓存档位**（缓存文本 $1.25/1M、缓存图片 $2/1M）与 `credits = USD × 10`；我们的 Price Plan 没有缓存字段、`cached_tokens` 也被丢弃，已记为待办。逐笔核对表见 `docs/facts/channel-facts.md` §3.9。
+**成本口径的第一手核对（2026-09-19，用户提供上游账单面板）**：上游控制台的"详情"面板自己写明 `Base cost` = 各分项 token × 费率之和，`Actual cost = Base × Group ratio 0.8 × Channel ratio 1 × Discount ratio 1`。两次调用**逐位对上**：29/1024/196 ⇒ Base `$0.014217` ⇒ Actual `$0.011374`，而**平台侧 capture 正好是 14217 microusd**（= Base）；另一支 33/1024/196 ⇒ Base `$0.014237` ⇒ Actual `$0.011390`。
+
+由此得到**平台成本价 = list 费率 × 0.8**（文本in $4 / 图片in $6.40 / 文本out $8 / 图片out $24，每 1M）——这是本阶段要的东西。**平台对外价没有定，也不该在这阶段定**（加价、让利、缓存档是否单独定价属后期产品决定，工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；两个素材 `price_plan` 里填的 list 费率现在的角色是**结算基数与成本对照**，已在文件里用 `_note` 标注清楚。面板还暴露两件之前不知道的事：**缓存档位**（缓存文本 $1.25/1M、缓存图片 $2/1M）与 `credits = USD × 10`；我们的 Price Plan 没有缓存字段、`cached_tokens` 也被丢弃，已记为待办。逐笔核对表见 `docs/facts/channel-facts.md` §3.9。
 
 ## 本变更对领域模型的影响（`0004` §4 的例外说明）
 
