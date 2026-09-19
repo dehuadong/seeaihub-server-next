@@ -1,88 +1,87 @@
 {
-  "_comment": "AIHubMix 供给 gpt-image-2.5-flare 的运行时发布素材（草案）。纯运行时数据，不涉及代码改动。来源与依据见 docs/facts/channel-facts.md §2.6/§2.8/§2.9。",
-  "_status": "草案 · 未发布。两个前置：① 未获「执行实现」授权前不得用于生产；② 本文用的是规划 §3.1 的「新形状」（price_plan），当前实现是扁平的 rates + price_source_url —— 代码支持新形状前本文件无法直接发布。",
-  "_schema_delta_vs_gpt_image_2": "相对 gpt-image-2：quality 新增 xhigh/max（共 6 档）；不含 extra.moderation —— 因 AdapterDescriptor.supported_extra_parameters 尚未声明它，带上会被发布期拒绝（见 channel-facts.md §2.9，方案 B）。",
-
+  "_comment": "AIHubMix 供给 gpt-image-2.5-flare 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。来源见 docs/facts/channel-facts.md §2.6/§2.8/§2.9。",
+  "_status": "草案 · 未发布。需「执行实现」授权后方可用于生产。",
+  "_evidence": "2.5 两款在同步 /v1 上实测与 gpt-image-2 同构（四分项 usage）；quality 在 /v1 为顶层参数；本阶段不声明 extra.moderation（Adapter 声明面不含它）。",
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-flare",
   "native_revision": "2026-09-19-validated-1.0",
-
-  "capability_schema": {
-    "$schema": "https://json-schema.org/draft/2020-12/schema",
-    "type": "object",
-    "additionalProperties": false,
-    "required": ["model", "prompt"],
-    "properties": {
-      "model": { "const": "gpt-image-2.5-flare" },
-      "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
-      "image": { "type": "string", "minLength": 1 },
-      "mask": { "type": "string", "minLength": 1 },
-      "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
-      "size": {
-        "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"]
+  "actor": "bootstrap",
+  "offerings": [
+    {
+      "provider_kind": "AIHubMix",
+      "adapter_key": "aihubmix-image-v1",
+      "provider_model_id": "gpt-image-2.5-flare",
+      "base_url": "https://api.inferera.com",
+      "credential_env": "AIHUBMIX_API_KEY",
+      "restrictions": {
+        "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
+        "max_images": 1
       },
-      "output_format": { "enum": ["png", "jpeg"], "default": "png" },
-      "extra": {
+      "capability_schema": {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
         "type": "object",
         "additionalProperties": false,
+        "required": ["model", "prompt"],
         "properties": {
-          "quality": { "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" },
-          "background": { "enum": ["transparent", "opaque", "auto"] },
-          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100 },
-          "user": { "type": "string" }
-        }
-      }
-    },
-    "allOf": [
-      { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
-      {
-        "if": {
-          "properties": {
-            "extra": {
-              "type": "object",
-              "required": ["background"],
-              "properties": { "background": { "const": "transparent" } }
+          "model": { "const": "gpt-image-2.5-flare" },
+          "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
+          "image": { "type": "string", "minLength": 1 },
+          "mask": { "type": "string", "minLength": 1 },
+          "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+          "size": { "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"] },
+          "output_format": { "enum": ["png", "jpeg"], "default": "png" },
+          "extra": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "quality": {
+                "enum": ["low", "medium", "high", "xhigh", "max", "auto"],
+                "default": "auto"
+              },
+              "background": { "enum": ["transparent", "opaque", "auto"] },
+              "output_compression": { "type": "integer", "minimum": 0, "maximum": 100 },
+              "user": { "type": "string" }
             }
-          },
-          "required": ["extra"]
+          }
         },
-        "then": { "properties": { "output_format": { "const": "png" } } }
+        "allOf": [
+          { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
+          {
+            "if": {
+              "properties": {
+                "extra": {
+                  "type": "object",
+                  "required": ["background"],
+                  "properties": { "background": { "const": "transparent" } }
+                }
+              },
+              "required": ["extra"]
+            },
+            "then": { "properties": { "output_format": { "const": "png" } } }
+          },
+          {
+            "if": {
+              "properties": {
+                "extra": { "type": "object", "required": ["output_compression"] }
+              },
+              "required": ["extra"]
+            },
+            "then": {
+              "required": ["output_format"],
+              "properties": { "output_format": { "const": "jpeg" } }
+            }
+          }
+        ]
       },
-      {
-        "if": {
-          "properties": {
-            "extra": { "type": "object", "required": ["output_compression"] }
-          },
-          "required": ["extra"]
-        },
-        "then": {
-          "required": ["output_format"],
-          "properties": { "output_format": { "const": "jpeg" } }
-        }
+      "price_plan": {
+        "formula": "token_rates",
+        "currency": "USD",
+        "text_input_microusd_per_million": 5000000,
+        "image_input_microusd_per_million": 8000000,
+        "text_output_microusd_per_million": 10000000,
+        "image_output_microusd_per_million": 30000000,
+        "source_url": "https://aihubmix.com/model/gpt-image-2.5-flare"
       }
-    ]
-  },
-
-  "restrictions": {
-    "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-    "max_images": 1
-  },
-
-  "provider_kind": "AIHubMix",
-  "adapter_key": "aihubmix-image-v1",
-  "provider_model_id": "gpt-image-2.5-flare",
-  "base_url": "https://api.inferera.com",
-  "credential_env": "AIHUBMIX_API_KEY",
-
-  "price_plan": {
-    "formula": "token_rates",
-    "currency": "USD",
-    "text_input_microusd_per_million": 5000000,
-    "image_input_microusd_per_million": 8000000,
-    "text_output_microusd_per_million": 10000000,
-    "image_output_microusd_per_million": 30000000,
-    "source_url": "https://aihubmix.com/model/gpt-image-2.5-flare"
-  },
-
-  "actor": "bootstrap"
+    }
+  ]
 }

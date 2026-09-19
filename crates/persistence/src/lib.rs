@@ -3,16 +3,17 @@ use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
     ApplicationError, AssetRecord, AttemptFailure, ClaimedJob, CompleteJob, HoldDisposition,
     HubRepository, JobView, LeaseRecovery, PublishRuntimeCommand, ReconciliationCaseView,
-    RefundReconciliationCommand,
+    RefundReconciliationCommand, RoutingDecision,
 };
 use seeai_domain::{
     AccountId, AssetId, AttemptId, ChannelId, CreateImageGeneration, GenerationJob, ImageBranch,
-    JobId, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PublishedOffering,
-    RuntimeRevisionId, VendorModelId,
+    JobId, OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot,
+    PublishedOffering, PublishedRevision, RuntimeRevisionId, VendorModelId,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -77,107 +78,167 @@ impl HubRepository for PgHubRepository {
     async fn publish_runtime(
         &self,
         command: PublishRuntimeCommand,
-    ) -> Result<PublishedOffering, ApplicationError> {
-        let vendor_model_id = VendorModelId::new();
-        let channel_id = ChannelId::new();
-        let offering_id = OfferingId::new();
-        let price_plan_id = PricePlanId::new();
+    ) -> Result<PublishedRevision, ApplicationError> {
         let revision_id = RuntimeRevisionId::new();
-        let schema_bytes = serde_json::to_vec(&command.capability_schema)
-            .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        let schema_hash = hex::encode(Sha256::digest(schema_bytes));
         let now = Utc::now();
-        let snapshot = serde_json::json!({
-            "vendor_id": command.vendor_id,
-            "native_model_id": command.native_model_id,
-            "native_revision": command.native_revision,
-            "provider_kind": command.provider_kind,
-            "adapter_key": command.adapter_key,
-            "base_url": command.base_url,
-            "credential_env": command.credential_env,
-            "schema_hash": schema_hash,
-            "rates": command.rates,
-        });
+        let actor = command.actor.clone();
+        let vendor_id = command.vendor_id.clone();
+        let native_model_id = command.native_model_id.clone();
+        let native_revision = command.native_revision.clone();
+        // 形状判别与逐候选校验已在 RuntimeService::publish 完成；这里只处理
+        // 「已归一、已校验」的有序候选列表。
+        let offerings = command.normalized;
+        if offerings.is_empty() {
+            return Err(ApplicationError::Validation(
+                "publish requires at least one offering".to_owned(),
+            ));
+        }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        let persisted_model_id: Uuid = sqlx::query_scalar(
-            r#"
-            INSERT INTO catalog.vendor_models
-                (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash)
-            VALUES ($1, $2, $3, $4, $5, $6)
-            ON CONFLICT (vendor_id, native_model_id, native_revision, schema_hash)
-            DO UPDATE SET capability_schema = EXCLUDED.capability_schema
-            RETURNING id
-            "#,
-        )
-        .bind(vendor_model_id.0)
-        .bind(&command.vendor_id)
-        .bind(&command.native_model_id)
-        .bind(&command.native_revision)
-        .bind(&command.capability_schema)
-        .bind(&schema_hash)
-        .fetch_one(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let vendor_model_id = VendorModelId(persisted_model_id);
-        sqlx::query(
-            r#"
-            INSERT INTO supply.channels
-                (id, provider_kind, base_url, credential_env, enabled)
-            VALUES ($1, $2, $3, $4, true)
-            "#,
-        )
-        .bind(channel_id.0)
-        .bind(&command.provider_kind)
-        .bind(&command.base_url)
-        .bind(&command.credential_env)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO supply.offerings
-                (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions, enabled)
-            VALUES ($1, $2, $3, $4, $5, $6, true)
-            "#,
-        )
-        .bind(offering_id.0)
-        .bind(vendor_model_id.0)
-        .bind(channel_id.0)
-        .bind(&command.adapter_key)
-        .bind(&command.provider_model_id)
-        .bind(&command.restrictions)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO pricing.price_plans (
-                id, offering_id, currency,
-                text_input_microusd_per_million, image_input_microusd_per_million,
-                text_output_microusd_per_million, image_output_microusd_per_million,
-                source_url, approved_by
-            ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-            "#,
-        )
-        .bind(price_plan_id.0)
-        .bind(offering_id.0)
-        .bind(&command.rates.currency)
-        .bind(to_i64(command.rates.text_input_microusd_per_million)?)
-        .bind(to_i64(command.rates.image_input_microusd_per_million)?)
-        .bind(to_i64(command.rates.text_output_microusd_per_million)?)
-        .bind(to_i64(command.rates.image_output_microusd_per_million)?)
-        .bind(&command.price_source_url)
-        .bind(&command.actor)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            "UPDATE publication.runtime_entries SET active = false WHERE active AND native_model_id = $1",
-        )
-            .bind(&command.native_model_id)
+        // 同一发布内两个候选的 Profile 内容相同时，`ON CONFLICT` 会归并到同一行
+        // vendor_model；不同时产生两行（规划 §3.3）。这里按 schema_hash 记忆结果，
+        // 避免对同一行重复 INSERT。
+        let mut model_ids: BTreeMap<String, VendorModelId> = BTreeMap::new();
+        let mut candidates = Vec::with_capacity(offerings.len());
+        let mut snapshot_entries = Vec::with_capacity(offerings.len());
+        for offering in &offerings {
+            let schema_bytes = serde_json::to_vec(&offering.capability_schema)
+                .map_err(|error| ApplicationError::Validation(error.to_string()))?;
+            let schema_hash = hex::encode(Sha256::digest(schema_bytes));
+            let vendor_model_id = if let Some(existing) = model_ids.get(&schema_hash) {
+                *existing
+            } else {
+                let persisted: Uuid = sqlx::query_scalar(
+                    r#"
+                    INSERT INTO catalog.vendor_models
+                        (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash)
+                    VALUES ($1, $2, $3, $4, $5, $6)
+                    ON CONFLICT (vendor_id, native_model_id, native_revision, schema_hash)
+                    DO UPDATE SET capability_schema = EXCLUDED.capability_schema
+                    RETURNING id
+                    "#,
+                )
+                .bind(VendorModelId::new().0)
+                .bind(&vendor_id)
+                .bind(&native_model_id)
+                .bind(&native_revision)
+                .bind(&offering.capability_schema)
+                .bind(&schema_hash)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                let id = VendorModelId(persisted);
+                model_ids.insert(schema_hash.clone(), id);
+                id
+            };
+            let channel_id = ChannelId::new();
+            sqlx::query(
+                r#"
+                INSERT INTO supply.channels
+                    (id, provider_kind, base_url, credential_env, enabled)
+                VALUES ($1, $2, $3, $4, true)
+                "#,
+            )
+            .bind(channel_id.0)
+            .bind(&offering.provider_kind)
+            .bind(&offering.base_url)
+            .bind(&offering.credential_env)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+            let offering_id = OfferingId::new();
+            sqlx::query(
+                r#"
+                INSERT INTO supply.offerings
+                    (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions, enabled)
+                VALUES ($1, $2, $3, $4, $5, $6, true)
+                "#,
+            )
+            .bind(offering_id.0)
+            .bind(vendor_model_id.0)
+            .bind(channel_id.0)
+            .bind(&offering.adapter_key)
+            .bind(&offering.provider_model_id)
+            .bind(&offering.restrictions)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            let price_plan_id = PricePlanId::new();
+            sqlx::query(
+                r#"
+                INSERT INTO pricing.price_plans (
+                    id, offering_id, currency,
+                    text_input_microusd_per_million, image_input_microusd_per_million,
+                    text_output_microusd_per_million, image_output_microusd_per_million,
+                    source_url, approved_by
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                "#,
+            )
+            .bind(price_plan_id.0)
+            .bind(offering_id.0)
+            .bind(&offering.rates.currency)
+            .bind(to_i64(offering.rates.text_input_microusd_per_million)?)
+            .bind(to_i64(offering.rates.image_input_microusd_per_million)?)
+            .bind(to_i64(offering.rates.text_output_microusd_per_million)?)
+            .bind(to_i64(offering.rates.image_output_microusd_per_million)?)
+            .bind(&offering.price_source_url)
+            .bind(&actor)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            candidates.push(OfferingCandidate {
+                runtime_revision_id: revision_id,
+                vendor_model_id,
+                offering_id,
+                channel_id,
+                native_model_id: native_model_id.clone(),
+                native_revision: native_revision.clone(),
+                capability_schema: offering.capability_schema.clone(),
+                restrictions: offering.restrictions.clone(),
+                adapter_key: offering.adapter_key.clone(),
+                provider_model_id: offering.provider_model_id.clone(),
+                provider_kind: offering.provider_kind.clone(),
+                base_url: offering.base_url.clone(),
+                credential_env: offering.credential_env.clone(),
+                price_snapshot: PriceSnapshot {
+                    price_plan_id,
+                    rates: offering.rates.clone(),
+                    captured_at: now,
+                },
+                routing_priority: offering.routing_priority,
+            });
+            snapshot_entries.push(serde_json::json!({
+                "offering_id": offering_id,
+                "routing_priority": offering.routing_priority,
+                "provider_kind": offering.provider_kind,
+                "adapter_key": offering.adapter_key,
+                "provider_model_id": offering.provider_model_id,
+                "base_url": offering.base_url,
+                "credential_env": offering.credential_env,
+                "restrictions": offering.restrictions,
+                "schema_hash": schema_hash,
+                "currency": offering.rates.currency,
+                "text_input_microusd_per_million": offering.rates.text_input_microusd_per_million,
+                "image_input_microusd_per_million": offering.rates.image_input_microusd_per_million,
+                "text_output_microusd_per_million": offering.rates.text_output_microusd_per_million,
+                "image_output_microusd_per_million": offering.rates.image_output_microusd_per_million,
+                "price_source_url": offering.price_source_url,
+            }));
+        }
+        // 发布即原子替换该模型的全部 active 条目（`docs/adr/0009`）：候选集与顺序
+        // 始终属于同一个 Revision，不存在跨 Revision 并存。
+        sqlx::query(
+            "UPDATE publication.runtime_entries SET active = false WHERE active AND native_model_id = $1",
+        )
+        .bind(&native_model_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let snapshot = serde_json::json!({
+            "vendor_id": vendor_id,
+            "native_model_id": native_model_id,
+            "native_revision": native_revision,
+            "candidates": snapshot_entries,
+        });
         sqlx::query(
             r#"
             INSERT INTO publication.runtime_revisions (id, snapshot, published_by)
@@ -186,29 +247,32 @@ impl HubRepository for PgHubRepository {
         )
         .bind(revision_id.0)
         .bind(&snapshot)
-        .bind(&command.actor)
+        .bind(&actor)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO publication.runtime_entries
-                (runtime_revision_id, vendor_model_id, offering_id, price_plan_id,
-                 native_model_id, active)
-            VALUES ($1, $2, $3, $4, $5, true)
-            "#,
-        )
-        .bind(revision_id.0)
-        .bind(vendor_model_id.0)
-        .bind(offering_id.0)
-        .bind(price_plan_id.0)
-        .bind(&command.native_model_id)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
+        for candidate in &candidates {
+            sqlx::query(
+                r#"
+                INSERT INTO publication.runtime_entries
+                    (runtime_revision_id, vendor_model_id, offering_id, price_plan_id,
+                     native_model_id, active, routing_priority)
+                VALUES ($1, $2, $3, $4, $5, true, $6)
+                "#,
+            )
+            .bind(revision_id.0)
+            .bind(candidate.vendor_model_id.0)
+            .bind(candidate.offering_id.0)
+            .bind(candidate.price_snapshot.price_plan_id.0)
+            .bind(&native_model_id)
+            .bind(candidate.routing_priority)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
         insert_audit(
             &mut transaction,
-            &command.actor,
+            &actor,
             "runtime.publish",
             "runtime_revision",
             &revision_id.to_string(),
@@ -216,33 +280,21 @@ impl HubRepository for PgHubRepository {
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
-        Ok(PublishedOffering {
+        Ok(PublishedRevision {
             runtime_revision_id: revision_id,
-            vendor_model_id,
-            offering_id,
-            channel_id,
-            native_model_id: command.native_model_id,
-            native_revision: command.native_revision,
-            capability_schema: command.capability_schema,
-            restrictions: command.restrictions,
-            adapter_key: command.adapter_key,
-            provider_model_id: command.provider_model_id,
-            provider_kind: command.provider_kind,
-            base_url: command.base_url,
-            credential_env: command.credential_env,
-            price_snapshot: PriceSnapshot {
-                price_plan_id,
-                rates: command.rates,
-                captured_at: now,
-            },
+            native_model_id,
+            candidates,
         })
     }
 
     async fn active_offering(
         &self,
         native_model_id: &str,
-    ) -> Result<PublishedOffering, ApplicationError> {
-        let row = sqlx::query(
+    ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+        // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它**自己的**
+        // vendor_models 行取 capability_schema——两个 Provider 的 Profile 内容不同时
+        // 会有两行 vendor_model（规划 §3.3）。
+        let rows = sqlx::query(
             r#"
             SELECT
                 rr.id AS runtime_revision_id,
@@ -255,26 +307,42 @@ impl HubRepository for PgHubRepository {
                 p.image_input_microusd_per_million,
                 p.text_output_microusd_per_million,
                 p.image_output_microusd_per_million,
-                rr.created_at AS captured_at
-            FROM publication.runtime_revisions rr
-            JOIN publication.runtime_entries re ON re.runtime_revision_id = rr.id
+                rr.created_at AS captured_at,
+                re.routing_priority
+            FROM publication.runtime_entries re
+            JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
             JOIN supply.offerings o ON o.id = re.offering_id AND o.enabled
             JOIN supply.channels c ON c.id = o.channel_id AND c.enabled
             JOIN pricing.price_plans p ON p.id = re.price_plan_id
             WHERE re.active AND re.native_model_id = $1
-            ORDER BY rr.created_at DESC
-            LIMIT 1
+            ORDER BY re.routing_priority ASC, rr.created_at DESC
             "#,
         )
         .bind(native_model_id)
-        .fetch_optional(&self.pool)
+        .fetch_all(&self.pool)
         .await
-        .map_err(database_error)?
-        .ok_or_else(|| {
-            ApplicationError::NotFound(format!("no active offering for model {native_model_id}"))
-        })?;
-        row_to_offering(&row)
+        .map_err(database_error)?;
+        // 无 active 候选不是错误：由调用方判定「无合格候选」。返回空集合。
+        let mut candidates = Vec::with_capacity(rows.len());
+        for row in &rows {
+            candidates.push(row_to_candidate(row)?);
+        }
+        // 防御：同一模型的 active 候选集必须**永远来自同一个 Revision**（发布即原子替换）。
+        // 若出现跨 Revision 并存，说明发布语义被绕过——宁可在这里失败，也不要在路由时
+        // 悄悄用一半旧候选挑供给。
+        if let Some(first) = candidates.first() {
+            let first_revision = first.runtime_revision_id;
+            if candidates
+                .iter()
+                .any(|candidate| candidate.runtime_revision_id != first_revision)
+            {
+                return Err(ApplicationError::Persistence(format!(
+                    "active candidates for model {native_model_id} span multiple runtime revisions"
+                )));
+            }
+        }
+        Ok(candidates)
     }
 
     async fn create_account(
@@ -494,6 +562,7 @@ impl HubRepository for PgHubRepository {
         branch: ImageBranch,
         offering: PublishedOffering,
         request_hash: String,
+        routing: RoutingDecision,
     ) -> Result<GenerationJob, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
@@ -593,6 +662,24 @@ impl HubRepository for PgHubRepository {
         .bind(job_id.0)
         .bind(-max_cost)
         .bind(format!("job:{job_id}:hold"))
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 路由判定与 Job **同事务**写入（规划 §3.4）。构造 Job 失败时不留下只写其一的中间态；
+        // 幂等重放分支在上方已 rollback 并返回，不写本表。
+        let considered = serde_json::to_value(&routing.considered)
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+        sqlx::query(
+            r#"
+            INSERT INTO generation.routing_decisions
+                (job_id, runtime_revision_id, chosen_offering_id, considered)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(routing.runtime_revision_id.0)
+        .bind(routing.chosen_offering_id.0)
+        .bind(&considered)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1312,8 +1399,8 @@ async fn insert_ledger_entry(
     Ok(())
 }
 
-fn row_to_offering(row: &sqlx::postgres::PgRow) -> Result<PublishedOffering, ApplicationError> {
-    Ok(PublishedOffering {
+fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, ApplicationError> {
+    Ok(OfferingCandidate {
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,
         ),
@@ -1352,6 +1439,7 @@ fn row_to_offering(row: &sqlx::postgres::PgRow) -> Result<PublishedOffering, App
             },
             captured_at: row.try_get("captured_at").map_err(database_error)?,
         },
+        routing_priority: row.try_get("routing_priority").map_err(database_error)?,
     })
 }
 

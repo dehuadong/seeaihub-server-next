@@ -1,9 +1,10 @@
 use anyhow::{Context, Result};
 use chrono::Duration as ChronoDuration;
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
+use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_adapter_sdk::ProviderCredential;
 use seeai_application::{
-    ApplicationError, AssetStore, CredentialProvider, HubRepository, WorkerService,
+    AdapterRegistry, ApplicationError, AssetStore, CredentialProvider, HubRepository, WorkerService,
 };
 use seeai_object_storage::ObjectStoreAssetStore;
 use seeai_persistence::PgHubRepository;
@@ -45,10 +46,16 @@ async fn main() -> Result<()> {
     repository.migrate().await?;
     let repository_port: Arc<dyn HubRepository> = repository;
     let store: Arc<dyn AssetStore> = Arc::new(ObjectStoreAssetStore::from_env()?);
+    // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（规划 §0 的装配点）。
+    let adapters: Arc<dyn seeai_application::AdapterFactory> =
+        Arc::new(AdapterRegistry::new(vec![
+            Arc::new(AihubmixAdapterFactory),
+            Arc::new(ApimartAdapterFactory),
+        ]));
     let worker = WorkerService::new(
         repository_port,
         store,
-        Arc::new(AihubmixAdapterFactory),
+        adapters,
         Arc::new(EnvironmentCredentialProvider),
         worker_id.clone(),
         ChronoDuration::seconds(lease_seconds),

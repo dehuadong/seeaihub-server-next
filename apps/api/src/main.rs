@@ -8,9 +8,11 @@ use axum::{
     routing::{get, post},
 };
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
+use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
-    ApplicationError, AssetService, GenerationService, HubRepository, IdentityService,
-    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RuntimeService,
+    AdapterRegistry, ApplicationError, AssetService, GenerationService, HubRepository,
+    IdentityService, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
+    RuntimeService,
 };
 use seeai_domain::{
     AccountId, AssetBinding, AssetId, CreateImageGeneration, ImageBranch, JobId, JobState,
@@ -50,7 +52,12 @@ async fn main() -> Result<()> {
     repository.migrate().await?;
     let store = Arc::new(ObjectStoreAssetStore::from_env()?);
     let repository_port: Arc<dyn HubRepository> = repository;
-    let adapters = Arc::new(AihubmixAdapterFactory);
+    // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（规划 §0 的装配点）。
+    let adapters: Arc<dyn seeai_application::AdapterFactory> =
+        Arc::new(AdapterRegistry::new(vec![
+            Arc::new(AihubmixAdapterFactory),
+            Arc::new(ApimartAdapterFactory),
+        ]));
     let state = AppState {
         admin_token,
         repository: repository_port.clone(),
@@ -180,7 +187,7 @@ async fn publish_runtime(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(mut command): Json<PublishRuntimeCommand>,
-) -> Result<Json<seeai_domain::PublishedOffering>, ApiError> {
+) -> Result<Json<seeai_domain::PublishedRevision>, ApiError> {
     require_admin(&state, &headers)?;
     command.actor = "admin-api".to_owned();
     Ok(Json(state.runtime.publish(command).await?))

@@ -250,6 +250,70 @@ pub struct PublishedOffering {
     pub price_snapshot: PriceSnapshot,
 }
 
+/// 同一 Vendor Model 的一个候选供给。
+///
+/// 依 `docs/adr/0009`：同一型号可有多个 active Offering，选中顺序由 `routing_priority`
+/// 决定（数字小者优先，来自发布顺序）。**每个候选自带它自己的 `capability_schema`**——
+/// 因为 `catalog.vendor_models` 的唯一键含 `schema_hash`，两个 Provider 的 Profile 内容
+/// 不同时会产生两行 `vendor_model`（见规划 §3.3）。
+///
+/// 与 [`PublishedOffering`] 的关系：字段完全一致，只多 `routing_priority`。
+/// `PublishedOffering` 表示**受理时被选中并固化进 Job 的那一份**；本类型表示**发布物中的候选**。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct OfferingCandidate {
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub vendor_model_id: VendorModelId,
+    pub offering_id: OfferingId,
+    pub channel_id: ChannelId,
+    pub native_model_id: String,
+    pub native_revision: String,
+    /// 该候选**自己的**能力声明，由它自己的 `vendor_model` 行带来。
+    pub capability_schema: Value,
+    pub restrictions: Value,
+    pub adapter_key: String,
+    pub provider_model_id: String,
+    pub provider_kind: String,
+    pub base_url: String,
+    pub credential_env: String,
+    pub price_snapshot: PriceSnapshot,
+    /// 选择顺序：数字小者优先。发布时由候选数组下标决定，只有一个来源。
+    pub routing_priority: i32,
+}
+
+impl OfferingCandidate {
+    /// 选中后固化进 Job 的形态（丢掉仅发布侧需要的 `routing_priority`）。
+    #[must_use]
+    pub fn into_published(self) -> PublishedOffering {
+        PublishedOffering {
+            runtime_revision_id: self.runtime_revision_id,
+            vendor_model_id: self.vendor_model_id,
+            offering_id: self.offering_id,
+            channel_id: self.channel_id,
+            native_model_id: self.native_model_id,
+            native_revision: self.native_revision,
+            capability_schema: self.capability_schema,
+            restrictions: self.restrictions,
+            adapter_key: self.adapter_key,
+            provider_model_id: self.provider_model_id,
+            provider_kind: self.provider_kind,
+            base_url: self.base_url,
+            credential_env: self.credential_env,
+            price_snapshot: self.price_snapshot,
+        }
+    }
+}
+
+/// 一次发布的产物：一个 Runtime Revision 及其为该型号写入的**完整、有序**候选集合。
+///
+/// 依 `docs/adr/0009`：一次发布携带该模型完整的候选集合，发布即原子替换该模型既有 active 条目，
+/// 因此同一模型的 active 候选集**永远来自同一个 Revision**，不会出现半套候选。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublishedRevision {
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub native_model_id: String,
+    pub candidates: Vec<OfferingCandidate>,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationJob {
     pub id: JobId,

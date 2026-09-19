@@ -7,7 +7,8 @@ use seeai_adapter_sdk::{
 };
 use seeai_domain::{
     AccountId, AssetBinding, AssetId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch,
-    JobId, JobState, MeteringEvidence, PriceRates, PublishedOffering,
+    JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, PriceRates,
+    PublishedOffering, PublishedRevision, RuntimeRevisionId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -16,13 +17,115 @@ use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use thiserror::Error;
 use uuid::Uuid;
 
+/// 发布一个 Vendor Model 的供给。
+///
+/// 依 `docs/adr/0009` 与规划 §3.1：一次发布携带该模型**完整、有序**的候选集合；
+/// 候选的 `routing_priority` **由数组下标决定**（`0..n-1`），不接受调用方赋号——只有一个来源。
+///
+/// 形状判别（确定性三例，见 `normalize`）：
+/// - `offerings` 为 `Some(非空)` ⇒ **数组形式**；扁平字段必须全部为空；
+/// - `offerings` 为 `None` ⇒ **扁平形式**；扁平字段必须全部齐备，等价于一元素数组；
+/// - `offerings` 为 `Some(空)` ⇒ 拒绝。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishRuntimeCommand {
     pub vendor_id: String,
     pub native_model_id: String,
     pub native_revision: String,
-    pub capability_schema: Value,
+    /// 数组形式下由每个 `Offerings` 自带；扁平形式下必填。
+    #[serde(default)]
+    pub capability_schema: Option<Value>,
     #[serde(default = "empty_object")]
+    pub restrictions: Value,
+    /// 扁平形式的单个供给。数组形式下必须为 `None`。
+    #[serde(default)]
+    pub provider_kind: Option<String>,
+    #[serde(default)]
+    pub adapter_key: Option<String>,
+    #[serde(default)]
+    pub provider_model_id: Option<String>,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub credential_env: Option<String>,
+    /// 数组形式的多个供给，顺序即 `routing_priority`。
+    #[serde(default)]
+    pub offerings: Option<Vec<OfferingDraft>>,
+    /// 扁平形式的计价。数组形式下必须为 `None`。
+    #[serde(default)]
+    pub price_plan: Option<PricePlanDraft>,
+    pub actor: String,
+    /// 由 [`PublishRuntimeCommand::normalize`] 填充，**不接受调用方输入**。
+    ///
+    /// 存在的理由：形状判别与逐候选校验只做一次（在 `RuntimeService::publish` 内），
+    /// 而仓库层拿到的是"已归一、已校验"的列表。`skip_deserializing` 保证 HTTP 请求无法直接塞入它。
+    #[serde(skip_deserializing, skip_serializing, default)]
+    pub normalized: Vec<NormalizedOffering>,
+}
+
+/// 候选集合的宿主类型。用 `untagged` 是为了让 JSON 里的 `offerings` 就是**数组本身**
+/// （`"offerings": [ {...}, {...} ]`），而不是再套一层对象。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Offerings {
+    Many(Vec<OfferingDraft>),
+}
+
+impl Offerings {
+    #[must_use]
+    pub fn into_vec(self) -> Vec<OfferingDraft> {
+        match self {
+            Self::Many(items) => items,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferingDraft {
+    pub provider_kind: String,
+    pub adapter_key: String,
+    pub provider_model_id: String,
+    pub base_url: String,
+    pub credential_env: String,
+    #[serde(default = "empty_object")]
+    pub restrictions: Value,
+    #[serde(default)]
+    pub capability_schema: Option<Value>,
+    #[serde(default)]
+    pub price_plan: Option<PricePlanDraft>,
+}
+
+/// 计价合同草案。
+///
+/// `formula` 只在**发布期**用于判别与校验，**不落库**——`pricing.price_plans` 没有该列
+/// （见规划 §3.1「价格字段形态」）。本阶段唯一启用 `token_rates`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct PricePlanDraft {
+    pub formula: String,
+    pub currency: String,
+    pub text_input_microusd_per_million: u64,
+    pub image_input_microusd_per_million: u64,
+    pub text_output_microusd_per_million: u64,
+    pub image_output_microusd_per_million: u64,
+    pub source_url: String,
+}
+
+impl PricePlanDraft {
+    #[must_use]
+    pub fn into_rates(self) -> PriceRates {
+        PriceRates {
+            currency: self.currency,
+            text_input_microusd_per_million: self.text_input_microusd_per_million,
+            image_input_microusd_per_million: self.image_input_microusd_per_million,
+            text_output_microusd_per_million: self.text_output_microusd_per_million,
+            image_output_microusd_per_million: self.image_output_microusd_per_million,
+        }
+    }
+}
+
+/// 归一后的单个供给：形状判别与必填校验都已完成，`routing_priority` 已按下标定好。
+#[derive(Debug, Clone)]
+pub struct NormalizedOffering {
+    pub capability_schema: Value,
     pub restrictions: Value,
     pub provider_kind: String,
     pub adapter_key: String,
@@ -31,11 +134,226 @@ pub struct PublishRuntimeCommand {
     pub credential_env: String,
     pub rates: PriceRates,
     pub price_source_url: String,
-    pub actor: String,
+    pub routing_priority: i32,
+}
+
+impl PublishRuntimeCommand {
+    /// 把两种形状归一到同一个有序候选列表。
+    ///
+    /// 这是发布接口**唯一**的形状判别点：`apps/api` 的 `Json<PublishRuntimeCommand>` 反序列化
+    /// 之后，下游只处理 `Vec<NormalizedOffering>`。
+    pub fn normalize(&self) -> Result<Vec<NormalizedOffering>, ApplicationError> {
+        match &self.offerings {
+            Some(drafts) => self.normalize_array(drafts),
+            None => self.normalize_flat(),
+        }
+    }
+
+    fn normalize_array(
+        &self,
+        drafts: &[OfferingDraft],
+    ) -> Result<Vec<NormalizedOffering>, ApplicationError> {
+        if drafts.is_empty() {
+            return Err(ApplicationError::Validation(
+                "offerings must not be empty".to_owned(),
+            ));
+        }
+        if let Some(field) = self.first_present_flat_field() {
+            return Err(ApplicationError::Validation(format!(
+                "offerings is present, so the flat field {field} must be omitted"
+            )));
+        }
+        if self.capability_schema.is_some() {
+            return Err(ApplicationError::Validation(
+                "offerings is present, so the flat field capability_schema must be omitted"
+                    .to_owned(),
+            ));
+        }
+        drafts
+            .iter()
+            .enumerate()
+            .map(|(index, draft)| {
+                let capability_schema = draft.capability_schema.clone().ok_or_else(|| {
+                    ApplicationError::Validation(format!(
+                        "offerings[{index}].capability_schema is required"
+                    ))
+                })?;
+                let price_plan = draft.price_plan.clone().ok_or_else(|| {
+                    ApplicationError::Validation(format!(
+                        "offerings[{index}].price_plan is required"
+                    ))
+                })?;
+                Ok(NormalizedOffering {
+                    capability_schema,
+                    restrictions: draft.restrictions.clone(),
+                    provider_kind: draft.provider_kind.clone(),
+                    adapter_key: draft.adapter_key.clone(),
+                    provider_model_id: draft.provider_model_id.clone(),
+                    base_url: draft.base_url.clone(),
+                    credential_env: draft.credential_env.clone(),
+                    price_source_url: price_plan.source_url.clone(),
+                    rates: price_plan.into_rates(),
+                    routing_priority: i32::try_from(index).map_err(|_| {
+                        ApplicationError::Validation("too many offerings".to_owned())
+                    })?,
+                })
+            })
+            .collect()
+    }
+
+    fn normalize_flat(&self) -> Result<Vec<NormalizedOffering>, ApplicationError> {
+        let missing = |field: &str| {
+            ApplicationError::Validation(format!("{field} is required when offerings is absent"))
+        };
+        let capability_schema = self
+            .capability_schema
+            .clone()
+            .ok_or_else(|| missing("capability_schema"))?;
+        let price_plan = self
+            .price_plan
+            .clone()
+            .ok_or_else(|| missing("price_plan"))?;
+        Ok(vec![NormalizedOffering {
+            capability_schema,
+            restrictions: self.restrictions.clone(),
+            provider_kind: self
+                .provider_kind
+                .clone()
+                .ok_or_else(|| missing("provider_kind"))?,
+            adapter_key: self
+                .adapter_key
+                .clone()
+                .ok_or_else(|| missing("adapter_key"))?,
+            provider_model_id: self
+                .provider_model_id
+                .clone()
+                .ok_or_else(|| missing("provider_model_id"))?,
+            base_url: self.base_url.clone().ok_or_else(|| missing("base_url"))?,
+            credential_env: self
+                .credential_env
+                .clone()
+                .ok_or_else(|| missing("credential_env"))?,
+            price_source_url: price_plan.source_url.clone(),
+            rates: price_plan.into_rates(),
+            routing_priority: 0,
+        }])
+    }
+
+    fn first_present_flat_field(&self) -> Option<&'static str> {
+        if self.provider_kind.is_some() {
+            return Some("provider_kind");
+        }
+        if self.adapter_key.is_some() {
+            return Some("adapter_key");
+        }
+        if self.provider_model_id.is_some() {
+            return Some("provider_model_id");
+        }
+        if self.base_url.is_some() {
+            return Some("base_url");
+        }
+        if self.credential_env.is_some() {
+            return Some("credential_env");
+        }
+        if self.price_plan.is_some() {
+            return Some("price_plan");
+        }
+        None
+    }
+}
+
+/// 一个候选在本次受理中的取舍结果，写入 `generation.routing_decisions.considered`。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsideredCandidate {
+    pub offering_id: OfferingId,
+    pub provider_kind: String,
+    pub routing_priority: i32,
+    pub eligible: bool,
+    /// 不合格时的原因；合格时为 `None`。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skip_reason: Option<String>,
+}
+
+/// 受理时的路由判定记录（规划 §3.4）。
+///
+/// **不复制** `base_url`/`credential_env` 等发布字段——候选集与顺序的权威是发布物
+/// （`runtime_revisions.snapshot`），本记录只记「受理时用哪些请求侧事实判成了什么」。
+#[derive(Debug, Clone)]
+pub struct RoutingDecision {
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub chosen_offering_id: OfferingId,
+    pub considered: Vec<ConsideredCandidate>,
 }
 
 fn empty_object() -> Value {
     Value::Object(Map::new())
+}
+
+/// 按 `routing_priority` 升序取**第一个合格候选**（规划 §3.2）。
+///
+/// 合格 = 该候选自己的 `restrictions` 允许本次分支与绑定，**且**请求满足该候选**自己的**
+/// `capability_schema`。两个条件都必须用该候选自己的声明判断——这正是「每个 Provider
+/// 各自声明支持面、限制只收窄」的落地方式。
+///
+/// **无合格候选时返回 `Validation` 错误**，即"在调用上游之前失败"，不回退到能力更宽但
+/// 优先级更低的候选（`docs/adr/0009`）。
+///
+/// 不做的事：不因价格重排候选（`docs/adr/0009`：价格不参与选中）。
+fn select_candidate(
+    command: &CreateImageGeneration,
+    branch: ImageBranch,
+    candidates: &[OfferingCandidate],
+    asset_bindings: &[AssetBinding],
+) -> Result<(PublishedOffering, RoutingDecision), ApplicationError> {
+    if candidates.is_empty() {
+        return Err(ApplicationError::Validation(format!(
+            "no active offering for model {}",
+            command.native_model_id
+        )));
+    }
+    let revision_id = candidates[0].runtime_revision_id;
+    let mut considered = Vec::with_capacity(candidates.len());
+    for candidate in candidates {
+        let published = candidate.clone().into_published();
+        let mut skip_reason = None;
+        if let Err(error) = validate_restrictions(branch, asset_bindings, &candidate.restrictions) {
+            skip_reason = Some(error.to_string());
+        } else if let Err(error) = validate_native_request(command, &published) {
+            skip_reason = Some(error.to_string());
+        }
+        let eligible = skip_reason.is_none();
+        considered.push(ConsideredCandidate {
+            offering_id: candidate.offering_id,
+            provider_kind: candidate.provider_kind.clone(),
+            routing_priority: candidate.routing_priority,
+            eligible,
+            skip_reason,
+        });
+        if eligible {
+            let decision = RoutingDecision {
+                runtime_revision_id: candidate.runtime_revision_id,
+                chosen_offering_id: candidate.offering_id,
+                considered,
+            };
+            return Ok((published, decision));
+        }
+    }
+    let reasons = considered
+        .iter()
+        .map(|item| {
+            format!(
+                "{}#{}: {}",
+                item.provider_kind,
+                item.routing_priority,
+                item.skip_reason.as_deref().unwrap_or("unknown")
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("; ");
+    Err(ApplicationError::Validation(format!(
+        "no eligible offering for model {} (revision {revision_id}): {reasons}",
+        command.native_model_id
+    )))
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -150,15 +468,20 @@ pub enum ApplicationError {
 
 #[async_trait]
 pub trait HubRepository: Send + Sync {
+    /// 发布一次 Runtime Revision。返回该 Revision 与它为这个型号写入的**完整候选集合**。
     async fn publish_runtime(
         &self,
         command: PublishRuntimeCommand,
-    ) -> Result<PublishedOffering, ApplicationError>;
+    ) -> Result<PublishedRevision, ApplicationError>;
 
+    /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
+    ///
+    /// 同一模型的 active 候选集**永远来自同一个 Revision**（`docs/adr/0009`：发布即原子替换）。
+    /// 无任何 active 候选时返回空 `Vec`，不是错误——由调用方判定"无合格候选"。
     async fn active_offering(
         &self,
         native_model_id: &str,
-    ) -> Result<PublishedOffering, ApplicationError>;
+    ) -> Result<Vec<OfferingCandidate>, ApplicationError>;
 
     async fn create_account(
         &self,
@@ -193,12 +516,14 @@ pub trait HubRepository: Send + Sync {
         asset_id: AssetId,
     ) -> Result<AssetRecord, ApplicationError>;
 
+    /// 创建 Job，并与 Job **同事务**写入路由判定记录（规划 §3.4）。
     async fn create_job(
         &self,
         command: CreateImageGeneration,
         branch: ImageBranch,
         offering: PublishedOffering,
         request_hash: String,
+        routing: RoutingDecision,
     ) -> Result<GenerationJob, ApplicationError>;
 
     async fn get_job(
@@ -350,6 +675,64 @@ pub trait AdapterFactory: Send + Sync {
     ) -> Result<Arc<dyn ImageAdapter>, ApplicationError>;
 }
 
+/// 按 `adapter_key` 分派的组合工厂（规划 §0 的"装配点"改动，E3）。
+///
+/// 存在的理由：同一进程要同时服务多个渠道（每个渠道一族 Driver），而
+/// `AdapterFactory` 是单一 trait 对象。**它只是装配，不含渠道语义**——
+/// 每个键对应的行为仍完全由各自的 adapter crate 拥有。
+#[derive(Default)]
+pub struct AdapterRegistry {
+    factories: Vec<Arc<dyn AdapterFactory>>,
+}
+
+impl AdapterRegistry {
+    #[must_use]
+    pub fn new(factories: Vec<Arc<dyn AdapterFactory>>) -> Self {
+        Self { factories }
+    }
+
+    fn find(&self, adapter_key: &str) -> Option<&Arc<dyn AdapterFactory>> {
+        self.factories
+            .iter()
+            .find(|factory| factory.descriptor(adapter_key).is_some())
+    }
+}
+
+impl AdapterFactory for AdapterRegistry {
+    fn descriptor(&self, adapter_key: &str) -> Option<AdapterDescriptor> {
+        self.find(adapter_key)
+            .and_then(|factory| factory.descriptor(adapter_key))
+    }
+
+    fn validate_publication(
+        &self,
+        adapter_key: &str,
+        capability_schema: &Value,
+        restrictions: &Value,
+    ) -> Result<(), String> {
+        match self.find(adapter_key) {
+            Some(factory) => {
+                factory.validate_publication(adapter_key, capability_schema, restrictions)
+            }
+            None => Err(format!("unknown adapter {adapter_key}")),
+        }
+    }
+
+    fn create(
+        &self,
+        adapter_key: &str,
+        base_url: &str,
+        timeout: Duration,
+    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
+        match self.find(adapter_key) {
+            Some(factory) => factory.create(adapter_key, base_url, timeout),
+            None => Err(ApplicationError::Configuration(format!(
+                "unknown adapter {adapter_key}"
+            ))),
+        }
+    }
+}
+
 pub trait CredentialProvider: Send + Sync {
     fn resolve(&self, reference: &str) -> Result<ProviderCredential, ApplicationError>;
 }
@@ -369,17 +752,19 @@ impl RuntimeService {
         }
     }
 
+    /// 发布一个 Vendor Model 的供给（完整候选集合）。
+    ///
+    /// 顺序：形状归一到 `Vec<NormalizedOffering>` → 命令级字段校验 → **逐候选**校验
+    /// （schema 封闭性、`model.const`、base_url、计价、Adapter 兼容性）→ 交给仓库逐项写入。
+    /// 校验不通过时不产生任何 revision 行。
     pub async fn publish(
         &self,
-        mut command: PublishRuntimeCommand,
-    ) -> Result<PublishedOffering, ApplicationError> {
+        command: PublishRuntimeCommand,
+    ) -> Result<PublishedRevision, ApplicationError> {
         for (name, value) in [
             ("vendor_id", command.vendor_id.as_str()),
             ("native_model_id", command.native_model_id.as_str()),
             ("native_revision", command.native_revision.as_str()),
-            ("provider_kind", command.provider_kind.as_str()),
-            ("adapter_key", command.adapter_key.as_str()),
-            ("provider_model_id", command.provider_model_id.as_str()),
             ("actor", command.actor.as_str()),
         ] {
             if value.trim().is_empty() {
@@ -388,9 +773,32 @@ impl RuntimeService {
                 )));
             }
         }
-        jsonschema::validator_for(&command.capability_schema)
+        let offerings = command.normalize()?;
+        let mut normalized = Vec::with_capacity(offerings.len());
+        for offering in offerings {
+            normalized.push(self.validate_offering(&command, offering)?);
+        }
+        let revision = self
+            .repository
+            .publish_runtime(PublishRuntimeCommand {
+                normalized,
+                ..command
+            })
+            .await?;
+        Ok(revision)
+    }
+
+    /// 校验单个候选，并归一化它的 `base_url`。
+    fn validate_offering(
+        &self,
+        command: &PublishRuntimeCommand,
+        mut offering: NormalizedOffering,
+    ) -> Result<NormalizedOffering, ApplicationError> {
+        jsonschema::validator_for(&offering.capability_schema)
             .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        if command
+        // 候选的身份必须与发布声明的型号一致：`model.const` 就是该 Provider 自己的
+        // 模型名，发布期据此拒绝「把 A 型号的 Profile 挂到 B 型号上」。
+        if offering
             .capability_schema
             .pointer("/properties/model/const")
             .and_then(Value::as_str)
@@ -400,12 +808,12 @@ impl RuntimeService {
                 "capability_schema model.const must equal native_model_id".to_owned(),
             ));
         }
-        if command
+        if offering
             .capability_schema
             .get("type")
             .and_then(Value::as_str)
             != Some("object")
-            || command
+            || offering
                 .capability_schema
                 .get("additionalProperties")
                 .and_then(Value::as_bool)
@@ -415,7 +823,7 @@ impl RuntimeService {
                 "capability_schema must be a closed object schema".to_owned(),
             ));
         }
-        let mut base_url = command.base_url.trim().trim_end_matches('/').to_owned();
+        let mut base_url = offering.base_url.trim().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
             return Err(ApplicationError::Validation(
                 "base_url must not be empty".to_owned(),
@@ -438,18 +846,26 @@ impl RuntimeService {
             ));
         }
         base_url.truncate(base_url.trim_end_matches('/').len());
-        command.base_url = base_url;
-        if command.credential_env.trim().is_empty() {
+        offering.base_url = base_url;
+        if offering.credential_env.trim().is_empty() {
             return Err(ApplicationError::Validation(
                 "credential_env must not be empty".to_owned(),
             ));
         }
-        if command.rates.currency != "USD" {
+        if offering.provider_kind.trim().is_empty()
+            || offering.adapter_key.trim().is_empty()
+            || offering.provider_model_id.trim().is_empty()
+        {
+            return Err(ApplicationError::Validation(
+                "provider_kind, adapter_key and provider_model_id must not be empty".to_owned(),
+            ));
+        }
+        if offering.rates.currency != "USD" {
             return Err(ApplicationError::Validation(
                 "price currency must be USD for microUSD rates".to_owned(),
             ));
         }
-        let price_source = url::Url::parse(&command.price_source_url)
+        let price_source = url::Url::parse(&offering.price_source_url)
             .map_err(|error| ApplicationError::Validation(error.to_string()))?;
         if price_source.scheme() != "https" {
             return Err(ApplicationError::Validation(
@@ -458,32 +874,32 @@ impl RuntimeService {
         }
         let descriptor = self
             .adapters
-            .descriptor(&command.adapter_key)
+            .descriptor(&offering.adapter_key)
             .ok_or_else(|| {
-                ApplicationError::Validation(format!("unknown adapter {}", command.adapter_key))
+                ApplicationError::Validation(format!("unknown adapter {}", offering.adapter_key))
             })?;
-        validate_adapter_compatibility(&command, &descriptor)?;
+        validate_adapter_compatibility(&offering, &descriptor)?;
         self.adapters
             .validate_publication(
-                &command.adapter_key,
-                &command.capability_schema,
-                &command.restrictions,
+                &offering.adapter_key,
+                &offering.capability_schema,
+                &offering.restrictions,
             )
             .map_err(ApplicationError::Validation)?;
         self.adapters.create(
-            &command.adapter_key,
-            &command.base_url,
+            &offering.adapter_key,
+            &offering.base_url,
             Duration::from_secs(1),
         )?;
-        self.repository.publish_runtime(command).await
+        Ok(offering)
     }
 }
 
 fn validate_adapter_compatibility(
-    command: &PublishRuntimeCommand,
+    offering: &NormalizedOffering,
     descriptor: &AdapterDescriptor,
 ) -> Result<(), ApplicationError> {
-    let properties = command
+    let properties = offering
         .capability_schema
         .get("properties")
         .and_then(Value::as_object)
@@ -518,7 +934,7 @@ fn validate_adapter_compatibility(
             }
         }
     }
-    let max_images = command
+    let max_images = offering
         .restrictions
         .get("max_images")
         .and_then(Value::as_u64)
@@ -529,7 +945,7 @@ fn validate_adapter_compatibility(
             descriptor.key, descriptor.max_images
         )));
     }
-    if let Some(branches) = command
+    if let Some(branches) = offering
         .restrictions
         .get("allowed_branches")
         .and_then(Value::as_array)
@@ -664,11 +1080,12 @@ impl GenerationService {
         let branch = command
             .branch()
             .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        let offering = self
+        let candidates = self
             .repository
             .active_offering(&command.native_model_id)
             .await?;
-        validate_restrictions(branch, &command.asset_bindings, &offering.restrictions)?;
+        let (offering, routing) =
+            select_candidate(&command, branch, &candidates, &command.asset_bindings)?;
         let mut image_dimensions = None;
         let mut mask_dimensions = None;
         for binding in &command.asset_bindings {
@@ -705,10 +1122,9 @@ impl GenerationService {
                 "mask dimensions must match the input image".to_owned(),
             ));
         }
-        validate_native_request(&command, &offering)?;
         let request_hash = request_hash(&command)?;
         self.repository
-            .create_job(command, branch, offering, request_hash)
+            .create_job(command, branch, offering, request_hash, routing)
             .await
     }
 
@@ -1289,6 +1705,154 @@ mod tests {
         }
     }
 
+    fn schema(model: &str) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": model},
+                "prompt": {"type": "string", "minLength": 1}
+            }
+        })
+    }
+
+    fn base_command() -> PublishRuntimeCommand {
+        PublishRuntimeCommand {
+            vendor_id: "OpenAI".to_owned(),
+            native_model_id: "gpt-image-2.5-flare".to_owned(),
+            native_revision: "test-1".to_owned(),
+            capability_schema: None,
+            restrictions: serde_json::json!({}),
+            provider_kind: None,
+            adapter_key: None,
+            provider_model_id: None,
+            base_url: None,
+            credential_env: None,
+            offerings: None,
+            price_plan: None,
+            actor: "tester".to_owned(),
+            normalized: Vec::new(),
+        }
+    }
+
+    fn price_plan() -> PricePlanDraft {
+        PricePlanDraft {
+            formula: "token_rates".to_owned(),
+            currency: "USD".to_owned(),
+            text_input_microusd_per_million: 5_000_000,
+            image_input_microusd_per_million: 8_000_000,
+            text_output_microusd_per_million: 10_000_000,
+            image_output_microusd_per_million: 30_000_000,
+            source_url: "https://example.invalid/price".to_owned(),
+        }
+    }
+
+    fn draft(provider_model_id: &str) -> OfferingDraft {
+        OfferingDraft {
+            provider_kind: "AIHubMix".to_owned(),
+            adapter_key: "aihubmix-image-v1".to_owned(),
+            provider_model_id: provider_model_id.to_owned(),
+            base_url: "https://api.inferera.com".to_owned(),
+            credential_env: "AIHUBMIX_API_KEY".to_owned(),
+            restrictions: serde_json::json!({}),
+            capability_schema: Some(schema("gpt-image-2.5-flare")),
+            price_plan: Some(price_plan()),
+        }
+    }
+
+    #[test]
+    fn normalize_rejects_an_empty_offering_array() {
+        let command = PublishRuntimeCommand {
+            offerings: Some(Vec::new()),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("empty array must be rejected");
+        assert!(error.to_string().contains("must not be empty"), "{error}");
+    }
+
+    #[test]
+    fn normalize_assigns_priority_from_array_index() {
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![draft("pm-a"), draft("pm-b"), draft("pm-c")]),
+            ..base_command()
+        };
+        let normalized = command.normalize().expect("array form is valid");
+        assert_eq!(normalized.len(), 3);
+        // 优先级只有一个来源：数组下标。
+        assert_eq!(
+            normalized
+                .iter()
+                .map(|offering| offering.routing_priority)
+                .collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
+        assert_eq!(normalized[1].provider_model_id, "pm-b");
+    }
+
+    #[test]
+    fn normalize_flat_form_equals_a_single_zero_priority_offering() {
+        let command = PublishRuntimeCommand {
+            capability_schema: Some(schema("gpt-image-2.5-flare")),
+            provider_kind: Some("AIHubMix".to_owned()),
+            adapter_key: Some("aihubmix-image-v1".to_owned()),
+            provider_model_id: Some("gpt-image-2.5-flare".to_owned()),
+            base_url: Some("https://api.inferera.com".to_owned()),
+            credential_env: Some("AIHUBMIX_API_KEY".to_owned()),
+            price_plan: Some(price_plan()),
+            ..base_command()
+        };
+        let normalized = command.normalize().expect("flat form is valid");
+        assert_eq!(normalized.len(), 1);
+        assert_eq!(normalized[0].routing_priority, 0);
+    }
+
+    #[test]
+    fn normalize_rejects_mixing_array_and_flat_forms() {
+        let command = PublishRuntimeCommand {
+            capability_schema: Some(schema("gpt-image-2.5-flare")),
+            provider_kind: Some("AIHubMix".to_owned()),
+            offerings: Some(vec![draft("pm-a")]),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("mixing both forms must be rejected");
+        assert!(error.to_string().contains("must be omitted"), "{error}");
+    }
+
+    #[test]
+    fn normalize_requires_every_flat_field_when_offerings_absent() {
+        let command = base_command();
+        let error = command
+            .normalize()
+            .expect_err("flat form without fields must be rejected");
+        assert!(error.to_string().contains("is required"), "{error}");
+    }
+
+    #[test]
+    fn normalize_requires_capability_schema_and_price_plan_per_offering() {
+        let mut without_schema = draft("pm-a");
+        without_schema.capability_schema = None;
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![without_schema]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("schema is required");
+        assert!(error.to_string().contains("capability_schema"), "{error}");
+
+        let mut without_price = draft("pm-a");
+        without_price.price_plan = None;
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![without_price]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("price plan is required");
+        assert!(error.to_string().contains("price_plan"), "{error}");
+    }
+
     #[test]
     fn validates_prompt_only_native_request() {
         let command = CreateImageGeneration {
@@ -1367,14 +1931,14 @@ mod tests {
         async fn publish_runtime(
             &self,
             _command: PublishRuntimeCommand,
-        ) -> Result<PublishedOffering, ApplicationError> {
+        ) -> Result<PublishedRevision, ApplicationError> {
             unused_repository()
         }
 
         async fn active_offering(
             &self,
             _native_model_id: &str,
-        ) -> Result<PublishedOffering, ApplicationError> {
+        ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
             unused_repository()
         }
 
@@ -1432,6 +1996,7 @@ mod tests {
             _branch: ImageBranch,
             _offering: PublishedOffering,
             _request_hash: String,
+            _routing: RoutingDecision,
         ) -> Result<GenerationJob, ApplicationError> {
             unused_repository()
         }
