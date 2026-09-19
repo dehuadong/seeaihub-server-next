@@ -1,0 +1,84 @@
+{
+  "vendor_id": "OpenAI",
+  "native_model_id": "gpt-image-2",
+  "native_revision": "2026-09-18-validated-1.3",
+  "capability_schema": {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object",
+    "additionalProperties": false,
+    "required": ["model", "prompt"],
+    "properties": {
+      "model": { "const": "gpt-image-2" },
+      "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
+      "image": { "type": "string", "minLength": 1 },
+      "mask": { "type": "string", "minLength": 1 },
+      "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+      "size": {
+        "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"]
+      },
+      "output_format": { "enum": ["png", "jpeg"], "default": "png" },
+      "extra": {
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {
+          "quality": { "enum": ["low", "medium", "high"] },
+          "background": { "enum": ["transparent", "opaque", "auto"] },
+          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "user": { "type": "string" }
+        }
+      }
+    },
+    "allOf": [
+      {
+        "if": { "required": ["mask"] },
+        "then": { "required": ["image"] }
+      },
+      {
+        "if": {
+          "properties": {
+            "extra": {
+              "type": "object",
+              "required": ["background"],
+              "properties": { "background": { "const": "transparent" } }
+            }
+          },
+          "required": ["extra"]
+        },
+        "then": { "properties": { "output_format": { "const": "png" } } }
+      },
+      {
+        "if": {
+          "properties": {
+            "extra": {
+              "type": "object",
+              "required": ["output_compression"]
+            }
+          },
+          "required": ["extra"]
+        },
+        "then": {
+          "required": ["output_format"],
+          "properties": { "output_format": { "const": "jpeg" } }
+        }
+      }
+    ]
+  },
+  "restrictions": {
+    "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
+    "max_images": 1
+  },
+  "provider_kind": "AIHubMix",
+  "adapter_key": "aihubmix-image-v1",
+  "provider_model_id": "gpt-image-2",
+  "base_url": "https://api.inferera.com",
+  "credential_env": "AIHUBMIX_API_KEY",
+  "rates": {
+    "currency": "USD",
+    "text_input_microusd_per_million": 5000000,
+    "image_input_microusd_per_million": 8000000,
+    "text_output_microusd_per_million": 0,
+    "image_output_microusd_per_million": 30000000
+  },
+  "price_source_url": "https://aihubmix.com/model/gpt-image-2",
+  "actor": "bootstrap"
+}

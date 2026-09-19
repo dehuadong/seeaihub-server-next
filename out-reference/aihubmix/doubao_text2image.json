@@ -1,0 +1,10 @@
+{
+  "http_status": 200,
+  "body": {
+    "output": [
+      {
+        "url": "https://ark-acg-cn-beijing.tos-cn-beijing.volces.com/doubao-seedream-5-0-pro/1509cb9706942f210cfdf9c8de8b00fa465472818114584587120/Image/2101075817/021785485411818274564af00b8ed8c9fdfc012f2496079bc9051.jpeg?X-Tos-Algorithm=TOS4-HMAC-SHA256&X-Tos-Credential=AKLTYWJkZTExNjA1ZDUyNDc3YzhjNTM5OGIyNjBhNDcyOTQ%2F20260731%2Fcn-beijing%2Ftos%2Frequest&X-Tos-Date=20260731T081122Z&X-Tos-Expires=86400&X-Tos-Signature=508b0670e0025d321d6b002d8316103d5871f2f2a1d713b54b607365d8bec292&X-Tos-SignedHeaders=host"
+      }
+    ]
+  }
+}

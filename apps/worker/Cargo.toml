@@ -1,0 +1,22 @@
+[package]
+name = "seeai-worker"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+chrono.workspace = true
+dotenvy.workspace = true
+seeai-adapter-aihubmix = { path = "../../crates/adapter-aihubmix" }
+seeai-adapter-sdk = { path = "../../crates/adapter-sdk" }
+seeai-application = { path = "../../crates/application" }
+seeai-object-storage = { path = "../../crates/object-storage" }
+seeai-persistence = { path = "../../crates/persistence" }
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+
+[lints]
+workspace = true

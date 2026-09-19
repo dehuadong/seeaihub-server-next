@@ -1,0 +1,3 @@
+interface:
+  display_name: "architect"
+  short_description: "分析跨模块职责、依赖与数据流，评估架构方案及迁移影响。"

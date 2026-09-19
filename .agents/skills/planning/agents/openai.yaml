@@ -1,0 +1,3 @@
+interface:
+  display_name: "planning"
+  short_description: "Use when creating or updating a Proposal "

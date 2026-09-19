@@ -1,0 +1,34 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: seeai
+          POSTGRES_PASSWORD: seeai
+          POSTGRES_DB: seeai_contract
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U seeai -d seeai_contract"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - run: cargo fmt --check
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
+      - run: cargo test -p seeai-api --test http_contract -- --ignored
+        env:
+          HTTP_CONTRACT_DATABASE_URL: postgres://seeai:seeai@127.0.0.1:5432/seeai_contract

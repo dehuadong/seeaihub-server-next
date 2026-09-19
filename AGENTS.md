@@ -1,0 +1,101 @@
+# Agent Rules
+
+使用简体中文与用户沟通。这个仓库是独立的新服务端，不引用或修改旧 SeeAI Hub 仓库的内部代码、数据库和缓存。
+
+## 工程边界
+
+- `apps/api`：HTTP 控制面与图片生成入口。
+- `apps/worker`：领取持久 Job、调用 Provider、归档结果和结算。
+- `crates/domain`：稳定领域类型与状态规则，不依赖数据库、HTTP 或 Provider。
+- `crates/application`：用例与端口，编排领域对象。
+- `crates/persistence`、`crates/object-storage`、`crates/adapter-*`：基础设施实现。
+- 模块通过公开接口通信；基础设施不得反向拥有目录、Job 或账本规则。
+
+## 事实与安全
+
+- PostgreSQL 是业务事实权威；缓存和对象存储清单不是事实来源。
+- Provider 凭证只从环境变量读取，不写入配置、日志、响应或测试 fixture。
+- Provider 创建请求状态不确定时进入 `reconciliation_required`，不得自动重提。
+- 模型 Schema、Offering、Channel、Price Plan 经不可变 Runtime Revision 发布；请求与 Job 固定受理时版本。
+
+## 验证
+
+在仓库根执行：
+
+```sh
+cargo fmt --check
+cargo clippy --workspace --all-targets --all-features -- -D warnings
+cargo test --workspace --all-features
+```
+
+真实 Provider 测试必须显式启用并限制调用次数；普通测试不得产生外部费用。
+
+## 工程工作流
+
+> 文档和仓库治理工作可以绕过该工程工作流，除非它改变了重要的产品、技术、架构或其他工程契约。
+
+工程任务从 Discuss 开始。
+进入后续阶段时，读取并按 `docs/agents/engineering.md` 执行：
+`Discuss → Planning → Implementation Gate → Implement → Verify`
+
+阶段技能交接（锚在**可判定的动作**上，而不是"进入了某个阶段"）：
+
+* 用户授权推进、且存在待固化的合同决策（进入 Planning）→ `planning`
+* Implementation Gate 通过、**写第一行实现代码之前** → `implement`
+* 实现完成、**报告完成或提交之前** → `code-review`（Implementation Review）
+* 实现期采用测试优先 → `tdd`
+* 审查通过、**声称交付（PASS/完成）之前** → `verify`
+
+上列动作发生前必须加载对应技能。加载技能不等于满足该阶段的完成条件，也不替代该阶段要求的审查。
+Discuss 及阶段推进权限在此定义；Planning 之后的阶段编排、门禁、审查收敛和返回路径由 `docs/agents/engineering.md` 定义。
+
+### Discuss
+
+使用 Discuss 理解请求、探索备选方案，并消除足够的歧义，以判断下一阶段。
+在以下情况下继续停留在 Discuss：
+
+* 工作仍处于探索阶段
+* 仍在比较重要的备选方案
+* 用户当前只是寻求理解，而不是准备推进实施
+* 目标或选定范围尚不足以形成实施合同
+
+常规细节优先根据上下文和仓库证据自行解决。
+只询问会实质影响工作的缺失信息；这里不要求所有实现细节都已经确定。
+不要仅因为正在讨论产品、技术或架构决策，就创建规划产物。
+模型可以判断讨论已经足够成熟，可以进入后续阶段，但不能仅凭这一判断自行离开 Discuss。
+何时从讨论进入规划或实施，由用户决定。若用户此前的请求已经明确授权推进，则复用该授权。
+当用户已授权推进时：
+
+* 若仍有重要合同决策需要补全或正式固化，则进入 Planning
+* 否则按照 `docs/agents/engineering.md` 中的 Implementation Gate 继续
+
+授权进入 Planning 不等于授权实施。
+
+### 执行授权
+
+当前范围已经具备实施条件但尚未获得执行授权时，需要用户输入“执行实现”。
+“确认”“可以”“同意”等仅表示审批，不构成执行授权。
+执行授权在已确定的工作范围内持续有效，覆盖实施、审查、范围内修正和验证；阶段切换不要求重复授权。
+新增范围或尚未解决的重大决策仍需要用户授权。
+端到端请求在满足相应工作流门禁后，持续推进至验证完成。
+限定阶段的请求，在该阶段及其要求的审查完成后结束。
+
+## Agent skills
+
+### Issue tracker
+
+Proposal 与工单以 GitHub Issues 为权威（`dehuadong/seeaihub-server-next`）。见 `docs/agents/issue-tracker.md`。
+
+### Domain docs
+
+单上下文：仓库根 `CONTEXT.md` 是唯一词汇表，`docs/design/` 承载独立技术设计 RFC，`docs/adr/` 是决策的权威位置。见 `docs/agents/domain.md`。
+
+### Agent Notes
+
+重大工程变更与重要提案遵循 `.agents/notes/README.md`。
+复用既有权威记录；改动时在同一变更中维护相关记录、重新生成索引，并运行文档化检查。
+
+### Artifact management
+
+工程工件的查找、创建、更新与生命周期遵循 `docs/agents/artifacts.md`。
+即使在子项目中工作，也从仓库管理根目录解析该注册表及其中登记的位置。
