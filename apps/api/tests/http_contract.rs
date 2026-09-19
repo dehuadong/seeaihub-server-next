@@ -715,6 +715,85 @@ async fn multiple_active_offerings_route_by_priority() {
             .expect("chosen offering channel");
     assert_eq!(job_channel, chosen_channel);
 
+    // ── 第 7 条：任务创建失败时，判定记录与 Job 两边都不留下 ──
+    // 预授权上限超过账户余额会让 create_job 在写入前失败（扣不动预授权），
+    // 此时不该留下判定记录，也不该留下 Job。
+    let decisions_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.routing_decisions")
+            .fetch_one(&pool)
+            .await
+            .expect("decision count");
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    let mut over_budget =
+        route_request(model, &format!("doomed-{}", Uuid::new_v4()), "over budget");
+    over_budget["max_cost_microusd"] = json!(10_000_000);
+    let doomed = client
+        .post(format!("{base_url}/v1/image-generations"))
+        .bearer_auth(&api_key)
+        .json(&over_budget)
+        .send()
+        .await
+        .expect("over-budget request");
+    assert!(
+        doomed.status().is_client_error(),
+        "an unaffordable request must be rejected, got {}",
+        doomed.status()
+    );
+    let decisions_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.routing_decisions")
+            .fetch_one(&pool)
+            .await
+            .expect("decision count");
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    assert_eq!(
+        (decisions_after, jobs_after),
+        (decisions_before, jobs_before),
+        "a rejected creation must leave neither a job nor a routing decision"
+    );
+
+    // ── 第 7 条补充：幂等重放不重复写判定记录 ──
+    // 同一个幂等键重放会返回同一个 Job，判定记录也应只有一条（它反映"受理时"的判定）。
+    let replay_key = format!("replay-{}", Uuid::new_v4());
+    let replay_request = route_request(model, &replay_key, "replayed");
+    let first = client
+        .post(format!("{base_url}/v1/image-generations"))
+        .bearer_auth(&api_key)
+        .json(&replay_request)
+        .send()
+        .await
+        .expect("first attempt");
+    assert_eq!(first.status(), StatusCode::ACCEPTED);
+    let replay = client
+        .post(format!("{base_url}/v1/image-generations"))
+        .bearer_auth(&api_key)
+        .json(&replay_request)
+        .send()
+        .await
+        .expect("replay");
+    assert_eq!(replay.status(), StatusCode::ACCEPTED);
+    let replay_job = Uuid::parse_str(
+        replay.json::<Value>().await.expect("replay JSON")["job_id"]
+            .as_str()
+            .expect("job id"),
+    )
+    .expect("job UUID");
+    let replay_decisions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.routing_decisions WHERE job_id = $1")
+            .bind(replay_job)
+            .fetch_one(&pool)
+            .await
+            .expect("replay decision count");
+    assert_eq!(
+        replay_decisions, 1,
+        "an idempotent replay must not write a second routing decision"
+    );
+
     // ── 用例 3：再发布一次即原子替换该型号的全部 active 候选（第 1 条）──
     let published = publish_candidates(
         &client,
