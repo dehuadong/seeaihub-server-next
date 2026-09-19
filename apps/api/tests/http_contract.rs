@@ -25,11 +25,342 @@ impl Drop for ApiProcess {
     }
 }
 
+/// 一个最小合法 PNG（1×1），用作假上游返回的结果图。
+const PNG_FIXTURE: &[u8] = &[
+    0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
+    0x00, 0x00, 0x00, 0x01, 0x00, 0x00, 0x00, 0x01, 0x08, 0x06, 0x00, 0x00, 0x00, 0x1F, 0x15, 0xC4,
+    0x89, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x44, 0x41, 0x54, 0x78, 0xDA, 0x63, 0x64, 0xF8, 0xCF, 0xF0,
+    0x1F, 0x00, 0x05, 0xFE, 0x02, 0xFE, 0x5D, 0xC6, 0x38, 0x59, 0x00, 0x00, 0x00, 0x00, 0x49, 0x45,
+    0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
+];
+
+/// 假上游记录下来的请求（方法、路径、解码后的请求体），用于断言 Driver 的线上请求。
+type UpstreamCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
+
+/// APIMart Driver 的真实执行验证（规划 §6 第 13 条等）。
+///
+/// 用**进程内假上游**替代真实 Provider：发布一个 `base_url` 指向 `127.0.0.1` 的
+/// APIMart Offering，让真实 Worker 跑一次完整流程（提交 → 轮询 → 取图 → 归档 → 结算）。
+/// **不产生任何外部调用。**
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn apimart_driver_executes_task_flow_against_local_upstream() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = start_fake_upstream(calls.clone()).await;
+    let upstream_base = format!("http://127.0.0.1:{}", upstream.port);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let base_url = format!("http://127.0.0.1:{port}");
+    let admin_token = format!("driver-admin-{}", Uuid::new_v4());
+    let asset_root = std::env::temp_dir().join(format!("seeai-driver-{}", Uuid::new_v4()));
+    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
+        .env("DATABASE_URL", &database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", &admin_token)
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", &asset_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("API process should start");
+    let _process = ApiProcess {
+        child,
+        asset_root: asset_root.clone(),
+    };
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // 发布一个指向假上游的 APIMart 供给。
+    let model = "driver-model";
+    let mut draft = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
+    draft["base_url"] = Value::String(upstream_base.clone());
+    draft["credential_env"] = Value::String("APIMART_API_KEY".to_owned());
+    let published = publish_candidates(&client, &base_url, &admin_token, model, vec![draft]).await;
+    assert_eq!(published, StatusCode::OK, "publication must succeed");
+
+    // 受理一个 Job。
+    let key = format!("driver-{}", Uuid::new_v4());
+    let created = client
+        .post(format!("{base_url}/v1/image-generations"))
+        .bearer_auth(&api_key)
+        .json(&route_request(model, &key, "driver prompt"))
+        .send()
+        .await
+        .expect("generation accepted");
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: Value = created.json().await.expect("job JSON");
+    let job_id = Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID");
+
+    // 启动真实 Worker（独立包的二进制，按当前 profile 定位）跑一次。
+    let mut worker = Command::new(worker_binary())
+        .env("DATABASE_URL", &database_url)
+        .env("WORKER_ID", "driver-contract-worker")
+        .env("WORKER_POLL_INTERVAL_MS", "200")
+        .env("WORKER_LEASE_SECONDS", "300")
+        .env("PROVIDER_TIMEOUT_SECONDS", "60")
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", &asset_root)
+        .env("APIMART_API_KEY", "contract-test-key")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("worker process should start");
+
+    // 等 Job 进入终态。
+    let mut state = String::new();
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        state = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("job state");
+        if matches!(
+            state.as_str(),
+            "succeeded" | "failed" | "reconciliation_required"
+        ) {
+            break;
+        }
+    }
+    let _ = worker.kill();
+    let _ = worker.wait();
+    assert_eq!(state, "succeeded", "the driver flow must settle the job");
+
+    // 计量证据：四分项 usage 落到 attempts.metering_evidence。
+    let evidence: Value =
+        sqlx::query_scalar("SELECT metering_evidence FROM generation.attempts WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("metering evidence");
+    assert_eq!(evidence["usage"]["input_text_tokens"], 14);
+    assert_eq!(evidence["usage"]["input_image_tokens"], 0);
+    assert_eq!(evidence["usage"]["output_image_tokens"], 196);
+    assert_eq!(evidence["usage"]["total_tokens"], 210);
+
+    // 结果先归档到自有对象存储，Job 只留资产引用。
+    let result_assets: Vec<Uuid> =
+        sqlx::query_scalar("SELECT result_asset_ids FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("result assets");
+    assert_eq!(result_assets.len(), 1, "one generated image must be stored");
+    let (media_type, byte_count): (String, i64) = {
+        let row = sqlx::query("SELECT media_type, byte_count FROM generation.assets WHERE id = $1")
+            .bind(result_assets[0])
+            .fetch_one(&pool)
+            .await
+            .expect("asset row");
+        (
+            row.try_get("media_type").expect("media type"),
+            row.try_get("byte_count").expect("byte count"),
+        )
+    };
+    assert_eq!(media_type, "image/png");
+    assert_eq!(byte_count, PNG_FIXTURE.len() as i64);
+
+    // Driver 的线上请求：只提交一次，且参数在顶层（无 extra 包装）。
+    let calls = calls.lock().expect("calls lock").clone();
+    let submits = calls
+        .iter()
+        .filter(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
+        .count();
+    assert_eq!(submits, 1, "the create request must never be resent");
+    let submit_body = calls
+        .iter()
+        .find(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
+        .map(|(_, _, body)| body.clone())
+        .expect("submit body");
+    let submit_body: Value = serde_json::from_str(&submit_body).expect("submit body is JSON");
+    assert_eq!(submit_body["model"], model);
+    assert_eq!(submit_body["prompt"], "driver prompt");
+    assert!(
+        submit_body.get("extra").is_none(),
+        "APIMart takes parameters at the top level"
+    );
+    let polls = calls
+        .iter()
+        .filter(|(method, path, _)| method == "GET" && path.starts_with("/v1/tasks/"))
+        .count();
+    assert!(polls >= 1, "the driver must poll the task at least once");
+    drop_isolated_database(&database_name).await;
+}
+
+struct FakeUpstream {
+    port: u16,
+    _handle: tokio::task::JoinHandle<()>,
+}
+
+async fn start_fake_upstream(calls: UpstreamCalls) -> FakeUpstream {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake upstream binds");
+    let port = listener.local_addr().expect("addr").port();
+    let handle = tokio::spawn(async move {
+        loop {
+            let Ok((mut socket, _)) = listener.accept().await else {
+                break;
+            };
+            let calls = calls.clone();
+            tokio::spawn(async move {
+                let _ = serve_fake_upstream(&mut socket, calls).await;
+            });
+        }
+    });
+    FakeUpstream {
+        port,
+        _handle: handle,
+    }
+}
+
+async fn serve_fake_upstream(
+    socket: &mut tokio::net::TcpStream,
+    calls: UpstreamCalls,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let mut buffer = vec![0_u8; 8192];
+    let read = socket.read(&mut buffer).await?;
+    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
+    let request_line = request.lines().next().unwrap_or_default().to_owned();
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+    let body = request
+        .split("\r\n\r\n")
+        .nth(1)
+        .unwrap_or_default()
+        .to_owned();
+    if let Ok(mut calls) = calls.lock() {
+        calls.push((method.clone(), path.clone(), body));
+    }
+
+    let (content_type, payload) = if method == "POST" && path.ends_with("/images/generations") {
+        (
+            "application/json",
+            serde_json::to_vec(&json!({
+                "code": 200,
+                "data": [{"status": "submitted", "task_id": "task-contract-1"}]
+            }))
+            .expect("submit body"),
+        )
+    } else if method == "GET" && path.starts_with("/v1/tasks/") {
+        (
+            "application/json",
+            serde_json::to_vec(&json!({
+                "code": 200,
+                "data": {
+                    "id": "task-contract-1",
+                    "status": "completed",
+                    "progress": 100,
+                    "cost": 0.00476,
+                    "credits_cost": 0.0476,
+                    "result": {"images": [{"url": [format!("http://127.0.0.1:{}/result.png", port_of(socket))], "expires_at": 4_000_000_000u64}]},
+                    "usage": {
+                        "input_tokens": 14,
+                        "input_tokens_details": {"cached_tokens": 0, "image_tokens": 0, "text_tokens": 14},
+                        "output_tokens": 196,
+                        "output_tokens_details": {"image_tokens": 196, "text_tokens": 0},
+                        "total_tokens": 210
+                    }
+                }
+            }))
+            .expect("task body"),
+        )
+    } else {
+        ("image/png", PNG_FIXTURE.to_vec())
+    };
+
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: {content_type}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        payload.len()
+    );
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(&payload).await?;
+    socket.flush().await?;
+    Ok(())
+}
+
+fn port_of(socket: &tokio::net::TcpStream) -> u16 {
+    socket.local_addr().map(|addr| addr.port()).unwrap_or(0)
+}
+
+/// 定位 `seeai-worker` 二进制。
+///
+/// 它是**独立包**，Cargo 不会为它提供 `CARGO_BIN_EXE_*`；而端到端驱动验证需要
+/// 真实启动它。路径从当前测试可执行文件推导：`target/<profile>/deps/<test>` →
+/// `target/<profile>/seeai-worker`。
+fn worker_binary() -> PathBuf {
+    let test_binary = std::env::current_exe().expect("current test executable");
+    let profile_dir = test_binary
+        .parent()
+        .and_then(|deps| deps.parent())
+        .expect("target profile directory");
+    let candidate = profile_dir.join(if cfg!(windows) {
+        "seeai-worker.exe"
+    } else {
+        "seeai-worker"
+    });
+    assert!(
+        candidate.is_file(),
+        "worker binary not found at {}; run `cargo build --workspace` first",
+        candidate.display()
+    );
+    candidate
+}
+
+/// 为本次测试创建**独立的空库**。
+///
+/// `HTTP_CONTRACT_DATABASE_URL` 指向一个可连接的空库；多个端到端测试并行时，
+/// 它们必须各自有库——驱动测试会启动真实 Worker，而 Worker 会领取数据库里**任何**
+/// 可领取的 Job，从而破坏其他测试的人工夹具。因此每个测试从该 URL 派生一个
+/// 一次性数据库，结束后自动删除。
+async fn isolated_database_url() -> (String, String) {
+    let base = std::env::var("HTTP_CONTRACT_DATABASE_URL")
+        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let admin = PgPool::connect(&base)
+        .await
+        .expect("connect to the provided contract database");
+    let name = format!("seeai_contract_{}", Uuid::new_v4().simple());
+    sqlx::query(sqlx::AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+        .execute(&admin)
+        .await
+        .expect("create an isolated contract database");
+    admin.close().await;
+    // 保留原有查询串的形状，只替换库名。
+    let url = match base.rfind('/') {
+        Some(index) => format!("{}/{}", &base[..index], name),
+        None => panic!("HTTP_CONTRACT_DATABASE_URL must include a database name"),
+    };
+    (url, name)
+}
+
+async fn drop_isolated_database(name: &str) {
+    let base = std::env::var("HTTP_CONTRACT_DATABASE_URL").unwrap_or_default();
+    let Ok(admin) = PgPool::connect(&base).await else {
+        return;
+    };
+    let _ = sqlx::query(sqlx::AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await;
+    admin.close().await;
+}
+
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn image_generation_http_contract() {
-    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
-        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let (database_url, database_name) = isolated_database_url().await;
     let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
     let port = listener.local_addr().expect("test address").port();
     drop(listener);
@@ -140,6 +471,7 @@ async fn image_generation_http_contract() {
 
     verify_reconciliation_contract(&client, &base_url, &admin_token, &api_key, &database_url).await;
     verify_lease_recovery_contract(&client, &base_url, &api_key, &database_url).await;
+    drop_isolated_database(&database_name).await;
 }
 
 /// 多 Offering 路由的端到端验证（规划 §6 第 1–4、7 条）。
@@ -150,8 +482,7 @@ async fn image_generation_http_contract() {
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn multiple_active_offerings_route_by_priority() {
-    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
-        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let (database_url, database_name) = isolated_database_url().await;
     let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
     let port = listener.local_addr().expect("test address").port();
     drop(listener);
@@ -283,6 +614,7 @@ async fn multiple_active_offerings_route_by_priority() {
         active, 1,
         "republishing must atomically replace the model's active candidates"
     );
+    drop_isolated_database(&database_name).await;
 }
 
 fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value {
