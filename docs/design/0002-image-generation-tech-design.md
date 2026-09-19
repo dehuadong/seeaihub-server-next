@@ -106,9 +106,11 @@ HTTP 只是应用命令的适配层，可并存三种请求入口而不复制业
 
 以 AIHubMix 无需鉴权的机器 Schema 为上游证据。导入后形成平台自己的不可变 `NativeImageCapabilitySchema` 修订，至少保存：来源 URL、抓取时间、内容摘要、上游 schema 版本和人工审核记录；必填 `model`、`prompt`；`image` 与 `images` 的同义/归并关系（`images` 最多 16 张）；`mask` 必须与 `image` 或非空 `images` 同时存在；`n` 为 1–10、默认 1；`output_format` 为 `png`/`jpeg`、默认 `png`；`size` 的原生值与图生图分支的受限集合；`extra.quality/background/output_compression/user` 及透明背景、压缩格式的组合约束；`async`、`webhook_url`、`webhook_events_filter` 的原生条件；未声明字段失败关闭。
 
+**未声明字段失败关闭是平台自己的防线**（2026-09-19 更正）：本句原先依赖「上游 `additionalProperties: false`」这一对该上游的观察。第二个 Provider 的实测表明上游可能**静默接受未声明字段并降级为默认值**，因此这道校验必须由平台在受理前执行，不能外包给上游。决策不变，见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
+
 运行时请求不实时依赖 AIHubMix Schema 地址。更新流程是「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」，旧 Job 继续使用受理时固定的旧修订。`extra` 是上游已声明的受控扩展对象，不是任意 JSON 逃生口。
 
-已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未知字段拒绝、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
+已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未知字段拒绝、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。「未知字段拒绝」是**平台自己的**受理前校验：上游不保证拒绝未声明字段（2026-09-19 实测另一 Provider 静默接受并降级为默认值），因此不能依赖上游返回错误来兜底。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
 
 ## 6. 计量证据与结算
 
@@ -196,3 +198,7 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 ## 评审历史
 
 技术设计 v3 结论为 REQUIRED REVISION（唯一剩余产品选择是首个 Provider/Adapter）；v4 结论为 REQUIRED REVISION（真实响应/账单中的 Metering Evidence 字段尚未由官方资料证明，资金闭环不能据此定稿）；v5 基于真实付费验证补齐该证据，Plan Review 在 Standards、Spec、Architecture 三轴均 PASS，结论为 **PASS**。逐版 Plan Review 全文保留在上游 issue 评论中；第一阶段取得执行授权后的实现与交付状态由本仓库工作项和 Agent Notes 记录。
+
+**2026-09-19 事实前提更正（`dehuadong/seeaihub-server-next#2` Planning，非修订级变更）**：本文 §5 与 §11 关于「未声明字段失败关闭依赖上游 `additionalProperties: false`」的理由段落已就地更正——第二个 Provider 实测表明上游可能静默接受未知字段并降级为默认值，因此该防线必须由平台在受理前实施。**结论不变**（仍不做跨厂商参数大一统、仍按不可变 Revision 发布原生能力），正文修订头因此仍为 v5。决策属主见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
+
+**与第二个 Provider 的关系**：本文 §5（原生能力 Schema 的理由）、§6（计量证据）、§9（Adapter 能力与错误分类）**只对 AIHubMix 成立**——它假定 token 计量、Base64 同响应返回、上游拒绝未知字段。第二个 Provider 的供给与计量设计见 [0003-doubao-ark-image-adapter.md](./0003-doubao-ark-image-adapter.md)，不在本文重复。

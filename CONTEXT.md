@@ -13,7 +13,7 @@ _Avoid_: Provider、渠道
 _Avoid_: 平台模型、渠道模型
 
 **Provider**:
-向平台实际提供模型调用和账单的服务方，例如 AIHubMix。
+向平台实际提供模型调用和账单的服务方，例如 AIHubMix。**Vendor 与 Provider 是角色而非身份类别**：同一主体可以同时是某个模型产品的 Vendor、又是它的 Provider（厂商直连自营时，如火山方舟之于 ByteDance 的 Seedream）。Provider 可以只供应一家 Vendor 的模型（直连型），也可以供应多家（聚合型）——这是供应范围的自然结果，不是两种不同的层，因此没有单独的「聚合/直连」类型字段。
 _Avoid_: Vendor
 
 **Offering**:
@@ -33,7 +33,7 @@ _Avoid_: 配置文件、当前缓存
 _Avoid_: Provider Task、HTTP 请求
 
 **Generation Attempt**:
-Generation Job 对某个 Offering 和 Channel 发起的一次外部副作用尝试。
+Generation Job 对某个 Offering 和 Channel 发起的一次外部副作用尝试。它同时承载对账标识（Provider 的逐请求标识，例如响应头 `x-request-id`），该标识只用于对账，不参与计价，也不属于 Metering Evidence。
 _Avoid_: 重试、Job
 
 **Asset**:
@@ -41,8 +41,20 @@ _Avoid_: 重试、Job
 _Avoid_: 外部 URL、Base64 字符串
 
 **Metering Evidence**:
-Provider 成功响应或账单中可核验的计量事实，不包含平台价格计算结果。
+Provider 成功响应或账单中可核验的计量事实，不包含平台价格计算结果。对账标识**不属于**本词条的一部分——它由 Generation Attempt 自己承载，见 `Generation Attempt`。
 _Avoid_: 费用、估算值
+
+**Token Usage**:
+`Metering Evidence` 中实际启用的计量形态：上游返回的分项 token 计数（文本输入/图像输入/文本输出/图像输出）。领域里由 `TokenUsage` 承载，计量事实本身仍归 `Metering Evidence` 词条。**它不是独立于证据之外的第二个概念**——「上游声明的扣费金额」能否替代或补充它，属主是 `docs/adr/0012`，**待实测结清后再定**。
+_Avoid_: Metered Usage（未曾有代码或文档使用该名）、费用
+
+**Routing Priority**:
+同一 Vendor Model 的候选 Offering 之间的选择顺序，随 Runtime Revision 发布；数字小者优先。它是**发布决定**，不由请求参数或 Adapter 决定，也不由价格自动推导。
+_Avoid_: 价格优先、负载均衡
+
+**Price Plan**:
+某个 Offering 的计价合同：声明**计价形态**（按 token 计量量，或——待 `docs/adr/0012` 结清后——按上游声明的扣费金额）、该形态所需的单价或来源、以及厂商原生币种与发布时固定的汇率。价格变化只通过发布新的 Price Plan 生效。
+_Avoid_: 当前价格、费率表
 
 **Price Snapshot**:
 Job 受理时固定的计价单位、单价和公式版本。

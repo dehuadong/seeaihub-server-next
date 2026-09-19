@@ -8,7 +8,9 @@
 
 ### proposed
 
-暂无记录。
+| 首次提出 | 记录 | 分类 | 生命周期 |
+| --- | --- | --- | --- |
+| 2026-09-19 | [第二阶段探测产生未授权付费调用的记录与后续付费授权边界](./proposed/workflow/2026-09-19-unauthorized-paid-provider-probe.md) | workflow | proposed |
 
 ### implemented
 
@@ -40,4 +42,6 @@ PostgreSQL 持久化与迁移、对象存储与 Asset 承载、Adapter 边界与
 
 工程边界与模块依赖规则、CI 与本地验证方式、Provider 凭证与安全约定、Agent 工件与文档治理约定
 
-暂无记录。
+| 首次提出 | 记录 | 分类 | 生命周期 |
+| --- | --- | --- | --- |
+| 2026-09-19 | [第二阶段探测产生未授权付费调用的记录与后续付费授权边界](./proposed/workflow/2026-09-19-unauthorized-paid-provider-probe.md) | workflow | proposed |

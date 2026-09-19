@@ -141,6 +141,45 @@
 
 **推论**：Adapter 必须按 `endpoint_family` 使用不同响应解码器，不能假定 `/ai/v1` 和 `/v1` 返回相同形状。
 
+### 7.1b `/ai/v1` 异步任务的**真实**响应（2026-09-19 实测，用户授权）
+
+此前 7.1 的 Task 对象结构只来自文档。本次以 `POST https://api.inferera.com/ai/v1/images/generations`（`async: true`）**实际发起并轮询**，取得真实样本。
+
+**创建成功（HTTP 200）后立即返回任务对象，`output` 为空、`status: pending`**（task id 与结果 URL 已脱敏；原始样本未入库）：
+
+```json
+{"completed_at":null,"created_at":1789804016,"error":null,"expires_at":null,
+ "id":"t_<已脱敏>","model":"gpt-image-2","object":"image",
+ "output":[],"status":"pending"}
+```
+
+**轮询 `GET /ai/v1/images/{id}` 至终态（HTTP 200，约 12 秒完成）**：
+
+```json
+{"completed_at":1789804028,"created_at":1789804016,"error":null,"expires_at":1789811227,
+ "id":"t_<已脱敏>","model":"gpt-image-2","object":"image",
+ "output":[{"b64_json":null,
+            "content_url":"https://aihubmix.com/ai/v1/images/<id>/content/res_<已脱敏>",
+            "index":0,"type":"file"}],
+ "status":"completed"}
+```
+
+**由此确认的事实**：
+
+1. **任务对象只有 9 个字段**：`id`、`object`、`model`、`status`、`output`、`error`、`created_at`、`completed_at`、`expires_at`。**其中没有 `usage`**——全文检索 `"usage"` **0 次**（对历史任务列表 `GET /ai/v1/images` 的 3 条已完成任务检索同样为 0 次）。
+2. **`output[]` 项**为 `{index, type, content_url, b64_json}`；本次 `b64_json` 为 `null`，结果只给 `content_url`。
+3. **状态流转**：受理即 `pending` → 本样本 10 秒内 `completed`。
+4. **`quality` 不是 `/ai/v1` 的顶层参数**：顶层传 `quality` 被拒，HTTP 400，`{"error":{"code":"schema_violation","message":"Unknown request parameter: `quality`.","type":"invalid_request_error"}}`；去掉后即受理。⇒ 必须放进 `extra`（与本地 Schema 一致）。
+5. **未知参数是硬拒绝**（`schema_violation`），不是静默接受——与火山方舟的行为相反。
+
+**尚未确认（本次未测）**：
+
+- 本次用的是 `gpt-image-2`（已退役），**未对 `gpt-image-2.5-flare`/`-sunburst` 做异步调用**；两者的异步任务对象形状**是否相同未验证**；
+- 任务列表/详情里只出现 `gpt-image-2`，说明该账户此前的异步历史也都在旧型号上；
+- 异步任务的**权威用量来源仍未知**：任务对象不含 `usage`，`/ai/v1` 也未给出按次金额。
+
+**对第二阶段的影响（仅供 ② 层参考）**：若走 `/ai/v1` 异步，则**拿不到分项 token**，只能得到 `content_url` + 状态；而第一阶段已确认**同步 `/v1` 返回四分项 token 且首期即用它**。因此本仓库现有计费路径（`TokenUsage` 四分项）**只与同步 `/v1` 相容**。同步 `/v1` 亦会保存任务记录（见 §6），`GET /ai/v1/images` 可查到。
+
 ### 7.2 Webhook
 
 - **事实**：Webhook 只适用于异步任务，采用至少一次投递；同一 `event_id` 可能重复。`5xx`、网络错误和超时会重试，最多 6 次；`3xx/4xx` 不重试。[Webhook 重试](https://docs.aihubmix.com/en/api/async-tasks.md#webhook-retry)

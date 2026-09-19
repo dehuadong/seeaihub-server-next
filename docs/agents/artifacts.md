@@ -16,12 +16,14 @@
 | --- | --- |
 | Proposal / 总体及阶段提案 | 按 `docs/agents/issue-tracker.md` 配置的 GitHub Issues 管理，以仓库限定编号作标识；作为该规划工作的主入口，引用独立需求与设计 |
 | Agent Notes / 工程变更与交付记录 | `.agents/notes/proposed/<分类>/YYYY-MM-DD-主题.md`，交付并验证后移至 `implemented/`，否决时移至 `rejected/`；记录工程变更、交付理由及其验证，可引用 Proposal 与 ADR，不复制提案正文与决策正文 |
-| 独立技术设计 RFC | `docs/design/`；需要独立评审、复用或演进时拆出，由提案引用，是技术设计的权威位置。沿用 `NNNN-slug.md` 顺序编号和既有 `主题` / `当前修订` / `状态` 头格式 |
-| 独立行为合同 Spec | `docs/specs/`；明确需要时创建，优先更新同一工作已有 Spec。当前无此类工件，目录按需创建 |
-| 持久决定 / ADR | **决策的权威位置**：`docs/adr/`，按 `0001-slug.md` 顺序编号，ADR 拥有决策正文。变更记录、RFC、Proposal 只引用 ADR，不复制决策正文。当前已有 0001–0008 共 8 份 |
+| 独立技术设计 RFC | `docs/design/`；需要独立评审、复用或演进时拆出，由提案引用，是技术设计的权威位置。沿用 `NNNN-slug.md` 顺序编号和既有 `主题` / `当前修订` / `状态` 头格式。第二阶段不另立 RFC，其技术设计与验收条件由工作项 `#2` 的规划正文承载 |
+| 独立行为合同 Spec | `docs/specs/`；明确需要时创建，优先更新同一工作已有 Spec |
+| 受控验证清单 | `docs/verification/`，按 `阶段-slug.md` 命名；记录受控验证的步骤、停止条件与留档要求。**停止条件以来源规划为准**，清单只复述与执行 |
+| 汇总事实登记 | `docs/facts/`；把散在原始证据里的渠道事实归纳成单一出处，引用而不复述。含凭证类内容时只记**变量名** |
+| 持久决定 / ADR | **决策的权威位置**：`docs/adr/`，按 `0001-slug.md` 顺序编号，ADR 拥有决策正文。变更记录、RFC、Proposal 只引用 ADR，不复制决策正文 |
 | 既有工作项 / 阶段进度 | 按 `docs/agents/issue-tracker.md` 配置；既有工作项能明确本次范围、验收及决定时可直接复用，不另建 Proposal |
 | 实施 Ticket | 按跟踪器配置存储与跟踪，关联所属工作项 |
-| 其他已有工件 | 本仓库承接总览与未来进度由 `dehuadong/seeaihub-server-next#1` 拥有；上游 `dehuadong/seeaihub#674` 只保留为冻结的历史产品与架构来源 |
+| 其他已有工件 | 承接总览与未来进度归 `dehuadong/seeaihub-server-next#1`；上游 `dehuadong/seeaihub#674` 只作冻结的历史来源，不再承接新提案或进度 |
 | 外部参考资源 | `out-reference/`，按 Provider 分目录（`aihubmix/`、`apimart/`、`doubao/`、`openai/`、`openrouter/`）。**只作参考，不是工程工件**，定位见下文「外部参考资源」一节 |
 | 决策记录工具 | `scripts/decisions/{lib,update-index,check}.mjs`，随决策记录系统部署的项目副本。已相对 setup 技能自带的原始版本修补链接解析（见下文「决策记录工具」） |
 
@@ -57,38 +59,22 @@ Proposal 的工作状态由 `docs/agents/issue-tracker.md` 拥有的 GitHub 标�
 
 位置：仓库根目录 `out-reference/`，按 Provider 分目录（`aihubmix/`、`apimart/`、`doubao/`、`openai/`、`openrouter/`），存放第一方协议调研、上游 Schema 快照、错误码表与官方示例代码。
 
-**目录名说明**：目录名为 `out-reference`，表示「外部（outbound/outside）参考资源」——材料来自本仓库之外的上游或第三方，用于外呼协议的调研依据。它不是构建产物目录（不表示 build output），也不是「过时（outdated）」之意。取名时避开了 `api-reference`，因为该名称容易被误读为本仓库自己的 API 参考文档。
-
-它的性质是**参考资料，不是工程工件**：这些文件是上游或第三方的材料，不表达平台的对外接口合同，不属于本仓库的工程边界（见仓库根 `AGENTS.md` 的「工程边界」）。目录内容混合了第三方官方文档与自研调研笔记，两者都只作证据使用。目录内已有文件自行声明了这一点，例如 `out-reference/aihubmix/gpt-image-2-inferera-research.md` 将自身标为「上游协议研究与受控验证证据，不是平台对外接口合同」。
+目录名表示「外部参考资源」：材料来自本仓库之外的上游或第三方，**不是工程工件，也不表达平台的对外接口合同**，只作证据使用（见仓库根 `AGENTS.md` 的「工程边界」）。顶层只放按 Provider 命名的目录，不放平铺文件；汇总登记类不放这里（见 `docs/facts/`）。
 
 使用规则：
 
-- 引用与追踪用普通相对链接，不作为构件依赖，也不从代码或配置里读取；
+- 引用与追踪用代码格式的根路径措辞，不作为构件依赖，也不从代码或配置里读取；
 - **不得**作为运行时数据源：运行中的服务只使用经审核发布的 Runtime Revision，不跟随远端文档或本目录内容变化；
 - 进入平台合同前必须走「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」流程，平台合同以发布后的不可变修订为准；
-- 新增或更新上游资料时按来源与证据等级标注（事实 / 推论 / 待确认分开），保留来源 URL、抓取时间与版本信息；
-- 目录内第三方示例代码不参与本仓库构建，不纳入 `cargo fmt` / `clippy` / `test` 的验证范围；
-- **凭证纪律**：目录内只保存脱敏后的调研记录，真实密钥、Bearer token、task ID 与短期 URL 一律不入库；新增样本前按此检查（见仓库根 `AGENTS.md` 的「事实与安全」）。
+- 新增或更新资料时按来源与证据等级标注（事实 / 推论 / 待确认分开），保留来源 URL、抓取时间与版本信息；
+- 第三方示例代码不参与本仓库构建，不纳入 `cargo fmt` / `clippy` / `test` 的验证范围；
+- **凭证纪律**：只保存脱敏后的记录，真实密钥、Bearer token、task ID 与短期 URL 一律不入库（见仓库根 `AGENTS.md` 的「事实与安全」）。
 
-纳入版本控制的范围与排除项见 `.gitignore` 与下文「外部参考资源的入库范围」。
-
-### 外部参考资源的入库范围
-
-入库：调研笔记、上游 Schema 快照、错误码表与计量证据样本，全部纳入版本控制，使 `docs/adr/` 与 `docs/design/` 中的引用在 clone 后可解析。
-
-排除：`out-reference/doubao/touch_edit_demo/` 第三方可运行示例代码，由 `.gitignore` 忽略。理由：它是拿来即用的独立 demo，不是本仓库的合同或实现，没有本地修改价值，也不参与构建与验证。它不是秘密材料——只是不值得进入版本历史。
-
-因此 clone 后缺 `touch_edit_demo/` 属预期行为，不是检出损坏；需要该 demo 时回上游来源重新获取。新增外部参考材料时按同一原则判断：**证据与笔记入库，可运行的第三方示例代码排除**。
+**入库范围**：调研笔记、Schema 快照、错误码表与计量证据样本入版本控制，使 `docs/adr/`、`docs/design/` 中的引用在 clone 后可解析；可运行的第三方示例代码排除（`.gitignore` 忽略 `out-reference/doubao/touch_edit_demo/`）。因此 clone 后缺该目录属预期行为，需要时回上游来源重新获取。
 
 ## 决策记录工具
 
-`scripts/decisions/lib.mjs` 是本地修补过的项目副本：`resolveTarget()` 用显式栈逐段解析相对链接，**不使用** `path.resolve` / `path.normalize` / `path.join`。原版 `lib.mjs` 用 `path.resolve` 解析链接目标，在本机 Node v24.10.0（Windows）上会把正确的跨目录相对链接误报为断链。
-
-**观测限制（如实记录）**：本机 `..` 的解析行为**无法稳定复现**——同一段代码在不同次运行中，有时 `..` 被正确消解，有时被丢弃而不上跳；单独测试 `path.dirname`、`array.pop`、`fs.existsSync` 均表现正常，未能定位到确定的触发条件。因此**已改用行为确定的实现**（显式栈，不依赖上述原语），而不是依赖对该现象的某种解释。
-
-修补后的验证方式（本轮采用）：临时加一条记录，确认跨目录正确链接通过、真断链仍被捕获。**注意**：本轮无法稳定复现原现象，因此对「解析是否真的错了」保留判断；可确信的是修补后上述探针行为正确，且不依赖不可靠的路径原语。
-
-本轮新写的跨目录引用**有意不写成 `../` 链接**：`docs/design/0002` 指向 `out-reference/` 的引用改用代码格式的根路径措辞。仓库内既有的 `../` 相对链接（`docs/agents/engineering.md`、`.agents/notes/README.md` 等）未改动，其目标经手工展开均存在。
+`scripts/decisions/lib.mjs` 是本地修补过的项目副本：`resolveTarget()` 用显式栈逐段解析相对链接，不使用 `path.resolve` / `path.normalize` / `path.join`——原版在本机 Node v24.10.0（Windows）上会把正确的跨目录相对链接误报为断链。
 
 升级 setup 技能自带的 bundle 时：先逐文件比对，保留本处定制，不要用原始 `lib.mjs` 覆盖；`update-index.mjs`、`check.mjs` 未修改。
 

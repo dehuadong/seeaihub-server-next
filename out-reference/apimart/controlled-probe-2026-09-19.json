@@ -1,0 +1,57 @@
+{
+  "_comment": "APIMart gpt-image-2.5-flare 的受控实测原始响应（2026-09-19，经用户授权）。已脱敏：结果 URL 替换为占位符。task_id 保留（它是本仓库已按惯例记录的上游标识；见 .agents/notes 的凭证纪律）。",
+  "_call": {
+    "endpoint": "POST https://api.apib.ai/v1/images/generations",
+    "request_body": {
+      "model": "gpt-image-2.5-flare",
+      "prompt": "a small blue cube on a white background",
+      "n": 1,
+      "size": "1:1",
+      "resolution": "1k",
+      "quality": "low"
+    },
+    "create_response": {
+      "http": 200,
+      "body": { "code": 200, "data": [ { "status": "submitted", "task_id": "task_<已脱敏，长度 31>" } ] }
+    },
+    "poll": {
+      "endpoint": "GET https://api.apib.ai/v1/tasks/{task_id}",
+      "attempts": 1,
+      "elapsed_seconds": 10,
+      "terminal_status": "completed"
+    }
+  },
+  "_terminal_response": {
+    "code": 200,
+    "data": {
+      "actual_time": 7,
+      "completed": 1789806901,
+      "cost": 0.00476,
+      "created": 1789806894,
+      "credits_cost": 0.0476,
+      "estimated_time": 60,
+      "id": "task_<已脱敏，长度 31>",
+      "progress": 100,
+      "result": {
+        "images": [
+          { "expires_at": 1789893301, "url": ["<result-url-redacted>"] }
+        ]
+      },
+      "status": "completed",
+      "usage": {
+        "input_tokens": 14,
+        "input_tokens_details": { "cached_tokens": 0, "image_tokens": 0, "text_tokens": 14 },
+        "output_tokens": 196,
+        "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+        "total_tokens": 210
+      }
+    }
+  },
+  "_conclusions": [
+    "V1 结清：APIMart 任务成功响应**含四分项 usage**，且 input_tokens_details 区分 text_tokens 与 image_tokens，另有 cached_tokens。",
+    "因此**无需扩展领域类型**：AIHubMix 与 APIMart 的响应都能归一成既有 TokenUsage 四分项（input_text / input_image / output_text / output_image）。",
+    "docs/adr/0012（金额型证据）在本阶段**不需要**。",
+    "响应同时含 cost / credits_cost（本次 0.00476 USD / 0.0476 credits），仅作记录，不作为结算依据。",
+    "本次计费：cost 0.00476 USD；若按公开单价算 14×$5 + 196×$30 per 1M = 5880 microusd，差额属账号折扣（见 out-reference/apimart/billing-basis.md §2）。"
+  ]
+}
