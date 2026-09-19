@@ -17,15 +17,16 @@
 > | V5 | `n` / `quality` 的实际行为 | **已删除**：属上游生成行为，非平台合同事实 |
 > | V6 | APIMart 机器 schema（只读） | **已结清**：`/v1/models/{model}/schema` 与 `/v1/models` 均已取到（§3.4/§3.5） |
 >
-> **本文当前没有待执行项。** 本阶段之后新出现的待验证项是**APIMart 的参考图/遮罩路径**（上传 + `image_urls`）：链路已实现，但**没有任何计费实测**，因此**不在本文已批准的范围内**。要执行需先由用户批准（`#2` 已关闭，应挂在后续工作项上）：调用清单就是下面 4 条，预算上限与停止条件沿用 §2 的既有条款。
+> **本文当前没有待执行项。** 本阶段之后出现的待验证项——**APIMart 的参考图/遮罩路径**——已于 2026-09-19 **在用户批准下执行完毕**，结果见 `docs/facts/channel-facts.md` §5.6：
 >
-> 已经**零费用**做完的部分：三个端点在我们配置的域名 `api.apib.ai` 上确实存在（无凭证 401 vs 对照路由 404），以及 401 的错误信封（`docs/facts/channel-facts.md` §3.1/§3.8/§5.5）。剩下需要凭证的：
-> 1. 上传接口真实返回的字段与 URL 形态（文档给 `{url, filename, content_type, bytes, created_at}`）；
-> 2. `image_urls` 到底吃**字符串数组**还是 `[{"url": …}]` 对象数组（实时 Schema 与生成页示例说前者，上传页示例说后者）；
-> 3. 传上传后的 URL 走**图生图**是否真的可用、`usage` 的 `input_image_tokens` 是否随之变化；
-> 4. `mask_url` 配第一张参考图是否可用（尺寸/Alpha 要求）。
+> 1. ✅ 上传接口真实返回 `{url, filename, content_type, bytes, created_at}`（URL 主机是 `getapib.org`，与文档示例的 `upload.apimart.ai` 不同）；
+> 2. ✅ `image_urls` **接受字符串数组**（上传页示例的对象数组写法不成立）；
+> 3. ✅ 图生图可用，且 `usage.input_tokens_details.image_tokens` 随参考图变化（512×512 ⇒ 1024）；
+> 4. ✅ `mask_url` 与 `image_urls` 同用可行（512×512 带 alpha，未报尺寸/通道错误）。
 >
-> 另：原「预算 ¥20 / $1」是我提的建议值，**偏高了**——实际只用了 5 次 `n=1 quality=low` 提交（见 `docs/facts/channel-facts.md` §5.4）。
+> 实际用量：上传 2 次 + 生成 2 次（1 次直连探合同、1 次走我们自己的 API + Worker），花费不足 $0.03，未超批准时的 $1 上限。两个发布素材据此放开 `image_conditioned` / `masked`。
+>
+> 另：原「预算 ¥20 / $1」是我提的建议值，**偏高了**——实际只用了 7 次 `n=1 quality=low` 提交（见 `docs/facts/channel-facts.md` §5.4）。
 >
 > **以下原文保留，作为历史记录与执行模板。**
 

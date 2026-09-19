@@ -18,7 +18,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 - **多 Offering 路由**：`publication.runtime_entries` 增加 `routing_priority`，唯一索引由「每型号一个 active 条目」改为「每型号每个优先级一个」；`active_offering` 返回**候选集合**（每个候选自带它自己的 `capability_schema`）；新增 `generation.routing_decisions` 记录受理时的判定。
 - **发布接口形状**：`PublishRuntimeCommand` 支持 `offerings` 数组与 `price_plan`（三例确定性形状判别）；数据库端口只接受已核验的 `PublishRuntimeRequest`。
 - **APIMart Driver**：任务式（提交 → 轮询 → 取图 → 证据提取 → 错误分类）；错误分类只依据 `error.code`，未知状态继续轮询，查询阶段错误一律进对账。
-- **参考图/遮罩路径（上传）**：APIMart 只接受公网 URL 且不再接受 base64，因此 Driver 在**提交生成任务之前**先调 `POST /v1/uploads/images` 换取 URL，再把 URL 回填到原生参数；上传失败＝**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**。Driver 的这三条分支都已实现并有端到端用例；**但两个 APIMart 发布素材仍只开放 `prompt_only`**——按 `docs/adr/0002`「未证实的参数不开启」，要等一次真实 wire 验证后才放开。上传细节见 `docs/facts/channel-facts.md` §3.7。
+- **参考图/遮罩路径（上传）**：APIMart 只接受公网 URL 且不再接受 base64，因此 Driver 在**提交生成任务之前**先调 `POST /v1/uploads/images` 换取 URL，再把 URL 回填到原生参数；上传失败＝**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**。**2026-09-19 经用户批准做了真实受控验证**（1 次直连 + 1 次走我们自己的 API+Worker，两次生成合计不足 $0.03），据此两条分支已开放（`allowed_branches` 加上 `image_conditioned`/`masked`，`max_images: 16`）。证据见 `docs/facts/channel-facts.md` §3.7/§5.6。
 - **资产绑定路径不再写死字段名**：`AssetBinding.native_parameter_path` 现在真正是**厂商原生参数路径**（APIMart 的 `/image_urls/0`、`/mask_url`），不再硬编码 `image`/`images`/`mask`——这正是 `docs/adr/0002` 要求的"由厂商自己的 Schema 声明原生字段路径"。平台只在**一处**判定"这个参数装的是参考图还是遮罩"（名字以 `image` 开头 / 含 `mask`，其余一律拒绝），发布期校验与运行期用的是同一个函数；Driver 侧同样按路径回填，不自己决定键名。
 - **渠道事实**：AIHubMix 2.5 两款与 APIMart 2.5 两款的发布素材；`docs/facts/channel-facts.md` 为渠道事实的单一出处。
 
@@ -40,6 +40,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 | 参考图先上传、生成请求带公网 URL 且不泄露 `asset://`，且字段全在 Profile 声明内 | `apimart_driver_uploads_reference_images_before_submitting` |
 | 参考图 + 遮罩各上传一次、各就各位 | `apimart_driver_uploads_reference_image_and_mask_together` |
 | 上传失败 → Job 失败 + 释放 hold（不进对账） | `upload_failure_fails_the_job_instead_of_asking_for_reconciliation` |
+| **真实上游**：参考图 + 遮罩 → Job `succeeded`、结果图归档、按真实 usage 结算 | `docs/facts/channel-facts.md` §5.6（2026-09-19 受控实测，非自动化用例） |
 | 两类对账的错误码可分 | `worker_sends_delivery_failure_to_reconciliation_with_its_own_code` |
 
 ## 交付过程中发现并修正的实质问题
@@ -47,7 +48,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 1. **「限制只能收窄」的校验此前不存在**（最重要）。规划与 `ADR-0009` 都要求发布期校验「Offering 的 `restrictions` 不超出该候选 Profile 自己声明的范围」，而原实现只检查了 Adapter 的能力面。已补 `validate_restrictions_within_profile`，并加正反例测试。
 2. **`attempts.provider_trace_id` 在成功路径从不写入**：任务式上游的 `task_id` 被直接丢弃，人工对账失去线索。已打通「Adapter → `ProviderSuccess` → `CompleteJob` → UPDATE」。
 3. **未发布型号的返回码回归**：无 active 候选时曾返回 `Validation`（400），应为 `NotFound`（404）。
-4. **把做不到的能力声明成支持的**：APIMart 声明支持参考图/遮罩，但上游要求公网可访问 URL，而本仓库没有上传链路 —— 当时先收窄为仅文生图、运行时显式拒绝；**随后按用户指定补上了上传链路**。补完之后**仍然没有立刻放开这两条分支**：`docs/adr/0002` 要求"未证实的参数不开启、经真实 wire 验证后再发布新修订"，而 `image_urls` 的取值形态（实时 Schema 写 `string[]`、上传页示例写对象数组）与上传接口的真实行为都还没经真实计费调用验证。当前状态：链路已实现、已测试、**未发布**。
+4. **把做不到的能力声明成支持的**：APIMart 声明支持参考图/遮罩，但上游要求公网可访问 URL，而本仓库没有上传链路 —— 当时先收窄为仅文生图、运行时显式拒绝；**随后按用户指定补上了上传链路**。补完之后仍未立刻放开这两条分支：`docs/adr/0002` 要求"未证实的参数不开启、经真实 wire 验证后再发布新修订"，而 `image_urls` 的取值形态与上传接口的真实行为都还没经验证。**2026-09-19 经用户批准做了真实受控验证后，两条分支已开放**（见"实际交付"与 `docs/facts/channel-facts.md` §5.6）。
 5. **`PricePlanDraft.formula` 从不校验**：未知计价形态曾静默落库。
 6. **资产绑定路径写死了字段名**：`image`/`images`/`mask` 被硬编码在领域与用例层，导致"字段名不是 `image` 的厂商"（APIMart 的 `image_urls`）无法绑定任何输入图。已改为按路径取厂商原生参数名，并把"参考图/遮罩"的判定收敛成**一个**有测试的函数（运行期与发布期共用），认不出的参数名直接拒绝而不是静默忽略。
 7. **上传失败的分类不实**：`upload_failure` 曾把"生成任务可证明未受理"标成 `NotRetryable`（"确定性拒绝"）。三态里对应的是 `SafeBeforeAcceptance`（`docs/adr/0011`），已改正并补测试；`code`/`message` 仍按 `error.code` 保留。
@@ -56,14 +57,15 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 第 4 项在实现评审中两次被质疑、两次都按 ADR 收紧了声明；第 1–4、7 项由实现评审（Standards / Spec 双轴）发现，第 5、6、8、9 项为自行核对发现（第 8 项来自零费用路由探测）。
 
-## 未花一分钱拿到的事实
+## 真实上游的受控验证（2026-09-19，经用户批准）
 
-用户要求"决定到完成"，但 `docs/adr/` 与 `AGENTS.md` 都规定**未经批准不发起任何计费调用**，`out-reference/apimart/billing-basis.md` 还写明 APIMart 侧计费口径只能由真实调用结清。因此在**不碰凭证**的前提下做了 4 次请求（无 Authorization 头，只看状态码，详见 `docs/facts/channel-facts.md` §5.5）：
+用户在本会话明确批准后执行，方案与用量当时就写明（上传 1~2 张 + 最多 2 次生成、`n=1`、`quality=low`、预算上限 $1）。实际：**上传 2 次 + 生成 2 次，合计不足 $0.03**。
 
-- 三个端点在我们**实际配置的域名** `api.apib.ai` 上都存在（401；不存在的路由是 404）——包括本次新写的上传端点；
-- 拿到了 401 的错误信封与失败路径的请求标识（`X-Oneapi-Request-Id`，同时写在 `message` 里），并据此修掉上面第 8 条。
+1. **先不碰凭证拿事实**：4 次无 Authorization 头的请求，确认三个端点在 `api.apib.ai` 上真实存在，并取到 401 的错误信封（据此修掉上面第 8 条）。
+2. **再直连探合同**：上传两张 512×512 测试图（参考图 + 带 alpha 的遮罩），随后一次生成带 `image_urls`（字符串数组）与 `mask_url`，11 秒完成 —— 一次结清四条待验项。
+3. **最后走我们自己的服务**：发布真实素材 → 平台接口上传两张图 → 受理 Job（`/image_urls/0` + `/mask_url`）→ 真实 Worker 执行 → **`succeeded`**：结果图 `image/png` 1,486,934 bytes / 1024×1024 归档到自有对象存储，Evidence 记 `input_text=29 / input_image=1024 / output_image=196`，结算 **14217 microusd**，与按已发布单价算出的金额逐位一致；上游自报金额与公开单价的比值正好 **0.8**（账号折扣，与 §3.3 一致）。
 
-**没有带凭证调用上传接口**：上传是否计费在一手文档里没有明确说法，"未证实即不做"。放开两条分支仍需用户批准一次受控生成调用。
+敏感信息未入库：**不保存**真实图片 URL 与 task id，原始响应只留本机临时目录。据此，两个 APIMart 发布素材的 `allowed_branches` 已加上 `image_conditioned` / `masked`。
 
 ## 本变更对领域模型的影响（`0004` §4 的例外说明）
 
@@ -71,11 +73,11 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 - 领域层改动**不是**为了适应 APIMart，恰恰相反：旧代码把 `image`/`images`/`mask` 三个**渠道字段名**写死在领域里，那才是渠道差异污染领域。现在领域只认识"路径的第一段是厂商参数名"这一件事，认不认得某个名字由一个**与具体渠道无关**的函数（`AssetParameterKind::classify`）回答；换一个字段名不同的 Provider，**不需要再改领域**。
 - 因此它更接近 §4 的 **E1（平台侧新能力）**：把"资产绑到哪个原生参数"从硬编码升级为平台自己的通用能力，而不是新增某渠道的分支。
-- 已知代价与未决项（**留给 Planning，不在本变更里自行扩模型**）：厂商若用不以 `image` 开头、也不含 `mask` 的名字（例如 `reference_images`），平台现在会**拒绝**该绑定。要让这种情况可用，应当把"哪个原生参数装图片/遮罩"变成 Profile 里的**显式声明**（属发布合同形状变更）；本次不擅自加字段，已记在下面"未决项"。
+- 已知代价：渠道若用不以 `image` 开头、也不含 `mask` 的名字（例如 `reference_images`），平台会**拒绝**该绑定。这是**有意的**——用户 2026-09-19 决定平台内部只认渠道原生参数名，统一参数转换留给**后期对外消费侧**（见下面"未决项"第一条与 `docs/adr/0002` 的补充段）。
 
 ## 已知限制与未决项（不在本次交付范围）
 
-- APIMart 的**图生图/遮罩分支尚未发布**（`allowed_branches` 仍只有 `prompt_only`），因为 ADR-0002 要求先做真实 wire 验证。零费用部分（端点存在、错误信封）已做完；剩下三件事需要一次经用户授权的**带凭证**受控调用，待验清单已在 `docs/verification/phase2-controlled-verification.md` 顶部列出（沿用该清单既有的预算与停止条件）。
+- APIMart 的**图生图/遮罩分支已开放并已受控实测**（2026-09-19，见上）；仍未测的是 `sunburst` 的图生图（与 flare 同渠道族、同端点、同参数面）、`base64` 路径，以及 20MB / 16 张 / 256MB 这些**边界**——代码已按文档上限拒绝（单张 20MB + 单次总量 256MB），但没有逐个压测。
 - **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。
 - `task_id` 不用于跨调用恢复（需新增列与拆分端口，属独立工作项）；
 - 火山方舟/Seedream、直连 OpenAI、多图与 `stream`/`tools` 不在本阶段；
