@@ -2,7 +2,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
     ApplicationError, AssetRecord, AttemptFailure, ClaimedJob, CompleteJob, HoldDisposition,
-    HubRepository, JobView, LeaseRecovery, PublishRuntimeCommand, ReconciliationCaseView,
+    HubRepository, JobView, LeaseRecovery, PublishRuntimeRequest, ReconciliationCaseView,
     RefundReconciliationCommand, RoutingDecision,
 };
 use seeai_domain::{
@@ -77,17 +77,17 @@ impl PgHubRepository {
 impl HubRepository for PgHubRepository {
     async fn publish_runtime(
         &self,
-        command: PublishRuntimeCommand,
+        request: PublishRuntimeRequest,
     ) -> Result<PublishedRevision, ApplicationError> {
         let revision_id = RuntimeRevisionId::new();
         let now = Utc::now();
-        let actor = command.actor.clone();
-        let vendor_id = command.vendor_id.clone();
-        let native_model_id = command.native_model_id.clone();
-        let native_revision = command.native_revision.clone();
-        // 形状判别与逐候选校验已在 RuntimeService::publish 完成；这里只处理
-        // 「已归一、已校验」的有序候选列表。
-        let offerings = command.normalized;
+        let PublishRuntimeRequest {
+            vendor_id,
+            native_model_id,
+            native_revision,
+            actor,
+            offerings,
+        } = request;
         if offerings.is_empty() {
             return Err(ApplicationError::Validation(
                 "publish requires at least one offering".to_owned(),

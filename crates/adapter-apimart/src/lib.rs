@@ -6,8 +6,10 @@
 //! 平台对外仍是"持久 Job + 可查询"（`docs/design/0004` R1/R2），上游的异步形态不外泄。
 //!
 //! 计费相关：任务成功响应含**四分项 `usage`**（`input_tokens_details` 区分 text/image，
-//! 另有 `cached_tokens`），归一到领域 `TokenUsage`。响应里的 `cost`/`credits_cost` 只记录
-//! 不参与结算——平台按 token × 费率计价，与 AIHubMix 口径一致。
+//! 另有 `cached_tokens`），归一到领域 `TokenUsage`。平台按 token × 费率计价，与 AIHubMix
+//! 口径一致；响应里的 `cost`/`credits_cost` **本阶段既不采纳也不留存**（它们受账号折扣
+//! 影响，见 `docs/facts/channel-facts.md` §3.3）——若将来要按上游声明金额结算，那需要先
+//! 结清 `docs/adr/0012` 并扩展领域证据形态，不是在 Driver 里顺手记下就算数。
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};

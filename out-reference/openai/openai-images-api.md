@@ -1,8 +1,8 @@
 # OpenAI Images API（gpt-image-2）参数参考
 
 > **本文是 OpenAI 官方 API 契约，与任何网关/中转服务无关。**
-> 来源：[Create image](https://developers.openai.com/api/reference/resources/images/methods/generate)、
-> [Create image edit](https://developers.openai.com/api/reference/resources/images/methods/edit)
+> 来源：[Create image](https://developers.openai.com/api/reference/resources/images/methods/generate/index.md)、
+> [Create image edit](https://developers.openai.com/api/reference/resources/images/methods/edit/index.md)
 > 及 openai/openai-python 类型定义（image_generate_params / image_edit_params）。以官方最新文档为准。
 
 ## 端点

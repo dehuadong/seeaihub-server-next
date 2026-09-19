@@ -54,12 +54,22 @@ pub struct PublishRuntimeCommand {
     #[serde(default)]
     pub price_plan: Option<PricePlanDraft>,
     pub actor: String,
-    /// 由 [`PublishRuntimeCommand::normalize`] 填充，**不接受调用方输入**。
-    ///
-    /// 存在的理由：形状判别与逐候选校验只做一次（在 `RuntimeService::publish` 内），
-    /// 而仓库层拿到的是"已归一、已校验"的列表。`skip_deserializing` 保证 HTTP 请求无法直接塞入它。
-    #[serde(skip_deserializing, skip_serializing, default)]
-    pub normalized: Vec<NormalizedOffering>,
+}
+
+/// 发布请求的**已校验**形态：由 [`PublishRuntimeCommand::into_request`] 产出
+/// （在逐候选校验之后），是仓库端口 `publish_runtime` 接收的唯一形态。
+///
+/// 为什么与 [`PublishRuntimeCommand`] 分开：命令是"线上格式"，允许两种线格式与
+/// 各自的必填规则；请求是"已经检查过、可以落库的东西"。分开之后，数据库那层的入口
+/// **在类型上**就只接受已核验的数据——绕开 `RuntimeService::publish` 直接调端口不再可能。
+#[derive(Debug, Clone)]
+pub struct PublishRuntimeRequest {
+    pub vendor_id: String,
+    pub native_model_id: String,
+    pub native_revision: String,
+    pub actor: String,
+    /// 有序候选集：下标即 `routing_priority`。
+    pub offerings: Vec<NormalizedOffering>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -121,6 +131,18 @@ pub struct NormalizedOffering {
 }
 
 impl PublishRuntimeCommand {
+    /// 消费命令，产出已校验的发布请求。
+    #[must_use]
+    pub fn into_request(self, offerings: Vec<NormalizedOffering>) -> PublishRuntimeRequest {
+        PublishRuntimeRequest {
+            vendor_id: self.vendor_id,
+            native_model_id: self.native_model_id,
+            native_revision: self.native_revision,
+            actor: self.actor,
+            offerings,
+        }
+    }
+
     /// 把两种形状归一到同一个有序候选列表。
     ///
     /// 这是发布接口**唯一**的形状判别点：`apps/api` 的 `Json<PublishRuntimeCommand>` 反序列化
@@ -146,11 +168,10 @@ impl PublishRuntimeCommand {
                 "offerings is present, so the flat field {field} must be omitted"
             )));
         }
-        if self.capability_schema.is_some() {
-            return Err(ApplicationError::Validation(
-                "offerings is present, so the flat field capability_schema must be omitted"
-                    .to_owned(),
-            ));
+        if let Some(field) = self.flat_extras_present() {
+            return Err(ApplicationError::Validation(format!(
+                "offerings is present, so the flat field {field} must be omitted"
+            )));
         }
         if self.flat_restrictions_present() {
             return Err(ApplicationError::Validation(
@@ -198,6 +219,12 @@ impl PublishRuntimeCommand {
         let missing = |field: &str| {
             ApplicationError::Validation(format!("{field} is required when offerings is absent"))
         };
+        // 同一份字段清单驱动这里：任何一个缺失都拒绝（与数组形式的"必须全部为空"对称）。
+        for (field, value) in self.flat_fields() {
+            if value.is_none() {
+                return Err(missing(field));
+            }
+        }
         let capability_schema = self
             .capability_schema
             .clone()
@@ -234,25 +261,36 @@ impl PublishRuntimeCommand {
         }])
     }
 
-    /// 数组形式下**必须全部为空**的扁平字段清单（规划 §3.1）。
+    /// 扁平形式必填的字段清单——**唯一一份**。
     ///
-    /// `restrictions` 也在其中：它同样是"单个供给"的扁平字段，在数组形式下必须由每个
-    /// 候选自带——否则调用方以为设置了限制，实际被静默忽略。
+    /// 它同时驱动两件事：数组形式下的"必须全部为空"检查，与扁平形式下的"必须齐备"检查。
+    /// 只留一处枚举的理由：分成两份时，漏改一处就会产生"检查了一半"——
+    /// 程序不报错，但校验已经不完整。
+    fn flat_fields(&self) -> [(&'static str, Option<&str>); 5] {
+        [
+            ("provider_kind", self.provider_kind.as_deref()),
+            ("adapter_key", self.adapter_key.as_deref()),
+            ("provider_model_id", self.provider_model_id.as_deref()),
+            ("base_url", self.base_url.as_deref()),
+            ("credential_env", self.credential_env.as_deref()),
+        ]
+    }
+
+    /// 数组形式下**必须全部为空**的扁平字段（规划 §3.1）。
+    ///
+    /// 除上表外还含 `capability_schema` 与 `price_plan`（见 [`Self::flat_extras_present`]）。
+    /// `restrictions` 只在**非空**时才算"被给出"：它带 `#[serde(default)]`，缺省即空对象，
+    /// 无法与显式写 `{}` 区分——而空的 `restrictions` 不携带信息，忽略它没有风险。
     fn first_present_flat_field(&self) -> Option<&'static str> {
-        if self.provider_kind.is_some() {
-            return Some("provider_kind");
-        }
-        if self.adapter_key.is_some() {
-            return Some("adapter_key");
-        }
-        if self.provider_model_id.is_some() {
-            return Some("provider_model_id");
-        }
-        if self.base_url.is_some() {
-            return Some("base_url");
-        }
-        if self.credential_env.is_some() {
-            return Some("credential_env");
+        self.flat_fields()
+            .into_iter()
+            .find_map(|(name, value)| value.is_some().then_some(name))
+    }
+
+    /// 扁平形式里那两个"不是简单字符串"的字段是否被给出。
+    fn flat_extras_present(&self) -> Option<&'static str> {
+        if self.capability_schema.is_some() {
+            return Some("capability_schema");
         }
         if self.price_plan.is_some() {
             return Some("price_plan");
@@ -260,9 +298,7 @@ impl PublishRuntimeCommand {
         None
     }
 
-    /// `restrictions` 的"是否被显式给出"与其它扁平字段不同：它带 `#[serde(default)]`，
-    /// 缺省时是空对象，无法与"显式写了 `{}`"区分。因此只在它**非空**时按扁平字段拒绝——
-    /// 空的 `restrictions` 不携带任何信息，忽略它是安全的；非空则必须拒绝。
+    /// `restrictions` 是否被显式给出（见 [`Self::first_present_flat_field`] 的说明）。
     fn flat_restrictions_present(&self) -> bool {
         self.restrictions
             .as_object()
@@ -336,36 +372,40 @@ fn select_candidate(
         )));
     }
     let revision_id = candidates[0].runtime_revision_id;
-    // 先算出**每一个**候选的取舍，再挑第一个合格的。这样 `considered` 记录的是完整的
-    // 取舍画面（每个候选各自的 priority 与 eligible），而不是"评估到命中为止"的部分清单
-    // ——它是判定记录，不是求值轨迹。
-    let mut evaluated = Vec::with_capacity(candidates.len());
-    for candidate in candidates {
-        let published = candidate.clone().into_published();
-        let mut skip_reason = None;
-        if let Err(error) = validate_restrictions(branch, asset_bindings, &candidate.restrictions) {
-            skip_reason = Some(error.to_string());
-        } else if let Err(error) = validate_native_request(command, &published) {
-            skip_reason = Some(error.to_string());
-        }
-        evaluated.push((published, skip_reason));
-    }
-    let considered: Vec<ConsideredCandidate> = candidates
+    // 把每个候选连它的取舍结果一起算出来。`considered` 要记录**完整**的取舍画面，
+    // 而不是"评估到命中为止"的部分清单——它是判定记录，不是求值轨迹。
+    let evaluated: Vec<(PublishedOffering, ConsideredCandidate)> = candidates
         .iter()
-        .zip(&evaluated)
-        .map(|(candidate, (_, skip_reason))| ConsideredCandidate {
-            offering_id: candidate.offering_id,
-            provider_kind: candidate.provider_kind.clone(),
-            routing_priority: candidate.routing_priority,
-            eligible: skip_reason.is_none(),
-            skip_reason: skip_reason.clone(),
+        .map(|candidate| {
+            let published = candidate.clone().into_published();
+            let mut skip_reason = None;
+            if let Err(error) =
+                validate_restrictions(branch, asset_bindings, &candidate.restrictions)
+            {
+                skip_reason = Some(error.to_string());
+            } else if let Err(error) = validate_native_request(command, &published) {
+                skip_reason = Some(error.to_string());
+            }
+            let considered = ConsideredCandidate {
+                offering_id: candidate.offering_id,
+                provider_kind: candidate.provider_kind.clone(),
+                routing_priority: candidate.routing_priority,
+                eligible: skip_reason.is_none(),
+                skip_reason,
+            };
+            (published, considered)
         })
         .collect();
-    if let Some(index) = evaluated
+    // 第一个合格候选胜出；不合格的留作诊断信息。
+    let chosen = evaluated
         .iter()
-        .position(|(_, skip_reason)| skip_reason.is_none())
-    {
-        let (published, _) = evaluated.swap_remove(index);
+        .position(|(_, considered)| considered.eligible);
+    if let Some(chosen) = chosen {
+        let considered = evaluated
+            .iter()
+            .map(|(_, considered)| considered.clone())
+            .collect::<Vec<_>>();
+        let (published, _) = evaluated.into_iter().nth(chosen).expect("index just found");
         let decision = RoutingDecision {
             runtime_revision_id: revision_id,
             chosen_offering_id: published.offering_id,
@@ -373,14 +413,14 @@ fn select_candidate(
         };
         return Ok((published, decision));
     }
-    let reasons = considered
+    let reasons = evaluated
         .iter()
-        .map(|item| {
+        .map(|(_, considered)| {
             format!(
                 "{}#{}: {}",
-                item.provider_kind,
-                item.routing_priority,
-                item.skip_reason.as_deref().unwrap_or("unknown")
+                considered.provider_kind,
+                considered.routing_priority,
+                considered.skip_reason.as_deref().unwrap_or("unknown")
             )
         })
         .collect::<Vec<_>>()
@@ -505,10 +545,11 @@ pub enum ApplicationError {
 
 #[async_trait]
 pub trait HubRepository: Send + Sync {
-    /// 发布一次 Runtime Revision。返回该 Revision 与它为这个型号写入的**完整候选集合**。
+    /// 发布一次 Runtime Revision。**只接受已核验的请求**（见 [`PublishRuntimeRequest`]）。
+    /// 返回该 Revision 与它为这个型号写入的**完整候选集合**。
     async fn publish_runtime(
         &self,
-        command: PublishRuntimeCommand,
+        request: PublishRuntimeRequest,
     ) -> Result<PublishedRevision, ApplicationError>;
 
     /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
@@ -815,13 +856,8 @@ impl RuntimeService {
         for offering in offerings {
             normalized.push(self.validate_offering(&command, offering)?);
         }
-        let revision = self
-            .repository
-            .publish_runtime(PublishRuntimeCommand {
-                normalized,
-                ..command
-            })
-            .await?;
+        let request = command.into_request(normalized);
+        let revision = self.repository.publish_runtime(request).await?;
         Ok(revision)
     }
 
@@ -1770,7 +1806,6 @@ mod tests {
             offerings: None,
             price_plan: None,
             actor: "tester".to_owned(),
-            normalized: Vec::new(),
         }
     }
 
@@ -2004,7 +2039,7 @@ mod tests {
     impl HubRepository for WorkerRepository {
         async fn publish_runtime(
             &self,
-            _command: PublishRuntimeCommand,
+            _request: PublishRuntimeRequest,
         ) -> Result<PublishedRevision, ApplicationError> {
             unused_repository()
         }

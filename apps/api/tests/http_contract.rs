@@ -240,20 +240,41 @@ async fn serve_fake_upstream(
     socket: &mut tokio::net::TcpStream,
     calls: UpstreamCalls,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
-    let mut buffer = vec![0_u8; 8192];
-    let read = socket.read(&mut buffer).await?;
-    let request = String::from_utf8_lossy(&buffer[..read]).to_string();
-    let request_line = request.lines().next().unwrap_or_default().to_owned();
-    let mut parts = request_line.split_whitespace();
-    let method = parts.next().unwrap_or_default().to_owned();
-    let path = parts.next().unwrap_or_default().to_owned();
-    let body = request
-        .split("\r\n\r\n")
-        .nth(1)
-        .unwrap_or_default()
-        .to_owned();
+    // 正经读完一个请求：请求行 + 头 + 按 Content-Length 读满请求体。
+    // 不能只 read 一次就假设整条请求都到了——网络会把请求拆成几段，
+    // 那样断言请求体的测试会偶发失败（看起来像代码错，其实是测试不稳）。
+    let (method, path, body) = {
+        let mut reader = BufReader::new(&mut *socket);
+        let mut request_line = String::new();
+        reader.read_line(&mut request_line).await?;
+        let mut parts = request_line.split_whitespace();
+        let method = parts.next().unwrap_or_default().to_owned();
+        let path = parts.next().unwrap_or_default().to_owned();
+
+        let mut content_length = 0_usize;
+        loop {
+            let mut header = String::new();
+            if reader.read_line(&mut header).await? == 0 {
+                break;
+            }
+            let header = header.trim_end();
+            if header.is_empty() {
+                break;
+            }
+            if let Some((name, value)) = header.split_once(':')
+                && name.eq_ignore_ascii_case("content-length")
+            {
+                content_length = value.trim().parse().unwrap_or(0);
+            }
+        }
+        let mut body = vec![0_u8; content_length];
+        if content_length > 0 {
+            reader.read_exact(&mut body).await?;
+        }
+        (method, path, String::from_utf8_lossy(&body).to_string())
+    };
     if let Ok(mut calls) = calls.lock() {
         calls.push((method.clone(), path.clone(), body));
     }
