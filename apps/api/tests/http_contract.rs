@@ -201,6 +201,28 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
         submit_body.get("extra").is_none(),
         "APIMart takes parameters at the top level"
     );
+    // 第 24 条「不改写原生字段」：线上请求体的键，名字与 Profile 声明**逐字相同**，
+    // 且不出现 Profile 未声明的字段（含内部包装字段）。
+    let material: Value = serde_json::from_str(include_str!(
+        "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
+    ))
+    .expect("APIMart material parses");
+    let declared = material["offerings"][0]["capability_schema"]["properties"]
+        .as_object()
+        .expect("declared properties");
+    let sent = submit_body.as_object().expect("sent body object");
+    for name in sent.keys() {
+        assert!(
+            declared.contains_key(name),
+            "the driver sent `{name}`, which the profile does not declare"
+        );
+    }
+    for name in ["model", "prompt"] {
+        assert!(
+            sent.contains_key(name),
+            "the driver must send `{name}` verbatim"
+        );
+    }
     let polls = calls
         .iter()
         .filter(|(method, path, _)| method == "GET" && path.starts_with("/v1/tasks/"))
@@ -669,6 +691,132 @@ async fn multiple_active_offerings_route_by_priority() {
         active, 1,
         "republishing must atomically replace the model's active candidates"
     );
+    drop_isolated_database(&database_name).await;
+}
+
+/// 第二阶段的**发布素材**要真的能用，并且每个候选要带自己的那份 Profile
+/// （规划 §6 第 21、22 条）。
+///
+/// 用 `config/bootstrap/` 里已备好的 2.5 素材发布：AIHubMix 与 APIMart 供同一型号。
+/// 两家 Profile 内容不同（AIHubMix 有 `extra`，APIMart 参数在顶层），正是"候选各自携带
+/// Profile"要覆盖的情形。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let base_url = format!("http://127.0.0.1:{port}");
+    let admin_token = format!("material-admin-{}", Uuid::new_v4());
+    let asset_root = std::env::temp_dir().join(format!("seeai-material-{}", Uuid::new_v4()));
+    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
+        .env("DATABASE_URL", &database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", &admin_token)
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", &asset_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("API process should start");
+    let _process = ApiProcess { child, asset_root };
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // 两份素材分别是各自的完整发布命令（一个候选）。
+    let aihubmix: Value = serde_json::from_str(include_str!(
+        "../../../config/bootstrap/aihubmix-gpt-image-2.5-flare.json"
+    ))
+    .expect("AIHubMix 2.5 material parses");
+    let apimart: Value = serde_json::from_str(include_str!(
+        "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
+    ))
+    .expect("APIMart 2.5 material parses");
+    let model = aihubmix["native_model_id"]
+        .as_str()
+        .expect("native model id")
+        .to_owned();
+    assert_eq!(
+        apimart["native_model_id"], aihubmix["native_model_id"],
+        "both materials must supply the same vendor model"
+    );
+    // 两家的 Profile 内容必须真的不同——否则第 22 条没有被覆盖。
+    let aihubmix_schema = &aihubmix["offerings"][0]["capability_schema"];
+    let apimart_schema = &apimart["offerings"][0]["capability_schema"];
+    assert_ne!(
+        aihubmix_schema, apimart_schema,
+        "this test only covers condition 22 if the two profiles actually differ"
+    );
+
+    // 合并成一次发布：两个候选，顺序即优先级。
+    let merged = json!({
+        "vendor_id": aihubmix["vendor_id"],
+        "native_model_id": aihubmix["native_model_id"],
+        "native_revision": "stage-two-material-1",
+        "actor": "contract-test",
+        "offerings": [aihubmix["offerings"][0], apimart["offerings"][0]]
+    });
+    let published = client
+        .post(format!("{base_url}/admin/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&merged)
+        .send()
+        .await
+        .expect("publication request");
+    assert_eq!(
+        published.status(),
+        StatusCode::OK,
+        "the prepared 2.5 material must be publishable: {:?}",
+        published.text().await
+    );
+
+    // 第 22 条：每个候选携带**它自己**的那份 Profile——读回来的 schema 要分别等于
+    // 发布时给各自的那一份，而不是共享同一份。
+    let rows = sqlx::query(
+        "SELECT o.provider_model_id, o.adapter_key, c.provider_kind, vm.capability_schema
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         JOIN supply.channels c ON c.id = o.channel_id
+         JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+         WHERE re.active AND re.native_model_id = $1
+         ORDER BY re.routing_priority",
+    )
+    .bind(&model)
+    .fetch_all(&pool)
+    .await
+    .expect("candidate rows");
+    assert_eq!(rows.len(), 2, "both providers must be active candidates");
+
+    let schemas: Vec<Value> = rows
+        .iter()
+        .map(|row| row.try_get("capability_schema").expect("schema"))
+        .collect();
+    assert_ne!(
+        schemas[0], schemas[1],
+        "each candidate must carry its own profile, not a shared one"
+    );
+    // 第 21 条：每个候选的 provider_model_id / adapter_key 与它自己 Profile 的 model.const 一致。
+    for (index, expected) in [(0_usize, &aihubmix), (1, &apimart)].iter() {
+        let row = &rows[*index];
+        let offering = &expected["offerings"][0];
+        let provider_model_id: String = row.try_get("provider_model_id").expect("provider model");
+        let adapter_key: String = row.try_get("adapter_key").expect("adapter key");
+        assert_eq!(provider_model_id, offering["provider_model_id"]);
+        assert_eq!(adapter_key, offering["adapter_key"]);
+        assert_eq!(
+            schemas[*index], offering["capability_schema"],
+            "candidate {index} must carry its own profile"
+        );
+        assert_eq!(
+            schemas[*index]["properties"]["model"]["const"], model,
+            "each profile's model.const must equal the vendor model identity"
+        );
+    }
+
     drop_isolated_database(&database_name).await;
 }
 
