@@ -62,23 +62,6 @@ pub struct PublishRuntimeCommand {
     pub normalized: Vec<NormalizedOffering>,
 }
 
-/// 候选集合的宿主类型。用 `untagged` 是为了让 JSON 里的 `offerings` 就是**数组本身**
-/// （`"offerings": [ {...}, {...} ]`），而不是再套一层对象。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-#[serde(untagged)]
-pub enum Offerings {
-    Many(Vec<OfferingDraft>),
-}
-
-impl Offerings {
-    #[must_use]
-    pub fn into_vec(self) -> Vec<OfferingDraft> {
-        match self {
-            Self::Many(items) => items,
-        }
-    }
-}
-
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferingDraft {
     pub provider_kind: String,
@@ -183,6 +166,11 @@ impl PublishRuntimeCommand {
                         "offerings[{index}].price_plan is required"
                     ))
                 })?;
+                validate_price_formula(&price_plan).map_err(|message| {
+                    ApplicationError::Validation(format!(
+                        "offerings[{index}].price_plan: {message}"
+                    ))
+                })?;
                 Ok(NormalizedOffering {
                     capability_schema,
                     restrictions: draft.restrictions.clone(),
@@ -213,6 +201,8 @@ impl PublishRuntimeCommand {
             .price_plan
             .clone()
             .ok_or_else(|| missing("price_plan"))?;
+        validate_price_formula(&price_plan)
+            .map_err(|message| ApplicationError::Validation(format!("price_plan: {message}")))?;
         Ok(vec![NormalizedOffering {
             capability_schema,
             restrictions: self.restrictions.clone(),
@@ -283,6 +273,21 @@ pub struct RoutingDecision {
     pub runtime_revision_id: RuntimeRevisionId,
     pub chosen_offering_id: OfferingId,
     pub considered: Vec<ConsideredCandidate>,
+}
+
+/// 校验计价形态。
+///
+/// 本阶段**唯一启用** `token_rates`。`formula` 不落库（`pricing.price_plans` 没有该列），
+/// 它只是发布期的判别符——因此必须在这里拒绝未知取值，否则"只启用一种形态"只是注释。
+/// 后续若引入金额型口径（见 `docs/adr/0012`），在此放行并同时落地对应列与结算路径。
+fn validate_price_formula(price_plan: &PricePlanDraft) -> Result<(), String> {
+    if price_plan.formula != "token_rates" {
+        return Err(format!(
+            "unsupported formula {}; this phase only enables token_rates",
+            price_plan.formula
+        ));
+    }
+    Ok(())
 }
 
 fn empty_object() -> Value {
@@ -1862,6 +1867,42 @@ mod tests {
         };
         let error = command.normalize().expect_err("price plan is required");
         assert!(error.to_string().contains("price_plan"), "{error}");
+    }
+
+    #[test]
+    fn normalize_rejects_unsupported_price_formula() {
+        // 本阶段只启用 token_rates；其余形态（例如 adr/0012 的金额口径）必须显式拒绝，
+        // 而不是静默落库成一个它并不支持的计价形态。
+        let mut draft = draft("pm-a");
+        draft.price_plan = Some(PricePlanDraft {
+            formula: "upstream_charge".to_owned(),
+            ..price_plan()
+        });
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![draft]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("unknown formula must fail");
+        assert!(error.to_string().contains("token_rates"), "{error}");
+    }
+
+    #[test]
+    fn normalize_rejects_unsupported_formula_in_flat_form() {
+        let command = PublishRuntimeCommand {
+            capability_schema: Some(schema("gpt-image-2.5-flare")),
+            provider_kind: Some("AIHubMix".to_owned()),
+            adapter_key: Some("aihubmix-image-v1".to_owned()),
+            provider_model_id: Some("gpt-image-2.5-flare".to_owned()),
+            base_url: Some("https://api.inferera.com".to_owned()),
+            credential_env: Some("AIHUBMIX_API_KEY".to_owned()),
+            price_plan: Some(PricePlanDraft {
+                formula: "amount_only".to_owned(),
+                ..price_plan()
+            }),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("unknown formula must fail");
+        assert!(error.to_string().contains("token_rates"), "{error}");
     }
 
     #[test]

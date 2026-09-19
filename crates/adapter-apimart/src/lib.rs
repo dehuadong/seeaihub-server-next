@@ -60,11 +60,13 @@ impl AdapterFactory for ApimartAdapterFactory {
                 "mask_url",
             ],
             supported_extra_parameters: &[],
-            supported_branches: &[
-                ImageBranch::PromptOnly,
-                ImageBranch::ImageConditioned,
-                ImageBranch::Masked,
-            ],
+            // **本阶段只声明文生图**。参考图与遮罩不能用平台内的资产引用表达：
+            // 上游 `image_urls` 要求**公网可访问的 HTTP(S) URL**，本地资产必须先经
+            // `POST /v1/uploads/images` 换成可用 url（见 `docs/facts/channel-facts.md` §3.2）。
+            // 那条上传链路**未实现也未实测**，因此这里不声明、运行时显式拒绝——
+            // 发布期据此会把候选的 `allowed_branches` 收窄到 `prompt_only`，
+            // 使"声明的能力"与"Driver 真能做的"一致。
+            supported_branches: &[ImageBranch::PromptOnly],
             max_images: 16,
         })
     }
@@ -318,6 +320,16 @@ impl ImageAdapter for ApimartImageAdapter {
         request: PreparedImageRequest,
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError> {
+        // 参考图/遮罩需要公网可访问的 URL，平台本地资产必须先上传换取 url
+        // （`POST /v1/uploads/images`）。那条链路未实现，因此显式拒绝，而不是
+        // 把 `asset://…` 当成 URL 发出去让上游拒绝。
+        if request.branch != ImageBranch::PromptOnly || !request.assets.is_empty() {
+            return Err(AdapterError::UnsupportedInput(
+                "the APIMart driver is published for text-to-image only; reference images and masks \
+                 require uploading the asset to the provider first"
+                    .to_owned(),
+            ));
+        }
         // 1) 提交。**这一步之后绝不能重发**（规划 §4：创建请求绝不重发）；
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
         let task_id = self.submit(&request, credential).await?;
@@ -382,28 +394,9 @@ fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError
             object.insert(field.to_owned(), value.clone());
         }
     }
-    // 参考图与遮罩：平台资产在受理时已解析为可访问的字符串引用。
-    let images: Vec<Value> = request
-        .assets
-        .iter()
-        .filter(|asset| asset.native_parameter_path.starts_with("/images/"))
-        .map(|asset| Value::String(asset_reference(asset)))
-        .collect();
-    if !images.is_empty() {
-        object.insert("image_urls".to_owned(), Value::Array(images));
-    }
-    if let Some(mask) = request
-        .assets
-        .iter()
-        .find(|asset| asset.native_parameter_path == "/mask")
-    {
-        object.insert("mask_url".to_owned(), Value::String(asset_reference(mask)));
-    }
+    // 参考图与遮罩不在此组装：它们需要公网可访问的 URL，而本阶段只声明文生图
+    // （见 descriptor 与 execute 的说明）。`execute` 会在到达这里之前拒绝那些分支。
     Ok(Value::Object(object))
-}
-
-fn asset_reference(asset: &seeai_adapter_sdk::ResolvedAsset) -> String {
-    format!("asset://{}", asset.sha256)
 }
 
 fn required_string(parameters: &Value, pointer: &str) -> Result<Value, AdapterError> {
@@ -868,5 +861,45 @@ mod tests {
         }
         assert_eq!(descriptor.max_images, 16);
         assert!(factory.descriptor("some-other-key").is_none());
+    }
+
+    #[test]
+    fn descriptor_only_publishes_text_to_image() {
+        // 参考图/遮罩需要公网可访问的 URL，而本地资产必须先经 `POST /v1/uploads/images`
+        // 换取可用 url——那条链路未实现也未实测。因此**不得**声明这两条分支，
+        // 否则就是把"没做到的"说成"支持的"。
+        let descriptor = ApimartAdapterFactory
+            .descriptor(ADAPTER_KEY)
+            .expect("descriptor is declared");
+        assert_eq!(
+            descriptor.supported_branches,
+            &[ImageBranch::PromptOnly],
+            "only text-to-image may be declared until asset upload is implemented"
+        );
+    }
+
+    #[tokio::test]
+    async fn execute_rejects_reference_images_rather_than_sending_asset_refs() {
+        // 即使发布期校验被绕过，运行时也必须拒绝：绝不能把 `asset://…` 当作 URL 发出去。
+        let adapter = ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(5))
+            .expect("adapter config");
+        let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+        let request = PreparedImageRequest {
+            provider_model_id: "gpt-image-2.5-flare".to_owned(),
+            branch: ImageBranch::ImageConditioned,
+            native_parameters: serde_json::json!({"prompt": "x"}),
+            assets: vec![seeai_adapter_sdk::ResolvedAsset {
+                native_parameter_path: "/images/0".to_owned(),
+                position: 0,
+                media_type: "image/png".to_owned(),
+                sha256: "abc".to_owned(),
+                bytes: Bytes::from_static(b"image"),
+            }],
+        };
+        let error = adapter
+            .execute(request, &credential)
+            .await
+            .expect_err("reference images must be rejected");
+        assert!(error.to_string().contains("text-to-image only"), "{error}");
     }
 }

@@ -15,7 +15,7 @@
       "base_url": "https://api.apib.ai",
       "credential_env": "APIMART_API_KEY",
       "restrictions": {
-        "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
+        "allowed_branches": ["prompt_only"],
         "max_images": 16
       },
       "capability_schema": {
