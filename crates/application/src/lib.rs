@@ -152,6 +152,11 @@ impl PublishRuntimeCommand {
                     .to_owned(),
             ));
         }
+        if self.flat_restrictions_present() {
+            return Err(ApplicationError::Validation(
+                "offerings is present, so the flat field restrictions must be omitted".to_owned(),
+            ));
+        }
         drafts
             .iter()
             .enumerate()
@@ -229,6 +234,10 @@ impl PublishRuntimeCommand {
         }])
     }
 
+    /// 数组形式下**必须全部为空**的扁平字段清单（规划 §3.1）。
+    ///
+    /// `restrictions` 也在其中：它同样是"单个供给"的扁平字段，在数组形式下必须由每个
+    /// 候选自带——否则调用方以为设置了限制，实际被静默忽略。
     fn first_present_flat_field(&self) -> Option<&'static str> {
         if self.provider_kind.is_some() {
             return Some("provider_kind");
@@ -249,6 +258,15 @@ impl PublishRuntimeCommand {
             return Some("price_plan");
         }
         None
+    }
+
+    /// `restrictions` 的"是否被显式给出"与其它扁平字段不同：它带 `#[serde(default)]`，
+    /// 缺省时是空对象，无法与"显式写了 `{}`"区分。因此只在它**非空**时按扁平字段拒绝——
+    /// 空的 `restrictions` 不携带任何信息，忽略它是安全的；非空则必须拒绝。
+    fn flat_restrictions_present(&self) -> bool {
+        self.restrictions
+            .as_object()
+            .is_some_and(|map| !map.is_empty())
     }
 }
 
@@ -311,7 +329,8 @@ fn select_candidate(
     asset_bindings: &[AssetBinding],
 ) -> Result<(PublishedOffering, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
-        return Err(ApplicationError::Validation(format!(
+        // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误（规划 §6-20）。
+        return Err(ApplicationError::NotFound(format!(
             "no active offering for model {}",
             command.native_model_id
         )));
@@ -442,6 +461,8 @@ pub struct CompleteJob {
     pub outputs: Vec<AssetRecord>,
     pub evidence: MeteringEvidence,
     pub charge_microusd: u64,
+    /// 上游逐请求标识，写入 `attempts.provider_trace_id` 供人工对账（规划 §4）。
+    pub provider_trace_id: Option<String>,
 }
 
 #[derive(Debug, Clone)]
@@ -1443,6 +1464,7 @@ impl WorkerService {
                     usage: success.usage,
                 },
                 charge_microusd: charge,
+                provider_trace_id: success.provider_trace_id,
             })
             .await
     }
@@ -2219,6 +2241,7 @@ mod tests {
                     total_tokens: 205,
                 },
                 response_digest: "provider-response-digest".to_owned(),
+                provider_trace_id: Some("provider-request-1".to_owned()),
             })
         }
     }

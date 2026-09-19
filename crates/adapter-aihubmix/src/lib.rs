@@ -445,6 +445,12 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
 
 async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, AdapterError> {
     let status = response.status();
+    // 对账标识：上游的逐请求标识，只用于对账，不参与计价（见 CONTEXT.md 的 Generation Attempt）。
+    let provider_trace_id = response
+        .headers()
+        .get("x-request-id")
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_owned);
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
@@ -522,6 +528,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
         images,
         usage,
         response_digest: digest,
+        provider_trace_id,
     })
 }
 

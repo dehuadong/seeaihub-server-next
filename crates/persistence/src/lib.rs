@@ -944,6 +944,7 @@ impl HubRepository for PgHubRepository {
             outputs,
             evidence,
             charge_microusd,
+            provider_trace_id,
         } = completion;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
@@ -1003,7 +1004,7 @@ impl HubRepository for PgHubRepository {
             r#"
             UPDATE generation.attempts
             SET state = 'succeeded', response_digest = $3, metering_evidence = $4,
-                completed_at = now()
+                provider_trace_id = $5, completed_at = now()
             WHERE id = $1 AND job_id = $2 AND state = 'submitting'
             "#,
         )
@@ -1011,6 +1012,7 @@ impl HubRepository for PgHubRepository {
         .bind(job_id.0)
         .bind(&evidence.provider_response_digest)
         .bind(&evidence_json)
+        .bind(&provider_trace_id)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;

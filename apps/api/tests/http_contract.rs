@@ -168,6 +168,20 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
     assert_eq!(media_type, "image/png");
     assert_eq!(byte_count, PNG_FIXTURE.len() as i64);
 
+    // 对账标识落到**已存在**的 attempts.provider_trace_id 列（规划 §4/§6-13）：
+    // 该列此前只有 fail_job 在写，成功路径不写。
+    let trace_id: Option<String> =
+        sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("attempt trace id");
+    assert_eq!(
+        trace_id.as_deref(),
+        Some("task-contract-1"),
+        "the upstream task id must be persisted for manual reconciliation"
+    );
+
     // Driver 的线上请求：只提交一次，且参数在顶层（无 extra 包装）。
     let calls = calls.lock().expect("calls lock").clone();
     let submits = calls
@@ -294,12 +308,32 @@ fn port_of(socket: &tokio::net::TcpStream) -> u16 {
     socket.local_addr().map(|addr| addr.port()).unwrap_or(0)
 }
 
-/// 定位 `seeai-worker` 二进制。
+/// 定位 `seeai-worker` 二进制，**并保证它是当前源码构建的**。
 ///
-/// 它是**独立包**，Cargo 不会为它提供 `CARGO_BIN_EXE_*`；而端到端驱动验证需要
-/// 真实启动它。路径从当前测试可执行文件推导：`target/<profile>/deps/<test>` →
-/// `target/<profile>/seeai-worker`。
+/// 它是**独立包**，因此有两件事需要注意：
+/// 1. Cargo 不为它提供 `CARGO_BIN_EXE_*`，路径只能从当前测试可执行文件推导；
+/// 2. `cargo test -p seeai-api` 只会重建 `seeai-api` 与测试本身，**不会重建 `seeai-worker`**。
+///    于是测试可能在验证一个陈旧二进制——这曾真实导致一次误判（新增的
+///    `provider_trace_id` 断言失败，原因只是 worker 没重建）。所以在返回路径前**先构建一次**。
 fn worker_binary() -> PathBuf {
+    // 注意 profile 名的坑：`debug` 是保留名，构建 profile 叫 `dev`，
+    // 但它的产物目录是 `target/debug`。
+    let profile = if cfg!(debug_assertions) {
+        "dev"
+    } else {
+        "release"
+    };
+    let status = Command::new(env!("CARGO"))
+        .args(["build", "-p", "seeai-worker", "--profile", profile])
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .expect("cargo must be runnable from the test");
+    assert!(
+        status.success(),
+        "failed to build seeai-worker for the driver contract test"
+    );
+
     let test_binary = std::env::current_exe().expect("current test executable");
     let profile_dir = test_binary
         .parent()
@@ -312,7 +346,7 @@ fn worker_binary() -> PathBuf {
     });
     assert!(
         candidate.is_file(),
-        "worker binary not found at {}; run `cargo build --workspace` first",
+        "worker binary not found at {}",
         candidate.display()
     );
     candidate

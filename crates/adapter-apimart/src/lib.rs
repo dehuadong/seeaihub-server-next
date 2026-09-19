@@ -33,6 +33,10 @@ const MAX_OUTPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 const MAX_TOTAL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// 轮询间隔。文档建议 2~5 秒，取偏小值以缩短 Job 驻留时间。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
+/// 单次任务查询的瞬时失败重试次数上限（幂等读才允许重试）。
+const QUERY_RETRY_LIMIT: u32 = 3;
+/// 查询重试的退避基数：第 n 次失败后等待 `n × 基数`。
+const QUERY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// 单次 HTTP 调用的超时（提交与轮询各自适用）。整轮耗时由 `deadline` 约束。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
 
@@ -211,6 +215,40 @@ impl ApimartImageAdapter {
             })
     }
 
+    /// 单次任务查询，对瞬时失败做有界退避重试。
+    ///
+    /// 只重试**读**：创建请求已经在别的路径上发过且绝不重发。
+    async fn query_task(
+        &self,
+        task_id: &str,
+        credential: &ProviderCredential,
+    ) -> Result<Bytes, AdapterError> {
+        let mut attempt = 0_u32;
+        loop {
+            let url = self.endpoint(&format!("v1/tasks/{task_id}"))?;
+            let outcome = match self
+                .client
+                .get(url)
+                .bearer_auth(credential.expose())
+                .send()
+                .await
+            {
+                Ok(response) => read_body(response).await,
+                Err(error) => Err(ambiguous_transport_error(error)),
+            };
+            match outcome {
+                Ok(body) => return Ok(body),
+                Err(error) => {
+                    attempt += 1;
+                    if attempt > QUERY_RETRY_LIMIT {
+                        return Err(error);
+                    }
+                    tokio::time::sleep(QUERY_RETRY_BACKOFF * attempt).await;
+                }
+            }
+        }
+    }
+
     /// 轮询任务直到终态。
     async fn poll(
         &self,
@@ -227,14 +265,13 @@ impl ApimartImageAdapter {
                     RetrySafety::AcceptanceUnknown,
                 ));
             }
-            let response = self
-                .client
-                .get(self.endpoint(&format!("v1/tasks/{task_id}"))?)
-                .bearer_auth(credential.expose())
-                .send()
-                .await
-                .map_err(ambiguous_transport_error)?;
-            let body = read_body(response).await?;
+            // 任务查询是**幂等读**，因此可以安全重试：同一次执行内对瞬时失败退避重试
+            // 若干次（规划 §4 与 §6-9）。这与"创建请求绝不重发"不冲突——重试的是读。
+            // 用完次数后仍失败，则按"已受理但没取到结果"进对账（见 `after_acceptance`）。
+            let body = match self.query_task(task_id, credential).await {
+                Ok(body) => body,
+                Err(error) => return Err(after_acceptance(error)),
+            };
             let parsed: TaskEnvelope = serde_json::from_slice(&body).map_err(|error| {
                 provider_error(
                     "provider_response_invalid",
@@ -363,6 +400,9 @@ impl ImageAdapter for ApimartImageAdapter {
         Ok(ProviderSuccess {
             images,
             usage,
+            // 对账标识：任务式上游的 task id。只写入 attempts.provider_trace_id 供人工对账，
+            // **不用于跨调用自动恢复**（规划 §4/§5.3 的统一边界）。
+            provider_trace_id: Some(task_id),
             response_digest: digest,
         })
     }
@@ -624,19 +664,23 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
         (None, Some(name)) => name.to_owned(),
         (None, None) => format!("http_{}", status.as_u16()),
     };
-    let retry_safety = match raw_code {
-        // 400 参数错误：请求未被接受。
-        Some(400) => RetrySafety::NotRetryable,
-        // 401/402/403：凭据、余额或权限问题，重试同一配置无意义。
-        Some(401..=403) => RetrySafety::NotRetryable,
-        // 429 限流：**不能证明未生成**。
-        Some(429) => RetrySafety::AcceptanceUnknown,
-        // 500 且 message 以 build_request_failed 开头：参数错误被 500 承载。
-        Some(500) if message.starts_with("build_request_failed") => RetrySafety::NotRetryable,
-        // 其它 5xx：上游可能已受理。
-        Some(500..=599) => RetrySafety::AcceptanceUnknown,
-        // 无 code、未知 code、解析失败：一律按"受理状态不确定"处理。
-        _ => RetrySafety::AcceptanceUnknown,
+    let retry_safety = if message.starts_with("build_request_failed") {
+        // 参数校验错误被 5xx 承载：**判据是消息前缀，不是状态码也不是 code**。
+        // 文档只承诺这个前缀；若它出现在别的 code 下，同样说明请求未被接受。
+        RetrySafety::NotRetryable
+    } else {
+        match raw_code {
+            // 400 参数错误：请求未被接受。
+            Some(400) => RetrySafety::NotRetryable,
+            // 401/402/403：凭据、余额或权限问题，重试同一配置无意义。
+            Some(401..=403) => RetrySafety::NotRetryable,
+            // 429 限流：**不能证明未生成**。
+            Some(429) => RetrySafety::AcceptanceUnknown,
+            // 其它 5xx：上游可能已受理。
+            Some(500..=599) => RetrySafety::AcceptanceUnknown,
+            // 无 code、未知 code、解析失败：一律按"受理状态不确定"处理。
+            _ => RetrySafety::AcceptanceUnknown,
+        }
     };
     ProviderCallError {
         code,
@@ -654,6 +698,21 @@ fn provider_error(code: &str, message: String, retry_safety: RetrySafety) -> Ada
         retry_safety,
     }
     .into()
+}
+
+/// 创建**已成功**之后发生的错误：一律按"受理状态不确定"处理，交给平台进对账。
+///
+/// 与 [`ambiguous_transport_error`] 的区别只在语义来源：这里明确是"已确认生成、
+/// 只是这次没取到结果"，而不是"请求可能没发出去"。两者都落到同一个安全处置。
+fn after_acceptance(error: AdapterError) -> AdapterError {
+    match error {
+        AdapterError::Provider(provider) => provider_error(
+            &provider.code,
+            provider.message,
+            RetrySafety::AcceptanceUnknown,
+        ),
+        other => other,
+    }
 }
 
 /// 连接中断、超时、解析失败：请求**可能已经发出**，因此一律按受理状态不确定处理
@@ -861,6 +920,37 @@ mod tests {
         }
         assert_eq!(descriptor.max_images, 16);
         assert!(factory.descriptor("some-other-key").is_none());
+    }
+
+    #[test]
+    fn query_phase_errors_are_routed_to_reconciliation_not_to_failure() {
+        // 跨阶段例外（规划 §4）：创建已成功后，查询阶段返回「无效的任务ID」（HTTP 400）
+        // 必须处置为**对账**，而不是"未受理"式的失败并释放预授权。
+        let raw = parse_provider_error(StatusCode::BAD_REQUEST, &envelope(400, "无效的任务ID"));
+        // 就错误分类本身而言 400 仍是 NotRetryable（它确实是参数/资源问题）……
+        assert_eq!(raw.retry_safety, RetrySafety::NotRetryable);
+        // ……但 `poll` 对查询阶段的错误统一加一层 after_acceptance，改为不确定。
+        let adjusted = after_acceptance(AdapterError::Provider(raw));
+        match adjusted {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.retry_safety, RetrySafety::AcceptanceUnknown);
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn build_request_failed_is_recognised_by_message_prefix_not_by_code() {
+        // 文档只承诺这个前缀；即使它出现在别的 code 下，同样说明请求未被接受。
+        let error = parse_provider_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &envelope(503, "build_request_failed: unsupported size"),
+        );
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        // 无 code 但带前缀：同样判为未受理。
+        let body = br#"{"error":{"message":"build_request_failed: bad field"}}"#;
+        let error = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, body);
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
     }
 
     #[test]
