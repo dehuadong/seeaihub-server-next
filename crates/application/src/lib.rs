@@ -952,6 +952,8 @@ impl RuntimeService {
                 ApplicationError::Validation(format!("unknown adapter {}", offering.adapter_key))
             })?;
         validate_adapter_compatibility(&offering, &descriptor)?;
+        // 限制只能收窄：供货方不得声明 Profile 自己都没声明的能力。
+        validate_restrictions_within_profile(&offering)?;
         self.adapters
             .validate_publication(
                 &offering.adapter_key,
@@ -966,6 +968,99 @@ impl RuntimeService {
         )?;
         Ok(offering)
     }
+}
+
+/// 校验「Offering 的限制不超出该候选 Profile 自己声明的范围」。
+///
+/// 这是"Provider 限制只能**收窄**，不能放宽"的落地（`#2` 计划范围第 4 条、`ADR-0009`）。
+/// 与 [`validate_adapter_compatibility`] 的区别：后者比对的是 **Adapter 的能力面**（Driver
+/// 做不到的不许声明）；本函数比对的是 **Profile 自己声明的能力**（供货方不许替厂商放宽）。
+///
+/// Restrictions 的形状很小，目前只有两项，因此可判定地检查两项：
+/// - `allowed_branches`：每个分支都必须能在 Profile 的 `required`/`properties` 下成立；
+/// - `max_images`：不得超过 Profile 对参考图数量的声明。
+fn validate_restrictions_within_profile(
+    offering: &NormalizedOffering,
+) -> Result<(), ApplicationError> {
+    let schema = &offering.capability_schema;
+    let properties = schema.get("properties").and_then(Value::as_object);
+    let required: Vec<&str> = schema
+        .get("required")
+        .and_then(Value::as_array)
+        .map(|items| items.iter().filter_map(Value::as_str).collect())
+        .unwrap_or_default();
+    let declares = |name: &str| {
+        properties.is_some_and(|map| map.contains_key(name)) || required.contains(&name)
+    };
+    if let Some(branches) = offering
+        .restrictions
+        .get("allowed_branches")
+        .and_then(Value::as_array)
+    {
+        for branch in branches {
+            let (name, described) = match branch.as_str() {
+                Some("prompt_only") => ("prompt_only", declares("prompt")),
+                // 图生图/编辑需要参考图输入，Profile 必须声明 `image` 或 `images`。
+                Some("image_conditioned") => ("image_conditioned", {
+                    declares("image") || declares("images") || declares("image_urls")
+                }),
+                // 遮罩编辑还需要遮罩输入。
+                Some("masked") => ("masked", declares("mask") || declares("mask_url")),
+                Some(other) => {
+                    return Err(ApplicationError::Validation(format!(
+                        "restriction contains an unknown image branch {other}"
+                    )));
+                }
+                None => {
+                    return Err(ApplicationError::Validation(
+                        "allowed_branches must contain strings".to_owned(),
+                    ));
+                }
+            };
+            if !described {
+                return Err(ApplicationError::Validation(format!(
+                    "restriction allows branch {name}, which the profile does not declare"
+                )));
+            }
+        }
+    }
+    if let Some(max_images) = offering
+        .restrictions
+        .get("max_images")
+        .and_then(Value::as_u64)
+    {
+        let declared = declared_image_maximum(schema);
+        if max_images > declared {
+            return Err(ApplicationError::Validation(format!(
+                "restriction allows {max_images} image(s), but the profile declares at most {declared}"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// Profile 对参考图数量的声明上限。
+///
+/// 只看**数组形式**的 `images`/`image_urls`（它们在 JSON Schema 里用 `maxItems` 表达上界）；
+/// 单值形式（`image`/`mask`）按 1 计。没有任何参考图声明时上限为 0——没有那一项，
+/// 就不该允许带图请求。
+fn declared_image_maximum(schema: &Value) -> u64 {
+    let Some(properties) = schema.get("properties").and_then(Value::as_object) else {
+        return 0;
+    };
+    for name in ["images", "image_urls"] {
+        if let Some(maximum) = properties
+            .get(name)
+            .and_then(|field| field.get("maxItems"))
+            .and_then(Value::as_u64)
+        {
+            return maximum;
+        }
+    }
+    if properties.contains_key("image") || properties.contains_key("mask") {
+        return 1;
+    }
+    0
 }
 
 fn validate_adapter_compatibility(
@@ -1924,6 +2019,103 @@ mod tests {
         };
         let error = command.normalize().expect_err("price plan is required");
         assert!(error.to_string().contains("price_plan"), "{error}");
+    }
+
+    /// 造一个用于兼容性校验的候选：Profile 只声明给定的字段。
+    fn offering_with(schema_properties: Value, restrictions: Value) -> NormalizedOffering {
+        NormalizedOffering {
+            capability_schema: serde_json::json!({
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["model", "prompt"],
+                "properties": schema_properties
+            }),
+            restrictions,
+            provider_kind: "AIHubMix".to_owned(),
+            adapter_key: "aihubmix-image-v1".to_owned(),
+            provider_model_id: "m".to_owned(),
+            base_url: "https://api.inferera.com".to_owned(),
+            credential_env: "AIHUBMIX_API_KEY".to_owned(),
+            rates: PriceRates {
+                currency: "USD".to_owned(),
+                text_input_microusd_per_million: 5_000_000,
+                image_input_microusd_per_million: 8_000_000,
+                text_output_microusd_per_million: 10_000_000,
+                image_output_microusd_per_million: 30_000_000,
+            },
+            price_source_url: "https://example.invalid/price".to_owned(),
+            routing_priority: 0,
+        }
+    }
+
+    #[test]
+    fn restriction_declaring_an_undeclared_branch_is_rejected() {
+        // 反例一：Profile 只声明 prompt，却把 image_conditioned 放进允许分支。
+        // 这是"限制放宽"——供货方声明了 Profile 自己都没声明的东西。
+        let offering = offering_with(
+            serde_json::json!({"model": {"const": "m"}, "prompt": {"type": "string"}}),
+            serde_json::json!({"allowed_branches": ["prompt_only", "image_conditioned"]}),
+        );
+        let error = validate_restrictions_within_profile(&offering)
+            .expect_err("an undeclared branch must be rejected");
+        assert!(error.to_string().contains("does not declare"), "{error}");
+    }
+
+    #[test]
+    fn restriction_allowing_more_images_than_declared_is_rejected() {
+        // 反例二：Profile 只声明一张参考图，限制却允许 4 张。
+        let offering = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "images": {"type": "array", "maxItems": 1}
+            }),
+            serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 4}),
+        );
+        let error = validate_restrictions_within_profile(&offering)
+            .expect_err("more images than declared must be rejected");
+        assert!(error.to_string().contains("declares at most"), "{error}");
+    }
+
+    #[test]
+    fn restriction_staying_within_the_profile_is_accepted() {
+        // 正例：收窄（声明 image_conditioned/masked 且真的有对应字段；收图数不超过声明）。
+        let offering = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "images": {"type": "array", "maxItems": 4},
+                "mask": {"type": "string"}
+            }),
+            serde_json::json!({
+                "allowed_branches": ["image_conditioned", "masked"],
+                "max_images": 2
+            }),
+        );
+        assert!(validate_restrictions_within_profile(&offering).is_ok());
+    }
+
+    #[test]
+    fn restriction_cannot_allow_edits_when_only_one_image_is_supported() {
+        // 收窄的另一面：Profile 只有单图字段时，`max_images: 1` 合法、`2` 不合法。
+        let single = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "image": {"type": "string"}
+            }),
+            serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 1}),
+        );
+        assert!(validate_restrictions_within_profile(&single).is_ok());
+        let widened = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "image": {"type": "string"}
+            }),
+            serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 2}),
+        );
+        assert!(validate_restrictions_within_profile(&widened).is_err());
     }
 
     #[test]

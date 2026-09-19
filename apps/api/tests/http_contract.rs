@@ -236,19 +236,39 @@ struct FakeUpstream {
     _handle: tokio::task::JoinHandle<()>,
 }
 
+/// 假上游的可配置行为，用于构造验收第 9、10 条要的场景。
+#[derive(Default, Clone)]
+struct UpstreamBehaviour {
+    /// 任务查询先失败这么多次（返回 500），之后才给正常响应 —— 覆盖"查询可重试"。
+    query_failures: usize,
+    /// 任务查询先返回这么多次未在文档中出现的状态，之后才 completed —— 覆盖"未知状态继续轮询"。
+    unknown_status_times: usize,
+}
+
 async fn start_fake_upstream(calls: UpstreamCalls) -> FakeUpstream {
+    start_fake_upstream_with(calls, UpstreamBehaviour::default()).await
+}
+
+async fn start_fake_upstream_with(
+    calls: UpstreamCalls,
+    behaviour: UpstreamBehaviour,
+) -> FakeUpstream {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("fake upstream binds");
     let port = listener.local_addr().expect("addr").port();
+    // 查询行为按调用次数推进：第 n 次查询按 behaviour 决定失败/未知状态/正常。
+    let query_count = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
                 break;
             };
             let calls = calls.clone();
+            let behaviour = behaviour.clone();
+            let query_count = query_count.clone();
             tokio::spawn(async move {
-                let _ = serve_fake_upstream(&mut socket, calls).await;
+                let _ = serve_fake_upstream(&mut socket, calls, behaviour, query_count).await;
             });
         }
     });
@@ -261,6 +281,8 @@ async fn start_fake_upstream(calls: UpstreamCalls) -> FakeUpstream {
 async fn serve_fake_upstream(
     socket: &mut tokio::net::TcpStream,
     calls: UpstreamCalls,
+    behaviour: UpstreamBehaviour,
+    query_count: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -311,13 +333,36 @@ async fn serve_fake_upstream(
             .expect("submit body"),
         )
     } else if method == "GET" && path.starts_with("/v1/tasks/") {
+        // 第 n 次查询（1-based），用于构造瞬时失败与未知状态。
+        let attempt = query_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if attempt <= behaviour.query_failures {
+            // 瞬时失败：上游 500。查询是幂等读，Driver 应重试而不是让 Job 失败。
+            let payload = serde_json::to_vec(&json!({
+                "error": {"code": 500, "message": "temporary upstream failure"}
+            }))
+            .expect("failure body");
+            let head = format!(
+                "HTTP/1.1 500 Internal Server Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+                payload.len()
+            );
+            socket.write_all(head.as_bytes()).await?;
+            socket.write_all(&payload).await?;
+            socket.flush().await?;
+            return Ok(());
+        }
+        let status = if attempt <= behaviour.query_failures + behaviour.unknown_status_times {
+            // 未在文档中出现的状态值：Driver 必须继续轮询，不得当失败。
+            "queued_somewhere_new"
+        } else {
+            "completed"
+        };
         (
             "application/json",
             serde_json::to_vec(&json!({
                 "code": 200,
                 "data": {
                     "id": "task-contract-1",
-                    "status": "completed",
+                    "status": status,
                     "progress": 100,
                     "cost": 0.00476,
                     "credits_cost": 0.0476,
@@ -820,7 +865,183 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 第 9 条：任务**查询**的瞬时失败可以重试，Job 最终仍成功。
+///
+/// 查询是幂等读，重试它不会造成重复副作用；这与"创建请求绝不重发"并不冲突。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn transient_query_failure_is_retried_and_the_job_still_succeeds() {
+    let behaviour = UpstreamBehaviour {
+        query_failures: 1,
+        unknown_status_times: 0,
+    };
+    let outcome = run_driver_attempt(behaviour).await;
+    assert_eq!(
+        outcome.job_state, "succeeded",
+        "a transient query failure must be retried, not turned into a job failure"
+    );
+    assert_eq!(
+        outcome.submits, 1,
+        "the create request must never be resent"
+    );
+    assert!(
+        outcome.polls >= 2,
+        "expected at least two queries (one failure + one success), got {}",
+        outcome.polls
+    );
+    outcome.cleanup().await;
+}
+
+/// 第 10 条：未在文档中出现的状态值必须**继续轮询**，不得当失败。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn unknown_task_status_keeps_polling_instead_of_failing() {
+    let behaviour = UpstreamBehaviour {
+        query_failures: 0,
+        unknown_status_times: 1,
+    };
+    let outcome = run_driver_attempt(behaviour).await;
+    assert_eq!(
+        outcome.job_state, "succeeded",
+        "an undocumented status must not be treated as failure"
+    );
+    assert!(
+        outcome.polls >= 2,
+        "the driver must keep polling after an unknown status, got {} queries",
+        outcome.polls
+    );
+    outcome.cleanup().await;
+}
+
+struct DriverOutcome {
+    job_state: String,
+    submits: usize,
+    polls: usize,
+    database_name: String,
+}
+
+impl DriverOutcome {
+    async fn cleanup(&self) {
+        drop_isolated_database(&self.database_name).await;
+    }
+}
+
+/// 起 API + 假上游 + 真实 Worker，让一个 Job 走完整个驱动流程，返回它的结局。
+async fn run_driver_attempt(behaviour: UpstreamBehaviour) -> DriverOutcome {
+    let (database_url, database_name) = isolated_database_url().await;
+    let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+    let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
+    let upstream_base = format!("http://127.0.0.1:{}", upstream.port);
+
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let base_url = format!("http://127.0.0.1:{port}");
+    let admin_token = format!("driver-admin-{}", Uuid::new_v4());
+    let asset_root = std::env::temp_dir().join(format!("seeai-driver-{}", Uuid::new_v4()));
+    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
+        .env("DATABASE_URL", &database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", &admin_token)
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", &asset_root)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("API process should start");
+    let _process = ApiProcess {
+        child,
+        asset_root: asset_root.clone(),
+    };
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let model = "driver-model";
+    let mut draft = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
+    draft["base_url"] = Value::String(upstream_base);
+    draft["credential_env"] = Value::String("APIMART_API_KEY".to_owned());
+    let published = publish_candidates(&client, &base_url, &admin_token, model, vec![draft]).await;
+    assert_eq!(published, StatusCode::OK, "publication must succeed");
+
+    let key = format!("driver-{}", Uuid::new_v4());
+    let created = client
+        .post(format!("{base_url}/v1/image-generations"))
+        .bearer_auth(&api_key)
+        .json(&route_request(model, &key, "driver prompt"))
+        .send()
+        .await
+        .expect("generation accepted");
+    assert_eq!(created.status(), StatusCode::ACCEPTED);
+    let created: Value = created.json().await.expect("job JSON");
+    let job_id = Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID");
+
+    let mut worker = Command::new(worker_binary())
+        .env("DATABASE_URL", &database_url)
+        .env("WORKER_ID", "driver-contract-worker")
+        .env("WORKER_POLL_INTERVAL_MS", "200")
+        .env("WORKER_LEASE_SECONDS", "300")
+        .env("PROVIDER_TIMEOUT_SECONDS", "60")
+        .env("ASSET_STORE", "local")
+        .env("ASSET_LOCAL_ROOT", &asset_root)
+        .env("APIMART_API_KEY", "contract-test-key")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("worker process should start");
+
+    let mut job_state = String::new();
+    for _ in 0..600 {
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        job_state = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("job state");
+        if matches!(
+            job_state.as_str(),
+            "succeeded" | "failed" | "reconciliation_required"
+        ) {
+            break;
+        }
+    }
+    let _ = worker.kill();
+    let _ = worker.wait();
+
+    let calls = calls.lock().expect("calls lock").clone();
+    DriverOutcome {
+        job_state,
+        submits: calls
+            .iter()
+            .filter(|(method, path, _)| method == "POST" && path == "/v1/images/generations")
+            .count(),
+        polls: calls
+            .iter()
+            .filter(|(method, path, _)| method == "GET" && path.starts_with("/v1/tasks/"))
+            .count(),
+        database_name,
+    }
+}
+
 fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value {
+    // Profile 必须与声明的分支自洽：声明 `image_conditioned` 就要有参考图字段，
+    // 声明 `masked` 就要有遮罩字段。发布期会拒绝不自洽的声明（限制只能收窄）。
+    let mut properties = json!({
+        "model": {"const": "placeholder"},
+        "prompt": {"type": "string", "minLength": 1}
+    });
+    let declares_image = branches
+        .iter()
+        .any(|branch| matches!(*branch, "image_conditioned" | "masked"));
+    if declares_image {
+        properties["image"] = json!({"type": "string", "minLength": 1});
+    }
+    if branches.contains(&"masked") {
+        properties["mask"] = json!({"type": "string", "minLength": 1});
+    }
     json!({
         "provider_kind": provider_kind,
         "adapter_key": adapter_key,
@@ -829,16 +1050,14 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
         "credential_env": "AIHUBMIX_API_KEY",
         "restrictions": {
             "allowed_branches": branches,
-            "max_images": 1
+            // 收图上限也要与 Profile 自洽：纯文生图只声明 prompt，收图数就是 0。
+            "max_images": if declares_image { 1 } else { 0 }
         },
         "capability_schema": {
             "type": "object",
             "additionalProperties": false,
             "required": ["model", "prompt"],
-            "properties": {
-                "model": {"const": "placeholder"},
-                "prompt": {"type": "string", "minLength": 1}
-            }
+            "properties": properties
         },
         "price_plan": {
             "formula": "token_rates",
