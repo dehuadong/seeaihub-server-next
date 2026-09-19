@@ -2394,6 +2394,8 @@ mod tests {
     struct WorkerStore {
         events: Arc<Mutex<Vec<&'static str>>>,
         keys: Mutex<Vec<String>>,
+        /// 置 true 时 `put` 失败，用于构造"已确认生成但归档失败"的路径。
+        fail_put: bool,
     }
 
     #[async_trait]
@@ -2408,6 +2410,11 @@ mod tests {
                 .lock()
                 .map_err(|error| ApplicationError::ObjectStorage(error.to_string()))?
                 .push("store");
+            if self.fail_put {
+                return Err(ApplicationError::ObjectStorage(
+                    "archive unavailable in worker test".to_owned(),
+                ));
+            }
             self.keys
                 .lock()
                 .map_err(|error| ApplicationError::ObjectStorage(error.to_string()))?
@@ -2552,6 +2559,7 @@ mod tests {
         let store = Arc::new(WorkerStore {
             events: events.clone(),
             keys: Mutex::new(Vec::new()),
+            fail_put: false,
         });
         let adapter = Arc::new(WorkerAdapter {
             succeeds: true,
@@ -2588,6 +2596,7 @@ mod tests {
         let store = Arc::new(WorkerStore {
             events,
             keys: Mutex::new(Vec::new()),
+            fail_put: false,
         });
         let adapter = Arc::new(WorkerAdapter {
             succeeds: false,
@@ -2618,6 +2627,63 @@ mod tests {
                 .lock()
                 .expect("completion lock")
                 .is_none()
+        );
+    }
+
+    /// 第 11 条的第二种对账：**已确认生成、但归档失败**。
+    ///
+    /// 与第一种（创建阶段失联）的区别在这条路径上体现为**错误码不同**：
+    /// 这里是 `result_delivery_failed`，而创建阶段失联用 adapter 报的错误码。
+    /// 两者都进对账并保留预授权，但性质可分。
+    #[tokio::test]
+    async fn worker_sends_delivery_failure_to_reconciliation_with_its_own_code() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let repository = Arc::new(WorkerRepository::new(worker_job(), events.clone()));
+        // 上游成功，但归档不可用——生成已经发生，因此只能对账，不能当失败。
+        let store = Arc::new(WorkerStore {
+            events,
+            keys: Mutex::new(Vec::new()),
+            fail_put: true,
+        });
+        let adapter = Arc::new(WorkerAdapter {
+            succeeds: true,
+            calls: AtomicUsize::new(0),
+        });
+
+        assert!(
+            worker(repository.clone(), store, adapter.clone())
+                .run_once()
+                .await
+                .expect("worker run must converge")
+        );
+        assert_eq!(
+            adapter.calls.load(Ordering::SeqCst),
+            1,
+            "the provider was called exactly once; delivery failure must not retry it"
+        );
+        let failure = repository
+            .failure
+            .lock()
+            .expect("failure lock")
+            .take()
+            .expect("delivery failure must be recorded");
+        assert_eq!(
+            failure.code, "result_delivery_failed",
+            "the delivery failure must carry its own code, distinct from acceptance-unknown"
+        );
+        assert_eq!(failure.target_state, JobState::ReconciliationRequired);
+        assert_eq!(
+            failure.hold_disposition,
+            HoldDisposition::RetainForReconciliation,
+            "a generated result must keep the hold for reconciliation"
+        );
+        assert!(
+            repository
+                .completion
+                .lock()
+                .expect("completion lock")
+                .is_none(),
+            "no settlement may happen when the result could not be archived"
         );
     }
 }
