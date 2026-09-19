@@ -39,9 +39,13 @@ www.apimart.ai/api/pricing
 | 关系式 | `Base cost` = 各分项 token × 各自费率之和；`Actual cost` = `Base cost` × 各 ratio；`Credits = Actual cost × 10` |
 | 实例 | 29/1024/196 tokens ⇒ Base **$0.014217** ⇒ Actual **$0.011374**（0.11374 Credits）；33/1024/196 ⇒ Base **$0.014237** ⇒ Actual **$0.011390**（0.11390 Credits） |
 
-**因此**：`Base cost` = "费率 × 真实分项 token"；`Actual cost` = Base × 账号倍率。**上游声明的是折后账号价**（随分组变化），**不能**当作可复现的计量事实——这正是 `docs/adr/0012` 在本阶段作废的原因之一。缓存档位我们目前**没有**对应字段，`cached_tokens` 也被丢弃——见 `docs/facts/channel-facts.md` §3.6/§3.9。
+**因此**：`Base cost` = "费率 × 真实分项 token"；`Actual cost` = Base × 账号倍率。**上游声明的 `cost` 就是本笔的成本价**（它等于 `Actual cost`）；`Base cost` 与公开费率只是解释差额、并做平台侧结算基数。
 
-**平台侧只做成本侧**：拿到上游费率与公式后，**平台成本价 = list 费率 × 0.8**（文本in $4 / 图片in $6.40 / 文本out $8 / 图片out $24，每 1M）。平台**对外价**（加价、是否让利、缓存档是否单独定价）属**后期产品决定**，本阶段不做——见 `docs/facts/channel-facts.md` §3.9.3。
+**注意这条与 AIHubMix 的分工**：**APIMart 直接给金额**，成本价取 `cost` 即可，**不要**再用公开费率乘倍率重算（倍率随账号变化，重算会引入失真）；**AIHubMix 只给四分项 token、不给金额**，成本价才需要按四档 token 费率自算。两者的共同点是都有四分项 token，所以平台侧 `TokenUsage` 归一不变（见 `docs/facts/channel-facts.md` §3.9.1）。
+
+**平台侧只做成本侧**：平台**对外价**（加价、让利）属**后期产品决定**，本阶段不做。**按 Tokens 计费不考虑缓存**——不为缓存加字段、也不作为待办。见 `docs/facts/channel-facts.md` §3.9。
+
+**上游声明金额与 `docs/adr/0012`**：上游声明的金额随账号倍率变化，**不是可复现的计量事实**，因此平台的**计量事实**仍是四分项 token，结算由分项 token 推出（这正是 `docs/adr/0012` 在本阶段作废的原因之一）；而它作为**成本价**（本阶段要的东西）是直接可用的。
 
 **来源**：用户 2026-09-19 在会话中提供的上游控制台"详情"面板截图。截图含 `task_id` 与 API 密钥标签，**不入库**；本文件只转录费率、倍率、token 数与金额。逐笔核对表见 `docs/facts/channel-facts.md` §3.9。
 

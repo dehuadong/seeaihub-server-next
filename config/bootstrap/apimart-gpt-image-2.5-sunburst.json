@@ -88,7 +88,7 @@
         "text_output_microusd_per_million": 10000000,
         "image_output_microusd_per_million": 30000000,
         "source_url": "https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md",
-        "_note": "这四个费率是**上游 list 价**，当前角色是结算基数 / 成本口径的对照：平台成本 = list × 账号倍率（本账号 Group ratio 0.8，见 docs/facts/channel-facts.md §3.9.2）。**平台对外价尚未决定**（加价、让利、缓存档是否单独定价属后期产品决定，见工作项 #5）。"
+        "_note": "这四个费率取自上游公开的按 Tokens 计费口径，是平台侧的结算基数。本渠道的成本价由上游在任务响应里直接声明（`cost`），不需要按费率再算一遍；见 docs/facts/channel-facts.md §3.9。**平台对外价尚未决定**（属后期产品决定，见工作项 #5）。"
       }
     }
   ]
