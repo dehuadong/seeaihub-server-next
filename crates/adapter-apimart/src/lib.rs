@@ -797,7 +797,12 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
             Some(429) => RetrySafety::AcceptanceUnknown,
             // 其它 5xx：上游可能已受理。
             Some(500..=599) => RetrySafety::AcceptanceUnknown,
-            // 无 code、未知 code、解析失败：一律按"受理状态不确定"处理。
+            // 没有可用的 `error.code`（实测：鉴权失败返回的是 `code: ""` 与
+            // `type: "apimart_error"`，见 `docs/facts/channel-facts.md` §3.8）。
+            // 此时只有凭据/权限类状态码还能证明"请求根本没进到生成"，按确定性拒绝处置；
+            // **5xx 仍然不看状态码**——那正是"只依据 code"这条规则要防的情况。
+            _ if matches!(status.as_u16(), 401..=403) => RetrySafety::NotRetryable,
+            // 其余（无 code、未知 code、解析失败）：一律按"受理状态不确定"处理。
             _ => RetrySafety::AcceptanceUnknown,
         }
     };
@@ -1222,6 +1227,22 @@ mod tests {
             }
             other => panic!("expected a provider error, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn credential_failures_are_not_retryable_even_without_an_error_code() {
+        // 实测（零费用、无凭证）：`POST /v1/uploads/images` 的 401 信封是
+        // `{"error":{"code":"","message":"invalid API key (request id: …)","param":"","type":"apimart_error"}}`
+        // ——没有可用的 `error.code`。凭据问题不该被当成"受理状态不确定"而送进对账。
+        let body = br#"{"error":{"code":"","message":"invalid API key (request id: 20260919182056471923385yBRUUrTx)","param":"","type":"apimart_error"}}"#;
+        let error = parse_provider_error(StatusCode::UNAUTHORIZED, body);
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        // code 退化成 `type`，message 原样保留（请求 id 就在里面，落库后可用于排查）。
+        assert_eq!(error.code, "apimart_error");
+        assert!(error.message.contains("request id"));
+        // 同为"无 code"的 5xx 仍然是不确定：状态码只在凭据类上兜底。
+        let error = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, br#"{"error":{}}"#);
+        assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
     }
 
     #[test]

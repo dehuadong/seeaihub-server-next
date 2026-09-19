@@ -51,8 +51,19 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 5. **`PricePlanDraft.formula` 从不校验**：未知计价形态曾静默落库。
 6. **资产绑定路径写死了字段名**：`image`/`images`/`mask` 被硬编码在领域与用例层，导致"字段名不是 `image` 的厂商"（APIMart 的 `image_urls`）无法绑定任何输入图。已改为按路径取厂商原生参数名，并把"参考图/遮罩"的判定收敛成**一个**有测试的函数（运行期与发布期共用），认不出的参数名直接拒绝而不是静默忽略。
 7. **上传失败的分类不实**：`upload_failure` 曾把"生成任务可证明未受理"标成 `NotRetryable`（"确定性拒绝"）。三态里对应的是 `SafeBeforeAcceptance`（`docs/adr/0011`），已改正并补测试；`code`/`message` 仍按 `error.code` 保留。
+8. **凭据类失败被误判成"受理状态不确定"**（零费用探测发现）：APIMart 的 401 信封里 `error.code` 是**空字符串**，只有 `type: "apimart_error"`，于是"只依据 `error.code`"这条规则会把一个明确没进到生成的请求送进人工对账。已加一条兜底：**凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝**，**5xx 仍不看状态码**（`build_request_failed` 会以 500 承载参数错误）。
+9. **渠道事实里把 `APIMART_API_KEY` 写成"不存在"**：实际 User 与 Machine 级都有，当时只看了进程环境。已更正——这条错误会让读者以为受控验证根本做不了。
 
-第 4 项在实现评审中两次被质疑、两次都按 ADR 收紧了声明；第 1–4、7 项由实现评审（Standards / Spec 双轴）发现，第 5、6 项为自行核对发现。
+第 4 项在实现评审中两次被质疑、两次都按 ADR 收紧了声明；第 1–4、7 项由实现评审（Standards / Spec 双轴）发现，第 5、6、8、9 项为自行核对发现（第 8 项来自零费用路由探测）。
+
+## 未花一分钱拿到的事实
+
+用户要求"决定到完成"，但 `docs/adr/` 与 `AGENTS.md` 都规定**未经批准不发起任何计费调用**，`out-reference/apimart/billing-basis.md` 还写明 APIMart 侧计费口径只能由真实调用结清。因此在**不碰凭证**的前提下做了 4 次请求（无 Authorization 头，只看状态码，详见 `docs/facts/channel-facts.md` §5.5）：
+
+- 三个端点在我们**实际配置的域名** `api.apib.ai` 上都存在（401；不存在的路由是 404）——包括本次新写的上传端点；
+- 拿到了 401 的错误信封与失败路径的请求标识（`X-Oneapi-Request-Id`，同时写在 `message` 里），并据此修掉上面第 8 条。
+
+**没有带凭证调用上传接口**：上传是否计费在一手文档里没有明确说法，"未证实即不做"。放开两条分支仍需用户批准一次受控生成调用。
 
 ## 本变更对领域模型的影响（`0004` §4 的例外说明）
 
@@ -64,7 +75,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 ## 已知限制与未决项（不在本次交付范围）
 
-- APIMart 的**图生图/遮罩分支尚未发布**（`allowed_branches` 仍只有 `prompt_only`），因为 ADR-0002 要求先做真实 wire 验证。要放开需要一次经用户授权的受控调用，清单与停止条件应先在规划里写明（参考 `docs/verification/phase2-controlled-verification.md`）。
+- APIMart 的**图生图/遮罩分支尚未发布**（`allowed_branches` 仍只有 `prompt_only`），因为 ADR-0002 要求先做真实 wire 验证。零费用部分（端点存在、错误信封）已做完；剩下三件事需要一次经用户授权的**带凭证**受控调用，待验清单已在 `docs/verification/phase2-controlled-verification.md` 顶部列出（沿用该清单既有的预算与停止条件）。
 - **"哪个原生参数装图片"目前靠名字约定**。若将来某个 Provider 用 `reference_images` 这类名字，需要把该声明搬进 Profile（发布合同变更），走 Planning，不在这里加名字特例。
 - `task_id` 不用于跨调用恢复（需新增列与拆分端口，属独立工作项）；
 - 火山方舟/Seedream、直连 OpenAI、多图与 `stream`/`tools` 不在本阶段；

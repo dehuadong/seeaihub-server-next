@@ -16,13 +16,13 @@
 
 ### 1.1 凭证（只记变量名）
 
-| 变量名 | 本机实际情况（2026-09-19） |
+| 变量名 | 本机实际情况（2026-09-19 复核） |
 | --- | --- |
-| `AIHUBMIX_API_KEY` | User 级与 Machine 级**均存在**（51 字符），本会话**已成功取到并用于一次经授权的实测调用** |
+| `AIHUBMIX_API_KEY` | User 级与 Machine 级**均存在**，本会话**已成功取到并用于经授权的实测调用** |
 | `DOUBAO_API_KEY` | User 级与 Machine 级均存在；属火山方舟，与本阶段无关 |
-| `APIMART_API_KEY` | **不存在**（User/Machine/进程均为空） |
+| `APIMART_API_KEY` | User 级与 Machine 级**均存在**（此处此前写成"不存在"，是错的——当时只看了进程环境） |
 
-**说明**：Agent 进程默认环境里读不到，但可用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取到——**「读不到」此前被写成部署障碍，是措辞错误**。
+**说明**：三个变量在 **User 与 Machine 级都存在**，但 Agent 进程默认环境里读不到；可用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取到——**「读不到」此前被写成部署障碍或"凭证不存在"，都是措辞错误**。
 
 ## 2. AIHubMix
 
@@ -306,11 +306,13 @@
 
 ### 3.1 端点
 
-| 端点 | 形态 |
-| --- | --- |
-| `POST /v1/images/generations` | **异步**，立即返回 `task_id` |
-| `GET /v1/tasks/{task_id}` | 任务查询（可选 `?language=`，仅影响 `error.message`） |
-| `POST /v1/uploads/images` | 上传本地图以取得可用 `url` |
+| 端点 | 形态 | 路由是否存在（2026-09-19 零费用探测） |
+| --- | --- | --- |
+| `POST /v1/images/generations` | **异步**，立即返回 `task_id` | **存在**（无凭证 401） |
+| `GET /v1/tasks/{task_id}` | 任务查询（可选 `?language=`，仅影响 `error.message`） | **存在**（无凭证 401） |
+| `POST /v1/uploads/images` | 上传本地图以取得可用 `url` | **存在**（无凭证 401；对照：`/v1/nonexistent-route` 返回 404） |
+
+**探测方法**：对 `https://api.apib.ai` 发**不带任何凭证**的请求，只看 401/404（不触达任何账号、不产生任何费用）。三个真实端点在**我们实际配置的域名**上都存在，不只是文档里写着。
 
 **提交响应**：`{"code":200,"data":[{"status":"submitted","task_id":"task_…"}]}` —— **`data` 是数组，读 `data[0].task_id`**。
 
@@ -403,11 +405,26 @@
 
 **平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。
 
-**发布状态：这两条分支尚未开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 目前只有 `prompt_only`。按 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再以新 Schema 修订发布」，要放开需要一次经用户授权的受控调用，先把上面两处冲突与上传接口的真实行为验掉。链路本身（上传 → 回填 URL → 提交）已实现，并有假上游端到端用例。
+**发布状态：这两条分支尚未开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 目前只有 `prompt_only`。零费用探测已确认三个端点在我们配置的域名上真实存在（§3.1、§5.5），但按 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再以新 Schema 修订发布」，仍要先做一次带凭证的受控调用验掉剩下三件事：`image_urls` 的取值形态（§3.7 冲突 1）、上传接口的真实返回（含 20MB 边界）、以及传 URL 后的 `usage` 是否如文档所述带上 `input_image_tokens`。链路本身（上传 → 回填 URL → 提交）已实现，并有假上游端到端用例。
 
 **参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`，`AssetBinding.native_parameter_path` 就是这些原生参数路径（`/image_urls/0`、`/mask_url`）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩、其余一律拒绝（发布期与运行期共用同一个函数）。
 
 **未做**：本渠道的图生图路径**没有任何真实计费实测**（未获授权）；实现只由**进程内假上游**端到端验证。
+
+### 3.8 错误信封（2026-09-19 零费用探测，无凭证）
+
+无凭证请求真实端点，取到的 401 响应体：
+
+```json
+{"error":{"code":"","message":"invalid API key (request id: 20260919182056471923385yBRUUrTx)","param":"","type":"apimart_error"}}
+```
+
+两条对实现有影响的事实：
+
+1. **`error.code` 是空字符串**，可用的只有 `type: "apimart_error"` 与 `message`。因此"只依据 `error.code` 分类"在**凭据类失败**上会退化成"受理状态不确定"，把一个明确没进到生成的请求送进人工对账。平台的处置：**凭据/权限类 HTTP 状态（401/402/403）作为兜底信号**判为确定性拒绝；**5xx 仍不看状态码**（`build_request_failed` 会以 500 承载参数错误，那正是这条规则要防的情况）。
+2. **每请求标识在失败时也有**：响应头 `X-Oneapi-Request-Id`，同时被写进 `message` 里的 `(request id: …)`。失败路径的 `provider_error_message` 会原样落库，排查时不需要额外取头（**只在失败路径**；成功路径的对账标识是任务式上游的 `task_id`）。
+
+**未做**：没有带凭证调用上传接口（上传是否计费在一手文档里没有明确说法，故按"未证实即不做"处理）；这几条只是**路由与错误信封**的事实。
 
 ## 4. 不跨渠道合并（原写法的更正）
 
@@ -467,3 +484,15 @@
 | 5 | APIMart `/v1`（异步，flare） | 完成 | **必要**（结清 V1：`usage` 是否存在与粒度） |
 
 全部使用 `n=1`、`quality=low` 的最小配置。**未发起任何火山方舟调用。** 另完成 3 次 APIMart **只读**探测（`/v1/models`、`/v1/models/{model}/schema`、`/v1/usage`），零费用。
+
+### 5.5 零费用路由探测（2026-09-19，**无凭证**）
+
+| 项 | 值 |
+| --- | --- |
+| 目的 | 确认我们**实际配置的域名**上三个端点真的存在（此前只有文档写着） |
+| 方法 | 对 `https://api.apib.ai` 发**不带任何凭证**的请求，只看状态码；不触达任何账号 |
+| 次数 | **4 次**（`POST /v1/uploads/images`、`POST /v1/images/generations`、`GET /v1/tasks/nonexistent`、`GET /v1/nonexistent-route` 对照） |
+| 结果 | 三个真实端点均 **401**（存在但需鉴权）；对照的不存在路由 **404** ⇒ 路由判定有效 |
+| 计费 | **零**（无凭证、未生成、未上传任何文件） |
+| 附带事实 | 401 错误信封与失败路径的请求标识（见 §3.8） |
+| 未做 | **没有带凭证调用上传接口**，也没有任何生成调用 |
