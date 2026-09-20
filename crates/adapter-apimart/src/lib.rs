@@ -272,7 +272,10 @@ impl ApimartImageAdapter {
             .send()
             .await
             .map_err(ambiguous_transport_error)?;
-        let body = read_body(response).await?;
+        let status = response.status();
+        let body = read_body(response)
+            .await
+            .map_err(|error| narrow_submit_rejection(status, error))?;
         let parsed: SubmitEnvelope = serde_json::from_slice(&body).map_err(|error| {
             provider_error(
                 "provider_response_invalid",
@@ -812,10 +815,12 @@ struct ErrorBody {
     r#type: Option<String>,
 }
 
-/// **只依据 `error.code` 分类，不依据 HTTP 状态码**。
+/// 分类以 `error.code` 与消息前缀为主，状态码只在它们给不出信息时兜底。
 ///
-/// 理由：APIMart 的参数校验错误可能以 `500` 承载（`build_request_failed: …`），
-/// 按状态码判断会把"不可重试的参数错误"误判成"受理状态不确定"。
+/// 理由：APIMart 的参数校验错误可能以 `500` 承载（`build_request_failed: …`），一概按状态码
+/// 判断会把"不可重试的参数错误"误判成"受理状态不确定"；反过来，鉴权失败实测返回的是
+/// `code: ""`，只看 `code` 又会把"根本没进到生成"的请求送进人工对账。创建阶段的成败收窄
+/// 另见 [`narrow_submit_rejection`]。
 fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
     let parsed = serde_json::from_slice::<ErrorEnvelope>(body).ok();
     let raw_code = parsed
@@ -832,10 +837,18 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
             )
         });
     let type_name = parsed.as_ref().and_then(|value| value.error.r#type.clone());
-    let code = match (raw_code, type_name.as_deref()) {
-        (Some(code), _) => code.to_string(),
-        (None, Some(name)) => name.to_owned(),
-        (None, None) => format!("http_{}", status.as_u16()),
+    // `error.code` 的类型随端点而异：数字、字符串、也可能是不在场的空串。
+    // 上游自己给了标识符就留住它（排查与幂等子类判定都要用），只有空串才退化成 `type`。
+    let text_code = parsed
+        .as_ref()
+        .and_then(|value| value.error.code.as_ref())
+        .and_then(Value::as_str)
+        .filter(|value| !value.is_empty());
+    let code = match (raw_code, text_code, type_name.as_deref()) {
+        (Some(code), _, _) => code.to_string(),
+        (None, Some(text), _) => text.to_owned(),
+        (None, None, Some(name)) => name.to_owned(),
+        (None, None, None) => format!("http_{}", status.as_u16()),
     };
     let retry_safety = if message.starts_with("build_request_failed") {
         // 参数校验错误被 5xx 承载：**判据是消息前缀，不是状态码也不是 code**。
@@ -861,7 +874,7 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
         }
     };
     // 平台侧失败类别：与 `retry_safety` 用的是同一批信号，但结论是另一个维度。
-    // `409` 的幂等子类标识符可能落在 `error.code`（字符串）或消息文本里，两处都看。
+    // 幂等子类的标识符可能落在 `error.code`（字符串）或消息文本里，两处都看。
     let idempotency_text = format!(
         "{} {}",
         parsed
@@ -871,14 +884,14 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
             .unwrap_or_default(),
         message
     );
-    // 第一方口径：这两个子类能证明请求未被受理，属"渠道拒了平台的请求"。
-    // `idempotency_result_indeterminate` 不能证明，落 `Unknown`（拿不准按平台侧处理）。
-    let idempotency_rejected = idempotency_text.contains("idempotency_in_progress")
-        || idempotency_text.contains("idempotency_key_reused");
     let kind = if message.starts_with("build_request_failed") {
         // 用 5xx 承载的参数错误仍然是"渠道拒绝了平台的请求"。
         ProviderFailureKind::UpstreamRejected
-    } else if idempotency_rejected {
+    } else if unaccepted_idempotency(status, &idempotency_text)
+        == Some(UnacceptedIdempotency::Conflict)
+    {
+        // `409` 的两个子类：渠道拒了平台的请求。`503 idempotency_unavailable` 不在此列，
+        // 它按普通 5xx 归到"渠道不可用"。
         ProviderFailureKind::UpstreamRejected
     } else {
         match raw_code {
@@ -945,18 +958,9 @@ struct UploadResponse {
 /// 这里**只改 `retry_safety`，不改 `code`/`message`**：`code` 仍由
 /// [`parse_provider_error`] 按 `error.code` 判定（上游上传失败的错误体多数没有
 /// `error.code`，只有 `type`/`message`，429 例外）。两件事不冲突——生成侧"错误分类
-/// 只依据 `error.code`"说的是**创建请求**的分类，而这里的结论来自"创建请求根本没发出去"。
+/// 以 `error.code` 为主"说的是**创建请求**的分类，而这里的结论来自"创建请求根本没发出去"。
 fn upload_failure(error: AdapterError) -> AdapterError {
-    match error {
-        AdapterError::Provider(provider) => provider_error(
-            &provider.code,
-            provider.message,
-            RetrySafety::SafeBeforeAcceptance,
-            // 这里只改 `retry_safety`：内层已经判出的失败类别原样保留。
-            provider.kind,
-        ),
-        other => other,
-    }
+    with_retry_safety(error, RetrySafety::SafeBeforeAcceptance)
 }
 
 fn upload_transport_error(error: reqwest::Error) -> AdapterError {
@@ -1012,16 +1016,76 @@ fn provider_error(
 /// 与 [`ambiguous_transport_error`] 的区别只在语义来源：这里明确是"已确认生成、
 /// 只是这次没取到结果"，而不是"请求可能没发出去"。两者都落到同一个安全处置。
 fn after_acceptance(error: AdapterError) -> AdapterError {
+    with_retry_safety(error, RetrySafety::AcceptanceUnknown)
+}
+
+/// 只改处置，其余原样：`code` / `message` / `trace_id` / `kind` 都是已经判出的事实，
+/// 重建错误对象时漏掉任何一个都会丢证据。
+fn with_retry_safety(error: AdapterError, retry_safety: RetrySafety) -> AdapterError {
     match error {
-        AdapterError::Provider(provider) => provider_error(
-            &provider.code,
-            provider.message,
-            RetrySafety::AcceptanceUnknown,
-            // 这里只改 `retry_safety`：内层已经判出的失败类别原样保留。
-            provider.kind,
-        ),
+        AdapterError::Provider(provider) => AdapterError::Provider(ProviderCallError {
+            retry_safety,
+            ..provider
+        }),
         other => other,
     }
+}
+
+/// 第一方写明的"请求未执行"信号：只有状态码与幂等子类**配对**时才算依据。
+///
+/// 两个变体的**含义不同**，因此平台侧类别也不同：`409` 的两个子类说明是调用方的幂等逻辑
+/// 把请求弄重了（渠道拒了平台的请求）；`503 idempotency_unavailable` 是渠道不可用期间的状态。
+/// `idempotency_result_indeterminate` 不在表里——第一方明确要求停止自动重试、不要换 Key，
+/// 它不能证明请求未被受理。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum UnacceptedIdempotency {
+    /// `409` 的 `idempotency_in_progress` / `idempotency_key_reused`。
+    Conflict,
+    /// `503` 的 `idempotency_unavailable`。
+    Unavailable,
+}
+
+fn unaccepted_idempotency(status: StatusCode, text: &str) -> Option<UnacceptedIdempotency> {
+    match status {
+        StatusCode::CONFLICT
+            if text.contains("idempotency_in_progress")
+                || text.contains("idempotency_key_reused") =>
+        {
+            Some(UnacceptedIdempotency::Conflict)
+        }
+        StatusCode::SERVICE_UNAVAILABLE if text.contains("idempotency_unavailable") => {
+            Some(UnacceptedIdempotency::Unavailable)
+        }
+        _ => None,
+    }
+}
+
+/// 创建请求**被上游拒绝**时的分类收窄：只认第一方明文写明"请求未执行"的三个**组合**。
+///
+/// - `429` 限流：第一方口径"能证明未受理"；
+/// - `409` + `idempotency_in_progress` / `idempotency_key_reused`：第一方口径"能"；
+/// - `503` + `idempotency_unavailable`：第一方原文"当前请求未执行"。
+///
+/// 其余一律**保持原判**（`AcceptanceUnknown` → 对账）：判错的代价是"其实已受理却当失败"，
+/// 上游成本由平台自己承担，所以宁可多进一次人工对账。状态码与文本不配对（例如 `500` 却带
+/// `idempotency_unavailable`）同样不算依据，第一方只承诺了上面那三个组合。
+///
+/// `429` 用 HTTP 状态码而不是 `error.code`：该码可能是空串；幂等子类的标识符落在 `code`
+/// 或消息文本里，两处都看（`code` 已由 [`parse_provider_error`] 归一）。
+///
+/// **只在创建请求这一处收窄**：轮询、取图与上传阶段的同名状态码都不适用——
+/// 那时任务已经受理（见 [`after_acceptance`]），或者压根不是"创建"这个动作。
+fn narrow_submit_rejection(status: StatusCode, error: AdapterError) -> AdapterError {
+    let AdapterError::Provider(provider) = &error else {
+        return error;
+    };
+    let proves_unaccepted = status == StatusCode::TOO_MANY_REQUESTS
+        || unaccepted_idempotency(status, &format!("{} {}", provider.code, provider.message))
+            .is_some();
+    if !proves_unaccepted {
+        return error;
+    }
+    with_retry_safety(error, RetrySafety::SafeBeforeAcceptance)
 }
 
 /// 连接中断、超时、解析失败：请求**可能已经发出**，因此一律按受理状态不确定处理
@@ -1154,7 +1218,7 @@ mod tests {
     }
 
     #[test]
-    fn error_classification_uses_code_not_status() {
+    fn error_classification_prefers_code_over_status() {
         // 400 参数错误：未受理；类别上是渠道拒绝了平台的请求。
         let error = parse_provider_error(StatusCode::BAD_REQUEST, &envelope(400, "bad"));
         assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
@@ -1185,7 +1249,7 @@ mod tests {
 
     #[test]
     fn parameter_error_carried_as_500_is_not_retryable() {
-        // 这是"只依据 error.code、不依据状态码"的关键理由。
+        // 这是"分类以 error.code 与消息前缀为主、状态码只兜底"的关键理由。
         let error = parse_provider_error(
             StatusCode::INTERNAL_SERVER_ERROR,
             &envelope(500, "build_request_failed: unsupported size"),
@@ -1241,6 +1305,15 @@ mod tests {
             &serde_json::to_vec(&body).expect("body"),
         );
         assert_eq!(error.kind, ProviderFailureKind::Unknown);
+        // 状态码与文本不配对时同样不算依据：第一方只承诺了 `409`/`503` 这两个组合。
+        let body = serde_json::json!({
+            "error": {"code": 500, "message": "idempotency_in_progress"}
+        });
+        let error = parse_provider_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &serde_json::to_vec(&body).expect("body"),
+        );
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamUnavailable);
     }
 
     #[test]
@@ -1321,6 +1394,136 @@ mod tests {
                 ImageBranch::Masked
             ]
         );
+    }
+
+    #[test]
+    fn submit_rejections_that_prove_no_execution_are_narrowed() {
+        // 第一方明文写明"请求未执行"的三类：提交阶段收窄为可证明未受理。
+        let narrowed = |status: StatusCode, body: &[u8]| {
+            let raw = parse_provider_error(status, body);
+            // 收窄前一律是"受理状态不确定"——否则这条测试没有意义。
+            assert_eq!(raw.retry_safety, RetrySafety::AcceptanceUnknown);
+            match narrow_submit_rejection(status, AdapterError::Provider(raw)) {
+                AdapterError::Provider(provider) => provider,
+                other => panic!("expected a provider error, got {other:?}"),
+            }
+        };
+
+        // 429 限流：第一方口径"能证明未受理"。
+        let error = narrowed(
+            StatusCode::TOO_MANY_REQUESTS,
+            &envelope(429, "rate_limit_error"),
+        );
+        assert_eq!(error.retry_safety, RetrySafety::SafeBeforeAcceptance);
+        // code 与 message 原样保留：平台仍看得出这是哪一类失败。
+        assert_eq!(error.code, "429");
+        // `429` 的依据就是状态码本身：错误体给不出可用标识符时仍然收窄——
+        // 第一方承诺的是"429 这个响应"能证明未受理。
+        let error = narrowed(
+            StatusCode::TOO_MANY_REQUESTS,
+            br#"{"error":{"message":"too many requests"}}"#,
+        );
+        assert_eq!(error.retry_safety, RetrySafety::SafeBeforeAcceptance);
+
+        // 409 的两个幂等子类：第一方口径"能"。标识符可能落在 `error.code`（字符串）或消息里。
+        let error = narrowed(
+            StatusCode::CONFLICT,
+            br#"{"error":{"code":"idempotency_in_progress","message":"in flight"}}"#,
+        );
+        assert_eq!(error.retry_safety, RetrySafety::SafeBeforeAcceptance);
+        // 上游自己给的字符串标识符要留住，而不是退化成 `type` 或 `http_409`。
+        assert_eq!(error.code, "idempotency_in_progress");
+        let error = narrowed(
+            StatusCode::CONFLICT,
+            br#"{"error":{"code":409,"message":"idempotency_key_reused"}}"#,
+        );
+        assert_eq!(error.retry_safety, RetrySafety::SafeBeforeAcceptance);
+
+        // 503 idempotency_unavailable：第一方原文"当前请求未执行"。
+        let error = narrowed(
+            StatusCode::SERVICE_UNAVAILABLE,
+            &envelope(503, "idempotency_unavailable"),
+        );
+        assert_eq!(error.retry_safety, RetrySafety::SafeBeforeAcceptance);
+    }
+
+    #[test]
+    fn submit_rejections_without_a_first_party_basis_stay_unknown() {
+        let unchanged = |status: StatusCode, body: &[u8]| {
+            let raw = parse_provider_error(status, body);
+            match narrow_submit_rejection(status, AdapterError::Provider(raw)) {
+                AdapterError::Provider(provider) => provider.retry_safety,
+                other => panic!("expected a provider error, got {other:?}"),
+            }
+        };
+
+        // 结果不明的幂等子类：第一方要求停止自动重试、不要换 Key——不许收窄。
+        assert_eq!(
+            unchanged(
+                StatusCode::CONFLICT,
+                &envelope(409, "idempotency_result_indeterminate")
+            ),
+            RetrySafety::AcceptanceUnknown
+        );
+        // 普通 503 与 500：第一方没有"未受理"承诺。
+        assert_eq!(
+            unchanged(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &envelope(503, "service_unavailable")
+            ),
+            RetrySafety::AcceptanceUnknown
+        );
+        assert_eq!(
+            unchanged(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &envelope(500, "server_error")
+            ),
+            RetrySafety::AcceptanceUnknown
+        );
+        // 凭据/余额/参数类本来就是确定性拒绝，收窄不改变它们。
+        assert_eq!(
+            unchanged(StatusCode::PAYMENT_REQUIRED, &envelope(402, "pay up")),
+            RetrySafety::NotRetryable
+        );
+        // 状态码与文本不配对时不算依据：第一方只承诺了 `409`+子类、`503`+unavailable。
+        assert_eq!(
+            unchanged(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                &envelope(500, "idempotency_unavailable")
+            ),
+            RetrySafety::AcceptanceUnknown
+        );
+        assert_eq!(
+            unchanged(
+                StatusCode::SERVICE_UNAVAILABLE,
+                &envelope(503, "idempotency_key_reused")
+            ),
+            RetrySafety::AcceptanceUnknown
+        );
+    }
+
+    #[test]
+    fn post_acceptance_failures_are_never_narrowed() {
+        // 同一批状态码出现在**已受理之后**（轮询、取图）时，一律仍按受理状态不确定处理：
+        // 任务已经在跑，把它当失败会让平台白付一次生成。
+        for (status, body) in [
+            (
+                StatusCode::TOO_MANY_REQUESTS,
+                envelope(429, "rate_limit_error"),
+            ),
+            (
+                StatusCode::SERVICE_UNAVAILABLE,
+                envelope(503, "idempotency_unavailable"),
+            ),
+        ] {
+            let raw = parse_provider_error(status, &body);
+            match after_acceptance(AdapterError::Provider(raw)) {
+                AdapterError::Provider(provider) => {
+                    assert_eq!(provider.retry_safety, RetrySafety::AcceptanceUnknown);
+                }
+                other => panic!("expected a provider error, got {other:?}"),
+            }
+        }
     }
 
     #[test]

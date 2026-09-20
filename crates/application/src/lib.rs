@@ -3189,5 +3189,19 @@ mod tests {
             unknown.hold_disposition,
             HoldDisposition::RetainForReconciliation
         );
+
+        // 可证明未受理（渠道按第一方依据明确"这次请求没执行"）与确定性拒绝走同一处置：
+        // 失败并释放预授权——区别只留在 Attempt 的渠道原始码上。
+        let unaccepted = failure_from_adapter(AdapterError::Provider(ProviderCallError {
+            code: "429".to_owned(),
+            message: "rate_limit_error".to_owned(),
+            trace_id: None,
+            retry_safety: RetrySafety::SafeBeforeAcceptance,
+            kind: ProviderFailureKind::UpstreamRateLimited,
+        }));
+        assert_eq!(unaccepted.provider_code, "429");
+        assert_eq!(unaccepted.public_code, PublicErrorCode::PlatformUnavailable);
+        assert_eq!(unaccepted.target_state, JobState::Failed);
+        assert_eq!(unaccepted.hold_disposition, HoldDisposition::Release);
     }
 }

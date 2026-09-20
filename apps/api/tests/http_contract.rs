@@ -1414,81 +1414,155 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
 async fn channel_rejections_reach_consumers_as_platform_problems() {
     /// 上游逐请求标识（AIHubMix 错误信封里的 `tid`）：只该留在内部。
     const UPSTREAM_TRACE_ID: &str = "upstream-trace-9f3a";
-    // (渠道方, 适配器, 状态码, 上游错误体, 渠道码, 渠道原文, 对客码, Job 终态, 是否平台侧事件)
+
+    /// 一条"上游拒绝提交"的场景。字段多，用命名字段而不是位置元组，免得加行时错位。
+    struct Rejected {
+        provider_kind: &'static str,
+        adapter_key: &'static str,
+        status: u16,
+        body: Value,
+        channel_code: &'static str,
+        channel_message: &'static str,
+        expected_code: &'static str,
+        expected_state: &'static str,
+        /// 该终态对应的预授权处置。**单列**而不是从终态派生——派生出来的断言只能证明
+        /// "两者一致"，发现不了错判。
+        expected_hold: &'static str,
+        /// 是否属平台侧事件（决定缺省清单列不列它）。
+        platform_side: bool,
+    }
+
     let cases = [
-        (
-            "APIMart",
-            "apimart-image-v1",
-            402,
-            json!({"error": {"code": 402, "message": "payment_required: account balance is insufficient"}}),
-            "402",
-            "payment_required: account balance is insufficient",
-            "platform_unavailable",
-            "failed",
-            true,
-        ),
-        (
-            "APIMart",
-            "apimart-image-v1",
-            403,
-            json!({"error": {"code": 403, "message": "permission denied for this key"}}),
-            "403",
-            "permission denied for this key",
-            "platform_unavailable",
-            "failed",
-            true,
-        ),
-        (
-            "APIMart",
-            "apimart-image-v1",
-            500,
-            json!({"error": {"code": 500, "message": "build_request_failed: invalid size 9999x9999"}}),
-            "500",
-            "build_request_failed: invalid size 9999x9999",
-            "platform_unavailable",
-            "failed",
-            true,
-        ),
-        (
-            "APIMart",
-            "apimart-image-v1",
-            503,
-            json!({"error": {"code": 503, "message": "idempotency_unavailable"}}),
-            "503",
-            "idempotency_unavailable",
-            "outcome_unknown",
-            "reconciliation_required",
-            false,
-        ),
-        (
-            "AIHubMix",
-            "aihubmix-image-v1",
-            403,
-            json!({"error": {"code": "insufficient_user_quota", "message": "quota exhausted", "tid": UPSTREAM_TRACE_ID}}),
-            "insufficient_user_quota",
-            "quota exhausted",
-            "platform_unavailable",
-            "failed",
-            true,
-        ),
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 402,
+            body: json!({"error": {"code": 402, "message": "payment_required: account balance is insufficient"}}),
+            channel_code: "402",
+            channel_message: "payment_required: account balance is insufficient",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: true,
+        },
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 403,
+            body: json!({"error": {"code": 403, "message": "permission denied for this key"}}),
+            channel_code: "403",
+            channel_message: "permission denied for this key",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: true,
+        },
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 500,
+            body: json!({"error": {"code": 500, "message": "build_request_failed: invalid size 9999x9999"}}),
+            channel_code: "500",
+            channel_message: "build_request_failed: invalid size 9999x9999",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: true,
+        },
+        // 以下三行是第一方写明"请求未执行"的三类：判为失败并释放预授权，不进对账。
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 503,
+            body: json!({"error": {"code": 503, "message": "idempotency_unavailable"}}),
+            channel_code: "503",
+            channel_message: "idempotency_unavailable",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: false,
+        },
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 429,
+            body: json!({"error": {"code": 429, "message": "rate_limit_error"}}),
+            channel_code: "429",
+            channel_message: "rate_limit_error",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: false,
+        },
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 409,
+            body: json!({"error": {"code": "idempotency_in_progress", "message": "the same key is in flight"}}),
+            channel_code: "idempotency_in_progress",
+            channel_message: "the same key is in flight",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: true,
+        },
+        // 结果不明的那一类：第一方要求停止自动重试、不要换 Key，仍进对账并保留预授权。
+        Rejected {
+            provider_kind: "APIMart",
+            adapter_key: "apimart-image-v1",
+            status: 409,
+            body: json!({"error": {"code": 409, "message": "idempotency_result_indeterminate"}}),
+            channel_code: "409",
+            channel_message: "idempotency_result_indeterminate",
+            expected_code: "outcome_unknown",
+            expected_state: "reconciliation_required",
+            expected_hold: "active",
+            platform_side: true,
+        },
+        Rejected {
+            provider_kind: "AIHubMix",
+            adapter_key: "aihubmix-image-v1",
+            status: 403,
+            body: json!({"error": {"code": "insufficient_user_quota", "message": "quota exhausted", "tid": UPSTREAM_TRACE_ID}}),
+            channel_code: "insufficient_user_quota",
+            channel_message: "quota exhausted",
+            expected_code: "platform_unavailable",
+            expected_state: "failed",
+            expected_hold: "released",
+            platform_side: true,
+        },
+        // 同一个状态码在另一个渠道没有"未受理"依据：不许跨渠道套用结论。
+        Rejected {
+            provider_kind: "AIHubMix",
+            adapter_key: "aihubmix-image-v1",
+            status: 429,
+            body: json!({"error": {"code": "upstream_rate_limited", "message": "slow down"}}),
+            channel_code: "upstream_rate_limited",
+            channel_message: "slow down",
+            expected_code: "outcome_unknown",
+            expected_state: "reconciliation_required",
+            expected_hold: "active",
+            platform_side: false,
+        },
     ];
 
-    for (
+    for Rejected {
         provider_kind,
         adapter_key,
         status,
-        error_body,
+        body: error_body,
         channel_code,
         channel_message,
         expected_code,
         expected_state,
+        expected_hold,
         platform_side,
-    ) in cases
+    } in cases
     {
         let behaviour = UpstreamBehaviour {
             submit: SubmitBehaviour::Rejected {
                 status,
-                body: error_body,
+                body: error_body.clone(),
             },
             ..UpstreamBehaviour::default()
         };
@@ -1540,6 +1614,18 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
             "上游逐请求标识不得出现在消费者面：{rendered}"
         );
 
+        // 终态与预授权必须一致：判成确定失败就释放预授权，进对账就继续握着。
+        let hold_status: String =
+            sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+                .bind(job_id)
+                .fetch_one(&harness.pool)
+                .await
+                .expect("hold status");
+        assert_eq!(
+            hold_status, expected_hold,
+            "{provider_kind} 的 {status} 预授权处置不符"
+        );
+
         // 内部记录保留渠道原始码、原文与上游标识：出问题时人要能拿去上游核对。
         let row = sqlx::query(
             r#"
@@ -1564,7 +1650,11 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
             row.try_get("provider_error_message").expect("message");
         assert_eq!(stored_message.as_deref(), Some(channel_message));
         let stored_trace: Option<String> = row.try_get("provider_trace_id").expect("trace");
-        let expected_trace = (provider_kind == "AIHubMix").then_some(UPSTREAM_TRACE_ID);
+        // 上游给了逐请求标识就必须留住；没给就不该凭空造一个。
+        let expected_trace = error_body
+            .to_string()
+            .contains(UPSTREAM_TRACE_ID)
+            .then_some(UPSTREAM_TRACE_ID);
         assert_eq!(
             stored_trace.as_deref(),
             expected_trace,

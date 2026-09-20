@@ -467,7 +467,7 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 三条对实现有影响的事实：
 
-1. **`error.code` 是空字符串**，可用的只有 `type: "apimart_error"` 与 `message`。因此"只依据 `error.code` 分类"在**凭据类失败**上会退化成"受理状态不确定"，把一个明确没进到生成的请求送进人工对账。平台的处置：**凭据/权限类 HTTP 状态（401/402/403）作为兜底信号**判为确定性拒绝；**5xx 仍不看状态码**（`build_request_failed` 会以 500 承载参数错误，那正是这条规则要防的情况）。
+1. **`error.code` 是空字符串**，可用的只有 `type: "apimart_error"` 与 `message`。因此"只依据 `error.code` 分类"在**凭据类失败**上会退化成"受理状态不确定"，把一个明确没进到生成的请求送进人工对账。平台的处置：分类**以 `error.code` 与消息前缀为主**，状态码只在它们给不出信息时兜底——凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝；**5xx 不按状态码定性**（`build_request_failed` 会以 500 承载参数错误，那正是这条规则要防的情况）。创建阶段另有按状态码收窄的三类，见 §3.10 的 `429` 与两个幂等子类。
 2. **每请求标识在失败时也有**：响应头 `X-Oneapi-Request-Id`，同时被写进 `message` 里的 `(request id: …)`。失败路径的 `provider_error_message` 会原样落库，排查时不需要额外取头（**只在失败路径**；成功路径的对账标识是任务式上游的 `task_id`）。
 3. **`402` 是平台侧欠费/额度不足**（用户 2026-09-20 告知）：它说的是**我们在这个渠道的账户**没额度了，与消费者余额无关。因此**不得原样返回给消费客户端**——对客表现为平台侧故障（`docs/adr/0017`：`platform_unavailable`），内部靠 `failure_kind = platform_funding` 让它成为可发现的运营事件。领域区分见 `CONTEXT.md` 的 `Platform Funding Failure` / `Consumer Insufficient Balance`。
 

@@ -16,6 +16,7 @@
 
 | 首次提出 | 记录 | 分类 | 生命周期 |
 | --- | --- | --- | --- |
+| 2026-09-20 | [APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"](./implemented/platform/2026-09-20-apimart-failure-narrowing.md) | platform | implemented |
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-19 | [独立图片生成服务端第一阶段交付](./implemented/platform/2026-09-19-initial-image-generation-vertical-slice.md) | platform | implemented |
 | 2026-09-19 | [第二阶段交付：多 Offering 路由与 APIMart Driver](./implemented/platform/2026-09-19-multi-offering-routing-and-apimart-driver.md) | platform | implemented |
@@ -42,6 +43,7 @@ PostgreSQL 持久化与迁移、对象存储与 Asset 承载、Adapter 边界与
 
 | 首次提出 | 记录 | 分类 | 生命周期 |
 | --- | --- | --- | --- |
+| 2026-09-20 | [APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"](./implemented/platform/2026-09-20-apimart-failure-narrowing.md) | platform | implemented |
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-19 | [独立图片生成服务端第一阶段交付](./implemented/platform/2026-09-19-initial-image-generation-vertical-slice.md) | platform | implemented |
 | 2026-09-19 | [第二阶段交付：多 Offering 路由与 APIMart Driver](./implemented/platform/2026-09-19-multi-offering-routing-and-apimart-driver.md) | platform | implemented |
