@@ -41,9 +41,12 @@
 - 免鉴权机器 Schema：`https://aihubmix.com/call/schema/models/{model}/endpoints`。
 - 输出 URL **约 30 分钟**过期，下载需带同一 `Authorization: Bearer`。
 
-### 2.2 同步 `/v1` 的真实响应（第一阶段的付费实测样本，已入库）
+### 2.2 同步 `/v1` 的真实响应（**用户早期采集**的样本，随仓库建立入库）
 
 `out-reference/aihubmix/gpt_image_2_generations.json`（HTTP 200，耗时 21.05 秒）：
+
+> **来源说明（2026-09-20 更正）**：这份样本**不是**本仓库的受控实测——它是**用户自己早期采集**的，响应体里的 `created = 1785485861` ⇒ **2026-07-31 16:17:41 +08:00**，随仓库建立提交 `1fe462a`（"establish independent image generation server"）入库。
+> 另外：**响应体没有 `model` 字段**，所以"它来自 `gpt-image-2`"是按文件名与 `out-reference/aihubmix/gpt-image-2.md` **推断**的，报文本身证明不了。
 
 ```json
 { "created": 1785485861, "background": "opaque", "output_format": "png",

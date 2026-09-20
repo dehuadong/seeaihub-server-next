@@ -6,19 +6,26 @@
 
 ## 0. 一句话现状（2026-09-19）
 
-| 端点 | 实测过？ | 有独立样本文件？ | 结构记在哪 |
-| --- | --- | --- | --- |
-| `POST /v1/images/generations`（同步，`gpt-image-2`） | ✅ 第一阶段 | ✅ **`gpt_image_2_generations.json`**（逐字，含 2 MB `b64_json`） | §1 |
-| `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ❌（当时只做了脱敏转录） | §1 |
-| `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 第一阶段 | ❌ | §2 |
-| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 第一阶段 + 2026-09-19 | ❌（样本内嵌在调研文件里） | §3 |
-| 错误信封 | ✅ 部分 | ❌ | §4 |
+**来源分级**（这份台账里每行都标）：
+
+- **用户早期采集**：仓库建立（提交 `1fe462a`）时随库进来的样本，采集时间见响应里的 `created`——**不是**本仓库的受控实测；
+- **本仓库受控实测**：经用户授权、由本仓库 Agent 发起并留档的调用（`docs/facts/channel-facts.md` §5 有留档）。
+
+| 端点 | 实测过？ | 有独立样本文件？ | 谁采集的 | 结构记在哪 |
+| --- | --- | --- | --- | --- |
+| `POST /v1/images/generations`（同步） | ✅ | ✅ **`gpt_image_2_generations.json`**（逐字，含 2 MB `b64_json`） | **用户早期采集**：响应 `created = 1785485861` ⇒ **2026-07-31 16:17:41 +08:00**；随仓库建立提交 `1fe462a` 入库 | §1 |
+| `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ❌（当时只做脱敏转录） | 本仓库受控实测（`channel-facts` §5.2） | §1 |
+| `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 2026-09-18 | ❌ | 本仓库受控实测（`docs/research/…` §13.2） | §2 |
+| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ❌（样本内嵌在调研文件里） | 本仓库受控实测（同上 §13.1 / `channel-facts` §2.3） | §3 |
+| 错误信封 | ✅ 部分 | ❌ | 本仓库受控实测 + 上游文档 | §4 |
+
+**口径提醒**：`gpt_image_2_generations.json` 的响应体**没有 `model` 字段**（顶层只有 `created/background/data/output_format/quality/size/usage`），因此"它来自 `gpt-image-2`"是**按文件名与 `gpt-image-2.md` 推断**的，报文本身证明不了。同理，同步 `/v1` 的响应都**不回显模型名**。
 
 **缺口**（要么补一次受控调用，要么接受现状）：三处没有独立样本文件。它们的**字段级结构已经记全**（见下），缺的是"逐字报文"这一层证据。
 
 ## 1. `POST /v1/images/generations`（同步，OpenAI 兼容）
 
-**逐字样本**：`gpt_image_2_generations.json` = `{http_status:200, elapsed_seconds:21.05, body:{…}}`，其中 `body`：
+**逐字样本**：`gpt_image_2_generations.json`（**用户早期采集，响应时间 2026-07-31**；随仓库建立提交 `1fe462a` 入库）= `{http_status:200, elapsed_seconds:21.05, body:{…}}`，其中 `body`：
 
 ```json
 { "created": 1785485861, "background": "opaque", "output_format": "png",
