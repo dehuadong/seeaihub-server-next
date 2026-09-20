@@ -69,16 +69,22 @@ async fn main() -> Result<()> {
     };
     let app = Router::new()
         .route("/health", get(health))
-        .route("/admin/accounts", post(create_account))
-        .route("/admin/accounts/{account_id}/credits", post(credit_account))
-        .route("/admin/accounts/{account_id}/api-keys", post(issue_api_key))
-        .route("/admin/runtime-revisions", post(publish_runtime))
+        .route("/api/v1/accounts", post(create_account))
         .route(
-            "/admin/reconciliation-cases",
+            "/api/v1/accounts/{account_id}/credits",
+            post(credit_account),
+        )
+        .route(
+            "/api/v1/accounts/{account_id}/api-keys",
+            post(issue_api_key),
+        )
+        .route("/api/v1/runtime-revisions", post(publish_runtime))
+        .route(
+            "/api/v1/reconciliation-cases",
             get(list_reconciliation_cases),
         )
         .route(
-            "/admin/reconciliation-cases/{job_id}/refund",
+            "/api/v1/reconciliation-cases/{job_id}/refund",
             post(refund_reconciliation),
         )
         .route("/v1/assets", post(upload_asset))

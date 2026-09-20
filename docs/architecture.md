@@ -49,12 +49,12 @@
 | 方法 | 路径 | handler | 谁可以调 |
 | --- | --- | --- | --- |
 | GET | `/health` | `health` | 任何人 |
-| POST | `/admin/accounts` | `create_account` | 管理员（`ADMIN_TOKEN`） |
-| POST | `/admin/accounts/{account_id}/credits` | `credit_account` | 管理员 |
-| POST | `/admin/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
-| POST | `/admin/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price） |
-| GET | `/admin/reconciliation-cases` | `list_reconciliation_cases` | 管理员（含上游对账标识） |
-| POST | `/admin/reconciliation-cases/{job_id}/refund` | `refund_reconciliation` | 管理员（幂等退款） |
+| POST | `/api/v1/accounts` | `create_account` | 管理员（`ADMIN_TOKEN`） |
+| POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
+| POST | `/api/v1/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
+| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price） |
+| GET | `/api/v1/reconciliation-cases` | `list_reconciliation_cases` | 管理员（含上游对账标识） |
+| POST | `/api/v1/reconciliation-cases/{job_id}/refund` | `refund_reconciliation` | 管理员（幂等退款） |
 | POST | `/v1/assets` | `upload_asset` | 持 Key 的账户（`Content-Type` + `x-asset-role`） |
 | GET | `/v1/assets/{asset_id}` | `download_asset` | 同上，限本账户 |
 | POST | `/v1/image-generations` | `create_generation` | 同上（需 `idempotency_key` 与 `max_cost_microusd`） |
@@ -90,8 +90,8 @@ Worker（独立进程，循环领活）                            apps/worker/s
              └─ 不确定是否已受理 → reconciliation_required + 保留预授权（人工处置）
   │
   ▼ ② GET /v1/image-generations/{job_id}                查询 Job 与结果资产
-     GET /admin/reconciliation-cases                    对账清单（含上游对账标识）
-     POST /admin/reconciliation-cases/{job_id}/refund    幂等退款，只释放预授权
+     GET /api/v1/reconciliation-cases                    对账清单（含上游对账标识）
+     POST /api/v1/reconciliation-cases/{job_id}/refund    幂等退款，只释放预授权
 ```
 
 ## 5. 谁拥有哪张表

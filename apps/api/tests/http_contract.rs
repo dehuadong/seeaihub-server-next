@@ -815,7 +815,7 @@ async fn image_generation_http_contract() {
     wait_until_ready(&client, &base_url).await;
 
     let unauthorized = client
-        .post(format!("{base_url}/admin/accounts"))
+        .post(format!("{base_url}/api/v1/accounts"))
         .json(&json!({"initial_credit_microusd": 1}))
         .send()
         .await
@@ -1196,7 +1196,7 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         "offerings": [aihubmix["offerings"][0], apimart["offerings"][0]]
     });
     let published = client
-        .post(format!("{base_url}/admin/runtime-revisions"))
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(&admin_token)
         .json(&merged)
         .send()
@@ -1341,7 +1341,7 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
     // 而且它必须能从**对账列表接口**看到，而不是只能翻数据库。
     let cases: Value = Client::new()
         .get(format!(
-            "{}/admin/reconciliation-cases",
+            "{}/api/v1/reconciliation-cases",
             outcome.harness.base_url
         ))
         .bearer_auth(&outcome.harness.admin_token)
@@ -1459,7 +1459,7 @@ async fn publish_candidates(
         "offerings": offerings
     });
     client
-        .post(format!("{base_url}/admin/runtime-revisions"))
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
         .json(&body)
         .send()
@@ -1495,7 +1495,7 @@ async fn wait_until_ready(client: &Client, base_url: &str) {
 
 async fn create_account(client: &Client, base_url: &str, admin_token: &str) -> String {
     let response = client
-        .post(format!("{base_url}/admin/accounts"))
+        .post(format!("{base_url}/api/v1/accounts"))
         .bearer_auth(admin_token)
         .json(&json!({"initial_credit_microusd": 100_000}))
         .send()
@@ -1510,7 +1510,7 @@ async fn create_account(client: &Client, base_url: &str, admin_token: &str) -> S
 
 async fn issue_key(client: &Client, base_url: &str, admin_token: &str, account_id: &str) -> String {
     client
-        .post(format!("{base_url}/admin/accounts/{account_id}/api-keys"))
+        .post(format!("{base_url}/api/v1/accounts/{account_id}/api-keys"))
         .bearer_auth(admin_token)
         .json(&json!({"label": "contract"}))
         .send()
@@ -1530,7 +1530,7 @@ async fn publish_bootstrap(client: &Client, base_url: &str, admin_token: &str) {
     ))
     .expect("bootstrap config");
     let response = client
-        .post(format!("{base_url}/admin/runtime-revisions"))
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
         .json(&config)
         .send()
@@ -1546,7 +1546,7 @@ async fn reject_mismatched_model_identity(client: &Client, base_url: &str, admin
     .expect("bootstrap config");
     config["native_model_id"] = Value::String("different-model".to_owned());
     let response = client
-        .post(format!("{base_url}/admin/runtime-revisions"))
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
         .json(&config)
         .send()
@@ -1620,7 +1620,7 @@ async fn verify_reconciliation_contract(
     .expect("case fixture");
 
     let cases: Value = client
-        .get(format!("{base_url}/admin/reconciliation-cases"))
+        .get(format!("{base_url}/api/v1/reconciliation-cases"))
         .bearer_auth(admin_token)
         .send()
         .await
@@ -1643,7 +1643,7 @@ async fn verify_reconciliation_contract(
     });
     let response = client
         .post(format!(
-            "{base_url}/admin/reconciliation-cases/{job_id}/refund"
+            "{base_url}/api/v1/reconciliation-cases/{job_id}/refund"
         ))
         .bearer_auth(admin_token)
         .json(&legacy_charge)
@@ -1658,7 +1658,7 @@ async fn verify_reconciliation_contract(
     for _ in 0..2 {
         let response = client
             .post(format!(
-                "{base_url}/admin/reconciliation-cases/{job_id}/refund"
+                "{base_url}/api/v1/reconciliation-cases/{job_id}/refund"
             ))
             .bearer_auth(admin_token)
             .json(&refund)

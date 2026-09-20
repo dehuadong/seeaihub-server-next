@@ -10,7 +10,7 @@
 
 **为什么另立本文而不是并入 [0002-image-generation-tech-design.md](./0002-image-generation-tech-design.md)**：0002 的 §5（原生能力 Schema 的理由）、§6（计量证据）、§9（Adapter 首期能力与错误分类）都**只对 AIHubMix 成立**——它假定 token 计量、Base64 同响应返回、`additionalProperties: false` 的上游。第二个 Provider 在这三处都不成立（按张计量、预签名 URL 异步取图、静默放行未知字段）。把两套 Provider 合同塞进同一份设计会让 0002 无法独立演进，因此按 `docs/agents/artifacts.md`「独立技术设计 RFC 需要独立评审、复用或演进时拆出」的规定另立本文。0002 保持其已评审通过状态，其通用部分（统一 Command、身份分离、Revision 发布、归档优先）继续有效。
 
-**本文件与 ADR 的职责边界**：持久决定在 `docs/adr/`（本设计引用 [0002](../adr/0002-native-capability-schema-not-canonical.md)、[0003](../adr/0003-postgresql-is-source-of-truth.md)、[0004](../adr/0004-vendor-and-provider-identities-stay-separate.md)、[0006](../adr/0006-no-settlement-without-metering-evidence.md)、[0007](../adr/0007-reconciliation-instead-of-automatic-retry.md)、[0008](../adr/0008-own-object-storage-is-the-platform-result.md)、[0009](../adr/0009-multiple-active-offerings-and-routing.md)、[0010](../adr/0010-metering-evidence-is-unit-bearing.md)、[0011](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)），本文只承载该 Provider 的技术设计细节，不复制决策正文。本 Provider 选择哪种执行策略属本文承载的技术设计细节。
+**本文件与 ADR 的职责边界**：持久决定在 `docs/adr/`（本设计引用 [0002](../adr/0002-native-capability-schema-not-canonical.md)、[0003](../adr/0003-postgresql-is-source-of-truth.md)、[0004](../adr/0004-vendor-and-provider-identities-stay-separate.md)、[0006](../adr/0006-no-settlement-without-metering-evidence.md)、[0007](../adr/0007-reconciliation-instead-of-automatic-retry.md)、[0008](../adr/0008-own-object-storage-is-the-platform-result.md)、[0009](../adr/0009-multiple-active-offerings-and-routing.md)、[0011](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)），本文只承载该 Provider 的技术设计细节，不复制决策正文。本 Provider 选择哪种执行策略属本文承载的技术设计细节。
 
 ## 1. Provider 与模型身份
 
@@ -114,7 +114,7 @@ MeteredUsage::Images { generated_images, images: [ { size, width, height } ], in
 - `generated_images` 是**唯一 Provider 计量事实**（声明计费了几张）；
 - `images[].size` 是**计价所需的 Provider 结果属性**（决定每张落在哪个像素档位），与前者角色不同但缺一不可；
 - `input_image_count` 是**受理时固化的请求侧事实**（由 `PreparedImageRequest.assets` 中 `native_path == "/image"` 的项计数），**不是** Provider 计量事实——放进 Evidence 是因为计价公式需要它。实测基础模型**不返回** `usage.input_images`，故不能从响应取；「非 pro 是否承诺不返回」在一手文档中未获承诺（保留该保留）；
-- 金额 = Provider 事实 × 已发布单价，不是平台估算。硬约束见 `docs/adr/0010-metering-evidence-is-unit-bearing.md`。
+- 金额 = Provider 事实 × 已发布单价，不是平台估算。硬约束见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
 ### 3.2 首期 Price Plan
 

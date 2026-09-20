@@ -54,7 +54,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 7. **上传失败的分类不实**：`upload_failure` 曾把"生成任务可证明未受理"标成 `NotRetryable`（"确定性拒绝"）。三态里对应的是 `SafeBeforeAcceptance`（`docs/adr/0011`），已改正并补测试；`code`/`message` 仍按 `error.code` 保留。
 8. **凭据类失败被误判成"受理状态不确定"**（零费用探测发现）：APIMart 的 401 信封里 `error.code` 是**空字符串**，只有 `type: "apimart_error"`，于是"只依据 `error.code`"这条规则会把一个明确没进到生成的请求送进人工对账。已加一条兜底：**凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝**，**5xx 仍不看状态码**（`build_request_failed` 会以 500 承载参数错误）。
 9. **渠道事实里把 `APIMART_API_KEY` 写成"不存在"**：实际 User 与 Machine 级都有，当时只看了进程环境。已更正——这条错误会让读者以为受控验证根本做不了。
-10. **对账时没有 task id 可用**（用户问"task_id 跨调用恢复是什么"时查出来）：APIMart 的 task id **只在成功路径**落库（`CompleteJob`），提交成功后如果轮询/取图失败，这个 id 直接丢掉——于是进对账的 Job **连"该去上游查哪个任务"都没有线索**，人工对账是盲的。已补：Driver 在提交后的每一步失败上都附上 task id（`with_task_id`，不改 code/message/`retry_safety`），并把它挂到 `/admin/reconciliation-cases` 的返回里，让人工能看到。**注意这仍不是"跨调用恢复"**——拿 task id 自动去补齐结果属于独立工作项（见"已知限制"）。
+10. **对账时没有 task id 可用**（用户问"task_id 跨调用恢复是什么"时查出来）：APIMart 的 task id **只在成功路径**落库（`CompleteJob`），提交成功后如果轮询/取图失败，这个 id 直接丢掉——于是进对账的 Job **连"该去上游查哪个任务"都没有线索**，人工对账是盲的。已补：Driver 在提交后的每一步失败上都附上 task id（`with_task_id`，不改 code/message/`retry_safety`），并把它挂到 `/api/v1/reconciliation-cases` 的返回里，让人工能看到。**注意这仍不是"跨调用恢复"**——拿 task id 自动去补齐结果属于独立工作项（见"已知限制"）。
 
 第 4 项在实现评审中两次被质疑、两次都按 ADR 收紧了声明；第 1–4、7 项由实现评审（Standards / Spec 双轴）发现，第 5、6、8、9 项为自行核对发现（第 8 项来自零费用路由探测）。
 
