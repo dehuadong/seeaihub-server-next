@@ -12,6 +12,8 @@
 
 ## 新工件归属
 
+> 变更、历史与状态**不写进本表**：变更归提交历史与 Agent Notes，历史位置归下方「历史工件与新旧衔接」表。本表只回答"放哪里、边界在哪、写的时候守什么"。
+
 | 工件或信息 | 位置与规则 |
 | --- | --- |
 | Proposal / 总体及阶段提案 | 按 `docs/agents/issue-tracker.md` 配置的 GitHub Issues 管理，以仓库限定编号作标识；作为该规划工作的主入口，引用独立需求与设计 |
@@ -79,7 +81,9 @@ Proposal 的工作状态由 `docs/agents/issue-tracker.md` 拥有的 GitHub 标�
 
 `scripts/decisions/lib.mjs` 是本地修补过的项目副本：`resolveTarget()` 用显式栈逐段解析相对链接，不使用 `path.resolve` / `path.normalize` / `path.join`——原版在本机 Node v24.10.0（Windows）上会把正确的跨目录相对链接误报为断链。
 
-升级 setup 技能自带的 bundle 时：先逐文件比对，保留本处定制，不要用原始 `lib.mjs` 覆盖；`update-index.mjs`、`check.mjs` 未修改。
+`check.mjs` 另有一处本地新增：检查 `docs/agents/artifacts.md` 的「新工件归属」表里没有变更信息（具体日期、提交号、"已移除/已更新"一类措辞）——该表只写位置与规则，靠这条检查而不是靠自觉。
+
+升级 setup 技能自带的 bundle 时：先逐文件比对，保留本处定制，不要用原始的 `lib.mjs` / `check.mjs` 覆盖；`update-index.mjs` 未修改。
 
 ## 维护
 
