@@ -4,7 +4,7 @@
 /.idea/
 /.vscode/
 *.log
-
+.scratch/
 # 第三方可运行示例代码：随外部参考资源保留在本地，不入版本库。
 # 其余 out-reference/ 内容（调研笔记、Schema 快照、错误码、计量证据样本）正常入库。
 /out-reference/doubao/touch_edit_demo/
