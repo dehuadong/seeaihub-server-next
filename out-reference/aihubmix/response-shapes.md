@@ -15,18 +15,15 @@
 | --- | --- | --- | --- | --- |
 | `POST /v1/images/generations`（同步） | ✅ | ✅ **`gpt_image_2_generations.json`**（逐字，含 2 MB `b64_json`） | **用户早期采集**：响应 `created = 1785485861` ⇒ **2026-07-31 16:17:41 +08:00**；随仓库建立提交 `1fe462a` 入库 | §1 |
 | `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ✅（转录）**`transcript-sync-and-async-2026-09.json`** | 本仓库受控实测（`channel-facts` §5.2） | §1 |
-| `POST /v1/images/generations`（同步，2.5 flare，逐字） | ✅ 2026-09-20 | ✅ **`probe-2026-09-20-generations.json`** | 本仓库受控实测（`channel-facts` §5.7） | §1、§7 |
-| `POST /ai/v1/images/generations`（**默认同步**，2.5 flare） | ✅ 2026-09-20 | ✅ **`probe-2026-09-20-native_sync.json`** | 本仓库受控实测（`channel-facts` §5.7） | §3、§7 |
-| `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 2026-09-18 | ✅（转录）`transcript-sync-and-async-2026-09.json` | 本仓库受控实测（同文件 §13.2 的转述，见 `channel-facts` §2.3 的说明） | §2 |
-| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ✅（转录）同上文件 | 本仓库受控实测（同上 / `channel-facts` §2.3） | §3 |
+| `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 2026-09-18 | ✅（转录）同上文件 | 本仓库受控实测（`docs/research/…` §13.2） | §2 |
+| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ✅（转录）同上文件 | 本仓库受控实测（同上 §13.1 / `channel-facts` §2.3） | §3 |
 | 错误信封 | ✅ 部分 | ✅（转录）同上文件 | 本仓库受控实测 + 上游文档 | §4 |
-| **响应头** | ✅ 2026-09-20 | ✅ 两个 `probe-2026-09-20-*.json` | 本仓库受控实测 | §7 |
 
-**证据等级**：`gpt_image_2_generations.json` 是**逐字**报文；`transcript-sync-and-async-2026-09.json` 是**转录**（字段名与取值照当时的实测记录整理，`b64_json` 只记长度）——这批调用的逐字报文当时没有落盘。`probe-2026-09-20-*.json` 是**逐字**（`b64_json`、URL 与 task id 已脱敏）。
+**证据等级**：`gpt_image_2_generations.json` 是**逐字**报文；`transcript-sync-and-async-2026-09.json` 是**转录**（字段名与取值照当时的实测记录整理，`b64_json` 只记长度）——这批调用的逐字报文当时没有落盘。
 
 **口径提醒**：`gpt_image_2_generations.json` 的响应体**没有 `model` 字段**（顶层只有 `created/background/data/output_format/quality/size/usage`），因此"它来自 `gpt-image-2`"是**按文件名与 `gpt-image-2.md` 推断**的，报文本身证明不了。同理，同步 `/v1` 的响应都**不回显模型名**。
 
-**缺口**：**逐字报文**这一层现在有用户早期那份（§1）与 2026-09-20 的两份 `probe-2026-09-20-*.json`；2026-09-18/19 那几批仍只有**转录**。**响应头**这一层 2026-09-20 之前完全空白，现已补上（§7）。
+**缺口**：**逐字报文**这一层只有用户早期那份（§1）；2026-09-18/19 那几批我方实测只有**转录**（`transcript-sync-and-async-2026-09.json`）。字段级结构已完整，缺的是"逐字可复核"这一层——若要补，按 §6 的脚本重跑一次即可。
 
 ## 1. `POST /v1/images/generations`（同步，OpenAI 兼容）
 
@@ -62,13 +59,13 @@
 
 | 字段 | 说明 |
 | --- | --- |
-| **响应体里没有 `id`** | 顶层只有 `created/background/data/output_format/quality/size/usage`——**既没有任务 id，也没有请求 id**；`data[]` 项里也只有 `b64_json`。两条同步路径（generations / edits）都是这样。**逐请求标识在响应头里**（`X-Request-ID`，见 §7） |
+| **没有 `id`** | 顶层只有 `created/background/data/output_format/quality/size/usage`——**既没有任务 id，也没有请求 id**；`data[]` 项里也只有 `b64_json`。两条同步路径（generations / edits）都是这样 |
 | `created` / `background` / `output_format` / `quality` / `size` | 顶层回显类字段，**不在** `data[]` 里 |
 | `data[]` | 数组；每项**只有** `b64_json`（本渠道这两条路径**不返回 URL**） |
 | `usage` | **四分项**（`input_tokens_details` / `output_tokens_details` 各含 `text_tokens`/`image_tokens`）+ `total_tokens`；**没有** `cached_tokens`、**没有**金额字段 |
 | 金额 | **响应里没有** ⇒ 成本价只能按四档 token 费率自算（见 `docs/facts/channel-facts.md` §2.4） |
 
-**⇒ 后果（同步路径）**：同步调用**没有可查的上游任务**——响应体里没有 id，且实测两次同步调用**未出现在** `/ai/v1/images` 任务列表里（原调研记录的 §13.2；该文档已于 2026-09-20 清理删除，结论转述在 `docs/facts/channel-facts.md` §2.3）。所以创建请求一旦失联，**没有技术手段能把结果取回**，只能进对账、人工按账号与时间窗核对（`docs/adr/0005`/`0007`）——**但有一枚可归因的请求标识**（响应头 `X-Request-ID`，§7），对账不再是"连查哪个请求都不知道"。`/ai/v1` 返回的才是任务对象（有 `id`），但那条路径不返回 `usage`（§3、§7），不作为计费执行路径。
+**⇒ 后果（同步路径）**：同步调用**没有可查的上游任务**——响应里没有 id，且实测两次同步调用**未出现在** `/ai/v1/images` 任务列表里（`docs/research/gpt-image-2-inferera-research.md` §13.2）。所以创建请求一旦失联，**没有技术手段能把结果找回来**，只能进对账、人工按账号与时间窗核对（`docs/adr/0005`/`0007`）。异步 `/ai/v1` 才有 `id`（`t_…`），但那条路径不返回 `usage`，不作为计费执行路径。
 
 ## 2. `POST /v1/images/edits`（同步，`multipart/form-data`）
 
@@ -106,8 +103,6 @@
 
 **状态取值**：`pending` → `in_progress` → `completed`（文档另列 `failed`/`cancelled`）。
 
-**默认（不带 `async`）也是同一个任务对象（2026-09-20 实测）**：`{"model":"gpt-image-2.5-flare","prompt":"…","n":1,"size":"1024x1024","extra":{"quality":"low"}}` ⇒ HTTP 200、13.86 秒后返回 `status: completed` 的同形任务对象（`id`、`output[0].b64_json` 与 `content_url` 都在，**仍无 `usage`**）。也就是说这条端点的"同步"只是**等它跑完再返回**，返回形状与 `async: true` 一致 ⇒ **它无论同步异步都不带计量**。样本：`probe-2026-09-20-native_sync.json`；响应头见 §7。
-
 ## 4. 错误信封
 
 文档给出的形状（**异步文档**，`gpt-image-2`）：
@@ -117,31 +112,17 @@
 ```
 
 - **实测的一条**（`/ai/v1` 顶层传 `quality`）：HTTP 400，`{"error":{"code":"schema_violation","message":"Unknown request parameter: `quality`.","type":"invalid_request_error"}}`——**这一条里没有 `tid` 字段**（文档说错误体带 `tid`，实测这个 400 没带）；
-- **`tid` / 响应头的现状（2026-09-20 实测结清，见 §7）**：文档说错误体带 `tid`；**响应头确实有逐请求标识**——`/v1/*` 带 `X-Request-ID` 与 `apim-request-id`，两条路径都带 `x-aihubmix-request-id`。② Adapter 读的 `x-request-id` 因此能采到值（成功路径也会落库）。此前"从未实测过响应头"的缺口已关闭；
+- **`tid`/`x-request-id` 的现状（2026-09-20 更正）**：文档说错误体带 `tid`、② Adapter 也会读响应头 `x-request-id` 作为对账标识，**但本仓库从未实测记录过 AIHubMix 的响应头**——用户早期那份样本只存了 `http_status/elapsed_seconds/body`（无 headers），2026-09-18/19 那几批也没记响应头。因此"AIHubMix 的响应头里到底有没有 `x-request-id`、长什么样"**目前是未结清的事实**；Adapter 的写法是"有就采、没有就留空"（`Option`），不会因此失败；
 - **未知参数是硬拒绝**（`schema_violation`），不会静默降级。
 
 ## 5. 相关记录
 
-- 渠道事实（归纳后）：`docs/facts/channel-facts.md` §2.2/§2.3/§2.6/§2.6b/§2.6c；
-- 调研过程与受控实测：2026-09-20 之前那份调研文档（`docs/research/gpt-image-2-inferera-research.md` §13）**已于 2026-09-20 清理删除**，其结论转述在 `docs/facts/channel-facts.md` §2.3；本目录保留当时的转录与快照；
+- 渠道事实（归纳后）：`docs/facts/channel-facts.md` §2.2/§2.3/§2.6/§2.6b；
+- 调研过程与受控实测：`docs/research/gpt-image-2-inferera-research.md` §13；
 - 请求侧合同（机器 Schema 快照）：`schema-gpt-image-2*.endpoints.json`；
 - 另一个渠道的对应台账：`out-reference/apimart/response-shapes.md`。
 
-## 7. 响应头（2026-09-20 首次实测）
-
-| 头 | 出现在 | 样例（脱敏后原样） |
-| --- | --- | --- |
-| `X-Request-ID` | 仅 `/v1/images/generations` | `911efcbf-2868-490c-b87e-729d1751ca38` |
-| `x-aihubmix-request-id` | 两条路径都有 | `2026092006194196914429082113579` |
-| `apim-request-id` | 仅 `/v1/images/generations` | `cf78feef-2e42-4596-9376-37996551bd3b` |
-| `x-ratelimit-limit-requests` / `-remaining-requests` | 仅 `/v1/images/generations` | `12` / `8`（本次调用前） |
-| `x-aihubmix-model` / `x-ms-deployment-name` / `x-ms-region` | 仅 `/v1/images/generations` | `gpt-image-2.5-flare` / `gpt-image-25-flare` / `Sweden Central` |
-
-**要点**：① 同步路径的对账标识**拿得到**（`X-Request-ID`），② Adapter 的取法（读 `x-request-id`）是对的；② **账号级限流天花板**：响应头自报每分钟 12 次；③ `/ai/v1` 那条路径的响应头里**只有** `x-aihubmix-request-id`。
-
-样本：`probe-2026-09-20-generations.json`（`/v1`）、`probe-2026-09-20-native_sync.json`（`/ai/v1` 默认同步）。
-
-## 8. 怎么补齐剩下的缺口
+## 6. 怎么补齐 §0 的三处缺口
 
 跑 `scripts/probe/response-shapes.ps1`（本仓库**唯一**会发真实计费调用的入口，默认只演练，必须显式加 `-ConfirmPaidCalls`）：
 
@@ -150,8 +131,8 @@
 pwsh -File scripts/probe/response-shapes.ps1 -Provider aihubmix
 # 真跑：同步文生图 + 图片编辑（各 1 次付费调用）
 pwsh -File scripts/probe/response-shapes.ps1 -Provider aihubmix -Probe generations,edits -ConfirmPaidCalls
-# `/ai/v1` 默认同步 / 异步任务对象（各 1 次付费调用）
-pwsh -File scripts/probe/response-shapes.ps1 -Provider aihubmix -Probe native_sync,async -ConfirmPaidCalls
+# 异步任务对象（`/ai/v1`，1 次付费调用）
+pwsh -File scripts/probe/response-shapes.ps1 -Provider aihubmix -Probe async -ConfirmPaidCalls
 ```
 
 脚本会写好 `out-reference/aihubmix/probe-<日期>-<probe>.json`（自动脱敏 URL / task id / `b64_json`），并在结束时提醒补两处登记：`docs/facts/channel-facts.md` §5 与本文档 §0 的表格。
