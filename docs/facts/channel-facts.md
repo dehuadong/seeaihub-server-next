@@ -313,6 +313,32 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 该码与 APIMart 的 `402` 是同一类（见 §3.8 第 3 条）；两者目前都被 Adapter 按"凭据/权限类 → 确定性拒绝"处理（重试同一配置无意义），**对客的呈现方式尚未决定**。
 
+### 2.13 错误码（第一方文档快照，页面更新于 2026-06-01）
+
+来源：`out-reference/aihubmix/error-code.md`（第一方「HTTP 状态码」页）。**只有部分状态码带机器可读的「错误标识符」**，其余只能靠状态码 + 消息文本识别；该页自述「**大部分 400 错误是上游透传的报错**」——连消息文本也可能是第三方（Vendor）原文。
+
+| 状态码 | 错误标识符 | 消息（原文摘要） | 常见原因（第一方口径） |
+| --- | --- | --- | --- |
+| 503 | — | Incorrect model ID… / you do not have permission to use this model | 没有可用的渠道处理请求 |
+| 503 | — | Rate limited by provider – contact support… | 模型遇到官方限速 |
+| 429 | — | The xx model Too many requests; please try again later. | 请求频率超过限制 |
+| **403** | **`insufficient_user_quota`** | Your account balance is insufficient. Please recharge your account… | **用户余额不足，需要充值**——**这里的"用户"是我们**，即平台侧欠费 |
+| 403 | — | Account suspended. | 用户状态被禁用或在黑名单 |
+| 403 | — | Forbidden – insufficient permissions. | 用户角色权限不够 |
+| 403 | — | Forbidden – key(后六位) allowed only from approved IP ranges. | IP 不在令牌允许的网段内 |
+| 403 | — | Forbidden – key(后六位) not authorized to access the requested model. | 令牌不支持请求的模型 |
+| 403 | — | Key error；(后六位) | 非管理员用户尝试指定渠道 |
+| 403 | — | Forbidden – channel has been disabled. | 渠道状态为禁用 |
+| 401 | — | Unauthorized – no access token supplied | 未提供 Authorization 头 |
+| 401 | — | Unauthorized – access token is invalid or expired | access token 验证失败 |
+| 400 | — / `prompt_missing` / `prompt_too_long` / `text_too_long` / `size_not_supported` / `n_not_within_range` | Bad Request – invalid channel ID / prompt is required / … | 渠道 ID 错误、缺提示词、提示词或输入过长、尺寸不被支持、n 超范围 |
+
+**对平台的三条要点**：
+
+1. **"余额不足"说的是我们**：`insufficient_user_quota` 是**平台在渠道侧的账户欠费**（`CONTEXT.md` 的 `Platform Funding Failure`），**不得原样返回给消费客户端**；403 的其余分支（账号禁用、IP 白名单、令牌不支持该模型、渠道被禁用）也全是**我们与渠道之间的配置/资质问题**。
+2. **没有"服务器错误"这一档**：该页的 503 只有"没有可用渠道"与"被官方限速"两种含义，属渠道侧/上游侧问题，不是"我们调它时它崩了"。
+3. **分类不能只靠字符串匹配**：多数分支没有错误标识符，文本还可能是上游透传——所以要以**状态码兜底**，并保留原始文本供人工核对。
+
 ## 3. APIMart
 
 > 同样适用 ②③④⑤；与本文件的 AIHubMix 各节**互不推导**。
@@ -501,6 +527,28 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 **金额型计量证据因此被否决**：平台的**计量事实**是四分项 token；金额随账号倍率变化、不可复现，所以结算必须由分项 token 推出，上游声明的金额只用来核成本（本阶段要的正是它）。§5.6 那次真实端到端是这条的实证。
 
 **来源**：用户 2026-09-19 在会话中提供的两张上游控制台"详情"面板截图（含 `task_id` 与 API 密钥标签，故**截图本身不入库**；本表只转录与结算有关的数字与倍率）。
+
+### 3.10 错误码与错误信封（第一方文档，2026-09-19）
+
+信封统一为 `{"error":{"code","message","type"}}`（部分页面另有 `param`、`request_id`）。**`code` 的类型与是否在场随端点而异**：真实 401 探测里 `error.code` 是**空字符串**（§3.8），而文档示例里 `code` 是**数字**（401/402/…）。因此分类必须以 HTTP 状态码兜底。
+
+| HTTP | 创建/查询接口（第一方文档） | 能否证明"未受理、未计费"（第一方口径） |
+| --- | --- | --- |
+| `400` | `invalid_request_error`：size 不合法 / resolution 不支持 / 像素违规；查询侧＝"无效的任务 ID" | **能** |
+| `401` | `authentication_error`：身份验证失败 | **能** |
+| `402` | `payment_required`：**账户余额不足，请充值后再试** | **能**（未受理）——**这里的"账户"是我们**，即平台侧欠费 |
+| `403` | 权限不足（官方渠道页） | **能** |
+| `409` | 幂等子类：`idempotency_in_progress` / `idempotency_key_reused` / `idempotency_result_indeterminate` | 前两者**能**；`result_indeterminate` **不能**（第一方要求停止自动重试、不要换 Key） |
+| `429` | `rate_limit_error`：请求过于频繁 | **能**（未受理） |
+| `500` | `server_error`：服务器错误 | **不能**——结果不明 |
+| `502` | 网关错误 | **不能** |
+| `503` | `service_unavailable`：上游暂时不可用 | 普通 503 **不能**；`503 idempotency_unavailable`（原文"当前请求未执行"）**能** |
+| 超时 / 连接中断 | — | **不能**（第一方明示：客户端取消不代表服务端未生成、不代表不计费） |
+
+**两个必须处理的陷阱**：
+
+1. **`500` 会被用来承载参数错误**：示例 message 为 `build_request_failed: invalid size: 3:5, allowed: …`。若按"500 ⇒ 结果不明 ⇒ 进对账"处理，会把一个纯粹可修正的请求错误升级成人工对账。
+2. **失败任务会退款**：`failed` 状态写明"reserved funds are refunded"，`/v1/usage` 也写明失败与失败后退款的调用不计入、部分成功的批次按实际交付张数计费。这影响"失败是否产生成本"的判断，但不改变平台的证据门槛。
 
 ## 4. 不跨渠道合并（原写法的更正）
 
