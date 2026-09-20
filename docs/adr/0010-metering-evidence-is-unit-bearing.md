@@ -24,4 +24,4 @@
 
 **本阶段不预判「要不要扩展证据形态」**：APIMart 的响应到底给分项 token 还是只给金额，属实施期受控验证要结清的事实。在结清之前，本条只声明原则（计量承单位、计价声明维度、不得由金额反推计量量），**不为推测的形态先造机制**。真实形状确定后，若需要扩展，按最小改动另行修订。
 
-**来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（见 `out-reference/aihubmix/gpt-image-2-inferera-research.md`）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。
+**来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（见 `docs/research/gpt-image-2-inferera-research.md`）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。

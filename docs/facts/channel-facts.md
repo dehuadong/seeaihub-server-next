@@ -74,7 +74,7 @@
 ### 2.3 异步 `/ai/v1` 的真实响应
 
 > ⚠️ **本节原写于 2026-09-19，是一次重复验证——第一阶段（2026-09-18）已完成更完整的同类实测。**
-> 权威记录在 `gpt-image-2-inferera-research.md` **§13.1**：三个场景（纯文生图 / 单图输入 / 图像+alpha mask）各一次真实付费调用，**创建与详情的 `usage` 均为「无」**；任务列表项只有 `id/object/model/status/output/error/created_at/completed_at/expires_at`，**无 prompt、无 metadata、无 correlation ID、无 usage**。
+> 权威记录在 `docs/research/gpt-image-2-inferera-research.md` **§13.1**：三个场景（纯文生图 / 单图输入 / 图像+alpha mask）各一次真实付费调用，**创建与详情的 `usage` 均为「无」**；任务列表项只有 `id/object/model/status/output/error/created_at/completed_at/expires_at`，**无 prompt、无 metadata、无 correlation ID、无 usage**。
 > §13.3 第 6 条已作出结论：`/ai/v1` 保留为 Adapter 已验证能力，**在提供可关联 usage/账单证据前，不发布为正式计费 Offering 的执行路径**。
 > 本节 2026-09-19 的实测**与该结论一致，不构成新发现**，仅补了 2.5 之前的一个样本。留此以供交叉核对，**结论归因于第一阶段**。
 

@@ -1,8 +1,21 @@
 # AIHubMix `gpt-image-2` 第一方协议调研
 
-> 调研日期：2026-09-18  
-> 用途：为历史提案 #674 与本仓库首个图片 Provider 提供事实依据  
+> 调研日期：2026-09-18
+> 用途：为历史提案 #674 与本仓库首个图片 Provider 提供事实依据
 > 性质：上游协议研究与受控验证证据，不是平台对外接口合同
+> 位置：**2026-09-19 从 `out-reference/aihubmix/` 迁到 `docs/research/`**——它是我们自己写的调研，按 `docs/agents/artifacts.md` 的分工不属于「上游或第三方原始材料」；原始证据（响应样本、Schema 快照）仍在 `out-reference/aihubmix/`。
+
+## 0. 更正记录（2026-09-19 整改）
+
+本文件此前有**两处结论是错的**，另有一处与另一渠道的对比混入。以下是更正，正文相应位置已标注：
+
+| # | 原结论（错） | 更正后 | 依据 |
+| --- | --- | --- | --- |
+| 1 | §9.1 / §10：公开价**只有三项**（文本输入 / 图片输入 / 图片输出），仓库旧资料里的「文本输出 `$10 / 1M`」**不予采用** | **四档都要用**：文本输入 `$5`、**文本输出 `$10`**、图像输入 `$8`、图像输出 `$30`（每 1M tokens）。当初按"只有三项"发布，导致生效配置里**文本输出费率写成 0**，即少收费——该缺陷记录在 `docs/facts/channel-facts.md` §2.11 | 用户 2026-09-19 确认四档；`docs/facts/channel-facts.md` §2.4 |
+| 2 | §6.1（据文档）：**即使同步执行，AIHubMix 也会保存任务记录**，创建响应丢失时可通过 `GET /ai/v1/images` 查找 | **对本渠道的 `/v1` 同步分支不成立**：§13.2 实测两次同步调用**未出现在** `/ai/v1/images` 列表里。因此 `/v1` 的创建请求失联后**没有**可查询的上游任务 ⇒ 只能进对账（见 `docs/adr/0005`/`0007`） | 本文件 §13.2 实测 |
+| 3 | §7.1b 末：以「与火山方舟的行为相反」作对比 | 已删除。渠道差异不互相推导（`docs/design/0004` R1）；火山方舟的事实只在 `out-reference/doubao/doubao-ark-image-research.md` | `docs/design/0004` R1 |
+
+**另外**：§12 的验证清单已在 §13 完成（§13 取代相冲突的"待确认"），§12 保留为历史过程记录。
 
 ## 1. 结论
 
@@ -13,8 +26,8 @@
 - **事实**：模型说明称生成可能超过 5 分钟，并建议客户端超时至少 10 分钟；异步任务需要账户预先开通，否则返回 `403 async_not_enabled`。[模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) · [异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md)
 - **推论**：新服务端仍应先落自己的持久 Job，再调用 Provider。若账户已开通异步能力，首选 `async: true`；不应让面向调用方的 HTTP 连接等待十分钟。
 - **事实**：公开模型页当前展示的价格为文本输入 `$5 / 1M tokens`、图片输入 `$8 / 1M tokens`、图片输出 `$30 / 1M tokens`。[模型页](https://aihubmix.com/model/gpt-image-2)
-- **待确认**：`/ai/v1` 的任务对象文档没有 `usage` 字段，而仓库中的 OpenAI 兼容接口实测样本有分项 token 用量。生产计费前必须确认异步任务的权威用量/账单来源，不能仅靠本地估算。[异步任务对象](https://docs.aihubmix.com/en/api/async-tasks.md#task-object) · [本地实测样本](./gpt_image_2_generations.json)
-- **待确认**：实时 Schema 与模型介绍/旧资料在 `input_fidelity`、`quality=auto`、`moderation`、`response_format`、`webp` 等字段上不一致。实现时应以实时 Schema 快照为默认合同，并通过付费冒烟测试确认差异，不能把旧文档字段直接固化进 Native Schema。[实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) · [模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) · [仓库旧资料](./gpt-image-2.md)
+- **待确认**：`/ai/v1` 的任务对象文档没有 `usage` 字段，而仓库中的 OpenAI 兼容接口实测样本有分项 token 用量。生产计费前必须确认异步任务的权威用量/账单来源，不能仅靠本地估算。[异步任务对象](https://docs.aihubmix.com/en/api/async-tasks.md#task-object) · [本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
+- **待确认**：实时 Schema 与模型介绍/旧资料在 `input_fidelity`、`quality=auto`、`moderation`、`response_format`、`webp` 等字段上不一致。实现时应以实时 Schema 快照为默认合同，并通过付费冒烟测试确认差异，不能把旧文档字段直接固化进 Native Schema。[实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) · [模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) · [仓库旧资料](../../out-reference/aihubmix/gpt-image-2.md)
 
 **建议**：可以把 AIHubMix 作为 #674 的首个 Provider 候选，并把文生图、图生图、多图参考、遮罩放在同一阶段；但“异步用量证据”和“冲突参数的真实可用性”是进入生产计费前的阻塞验证项。
 
@@ -27,7 +40,7 @@
 | A | [AIHubMix 模型页](https://aihubmix.com/model/gpt-image-2) | 当前公开价格、模型身份和模态 |
 | B | [用户给出的 Inferera 模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) | 模型摘要、端点索引、鉴权、超时、结果 URL 和错误概览；正文给出的 canonical 地址是 `aihubmix.com` 下的同名页面 |
 | B | [AIHubMix HTTP 状态码说明](https://docs.aihubmix.com/en/FAQs/HTTP-Codes.md) | OpenAI 兼容/通用接口的错误概览 |
-| 仓库观察 | [现有说明](./gpt-image-2.md)、[实测响应](./gpt_image_2_generations.json) | 与最新第一方资料做差异对照；不能反向覆盖当前第一方合同 |
+| 仓库观察 | [现有说明](../../out-reference/aihubmix/gpt-image-2.md)、[实测响应](../../out-reference/aihubmix/gpt_image_2_generations.json) | 与最新第一方资料做差异对照；不能反向覆盖当前第一方合同 |
 
 说明：本文没有引用第三方博客。第 1–12 节保留付费验证前的调研过程，第 13 节记录随后完成的受控真实付费验证；后者取代前文相冲突的“待确认”结论。
 
@@ -104,7 +117,7 @@
 | --- | --- | --- |
 | `input_fidelity` | 模型说明称模型支持 high input fidelity，但实时 Schema 没有该字段，且拒绝未知字段 | **待确认**；首版 Native Schema 不开放，付费联调确认后再按版本加入。[模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) · [实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
 | `quality=auto` | 模型页/仓库旧示例使用 `auto`，实时 Schema 只允许 `low/medium/high` | **待确认**；自动导入时遵守实时 Schema，不把示例值越权加入枚举。[模型页](https://aihubmix.com/model/gpt-image-2) · [实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
-| `moderation` | 仓库旧资料列出 `auto/low`，实时 Schema 没有该字段 | **待确认**；首版不开放。[仓库旧资料](./gpt-image-2.md) · [实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
+| `moderation` | 仓库旧资料列出 `auto/low`，实时 Schema 没有该字段 | **待确认**；首版不开放。[仓库旧资料](../../out-reference/aihubmix/gpt-image-2.md) · [实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
 | `response_format` | 通用异步文档列出 `url/b64_json`，模型实时 Schema 没有该字段 | **待确认**；Adapter 响应解析同时兼容 URL 和 Base64，但请求侧不承诺可选择。[异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md#image-parameters) · [实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
 | `webp` | 通用异步文档列出 `webp`，模型实时 Schema 仅允许 PNG/JPEG | **事实 + 待确认**；模型级 Schema 应覆盖通用字段全集。[异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md#image-parameters) · [实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
 | `mask` 类型 | 同一实时 Schema 同时含 `type: string` 和允许 `{url}` 的 `oneOf` | **待确认**；这是自相矛盾的 JSON Schema，首版先只接受 string，待联调验证 object。[实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) |
@@ -114,7 +127,7 @@
 
 ### 6.1 Provider 事实
 
-- **事实**：图片接口默认同步；`async: true` 时立即返回任务对象，并在后台继续生成。即使同步执行，AIHubMix 也会保存任务记录；创建响应丢失时可以通过 `GET /ai/v1/images` 查找。[异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md#create-async-task)
+- **事实**：图片接口默认同步；`async: true` 时立即返回任务对象，并在后台继续生成。文档称即使同步执行也会保存任务记录、创建响应丢失时可通过 `GET /ai/v1/images` 查找——**⚠️ 实测更正（见文首第 2 条）**：这句话对本渠道的 `/v1` 同步分支**不成立**，两次同步调用未出现在任务列表里；只有 `/ai/v1` 的异步任务才在列表里。[异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md#create-async-task)
 - **事实**：异步能力需在账户后台开通；未开通返回 `403 async_not_enabled`。[异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md)
 - **事实**：详情轮询为 `GET /ai/v1/images/{id}`；状态为 `pending`、`in_progress`、`completed`、`failed`、`cancelled`，建议每 15 秒轮询一次。[异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md#task-status)
 - **事实**：实时 Schema 的 `cancel_path` 为空；当前文档没有给出图片取消接口。[实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints)
@@ -137,7 +150,7 @@
 
 **推论**：Provider 完成后必须立即把全部结果复制进新服务端自己的对象存储，记录内容哈希、MIME、字节数、宽高和上游 result/index；不能把短期上游 URL 直接当作平台长期结果。
 
-**事实**：仓库已有的 OpenAI 兼容接口响应样本不是 Task 对象，而是 `created/background/data[].b64_json/output_format/quality/size/usage`；样本 HTTP 200、耗时 21.05 秒，`usage` 含文本/图片输入输出 token 分项。[本地实测样本](./gpt_image_2_generations.json)
+**事实**：仓库已有的 OpenAI 兼容接口响应样本不是 Task 对象，而是 `created/background/data[].b64_json/output_format/quality/size/usage`；样本 HTTP 200、耗时 21.05 秒，`usage` 含文本/图片输入输出 token 分项。[本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
 
 **推论**：Adapter 必须按 `endpoint_family` 使用不同响应解码器，不能假定 `/ai/v1` 和 `/v1` 返回相同形状。
 
@@ -170,7 +183,7 @@
 2. **`output[]` 项**为 `{index, type, content_url, b64_json}`；本次 `b64_json` 为 `null`，结果只给 `content_url`。
 3. **状态流转**：受理即 `pending` → 本样本 10 秒内 `completed`。
 4. **`quality` 不是 `/ai/v1` 的顶层参数**：顶层传 `quality` 被拒，HTTP 400，`{"error":{"code":"schema_violation","message":"Unknown request parameter: `quality`.","type":"invalid_request_error"}}`；去掉后即受理。⇒ 必须放进 `extra`（与本地 Schema 一致）。
-5. **未知参数是硬拒绝**（`schema_violation`），不是静默接受——与火山方舟的行为相反。
+5. **未知参数是硬拒绝**（`schema_violation`），不是静默接受。
 
 **尚未确认（本次未测）**：
 
@@ -229,15 +242,18 @@
 
 ### 9.1 当前公开价格
 
+**四档 token 单价**（本渠道按 Tokens 计费；上游**只返回 token、不返回金额**）：
+
 | 计费项 | 公开单价 | 性质与来源 |
 | --- | --- | --- |
 | 文本输入 | `$5 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
-| 图片输入 | `$8 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
-| 图片输出 | `$30 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
+| **文本输出** | **`$10 / 1M tokens`** | **事实**：用户 2026-09-19 确认；`docs/facts/channel-facts.md` §2.4 |
+| 图像输入 | `$8 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
+| 图像输出 | `$30 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
+
+> **⚠️ 更正（见文首第 1 条）**：本节此前只列三项，并把仓库旧资料里的「文本输出 `$10 / 1M`」判为不予采用。**那是错的**——按"只有三项"发布的生效配置把**文本输出费率写成 0**，会在 `output_text_tokens > 0` 时少收费（缺陷记录：`docs/facts/channel-facts.md` §2.11）。四档都要用。
 
 **事实**：模型说明摘要写成“per-generation，价格见模型页”，但实际模型页展示的是 token-based pricing；应以模型页具体价格表为准。[模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) · [模型页](https://aihubmix.com/model/gpt-image-2)
-
-**事实**：仓库旧资料还写有“文本输出 `$10 / 1M tokens`”，当前模型页的公开价格句没有展示这一项。[仓库旧资料](./gpt-image-2.md) · [模型页](https://aihubmix.com/model/gpt-image-2)
 
 ### 9.2 本地响应样本
 
@@ -259,13 +275,13 @@
 }
 ```
 
-来源：[本地实测样本](./gpt_image_2_generations.json)。按当前公开三项单价做**示意计算**为 `13×5/1,000,000 + 196×30/1,000,000 = $0.005945`。这只是按公开价格和响应 usage 推导的名义金额，不是账单核对结果。
+来源：[本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)。按公开**四档**单价做**示意计算**：`13×5 + 0×8 + 0×10 + 196×30`（每 1M）`= $0.005945`——本样本没有文本输出，第四档不参与。这只是按公开价格和响应 usage 推导的名义金额，不是账单核对结果。
 
 ### 9.3 对计费设计的影响
 
-- **事实**：公开的 `/ai/v1` Task 对象没有 `usage` 字段；OpenAI 兼容本地样本有 `usage`。[任务对象](https://docs.aihubmix.com/en/api/async-tasks.md#task-object) · [本地实测样本](./gpt_image_2_generations.json)
+- **事实**：公开的 `/ai/v1` Task 对象没有 `usage` 字段；OpenAI 兼容本地样本有 `usage`。[任务对象](https://docs.aihubmix.com/en/api/async-tasks.md#task-object) · [本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
 - **待确认**：AIHubMix 是否通过任务详情、响应 Header、账单查询 API 或其他记录提供异步任务的文本/图片 token 分项和最终扣费。
-- **待确认**：文本输出、缓存输入、舍入、最低扣费、失败计费、促销/折扣的权威规则。`output_blocked` 明确称不收生成费，但 `output_policy_violation` 可能仍按既有审核计费规则处理。[任务错误](https://docs.aihubmix.com/en/api/async-tasks.md#task-errors)
+- **待确认**：缓存输入、舍入、最低扣费、失败计费、促销/折扣的权威规则（**缓存不由我们建模**：按 Tokens 计费不区分缓存，见 `docs/facts/channel-facts.md` §3.9.2）。`output_blocked` 明确称不收生成费，但 `output_policy_violation` 可能仍按既有审核计费规则处理。[任务错误](https://docs.aihubmix.com/en/api/async-tasks.md#task-errors)
 - **推论**：价格配置必须版本化并保留四种可能的 money rate；结算应优先使用 Provider 权威用量或账单记录，不应用图片尺寸自行反推 token。
 - **推论**：若 `/ai/v1` 最终无法提供可审计用量，需在以下方案中做明确选择后才能生产计费：使用可返回 usage 的 `/v1` 端点、接入 AIHubMix 账单记录、或采用经过验证的固定/预估计价并向用户明确其性质。
 
@@ -282,9 +298,9 @@
 | `moderation` | 写有 `auto/low` | 实时 Schema 不接受 | 首版不开放 |
 | 输出格式 | 旧资料写 PNG/JPEG/WebP | 模型实时 Schema 只有 PNG/JPEG | 模型级约束覆盖通用说明 |
 | 结果 | OpenAI 兼容实测是 Base64 + usage | `/ai/v1` 文档是 Task + URL/Base64，未见 usage | Adapter 分开解码；计费证据待确认 |
-| 价格 | 多写一项文本输出 `$10/M` | 当前模型页只公开文本输入、图片输入、图片输出三项 | 不把旧的文本输出价直接发布为当前价格合同 |
+| 价格 | 多写一项文本输出 `$10/M` | 当前模型页的公开价格句只展示三项 | **⚠️ 已更正：四项都要用**——模型页那句话没列文本输出，不等于该档不存在；用户已确认四档（见 §9.1 与文首更正 1） |
 
-仓库来源：[现有说明](./gpt-image-2.md) · [实测响应](./gpt_image_2_generations.json)。第一方来源：[实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) · [模型页](https://aihubmix.com/model/gpt-image-2) · [异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md)。
+仓库来源：[现有说明](../../out-reference/aihubmix/gpt-image-2.md) · [实测响应](../../out-reference/aihubmix/gpt_image_2_generations.json)。第一方来源：[实时模型 Schema](https://aihubmix.com/call/schema/models/gpt-image-2/endpoints) · [模型页](https://aihubmix.com/model/gpt-image-2) · [异步任务文档](https://docs.aihubmix.com/en/api/async-tasks.md)。
 
 ## 11. 对 #674 技术设计的具体影响
 
@@ -318,7 +334,9 @@
 3. **推论**：Provider 返回的分项 usage、Provider 账单记录和平台最终扣款都要可追溯到同一 Attempt。
 4. **阻塞项**：未确认 `/ai/v1` 异步用量来源前，AIHubMix 可用于 Adapter/Job 开发和受控测试，但不应宣布生产计费闭环完成。
 
-## 12. 首个 Provider 验证清单
+## 12. 首个 Provider 验证清单（历史过程记录）
+
+> 本节是**验证前的清单**。其中绝大部分已由 §13 的受控实测完成；§13 取代与本节相冲突的"待确认"。保留本节只为记录当时的判断依据。
 
 以下项目需要使用测试账户和真实付费请求完成；本文没有代替它们：
 
