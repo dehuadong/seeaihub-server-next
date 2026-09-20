@@ -51,7 +51,7 @@ impl PgHubRepository {
         let row = sqlx::query(
             r#"
             SELECT
-                j.id, j.account_id, j.state, j.branch, j.native_model_id,
+                j.id, j.account_id, j.state, j.branch, j.gateway_model,
                 j.native_parameters, j.asset_bindings, j.idempotency_key,
                 j.request_hash, j.max_cost_microusd, j.created_at, j.updated_at,
                 vm.id AS vendor_model_id, vm.native_revision, vm.capability_schema,
@@ -191,7 +191,7 @@ impl HubRepository for PgHubRepository {
                 vendor_model_id,
                 offering_id,
                 channel_id,
-                native_model_id: native_model_id.clone(),
+                gateway_model: native_model_id.clone(),
                 native_revision: native_revision.clone(),
                 capability_schema: offering.capability_schema.clone(),
                 restrictions: offering.restrictions.clone(),
@@ -228,7 +228,7 @@ impl HubRepository for PgHubRepository {
         // 发布即原子替换该模型的全部 active 条目：候选集与顺序
         // 始终属于同一个 Revision，不存在跨 Revision 并存。
         sqlx::query(
-            "UPDATE publication.runtime_entries SET active = false WHERE active AND native_model_id = $1",
+            "UPDATE publication.runtime_entries SET active = false WHERE active AND gateway_model = $1",
         )
         .bind(&native_model_id)
         .execute(&mut *transaction)
@@ -236,7 +236,7 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)?;
         let snapshot = serde_json::json!({
             "vendor_id": vendor_id,
-            "native_model_id": native_model_id,
+            "gateway_model": native_model_id,
             "native_revision": native_revision,
             "candidates": snapshot_entries,
         });
@@ -257,7 +257,7 @@ impl HubRepository for PgHubRepository {
                 r#"
                 INSERT INTO publication.runtime_entries
                     (runtime_revision_id, vendor_model_id, offering_id, price_plan_id,
-                     native_model_id, active, routing_priority)
+                     gateway_model, active, routing_priority)
                 VALUES ($1, $2, $3, $4, $5, true, $6)
                 "#,
             )
@@ -283,7 +283,7 @@ impl HubRepository for PgHubRepository {
         transaction.commit().await.map_err(database_error)?;
         Ok(PublishedRevision {
             runtime_revision_id: revision_id,
-            native_model_id,
+            gateway_model: native_model_id,
             candidates,
         })
     }
@@ -299,7 +299,7 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT
                 rr.id AS runtime_revision_id,
-                vm.id AS vendor_model_id, vm.native_model_id, vm.native_revision,
+                vm.id AS vendor_model_id, re.gateway_model, vm.native_revision,
                 vm.capability_schema,
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
@@ -316,7 +316,7 @@ impl HubRepository for PgHubRepository {
             JOIN supply.offerings o ON o.id = re.offering_id AND o.enabled
             JOIN supply.channels c ON c.id = o.channel_id AND c.enabled
             JOIN pricing.price_plans p ON p.id = re.price_plan_id
-            WHERE re.active AND re.native_model_id = $1
+            WHERE re.active AND re.gateway_model = $1
             ORDER BY re.routing_priority ASC, rr.created_at DESC
             "#,
         )
@@ -619,7 +619,7 @@ impl HubRepository for PgHubRepository {
             r#"
             INSERT INTO generation.jobs (
                 id, account_id, idempotency_key, request_hash, state, branch,
-                native_model_id, native_parameters, asset_bindings,
+                gateway_model, native_parameters, asset_bindings,
                 runtime_revision_id, vendor_model_id, offering_id, channel_id,
                 price_snapshot, max_cost_microusd
             ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
@@ -630,7 +630,7 @@ impl HubRepository for PgHubRepository {
         .bind(&command.idempotency_key)
         .bind(&request_hash)
         .bind(branch_name(branch))
-        .bind(&command.native_model_id)
+        .bind(&command.gateway_model)
         .bind(&command.native_parameters)
         .bind(&bindings)
         .bind(offering.runtime_revision_id.0)
@@ -691,7 +691,7 @@ impl HubRepository for PgHubRepository {
             account_id: command.account_id,
             state: seeai_domain::JobState::Accepted,
             branch,
-            native_model_id: command.native_model_id,
+            gateway_model: command.gateway_model,
             native_parameters: command.native_parameters,
             asset_bindings: command.asset_bindings,
             offering,
@@ -710,7 +710,7 @@ impl HubRepository for PgHubRepository {
     ) -> Result<JobView, ApplicationError> {
         let row = sqlx::query(
             r#"
-            SELECT id, account_id, state, branch, native_model_id, result_asset_ids,
+            SELECT id, account_id, state, branch, gateway_model, result_asset_ids,
                    error_code, error_message, created_at, updated_at
             FROM generation.jobs WHERE id = $1 AND account_id = $2
             "#,
@@ -727,9 +727,8 @@ impl HubRepository for PgHubRepository {
             account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
             state: row.try_get("state").map_err(database_error)?,
             branch: parse_branch(row.try_get("branch").map_err(database_error)?)?,
-            // 对外叫 `model`（平台型号名）；库里这一列仍叫 `native_model_id`——
-            // 三方命名（平台型号名 / 厂商原生名 / 发给渠道的模型名）的收口另做。
-            model: row.try_get("native_model_id").map_err(database_error)?,
+            // 平台上就叫 `gateway_model`，对外接口叫 `model`；厂商原生名在 vendor_models 上。
+            model: row.try_get("gateway_model").map_err(database_error)?,
             result_asset_ids: result_ids.into_iter().map(AssetId).collect(),
             error_code: row.try_get("error_code").map_err(database_error)?,
             created_at: row.try_get("created_at").map_err(database_error)?,
@@ -1199,6 +1198,30 @@ impl HubRepository for PgHubRepository {
         transaction.commit().await.map_err(database_error)
     }
 
+    async fn count_in_flight_jobs(
+        &self,
+        account_id: AccountId,
+        except_idempotency_key: &str,
+    ) -> Result<u64, ApplicationError> {
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*) FROM generation.jobs
+            WHERE account_id = $1 AND state IN ($2, $3, $4) AND idempotency_key <> $5
+            -- 在跑的三态：等执行、持有租约、正在调上游；终态与对账态不算在飞。
+            -- 同一个幂等键的那个不算：重发要拿回原来那个 Job，不该被并发上限拒掉。
+            "#,
+        )
+        .bind(account_id.0)
+        .bind("accepted")
+        .bind("leased")
+        .bind("submitting")
+        .bind(except_idempotency_key)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(u64::try_from(count).unwrap_or(u64::MAX))
+    }
+
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
@@ -1248,7 +1271,7 @@ impl HubRepository for PgHubRepository {
         };
         let rows = sqlx::query(
             r#"
-            SELECT j.id AS job_id, j.account_id, j.native_model_id, j.offering_id,
+            SELECT j.id AS job_id, j.account_id, j.gateway_model, j.offering_id,
                    c.provider_kind, j.failure_kind, j.error_code, j.updated_at,
                    a.provider_trace_id, a.provider_error_code, a.provider_error_message
             FROM generation.jobs j
@@ -1284,7 +1307,7 @@ impl HubRepository for PgHubRepository {
                 Ok(ProviderFailureView {
                     job_id: JobId(row.try_get("job_id").map_err(database_error)?),
                     account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
-                    native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+                    gateway_model: row.try_get("gateway_model").map_err(database_error)?,
                     offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
                     provider_kind: row.try_get("provider_kind").map_err(database_error)?,
                     kind,
@@ -1488,7 +1511,7 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
         vendor_model_id: VendorModelId(row.try_get("vendor_model_id").map_err(database_error)?),
         offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
         channel_id: ChannelId(row.try_get("channel_id").map_err(database_error)?),
-        native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+        gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,
         capability_schema: row.try_get("capability_schema").map_err(database_error)?,
         restrictions: row.try_get("restrictions").map_err(database_error)?,
@@ -1533,7 +1556,7 @@ fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, A
         vendor_model_id: VendorModelId(row.try_get("vendor_model_id").map_err(database_error)?),
         offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
         channel_id: ChannelId(row.try_get("channel_id").map_err(database_error)?),
-        native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+        gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,
         capability_schema: row.try_get("capability_schema").map_err(database_error)?,
         restrictions: row.try_get("restrictions").map_err(database_error)?,
@@ -1552,7 +1575,7 @@ fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, A
         account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
         state: parse_state(&state)?,
         branch: parse_branch(row.try_get("branch").map_err(database_error)?)?,
-        native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+        gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_parameters: row.try_get("native_parameters").map_err(database_error)?,
         asset_bindings: serde_json::from_value(bindings)
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?,

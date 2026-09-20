@@ -73,7 +73,7 @@ accepted → leased → submitting → submitted/running → succeeded
 
 Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、Native Parameters 摘要、Asset Bindings 与 Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
-HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务逻辑：统一图片生成入口（`/v1/image-generations`）、generations 兼容入口（`/v1/images/generations`，JSON）、edits 兼容入口（`/v1/images/edits`，`multipart/form-data`）。三个入口**能力相同**：分支只看请求里有没有 `image`/`mask`，不按端点断言。三个入口都调用同一个受理路径（`CreateImageGenerationRequest`）；兼容入口只负责请求解码、Asset Binding 和分支断言，不能自己选路、计费或调用 Provider。**响应合同仍是异步受理（202 返回 Job）**：要不要再提供"等结果"的同步响应形态，属尚未作出的产品选择。
+HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务逻辑：统一图片生成入口（`/v1/image-generations`）、generations 兼容入口（`/v1/images/generations`，JSON）、edits 兼容入口（`/v1/images/edits`，`multipart/form-data`）。三个入口**能力相同**：分支只看请求里有没有 `image`/`mask`，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。三个入口都调用同一个受理路径（`CreateImageGenerationRequest`）；兼容入口只负责请求解码与 Asset Binding，不能自己选路、计费或调用 Provider。**响应形态有两个**（2026-09-20 定）：统一入口按本平台的异步合同回 `202 { job_id}`；两个 OpenAI 兼容入口按 OpenAI SDK 的期望**同步**回结果（受理后等终态，成功 `{created, data:[{b64_json}]}`，失败 OpenAI 错误信封），内部流水线相同。
 
 ## 4. 执行路径与接口职责
 

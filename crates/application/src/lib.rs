@@ -686,8 +686,8 @@ pub struct ReconciliationCaseView {
 pub struct ProviderFailureView {
     pub job_id: JobId,
     pub account_id: AccountId,
-    /// 客户选的型号；列表里可以直接看出是哪条供给出的问题。
-    pub native_model_id: String,
+    /// 平台型号名。
+    pub gateway_model: String,
     /// 当时选中的 Offering。
     pub offering_id: OfferingId,
     /// 渠道类别（例如 AIHubMix / APIMart）；没有渠道信息时为 `None`。
@@ -721,6 +721,8 @@ pub enum ApplicationError {
     Conflict(String),
     #[error("insufficient balance")]
     InsufficientBalance,
+    #[error("too many jobs in flight")]
+    TooManyInFlight,
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("persistence error: {0}")]
@@ -746,7 +748,7 @@ pub trait HubRepository: Send + Sync {
     /// 无任何 active 候选时返回空 `Vec`，不是错误——由调用方判定"无合格候选"。
     async fn active_offering(
         &self,
-        native_model_id: &str,
+        gateway_model: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError>;
 
     async fn create_account(
@@ -830,6 +832,16 @@ pub trait HubRepository: Send + Sync {
         attempt_id: Option<AttemptId>,
         failure: AttemptFailure,
     ) -> Result<(), ApplicationError>;
+
+    /// 该账户当前**在跑**的 Job 数（`accepted`/`leased`/`submitting`）。
+    ///
+    /// `except_idempotency_key` 那个不算在内：同一个键重发时，`create_job` 会把它去重成
+    /// 原来那个 Job，并发上限不该把这个重发拒掉。
+    async fn count_in_flight_jobs(
+        &self,
+        account_id: AccountId,
+        except_idempotency_key: &str,
+    ) -> Result<u64, ApplicationError>;
 
     async fn list_open_reconciliation_cases(
         &self,
@@ -1490,14 +1502,24 @@ pub struct GenerationService {
     /// 现状是"一个固定数"，属粗判；按 Price Snapshot 算这次请求的最坏成本是后续优化
     /// （`docs/adr/0009` 要求的"低于最小可能成本就受理前拒绝"要在那时一并实现）。
     max_cost_microusd: u64,
+    /// 该账户同时能有多少个**在跑**的生成任务（默认 1）。
+    ///
+    /// 这是最初的并发设计：一个账户同时只跑一个，超出的直接拒（429），
+    /// 免得一次提交一堆把上游额度与平台成本一起打满。
+    max_concurrent_jobs: u64,
 }
 
 impl GenerationService {
     #[must_use]
-    pub fn new(repository: Arc<dyn HubRepository>, max_cost_microusd: u64) -> Self {
+    pub fn new(
+        repository: Arc<dyn HubRepository>,
+        max_cost_microusd: u64,
+        max_concurrent_jobs: u64,
+    ) -> Self {
         Self {
             repository,
             max_cost_microusd,
+            max_concurrent_jobs,
         }
     }
 
@@ -1513,6 +1535,16 @@ impl GenerationService {
         }
         let branch = request.branch()?;
         self.validate_input_assets(&request).await?;
+        // 并发上限：一个账户同时只跑这么多个，多出来的在受理前就拒掉。
+        // 同一个幂等键的重发不占名额：那种请求会去重成原来那个 Job（见 `create_job`）。
+        if self
+            .repository
+            .count_in_flight_jobs(request.account_id, &request.idempotency_key)
+            .await?
+            >= self.max_concurrent_jobs
+        {
+            return Err(ApplicationError::TooManyInFlight);
+        }
         let candidates = self.repository.active_offering(&request.model).await?;
         let (offering, asset_bindings, routing) = select_candidate(&request, branch, &candidates)?;
         // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的路径）：上游目录变了不该
@@ -1522,7 +1554,7 @@ impl GenerationService {
             .create_job(
                 CreateImageGeneration {
                     account_id: request.account_id,
-                    native_model_id: request.model,
+                    gateway_model: request.model,
                     native_parameters: request.native_parameters,
                     asset_bindings,
                     idempotency_key: request.idempotency_key,
@@ -2121,7 +2153,7 @@ mod tests {
             vendor_model_id: VendorModelId::new(),
             offering_id: OfferingId::new(),
             channel_id: ChannelId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
+            gateway_model: "gpt-image-2".to_owned(),
             native_revision: "2026-04-21".to_owned(),
             capability_schema: serde_json::json!({
                 "type": "object",
@@ -2764,6 +2796,14 @@ mod tests {
             Ok(Vec::new())
         }
 
+        async fn count_in_flight_jobs(
+            &self,
+            _account_id: AccountId,
+            _except_idempotency_key: &str,
+        ) -> Result<u64, ApplicationError> {
+            Ok(0)
+        }
+
         async fn list_open_reconciliation_cases(
             &self,
         ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
@@ -2911,7 +2951,7 @@ mod tests {
             account_id: AccountId::new(),
             state: JobState::Leased,
             branch: ImageBranch::PromptOnly,
-            native_model_id: "gpt-image-2".to_owned(),
+            gateway_model: "gpt-image-2".to_owned(),
             native_parameters: serde_json::json!({"prompt": "worker contract"}),
             asset_bindings: Vec::new(),
             offering: offering(),

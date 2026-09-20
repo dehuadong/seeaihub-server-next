@@ -7,21 +7,22 @@ use axum::{
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
     AdapterRegistry, ApplicationError, AssetService, CreateImageGenerationRequest,
-    GenerationService, HubRepository, IdentityService, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
-    RuntimeService,
+    GenerationService, HubRepository, IdentityService, JobView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
+    RefundReconciliationCommand, RuntimeService,
 };
 use seeai_domain::{AccountId, AssetId, ImageBranch, JobId, JobState};
 use seeai_object_storage::ObjectStoreAssetStore;
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{env, net::SocketAddr, sync::Arc};
+use std::{env, net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -36,6 +37,8 @@ struct AppState {
     reconciliation: ReconciliationService,
     assets: AssetService,
     generations: GenerationService,
+    /// 兼容入口等任务跑完的最长时间。
+    sync_wait: Duration,
 }
 
 #[tokio::main]
@@ -65,7 +68,12 @@ async fn main() -> Result<()> {
         runtime: RuntimeService::new(repository_port.clone(), adapters),
         reconciliation: ReconciliationService::new(repository_port.clone()),
         assets: AssetService::new(repository_port.clone(), store),
-        generations: GenerationService::new(repository_port, generation_max_cost_microusd()?),
+        sync_wait: generation_sync_wait()?,
+        generations: GenerationService::new(
+            repository_port,
+            generation_max_cost_microusd()?,
+            generation_max_concurrent_jobs()?,
+        ),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -448,7 +456,7 @@ async fn create_generation(
     let mut parameters = body.parameters;
     let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
     let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
-    accept_generation(
+    let accepted = accept_generation(
         &state,
         account_id,
         &headers,
@@ -456,12 +464,13 @@ async fn create_generation(
         image_asset_ids,
         mask_asset_id,
     )
-    .await
+    .await?;
+    Ok((StatusCode::ACCEPTED, Json(accepted)))
 }
 
 /// 三个入口共用的受理路径：解码差异只到"参数 + 图片角色"为止，之后完全一样。
 ///
-/// 兼容入口不自己选路、计费或调用 Provider——它们只做请求解码、资产绑定与分支断言。
+/// 兼容入口不自己选路、计费或调用 Provider——它们只做请求解码与资产绑定，分支由参数与图片角色决定。
 async fn accept_generation(
     state: &AppState,
     account_id: AccountId,
@@ -469,7 +478,7 @@ async fn accept_generation(
     mut parameters: Map<String, Value>,
     image_asset_ids: Vec<AssetId>,
     mask_asset_id: Option<AssetId>,
-) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
+) -> Result<CreateGenerationResponse, ApiError> {
     let model = parameters
         .remove("model")
         .and_then(|value| value.as_str().map(str::to_owned))
@@ -485,15 +494,12 @@ async fn accept_generation(
             idempotency_key: idempotency_key(headers),
         })
         .await?;
-    Ok((
-        StatusCode::ACCEPTED,
-        Json(CreateGenerationResponse {
-            job_id: job.id,
-            state: job.state,
-            branch: job.branch,
-            created_at: job.created_at,
-        }),
-    ))
+    Ok(CreateGenerationResponse {
+        job_id: job.id,
+        state: job.state,
+        branch: job.branch,
+        created_at: job.created_at,
+    })
 }
 
 /// generations 兼容入口（OpenAI 契约的路径）。
@@ -504,12 +510,12 @@ async fn create_generation_compat(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateGenerationBody>,
-) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     let account_id = authenticate(&state, &headers).await?;
     let mut parameters = body.parameters;
     let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
     let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
-    accept_generation(
+    accept_compat_generation(
         &state,
         account_id,
         &headers,
@@ -528,7 +534,7 @@ async fn create_image_edit_compat(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
-) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
+) -> Result<Response, ApiError> {
     let account_id = authenticate(&state, &headers).await?;
     let mut parameters = Map::new();
     let mut image_asset_ids = Vec::new();
@@ -554,7 +560,7 @@ async fn create_image_edit_compat(
             }
         }
     }
-    accept_generation(
+    accept_compat_generation(
         &state,
         account_id,
         &headers,
@@ -563,6 +569,108 @@ async fn create_image_edit_compat(
         mask_asset_id,
     )
     .await
+}
+
+/// 兼容入口的受理与响应：受理之后**等任务跑到终态**，按 OpenAI 的形状把图片交回去。
+///
+/// OpenAI 的客户端调这两个路径时，期望在同一个响应里直接拿到图片；我们的流水线是异步的
+/// （受理 → Worker 执行），所以这里给它一个同步门面：等不到就返回 504，并把 `job_id` 写进
+/// 错误信息里，调用方可以改用 `/v1/image-generations/{job_id}` 自己轮询。
+async fn accept_compat_generation(
+    state: &AppState,
+    account_id: AccountId,
+    headers: &HeaderMap,
+    parameters: Map<String, Value>,
+    image_asset_ids: Vec<AssetId>,
+    mask_asset_id: Option<AssetId>,
+) -> Result<Response, ApiError> {
+    let accepted = accept_generation(
+        state,
+        account_id,
+        headers,
+        parameters,
+        image_asset_ids,
+        mask_asset_id,
+    )
+    .await?;
+    let job_id = accepted.job_id;
+    let deadline = tokio::time::Instant::now() + state.sync_wait;
+    loop {
+        let view = state.generations.get(account_id, job_id).await?;
+        match view.state.as_str() {
+            "succeeded" => return openai_image_response(state, account_id, view).await,
+            "failed" | "reconciliation_required" => {
+                let code = view.error_code.as_deref().unwrap_or("platform_unavailable");
+                return Ok(openai_error_response(code));
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                return Ok(openai_error_response_with(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "job_still_running",
+                    "server_error",
+                    &format!(
+                        "the job is still running; query /v1/image-generations/{job_id} for the result"
+                    ),
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// 成功：OpenAI 的形状 `{created, data:[{b64_json}]}`。
+async fn openai_image_response(
+    state: &AppState,
+    account_id: AccountId,
+    view: JobView,
+) -> Result<Response, ApiError> {
+    let mut data = Vec::with_capacity(view.result_asset_ids.len());
+    for asset_id in view.result_asset_ids {
+        let (_record, bytes) = state.assets.download(account_id, asset_id).await?;
+        data.push(json!({ "b64_json": STANDARD.encode(&bytes) }));
+    }
+    Ok(Json(json!({
+        "created": view.updated_at.timestamp(),
+        "data": data,
+    }))
+    .into_response())
+}
+
+/// 失败：仍用 OpenAI 的错误信封，对客码沿用平台那三个。
+fn openai_error_response(public_code: &str) -> Response {
+    match public_code {
+        "content_rejected" => openai_error_response_with(
+            StatusCode::BAD_REQUEST,
+            public_code,
+            "invalid_request_error",
+            "the submitted content was rejected",
+        ),
+        "outcome_unknown" => openai_error_response_with(
+            StatusCode::BAD_GATEWAY,
+            public_code,
+            "server_error",
+            "the request outcome is unknown; see reconciliation",
+        ),
+        _ => openai_error_response_with(
+            StatusCode::BAD_GATEWAY,
+            public_code,
+            "server_error",
+            "the platform could not complete this request",
+        ),
+    }
+}
+
+fn openai_error_response_with(
+    status: StatusCode,
+    code: &str,
+    error_type: &str,
+    message: &str,
+) -> Response {
+    (
+        status,
+        Json(json!({ "error": { "message": message, "type": error_type, "code": code } })),
+    )
+        .into_response()
 }
 
 /// 把 multipart 里的文件部件存成平台资产，返回它的 id。
@@ -674,6 +782,9 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::InsufficientBalance => {
                 (StatusCode::PAYMENT_REQUIRED, "insufficient_balance")
             }
+            ApplicationError::TooManyInFlight => {
+                (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight")
+            }
             ApplicationError::Configuration(_)
             | ApplicationError::Persistence(_)
             | ApplicationError::ObjectStorage(_)
@@ -725,6 +836,29 @@ fn generation_max_cost_microusd() -> Result<u64> {
             .parse::<u64>()
             .context("GENERATION_MAX_COST_MICROUSD must be an integer"),
         _ => Ok(20_000),
+    }
+}
+
+/// 兼容入口等任务跑完的窗口（秒，默认 120）：超了就把 job id 交回调用方自己去查。
+fn generation_sync_wait() -> Result<Duration> {
+    let seconds = match env::var("GENERATION_SYNC_WAIT_SECONDS") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .context("GENERATION_SYNC_WAIT_SECONDS must be an integer")?,
+        _ => 120,
+    };
+    Ok(Duration::from_secs(seconds))
+}
+
+/// 一个账户同时能有多少个在跑的生成任务（默认 1）。
+fn generation_max_concurrent_jobs() -> Result<u64> {
+    match env::var("GENERATION_MAX_CONCURRENT_JOBS") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .context("GENERATION_MAX_CONCURRENT_JOBS must be an integer"),
+        _ => Ok(1),
     }
 }
 

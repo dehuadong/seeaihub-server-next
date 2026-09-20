@@ -593,7 +593,11 @@ async fn drop_isolated_database(name: &str) {
 }
 
 /// 一个可用的平台 API 进程：`Drop` 时结束它并清掉资产目录。
-fn start_api(database_url: &str, asset_root: &std::path::Path) -> (String, String, ApiProcess) {
+fn start_api_with_concurrency(
+    database_url: &str,
+    asset_root: &std::path::Path,
+    max_concurrent_jobs: u64,
+) -> (String, String, ApiProcess) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
     let port = listener.local_addr().expect("test address").port();
     drop(listener);
@@ -604,7 +608,13 @@ fn start_api(database_url: &str, asset_root: &std::path::Path) -> (String, Strin
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", &admin_token)
         .env("ASSET_STORE", "local")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "64")
+        .env("GENERATION_SYNC_WAIT_SECONDS", "30")
         .env("ASSET_LOCAL_ROOT", asset_root)
+        .env(
+            "GENERATION_MAX_CONCURRENT_JOBS",
+            max_concurrent_jobs.to_string(),
+        )
         .stdout(Stdio::null())
         .stderr(Stdio::null())
         .spawn()
@@ -651,11 +661,24 @@ impl DriverHarness {
         branches: &[&str],
         behaviour: UpstreamBehaviour,
     ) -> Self {
+        Self::start_with_provider_and_limit(provider_kind, adapter_key, branches, behaviour, 64)
+            .await
+    }
+
+    /// 同 `start_with_provider`，但指定并发上限（用于验并发拦截）。
+    async fn start_with_provider_and_limit(
+        provider_kind: &str,
+        adapter_key: &str,
+        branches: &[&str],
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+    ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
         let asset_root = std::env::temp_dir().join(format!("seeai-driver-{}", Uuid::new_v4()));
-        let (base_url, admin_token, process) = start_api(&database_url, &asset_root);
+        let (base_url, admin_token, process) =
+            start_api_with_concurrency(&database_url, &asset_root, max_concurrent_jobs);
         let client = Client::new();
         wait_until_ready(&client, &base_url).await;
         let account = create_account(&client, &base_url, &admin_token).await;
@@ -744,10 +767,12 @@ impl DriverHarness {
         (job_id, state)
     }
 
-    /// 起真实 Worker，把**已经受理**的 Job 跑到终态。
-    async fn run_worker_until_terminal(&self, job_id: Uuid) -> String {
+    /// 起一个真实 Worker 进程（调用方负责收尾）。
+    ///
+    /// 同步门面要等任务跑完，所以这类用例必须在请求之前就把 Worker 起着。
+    fn spawn_worker(&self) -> Child {
         // Worker 是**独立包**的二进制，按当前 profile 定位（见 `worker_binary`）。
-        let mut worker = Command::new(worker_binary())
+        Command::new(worker_binary())
             .env("DATABASE_URL", &self.database_url)
             .env("WORKER_ID", "driver-contract-worker")
             .env("WORKER_POLL_INTERVAL_MS", "200")
@@ -760,8 +785,11 @@ impl DriverHarness {
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
-            .expect("worker process should start");
+            .expect("worker process should start")
+    }
 
+    /// 等一个**已经受理**的 Job 到终态，返回终态。
+    async fn wait_for_terminal(&self, job_id: Uuid) -> String {
         let mut state = String::new();
         for _ in 0..600 {
             tokio::time::sleep(Duration::from_millis(200)).await;
@@ -777,6 +805,13 @@ impl DriverHarness {
                 break;
             }
         }
+        state
+    }
+
+    /// 起真实 Worker，把**已经受理**的 Job 跑到终态。
+    async fn run_worker_until_terminal(&self, job_id: Uuid) -> String {
+        let mut worker = self.spawn_worker();
+        let state = self.wait_for_terminal(job_id).await;
         let _ = worker.kill();
         let _ = worker.wait();
         state
@@ -856,6 +891,8 @@ async fn image_generation_http_contract() {
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", &admin_token)
         .env("ASSET_STORE", "local")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "64")
+        .env("GENERATION_SYNC_WAIT_SECONDS", "30")
         .env("ASSET_LOCAL_ROOT", &asset_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -984,6 +1021,8 @@ async fn multiple_active_offerings_route_by_priority() {
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", &admin_token)
         .env("ASSET_STORE", "local")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "64")
+        .env("GENERATION_SYNC_WAIT_SECONDS", "30")
         .env("ASSET_LOCAL_ROOT", &asset_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1054,7 +1093,7 @@ async fn multiple_active_offerings_route_by_priority() {
     // 选中项就是优先级 0 的那个候选。
     let expected: Uuid = sqlx::query_scalar(
         "SELECT re.offering_id FROM publication.runtime_entries re
-         WHERE re.active AND re.native_model_id = $1 AND re.routing_priority = 0",
+         WHERE re.active AND re.gateway_model = $1 AND re.routing_priority = 0",
     )
     .bind(model)
     .fetch_one(&pool)
@@ -1105,7 +1144,7 @@ async fn multiple_active_offerings_route_by_priority() {
         &client,
         format!("{base_url}/v1/image-generations"),
         &poor_key,
-        &route_request(model, "doomed-request", "over budget"),
+        &route_request(model, "doomed-request-0001", "over budget"),
     )
     .send()
     .await
@@ -1182,7 +1221,7 @@ async fn multiple_active_offerings_route_by_priority() {
     .await;
     assert_eq!(published, StatusCode::OK);
     let active: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM publication.runtime_entries WHERE active AND native_model_id = $1",
+        "SELECT count(*) FROM publication.runtime_entries WHERE active AND gateway_model = $1",
     )
     .bind(model)
     .fetch_one(&pool)
@@ -1216,6 +1255,8 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", &admin_token)
         .env("ASSET_STORE", "local")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "64")
+        .env("GENERATION_SYNC_WAIT_SECONDS", "30")
         .env("ASSET_LOCAL_ROOT", &asset_root)
         .stdout(Stdio::null())
         .stderr(Stdio::null())
@@ -1283,7 +1324,7 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
          JOIN supply.offerings o ON o.id = re.offering_id
          JOIN supply.channels c ON c.id = o.channel_id
          JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
-         WHERE re.active AND re.native_model_id = $1
+         WHERE re.active AND re.gateway_model = $1
          ORDER BY re.routing_priority",
     )
     .bind(&model)
@@ -1429,10 +1470,103 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
     outcome.harness.cleanup().await;
 }
 
-/// OpenAI 契约的两个兼容入口：`/v1/images/generations`（JSON，只收文本）与
-/// `/v1/images/edits`（multipart，`image` 必填、`mask` 可选）。它们只做请求解码、资产
-/// 绑定与分支断言，之后走同一条受理路径——所以这里验的是"解出来的分支对不对、图片有没有
-/// 落到该候选的参数路径上、Job 能不能照常跑完"。
+/// 并发上限：同一账户同时只能有 N 个在跑的生成任务（默认 1），多出来的在**受理前**就被拒。
+///
+/// 这条是"一次提交一堆把上游额度与平台成本一起打满"的第一道闸；跑完一个才能再提一个。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn concurrent_generations_are_capped() {
+    let harness = DriverHarness::start_with_provider_and_limit(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only"],
+        UpstreamBehaviour::default(),
+        1,
+    )
+    .await;
+    let client = Client::new();
+    let url = format!("{}/v1/image-generations", harness.base_url);
+
+    let first_response = post_generation(
+        &client,
+        url.clone(),
+        &harness.api_key,
+        &route_request(harness.model, "cap-0001", "first in flight"),
+    )
+    .send()
+    .await
+    .expect("first generation");
+    let first_status = first_response.status();
+    let first_body = first_response.text().await.expect("first body");
+    assert_eq!(
+        first_status,
+        StatusCode::ACCEPTED,
+        "the first job must be accepted: {first_body}"
+    );
+    let first: Value = serde_json::from_str(&first_body).expect("first job JSON");
+    let first_id = Uuid::parse_str(first["job_id"].as_str().expect("job id")).expect("uuid");
+
+    let blocked = post_generation(
+        &client,
+        url.clone(),
+        &harness.api_key,
+        &route_request(harness.model, "cap-0002", "second while the first runs"),
+    )
+    .send()
+    .await
+    .expect("second generation");
+    assert_eq!(
+        blocked.status(),
+        StatusCode::TOO_MANY_REQUESTS,
+        "a second job while the first is in flight must be rejected"
+    );
+    let body: Value = blocked.json().await.expect("rejection JSON");
+    assert_eq!(body["error"]["code"].as_str(), Some("too_many_in_flight"));
+
+    // 但**同一个幂等键**的重发不算占名额：它要去重成原来那个 Job，不能被上限拒掉。
+    let retried = post_generation(
+        &client,
+        url.clone(),
+        &harness.api_key,
+        &route_request(harness.model, "cap-0001", "first in flight"),
+    )
+    .send()
+    .await
+    .expect("retry with the same idempotency key");
+    assert_eq!(
+        retried.status(),
+        StatusCode::ACCEPTED,
+        "a retry of the in-flight job must get the same job back, not a 429"
+    );
+    let retried: Value = retried.json().await.expect("retry JSON");
+    assert_eq!(
+        retried["job_id"].as_str(),
+        Some(first_id.to_string().as_str()),
+        "the retry must be deduplicated onto the first job"
+    );
+
+    // 第一个跑完之后，额度释放，可以再受理一个。
+    assert_eq!(
+        harness.run_worker_until_terminal(first_id).await,
+        "succeeded"
+    );
+    let third = post_generation(
+        &client,
+        url,
+        &harness.api_key,
+        &route_request(harness.model, "cap-0003", "after the first finished"),
+    )
+    .send()
+    .await
+    .expect("third generation");
+    assert_eq!(third.status(), StatusCode::ACCEPTED);
+
+    harness.cleanup().await;
+}
+
+/// OpenAI 契约的两个兼容入口：`/v1/images/generations`（JSON）与 `/v1/images/edits`
+/// （multipart，`image`/`mask` 是文件部件）。它们与统一入口是**同一个能力**（分支看请求里
+/// 有没有图），但**响应是同步的**：受理之后等任务跑完，按 OpenAI 的形状把图片交回去。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn openai_compatible_entries_accept_and_map_assets() {
@@ -1442,12 +1576,11 @@ async fn openai_compatible_entries_accept_and_map_assets() {
     )
     .await;
     let client = Client::new();
+    // 同步门面要等任务跑完，所以 Worker 得在请求之前就起着。
+    let mut worker = harness.spawn_worker();
 
-    // generations：OpenAI 形状的 JSON，`Idempotency-Key` 在请求头。
-    let image_asset = harness
-        .upload_input_asset("image", PNG_FIXTURE.to_vec(), "image/png")
-        .await;
-    let generated: Value = client
+    // generations：只给文本 ⇒ 文生图，响应里直接拿到图片。
+    let generated = client
         .post(format!("{}/v1/images/generations", harness.base_url))
         .bearer_auth(&harness.api_key)
         .header("idempotency-key", format!("compat-gen-{}", Uuid::new_v4()))
@@ -1457,21 +1590,16 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         }))
         .send()
         .await
-        .expect("compat generations")
-        .json()
-        .await
-        .expect("compat generations JSON");
-    let generated_id =
-        Uuid::parse_str(generated["job_id"].as_str().expect("job id")).expect("uuid");
-    assert_eq!(generated["branch"].as_str(), Some("prompt_only"));
-    assert_eq!(
-        harness.run_worker_until_terminal(generated_id).await,
-        "succeeded",
-        "a job accepted through the compat entry must run like any other"
-    );
+        .expect("compat generations");
+    assert_eq!(generated.status(), StatusCode::OK);
+    let generated: Value = generated.json().await.expect("compat generations JSON");
+    assert_png_payload(&generated, "compat generations");
 
-    // 带图的 generations 一样合法：分支看请求内容，不看端点。
-    let conditioned: Value = client
+    // 带图的 generations 一样合法：分支由请求内容决定，不由端点断言。
+    let image_asset = harness
+        .upload_input_asset("image", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+    let conditioned = client
         .post(format!("{}/v1/images/generations", harness.base_url))
         .bearer_auth(&harness.api_key)
         .header(
@@ -1485,11 +1613,13 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         }))
         .send()
         .await
-        .expect("compat generations with an image")
+        .expect("compat generations with an image");
+    assert_eq!(conditioned.status(), StatusCode::OK);
+    let conditioned: Value = conditioned
         .json()
         .await
         .expect("compat generations with an image JSON");
-    assert_eq!(conditioned["branch"].as_str(), Some("image_conditioned"));
+    assert_png_payload(&conditioned, "compat generations with an image");
 
     // edits：multipart，`image` 是文件部件；平台把它存成资产并映射到该候选的参数路径。
     let mask_asset = harness
@@ -1505,10 +1635,11 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         let key: String = record.try_get("object_key").expect("object key");
         std::fs::read(harness.asset_root.join(key)).expect("mask bytes")
     };
+    let edit_idempotency_key = format!("compat-edit-{}", Uuid::new_v4());
     let edited = client
         .post(format!("{}/v1/images/edits", harness.base_url))
         .bearer_auth(&harness.api_key)
-        .header("idempotency-key", format!("compat-edit-{}", Uuid::new_v4()))
+        .header("idempotency-key", &edit_idempotency_key)
         .multipart(
             reqwest::multipart::Form::new()
                 .part(
@@ -1533,33 +1664,25 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         .expect("compat edits");
     let status = edited.status();
     let body = edited.text().await.expect("compat edits body");
-    assert_eq!(
-        status,
-        StatusCode::ACCEPTED,
-        "compat edits rejected: {body}"
-    );
+    assert_eq!(status, StatusCode::OK, "compat edits rejected: {body}");
     let edited: Value = serde_json::from_str(&body).expect("compat edits JSON");
-    assert_eq!(edited["branch"].as_str(), Some("masked"));
-    let edited_id = Uuid::parse_str(edited["job_id"].as_str().expect("job id")).expect("uuid");
+    assert_png_payload(&edited, "compat edits");
 
     // 图片落到了该候选声明的参数路径上（APIMart 收 `image_urls` / `mask_url`）。
-    let bindings: String =
-        sqlx::query_scalar("SELECT asset_bindings::text FROM generation.jobs WHERE id = $1")
-            .bind(edited_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("bindings");
+    let bindings: String = sqlx::query_scalar(
+        "SELECT asset_bindings::text FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&edit_idempotency_key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("bindings");
     assert!(
         bindings.contains("/image_urls/0") && bindings.contains("/mask_url"),
         "compat edits must map images onto the candidate's own parameters, got {bindings}"
     );
-    assert_eq!(
-        harness.run_worker_until_terminal(edited_id).await,
-        "succeeded"
-    );
 
     // 不带图的 edits 同样合法（那就是文生图）。
-    let text_only: Value = client
+    let text_only = client
         .post(format!("{}/v1/images/edits", harness.base_url))
         .bearer_auth(&harness.api_key)
         .header(
@@ -1573,15 +1696,36 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         )
         .send()
         .await
-        .expect("compat edits without an image")
+        .expect("compat edits without an image");
+    assert_eq!(text_only.status(), StatusCode::OK);
+    let text_only: Value = text_only
         .json()
         .await
         .expect("compat edits without an image JSON");
-    assert_eq!(text_only["branch"].as_str(), Some("prompt_only"));
+    assert_png_payload(&text_only, "compat edits without an image");
 
+    let _ = worker.kill();
+    let _ = worker.wait();
     harness.cleanup().await;
 }
 
+/// OpenAI 形状的成功响应：`{created, data:[{b64_json}]}`，解出来必须是一张 PNG。
+fn assert_png_payload(body: &Value, what: &str) {
+    let encoded = body["data"][0]["b64_json"]
+        .as_str()
+        .unwrap_or_else(|| panic!("{what}: expected a b64_json image, got {body}"));
+    let bytes = STANDARD
+        .decode(encoded)
+        .unwrap_or_else(|error| panic!("{what}: b64_json must be valid base64: {error}"));
+    assert!(
+        bytes.starts_with(&PNG_FIXTURE[..8]),
+        "{what}: the decoded payload must be the PNG the upstream returned"
+    );
+    assert!(
+        body["created"].as_i64().is_some(),
+        "{what}: created is required"
+    );
+}
 /// 上游直接拒绝提交时，消费者看到的必须是**平台侧语义**：渠道的状态码、错误码、原文与上游标识一律不外泄。
 ///
 /// 渠道说的"余额不足"指的是平台在渠道侧的账户，原样返回会让消费者去充值。

@@ -247,7 +247,7 @@ pub fn set_native_parameter_at_path(
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct CreateImageGeneration {
     pub account_id: AccountId,
-    pub native_model_id: String,
+    pub gateway_model: String,
     pub native_parameters: Value,
     #[serde(default)]
     pub asset_bindings: Vec<AssetBinding>,
@@ -376,7 +376,7 @@ pub struct PublishedOffering {
     pub vendor_model_id: VendorModelId,
     pub offering_id: OfferingId,
     pub channel_id: ChannelId,
-    pub native_model_id: String,
+    pub gateway_model: String,
     pub native_revision: String,
     pub capability_schema: Value,
     pub restrictions: Value,
@@ -403,7 +403,7 @@ pub struct OfferingCandidate {
     pub vendor_model_id: VendorModelId,
     pub offering_id: OfferingId,
     pub channel_id: ChannelId,
-    pub native_model_id: String,
+    pub gateway_model: String,
     pub native_revision: String,
     /// 该候选**自己的**能力声明，由它自己的 `vendor_model` 行带来。
     pub capability_schema: Value,
@@ -427,7 +427,7 @@ impl OfferingCandidate {
             vendor_model_id: self.vendor_model_id,
             offering_id: self.offering_id,
             channel_id: self.channel_id,
-            native_model_id: self.native_model_id,
+            gateway_model: self.gateway_model,
             native_revision: self.native_revision,
             capability_schema: self.capability_schema,
             restrictions: self.restrictions,
@@ -448,7 +448,7 @@ impl OfferingCandidate {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedRevision {
     pub runtime_revision_id: RuntimeRevisionId,
-    pub native_model_id: String,
+    pub gateway_model: String,
     pub candidates: Vec<OfferingCandidate>,
 }
 
@@ -458,7 +458,7 @@ pub struct GenerationJob {
     pub account_id: AccountId,
     pub state: JobState,
     pub branch: ImageBranch,
-    pub native_model_id: String,
+    pub gateway_model: String,
     pub native_parameters: Value,
     pub asset_bindings: Vec<AssetBinding>,
     pub offering: PublishedOffering,
@@ -503,7 +503,7 @@ mod tests {
     fn derives_masked_branch_from_asset_bindings() {
         let command = CreateImageGeneration {
             account_id: AccountId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
+            gateway_model: "gpt-image-2".to_owned(),
             native_parameters: serde_json::json!({"prompt": "test"}),
             asset_bindings: vec![
                 AssetBinding {
@@ -527,7 +527,7 @@ mod tests {
     fn refuses_mask_without_image() {
         let command = CreateImageGeneration {
             account_id: AccountId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
+            gateway_model: "gpt-image-2".to_owned(),
             native_parameters: serde_json::json!({"prompt": "test"}),
             asset_bindings: vec![AssetBinding {
                 native_parameter_path: "/mask".to_owned(),
@@ -551,7 +551,7 @@ mod tests {
         };
         let command = |bindings: Vec<AssetBinding>| CreateImageGeneration {
             account_id: AccountId::new(),
-            native_model_id: "gpt-image-2.5-flare".to_owned(),
+            gateway_model: "gpt-image-2.5-flare".to_owned(),
             native_parameters: serde_json::json!({"prompt": "test"}),
             asset_bindings: bindings,
             idempotency_key: "test-key".to_owned(),
@@ -586,7 +586,7 @@ mod tests {
         // 认不出就拒绝：静默忽略会让某张图悄悄不生效。
         let command = CreateImageGeneration {
             account_id: AccountId::new(),
-            native_model_id: "gpt-image-2.5-flare".to_owned(),
+            gateway_model: "gpt-image-2.5-flare".to_owned(),
             native_parameters: serde_json::json!({"prompt": "test"}),
             asset_bindings: vec![AssetBinding {
                 native_parameter_path: "/seed_image".to_owned(),

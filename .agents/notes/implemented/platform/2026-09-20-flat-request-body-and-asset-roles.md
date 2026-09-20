@@ -4,7 +4,7 @@ status: implemented
 created: 2026-09-20
 updated: 2026-09-20
 approval: 用户 2026-09-20 指出"`native_parameters` 是多余的、其下应该都是顶层""`quality` 怎么还是在 `extra`""`asset_bindings` 应兼容 OpenAI 的 `mask`"并要求直接实现（GitHub 上没有对应的授权语句记录，本条只陈述出处，不额外推定）
-verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **12/12 通过**（含参考图、遮罩、上传失败三条真实链路，以及两个 OpenAI 兼容入口）
+verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **13/13 通过**（含参考图、遮罩、上传失败三条真实链路，两个 OpenAI 兼容入口的**同步**响应，以及并发上限）
 ---
 
 # 对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
@@ -24,8 +24,8 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
   `POST /v1/images/edits`（`multipart/form-data`，`image`/`mask` 是文件部件，自动存成平台
   资产）。它们与统一入口**是同一个能力**：分支只看请求里有没有 `image`/`mask`，**不按端点
   断言**——带图的 generations、不带图的 edits 都合法。三个入口共用同一条受理路径；兼容入口
-  只做请求解码与资产绑定。**响应仍是异步受理（202 返回 Job）**——要不要再给"等结果"的
-  同步响应形态，属尚未作出的产品选择。
+  只做请求解码与资产绑定。**响应形态**：统一入口回 `202 {job_id}`，两个兼容入口
+  同日改成**同步**回图片（见下方"三条收口"）。
 
 ## 追加（同日，参数放行）
 
@@ -49,7 +49,25 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 
 - 素材把 `quality` 等声明在**顶层**，`extra` 这一层消失；
 - `AdapterDescriptor` 的顶层参数面 = `model/prompt/image/mask/n/size/output_format/quality`，不再声明 `extra`，出网时也不再摊平 `extra.*`；
-- **四个未经验证的参数一律不声明**（`background`、`output_compression`、`user`、`moderation`），依据 `docs/adr/0002`「未证实的参数不开启」——这是**有意的收窄**，请求带它们会在受理前被拒。
+- **四个参数改按第一方文档声明**（`background`、`output_compression`、`user`、`moderation`），
+  依据 [`docs/adr/0018`](../../../../docs/adr/0018-open-parameters-by-first-party-docs.md)：文档写明支持的
+  参数就声明，不再以"没实测"为由拦截。本条原先的"一律不声明"因此作废。
+
+## 追加（同日，三条收口：命名 / 并发 / 同步门面）
+
+- **字段命名统一成 `model`**：对外只有 `model`；库里与类型上叫 `gateway_model`（平台型号名，
+  即运营发布时用的标识）；厂商原生名留在 `catalog.vendor_models.native_model_id`；发给渠道的是
+  `provider_model_id`。迁移 `migrations/0004_gateway_model.sql` 把
+  `generation.jobs` 与 `publication.runtime_entries` 的 `native_model_id` 改成 `gateway_model`
+  （两者当时同值，改名只写清角色，不改取值）。
+- **同一账户的在飞任务数上限**：`GENERATION_MAX_CONCURRENT_JOBS`（默认 1）。受理前数一次
+  `count_in_flight_jobs`（`accepted`/`leased`/`submitting`），到顶回 `429 too_many_in_flight`
+  （新的对客码 `ApplicationError::TooManyInFlight`）。额度按**账户**算，不是按端点——用户
+  2026-09-20 的裁定是"针对端点先设计成 1 个并发数"。**同一个幂等键的那个不算占名额**：那种
+  请求会去重成原来那个 Job，重发不该被上限拒掉（用户同日："超时当然可以重发"）。
+- **两个 OpenAI 兼容入口改成同步返回**：受理后等任务跑到终态（上限
+  `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），成功回 `{created, data:[{b64_json}]}`，失败回
+  OpenAI 错误信封（平台侧语义，渠道原文不外泄）。内部流水线一字未改，同步只是门面的等待。
 
 ## 验证结果
 
@@ -65,14 +83,16 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 | 没见过的参数原样发给上游 | `forwards_parameters_it_does_not_know`（两个 Adapter） |
 | 取值放行、必填项仍拦 | `loose_and_unknown_parameters_are_passed_through`、`missing_required_parameters_are_rejected` |
 | 两个兼容入口：带图/不带图都合法、分支按内容判定、图片映射到候选参数路径、Job 照样跑完 | `openai_compatible_entries_accept_and_map_assets` |
+| 兼容入口**同步**返回图片 | 同上（读 `data[0].b64_json` 解出来是上游那张 PNG） |
+| 在飞任务到顶回 429、跑完释放、同键重发不被误拒 | `concurrent_generations_are_capped` |
+| 改名后受理与查询都不缺列 | 全部端到端用例（`active_offering` 读 `gateway_model`） |
 
 ## 未做（需要你的决定）
 
-- **字段命名**：请求体里仍同时有 `native_model_id`（查目录用）与合同参数里的 `model`（由服务端强制成同一个值），冗余。要不要统一成一个"平台型号名"（例如只用 `model`）仍未定。
-- **编辑请求的编码**：现在是统一 JSON + 先上传换资产 id；OpenAI 的编辑端点用 `multipart/form-data`。要不要提供兼容入口（`docs/design/0002` 里设计过 generations/edits 兼容入口，一直没实现）仍未定。
 - **预授权额的精度**：现在是一个固定数；按 Price Snapshot 算最坏成本、以及低于最小可能成本就受理前拒绝（`docs/adr/0009`），仍未实现。
-- **库/类型里的三方命名**：`generation.jobs.native_model_id` 装的其实是平台型号名，收口（表与类型上把平台型号名 / 厂商原生名 / 渠道模型名分开）另做。
 - **其余字段的取值仍随候选不同**：同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 并多一个 `resolution`——调用方仍要看命中哪个候选。
+- **哪些参数要把取值管起来**：用户 2026-09-20 说明后期统一整理一份清单，届时加在 [`validate_native_request`] 那一处。
+- **兼容入口的等待窗口**：`GENERATION_SYNC_WAIT_SECONDS` 默认 120s；等不到终态时的行为（现在按超时错误回）还没有产品裁定。
 
 ## 依据与关联
 
