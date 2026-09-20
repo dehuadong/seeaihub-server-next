@@ -157,7 +157,7 @@
 
 **位置差异属于渠道各端点族自己的形态。** 本平台对 AIHubMix 采用的执行路径是**同步**的 `/v1/images/generations` 与 `/v1/images/edits`（§2.6 实测结清），上表第 1 行那条异步面**不使用**——它的包装形态与本平台无关。
 
-**该执行路径上的"已声明未验证"参数**：`background`、`output_compression`、`user` 出现在第 1 行的参数集合里，但**不在**第 2、3 行的顶层参数集合内（那两个端点 `additionalProperties` 为 `false`）。AIHubMix 的发布素材目前把这三项声明为支持（差距 G2），与 `docs/adr/0002`"未证实的参数不开启"不符。相关归属与整改见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
+**该执行路径上的"已声明未验证"参数**：`background`、`output_compression`、`user` 出现在第 1 行的参数集合里，但**不在**第 2、3 行的顶层参数集合内（那两个端点 `additionalProperties` 为 `false`）。AIHubMix 的发布素材目前把这三项声明为支持（[`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G2），与 `docs/adr/0002`"未证实的参数不开启"不符。相关归属与整改见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 ### 2.6 2.5 两款在同步 `/v1` 上的实测（2026-09-19，经用户授权）
 

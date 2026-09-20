@@ -104,7 +104,7 @@ HTTP 只是应用命令的适配层，可并存三种请求入口而不复制业
 
 **形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而那份 Schema 覆盖的端点不止一个，各端点的参数位置与可用面并不相同。声明"原生能力 Schema"时，字段与位置一律取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；各端点的实际形态属渠道事实，见 `docs/facts/channel-facts.md` §2。
 
-- 上一段清单里的 `background`、`output_compression`、`user` **不在**本阶段采用的执行路径的参数集合内，因此属"已声明未验证"，不应视为已开放能力（差距 G2）；
+- 上一段清单里的 `background`、`output_compression`、`user` **不在**本阶段采用的执行路径的参数集合内，因此属"已声明未验证"，不应视为已开放能力（[`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G2）；
 - 已知差距（当前素材把可选参数声明在本 Offering 未采用的那一族端点的形状下，Adapter 能力面又强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。
 
 已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未知字段拒绝、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。「未知字段拒绝」是**平台自己的**受理前校验：上游不保证拒绝未声明字段（2026-09-19 实测另一 Provider 静默接受并降级为默认值），因此不能依赖上游返回错误来兜底。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
