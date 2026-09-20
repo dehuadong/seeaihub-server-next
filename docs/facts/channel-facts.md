@@ -110,7 +110,7 @@
 4. 状态：受理即 `pending`，十几秒内 `completed`；
 5. **`quality` 不是 `/ai/v1` 的顶层参数**：顶层传它被硬拒 ——
    `HTTP 400 {"error":{"code":"schema_violation","message":"Unknown request parameter: \`quality\`.","type":"invalid_request_error"}}`；
-   ⇒ 必须放进 `extra`（与本地 Schema 快照一致）。**未知参数是硬拒绝，不静默接受**（与火山方舟相反）。
+   ⇒ 在 `/ai/v1` 那族端点上必须放进 `extra`。**本平台不调用那族端点**：执行路径是同步 `/v1/*`，那里 `quality` 就在顶层（本仓库的发布素材已按顶层声明，不再有 `extra`）。**未知参数是硬拒绝，不静默接受**（与火山方舟相反）。
 
 **尚未测**：本次用的是 `gpt-image-2`（已退役），**未对 `gpt-image-2.5-flare`/`-sunburst` 做异步调用**；2.5 的异步任务对象形状是否相同**未验证**。
 
@@ -220,9 +220,9 @@
 | 项 | `gpt-image-2` | 2.5 两款 |
 | --- | --- | --- |
 | `model.const` 字面值 | `gpt-image-2` | **`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`**（各与 `native_model_id` 同名） |
-| `extra.quality` 取值 | `low`/`medium`/`high` | **新增 `xhigh`、`max`**，共 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`） |
-| `extra.moderation` | **无** | **有**（`auto`/`low`） |
-| `extra.background` | 有 | 有 |
+| `quality` 取值 | `low`/`medium`/`high` | **新增 `xhigh`、`max`**，共 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）；在本平台采用的同步 `/v1` 端点上是**顶层**参数 |
+| `moderation` | **无** | 上游 `/ai/v1` 机器 Schema 有（`auto`/`low`），但**本平台素材不声明**它（Adapter 未验证该参数，见 §2.9） |
+| `background` | 上游有 | 上游有；**本平台素材不声明**（未经验证，按 `docs/adr/0002` 不开放） |
 | `n` | `min 1, max 10` | `min 1, max 10`（**同**） |
 
 **Offering（④）参数**：
@@ -250,29 +250,13 @@
 
 **本渠道就绪判定**：③④⑤ 所需事实**齐备**；② 沿用现有 Driver（2.5 实测同构）——**但存在一处发布阻塞，见 2.9**。
 
-### 2.9 ⚠️ 发布阻塞：Adapter 未声明 `moderation`，2.5 的 Profile 会被发布期拒绝
+### 2.9 素材的参数面：只声明已验证的顶层参数
 
-**事实链**（三处均已核对）：
+**执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。本仓库的 AIHubMix 素材因此把参数**全部声明在顶层**：`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`。
 
-1. 2.5 的机器 Schema **含 `extra.moderation`**（`auto`/`low`），`gpt-image-2` **不含**；
-2. `crates/adapter-aihubmix/src/lib.rs` 的 `AdapterDescriptor` 声明：
-   `supported_extra_parameters: &["quality", "background", "output_compression", "user"]` —— **没有 `moderation`**；
-3. `crates/application/src/lib.rs:504-519` 的 `validate_adapter_compatibility` 会逐项检查 `capability_schema.extra.properties` 的键，**不在该列表内即返回 `Validation`，发布失败且不产生 revision 行**。
+**四个未经验证的参数一律不声明**：`background`、`output_compression`、`user`、`moderation`（AIHubMix 2.5 的机器 Schema 有前三个与 `moderation`，但我们没有实测过它们在**我们采用的端点**上的行为）。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——收窄是**有证据的本地收窄**，请求带这些参数会在受理前被拒（比"声明了却不发"更安全）。
 
-⇒ **直接拿 2.5 的机器 Schema 当 Profile 发布，会被拒。** 这不是渠道问题，是**平台侧的 Driver 声明面落后于上游能力**。
-
-**两条路（各自动作与代价）**：
-
-| | 做法 | 动作 | 代价 |
-| --- | --- | --- | --- |
-| **A** | 把 `moderation` 加进 `supported_extra_parameters` | **改代码**（`crates/adapter-aihubmix`），新 Driver 版本 | 本阶段的改动面从"纯数据发布"变为**含代码发版**；但该参数确由上游支持，属如实声明 |
-| **B** | 维持 Adapter 不动，2.5 的 Profile **不声明 `moderation`** | 纯数据发布 | Profile 比上游能力**窄**；请求带 `moderation` 会在受理前被拒（比"声明了却不发"更安全）；需按 `0002` §5 记录「上游 Schema 与本地 Profile 的差异」 |
-
-**注意**：`quality` **不是**阻塞项——它已在列表内，2.5 只是**拓宽取值**（新增 `xhigh`/`max`），发布期只看键名不看取值集合。
-
-**决定（2026-09-19）：本阶段走 B**——Adapter 不动，2.5 的 Profile 不声明 `moderation`。理由：`#2` 的核心命题是「同一 Vendor Model 多 Offering 路由」，不是"支持 `moderation`"；B 使 2.5 供给可发布且零代码改动，`moderation` 留作后续能力扩展。
-
-**B 有一个必须记住的后果**：带 `moderation` 的请求会在**受理前**被 Profile 校验拒绝（这是**更安全**的方向——不会出现"声明了却不发"）。差异需按 `0002` §5 记录：上游 Schema 与本地 Profile 不同，属**有证据的本地收窄**。
+**2026-09-20 的变化**：此前素材把 `quality` 等放在 `extra` 内、并因此与 Adapter 的声明面互相牵制（当时记为"发布阻塞"）。现在两边都去掉了 `extra`，阻塞不存在了；`quality` 顶层直传（上游在同步 `/v1` 上就是这样）。
 
 ### 2.10 已生成的发布素材
 
@@ -281,28 +265,15 @@
 | `config/bootstrap/aihubmix-gpt-image-2.5-flare.json` | AIHubMix → `gpt-image-2.5-flare` 的 Profile + Offering + Price（草案） |
 | `config/bootstrap/aihubmix-gpt-image-2.5-sunburst.json` | 同上，`sunburst` |
 
-已在生成时逐项模拟 `validate_adapter_compatibility`：**两者都会通过发布校验**（对照验证：若按 2.5 原始 Schema 带上 `moderation`，会被拒并给出 `adapter AIHubMix does not support native parameter extra.moderation`）。
+两个文件都通过发布校验（顶层参数面与 Adapter 的 `AdapterDescriptor` 一致；见 `crates/application` 的 `validate_adapter_compatibility`）。
 
-**两个前置（文件内 `_status` 已写明）**：
+**前置（文件内 `_status` 已写明）**：未获「执行实现」授权前不得用于生产；素材是"草案 · 未发布"。
 
-1. **未获「执行实现」授权前不得用于生产**；
-2. 这两个文件用的是规划 §3.1 的**新形状**（`price_plan`），而**当前实现是扁平的 `rates` + `price_source_url`** ⇒ **代码支持新形状前，它们无法直接发布**。这是 B 的第二个后果：素材可以现在备好，但发布要等形状落地。
+### 2.11 费率
 
-### 2.11 ⚠️ 既有配置的一处实质缺陷（未擅自修改）
+四档单价见 §2.4（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens）；`config/bootstrap/aihubmix-*.json` 的 `price_plan` 按同一四档填写。
 
-`config/bootstrap/aihubmix-gpt-image-2.json`（**现在在跑的配置**）里：
-
-```json
-"rates": { ..., "text_output_microusd_per_million": 0 }
-```
-
-**文本输出的费率是 0**，而 AIHubMix 公开单价是 **$10 / 1M tokens**（用户 2026-09-19 亦确认该四档）。
-
-**后果**：若某次响应出现 `output_tokens_details.text_tokens > 0`，平台**不会对这部分计费**——即**少收费**。第一阶段实测样本里该项恰为 0，所以没暴露。
-
-**我没有改它**：费率属运营定价，改 `gpt-image-2` 的费率不在本阶段范围内，且改生效配置需要你的决定。**仅记录，待你定。**
-
-（新生成的 2.5 两个文件按 **$10** 写，与此处不同。）
+**（2026-09-20 更正）** 本节此前记"在跑的配置把文本输出费率写成 0、平台少收费"。核对当前素材：`text_output_microusd_per_million` 已是 **10000000**（$10），该缺陷不存在于现文件。
 
 ### 2.12 平台侧额度失败：`403`（用户 2026-09-20 告知）
 

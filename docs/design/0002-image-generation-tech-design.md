@@ -35,14 +35,23 @@ Provider 与 Vendor 不合并：以后其他 Provider 也供应 `gpt-image-2` �
 文生图、图生图以及厂商支持时的 mask 编辑是同一个图片生成业务能力的不同输入分支，共用一个 Command、Job、Attempt、Asset、Evidence 和结算流程。决策依据见 `docs/adr/0001-unified-image-generation-command.md`。
 
 ```text
-CreateImageGeneration {
-  vendor_model_revision,
-  native_parameters,
-  asset_bindings,
+CreateImageGenerationRequest {        // 调用方看到的形状（对客接口）
+  native_model_id,                   // 运营发布的型号标识
+  <合同里的模型参数，扁平放顶层>,        // prompt / n / size / quality / …
+  image: <asset id> | [<asset id>…], // 参考图（OpenAI 契约的字段名）
+  mask:  <asset id>,                 // 可选；遮罩
   idempotency_key,
-  account_context
+}
+
+CreateImageGeneration {               // 落库与 Worker 看到的形状（已落到某个候选的装载面）
+  native_model_id,
+  native_parameters,                  // 同上，但图片已按该候选声明映射成具体路径
+  asset_bindings,                     // [{native_parameter_path, asset_id, position}]
+  idempotency_key,
 }
 ```
+
+两者的换算就是 Offering Parameter Mapping 的起点：调用方只给 `image` / `mask`，平台按选中候选声明的参数面决定装到 `/image`、`/image_urls/0` 还是 `/mask_url`；候选表达不了就是不合格，选路据此判定。
 
 请求分支判定（发布期/请求期派生结果，不是客户端字段）：
 

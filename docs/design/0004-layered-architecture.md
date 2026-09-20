@@ -25,7 +25,7 @@
 | **④ Offering** | Provider、上游模型名、用哪个 Driver、渠道限制、优先级 | 供给面 | 运行时发布 | `supply.offerings` + `publication.runtime_entries` |
 | **⑤ Price** | 计价单位、单价、币种、汇率、生效区间（"上游金额口径"这一分支经实测**不需要**：两家渠道都返回分项 token） | 价格 | PG 动态配置 | `pricing.price_plans` |
 
-**① 层的已知差距（2026-09-20 登记）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**当前实现尚未做到**——对外接口把渠道原生参数直接交给调用方（`native_parameters`、`asset_bindings[].native_parameter_path`），于是同一 Vendor Model 的两个候选对调用方的字段形状不同，候选是否合格由调用方写的字段名决定，`routing_priority` 实际上不起决定作用。合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定；差距与工作量登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)，需另行 Planning 与执行授权。
+**① 层的已知差距（2026-09-20 登记，同日部分收口）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**已做掉的**：对客请求体改成**扁平**（不再有 `native_parameters` 外壳）、图片改用 OpenAI 契约的 `image` / `mask`（平台资产 id），参数路径与 `position` 不再出现在调用方面前；AIHubMix 素材与 Adapter 的 `extra` 包装已去掉（`quality` 顶层）。**仍存在的**：其余字段名与取值仍随候选不同（例如同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 且另有 `resolution`），调用方仍要看命中哪个候选；合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定，剩余收口对应的差距登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 ## 2. 四条不会违反的规则
 

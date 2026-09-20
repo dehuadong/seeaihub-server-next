@@ -9,8 +9,8 @@ use seeai_adapter_sdk::{
 use seeai_domain::{
     AccountId, AssetBinding, AssetId, AssetParameterKind, AttemptId, CreateImageGeneration,
     GenerationJob, ImageBranch, JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId,
-    PriceRates, PublishedOffering, PublishedRevision, RuntimeRevisionId, is_image_parameter_name,
-    is_mask_parameter_name, set_native_parameter_at_path,
+    PriceRates, PublishedOffering, PublishedRevision, RuntimeRevisionId, asset_parameter_path,
+    is_image_parameter_name, is_mask_parameter_name, set_native_parameter_at_path,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -360,33 +360,77 @@ fn empty_object() -> Value {
 /// 优先级更低的候选。
 ///
 /// 不做的事：不因价格重排候选（价格不参与选中）。
+/// 把调用方给的角色落到某个候选的装载路径上。
+///
+/// 候选表达不了调用方要的图片输入（参数面里没有装参考图/遮罩的参数）就是**不合格**——
+/// 选路按"这份合同它能不能表达"判定，而不是按调用方恰好写了哪个渠道字段名。
+fn bind_assets(
+    capability_schema: &Value,
+    request: &CreateImageGenerationRequest,
+) -> Result<Vec<AssetBinding>, ApplicationError> {
+    let mut bindings = Vec::with_capacity(request.image_asset_ids.len() + 1);
+    for (index, asset_id) in request.image_asset_ids.iter().enumerate() {
+        let path = asset_parameter_path(capability_schema, AssetParameterKind::Image, index)
+            .ok_or_else(|| {
+                ApplicationError::Validation(
+                    "this offering cannot take a reference image".to_owned(),
+                )
+            })?;
+        bindings.push(AssetBinding {
+            native_parameter_path: path,
+            asset_id: *asset_id,
+            position: u16::try_from(index).unwrap_or(u16::MAX),
+        });
+    }
+    if let Some(mask_id) = request.mask_asset_id {
+        let path = asset_parameter_path(capability_schema, AssetParameterKind::Mask, 0)
+            .ok_or_else(|| {
+                ApplicationError::Validation("this offering cannot take a mask".to_owned())
+            })?;
+        bindings.push(AssetBinding {
+            native_parameter_path: path,
+            asset_id: mask_id,
+            position: 0,
+        });
+    }
+    Ok(bindings)
+}
+
 fn select_candidate(
-    command: &CreateImageGeneration,
+    request: &CreateImageGenerationRequest,
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
-    asset_bindings: &[AssetBinding],
-) -> Result<(PublishedOffering, RoutingDecision), ApplicationError> {
+) -> Result<(PublishedOffering, Vec<AssetBinding>, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
         // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误。
         return Err(ApplicationError::NotFound(format!(
             "no active offering for model {}",
-            command.native_model_id
+            request.native_model_id
         )));
     }
     let revision_id = candidates[0].runtime_revision_id;
     // 把每个候选连它的取舍结果一起算出来。`considered` 要记录**完整**的取舍画面，
     // 而不是"评估到命中为止"的部分清单——它是判定记录，不是求值轨迹。
-    let evaluated: Vec<(PublishedOffering, ConsideredCandidate)> = candidates
+    let evaluated: Vec<(PublishedOffering, Vec<AssetBinding>, ConsideredCandidate)> = candidates
         .iter()
         .map(|candidate| {
             let published = candidate.clone().into_published();
             let mut skip_reason = None;
-            if let Err(error) =
-                validate_restrictions(branch, asset_bindings, &candidate.restrictions)
-            {
-                skip_reason = Some(error.to_string());
-            } else if let Err(error) = validate_native_request(command, &published) {
-                skip_reason = Some(error.to_string());
+            let mut bindings = Vec::new();
+            match bind_assets(&published.capability_schema, request) {
+                Err(error) => skip_reason = Some(error.to_string()),
+                Ok(resolved) => {
+                    bindings = resolved;
+                    if let Err(error) =
+                        validate_restrictions(branch, &bindings, &candidate.restrictions)
+                    {
+                        skip_reason = Some(error.to_string());
+                    } else if let Err(error) =
+                        validate_native_request(request, &published, &bindings)
+                    {
+                        skip_reason = Some(error.to_string());
+                    }
+                }
             }
             let considered = ConsideredCandidate {
                 offering_id: candidate.offering_id,
@@ -395,29 +439,29 @@ fn select_candidate(
                 eligible: skip_reason.is_none(),
                 skip_reason,
             };
-            (published, considered)
+            (published, bindings, considered)
         })
         .collect();
     // 第一个合格候选胜出；不合格的留作诊断信息。
     let chosen = evaluated
         .iter()
-        .position(|(_, considered)| considered.eligible);
+        .position(|(_, _, considered)| considered.eligible);
     if let Some(chosen) = chosen {
         let considered = evaluated
             .iter()
-            .map(|(_, considered)| considered.clone())
+            .map(|(_, _, considered)| considered.clone())
             .collect::<Vec<_>>();
-        let (published, _) = evaluated.into_iter().nth(chosen).expect("index just found");
+        let (published, bindings, _) = evaluated.into_iter().nth(chosen).expect("index just found");
         let decision = RoutingDecision {
             runtime_revision_id: revision_id,
             chosen_offering_id: published.offering_id,
             considered,
         };
-        return Ok((published, decision));
+        return Ok((published, bindings, decision));
     }
     let reasons = evaluated
         .iter()
-        .map(|(_, considered)| {
+        .map(|(_, _, considered)| {
             format!(
                 "{}#{}: {}",
                 considered.provider_kind,
@@ -429,8 +473,47 @@ fn select_candidate(
         .join("; ");
     Err(ApplicationError::Validation(format!(
         "no eligible offering for model {} (revision {revision_id}): {reasons}",
-        command.native_model_id
+        request.native_model_id
     )))
+}
+
+/// 对客受理请求：调用方按**合同**给字段，图片用平台资产 id 指名。
+///
+/// 这是**接收入口**的形状，与落库的 [`CreateImageGeneration`] 分开：那个是"已经落到某个候选
+/// 的装载面"的形态（图片带具体参数路径），落库与 Worker 只看后者。两者之间的换算就是
+/// Offering Parameter Mapping 的第一块：调用方给 `image` / `mask`，平台按选中候选声明的
+/// 参数面决定装到哪个字段（`/image`、`/image_urls/0`、`/mask_url`…）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CreateImageGenerationRequest {
+    pub account_id: AccountId,
+    pub native_model_id: String,
+    /// 合同里的模型参数（扁平，不再有 `native_parameters` 外壳；图片不走这里）。
+    pub native_parameters: Value,
+    #[serde(default)]
+    pub image_asset_ids: Vec<AssetId>,
+    #[serde(default)]
+    pub mask_asset_id: Option<AssetId>,
+    pub idempotency_key: String,
+    pub max_cost_microusd: u64,
+}
+
+impl CreateImageGenerationRequest {
+    /// 这个请求属于哪条图片分支：有图无遮罩=图生图、两者都有=带遮罩、都没=文生图。
+    ///
+    /// 只有遮罩没有参考图直接拒绝（遮罩是"编辑范围"，没有可编辑的图没有意义）。
+    pub fn branch(&self) -> Result<ImageBranch, ApplicationError> {
+        match (
+            self.image_asset_ids.is_empty(),
+            self.mask_asset_id.is_some(),
+        ) {
+            (true, true) => Err(ApplicationError::Validation(
+                "mask requires an input image".to_owned(),
+            )),
+            (true, false) => Ok(ImageBranch::PromptOnly),
+            (false, false) => Ok(ImageBranch::ImageConditioned),
+            (false, true) => Ok(ImageBranch::Masked),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -1409,68 +1492,79 @@ impl GenerationService {
 
     pub async fn create(
         &self,
-        command: CreateImageGeneration,
+        request: CreateImageGenerationRequest,
     ) -> Result<GenerationJob, ApplicationError> {
-        validate_idempotency_key(&command.idempotency_key)?;
-        if command.max_cost_microusd == 0 {
+        validate_idempotency_key(&request.idempotency_key)?;
+        if request.max_cost_microusd == 0 {
             return Err(ApplicationError::Validation(
                 "max_cost_microusd must be positive".to_owned(),
             ));
         }
-        let branch = command
-            .branch()
-            .map_err(|error| ApplicationError::Validation(error.to_string()))?;
+        let branch = request.branch()?;
+        self.validate_input_assets(&request).await?;
         let candidates = self
             .repository
-            .active_offering(&command.native_model_id)
+            .active_offering(&request.native_model_id)
             .await?;
-        let (offering, routing) =
-            select_candidate(&command, branch, &candidates, &command.asset_bindings)?;
+        let (offering, asset_bindings, routing) = select_candidate(&request, branch, &candidates)?;
+        // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的路径）：上游目录变了不该
+        // 让同一个幂等键算出不同的哈希。
+        let request_hash = request_hash(&request)?;
+        self.repository
+            .create_job(
+                CreateImageGeneration {
+                    account_id: request.account_id,
+                    native_model_id: request.native_model_id,
+                    native_parameters: request.native_parameters,
+                    asset_bindings,
+                    idempotency_key: request.idempotency_key,
+                    max_cost_microusd: request.max_cost_microusd,
+                },
+                branch,
+                offering,
+                request_hash,
+                routing,
+            )
+            .await
+    }
+
+    /// 输入资产必须属于本账户、角色对得上，且遮罩与参考图同尺寸。
+    async fn validate_input_assets(
+        &self,
+        request: &CreateImageGenerationRequest,
+    ) -> Result<(), ApplicationError> {
         let mut image_dimensions = None;
-        let mut mask_dimensions = None;
-        for binding in &command.asset_bindings {
+        for asset_id in &request.image_asset_ids {
             let asset = self
                 .repository
-                .get_asset(command.account_id, binding.asset_id)
+                .get_asset(request.account_id, *asset_id)
                 .await?;
-            match binding.kind() {
-                Some(AssetParameterKind::Mask) => {
-                    if asset.role != "mask" {
-                        return Err(ApplicationError::Validation(format!(
-                            "asset {} is not a mask",
-                            asset.id
-                        )));
-                    }
-                    mask_dimensions = Some((asset.width, asset.height));
-                }
-                Some(AssetParameterKind::Image) => {
-                    if !matches!(asset.role.as_str(), "image" | "output") {
-                        return Err(ApplicationError::Validation(format!(
-                            "asset {} cannot be used as an image",
-                            asset.id
-                        )));
-                    }
-                    image_dimensions.get_or_insert((asset.width, asset.height));
-                }
-                None => {
-                    return Err(ApplicationError::Validation(format!(
-                        "unsupported asset parameter path {}",
-                        binding.native_parameter_path
-                    )));
-                }
+            if !matches!(asset.role.as_str(), "image" | "output") {
+                return Err(ApplicationError::Validation(format!(
+                    "asset {} cannot be used as an image",
+                    asset.id
+                )));
+            }
+            image_dimensions.get_or_insert((asset.width, asset.height));
+        }
+        if let Some(mask_id) = request.mask_asset_id {
+            let asset = self
+                .repository
+                .get_asset(request.account_id, mask_id)
+                .await?;
+            if asset.role != "mask" {
+                return Err(ApplicationError::Validation(format!(
+                    "asset {} is not a mask",
+                    asset.id
+                )));
+            }
+            if Some((asset.width, asset.height)) != image_dimensions {
+                return Err(ApplicationError::Validation(
+                    "mask dimensions must match the input image".to_owned(),
+                ));
             }
         }
-        if let Some(mask_dimensions) = mask_dimensions
-            && Some(mask_dimensions) != image_dimensions
-        {
-            return Err(ApplicationError::Validation(
-                "mask dimensions must match the input image".to_owned(),
-            ));
-        }
-        let request_hash = request_hash(&command)?;
-        self.repository
-            .create_job(command, branch, offering, request_hash, routing)
-            .await
+        Ok(())
     }
 
     pub async fn get(
@@ -1838,18 +1932,19 @@ fn validate_restrictions(
 }
 
 fn validate_native_request(
-    command: &CreateImageGeneration,
+    request: &CreateImageGenerationRequest,
     offering: &PublishedOffering,
+    bindings: &[AssetBinding],
 ) -> Result<(), ApplicationError> {
-    let mut instance = command.native_parameters.clone();
+    let mut instance = request.native_parameters.clone();
     let object = instance.as_object_mut().ok_or_else(|| {
         ApplicationError::Validation("native_parameters must be an object".to_owned())
     })?;
     object.insert(
         "model".to_owned(),
-        Value::String(command.native_model_id.clone()),
+        Value::String(request.native_model_id.clone()),
     );
-    for binding in &command.asset_bindings {
+    for binding in bindings {
         inject_asset_placeholder(object, binding)?;
     }
     let validator = jsonschema::validator_for(&offering.capability_schema)
@@ -1879,8 +1974,8 @@ fn inject_asset_placeholder(
     .map_err(ApplicationError::Validation)
 }
 
-fn request_hash(command: &CreateImageGeneration) -> Result<String, ApplicationError> {
-    let mut value = serde_json::to_value(command)
+fn request_hash<T: Serialize>(value: &T) -> Result<String, ApplicationError> {
+    let mut value = serde_json::to_value(value)
         .map_err(|error| ApplicationError::Validation(error.to_string()))?;
     canonicalize_json(&mut value);
     let encoded = serde_json::to_vec(&value)
@@ -2360,40 +2455,38 @@ mod tests {
         assert!(error.to_string().contains("token_rates"), "{error}");
     }
 
-    #[test]
-    fn validates_prompt_only_native_request() {
-        let command = CreateImageGeneration {
+    /// 一条最小的对客请求（文生图）；参考图与遮罩由各用例自己加。
+    fn image_request(parameters: Value) -> CreateImageGenerationRequest {
+        CreateImageGenerationRequest {
             account_id: AccountId::new(),
             native_model_id: "gpt-image-2".to_owned(),
-            native_parameters: serde_json::json!({"prompt": "hello"}),
-            asset_bindings: Vec::new(),
+            native_parameters: parameters,
+            image_asset_ids: Vec::new(),
+            mask_asset_id: None,
             idempotency_key: "request-0001".to_owned(),
             max_cost_microusd: 20_000,
-        };
-        assert!(validate_native_request(&command, &offering()).is_ok());
+        }
+    }
+
+    #[test]
+    fn validates_prompt_only_native_request() {
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        assert!(validate_native_request(&request, &offering(), &[]).is_ok());
     }
 
     #[test]
     fn injects_image_binding_before_schema_validation() {
-        let command = CreateImageGeneration {
-            account_id: AccountId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
-            native_parameters: serde_json::json!({"prompt": "hello"}),
-            asset_bindings: vec![AssetBinding {
-                native_parameter_path: "/image".to_owned(),
-                asset_id: AssetId::new(),
-                position: 0,
-            }],
-            idempotency_key: "request-0002".to_owned(),
-            max_cost_microusd: 20_000,
-        };
-        assert!(validate_native_request(&command, &offering()).is_ok());
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        request.image_asset_ids.push(AssetId::new());
+        let bindings = bind_assets(&offering().capability_schema, &request).expect("image binding");
+        assert_eq!(bindings.len(), 1);
+        assert_eq!(bindings[0].native_parameter_path, "/image");
+        assert!(validate_native_request(&request, &offering(), &bindings).is_ok());
     }
 
     #[test]
     fn injects_array_bindings_into_the_vendors_own_array_parameter() {
-        // 路径的第二段表示"要塞进数组"，而参数名取自路径第一段——厂商叫 `image_urls`
-        // 就写进 `image_urls`，平台不替它改名。
+        // 调用方只给 image/mask；装到 `image_urls` / `mask_url` 是平台按候选声明做的映射。
         let mut vendor = offering();
         vendor.capability_schema = serde_json::json!({
             "type": "object",
@@ -2406,42 +2499,41 @@ mod tests {
                 "mask_url": {"type": "string"}
             }
         });
-        let command = CreateImageGeneration {
-            account_id: AccountId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
-            native_parameters: serde_json::json!({"prompt": "hello"}),
-            asset_bindings: vec![
-                AssetBinding {
-                    native_parameter_path: "/image_urls/0".to_owned(),
-                    asset_id: AssetId::new(),
-                    position: 0,
-                },
-                AssetBinding {
-                    native_parameter_path: "/mask_url".to_owned(),
-                    asset_id: AssetId::new(),
-                    position: 0,
-                },
-            ],
-            idempotency_key: "request-0004".to_owned(),
-            max_cost_microusd: 20_000,
-        };
-        assert!(validate_native_request(&command, &vendor).is_ok());
-        // 声明里没有的路径：拒掉，而不是静默丢掉这张图。
-        let mut unknown = command.clone();
-        unknown.asset_bindings[0].native_parameter_path = "/images/0".to_owned();
-        assert!(validate_native_request(&unknown, &vendor).is_err());
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        request.image_asset_ids.push(AssetId::new());
+        request.mask_asset_id = Some(AssetId::new());
+        let bindings = bind_assets(&vendor.capability_schema, &request).expect("bindings");
+        let paths = bindings
+            .iter()
+            .map(|binding| binding.native_parameter_path.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(paths, vec!["/image_urls/0", "/mask_url"]);
+        assert!(validate_native_request(&request, &vendor, &bindings).is_ok());
+
+        // 候选的参数面里没有装参考图的参数：这个候选表达不了，直接不合格。
+        let mut text_only = offering();
+        text_only.capability_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string", "minLength": 1}
+            }
+        });
+        assert!(bind_assets(&text_only.capability_schema, &request).is_err());
+    }
+
+    #[test]
+    fn mask_without_an_image_is_rejected() {
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        request.mask_asset_id = Some(AssetId::new());
+        assert!(request.branch().is_err());
     }
 
     #[test]
     fn canonical_request_hash_ignores_object_key_order() {
-        let first = CreateImageGeneration {
-            account_id: AccountId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
-            native_parameters: serde_json::json!({"prompt":"x", "n":1}),
-            asset_bindings: Vec::new(),
-            idempotency_key: "request-0003".to_owned(),
-            max_cost_microusd: 20_000,
-        };
+        let first = image_request(serde_json::json!({"prompt":"x", "n":1}));
         let mut second = first.clone();
         second.native_parameters =
             serde_json::from_str(r#"{"n":1,"prompt":"x"}"#).expect("fixture should parse");

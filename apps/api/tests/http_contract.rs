@@ -144,10 +144,8 @@ async fn apimart_driver_uploads_reference_images_before_submitting() {
 
     let key = format!("driver-reference-{}", Uuid::new_v4());
     let mut request = route_request(model, &key, "edit this image");
-    // 绑定路径用的是该渠道的原生字段名（APIMart 收 `image_urls`）。
-    request["asset_bindings"] = json!([
-        {"native_parameter_path": "/image_urls/0", "asset_id": asset_id, "position": 0}
-    ]);
+    // 调用方只给 `image`（平台资产 id），装到哪个字段由平台按候选声明决定。
+    request["image"] = json!(asset_id);
     let (_, state) = harness.run_job(request).await;
     assert_eq!(state, "succeeded", "the reference-image flow must succeed");
 
@@ -201,10 +199,8 @@ async fn apimart_driver_uploads_reference_image_and_mask_together() {
 
     let key = format!("driver-mask-{}", Uuid::new_v4());
     let mut request = route_request(model, &key, "masked edit");
-    request["asset_bindings"] = json!([
-        {"native_parameter_path": "/image_urls/0", "asset_id": image_id, "position": 0},
-        {"native_parameter_path": "/mask_url", "asset_id": mask_id, "position": 0}
-    ]);
+    request["image"] = json!(image_id);
+    request["mask"] = json!(mask_id);
     let (_, state) = harness.run_job(request).await;
     assert_eq!(state, "succeeded", "the masked edit must succeed");
 
@@ -253,9 +249,7 @@ async fn upload_failure_fails_the_job_instead_of_asking_for_reconciliation() {
 
     let key = format!("driver-upload-failure-{}", Uuid::new_v4());
     let mut request = route_request(model, &key, "edit this image");
-    request["asset_bindings"] = json!([
-        {"native_parameter_path": "/image_urls/0", "asset_id": asset_id, "position": 0}
-    ]);
+    request["image"] = json!(asset_id);
     let (job_id, state) = harness.run_job(request).await;
     assert_eq!(
         state, "failed",
@@ -1897,8 +1891,7 @@ async fn publish_candidates(
 fn route_request(native_model_id: &str, idempotency_key: &str, prompt: &str) -> Value {
     json!({
         "native_model_id": native_model_id,
-        "native_parameters": {"prompt": prompt},
-        "asset_bindings": [],
+        "prompt": prompt,
         "idempotency_key": idempotency_key,
         "max_cost_microusd": 20_000
     })
@@ -1984,8 +1977,7 @@ async fn reject_mismatched_model_identity(client: &Client, base_url: &str, admin
 fn generation_request(idempotency_key: &str, prompt: &str) -> Value {
     json!({
         "native_model_id": "gpt-image-2",
-        "native_parameters": {"prompt": prompt, "n": 1, "extra": {"quality": "low"}},
-        "asset_bindings": [],
+        "prompt": prompt, "n": 1, "quality": "low",
         "idempotency_key": idempotency_key,
         "max_cost_microusd": 20_000
     })

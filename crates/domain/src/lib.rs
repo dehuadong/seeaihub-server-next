@@ -161,6 +161,34 @@ impl AssetParameterKind {
     }
 }
 
+/// 在某个候选声明的参数面里，找出装这一类图片的参数，返回**装载路径**。
+///
+/// 这是"调用方只给 `image` / `mask`，平台自己落到该候选的字段上"的落点：名字约定仍是
+/// [`AssetParameterKind::classify`] 那一处；数组型参数（`image_urls`）取下标，标量型
+/// （`image` / `mask_url`）直接赋值。找不到就返回 `None`——调用方需要这类图片而该候选
+/// 表达不了，候选因此不合格（选路按映射能力判定，而不是按调用方写了哪个字段名）。
+#[must_use]
+pub fn asset_parameter_path(
+    capability_schema: &serde_json::Value,
+    kind: AssetParameterKind,
+    index: usize,
+) -> Option<String> {
+    let properties = capability_schema.get("properties")?.as_object()?;
+    let (name, schema) = properties
+        .iter()
+        .find(|(name, _)| AssetParameterKind::classify(name) == Some(kind))?;
+    let is_array = schema
+        .get("type")
+        .and_then(|value| value.as_str())
+        .is_some_and(|value| value == "array")
+        || schema.get("items").is_some();
+    Some(if is_array {
+        format!("/{name}/{index}")
+    } else {
+        format!("/{name}")
+    })
+}
+
 /// 资产绑定路径（`/image_urls/0`）的第一段：参数名。
 pub fn asset_parameter_name(path: &str) -> &str {
     path.trim_start_matches('/')

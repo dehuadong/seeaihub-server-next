@@ -36,9 +36,9 @@ impl AdapterFactory for AihubmixAdapterFactory {
                 "n",
                 "size",
                 "output_format",
-                "extra",
+                "quality",
             ],
-            supported_extra_parameters: &["quality", "background", "output_compression", "user"],
+            supported_extra_parameters: &[],
             supported_branches: &[
                 ImageBranch::PromptOnly,
                 ImageBranch::ImageConditioned,
@@ -101,31 +101,9 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
     if properties.contains_key("n") {
         require_type(properties, "n", "integer")?;
     }
-    for name in ["size", "output_format"] {
+    for name in ["size", "output_format", "quality"] {
         if properties.contains_key(name) {
             require_string_enum(properties, name)?;
-        }
-    }
-    if let Some(extra) = properties.get("extra") {
-        if extra.get("type").and_then(Value::as_str) != Some("object")
-            || extra.get("additionalProperties").and_then(Value::as_bool) != Some(false)
-        {
-            return Err("extra must be a closed object schema".to_owned());
-        }
-        let extra_properties = extra
-            .get("properties")
-            .and_then(Value::as_object)
-            .ok_or_else(|| "extra.properties is required".to_owned())?;
-        for name in ["quality", "background"] {
-            if extra_properties.contains_key(name) {
-                require_string_enum(extra_properties, name)?;
-            }
-        }
-        if extra_properties.contains_key("output_compression") {
-            require_type(extra_properties, "output_compression", "integer")?;
-        }
-        if extra_properties.contains_key("user") {
-            require_type(extra_properties, "user", "string")?;
         }
     }
     let validator = jsonschema::validator_for(schema).map_err(|error| error.to_string())?;
@@ -173,7 +151,6 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
         serde_json::json!({"model": model, "prompt": 1}),
         serde_json::json!({"model": model, "prompt": "x", "unknown": true}),
         serde_json::json!({"model": model, "prompt": "x", "mask": "asset://mask"}),
-        serde_json::json!({"model": model, "prompt": "x", "extra": {"unknown": true}}),
     ] {
         if validator.is_valid(&invalid) {
             return Err(
@@ -359,17 +336,8 @@ fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError
         "prompt".to_owned(),
         Value::String(required_string(&request.native_parameters, "/prompt")?),
     );
-    for field in ["n", "size", "output_format"] {
+    for field in ["n", "size", "output_format", "quality"] {
         if let Some(value) = request.native_parameters.get(field) {
-            object.insert(field.to_owned(), value.clone());
-        }
-    }
-    for field in ["quality", "background", "output_compression", "user"] {
-        if let Some(value) = request
-            .native_parameters
-            .pointer(&format!("/extra/{field}"))
-            .or_else(|| request.native_parameters.get(field))
-        {
             object.insert(field.to_owned(), value.clone());
         }
     }
@@ -388,9 +356,7 @@ fn required_string(parameters: &Value, pointer: &str) -> Result<String, AdapterE
 }
 
 fn wire_value(parameters: &Value, field: &str) -> Option<String> {
-    let value = parameters
-        .pointer(&format!("/extra/{field}"))
-        .or_else(|| parameters.get(field))?;
+    let value = parameters.get(field)?;
     match value {
         Value::String(value) => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
@@ -720,7 +686,7 @@ mod tests {
                 "n": 1,
                 "size": "1024x1024",
                 "output_format": "png",
-                "extra": {"quality": "low"}
+                "quality": "low"
             }),
             assets: Vec::new(),
         }
@@ -789,13 +755,14 @@ mod tests {
     }
 
     #[test]
-    fn maps_extra_quality_to_openai_wire_field() {
+    fn sends_quality_on_the_wire_field() {
         let body = generation_body(&request(ImageBranch::PromptOnly))
             .expect("request should be supported");
         assert_eq!(
             body.pointer("/quality"),
             Some(&Value::String("low".to_owned()))
         );
+        // 调用方与线上都是顶层：不再有 `extra` 这一层包装。
         assert!(body.get("extra").is_none());
     }
 

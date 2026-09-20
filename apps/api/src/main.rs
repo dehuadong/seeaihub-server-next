@@ -11,17 +11,16 @@ use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
-    AdapterRegistry, ApplicationError, AssetService, GenerationService, HubRepository,
-    IdentityService, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RuntimeService,
+    AdapterRegistry, ApplicationError, AssetService, CreateImageGenerationRequest,
+    GenerationService, HubRepository, IdentityService, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
+    RuntimeService,
 };
-use seeai_domain::{
-    AccountId, AssetBinding, AssetId, CreateImageGeneration, ImageBranch, JobId, JobState,
-};
+use seeai_domain::{AccountId, AssetId, ImageBranch, JobId, JobState};
 use seeai_object_storage::ObjectStoreAssetStore;
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 use std::{env, net::SocketAddr, sync::Arc};
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
@@ -361,14 +360,64 @@ async fn download_asset(
     Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
 }
 
+/// 受理请求：**平铺**的模型参数 + 平台自己的控制字段。
+///
+/// 调用方按合同把模型参数写在顶层（不再有 `native_parameters` 外壳），图片用 `image` /
+/// `mask` 指名平台资产 id；平台按选中候选声明的参数面决定装到哪个字段上。
 #[derive(Debug, Deserialize)]
 struct CreateGenerationBody {
     native_model_id: String,
-    native_parameters: Value,
-    #[serde(default)]
-    asset_bindings: Vec<AssetBinding>,
     idempotency_key: String,
     max_cost_microusd: u64,
+    #[serde(flatten)]
+    parameters: Map<String, Value>,
+}
+
+/// 取出 `image`（一个 id 或 id 数组）并从参数里删掉它。
+fn take_asset_ids(
+    parameters: &mut Map<String, Value>,
+    name: &str,
+) -> Result<Vec<AssetId>, ApiError> {
+    match parameters.remove(name) {
+        None | Some(Value::Null) => Ok(Vec::new()),
+        Some(Value::String(id)) => Ok(vec![parse_asset_id(name, &id)?]),
+        Some(Value::Array(items)) => items
+            .into_iter()
+            .map(|item| match item {
+                Value::String(id) => parse_asset_id(name, &id),
+                other => Err(invalid_asset_reference(name, &other)),
+            })
+            .collect(),
+        Some(other) => Err(invalid_asset_reference(name, &other)),
+    }
+}
+
+/// 取出 `mask`（只接受一个 id）并从参数里删掉它。
+fn take_asset_id(
+    parameters: &mut Map<String, Value>,
+    name: &str,
+) -> Result<Option<AssetId>, ApiError> {
+    match parameters.remove(name) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(id)) => Ok(Some(parse_asset_id(name, &id)?)),
+        Some(other) => Err(invalid_asset_reference(name, &other)),
+    }
+}
+
+fn parse_asset_id(name: &str, value: &str) -> Result<AssetId, ApiError> {
+    Uuid::parse_str(value.trim()).map(AssetId).map_err(|_| {
+        ApiError::bad_request(
+            "invalid_asset_id",
+            format!("{name} is not a valid asset id: {value}"),
+        )
+    })
+}
+
+fn invalid_asset_reference(name: &str, value: &Value) -> ApiError {
+    ApiError::bad_request(
+        "invalid_asset_reference",
+        format!("{name} must be an asset id or an array of asset ids, got {value}"),
+    )
 }
 
 #[derive(Debug, Serialize)]
@@ -385,13 +434,17 @@ async fn create_generation(
     Json(body): Json<CreateGenerationBody>,
 ) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
     let account_id = authenticate(&state, &headers).await?;
+    let mut parameters = body.parameters;
+    let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
+    let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
     let job = state
         .generations
-        .create(CreateImageGeneration {
+        .create(CreateImageGenerationRequest {
             account_id,
             native_model_id: body.native_model_id,
-            native_parameters: body.native_parameters,
-            asset_bindings: body.asset_bindings,
+            native_parameters: Value::Object(parameters),
+            image_asset_ids,
+            mask_asset_id,
             idempotency_key: body.idempotency_key,
             max_cost_microusd: body.max_cost_microusd,
         })
