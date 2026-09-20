@@ -36,18 +36,19 @@ Provider 与 Vendor 不合并：以后其他 Provider 也供应 `gpt-image-2` �
 
 ```text
 CreateImageGenerationRequest {        // 调用方看到的形状（对客接口）
-  native_model_id,                   // 运营发布的型号标识
+  model,                             // 对外的模型字段＝平台型号名（运营发布时的型号标识）
   <合同里的模型参数，扁平放顶层>,        // prompt / n / size / quality / …
   image: <asset id> | [<asset id>…], // 参考图（OpenAI 契约的字段名）
   mask:  <asset id>,                 // 可选；遮罩
-  idempotency_key,
+  // 幂等键走 `Idempotency-Key` 请求头；预授权额由服务端定，调用方不报
 }
 
 CreateImageGeneration {               // 落库与 Worker 看到的形状（已落到某个候选的装载面）
-  native_model_id,
+  native_model_id,                   // 库里这一列装的也是平台型号名；三方命名的收口另做
   native_parameters,                  // 同上，但图片已按该候选声明映射成具体路径
   asset_bindings,                     // [{native_parameter_path, asset_id, position}]
   idempotency_key,
+  max_cost_microusd,                  // 服务端按固定数给的预授权额
 }
 ```
 
@@ -72,7 +73,7 @@ accepted → leased → submitting → submitted/running → succeeded
 
 Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、Native Parameters 摘要、Asset Bindings 与 Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
-HTTP 只是应用命令的适配层，可并存三种请求入口而不复制业务逻辑：统一图片生成入口、generations 兼容入口、edits 兼容入口。三个入口都调用 `CreateImageGeneration`；兼容入口只负责请求解码、Asset Binding 和分支断言，不能自己选路、计费或调用 Provider。首期不考虑客户端，因此具体公开 URL 和响应合同仍不冻结。
+HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务逻辑：统一图片生成入口（`/v1/image-generations`）、generations 兼容入口（`/v1/images/generations`，JSON、只收文本）、edits 兼容入口（`/v1/images/edits`，`multipart/form-data`、`image` 必填）。三个入口都调用同一个受理路径（`CreateImageGenerationRequest`）；兼容入口只负责请求解码、Asset Binding 和分支断言，不能自己选路、计费或调用 Provider。**响应合同仍是异步受理（202 返回 Job）**：要不要再提供"等结果"的同步响应形态，属尚未作出的产品选择。
 
 ## 4. 执行路径与接口职责
 

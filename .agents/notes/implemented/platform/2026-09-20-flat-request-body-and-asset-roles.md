@@ -4,10 +4,27 @@ status: implemented
 created: 2026-09-20
 updated: 2026-09-20
 approval: 用户 2026-09-20 指出"`native_parameters` 是多余的、其下应该都是顶层""`quality` 怎么还是在 `extra`""`asset_bindings` 应兼容 OpenAI 的 `mask`"并要求直接实现（GitHub 上没有对应的授权语句记录，本条只陈述出处，不额外推定）
-verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **11/11 通过**（含参考图、遮罩、上传失败三条真实链路）
+verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **12/12 通过**（含参考图、遮罩、上传失败三条真实链路，以及两个 OpenAI 兼容入口）
 ---
 
 # 对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
+
+## 追加（同日，按用户的四条决定）
+
+- **对外的模型字段就是 `model`**：请求里不再有 `native_model_id`（那是内部/发布侧的名字），
+  平台型号名与厂商原生名、发给渠道的模型名是三个角色（词汇表新增 Gateway Model）。
+  Job 查询返回的字段也从 `native_model_id` 改成 `model`。**库里的列名暂未改**——三方命名的
+  收口（表与类型上分开）另做，避免把一次接口改动扩成迁移。
+- **幂等键改走 `Idempotency-Key` 请求头**（OpenAI 的写法，可选）：给了就用它去重，没给就
+  服务端生成一个（只失去跨重试的自动去重）。
+- **预授权额由服务端定**：请求体里不再有 `max_cost_microusd`；服务端按固定数给
+  （`GENERATION_MAX_COST_MICROUSD`，默认 $0.02）。按 Price Snapshot 算该请求的最坏成本、
+  以及 `docs/adr/0009` 要求的"低于最小可能成本就受理前拒绝"，都留作后续优化。
+- **两个 OpenAI 兼容入口落地**：`POST /v1/images/generations`（JSON，只收文本，带图直接拒）
+  与 `POST /v1/images/edits`（`multipart/form-data`，`image` 必填、`mask` 可选，文件存成平台
+  资产）。三个入口共用 `CreateImageGenerationRequest` 之后的同一条受理路径；兼容入口只做
+  请求解码、资产绑定与分支断言。**响应仍是异步受理（202 返回 Job）**——要不要再给"等结果"
+  的同步响应形态，属尚未作出的产品选择。
 
 ## 实际交付
 
@@ -35,13 +52,14 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 | 只有遮罩没有参考图直接拒 | `mask_without_an_image_is_rejected` |
 | `quality` 顶层直传、线上没有 `extra` | `sends_quality_on_the_wire_field`（aihubmix） |
 | 素材与 Adapter 声明面一致 | `accepts_bootstrap_capability_contract`（aihubmix，读真实素材） |
+| 两个兼容入口：解出的分支、图片映射到候选参数路径、Job 照样跑完 | `openai_compatible_entries_accept_and_map_assets` |
 
 ## 未做（需要你的决定）
 
 - **字段命名**：请求体里仍同时有 `native_model_id`（查目录用）与合同参数里的 `model`（由服务端强制成同一个值），冗余。要不要统一成一个"平台型号名"（例如只用 `model`）仍未定。
 - **编辑请求的编码**：现在是统一 JSON + 先上传换资产 id；OpenAI 的编辑端点用 `multipart/form-data`。要不要提供兼容入口（`docs/design/0002` 里设计过 generations/edits 兼容入口，一直没实现）仍未定。
-- **`idempotency_key` 的位置**：现在在请求体里且必填；OpenAI 放在 `Idempotency-Key` 请求头且可选。
-- **`max_cost_microusd`**：仍在请求体里、仍由客户端自报，平台只校验 `> 0`（`docs/adr/0009` 要求的"低于最小可能成本就受理前拒绝"仍未实现）。
+- **预授权额的精度**：现在是一个固定数；按 Price Snapshot 算最坏成本、以及低于最小可能成本就受理前拒绝（`docs/adr/0009`），仍未实现。
+- **库/类型里的三方命名**：`generation.jobs.native_model_id` 装的其实是平台型号名，收口（表与类型上把平台型号名 / 厂商原生名 / 渠道模型名分开）另做。
 - **其余字段的取值仍随候选不同**：同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 并多一个 `resolution`——调用方仍要看命中哪个候选。
 
 ## 依据与关联

@@ -405,7 +405,7 @@ fn select_candidate(
         // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误。
         return Err(ApplicationError::NotFound(format!(
             "no active offering for model {}",
-            request.native_model_id
+            request.model
         )));
     }
     let revision_id = candidates[0].runtime_revision_id;
@@ -473,7 +473,7 @@ fn select_candidate(
         .join("; ");
     Err(ApplicationError::Validation(format!(
         "no eligible offering for model {} (revision {revision_id}): {reasons}",
-        request.native_model_id
+        request.model
     )))
 }
 
@@ -486,15 +486,17 @@ fn select_candidate(
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateImageGenerationRequest {
     pub account_id: AccountId,
-    pub native_model_id: String,
+    /// **对外的模型字段**：平台型号名（发布时的型号标识）。它与厂商原生名、
+    /// 以及真正发给渠道的模型名是三个分开的角色。
+    pub model: String,
     /// 合同里的模型参数（扁平，不再有 `native_parameters` 外壳；图片不走这里）。
     pub native_parameters: Value,
     #[serde(default)]
     pub image_asset_ids: Vec<AssetId>,
     #[serde(default)]
     pub mask_asset_id: Option<AssetId>,
+    /// 幂等键：来自 `Idempotency-Key` 请求头，缺省时由接口层生成一个。
     pub idempotency_key: String,
-    pub max_cost_microusd: u64,
 }
 
 impl CreateImageGenerationRequest {
@@ -543,7 +545,8 @@ pub struct JobView {
     pub account_id: AccountId,
     pub state: String,
     pub branch: ImageBranch,
-    pub native_model_id: String,
+    /// 对外的模型字段：平台型号名。
+    pub model: String,
     pub result_asset_ids: Vec<AssetId>,
     pub error_code: Option<String>,
     pub created_at: DateTime<Utc>,
@@ -1482,12 +1485,20 @@ impl AssetService {
 #[derive(Clone)]
 pub struct GenerationService {
     repository: Arc<dyn HubRepository>,
+    /// 预授权额（microusd）：**服务端定的固定数**，不由调用方自报。
+    ///
+    /// 现状是"一个固定数"，属粗判；按 Price Snapshot 算这次请求的最坏成本是后续优化
+    /// （`docs/adr/0009` 要求的"低于最小可能成本就受理前拒绝"要在那时一并实现）。
+    max_cost_microusd: u64,
 }
 
 impl GenerationService {
     #[must_use]
-    pub fn new(repository: Arc<dyn HubRepository>) -> Self {
-        Self { repository }
+    pub fn new(repository: Arc<dyn HubRepository>, max_cost_microusd: u64) -> Self {
+        Self {
+            repository,
+            max_cost_microusd,
+        }
     }
 
     pub async fn create(
@@ -1495,17 +1506,14 @@ impl GenerationService {
         request: CreateImageGenerationRequest,
     ) -> Result<GenerationJob, ApplicationError> {
         validate_idempotency_key(&request.idempotency_key)?;
-        if request.max_cost_microusd == 0 {
-            return Err(ApplicationError::Validation(
-                "max_cost_microusd must be positive".to_owned(),
+        if self.max_cost_microusd == 0 {
+            return Err(ApplicationError::Configuration(
+                "generation max cost must be positive".to_owned(),
             ));
         }
         let branch = request.branch()?;
         self.validate_input_assets(&request).await?;
-        let candidates = self
-            .repository
-            .active_offering(&request.native_model_id)
-            .await?;
+        let candidates = self.repository.active_offering(&request.model).await?;
         let (offering, asset_bindings, routing) = select_candidate(&request, branch, &candidates)?;
         // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的路径）：上游目录变了不该
         // 让同一个幂等键算出不同的哈希。
@@ -1514,11 +1522,11 @@ impl GenerationService {
             .create_job(
                 CreateImageGeneration {
                     account_id: request.account_id,
-                    native_model_id: request.native_model_id,
+                    native_model_id: request.model,
                     native_parameters: request.native_parameters,
                     asset_bindings,
                     idempotency_key: request.idempotency_key,
-                    max_cost_microusd: request.max_cost_microusd,
+                    max_cost_microusd: self.max_cost_microusd,
                 },
                 branch,
                 offering,
@@ -1940,10 +1948,7 @@ fn validate_native_request(
     let object = instance.as_object_mut().ok_or_else(|| {
         ApplicationError::Validation("native_parameters must be an object".to_owned())
     })?;
-    object.insert(
-        "model".to_owned(),
-        Value::String(request.native_model_id.clone()),
-    );
+    object.insert("model".to_owned(), Value::String(request.model.clone()));
     for binding in bindings {
         inject_asset_placeholder(object, binding)?;
     }
@@ -2459,12 +2464,11 @@ mod tests {
     fn image_request(parameters: Value) -> CreateImageGenerationRequest {
         CreateImageGenerationRequest {
             account_id: AccountId::new(),
-            native_model_id: "gpt-image-2".to_owned(),
+            model: "gpt-image-2".to_owned(),
             native_parameters: parameters,
             image_asset_ids: Vec::new(),
             mask_asset_id: None,
             idempotency_key: "request-0001".to_owned(),
-            max_cost_microusd: 20_000,
         }
     }
 

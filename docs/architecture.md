@@ -58,8 +58,12 @@
 | GET | `/api/v1/provider-failures` | `list_provider_failures` | 管理员（平台侧失败清单，含渠道原始码与原文） |
 | POST | `/v1/assets` | `upload_asset` | 持 Key 的账户（`Content-Type` + `x-asset-role`） |
 | GET | `/v1/assets/{asset_id}` | `download_asset` | 同上，限本账户 |
-| POST | `/v1/image-generations` | `create_generation` | 同上（需 `idempotency_key` 与 `max_cost_microusd`） |
+| POST | `/v1/image-generations` | `create_generation` | 持 Key 的账户（`model` + 平铺的模型参数 + 可选 `image`/`mask`；幂等键走 `Idempotency-Key` 头） |
 | GET | `/v1/image-generations/{job_id}` | `get_generation` | 同上，限本账户 |
+| POST | `/v1/images/generations` | `create_generation_compat` | 同上（OpenAI 契约的 generations 兼容入口：只收文本） |
+| POST | `/v1/images/edits` | `create_image_edit_compat` | 同上（OpenAI 契约的 edits 兼容入口：`multipart/form-data`，`image` 必填、`mask` 可选） |
+
+三个受理入口（统一入口 + 两个 OpenAI 兼容入口）**共用同一条受理路径**：兼容入口只做请求解码、资产绑定与分支断言，不自己选路、计费或调用 Provider。预授权额由服务端定（`GENERATION_MAX_COST_MICROUSD`，默认 $0.02），不由调用方自报。
 
 请求体上限 16MB（`DefaultBodyLimit`）；资产字节走对象存储，不经过数据库。
 

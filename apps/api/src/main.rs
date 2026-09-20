@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, Query, State},
+    extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
@@ -65,7 +65,7 @@ async fn main() -> Result<()> {
         runtime: RuntimeService::new(repository_port.clone(), adapters),
         reconciliation: ReconciliationService::new(repository_port.clone()),
         assets: AssetService::new(repository_port.clone(), store),
-        generations: GenerationService::new(repository_port),
+        generations: GenerationService::new(repository_port, generation_max_cost_microusd()?),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -92,6 +92,8 @@ async fn main() -> Result<()> {
         .route("/v1/assets/{asset_id}", get(download_asset))
         .route("/v1/image-generations", post(create_generation))
         .route("/v1/image-generations/{job_id}", get(get_generation))
+        .route("/v1/images/generations", post(create_generation_compat))
+        .route("/v1/images/edits", post(create_image_edit_compat))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(tower_http::request_id::SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -366,11 +368,19 @@ async fn download_asset(
 /// `mask` 指名平台资产 id；平台按选中候选声明的参数面决定装到哪个字段上。
 #[derive(Debug, Deserialize)]
 struct CreateGenerationBody {
-    native_model_id: String,
-    idempotency_key: String,
-    max_cost_microusd: u64,
     #[serde(flatten)]
     parameters: Map<String, Value>,
+}
+
+/// `Idempotency-Key` 请求头（可选，OpenAI 的写法）：给了就用它去重，没给就生成一个。
+fn idempotency_key(headers: &HeaderMap) -> String {
+    headers
+        .get("idempotency-key")
+        .and_then(|value| value.to_str().ok())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+        .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
 /// 取出 `image`（一个 id 或 id 数组）并从参数里删掉它。
@@ -428,6 +438,7 @@ struct CreateGenerationResponse {
     created_at: chrono::DateTime<chrono::Utc>,
 }
 
+/// 统一入口：平铺的模型参数 + `image` / `mask`（平台资产 id）。
 async fn create_generation(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -437,16 +448,41 @@ async fn create_generation(
     let mut parameters = body.parameters;
     let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
     let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
+    accept_generation(
+        &state,
+        account_id,
+        &headers,
+        parameters,
+        image_asset_ids,
+        mask_asset_id,
+    )
+    .await
+}
+
+/// 三个入口共用的受理路径：解码差异只到"参数 + 图片角色"为止，之后完全一样。
+///
+/// 兼容入口不自己选路、计费或调用 Provider——它们只做请求解码、资产绑定与分支断言。
+async fn accept_generation(
+    state: &AppState,
+    account_id: AccountId,
+    headers: &HeaderMap,
+    mut parameters: Map<String, Value>,
+    image_asset_ids: Vec<AssetId>,
+    mask_asset_id: Option<AssetId>,
+) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
+    let model = parameters
+        .remove("model")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| ApiError::bad_request("missing_model", "model is required"))?;
     let job = state
         .generations
         .create(CreateImageGenerationRequest {
             account_id,
-            native_model_id: body.native_model_id,
+            model,
             native_parameters: Value::Object(parameters),
             image_asset_ids,
             mask_asset_id,
-            idempotency_key: body.idempotency_key,
-            max_cost_microusd: body.max_cost_microusd,
+            idempotency_key: idempotency_key(headers),
         })
         .await?;
     Ok((
@@ -458,6 +494,106 @@ async fn create_generation(
             created_at: job.created_at,
         }),
     ))
+}
+
+/// generations 兼容入口（OpenAI 契约的文生图）：请求体与统一入口同形，但**不接受图片**
+/// ——这个端点的语义就是文生图，带图属于用错入口。
+async fn create_generation_compat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<CreateGenerationBody>,
+) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
+    let account_id = authenticate(&state, &headers).await?;
+    let parameters = body.parameters;
+    if parameters.contains_key("image") || parameters.contains_key("mask") {
+        return Err(ApiError::bad_request(
+            "images_not_allowed",
+            "the generations entry takes text only; use the edits entry for images",
+        ));
+    }
+    accept_generation(&state, account_id, &headers, parameters, Vec::new(), None).await
+}
+
+/// edits 兼容入口（OpenAI 契约的图生图/编辑）：`multipart/form-data`，`image` 必填、
+/// `mask` 可选，两者都是**文件部件**；其余文本部件就是模型参数。
+async fn create_image_edit_compat(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    mut multipart: Multipart,
+) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
+    let account_id = authenticate(&state, &headers).await?;
+    let mut parameters = Map::new();
+    let mut image_asset_ids = Vec::new();
+    let mut mask_asset_id = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        match name.as_str() {
+            "image" => {
+                image_asset_ids.push(upload_form_asset(&state, account_id, "image", field).await?);
+            }
+            "mask" => {
+                mask_asset_id = Some(upload_form_asset(&state, account_id, "mask", field).await?);
+            }
+            _ => {
+                let text = field.text().await.map_err(|error| {
+                    ApiError::bad_request("invalid_multipart", error.to_string())
+                })?;
+                parameters.insert(name.clone(), form_scalar(&name, &text));
+            }
+        }
+    }
+    if image_asset_ids.is_empty() {
+        return Err(ApiError::bad_request(
+            "missing_image",
+            "the edits entry requires an image part",
+        ));
+    }
+    accept_generation(
+        &state,
+        account_id,
+        &headers,
+        parameters,
+        image_asset_ids,
+        mask_asset_id,
+    )
+    .await
+}
+
+/// 把 multipart 里的文件部件存成平台资产，返回它的 id。
+async fn upload_form_asset(
+    state: &AppState,
+    account_id: AccountId,
+    role: &str,
+    field: Field<'_>,
+) -> Result<AssetId, ApiError> {
+    let media_type = field
+        .content_type()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "image/png".to_owned());
+    let bytes = field
+        .bytes()
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
+    let asset = state
+        .assets
+        .upload(account_id, role, &media_type, bytes)
+        .await?;
+    Ok(asset.id)
+}
+
+/// 表单里除文件外的部件都是字符串；只有整数型参数还原成数字（`n`），其余保持字符串
+/// （`prompt` 写成 "1" 也不能变成数字）。
+fn form_scalar(name: &str, text: &str) -> Value {
+    if name == "n"
+        && let Ok(value) = text.trim().parse::<i64>()
+    {
+        return Value::from(value);
+    }
+    Value::String(text.to_owned())
 }
 
 async fn get_generation(
@@ -576,6 +712,18 @@ fn required_env(name: &str) -> Result<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("missing environment {name}"))
+}
+
+/// 预授权额（microusd）。**服务端定，不由调用方自报**——现状是一个固定数（默认 $0.02），
+/// 够跑通也有上限；按 Price Snapshot 算该请求的最坏成本是后续优化。
+fn generation_max_cost_microusd() -> Result<u64> {
+    match env::var("GENERATION_MAX_COST_MICROUSD") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .context("GENERATION_MAX_COST_MICROUSD must be an integer"),
+        _ => Ok(20_000),
+    }
 }
 
 fn init_tracing() {

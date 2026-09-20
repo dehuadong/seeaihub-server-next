@@ -715,9 +715,17 @@ impl DriverHarness {
 
     /// 受理一个 Job（尚未启动 Worker），返回它的 id。
     async fn accept(&self, request: Value) -> Uuid {
+        // 幂等键走 `Idempotency-Key` 请求头（OpenAI 的写法）：测试构造体写在一起，这里拆出来。
+        let mut request = request;
+        let key = request
+            .as_object_mut()
+            .and_then(|object| object.remove("idempotency_key"))
+            .and_then(|value| value.as_str().map(str::to_owned))
+            .unwrap_or_else(|| Uuid::new_v4().to_string());
         let created = Client::new()
             .post(format!("{}/v1/image-generations", self.base_url))
             .bearer_auth(&self.api_key)
+            .header("idempotency-key", key)
             .json(&request)
             .send()
             .await
@@ -732,6 +740,12 @@ impl DriverHarness {
     /// 起真实 Worker 并把 Job 跑到终态，返回 (job_id, 终态)。
     async fn run_job(&self, request: Value) -> (Uuid, String) {
         let job_id = self.accept(request).await;
+        let state = self.run_worker_until_terminal(job_id).await;
+        (job_id, state)
+    }
+
+    /// 起真实 Worker，把**已经受理**的 Job 跑到终态。
+    async fn run_worker_until_terminal(&self, job_id: Uuid) -> String {
         // Worker 是**独立包**的二进制，按当前 profile 定位（见 `worker_binary`）。
         let mut worker = Command::new(worker_binary())
             .env("DATABASE_URL", &self.database_url)
@@ -765,7 +779,7 @@ impl DriverHarness {
         }
         let _ = worker.kill();
         let _ = worker.wait();
-        (job_id, state)
+        state
     }
 
     /// 假上游记录下来的请求（方法、路径、请求体）。
@@ -883,25 +897,29 @@ async fn image_generation_http_contract() {
 
     let request_key = format!("contract-{}", Uuid::new_v4());
     let request = generation_request(&request_key, "contract prompt");
-    let first = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&request)
-        .send()
-        .await
-        .expect("first generation");
+    let first = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &api_key,
+        &request,
+    )
+    .send()
+    .await
+    .expect("first generation");
     assert_eq!(first.status(), StatusCode::ACCEPTED);
     let first: Value = first.json().await.expect("first job JSON");
-    let repeated: Value = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&request)
-        .send()
-        .await
-        .expect("repeated generation")
-        .json()
-        .await
-        .expect("repeated job JSON");
+    let repeated: Value = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &api_key,
+        &request,
+    )
+    .send()
+    .await
+    .expect("repeated generation")
+    .json()
+    .await
+    .expect("repeated job JSON");
     assert_eq!(first["job_id"], repeated["job_id"]);
     assert_eq!(
         first.as_object().expect("response object").len(),
@@ -909,13 +927,15 @@ async fn image_generation_http_contract() {
         "creation response must not leak runtime/provider fields"
     );
 
-    let conflict = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&generation_request(&request_key, "changed prompt"))
-        .send()
-        .await
-        .expect("conflicting generation");
+    let conflict = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &api_key,
+        &generation_request(&request_key, "changed prompt"),
+    )
+    .send()
+    .await
+    .expect("conflicting generation");
     assert_eq!(conflict.status(), StatusCode::CONFLICT);
     let job_id = first["job_id"].as_str().expect("job id");
     let job = client
@@ -998,13 +1018,15 @@ async fn multiple_active_offerings_route_by_priority() {
     );
 
     let key = format!("route-{}", Uuid::new_v4());
-    let created = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&route_request(model, &key, "route prompt"))
-        .send()
-        .await
-        .expect("routed generation");
+    let created = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &api_key,
+        &route_request(model, &key, "route prompt"),
+    )
+    .send()
+    .await
+    .expect("routed generation");
     assert_eq!(created.status(), StatusCode::ACCEPTED);
     let created: Value = created.json().await.expect("job JSON");
     let job_id = Uuid::parse_str(created["job_id"].as_str().expect("job id")).expect("job UUID");
@@ -1075,20 +1097,23 @@ async fn multiple_active_offerings_route_by_priority() {
         .fetch_one(&pool)
         .await
         .expect("job count");
-    let mut over_budget =
-        route_request(model, &format!("doomed-{}", Uuid::new_v4()), "over budget");
-    over_budget["max_cost_microusd"] = json!(10_000_000);
-    let doomed = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&over_budget)
-        .send()
-        .await
-        .expect("over-budget request");
-    assert!(
-        doomed.status().is_client_error(),
-        "an unaffordable request must be rejected, got {}",
-        doomed.status()
+    // 余额不足在**受理前**拒绝：换一个余额低于服务端预授权额的账户来验（预授权额由服务端定，
+    // 调用方自报不了，所以这里用"钱不够"而不是"自报一个很大的上限"）。
+    let poor_account = create_account_with_credit(&client, &base_url, &admin_token, 1_000).await;
+    let poor_key = issue_key(&client, &base_url, &admin_token, &poor_account).await;
+    let doomed = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &poor_key,
+        &route_request(model, "doomed-request", "over budget"),
+    )
+    .send()
+    .await
+    .expect("unaffordable request");
+    assert_eq!(
+        doomed.status(),
+        StatusCode::PAYMENT_REQUIRED,
+        "an unaffordable request must be rejected before acceptance"
     );
     let decisions_after: i64 =
         sqlx::query_scalar("SELECT count(*) FROM generation.routing_decisions")
@@ -1109,21 +1134,25 @@ async fn multiple_active_offerings_route_by_priority() {
     // 同一个幂等键重放会返回同一个 Job，判定记录也应只有一条（它反映"受理时"的判定）。
     let replay_key = format!("replay-{}", Uuid::new_v4());
     let replay_request = route_request(model, &replay_key, "replayed");
-    let first = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&replay_request)
-        .send()
-        .await
-        .expect("first attempt");
+    let first = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &api_key,
+        &replay_request,
+    )
+    .send()
+    .await
+    .expect("first attempt");
     assert_eq!(first.status(), StatusCode::ACCEPTED);
-    let replay = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(&api_key)
-        .json(&replay_request)
-        .send()
-        .await
-        .expect("replay");
+    let replay = post_generation(
+        &client,
+        format!("{base_url}/v1/image-generations"),
+        &api_key,
+        &replay_request,
+    )
+    .send()
+    .await
+    .expect("replay");
     assert_eq!(replay.status(), StatusCode::ACCEPTED);
     let replay_job = Uuid::parse_str(
         replay.json::<Value>().await.expect("replay JSON")["job_id"]
@@ -1400,6 +1429,127 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
     outcome.harness.cleanup().await;
 }
 
+/// OpenAI 契约的两个兼容入口：`/v1/images/generations`（JSON，只收文本）与
+/// `/v1/images/edits`（multipart，`image` 必填、`mask` 可选）。它们只做请求解码、资产
+/// 绑定与分支断言，之后走同一条受理路径——所以这里验的是"解出来的分支对不对、图片有没有
+/// 落到该候选的参数路径上、Job 能不能照常跑完"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn openai_compatible_entries_accept_and_map_assets() {
+    let harness = DriverHarness::start(
+        &["prompt_only", "image_conditioned", "masked"],
+        UpstreamBehaviour::default(),
+    )
+    .await;
+    let client = Client::new();
+
+    // generations：OpenAI 形状的 JSON，`Idempotency-Key` 在请求头。
+    let image_asset = harness
+        .upload_input_asset("image", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+    let generated: Value = client
+        .post(format!("{}/v1/images/generations", harness.base_url))
+        .bearer_auth(&harness.api_key)
+        .header("idempotency-key", format!("compat-gen-{}", Uuid::new_v4()))
+        .json(&json!({
+            "model": harness.model,
+            "prompt": "compat entry"
+        }))
+        .send()
+        .await
+        .expect("compat generations")
+        .json()
+        .await
+        .expect("compat generations JSON");
+    let generated_id =
+        Uuid::parse_str(generated["job_id"].as_str().expect("job id")).expect("uuid");
+    assert_eq!(generated["branch"].as_str(), Some("prompt_only"));
+    assert_eq!(
+        harness.run_worker_until_terminal(generated_id).await,
+        "succeeded",
+        "a job accepted through the compat entry must run like any other"
+    );
+
+    // 带图的 generations 属于用错入口：直接拒绝，不产生 Job。
+    let rejected = client
+        .post(format!("{}/v1/images/generations", harness.base_url))
+        .bearer_auth(&harness.api_key)
+        .json(&json!({"model": harness.model, "prompt": "x", "image": image_asset}))
+        .send()
+        .await
+        .expect("compat generations with an image");
+    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+
+    // edits：multipart，`image` 是文件部件；平台把它存成资产并映射到该候选的参数路径。
+    let mask_asset = harness
+        .upload_input_asset("mask", PNG_FIXTURE.to_vec(), "image/png")
+        .await;
+    let mask_bytes = {
+        // 复用上面上传过的遮罩字节：直接从对象存储读回来（角色与尺寸都已经被校验过）。
+        let record = sqlx::query("SELECT object_key FROM generation.assets WHERE id = $1")
+            .bind(mask_asset)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("mask row");
+        let key: String = record.try_get("object_key").expect("object key");
+        std::fs::read(harness.asset_root.join(key)).expect("mask bytes")
+    };
+    let edited = client
+        .post(format!("{}/v1/images/edits", harness.base_url))
+        .bearer_auth(&harness.api_key)
+        .header("idempotency-key", format!("compat-edit-{}", Uuid::new_v4()))
+        .multipart(
+            reqwest::multipart::Form::new()
+                .part(
+                    "image",
+                    reqwest::multipart::Part::bytes(PNG_FIXTURE.to_vec())
+                        .file_name("input.png")
+                        .mime_str("image/png")
+                        .expect("mime"),
+                )
+                .part(
+                    "mask",
+                    reqwest::multipart::Part::bytes(mask_bytes)
+                        .file_name("mask.png")
+                        .mime_str("image/png")
+                        .expect("mime"),
+                )
+                .text("model", harness.model.to_owned())
+                .text("prompt", "edit through the compat entry"),
+        )
+        .send()
+        .await
+        .expect("compat edits");
+    let status = edited.status();
+    let body = edited.text().await.expect("compat edits body");
+    assert_eq!(
+        status,
+        StatusCode::ACCEPTED,
+        "compat edits rejected: {body}"
+    );
+    let edited: Value = serde_json::from_str(&body).expect("compat edits JSON");
+    assert_eq!(edited["branch"].as_str(), Some("masked"));
+    let edited_id = Uuid::parse_str(edited["job_id"].as_str().expect("job id")).expect("uuid");
+
+    // 图片落到了该候选声明的参数路径上（APIMart 收 `image_urls` / `mask_url`）。
+    let bindings: String =
+        sqlx::query_scalar("SELECT asset_bindings::text FROM generation.jobs WHERE id = $1")
+            .bind(edited_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("bindings");
+    assert!(
+        bindings.contains("/image_urls/0") && bindings.contains("/mask_url"),
+        "compat edits must map images onto the candidate's own parameters, got {bindings}"
+    );
+    assert_eq!(
+        harness.run_worker_until_terminal(edited_id).await,
+        "succeeded"
+    );
+
+    harness.cleanup().await;
+}
+
 /// 上游直接拒绝提交时，消费者看到的必须是**平台侧语义**：渠道的状态码、错误码、原文与上游标识一律不外泄。
 ///
 /// 渠道说的"余额不足"指的是平台在渠道侧的账户，原样返回会让消费者去充值。
@@ -1611,7 +1761,7 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
                 "created_at",
                 "error_code",
                 "id",
-                "native_model_id",
+                "model",
                 "result_asset_ids",
                 "state",
                 "updated_at"
@@ -1888,13 +2038,33 @@ async fn publish_candidates(
         .status()
 }
 
-fn route_request(native_model_id: &str, idempotency_key: &str, prompt: &str) -> Value {
+fn route_request(model: &str, idempotency_key: &str, prompt: &str) -> Value {
     json!({
-        "native_model_id": native_model_id,
+        "model": model,
         "prompt": prompt,
-        "idempotency_key": idempotency_key,
-        "max_cost_microusd": 20_000
+        "idempotency_key": idempotency_key
     })
+}
+
+/// 发一次受理请求：测试构造体里的 `idempotency_key` 提到 `Idempotency-Key` 请求头
+/// （OpenAI 的写法），body 里不带它。
+fn post_generation(
+    client: &Client,
+    url: String,
+    api_key: &str,
+    request: &Value,
+) -> reqwest::RequestBuilder {
+    let mut body = request.clone();
+    let key = body
+        .as_object_mut()
+        .and_then(|object| object.remove("idempotency_key"))
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .unwrap_or_else(|| Uuid::new_v4().to_string());
+    client
+        .post(url)
+        .bearer_auth(api_key)
+        .header("idempotency-key", key)
+        .json(&body)
 }
 
 async fn wait_until_ready(client: &Client, base_url: &str) {
@@ -1913,10 +2083,20 @@ async fn wait_until_ready(client: &Client, base_url: &str) {
 }
 
 async fn create_account(client: &Client, base_url: &str, admin_token: &str) -> String {
+    create_account_with_credit(client, base_url, admin_token, 100_000).await
+}
+
+/// 指定初始余额的账户（余额不足的用例要一个"钱不够"的账户）。
+async fn create_account_with_credit(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    initial_credit_microusd: u64,
+) -> String {
     let response = client
         .post(format!("{base_url}/api/v1/accounts"))
         .bearer_auth(admin_token)
-        .json(&json!({"initial_credit_microusd": 100_000}))
+        .json(&json!({"initial_credit_microusd": initial_credit_microusd}))
         .send()
         .await
         .expect("account creation");
@@ -1976,10 +2156,9 @@ async fn reject_mismatched_model_identity(client: &Client, base_url: &str, admin
 
 fn generation_request(idempotency_key: &str, prompt: &str) -> Value {
     json!({
-        "native_model_id": "gpt-image-2",
+        "model": "gpt-image-2",
         "prompt": prompt, "n": 1, "quality": "low",
-        "idempotency_key": idempotency_key,
-        "max_cost_microusd": 20_000
+        "idempotency_key": idempotency_key
     })
 }
 
@@ -1991,16 +2170,18 @@ async fn verify_reconciliation_contract(
     database_url: &str,
 ) {
     let key = format!("reconciliation-{}", Uuid::new_v4());
-    let job: Value = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(api_key)
-        .json(&generation_request(&key, "reconciliation contract"))
-        .send()
-        .await
-        .expect("reconciliation job")
-        .json()
-        .await
-        .expect("reconciliation job JSON");
+    let job: Value = post_generation(
+        client,
+        format!("{base_url}/v1/image-generations"),
+        api_key,
+        &generation_request(&key, "reconciliation contract"),
+    )
+    .send()
+    .await
+    .expect("reconciliation job")
+    .json()
+    .await
+    .expect("reconciliation job JSON");
     let job_id = Uuid::parse_str(job["job_id"].as_str().expect("job id")).expect("job UUID");
     let attempt_id = Uuid::new_v4();
     let case_id = Uuid::new_v4();
@@ -2126,34 +2307,38 @@ async fn verify_lease_recovery_contract(
     api_key: &str,
     database_url: &str,
 ) {
-    let leased_job: Value = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(api_key)
-        .json(&generation_request(
+    let leased_job: Value = post_generation(
+        client,
+        format!("{base_url}/v1/image-generations"),
+        api_key,
+        &generation_request(
             &format!("lease-before-submit-{}", Uuid::new_v4()),
             "lease recovery before submit",
-        ))
-        .send()
-        .await
-        .expect("leased recovery job")
-        .json()
-        .await
-        .expect("leased recovery job JSON");
+        ),
+    )
+    .send()
+    .await
+    .expect("leased recovery job")
+    .json()
+    .await
+    .expect("leased recovery job JSON");
     let leased_job_id = Uuid::parse_str(leased_job["job_id"].as_str().expect("leased job id"))
         .expect("leased job UUID");
-    let submitted_job: Value = client
-        .post(format!("{base_url}/v1/image-generations"))
-        .bearer_auth(api_key)
-        .json(&generation_request(
+    let submitted_job: Value = post_generation(
+        client,
+        format!("{base_url}/v1/image-generations"),
+        api_key,
+        &generation_request(
             &format!("lease-after-submit-{}", Uuid::new_v4()),
             "lease recovery after submit",
-        ))
-        .send()
-        .await
-        .expect("submitted recovery job")
-        .json()
-        .await
-        .expect("submitted recovery job JSON");
+        ),
+    )
+    .send()
+    .await
+    .expect("submitted recovery job")
+    .json()
+    .await
+    .expect("submitted recovery job JSON");
     let submitted_job_id =
         Uuid::parse_str(submitted_job["job_id"].as_str().expect("submitted job id"))
             .expect("submitted job UUID");

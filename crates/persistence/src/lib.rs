@@ -727,7 +727,9 @@ impl HubRepository for PgHubRepository {
             account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
             state: row.try_get("state").map_err(database_error)?,
             branch: parse_branch(row.try_get("branch").map_err(database_error)?)?,
-            native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+            // 对外叫 `model`（平台型号名）；库里这一列仍叫 `native_model_id`——
+            // 三方命名（平台型号名 / 厂商原生名 / 发给渠道的模型名）的收口另做。
+            model: row.try_get("native_model_id").map_err(database_error)?,
             result_asset_ids: result_ids.into_iter().map(AssetId).collect(),
             error_code: row.try_get("error_code").map_err(database_error)?,
             created_at: row.try_get("created_at").map_err(database_error)?,
