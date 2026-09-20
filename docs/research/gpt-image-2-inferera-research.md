@@ -150,7 +150,7 @@
 
 **推论**：Provider 完成后必须立即把全部结果复制进新服务端自己的对象存储，记录内容哈希、MIME、字节数、宽高和上游 result/index；不能把短期上游 URL 直接当作平台长期结果。
 
-**事实**：仓库已有的 OpenAI 兼容接口响应样本不是 Task 对象，而是 `created/background/data[].b64_json/output_format/quality/size/usage`；样本 HTTP 200、耗时 21.05 秒，`usage` 含文本/图片输入输出 token 分项。[本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
+**事实**：仓库已有的 OpenAI 兼容接口响应样本不是 Task 对象，而是 `created/background/data[].b64_json/output_format/quality/size/usage`——**没有 `id`**（既无任务 id 也无请求 id）；样本 HTTP 200、耗时 21.05 秒，`usage` 含文本/图片输入输出 token 分项。[本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
 
 **推论**：Adapter 必须按 `endpoint_family` 使用不同响应解码器，不能假定 `/ai/v1` 和 `/v1` 返回相同形状。
 

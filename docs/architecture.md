@@ -124,7 +124,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射 | 业务判定（只执行用例给出的结论） |
 | `crates/object-storage/src/lib.rs` | `AssetStore` 的本地与 S3 实现 | 资产归属与授权（在用例层） |
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、`ProviderSuccess`、`ProviderCallError`、`RetrySafety` 三态 | 任何具体渠道的协议细节 |
-| `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装、`b64_json` 解码、`x-request-id` 对账标识、错误分类 | 平台侧的生命周期与计费规则 |
+| `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装、`b64_json` 解码、响应头 `x-request-id`（有则采集为对账标识）、错误分类 | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询 → 取图）、提交前上传换 URL、渠道原生参数名回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance` | 同上；上游声明的 `cost`/`credits_cost` **不进平台证据**（计费事实由分项 token 推出，金额只在渠道事实台账里作为成本口径记录） |
 | `migrations/0001_initial.sql`、`0002_multiple_active_offerings.sql` | 表结构与约束（含"每型号每个优先级一个活动条目"、路由判定表） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |

@@ -59,10 +59,13 @@
 
 | 字段 | 说明 |
 | --- | --- |
+| **没有 `id`** | 顶层只有 `created/background/data/output_format/quality/size/usage`——**既没有任务 id，也没有请求 id**；`data[]` 项里也只有 `b64_json`。两条同步路径（generations / edits）都是这样 |
 | `created` / `background` / `output_format` / `quality` / `size` | 顶层回显类字段，**不在** `data[]` 里 |
 | `data[]` | 数组；每项**只有** `b64_json`（本渠道这两条路径**不返回 URL**） |
 | `usage` | **四分项**（`input_tokens_details` / `output_tokens_details` 各含 `text_tokens`/`image_tokens`）+ `total_tokens`；**没有** `cached_tokens`、**没有**金额字段 |
 | 金额 | **响应里没有** ⇒ 成本价只能按四档 token 费率自算（见 `docs/facts/channel-facts.md` §2.4） |
+
+**⇒ 后果（同步路径）**：同步调用**没有可查的上游任务**——响应里没有 id，且实测两次同步调用**未出现在** `/ai/v1/images` 任务列表里（`docs/research/gpt-image-2-inferera-research.md` §13.2）。所以创建请求一旦失联，**没有技术手段能把结果找回来**，只能进对账、人工按账号与时间窗核对（`docs/adr/0005`/`0007`）。异步 `/ai/v1` 才有 `id`（`t_…`），但那条路径不返回 `usage`，不作为计费执行路径。
 
 ## 2. `POST /v1/images/edits`（同步，`multipart/form-data`）
 
@@ -102,14 +105,14 @@
 
 ## 4. 错误信封
 
-文档与实测一致形状（`gpt-image-2`，异步文档 + 本仓库实测）：
+文档给出的形状（**异步文档**，`gpt-image-2`）：
 
 ```json
 {"error":{"message":"…","type":"invalid_request_error","code":"…","tid":"req_…"}}
 ```
 
-- **实测的一条**：在 `/ai/v1` 顶层传 `quality` ⇒ HTTP 400，`{"error":{"code":"schema_violation","message":"Unknown request parameter: `quality`.","type":"invalid_request_error"}}`；
-- **`tid`**：错误里的逐请求标识，**用于向支持方报告 5xx**。成功响应的对账标识是响应头 `x-request-id`（② Adapter 已采集，写入 `attempts.provider_trace_id`）；
+- **实测的一条**（`/ai/v1` 顶层传 `quality`）：HTTP 400，`{"error":{"code":"schema_violation","message":"Unknown request parameter: `quality`.","type":"invalid_request_error"}}`——**这一条里没有 `tid` 字段**（文档说错误体带 `tid`，实测这个 400 没带）；
+- **`tid`/`x-request-id` 的现状（2026-09-20 更正）**：文档说错误体带 `tid`、② Adapter 也会读响应头 `x-request-id` 作为对账标识，**但本仓库从未实测记录过 AIHubMix 的响应头**——用户早期那份样本只存了 `http_status/elapsed_seconds/body`（无 headers），2026-09-18/19 那几批也没记响应头。因此"AIHubMix 的响应头里到底有没有 `x-request-id`、长什么样"**目前是未结清的事实**；Adapter 的写法是"有就采、没有就留空"（`Option`），不会因此失败；
 - **未知参数是硬拒绝**（`schema_violation`），不会静默降级。
 
 ## 5. 相关记录
