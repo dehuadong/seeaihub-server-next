@@ -68,7 +68,6 @@ Proposal 的工作状态由 `docs/agents/issue-tracker.md` 拥有的 GitHub 标�
 - **不得**作为运行时数据源：运行中的服务只使用经审核发布的 Runtime Revision，不跟随远端文档或本目录内容变化；
 - 进入平台合同前必须走「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」流程，平台合同以发布后的不可变修订为准；
 - 第三方示例代码不参与本仓库构建，不纳入 `cargo fmt` / `clippy` / `test` 的验证范围； 
-- 新增或更新资料由用户负责维护；
 
 **入库范围**：调研笔记、Schema 快照、错误码表与计量证据样本入版本控制，使 `docs/adr/`、`docs/design/` 中的引用在 clone 后可解析；可运行的第三方示例代码排除（`.gitignore` 忽略 `out-reference/doubao/touch_edit_demo/`）。因此 clone 后缺该目录属预期行为，需要时回上游来源重新获取。
 
