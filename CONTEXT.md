@@ -75,3 +75,11 @@ _Avoid_: 当前价格
 **Reconciliation Case**:
 Provider 是否受理、是否生成或是否计费无法自动确认时，需要独立处置的业务事实。
 _Avoid_: 普通失败、自动重试
+
+**Platform Funding Failure**:
+平台在某个 Provider 侧的账户余额、额度或权限不足，导致该渠道拒绝**平台的**调用。它不是消费者的问题，属**运营事件**；对客表现**不得**是"余额不足"，且必须能被运营侧发现与处置。
+_Avoid_: 用户欠费、`insufficient_balance`（那是消费者余额的语义）、把渠道的信封原样当成对客语义
+
+**Consumer Insufficient Balance**:
+消费者在本平台的账户余额不足。它在**受理之前**就被拒绝，是对客可见、有意义的状态。
+_Avoid_: 与 Platform Funding Failure 混用；把平台在渠道侧的额度问题说成"用户余额不足"
