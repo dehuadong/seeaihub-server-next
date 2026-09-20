@@ -324,6 +324,8 @@
 
 **探测方法**：对 `https://api.apib.ai` 发**不带任何凭证**的请求，只看 401/404（不触达任何账号、不产生任何费用）。三个真实端点在**我们实际配置的域名**上都存在，不只是文档里写着。
 
+**该渠道对同一模型声明两种端点类型，但只有任务面给得出计量与计费事实（2026-09-20 补记）**：目录里 `gpt-image-2.5-flare` / `-sunburst` 的 `supported_endpoint_types` 是 `["image-generation", "openai"]`（原始材料 `out-reference/apimart/catalog-models.json`）。**任务面**（`image-generation`）的终态同时返回四分项 `usage` 与 `cost`（§3.3 有逐字样本）；**非任务面拿不到 token，也没有 `cost` 字段**（用户 2026-09-20 实测）。⇒ 本平台**只用任务面**，该 Offering 的计量与成本事实的唯一来源是任务终态；成本口径的决策见 `docs/adr/0016`。
+
 **提交响应**：`{"code":200,"data":[{"status":"submitted","task_id":"task_…"}]}` —— **`data` 是数组，读 `data[0].task_id`**。
 
 ### 3.2 请求参数（`gpt-image-2.5`）
@@ -472,7 +474,7 @@
 - 平台结算用的是**已发布 `price_plan` 的费率 × 真实分项 token**。两个 APIMart 素材的 `price_plan` 现在填的是上游公开费率——它现在的角色是**结算基数**，不是"平台对外定价决定"。
 - **`owned_by` 不携带厂商信息（2026-09-20 登记）**：APIMart 的目录接口响应对**所有**模型都返回 `"owned_by": "custom"`（含 `gemini-*` 等明确非 OpenAI 的模型），因此它**既不能证明也不能否证**某个 `gpt-image-*` 的 Vendor 归属。原始材料见 `out-reference/apimart/catalog-models.json`。⇒ 本仓库 `vendor_id: OpenAI` 是**运营方的显式配置决定**（发布命令里的 `vendor_id` + `native_model_id`，见 `config/bootstrap/*.json` 与工作项 `#2` 的规划范围），不是由渠道字段推导出来的事实。
 - **平台对外价尚未决定**：要不要在基数之上加价、要不要把账号折扣让给消费侧，都是**后期产品决定**（跟踪工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。本阶段**只固化成本价**。
-- 上游声明的 `cost`（APIMart）是**折后账号价**，随账号分组变化；它作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（这也是金额型证据被否决的原因之一，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。
+- 上游声明的 `cost`（APIMart）是**折后账号价**，随账号分组变化；它作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（这也是金额型证据被否决的原因之一，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。**成本口径按渠道取数的决策见 [`docs/adr/0016`](../adr/0016-cost-basis-per-channel.md)**：APIMart 取 `cost`、AIHubMix 按费率自算。
 
 #### 3.9.4 差价（面板账单 vs 我们的记录）
 
