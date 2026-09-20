@@ -107,3 +107,4 @@ Proposal 与工单以 GitHub Issues 为权威（`dehuadong/seeaihub-server-next`
 
 工程工件的查找、创建、更新与生命周期遵循 `docs/agents/artifacts.md`。
 即使在子项目中工作，也从仓库管理根目录解析该注册表及其中登记的位置。
+**注册表只登记位置与规则**：变更、历史与状态不写进登记表——变更归提交历史与 Agent Notes，历史位置归「历史工件与新旧衔接」表。
