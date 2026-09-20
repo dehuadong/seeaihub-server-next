@@ -16,7 +16,7 @@
 | --- | --- |
 | Proposal / 总体及阶段提案 | 按 `docs/agents/issue-tracker.md` 配置的 GitHub Issues 管理，以仓库限定编号作标识；作为该规划工作的主入口，引用独立需求与设计 |
 | Agent Notes / 工程变更与交付记录 | `.agents/notes/proposed/<分类>/YYYY-MM-DD-主题.md`，交付并验证后移至 `implemented/`，否决时移至 `rejected/`；记录工程变更、交付理由及其验证，可引用 Proposal 与 ADR，不复制提案正文与决策正文 |
-| 独立技术设计 RFC | `docs/design/`；需要独立评审、复用或演进时拆出，由提案引用，是技术设计的权威位置。沿用 `NNNN-slug.md` 顺序编号和既有 `主题` / `当前修订` / `状态` 头格式。第二阶段不另立 RFC，其技术设计与验收条件由工作项 `#2` 的规划正文承载 |
+| 独立技术设计 RFC | `docs/design/`；需要独立评审、复用或演进时拆出，由提案引用，是技术设计的权威位置。沿用 `NNNN-slug.md` 顺序编号和既有 `主题` / `当前修订` / `状态` 头格式 |
 | 代码结构图 / 落点索引 | `docs/architecture.md`；回答"哪个 crate、文件、表负责什么"。它**只做索引**：分层的职责与规则归 `docs/design/0004-layered-architecture.md`，持久决定归 `docs/adr/`，冲突时以后两者为准。新增或移动文件、增删路由与表时在**同一变更**里同步 |
 | 调查与探索存档 | `docs/research/`；存放**本仓库 Agent 自己做的**调查与探索记录：结论 + 事实/推论/待确认分开 + 来源。**上游或第三方的原始材料放 `out-reference/`**（只作证据、服务不读取）；已归纳定稿的渠道事实放 `docs/facts/`。写法：**只写重点、不过度解读**；推论与待确认必须标明；结论被推翻时保留更正记录，不静默改写 |
 | 独立行为合同 Spec | `docs/specs/`；明确需要时创建，优先更新同一工作已有 Spec |
@@ -27,10 +27,10 @@
 | 实施 Ticket | 按跟踪器配置存储与跟踪，关联所属工作项 |
 | 其他已有工件 | 承接总览与未来进度归 `dehuadong/seeaihub-server-next#1`；上游 `dehuadong/seeaihub#674` 只作冻结的历史来源，不再承接新提案或进度 |
 | 外部参考资源 | `out-reference/`，按 Provider 分目录（`aihubmix/`、`apimart/`、`doubao/`、`openai/`、`openrouter/`）。**只作参考，不是工程工件**，定位见下文「外部参考资源」一节 |
-| 决策记录工具 | `scripts/decisions/{lib,update-index,check}.mjs`，随决策记录系统部署的项目副本。已相对 setup 技能自带的原始版本修补链接解析（见下文「决策记录工具」） |
+| 决策记录工具 | `scripts/decisions/{lib,update-index,check}.mjs`；生成并检查 Agent Notes 索引，用法见下文「决策记录工具」 |
 | 受控采集脚本 | `scripts/probe/response-shapes.ps1`：**唯一**会发真实计费调用的入口（默认演练，必须显式加 `-ConfirmPaidCalls`）。用途是把各渠道的真实响应结构落成脱敏文件到 `out-reference/<provider>/`，并把登记补进该渠道的 `response-shapes.md`。凭证只从环境变量读 |
 
-文件有真实内容时才创建。Agent Notes 分类读取 `.agents/notes/config.json`，当前分类为 `domain`、`platform`、`workflow`，分别覆盖领域语义与状态规则、平台基础设施与运行时保证、仓库级工程约定与 CI 工具。Agent Notes 的正文格式参考 `.agents/notes/templates/record.md`。
+文件有真实内容时才创建。Agent Notes 的分类以 `.agents/notes/config.json` 为唯一来源，正文格式参考 `.agents/notes/templates/record.md`。
 
 工件职责边界：`docs/design/` 是独立技术设计 RFC 的权威位置，拥有设计正文；`docs/adr/` 是决策的权威位置，拥有决策正文；`.agents/notes/` 承载工程变更、交付理由及其验证的记录，引用而不复制决策正文。同一决定只保留一个权威属主：已写入 ADR 的决定，Agent Notes 只引用并链接。
 
