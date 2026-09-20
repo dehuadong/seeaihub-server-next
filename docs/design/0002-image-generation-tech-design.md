@@ -13,17 +13,9 @@
 
 ## 1. 实测结论
 
-2026-09-18 用真实付费调用取得的分支实测结果：
+2026-09-18 用真实付费调用结清：**AIHubMix 的正式执行路径采用它同步的两个端点**——`/v1/images/generations`（文生图）与 `/v1/images/edits`（图生图 / mask）。它们返回完整的分项 token，能形成可核验的 Metering Evidence。
 
-| Provider 接口 | 实测分支 | 生命周期 | 结果 | Metering Evidence | 可查询恢复 |
-| --- | --- | --- | --- | --- | --- |
-| `/ai/v1/images/generations` | 文生图、单图输入、图片 + mask | 原生异步 | 短期受保护 URL | 创建与详情均无 `usage` | 有 task/list，但列表没有 prompt、metadata、correlation ID 或 usage |
-| `/v1/images/generations` | 文生图 | 上游同步 | Base64 PNG | 有完整文本输入、图片输入、图片输出 token | 不进入 `/ai/v1/images` 列表 |
-| `/v1/images/edits` | 图片 + mask | 上游同步 | Base64 PNG | 有完整文本输入、图片输入、图片输出 token | 不进入 `/ai/v1/images` 列表 |
-
-实测 token：generations 文本输入 24、图片输入 0、图片输出 196、总计 220；edits 文本输入 27、图片输入 1024、图片输出 196、总计 1247。
-
-没有保存密钥、task ID 或短期 URL。完整脱敏记录原在 `docs/research/gpt-image-2-inferera-research.md`（**该存档已于 2026-09-20 被移除，提交 `ed140c2`**）；已归纳的渠道事实现在只以 `docs/facts/channel-facts.md` 为出处。
+逐端点的形态、分支、计量事实与实测 token 数，以 `docs/facts/channel-facts.md` §2 为唯一出处，本文不复述。没有保存密钥、task ID 或短期 URL。
 
 ## 2. 身份与供给登记
 
@@ -100,22 +92,20 @@ HTTP 只是应用命令的适配层，可并存三种请求入口而不复制业
 
 这正好落实「`image.generations.sync.v1` 与 task 协议不应成为领域拆分，生命周期差异由 Adapter 处理」的方向。决策依据见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
-`/ai/v1` 的定位：已验证可统一处理文生图、图生图和 mask，但当前不作为正式计费 Offering 的执行路径，原因是任务对象没有 usage，无法形成精确最终 Evidence。它保留为 Adapter Descriptor 中的已验证能力，只有满足以下任一条件后才可通过新 Runtime Revision 发布：AIHubMix 任务详情返回可核验 usage；有可通过 task ID 关联的账单 API；产品另行接受并明确一种不依赖 Provider usage 的计价合同。切换不需要修改应用层或公开协议，只发布新的 Adapter 执行策略/Offering 修订。
+**关于该渠道的异步任务面**：它**不使用**——任务对象没有可核验的计量事实，无法形成精确的最终 Evidence。若将来它能给出可核验的计量，按新的 Offering 修订发布即可，不需要改应用层或公开协议。各端点的实际形态见 `docs/facts/channel-facts.md` §2。
 
 ## 5. 原生能力 Schema 与发布
 
-以 AIHubMix 无需鉴权的机器 Schema 为上游证据。导入后形成平台自己的不可变 `NativeImageCapabilitySchema` 修订，至少保存：来源 URL、抓取时间、内容摘要、上游 schema 版本和人工审核记录；必填 `model`、`prompt`；`image` 与 `images` 的同义/归并关系（`images` 最多 16 张）；`mask` 必须与 `image` 或非空 `images` 同时存在；`n` 为 1–10、默认 1；`output_format` 为 `png`/`jpeg`、默认 `png`；`size` 的原生值与图生图分支的受限集合；`quality`/`background`/`output_compression`/`user` 四项可选参数及其透明背景、压缩格式的组合约束（**这些参数落在顶层还是嵌套对象里，以实际调用的端点为定，见下**；其中后三项在本阶段调用的 `/v1/*` 上属**已声明未验证**，见下）；`async`、`webhook_url`、`webhook_events_filter` 的原生条件；未声明字段失败关闭。
+以 AIHubMix 无需鉴权的机器 Schema 为上游证据。导入后形成平台自己的不可变 `NativeImageCapabilitySchema` 修订，至少保存：来源 URL、抓取时间、内容摘要、上游 schema 版本和人工审核记录；必填 `model`、`prompt`；`image` 与 `images` 的同义/归并关系（`images` 最多 16 张）；`mask` 必须与 `image` 或非空 `images` 同时存在；`n` 为 1–10、默认 1；`output_format` 为 `png`/`jpeg`、默认 `png`；`size` 的原生值与图生图分支的受限集合；`quality`/`background`/`output_compression`/`user` 四项可选参数及其透明背景、压缩格式的组合约束（**字段位置以该 Offering 实际调用的端点为定，见下**；其中后三项在本阶段采用的执行路径上属**已声明未验证**，见下）；`async`、`webhook_url`、`webhook_events_filter` 的原生条件；未声明字段失败关闭。
 
 **未声明字段失败关闭是平台自己的防线**（2026-09-19 更正）：本句原先依赖「上游 `additionalProperties: false`」这一对该上游的观察。第二个 Provider 的实测表明上游可能**静默接受未声明字段并降级为默认值**，因此这道校验必须由平台在受理前执行，不能外包给上游。决策不变，见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
 
 运行时请求不实时依赖 AIHubMix Schema 地址。更新流程是「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」，旧 Job 继续使用受理时固定的旧修订。
 
-**形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而该 Provider 有两个端点族，同一参数的**位置不同**——`/ai/v1/images/generations` 把可选参数放在 `extra` 内，OpenAI 兼容的 `/v1/images/generations` 与 `/v1/images/edits` 则把 `quality` 放在**顶层**、**不存在 `extra`**（`docs/facts/channel-facts.md` §2.5）。本阶段实际调用的是后者。因此：
+**形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而那份 Schema 覆盖的端点不止一个，各端点的参数位置与可用面并不相同。声明"原生能力 Schema"时，字段与位置一律取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；各端点的实际形态属渠道事实，见 `docs/facts/channel-facts.md` §2。
 
-- 声明"原生能力 Schema"时，字段与位置取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；
-- 原文中"`extra` 是上游已声明的受控扩展对象"仅对 `/ai/v1` 成立；在 `/v1/*` 上 `extra` **不是**合法顶层参数，把它留在调用方可见面上会形成"发布校验认一套形状、上行发另一套形状"的翻译层；
-- 上一段清单里的 `background`、`output_compression`、`user` **不在** `/v1/images/generations` 的顶层参数集合内（该端点 `additionalProperties: false`），因此它们在**本阶段调用的路径上属"已声明未验证"**，不应视为已开放能力（差距 G2）；
-- 已知差距（当前素材把 `quality` 声明在 `extra` 内、Adapter 能力面强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。
+- 上一段清单里的 `background`、`output_compression`、`user` **不在**本阶段采用的执行路径的参数集合内，因此属"已声明未验证"，不应视为已开放能力（差距 G2）；
+- 已知差距（当前素材把可选参数声明在本 Offering 未采用的那一族端点的形状下，Adapter 能力面又强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。
 
 已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未知字段拒绝、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。「未知字段拒绝」是**平台自己的**受理前校验：上游不保证拒绝未声明字段（2026-09-19 实测另一 Provider 静默接受并降级为默认值），因此不能依赖上游返回错误来兜底。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
 

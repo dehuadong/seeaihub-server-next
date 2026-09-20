@@ -155,14 +155,9 @@
 
 `extra.quality` 与顶层 `quality` 的取值集合相同：`low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）。
 
-⇒ **同一个 `quality`，端点族不同则位置不同**：`/ai/v1` 走 `extra`，OpenAI 兼容的 `/v1/*` 走顶层。这与 2.3 的实测 400 一致（在 `/ai/v1` 顶层传 `quality` 被硬拒）。**参数名不变，只是位置不同**。（此前的括号注写"位置差异属 ② 内部实现"，2026-09-20 更正：位置的**归属**是 Offering Parameter Mapping，不是 Adapter——见 `docs/adr/0015`。）
+**位置差异属于渠道各端点族自己的形态。** 本平台对 AIHubMix 采用的执行路径是**同步**的 `/v1/images/generations` 与 `/v1/images/edits`（§2.6 实测结清），上表第 1 行那条异步面**不使用**——它的包装形态与本平台无关。
 
-**⚠️ 但"位置差异属 Adapter 内部"不等于可以脱离端点族声明形状（2026-09-20 收口核对）**：本仓库的 AIHubMix 2.5 发布素材把 `quality`/`background`/`output_compression`/`user` 声明在 **`extra` 内**——那是上表**第 1 行**端点族的形状，而本阶段实际调用的是**第 2、3 行**（`/v1/*`），那两行**不存在 `extra`**。Adapter 因此在出网前把 `extra.quality` 摊平回顶层。后果有两条，均已登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)：
-
-- 调用方被要求写一个**实际未被调用**的端点族的字段布局（差距 G1）；
-- 同一 Vendor Model 的另一个候选（APIMart）要求顶层 `quality`，两份 Schema 又都是 `additionalProperties: false`，于是**参数位置成了隐形的渠道选择器**——调用方把参数写在哪，决定哪个候选合格，`routing_priority` 不起决定作用。
-
-**三个参数在 `/v1/*` 上属"已声明未验证"**：`background`、`output_compression`、`user` 出现在第 1 行的 `extra` 内，但**不在**第 2、3 行的顶层参数集合里，而那两个端点的 `additionalProperties` 均为 `false`。**AIHubMix 的**发布素材目前把这三项声明为支持（差距 G2），与 `docs/adr/0002`"未证实的参数不开启"不符。（APIMart 素材顶层自身的参数面不受此条影响。）相关归属与整改见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
+**该执行路径上的"已声明未验证"参数**：`background`、`output_compression`、`user` 出现在第 1 行的参数集合里，但**不在**第 2、3 行的顶层参数集合内（那两个端点 `additionalProperties` 为 `false`）。AIHubMix 的发布素材目前把这三项声明为支持（差距 G2），与 `docs/adr/0002`"未证实的参数不开启"不符。相关归属与整改见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 ### 2.6 2.5 两款在同步 `/v1` 上的实测（2026-09-19，经用户授权）
 
