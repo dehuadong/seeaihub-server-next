@@ -22,7 +22,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 - **资产绑定路径不再写死字段名**：`AssetBinding.native_parameter_path` 现在真正是**厂商原生参数路径**（APIMart 的 `/image_urls/0`、`/mask_url`），不再硬编码 `image`/`images`/`mask`——这正是 `docs/adr/0002` 要求的"由厂商自己的 Schema 声明原生字段路径"。平台只在**一处**判定"这个参数装的是参考图还是遮罩"（名字以 `image` 开头 / 含 `mask`，其余一律拒绝），发布期校验与运行期用的是同一个函数；Driver 侧同样按路径回填，不自己决定键名。
 - **渠道事实**：AIHubMix 2.5 两款与 APIMart 2.5 两款的发布素材；`docs/facts/channel-facts.md` 为渠道事实的单一出处。
 
-技术设计与边界由 [工作项 #2 的规划正文](https://github.com/dehuadong/seeaihub-server-next/issues/2) 与 [分层架构](../../../../docs/design/0004-layered-architecture.md) 拥有，持久决定由 [ADR 目录](../../../../docs/adr/) 拥有（本阶段新增 0009–0014；2026-09-20 收口新增 [`0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）；本记录不复制其正文。
+技术设计与边界由 [工作项 #2 的规划正文](https://github.com/dehuadong/seeaihub-server-next/issues/2) 与 [分层架构](../../../../docs/design/0004-layered-architecture.md) 拥有，持久决定由 [ADR 目录](../../../../docs/adr/) 拥有（本阶段新增 0009–0011；2026-09-20 收口新增 [`0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)；原 0012–0014 已于 2026-09-20 按 ADR 准入门槛退役，见下方更正节第 10 条）；本记录不复制其正文。
 
 ## 验证结果
 
@@ -92,7 +92,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 - APIMart 的**图生图/遮罩分支已开放并已受控实测**（2026-09-19，见上）；仍未测的是 `sunburst` 的图生图（与 flare 同渠道族、同端点、同参数面）、`base64` 路径，以及 20MB / 16 张 / 256MB 这些**边界**——代码已按文档上限拒绝（单张 20MB + 单次总量 256MB），但没有逐个压测。
 - **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**（该 ADR 第 8 条把名字约定定性为阶段性兼容规则）；`reference_images` 这类名字改由 Vendor Model Contract 显式声明解决，不再留给"那一层"。此条仅保留为当时的理由，**不再是现行规则**。
 - **`task_id` 不用于跨调用恢复**：现在只做到"失败时把 task id 留下、对账的人能查到"（见上第 10 条）。**拿它自动去补齐结果**需要改造 Attempt 模型——`generation.attempts` 有 `UNIQUE (job_id)`（一个 Job 只能一个 Attempt），且状态机只允许 `reconciliation_required → failed`、**不允许 → succeeded**（有测试钉着，理由是不确定是否已产生费用时不能自作主张，见 `docs/adr/0007`/`0011`）。要做属于独立工作项。
-- 火山方舟/Seedream、直连 OpenAI **用户 2026-09-19 明确暂不做**（先把两家渠道跑通；`docs/adr/0014` 第 3、4 条不变）；多图与 `stream`/`tools` 同样不在本阶段；
+- 火山方舟/Seedream、直连 OpenAI **用户 2026-09-19 明确暂不做**（先把两家渠道跑通；该范围由工作项 #2 的规划保持不变）；多图与 `stream`/`tools` 同样不在本阶段；
 - 平台**对外价**等运营后台管理设计定了再考虑（工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；
 - 第 16–18 条验收条件已标为过期，其若要恢复需先结清非 USD 计价或金额型证据。
 
@@ -111,3 +111,10 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 9. **授权证据不可复核**：`#2` 的 38 条评论全部出自同一账号、无授权语句，见 frontmatter 的 approval 说明；不作为后续任务的持续授权。
 
 本次收口**未改动实现代码、未发起任何真实渠道调用**。
+
+10. **ADR 集合按准入门槛整改（2026-09-20，用户指示）**：原 0012–0014 三篇**不是持久决定**，已移出 `docs/adr/`（编号不复用，历史全文见 git 历史）。判据与去向：
+    - **0012「Provider 声明的扣费金额能否作为计量证据」**——被实测回答掉的**候选问题**，不是决定 → 否决理由落成 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`，渠道侧事实留在 `docs/facts/channel-facts.md` §3.3/§3.9；
+    - **0013「退役 `gpt-image-2`，改用两款 2.5」**——**目录运营状态**（改数据就能回退）→ 在售型号由 `config/bootstrap/*.json` 的发布声明表达；其中"`gpt-image-2-official` 与 `gpt-image-2` 视为同一 Vendor Model"是**运营方的显式配置判断**，其规则属 [`docs/adr/0004`](../../../../docs/adr/0004-vendor-and-provider-identities-stay-separate.md)（Vendor 与 Provider 身份不合并），不在 ADR 里记录具体型号；
+    - **0014「第二阶段的 Provider 集合」**——**规划范围**（属 Proposal）→ 归工作项 `#2` 的规划正文。
+    
+    准入门槛已写入 [`docs/agents/artifacts.md`](../../../../docs/agents/artifacts.md)：ADR 只收"难反悔 + 不看记录会奇怪 + 真权衡过"三条都成立的决定；目录状态、价格、阶段范围、被实测回答掉的问题、当前实现状态一律走发布物 / `docs/facts/` / 工作项 / Agent Notes。

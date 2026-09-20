@@ -1,10 +1,10 @@
 主题: 火山方舟 Doubao Seedream 供给与计量计价泛化
 当前修订: v1
-状态: 待评审；**已移出第二阶段范围**（2026-09-19，见 `docs/adr/0014-phase-two-provider-set.md`）——它是「引入另一个 Vendor 的 Vendor Model」这一**独立工作项**的设计草案，不属于「同一 Vendor Model 由多个 Provider 供应」的范畴
+状态: 待评审；**已移出第二阶段范围**（2026-09-19，见工作项 `dehuadong/seeaihub-server-next#2` 的规划范围）——它是「引入另一个 Vendor 的 Vendor Model」这一**独立工作项**的设计草案，不属于「同一 Vendor Model 由多个 Provider 供应」的范畴
 
 # 火山方舟 Doubao Seedream 供给与计量计价泛化
 
-本文是**火山方舟接入**这一独立工作项的技术设计权威位置。它**不再是第二阶段（`dehuadong/seeaihub-server-next#2`）的实现依据**：第二阶段的 Vendor 固定为 OpenAI，首批 Provider 为 AIHubMix 与 APIMart，见 [0014](../adr/0014-phase-two-provider-set.md)。
+本文是**火山方舟接入**这一独立工作项的技术设计权威位置。它**不再是第二阶段（`dehuadong/seeaihub-server-next#2`）的实现依据**：第二阶段的 Vendor 固定为 OpenAI，首批 Provider 为 AIHubMix 与 APIMart，见[工作项 #2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的规划范围。
 
 **为什么移出**：火山方舟供应的是 **ByteDance 自有的 Seedream**，它**不供应 `gpt-image-*`、也不供应 `gemini-image`**。因此它与 AIHubMix 不在同一个 Vendor Model 上竞争，「AIHubMix + 火山方舟」**不构成**「同一 Vendor Model 由多个 Provider 供应」，而后者正是 #2 的核心命题。它是另一件事，应当独立规划。
 

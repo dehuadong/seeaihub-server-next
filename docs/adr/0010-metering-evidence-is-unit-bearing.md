@@ -12,7 +12,7 @@
 
 **不得由金额反推计量量**——即不能拿上游声明的扣费金额除出一个「用量」再当计量事实用（[0006](./0006-no-settlement-without-metering-evidence.md) 的禁止项）。金额是结果，不是计量。
 
-**「金额本身能否作为结算事实」不由本条决定**。那是一个**独立的持久决定**，属主原是 [0012](./0012-provider-declared-charge-as-evidence.md)（Provider 声明的扣费金额作为计量证据）；**该问题已由事实结清、0012 已作废**（2026-09-20）：两家渠道都返回分项 token，**不需要**金额型证据，本阶段不再有"金额能否作为计量证据"的开口。本条只规定：
+**「金额本身能否作为结算事实」不由本条决定**。它曾作为**独立的候选决策**提出（"Provider 声明的扣费金额作为计量证据"）；**该问题已由实测结清，候选决策被否决并退役**（2026-09-20，理由见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）：两家渠道都返回分项 token，**不需要**金额型证据，本阶段不再有"金额能否作为计量证据"的开口。本条只规定：
 
 - 若某个 Offering 走「计量量 × 已发布单价」这条主路径，则它的 Evidence 必须是**带单位的计量量**，不得写成金额；
 - 两个形态**不得在同一 Offering 上并存或隐含切换**，由 Price Plan 在受理时固定；
@@ -22,10 +22,10 @@
 
 **币种**：账本与 Price Snapshot 以 microUSD 计价。Price Plan 保留**原生币种与原生单价**以及发布时固定的汇率，使「厂商原价 → 平台美元价」可追溯，且已受理 Job 不受后续汇率漂移影响。对本身就以 USD 计价的计划，原生价即 microUSD 本身、汇率取恒等值，**不得为此伪造一个换算**。`native_pricing` 的来源 URL 与抓取时间与 `fx_source_url`/`fx_captured_at` 同为发布必填，汇率不得凭空填入。
 
-**其它计量维度是已声明的能力，但本阶段不启用**：机制上不排除将来按图片张数与像素档位计价。**当前不引入该形态**——已核实的两个 Provider 中，AIHubMix 直接返回分项 token；APIMart 的响应形状**尚未由真实调用结清**（见 [0012](./0012-provider-declared-charge-as-evidence.md)）。届时确有需要，再以新的修订启用，并基于真实需求定义档位边界，而不是预先发明。
+**其它计量维度是已声明的能力，但本阶段不启用**：机制上不排除将来按图片张数与像素档位计价。**当前不引入该形态**——已核实的两个 Provider 中，AIHubMix 直接返回分项 token；APIMart 的响应形状**当时尚未由真实调用结清**（该事实现已结清，见下方事实更正）。届时确有需要，再以新的修订启用，并基于真实需求定义档位边界，而不是预先发明。
 
 **本阶段不预判「要不要扩展证据形态」**：APIMart 的响应到底给分项 token 还是只给金额，属实施期受控验证要结清的事实。在结清之前，本条只声明原则（计量承单位、计价声明维度、不得由金额反推计量量），**不为推测的形态先造机制**。真实形状确定后，若需要扩展，按最小改动另行修订。
 
-**事实更正（2026-09-20）**：上面两段写"APIMart 的响应形状尚未由真实调用结清"。该前提**已结清**——APIMart 的任务完成响应**含四分项 `usage`**（`input_tokens_details` 区分 text/image），与 AIHubMix 同构。因此**已应用的计量维度仍只有 token 一条**，[0012](./0012-provider-declared-charge-as-evidence.md) 随之作废。依据：`docs/facts/channel-facts.md` §3.3、§3.9。本 ADR 的原则（计量承单位、计价声明维度、不得由金额反推计量量）**不因此改变**。
+**事实更正（2026-09-20）**：上面两段写"APIMart 的响应形状尚未由真实调用结清"。该前提**已结清**——APIMart 的任务完成响应**含四分项 `usage`**（`input_tokens_details` 区分 text/image），与 AIHubMix 同构。因此**已应用的计量维度仍只有 token 一条**，金额型证据这条候选决策随之**被否决并退役**（见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。依据：`docs/facts/channel-facts.md` §3.3、§3.9。本 ADR 的原则（计量承单位、计价声明维度、不得由金额反推计量量）**不因此改变**。
 
 **来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（原记录在 `docs/research/gpt-image-2-inferera-research.md`，**该存档已于 2026-09-20 被移除、提交 `ed140c2`**；结论已归纳进 `docs/facts/channel-facts.md` §2）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。**后一项已由 2026-09-19 的受控实测结清**（见上方事实更正）。

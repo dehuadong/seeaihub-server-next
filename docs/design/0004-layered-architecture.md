@@ -23,7 +23,7 @@
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、Evidence 提取、错误分类、轮询与取图 | Adapter crate | 代码发版 | `crates/adapter-sdk` + `crates/adapter-*` |
 | **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份），以及**该 Offering 能承载的面**（能力子集）：支持参数、值域、默认值、组合规则、说明 | 目录 | **运行时版本发布** | `catalog.vendor_models.capability_schema`（随 Runtime Revision 发布）。**当前实现仍是"每候选各带一份合同"——合同与承载面尚未拆开，见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G5** |
 | **④ Offering** | Provider、上游模型名、用哪个 Driver、渠道限制、优先级 | 供给面 | 运行时发布 | `supply.offerings` + `publication.runtime_entries` |
-| **⑤ Price** | 计价单位、单价、币种、汇率、生效区间（"上游金额口径"这一分支已随 [`docs/adr/0012`](../adr/0012-provider-declared-charge-as-evidence.md) 作废而不再需要：两家渠道都返回分项 token） | 价格 | PG 动态配置 | `pricing.price_plans` |
+| **⑤ Price** | 计价单位、单价、币种、汇率、生效区间（"上游金额口径"这一分支经实测**不需要**：两家渠道都返回分项 token） | 价格 | PG 动态配置 | `pricing.price_plans` |
 
 **① 层的已知差距（2026-09-20 登记）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**当前实现尚未做到**——对外接口把渠道原生参数直接交给调用方（`native_parameters`、`asset_bindings[].native_parameter_path`），于是同一 Vendor Model 的两个候选对调用方的字段形状不同，候选是否合格由调用方写的字段名决定，`routing_priority` 实际上不起决定作用。合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定；差距与工作量登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)，需另行 Planning 与执行授权。
 
@@ -53,7 +53,7 @@
 **R4 · 钱的形态由 ⑤ 声明，证据由 ② 归一提取。**
 依据：0002 §9 Adapter 能力含 `parse_result` / `extract_evidence` / `classify_error`；§11「价格是运行时 Price Plan 数据，不写进 Adapter 代码」。
 
-因此：Adapter 把上游响应**归一成该 Offering 声明的计价单位所需的证据**；Price Plan 声明按什么计价。上游给 token 就给 token 型证据，上游只给金额就给金额型证据——**这是 ② 的职责，不是领域模型的分叉**。（2026-09-20 补注：金额型证据这一支**本阶段不再需要**——两家渠道都已实测返回分项 token，[`docs/adr/0012`](../adr/0012-provider-declared-charge-as-evidence.md) 随之作废。）
+因此：Adapter 把上游响应**归一成该 Offering 声明的计价单位所需的证据**；Price Plan 声明按什么计价。上游给 token 就给 token 型证据，上游只给金额就给金额型证据——**这是 ② 的职责，不是领域模型的分叉**。（2026-09-20 补注：金额型证据这一支经实测**不需要**——两家渠道都已返回分项 token；该候选决策已被否决并退役，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`。）
 
 ## 3. 边界上四件容易搞错的事
 

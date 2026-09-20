@@ -355,7 +355,7 @@
 
 1. **任务成功响应含四分项 `usage`**，且 `input_tokens_details` **区分 `text_tokens` 与 `image_tokens`**（另有 `cached_tokens`）；
 2. ⇒ **无需扩展领域类型**：本渠道与 AIHubMix 的响应都能归一成既有 `TokenUsage`（`input_text` / `input_image` / `output_text` / `output_image`）；
-3. ⇒ `docs/adr/0012`（金额型证据）**本阶段不需要**；
+3. ⇒ **金额型计量证据本阶段不需要**（该候选决策经实测被否决并退役，理由见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）；
 4. **计价维度与 AIHubMix 相同**：单价 `$5 / $8 / $10 / $30` per 1M；本次 `cost = 0.00476 USD`，与按公开单价算出的 `0.00595` 差**正好 20%**——2026-09-19 由上游账单面板结清：那是面板自报的 `Group ratio 0.8`（**账号级固定倍率**），不是计量误差，也不作为平台结算依据（详见 §3.9）。
 
 **此前记录的文档不一致**（生成页样例有 `usage`、`tasks/status.md` 样例无 `usage`）**已由实测结清**：实际响应**有**四分项 `usage`，粒度比两份文档样例都更细（文档只给聚合三项）。
@@ -470,9 +470,9 @@
 #### 3.9.3 平台侧现在怎么用这些数（以及没有做什么）
 
 - 平台结算用的是**已发布 `price_plan` 的费率 × 真实分项 token**。两个 APIMart 素材的 `price_plan` 现在填的是上游公开费率——它现在的角色是**结算基数**，不是"平台对外定价决定"。
-- **`owned_by` 不携带厂商信息（2026-09-20 登记）**：APIMart 的目录接口响应对**所有**模型都返回 `"owned_by": "custom"`（含 `gemini-*` 等明确非 OpenAI 的模型），因此它**既不能证明也不能否证**某个 `gpt-image-*` 的 Vendor 归属。原始材料见 `out-reference/apimart/catalog-models.json`。⇒ 本仓库 `vendor_id: OpenAI` 是**运营方的显式配置决定**（`docs/adr/0014`），不是由渠道字段推导出来的事实。
+- **`owned_by` 不携带厂商信息（2026-09-20 登记）**：APIMart 的目录接口响应对**所有**模型都返回 `"owned_by": "custom"`（含 `gemini-*` 等明确非 OpenAI 的模型），因此它**既不能证明也不能否证**某个 `gpt-image-*` 的 Vendor 归属。原始材料见 `out-reference/apimart/catalog-models.json`。⇒ 本仓库 `vendor_id: OpenAI` 是**运营方的显式配置决定**（发布命令里的 `vendor_id` + `native_model_id`，见 `config/bootstrap/*.json` 与工作项 `#2` 的规划范围），不是由渠道字段推导出来的事实。
 - **平台对外价尚未决定**：要不要在基数之上加价、要不要把账号折扣让给消费侧，都是**后期产品决定**（跟踪工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。本阶段**只固化成本价**。
-- 上游声明的 `cost`（APIMart）是**折后账号价**，随账号分组变化；它作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（`docs/adr/0012` 在本阶段作废的原因之一）。
+- 上游声明的 `cost`（APIMart）是**折后账号价**，随账号分组变化；它作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（这也是金额型证据被否决的原因之一，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。
 
 #### 3.9.4 差价（面板账单 vs 我们的记录）
 
@@ -490,7 +490,7 @@
 
 **AIHubMix 侧目前无法核对差价**：上游不返回任何金额字段，也无从知道它是否给账号折扣（§2.4）。要结清得看它的控制台/账单，不在这几次调用的实测范围内。
 
-**`docs/adr/0012` 因此在本阶段作废**：平台的**计量事实**是四分项 token；金额随账号倍率变化、不可复现，所以结算必须由分项 token 推出，上游声明的金额只用来核成本（本阶段要的正是它）。§5.6 那次真实端到端是这条的实证。
+**金额型计量证据因此被否决**：平台的**计量事实**是四分项 token；金额随账号倍率变化、不可复现，所以结算必须由分项 token 推出，上游声明的金额只用来核成本（本阶段要的正是它）。§5.6 那次真实端到端是这条的实证。
 
 **来源**：用户 2026-09-19 在会话中提供的两张上游控制台"详情"面板截图（含 `task_id` 与 API 密钥标签，故**截图本身不入库**；本表只转录与结算有关的数字与倍率）。
 

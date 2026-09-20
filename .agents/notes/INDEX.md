@@ -21,7 +21,9 @@
 
 ### rejected
 
-暂无记录。
+| 首次提出 | 记录 | 分类 | 生命周期 |
+| --- | --- | --- | --- |
+| 2026-09-19 | [金额型计量证据被否决（原候选决策：Provider 声明的扣费金额作为计量证据）](./rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md) | domain | rejected |
 
 ## 按项目分类
 
@@ -29,7 +31,9 @@
 
 Vendor/Vendor Model/Provider/Offering/Channel 等模型供给语义、Runtime Revision 发布规则、Generation Job/Attempt 状态机、计价与结算公式、Reconciliation Case 处置规则
 
-暂无记录。
+| 首次提出 | 记录 | 分类 | 生命周期 |
+| --- | --- | --- | --- |
+| 2026-09-19 | [金额型计量证据被否决（原候选决策：Provider 声明的扣费金额作为计量证据）](./rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md) | domain | rejected |
 
 ### 平台基础设施与运行时
 
