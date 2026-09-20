@@ -180,6 +180,8 @@
 
 **结论**：**2.5 两款在同步 `/v1` 上与 `gpt-image-2` 完全同构**——顶层字段集合相同、`usage` 同为四分项 + `total_tokens`、`quality` 顶层传入即被接受（无需 `extra`）。⇒ **② 的同步解码器不需要为 2.5 新建分支**。
 
+**转录已落盘**：`out-reference/aihubmix/transcript-sync-and-async-2026-09.json`（本次 2.5 两次 + 2026-09-18 的同步 generations/edits 与 `/ai/v1` 异步；**转录**，非逐字——逐字报文当时未落盘）。
+
 **计费**（两次相同）：`14×$5 + 0×$8 + 0×$10 + 196×$30` per 1M → **5950 microusd = $0.005950**。**响应里没有金额字段**，只有 token。
 
 ### 2.6b 2.5-sunburst 的完整响应样例
@@ -580,3 +582,5 @@
 | 未做 | 未下载上游结果图（结果图是我们自己服务完成取图后归档的）；未测 `sunburst`；未测 base64；未压测 20MB/16 张/256MB 边界 |
 
 **这一轮调用同时结清了 `docs/verification/phase2-controlled-verification.md` 里列的四条**（上传返回、`image_urls` 形态、图生图可用 + `usage` 变化、`mask_url` 可用），因此两个发布素材据此放开两条分支。
+
+**转录已落盘**：`out-reference/apimart/transcript-image-edit-2026-09-19.json`——上传 2 次、提交、4 次轮询、终态（含四分项 `usage` 与 `cost`/`credits_cost`）、401 错误信封、以及平台侧那次的 Evidence 与面板数字。**这是转录（字段名与取值照当时输出记录），不是逐字报文**：逐字报文当时写在临时目录，收尾时被删除——这层缺口如实记在 `out-reference/apimart/response-shapes.md` §0。

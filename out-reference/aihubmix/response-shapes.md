@@ -14,14 +14,16 @@
 | 端点 | 实测过？ | 有独立样本文件？ | 谁采集的 | 结构记在哪 |
 | --- | --- | --- | --- | --- |
 | `POST /v1/images/generations`（同步） | ✅ | ✅ **`gpt_image_2_generations.json`**（逐字，含 2 MB `b64_json`） | **用户早期采集**：响应 `created = 1785485861` ⇒ **2026-07-31 16:17:41 +08:00**；随仓库建立提交 `1fe462a` 入库 | §1 |
-| `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ❌（当时只做脱敏转录） | 本仓库受控实测（`channel-facts` §5.2） | §1 |
-| `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 2026-09-18 | ❌ | 本仓库受控实测（`docs/research/…` §13.2） | §2 |
-| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ❌（样本内嵌在调研文件里） | 本仓库受控实测（同上 §13.1 / `channel-facts` §2.3） | §3 |
-| 错误信封 | ✅ 部分 | ❌ | 本仓库受控实测 + 上游文档 | §4 |
+| `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ✅（转录）**`transcript-sync-and-async-2026-09.json`** | 本仓库受控实测（`channel-facts` §5.2） | §1 |
+| `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 2026-09-18 | ✅（转录）同上文件 | 本仓库受控实测（`docs/research/…` §13.2） | §2 |
+| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ✅（转录）同上文件 | 本仓库受控实测（同上 §13.1 / `channel-facts` §2.3） | §3 |
+| 错误信封 | ✅ 部分 | ✅（转录）同上文件 | 本仓库受控实测 + 上游文档 | §4 |
+
+**证据等级**：`gpt_image_2_generations.json` 是**逐字**报文；`transcript-sync-and-async-2026-09.json` 是**转录**（字段名与取值照当时的实测记录整理，`b64_json` 只记长度）——这批调用的逐字报文当时没有落盘。
 
 **口径提醒**：`gpt_image_2_generations.json` 的响应体**没有 `model` 字段**（顶层只有 `created/background/data/output_format/quality/size/usage`），因此"它来自 `gpt-image-2`"是**按文件名与 `gpt-image-2.md` 推断**的，报文本身证明不了。同理，同步 `/v1` 的响应都**不回显模型名**。
 
-**缺口**（要么补一次受控调用，要么接受现状）：三处没有独立样本文件。它们的**字段级结构已经记全**（见下），缺的是"逐字报文"这一层证据。
+**缺口**：**逐字报文**这一层只有用户早期那份（§1）；2026-09-18/19 那几批我方实测只有**转录**（`transcript-sync-and-async-2026-09.json`）。字段级结构已完整，缺的是"逐字可复核"这一层——若要补，按 §6 的脚本重跑一次即可。
 
 ## 1. `POST /v1/images/generations`（同步，OpenAI 兼容）
 

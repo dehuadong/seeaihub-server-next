@@ -1,0 +1,106 @@
+{
+  "_comment": "AIHubMix 四条路径的实测响应转录（2026-09-18 与 2026-09-19 两批受控实测）。",
+  "_provenance": {
+    "who": "本仓库 Agent（前期会话的受控实测，经用户授权）",
+    "when": "2026-09-18（同步 generations / 同步 edits / /ai/v1 异步）与 2026-09-19（2.5 两款同步）",
+    "evidence_level": "转录：字段名与取值来自当时的实测记录（docs/research/gpt-image-2-inferera-research.md §13、docs/facts/channel-facts.md §2.3/§2.6/§2.6b）；**逐字报文未落盘**，`b64_json` 只记长度不落全文",
+    "redaction": "task id、content_url、结果 URL 已脱敏",
+    "why_not_verbatim": "这几次的原始报文没有保存成文件；下面每块都标了它来自哪条记录。"
+  },
+  "_calls": [
+    {
+      "name": "sync-generations-2026-09-18",
+      "endpoint": "POST https://api.inferera.com/v1/images/generations",
+      "model": "gpt-image-2",
+      "http": 200,
+      "elapsed_seconds": 13.3,
+      "response": {
+        "top_level_keys": ["created", "background", "data", "output_format", "quality", "size", "usage"],
+        "data": [{ "b64_json": "<base64 PNG，长度未记录>" }],
+        "usage": {
+          "input_tokens": 24,
+          "input_tokens_details": { "image_tokens": 0, "text_tokens": 24 },
+          "output_tokens": 196,
+          "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+          "total_tokens": 220
+        }
+      },
+      "source": "docs/research/gpt-image-2-inferera-research.md §13.2"
+    },
+    {
+      "name": "sync-edits-2026-09-18",
+      "endpoint": "POST https://api.inferera.com/v1/images/edits",
+      "model": "gpt-image-2",
+      "request": "multipart/form-data：image（图片）+ mask（PNG，带 alpha）",
+      "http": 200,
+      "elapsed_seconds": 23.3,
+      "response": {
+        "top_level_keys": ["created", "background", "data", "output_format", "quality", "size", "usage"],
+        "data": [{ "b64_json": "<base64 PNG，长度未记录>" }],
+        "usage": {
+          "input_tokens": 1051,
+          "input_tokens_details": { "image_tokens": 1024, "text_tokens": 27 },
+          "output_tokens": 196,
+          "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+          "total_tokens": 1247
+        }
+      },
+      "note": "图片输入**真实计入** input_tokens_details.image_tokens（1024）",
+      "source": "docs/research/gpt-image-2-inferera-research.md §13.2"
+    },
+    {
+      "name": "async-ai-v1-2026-09-18",
+      "endpoint": "POST https://api.inferera.com/ai/v1/images/generations（async: true）+ GET /ai/v1/images/{id}",
+      "model": "gpt-image-2",
+      "scenarios": [
+        { "case": "纯文生图（quality=low, 1024x1024）", "status_flow": ["pending", "completed"], "output": "1 个受保护 PNG URL；下载 216063 bytes" },
+        { "case": "单图输入（Data URI, quality=low, size=auto）", "status_flow": ["pending", "in_progress", "completed"], "output": "1 个受保护 PNG URL；下载 2717520 bytes" },
+        { "case": "图片 + PNG alpha 遮罩（quality=low, 1024x1024）", "status_flow": ["pending", "in_progress", "completed"], "output": "1 个受保护 PNG URL；下载 1021847 bytes" }
+      ],
+      "create_response": {
+        "completed_at": null, "created_at": 1789804016, "error": null, "expires_at": null,
+        "id": "t_<redacted>", "model": "gpt-image-2", "object": "image",
+        "output": [], "status": "pending"
+      },
+      "terminal_response": {
+        "completed_at": 1789804028, "created_at": 1789804016, "error": null, "expires_at": 1789811227,
+        "id": "t_<redacted>", "model": "gpt-image-2", "object": "image",
+        "output": [{ "b64_json": null, "content_url": "https://aihubmix.com/ai/v1/images/<id>/content/res_<redacted>", "index": 0, "type": "file" }],
+        "status": "completed"
+      },
+      "task_list_item_keys": ["id", "object", "model", "status", "output", "error", "created_at", "completed_at", "expires_at"],
+      "usage": "**无**（创建与详情都没有；任务列表项也没有）",
+      "source": "docs/research/gpt-image-2-inferera-research.md §13.1 与 §7.1b"
+    },
+    {
+      "name": "sync-generations-2.5-2026-09-19",
+      "endpoint": "POST https://api.inferera.com/v1/images/generations",
+      "requests": [
+        { "model": "gpt-image-2.5-sunburst", "prompt": "…", "n": 1, "size": "1024x1024", "quality": "low", "output_format": "png" },
+        { "model": "gpt-image-2.5-flare", "prompt": "（与上一条除 model 外完全相同）", "n": 1, "size": "1024x1024", "quality": "low", "output_format": "png" }
+      ],
+      "results": [
+        { "model": "gpt-image-2.5-sunburst", "http": 200, "elapsed_seconds": 19.8, "bytes": 245138, "b64_json_chars": 244700, "created": 1789804584 },
+        { "model": "gpt-image-2.5-flare", "http": 200, "elapsed_seconds": 14.7, "bytes": 321146, "b64_json_chars": 320708 }
+      ],
+      "response": {
+        "top_level_keys": ["created", "background", "data", "output_format", "quality", "size", "usage"],
+        "sample_values": { "background": "opaque", "output_format": "png", "quality": "low", "size": "1024x1024" },
+        "usage_both_calls_identical": {
+          "input_tokens": 14,
+          "input_tokens_details": { "image_tokens": 0, "text_tokens": 14 },
+          "output_tokens": 196,
+          "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+          "total_tokens": 210
+        }
+      },
+      "note": "顶层字段集合与 gpt-image-2 完全同构 ⇒ ② 的同步解码器不需要为 2.5 新建分支；`quality` 顶层传入即被接受（无需 extra）",
+      "source": "docs/facts/channel-facts.md §2.6/§2.6b（2026-09-19 受控实测）"
+    }
+  ],
+  "_user_early_capture（不是本仓库实测，另见 response-shapes.md §0）": {
+    "file": "gpt_image_2_generations.json",
+    "captured_at": "2026-07-31 16:17:41 +08:00（响应内 created=1785485861）",
+    "note": "用户早期采集，随仓库建立提交 1fe462a 入库；报文无 model 字段"
+  }
+}

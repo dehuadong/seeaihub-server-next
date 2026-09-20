@@ -1,0 +1,137 @@
+{
+  "_comment": "APIMart 图生图 + 遮罩那一轮的实测记录（2026-09-19，经用户批准：上传 2 次 + 生成 2 次）。",
+  "_provenance": {
+    "who": "本仓库 Agent（2026-09-19 会话，工具输出即证据）",
+    "when": "2026-09-19",
+    "evidence_level": "字段级转录：字段名与取值照当时的实测输出记录；**逐字报文未落盘**（当时写在系统临时目录，收尾时被删除）",
+    "redaction": "task id 与结果 URL 已脱敏；未保存真实 URL、task id 全文与任何凭证"
+  },
+  "_calls": [
+    {
+      "name": "upload-reference",
+      "endpoint": "POST https://api.apib.ai/v1/uploads/images",
+      "request": { "multipart_field": "file", "file": "reference.png（512×512 PNG，4499 bytes）" },
+      "http": 200,
+      "response": {
+        "url": "https://getapib.org/<redacted>（主机 getapib.org；路径长度 74 字符）",
+        "filename": "reference.png",
+        "content_type": "image/png",
+        "bytes": 4499,
+        "created_at": 1789813766
+      },
+      "note": "顶层字段正好 5 个，与上传页文档一致；URL 主机不是文档示例里的 upload.apimart.ai"
+    },
+    {
+      "name": "upload-mask",
+      "endpoint": "POST https://api.apib.ai/v1/uploads/images",
+      "request": { "multipart_field": "file", "file": "mask.png（512×512 带 alpha，2442 bytes）" },
+      "http": 200,
+      "response": {
+        "url": "https://getapib.org/<redacted>（路径长度 69 字符）",
+        "filename": "mask.png",
+        "content_type": "image/png",
+        "bytes": 2442,
+        "created_at": 1789813766
+      }
+    },
+    {
+      "name": "submit-masked-generation",
+      "endpoint": "POST https://api.apib.ai/v1/images/generations",
+      "http": 200,
+      "request_body": {
+        "model": "gpt-image-2.5-flare",
+        "prompt": "Turn the blue circle into a red apple on a wooden table, keep the composition.",
+        "image_urls": ["<上一步上传得到的 URL>"],
+        "mask_url": "<上一步上传得到的 URL>",
+        "n": 1,
+        "size": "1:1",
+        "resolution": "1k",
+        "quality": "low"
+      },
+      "response_body_verbatim_minus_task_id": {
+        "code": 200,
+        "data": [{ "status": "submitted", "task_id": "<task-id-redacted>" }]
+      }
+    },
+    {
+      "name": "poll-terminal",
+      "endpoint": "GET https://api.apib.ai/v1/tasks/{task_id}",
+      "polls": [
+        { "attempt": 1, "http": 200, "status": "pending", "progress": 0 },
+        { "attempt": 2, "http": 200, "status": "pending", "progress": 0 },
+        { "attempt": 3, "http": 200, "status": "pending", "progress": 0 },
+        { "attempt": 4, "http": 200, "status": "completed", "progress": 100 }
+      ],
+      "poll_interval_seconds": 3,
+      "top_level_keys": ["actual_time", "completed", "cost", "created", "credits_cost", "estimated_time", "id", "progress", "result", "status", "usage"],
+      "known_values": {
+        "http": 200,
+        "code": 200,
+        "status": "completed",
+        "progress": 100,
+        "actual_time": 11,
+        "cost": 0.01139,
+        "credits_cost": 0.1139,
+        "result": {
+          "images": [
+            {
+              "url": ["https://getapib.org/<redacted>（数组，1 项；主机 getapib.org）"],
+              "expires_at": 1789900183
+            }
+          ]
+        },
+        "usage": {
+          "input_tokens": 1057,
+          "input_tokens_details": { "cached_tokens": 0, "image_tokens": 1024, "text_tokens": 33 },
+          "output_tokens": 196,
+          "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
+          "total_tokens": 1253
+        }
+      },
+      "not_recorded": ["created 与 completed 的具体数值（当次只记录了字段名）", "task id 全文（按纪律不入库）"]
+    },
+    {
+      "name": "auth-error-envelope-zero-cost",
+      "endpoint": "POST https://api.apib.ai/v1/uploads/images（不带凭证，零费用探测）",
+      "http": 401,
+      "response_body_verbatim": {
+        "error": {
+          "code": "",
+          "message": "invalid API key (request id: <request-id-redacted>)",
+          "param": "",
+          "type": "apimart_error"
+        }
+      },
+      "headers_of_note": ["X-Oneapi-Request-Id（逐请求标识；同一个 id 也写在 message 的 (request id: …) 里）"],
+      "note": "凭据类失败没有可用的 error.code ⇒ ② 的错误分类对 401/402/403 用状态码兜底"
+    },
+    {
+      "name": "platform-end-to-end（走我们自己的 API + Worker）",
+      "endpoint": "POST /v1/image-generations（平台）→ 平台内部调用同一个上游端点",
+      "job_state": "succeeded",
+      "our_side": {
+        "attempt_provider_trace_id": "已落库（真实 task id，按纪律不转录全文）",
+        "metering_evidence_usage": {
+          "input_tokens": 1053,
+          "input_text_tokens": 29,
+          "input_image_tokens": 1024,
+          "output_tokens": 196,
+          "output_text_tokens": 0,
+          "output_image_tokens": 196,
+          "total_tokens": 1249
+        },
+        "capture_microusd": 14217,
+        "result_asset": { "media_type": "image/png", "byte_count": 1486934, "width": 1024, "height": 1024 }
+      },
+      "upstream_side_from_user_panel（用户提供的上游账单面板）": {
+        "tokens": { "text_input": 29, "image_input": 1024, "image_output": 196, "total_input": 1053 },
+        "base_cost_usd": 0.014217,
+        "ratios": "Group ratio 0.8 × Channel ratio 1 × Discount ratio 1",
+        "actual_cost_usd": 0.011374,
+        "credits": 0.11374,
+        "elapsed_seconds": 10
+      },
+      "note": "上游报文由 Worker 直接消费，未打印；上表的上游侧数字来自用户提供的控制台面板（转录见 docs/facts/channel-facts.md §3.9.4）"
+    }
+  ]
+}
