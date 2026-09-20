@@ -1,9 +1,14 @@
 # OpenAI Images API（gpt-image-2）参数参考
 
 > **本文是 OpenAI 官方 API 契约，与任何网关/中转服务无关。**
-> 来源：[Create image](https://developers.openai.com/api/reference/resources/images/methods/generate/index.md)、
+> [Create image](https://developers.openai.com/api/reference/resources/images/methods/generate/index.md)、
 > [Create image edit](https://developers.openai.com/api/reference/resources/images/methods/edit/index.md)
+> [使用说明](https://developers.openai.com/api/docs/guides/image-generation?mask-edit-api=image)
 > 及 openai/openai-python 类型定义（image_generate_params / image_edit_params）。以官方最新文档为准。
+
+> 最新上线提供 gpt-image-2.5-flare 与 gpt-image-2.5-sunburst 两种模型；与旧模型的核心区别是支持 low（低）、medium（中）、high（高）、xhigh（超高）、max（最高）和 auto（自动）质量设置。
+
+以下内容基于早期的模型 gpt-image-2，最新资料以官方最新文档为准（见上方链接）。
 
 ## 端点
 
