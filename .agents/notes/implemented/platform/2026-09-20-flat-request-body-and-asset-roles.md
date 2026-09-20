@@ -27,6 +27,15 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
   只做请求解码与资产绑定。**响应仍是异步受理（202 返回 Job）**——要不要再给"等结果"的
   同步响应形态，属尚未作出的产品选择。
 
+## 追加（同日，参数放行）
+
+- **请求参数一律放行透传**：受理前**只要求合同的必填项在场**，取值不校验（枚举、区间、类型、
+  未知字段都不管）。渠道自己的长尾参数因此不必逐个由平台声明，调用方也不会因为多写一个参数
+  被整体拒掉；哪些参数需要把取值管起来，等一份明确的清单后再加在 [`validate_native_request`]
+  那一处（用户 2026-09-20 说明后期统一整理）。
+- **两个 Adapter 同步改成透传**：出网请求体只重写 `model`/`prompt` 与图片参数（图片由 assets
+  回填），其余键原样发给上游。
+
 ## 实际交付
 
 **对客受理请求换形**（`POST /v1/image-generations`）：
@@ -53,6 +62,8 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 | 只有遮罩没有参考图直接拒 | `mask_without_an_image_is_rejected` |
 | `quality` 顶层直传、线上没有 `extra` | `sends_quality_on_the_wire_field`（aihubmix） |
 | 素材与 Adapter 声明面一致 | `accepts_bootstrap_capability_contract`（aihubmix，读真实素材） |
+| 没见过的参数原样发给上游 | `forwards_parameters_it_does_not_know`（两个 Adapter） |
+| 取值放行、必填项仍拦 | `loose_and_unknown_parameters_are_passed_through`、`missing_required_parameters_are_rejected` |
 | 两个兼容入口：带图/不带图都合法、分支按内容判定、图片映射到候选参数路径、Job 照样跑完 | `openai_compatible_entries_accept_and_map_assets` |
 
 ## 未做（需要你的决定）

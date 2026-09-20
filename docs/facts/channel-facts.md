@@ -258,7 +258,8 @@
 
 `model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality` / `background` / `output_compression` / `user`（2.5 两款另有 `moderation`）。
 
-**依据是文档，不是实测**（[`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)）：渠道第一方文档写明支持的参数就声明，平台按声明做受理前取值校验（例如 `background` 的枚举、`output_compression` 的 0–100）；"没实测过"不再作为拦截理由，某个参数真正需要用时再验它在实际端点上的行为。
+**依据是文档，不是实测**（[`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)）：渠道第一方文档写明支持的参数就声明；"没实测过"不再作为拦截理由，某个参数真正需要用时再验它在实际端点上的行为。
+**当前阶段平台不校验取值**（枚举、区间、类型、未知字段都不管），只要求合同的必填项在场：请求参数一律放行透传，哪些参数需要把取值管起来，等一份明确的清单（用户 2026-09-20 说明后期统一整理）。
 
 **取值约束取自文档**：`background` 为 `auto`/`opaque`/`transparent`；`moderation` 为 `auto`/`low`；`output_compression` 为 0–100 的整数；`user` 为字符串。素材里还带一条文档写明的条件：`background = transparent` 时 `output_format` 必须是 `png`。
 

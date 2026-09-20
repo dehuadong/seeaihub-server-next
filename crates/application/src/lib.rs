@@ -1939,6 +1939,13 @@ fn validate_restrictions(
     Ok(())
 }
 
+/// 受理前的检查：**只要求合同的必填项在场，取值一律放行**。
+///
+/// 现在**不**校验已知参数的取值合法性（枚举、区间、类型、未知字段都不管）：渠道自己的长尾
+/// 参数不必由平台逐个声明，调用方也不会因为多写一个参数被整体拒掉。哪些参数需要把取值管起来，
+/// 等有一份明确的清单后再加，加在这里。
+///
+/// `model` 与图片绑定在校验前注入，所以它们照样参与"必填项在场"的判断。
 fn validate_native_request(
     request: &CreateImageGenerationRequest,
     offering: &PublishedOffering,
@@ -1952,16 +1959,25 @@ fn validate_native_request(
     for binding in bindings {
         inject_asset_placeholder(object, binding)?;
     }
-    let validator = jsonschema::validator_for(&offering.capability_schema)
-        .map_err(|error| ApplicationError::Configuration(error.to_string()))?;
-    let errors = validator
-        .iter_errors(&instance)
-        .map(|error| error.to_string())
-        .collect::<Vec<_>>();
-    if errors.is_empty() {
+    let required = offering
+        .capability_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let mut missing = Vec::new();
+    for name in required.iter().filter_map(Value::as_str) {
+        if instance.get(name).is_none_or(Value::is_null) {
+            missing.push(name.to_owned());
+        }
+    }
+    if missing.is_empty() {
         Ok(())
     } else {
-        Err(ApplicationError::Validation(errors.join("; ")))
+        Err(ApplicationError::Validation(format!(
+            "missing required parameter(s): {}",
+            missing.join(", ")
+        )))
     }
 }
 
@@ -2476,6 +2492,26 @@ mod tests {
     fn validates_prompt_only_native_request() {
         let request = image_request(serde_json::json!({"prompt": "hello"}));
         assert!(validate_native_request(&request, &offering(), &[]).is_ok());
+    }
+
+    #[test]
+    fn loose_and_unknown_parameters_are_passed_through() {
+        // 现在不校验取值：类型不对的已知参数、没见过的参数都放行——渠道的长尾参数不必由
+        // 平台逐个声明，调用方也不会因为多写一个参数被整体拒掉。
+        let request = image_request(serde_json::json!({
+            "prompt": "hello",
+            "n": "not-a-number",
+            "channel_specific_knob": {"a": 1}
+        }));
+        assert!(validate_native_request(&request, &offering(), &[]).is_ok());
+    }
+
+    #[test]
+    fn missing_required_parameters_are_rejected() {
+        let request = image_request(serde_json::json!({}));
+        let error = validate_native_request(&request, &offering(), &[])
+            .expect_err("a missing required parameter must fail");
+        assert!(error.to_string().contains("prompt"), "{error}");
     }
 
     #[test]

@@ -278,17 +278,9 @@ impl AihubmixImageAdapter {
                 "prompt",
                 required_string(&request.native_parameters, "/prompt")?,
             );
-        for field in [
-            "n",
-            "size",
-            "quality",
-            "output_format",
-            "background",
-            "output_compression",
-            "user",
-        ] {
-            if let Some(value) = wire_value(&request.native_parameters, field) {
-                form = form.text(field.to_owned(), value);
+        for (name, value) in passthrough_parameters(request) {
+            if let Some(text) = scalar_text(value) {
+                form = form.text(name.clone(), text);
             }
         }
         form = form.part("image", asset_part(image, "image")?);
@@ -354,21 +346,38 @@ fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError
         "prompt".to_owned(),
         Value::String(required_string(&request.native_parameters, "/prompt")?),
     );
-    for field in [
-        "n",
-        "size",
-        "output_format",
-        "quality",
-        "background",
-        "output_compression",
-        "moderation",
-        "user",
-    ] {
-        if let Some(value) = request.native_parameters.get(field) {
-            object.insert(field.to_owned(), value.clone());
-        }
+    for (name, value) in passthrough_parameters(request) {
+        object.insert(name.clone(), value.clone());
     }
     Ok(Value::Object(object))
+}
+
+/// 平台自己产的字段与图片参数之外的参数，**原样透传**给上游。
+///
+/// 平台只按合同校验**已知**参数的取值，未知参数交给上游（渠道自己的长尾参数因此不必逐个
+/// 由平台声明）；图片由 `assets` 回填，所以这里跳过它们的参数名。
+fn passthrough_parameters(request: &PreparedImageRequest) -> Vec<(&String, &Value)> {
+    let Value::Object(parameters) = &request.native_parameters else {
+        return Vec::new();
+    };
+    parameters
+        .iter()
+        .filter(|(name, value)| {
+            !matches!(name.as_str(), "model" | "prompt")
+                && !value.is_null()
+                && !request.assets.iter().any(|asset| {
+                    asset_parameter_name(&asset.native_parameter_path) == name.as_str()
+                })
+        })
+        .collect()
+}
+
+/// 参数路径（`/image_urls/0`）的第一段：参数名。
+fn asset_parameter_name(path: &str) -> &str {
+    path.trim_start_matches('/')
+        .split('/')
+        .next()
+        .unwrap_or_default()
 }
 
 fn required_string(parameters: &Value, pointer: &str) -> Result<String, AdapterError> {
@@ -382,8 +391,8 @@ fn required_string(parameters: &Value, pointer: &str) -> Result<String, AdapterE
         })
 }
 
-fn wire_value(parameters: &Value, field: &str) -> Option<String> {
-    let value = parameters.get(field)?;
+/// multipart 文本部件只接受字符串：标量转成文本，对象/数组不装。
+fn scalar_text(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
         Value::Number(value) => Some(value.to_string()),
@@ -816,6 +825,21 @@ mod tests {
         assert_eq!(
             body.pointer("/user"),
             Some(&Value::String("end-user-1".to_owned()))
+        );
+    }
+
+    #[test]
+    fn forwards_parameters_it_does_not_know() {
+        // 平台不逐个声明渠道的长尾参数：没见过的键原样发给上游。
+        let mut prepared = request(ImageBranch::PromptOnly);
+        let Value::Object(parameters) = &mut prepared.native_parameters else {
+            panic!("fixture parameters must be an object");
+        };
+        parameters.insert("channel_specific_knob".to_owned(), Value::from(7));
+        let body = generation_body(&prepared).expect("request should be supported");
+        assert_eq!(
+            body.pointer("/channel_specific_knob"),
+            Some(&Value::from(7))
         );
     }
 

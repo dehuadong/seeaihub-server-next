@@ -549,20 +549,17 @@ fn generation_body(
         "prompt".to_owned(),
         required_string(&request.native_parameters, "/prompt")?,
     );
-    for field in [
-        "n",
-        "size",
-        "resolution",
-        "quality",
-        "output_format",
-        "output_compression",
-        "background",
-        "moderation",
-    ] {
-        if let Some(value) = request.native_parameters.get(field)
-            && !value.is_null()
-        {
-            object.insert(field.to_owned(), value.clone());
+    // 其余参数**原样透传**：平台只按合同校验**已知**参数的取值，未知参数交给上游
+    // （渠道自己的长尾参数因此不必逐个由平台声明）。图片由 `uploaded` 回填，这里跳过它们。
+    if let Value::Object(parameters) = &request.native_parameters {
+        for (name, value) in parameters {
+            if matches!(name.as_str(), "model" | "prompt")
+                || value.is_null()
+                || name == "image_urls"
+            {
+                continue;
+            }
+            object.insert(name.clone(), value.clone());
         }
     }
     // 参考图与遮罩用**上传后拿到的公网 URL**回填到它们各自的参数路径。
@@ -1651,6 +1648,26 @@ mod tests {
     fn total_upload_size_is_capped_like_the_per_file_limit() {
         assert!(ensure_total_upload_within_limit(MAX_TOTAL_UPLOAD_BYTES).is_ok());
         assert!(ensure_total_upload_within_limit(MAX_TOTAL_UPLOAD_BYTES + 1).is_err());
+    }
+
+    #[test]
+    fn forwards_parameters_it_does_not_know() {
+        // 平台不逐个声明渠道的长尾参数：没见过的键原样发给上游。
+        let mut prepared = PreparedImageRequest {
+            provider_model_id: "gpt-image-2".to_owned(),
+            branch: ImageBranch::PromptOnly,
+            native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
+            assets: Vec::new(),
+        };
+        let Value::Object(parameters) = &mut prepared.native_parameters else {
+            panic!("fixture parameters must be an object");
+        };
+        parameters.insert("channel_specific_knob".to_owned(), Value::from(7));
+        let body = generation_body(&prepared, &[]).expect("supported");
+        assert_eq!(
+            body.pointer("/channel_specific_knob"),
+            Some(&Value::from(7))
+        );
     }
 
     #[test]
