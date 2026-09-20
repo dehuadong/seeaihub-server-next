@@ -18,7 +18,7 @@
 
 .PARAMETER Probe
   要采集哪些端点，逗号分隔。缺省为所选渠道的全部：
-    aihubmix → generations（同步文生图）、edits（同步图片编辑）、async（/ai/v1 异步任务）
+    aihubmix → generations（同步文生图）、native_sync（`/ai/v1` 默认同步）、edits（同步图片编辑）、async（/ai/v1 异步任务）
     apimart  → image_edit（上传换 URL + 带参考图/遮罩的生成 + 轮询）
 
 .PARAMETER ConfirmPaidCalls
@@ -55,7 +55,7 @@ $providerList = @($Provider -split ',' | ForEach-Object { $_.Trim() } | Where-Ob
 $unknown = $providerList | Where-Object { $_ -notin @('aihubmix', 'apimart') }
 if ($unknown) { throw "不认识的 Provider：$($unknown -join ', ')（只支持 aihubmix / apimart）" }
 $probeList = @($Probe -split ',' | ForEach-Object { $_.Trim() } | Where-Object { $_ })
-$knownProbes = @('generations', 'edits', 'async', 'image_edit')
+$knownProbes = @('generations', 'native_sync', 'edits', 'async', 'image_edit')
 $unknownProbe = $probeList | Where-Object { $_ -notin $knownProbes }
 if ($unknownProbe) { throw "不认识的 Probe：$($unknownProbe -join ', ')（只支持 $($knownProbes -join ' / ')）" }
 
@@ -63,15 +63,15 @@ if ($unknownProbe) { throw "不认识的 Probe：$($unknownProbe -join ', ')（�
 $TestImageBase64 = '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'
 $TestMaskBase64 = 'iVBORw0KGgoAAAANSUhEUgAAAQAAAAEACAYAAABccqhmAAADtklEQVR4nO3SQRGAMAAEsfo3DSJ47A1NNOQcAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAOCbh2vV9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn2PAXVCOvU9BtQJ6dT3GFAnpFPfY0CdkE59jwF1Qjr1PQbUCenU9xhQJ6RT32NAnZBOfY8BdUI69T0G1Anp1PcYUCekU99jQJ2QTn0PAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA/uAF5dgWshyAgNAAAAAASUVORK5CYII='
 
-$probes = if ($probeList) { $probeList } else { @('generations', 'edits', 'async', 'image_edit') }
+$probes = if ($probeList) { $probeList } else { @('generations', 'native_sync', 'edits', 'async', 'image_edit') }
 $plan = @()
 foreach ($p in $providerList) {
   foreach ($x in $probes) {
-    if ($p -eq 'aihubmix' -and $x -in @('generations', 'edits', 'async')) { $plan += [pscustomobject]@{ Provider = $p; Probe = $x } }
+    if ($p -eq 'aihubmix' -and $x -in @('generations', 'native_sync', 'edits', 'async')) { $plan += [pscustomobject]@{ Provider = $p; Probe = $x } }
     if ($p -eq 'apimart' -and $x -eq 'image_edit') { $plan += [pscustomobject]@{ Provider = $p; Probe = $x } }
   }
 }
-if (-not $plan) { throw '没有匹配的采集项：aihubmix 支持 generations/edits/async，apimart 支持 image_edit' }
+if (-not $plan) { throw '没有匹配的采集项：aihubmix 支持 generations/native_sync/edits/async，apimart 支持 image_edit' }
 
 $estimate = @{ aihubmix = 0.006; apimart = 0.011 }
 $paidCalls = $plan.Count
@@ -104,15 +104,23 @@ function Protect-Json([string] $json) {
   return $out
 }
 
-function Save-Shape([string] $provider, [string] $probe, $call, $response, [int] $http, [double] $seconds) {
+function Save-Shape([string] $provider, [string] $probe, $call, $response, [int] $http, [double] $seconds, $headers) {
   $dir = Join-Path $OutDir $provider
   New-Item -ItemType Directory -Force -Path $dir | Out-Null
   $file = Join-Path $dir ("probe-{0}-{1}.json" -f $today, $probe)
+  # 响应头也留档：`x-request-id` 一类标识只可能在头里（凭证类的头一律不记）。
+  $safeHeaders = [ordered]@{}
+  if ($headers) {
+    foreach ($name in $headers.Keys) {
+      if ($name -match '(?i)auth|cookie|token|secret|key') { continue }
+      $safeHeaders[$name] = ($headers[$name] -join ', ')
+    }
+  }
   $doc = [ordered]@{
     '_comment'           = "受控采集（$today）。URL 与 task id 已自动脱敏；凭证从未写入文件。"
     '_provider'          = $provider
     '_probe'             = $probe
-    '_http'              = [ordered]@{ status = $http; elapsed_seconds = [math]::Round($seconds, 2) }
+    '_http'              = [ordered]@{ status = $http; elapsed_seconds = [math]::Round($seconds, 2); headers = $safeHeaders }
     '_call'              = $call
     '_terminal_response' = $response
     '_conclusions'       = @('（待填：这次采集结清了什么、与既有记录是否一致）')
@@ -144,7 +152,17 @@ foreach ($item in $plan) {
       $sw.Restart()
       $r = Invoke-WebRequest -Method Post -Uri 'https://api.inferera.com/v1/images/generations' -Headers @{ Authorization = "Bearer $key" } -ContentType 'application/json' -Body $body -TimeoutSec 600
       $sw.Stop()
-      Save-Shape 'aihubmix' 'generations' ([ordered]@{ endpoint = 'POST https://api.inferera.com/v1/images/generations'; request_body = ($body | ConvertFrom-Json) }) ($r.Content | ConvertFrom-Json) $r.StatusCode $sw.Elapsed.TotalSeconds
+      Save-Shape 'aihubmix' 'generations' ([ordered]@{ endpoint = 'POST https://api.inferera.com/v1/images/generations'; request_body = ($body | ConvertFrom-Json) }) ($r.Content | ConvertFrom-Json) $r.StatusCode $sw.Elapsed.TotalSeconds $r.Headers
+    }
+    'aihubmix/native_sync' {
+      # `/ai/v1/images/generations` 的**默认形态**（不带 `async`）：机器 Schema 里它 `mode=sync`，
+      # 只有显式 `async: true` 才返回任务对象。这条路从没实测过。
+      $key = Get-EnvOrThrow 'AIHUBMIX_API_KEY'
+      $body = @{ model = 'gpt-image-2.5-flare'; prompt = 'a small blue cube on a white background'; n = 1; size = '1024x1024'; output_format = 'png'; extra = @{ quality = 'low' } } | ConvertTo-Json -Depth 5
+      $sw.Restart()
+      $r = Invoke-WebRequest -Method Post -Uri 'https://api.inferera.com/ai/v1/images/generations' -Headers @{ Authorization = "Bearer $key" } -ContentType 'application/json' -Body $body -TimeoutSec 600
+      $sw.Stop()
+      Save-Shape 'aihubmix' 'native_sync' ([ordered]@{ endpoint = 'POST https://api.inferera.com/ai/v1/images/generations'; note = '不带 async：采集它的默认（同步）形态'; request_body = ($body | ConvertFrom-Json) }) ($r.Content | ConvertFrom-Json) $r.StatusCode $sw.Elapsed.TotalSeconds $r.Headers
     }
     'aihubmix/edits' {
       $key = Get-EnvOrThrow 'AIHUBMIX_API_KEY'

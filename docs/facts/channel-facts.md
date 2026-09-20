@@ -182,7 +182,7 @@
 
 **结论**：**2.5 两款在同步 `/v1` 上与 `gpt-image-2` 完全同构**——顶层字段集合相同、`usage` 同为四分项 + `total_tokens`、`quality` 顶层传入即被接受（无需 `extra`）。⇒ **② 的同步解码器不需要为 2.5 新建分支**。
 
-**同步响应里没有 `id`**（顶层 7 个字段、`data[]` 只有 `b64_json`）：既无任务 id 也无请求 id，且同步调用**不出现在** `/ai/v1/images` 任务列表里 ⇒ 创建请求失联后**没有技术手段找回**，只能进对账人工核对（`docs/adr/0007`）。另有**未结清的一项**：AIHubMix 的**响应头**（文档说错误体带 `tid`、② 也读 `x-request-id`）本仓库从未实测记录过——详见 `out-reference/aihubmix/response-shapes.md` §4。
+**同步响应体里没有 `id`**（顶层 7 个字段、`data[]` 只有 `b64_json`），且同步调用**不出现在** `/ai/v1/images` 任务列表里 ⇒ 创建请求失联后**没有技术手段把结果取回**，只能进对账人工核对（`docs/adr/0007`）。**但响应头里有逐请求标识**（2026-09-20 实测结清，见 §2.6c）：`X-Request-ID`，Adapter 采的就是它。
 
 **转录已落盘**：`out-reference/aihubmix/transcript-sync-and-async-2026-09.json`（本次 2.5 两次 + 2026-09-18 的同步 generations/edits 与 `/ai/v1` 异步；**转录**，非逐字——逐字报文当时未落盘）。
 
@@ -203,10 +203,36 @@
 
 （flare 那次 `b64_json` 为 320,708 字符，其余字段同形。）
 
+### 2.6c 端点与"能不能拿到 id"（2026-09-20 受控实测，各 1 次）
+
+问的是两件事：`/ai/v1/images/generations` 的**默认（同步）形态**到底返回什么；以及实际响应里**能不能拿到 id**。
+
+| 端点 | 形态 | 有 `id`？ | 有 `usage`？ |
+| --- | --- | --- | --- |
+| `POST /ai/v1/images/generations`（**不带** `async`） | HTTP 200，13.86 秒后返回 **`status: completed` 的任务对象**（9 字段：`id`/`object`/`model`/`status`/`output`/`error`/`created_at`/`completed_at`/`expires_at`） | **有**（任务对象自带） | **无** |
+| `POST /v1/images/generations`（OpenAI 兼容同步） | HTTP 200，16.27 秒，顶层 7 字段 + `data[0].b64_json` | 响应体**无**；**响应头有**（见下） | **有**四分项 |
+
+**`/ai/v1` 的"同步"也是任务对象**：不带 `async` 时它只是**等它跑完再返回**，返回的形状和 `async: true` 那条完全一样。⇒ **该端点无论同步异步都不带计量**，这就是它不能作正式计费路径的原因（计量门槛见 `docs/adr/0006`），与"哪个端点更原生"无关。
+
+**响应头（首次实测，此前记为未结清）**：
+
+| 头 | 出现在 | 值样例 |
+| --- | --- | --- |
+| `X-Request-ID` | 仅 `/v1/*` | `911efcbf-2868-490c-b87e-729d1751ca38` |
+| `x-aihubmix-request-id` | 两条都有 | `2026092006194196914429082113579`（数字串） |
+| `apim-request-id` | 仅 `/v1/*` | `cf78feef-2e42-4596-9376-37996551bd3b` |
+| `x-ratelimit-limit-requests` / `x-ratelimit-remaining-requests` | 仅 `/v1/*` | `12` / `8`（本次调用前） |
+| `x-aihubmix-model`、`x-ms-deployment-name`、`x-ms-region` | 仅 `/v1/*` | `gpt-image-2.5-flare`、`gpt-image-25-flare`、`Sweden Central` |
+
+⇒ **同步路径的对账标识拿得到**：② 读的 `x-request-id` 确实存在，成功路径也能落库（不再是"未结清"）。同时注意**账号级限流事实**：响应头自报每分钟 12 次请求（`x-ratelimit-limit-requests`），这是我们对这个渠道的真实天花板。
+
+**留档**：`out-reference/aihubmix/probe-2026-09-20-native_sync.json`、`probe-2026-09-20-generations.json`（逐字，`b64_json` 与 id 已脱敏）。
+
 ### 2.7 本渠道独立待办
 
 - ~~2.5 两款在同步 `/v1` 上是否同构~~ → **已测（2.6）：两款均同构** ✅
 - ~~`gpt-image-2.5-flare` 单独调用~~ → **已测（2.6）** ✅
+- ~~AIHubMix 的响应头里到底有没有逐请求标识~~ → **已测（2.6c）：有，`X-Request-ID`（仅 `/v1/*`）** ✅
 - 2.5 两款在**异步 `/ai/v1`** 上是否同样无 `usage` —— **未测**，且**不必测**：任务对象格式本身不带计量已由第一阶段 §13.1 三场景证实，且 `/ai/v1` 已判定不作为正式计费路径；
 - 带参考图的编辑路径（`/v1/images/edits`，multipart）—— 第一阶段在 `gpt-image-2` 上测过（图片输入 1024 tokens），**2.5 未测**。
 
@@ -598,7 +624,6 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 ### 5.4 累计
 
 本日经用户授权的计费提交共 **7 次**（AIHubMix 4 次 + APIMart 3 次）：
-
 | # | 渠道 / 端点 | 结果 | 是否必要 |
 | --- | --- | --- | --- |
 | 1 | AIHubMix `/ai/v1`（异步） | HTTP 400 **未受理**（顶层 `quality` 非法） | 顺带确认了参数位置 |
@@ -650,3 +675,17 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 **这一轮调用同时结清了 `docs/verification/phase2-controlled-verification.md` 里列的四条**（上传返回、`image_urls` 形态、图生图可用 + `usage` 变化、`mask_url` 可用），因此两个发布素材据此放开两条分支。
 
 **转录已落盘**：`out-reference/apimart/transcript-image-edit-2026-09-19.json`——上传 2 次、提交、4 次轮询、终态（含四分项 `usage` 与 `cost`/`credits_cost`）、401 错误信封、以及平台侧那次的 Evidence 与面板数字。**这是转录（字段名与取值照当时输出记录），不是逐字报文**：逐字报文当时写在临时目录，收尾时被删除——这层缺口如实记在 `out-reference/apimart/response-shapes.md` §0。
+
+### 5.7 端点与响应头实测（2026-09-20，经用户授权）
+
+| 项 | 值 |
+| --- | --- |
+| 授权 | 用户 2026-09-20 指示「你现在实测下，看看结果如何」 |
+| 渠道 / 端点 | AIHubMix `POST /ai/v1/images/generations`（**不带** `async`）1 次；`POST /v1/images/generations`（同步）1 次 |
+| 参数 | 各 `model=gpt-image-2.5-flare`、`n=1`、`size=1024x1024`、`quality=low`、`output_format=png`（`/ai/v1` 那次 `quality` 放在 `extra` 里） |
+| 结果 | 两次均 HTTP 200：`/ai/v1` 13.86 秒返回 `completed` 任务对象（有 `id`、无 `usage`）；`/v1` 16.27 秒返回 OpenAI 形状（无 `id`、有四分项 `usage`） |
+| 计费 | 2 次，按 §2.4 费率各约 **$0.00595**，合计约 **$0.012**（上游不返回金额，自算） |
+| 结清的事实 | 响应头（此前从未记录）：`/v1` 带 `X-Request-ID` / `apim-request-id` / `x-ratelimit-*`（12 次每分钟），两条路径都带 `x-aihubmix-request-id`——见 §2.6c |
+| 原始记录 | `out-reference/aihubmix/probe-2026-09-20-native_sync.json`、`probe-2026-09-20-generations.json`（逐字，`b64_json` 与 id 已脱敏） |
+
+**累计（截至 2026-09-20）**：AIHubMix 6 次 + APIMart 3 次 = **9 次计费提交**，可核对金额 ≈ **$0.0514**（另 1 次 AIHubMix 异步金额未知）。

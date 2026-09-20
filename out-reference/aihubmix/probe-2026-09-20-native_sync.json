@@ -1,0 +1,54 @@
+{
+  "_comment": "受控采集（2026-09-20）。URL 与 task id 已自动脱敏；凭证从未写入文件。",
+  "_provider": "aihubmix",
+  "_probe": "native_sync",
+  "_http": {
+    "status": 200,
+    "elapsed_seconds": 13.86,
+    "headers": {
+      "x-aihubmix-request-id": "2026092006192816060532298819076",
+      "Date": "Sun, 20 Sep 2026 06:19:40 GMT",
+      "Via": "1.1 google",
+      "Alt-Svc": "h3=\":443\"; ma=2592000, h3-29=\":443\"; ma=2592000",
+      "Transfer-Encoding": "chunked",
+      "Content-Type": "application/json; charset=utf-8"
+    }
+  },
+  "_call": {
+    "endpoint": "POST https://api.inferera.com/<redacted>",
+    "note": "不带 async：采集它的默认（同步）形态",
+    "request_body": {
+      "size": "1024x1024",
+      "prompt": "a small blue cube on a white background",
+      "n": 1,
+      "output_format": "png",
+      "extra": {
+        "quality": "low"
+      },
+      "model": "gpt-image-2.5-flare"
+    }
+  },
+  "_terminal_response": {
+    "completed_at": 1789885180,
+    "created_at": 1789885168,
+    "error": null,
+    "expires_at": 1789892380,
+    "id": "<task-id-redacted>",
+    "model": "gpt-image-2.5-flare",
+    "object": "image",
+    "output": [
+      {
+        "b64_json": "<base64-redacted>",
+        "content_url": "https://aihubmix.com/<redacted>",
+        "index": 0,
+        "type": "file"
+      }
+    ],
+    "status": "completed"
+  },
+  "_conclusions": [
+    "`/ai/v1/images/generations` 不带 async（默认）也是**任务对象**：HTTP 200、13.86 秒后返回 status=completed 的 9 字段任务对象（含 id、output[0].b64_json 与 content_url）。",
+    "该路径**没有 usage**——同步与异步在这条端点上返回同一种体，区别只是等不等它跑完。",
+    "响应头有 `x-aihubmix-request-id`，但**没有** `X-Request-ID` / `apim-request-id`。"
+  ]
+}

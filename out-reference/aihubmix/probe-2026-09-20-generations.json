@@ -1,0 +1,68 @@
+{
+  "_comment": "受控采集（2026-09-20）。URL 与 task id 已自动脱敏；凭证从未写入文件。",
+  "_provider": "aihubmix",
+  "_probe": "generations",
+  "_http": {
+    "status": 200,
+    "elapsed_seconds": 16.27,
+    "headers": {
+      "apim-request-id": "cf78feef-2e42-4596-9376-37996551bd3b",
+      "Date": "Sun, 20 Sep 2026 06:19:41 GMT",
+      "Server": "istio-envoy",
+      "Strict-Transport-Security": "max-age=31536000; includeSubDomains; preload",
+      "x-aihubmix-model": "gpt-image-2.5-flare",
+      "x-aihubmix-request-id": "2026092006194196914429082113579",
+      "X-Content-Type-Options": "nosniff",
+      "x-ms-deployment-name": "gpt-image-25-flare",
+      "x-ms-region": "Sweden Central",
+      "x-ratelimit-limit-requests": "12",
+      "x-ratelimit-remaining-requests": "8",
+      "X-Request-ID": "911efcbf-2868-490c-b87e-729d1751ca38",
+      "Via": "1.1 google",
+      "Alt-Svc": "h3=\":443\"; ma=2592000",
+      "Content-Length": "263842",
+      "Content-Type": "application/json"
+    }
+  },
+  "_call": {
+    "endpoint": "POST https://api.inferera.com/<redacted>",
+    "request_body": {
+      "size": "1024x1024",
+      "quality": "low",
+      "prompt": "a small blue cube on a white background",
+      "n": 1,
+      "output_format": "png",
+      "model": "gpt-image-2.5-flare"
+    }
+  },
+  "_terminal_response": {
+    "created": 1789885196,
+    "background": "opaque",
+    "data": [
+      {
+        "b64_json": "<base64-redacted>"
+      }
+    ],
+    "output_format": "png",
+    "quality": "low",
+    "size": "1024x1024",
+    "usage": {
+      "input_tokens": 14,
+      "input_tokens_details": {
+        "image_tokens": 0,
+        "text_tokens": 14
+      },
+      "output_tokens": 196,
+      "output_tokens_details": {
+        "image_tokens": 196,
+        "text_tokens": 0
+      },
+      "total_tokens": 210
+    }
+  },
+  "_conclusions": [
+    "同步 `/v1/images/generations` 与既有记录同构：顶层 7 字段、data[0].b64_json、四分项 usage（14/0/0/196，total 210）。",
+    "响应体里**没有**任何 id；但**响应头有 `X-Request-ID`**（以及 `x-aihubmix-request-id`、`apim-request-id`）——Adapter 读的就是 `x-request-id`，因此同步路径的对账标识**确实拿得到**。",
+    "响应头另记：`x-aihubmix-model`、`x-ms-deployment-name`、`x-ms-region`、`x-ratelimit-limit-requests: 12`、`x-ratelimit-remaining-requests: 8`（本次调用前）。"
+  ]
+}
