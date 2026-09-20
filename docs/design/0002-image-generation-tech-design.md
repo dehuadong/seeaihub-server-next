@@ -98,7 +98,7 @@ HTTP 只是应用命令的适配层，可并存三种请求入口而不复制业
 - Provider 同步不等于平台同步：调用方先得到持久 Job，Worker 在后台等待 Provider 响应并维护 lease/heartbeat；
 - 以后是否增加同步等待型公开 API，不影响这个执行模型。
 
-这正好落实「`image.generations.sync.v1` 与 task 协议不应成为领域拆分，生命周期差异由 Adapter 处理」的方向。决策依据见 `docs/adr/0005-billing-path-uses-v1-endpoints.md`。
+这正好落实「`image.generations.sync.v1` 与 task 协议不应成为领域拆分，生命周期差异由 Adapter 处理」的方向。决策依据见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
 `/ai/v1` 的定位：已验证可统一处理文生图、图生图和 mask，但当前不作为正式计费 Offering 的执行路径，原因是任务对象没有 usage，无法形成精确最终 Evidence。它保留为 Adapter Descriptor 中的已验证能力，只有满足以下任一条件后才可通过新 Runtime Revision 发布：AIHubMix 任务详情返回可核验 usage；有可通过 task ID 关联的账单 API；产品另行接受并明确一种不依赖 Provider usage 的计价合同。切换不需要修改应用层或公开协议，只发布新的 Adapter 执行策略/Offering 修订。
 

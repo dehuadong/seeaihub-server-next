@@ -2,10 +2,10 @@
 status: accepted
 ---
 
-# 渠道成本按各自渠道的口径取数：APIMart 用任务终态声明的 `cost`，AIHubMix 按已发布费率自算
+# 渠道成本按各自渠道的口径取数：APIMart 取上游声明的 `cost`，AIHubMix 按已发布费率自算
 
-APIMart 的**计量与计费事实只在异步任务终态可得**：该渠道对同一模型声明了 `image-generation` 与 `openai` 两种端点类型，但只有任务面返回四分项 `usage` 与 `cost`——非任务面既拿不到 token、也没有 `cost` 字段（2026-09-20 实测）。因此该 Offering **固定走任务式执行**，成本价取上游声明的 `cost`（渠道实际扣费，含账号倍率，不可复现），平台不按 token × 公开费率去反算它的成本。
+平台的**计量事实**统一是分项 token，但**成本价**的取数按渠道各自的口径：APIMart 直接给出 `cost`——那就是它的实际成本（含账号倍率，不可复现），平台不再按 token × 公开费率反算；AIHubMix 不给出任何金额字段，成本只能按分项 token × 已发布费率自算。渠道各自响应里有什么、没有什么，属渠道事实，见 `docs/facts/channel-facts.md`。
 
-AIHubMix 相反：响应里没有任何金额字段、只有四分项 token，**成本价按分项 token × 已发布费率自算**。两个渠道因此**成本不同源**，但**计量事实都是分项 token**——`cost` 只用于核成本，不替代计量事实（[0010](./0010-metering-evidence-is-unit-bearing.md)）。
+`cost` 只用于核成本，**不替代计量事实**（[0010](./0010-metering-evidence-is-unit-bearing.md)）。
 
 **后果**：换渠道就换成本口径，逐笔账目必须按渠道分别取数，不能跨渠道套同一套算法；平台对外价与账号折扣是否让利属后期产品决定，不在本条。

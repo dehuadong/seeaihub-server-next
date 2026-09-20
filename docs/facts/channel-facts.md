@@ -187,7 +187,7 @@
 
 **结论**：**2.5 两款在同步 `/v1` 上与 `gpt-image-2` 完全同构**——顶层字段集合相同、`usage` 同为四分项 + `total_tokens`、`quality` 顶层传入即被接受（无需 `extra`）。⇒ **② 的同步解码器不需要为 2.5 新建分支**。
 
-**同步响应里没有 `id`**（顶层 7 个字段、`data[]` 只有 `b64_json`）：既无任务 id 也无请求 id，且同步调用**不出现在** `/ai/v1/images` 任务列表里 ⇒ 创建请求失联后**没有技术手段找回**，只能进对账人工核对（`docs/adr/0005`/`0007`）。另有**未结清的一项**：AIHubMix 的**响应头**（文档说错误体带 `tid`、② 也读 `x-request-id`）本仓库从未实测记录过——详见 `out-reference/aihubmix/response-shapes.md` §4。
+**同步响应里没有 `id`**（顶层 7 个字段、`data[]` 只有 `b64_json`）：既无任务 id 也无请求 id，且同步调用**不出现在** `/ai/v1/images` 任务列表里 ⇒ 创建请求失联后**没有技术手段找回**，只能进对账人工核对（`docs/adr/0007`）。另有**未结清的一项**：AIHubMix 的**响应头**（文档说错误体带 `tid`、② 也读 `x-request-id`）本仓库从未实测记录过——详见 `out-reference/aihubmix/response-shapes.md` §4。
 
 **转录已落盘**：`out-reference/aihubmix/transcript-sync-and-async-2026-09.json`（本次 2.5 两次 + 2026-09-18 的同步 generations/edits 与 `/ai/v1` 异步；**转录**，非逐字——逐字报文当时未落盘）。
 
