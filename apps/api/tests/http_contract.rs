@@ -1600,18 +1600,50 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
             Some(expected_code),
             "消费者看到的对客码不对：{view}"
         );
+        // 消费者面的**字段集**是合同的一部分：渠道信息只可能藏在多出来的字段里。
+        // 不拿整个 JSON 做子串匹配——里面的 UUID 与时间戳会偶然命中 `402`/`403` 这类短码。
+        let mut keys: Vec<&str> = view
+            .as_object()
+            .expect("job view is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            [
+                "account_id",
+                "branch",
+                "created_at",
+                "error_code",
+                "id",
+                "native_model_id",
+                "result_asset_ids",
+                "state",
+                "updated_at"
+            ],
+            "消费者面的字段集变了：新字段可能把渠道信息带出去"
+        );
         let rendered = view.to_string();
+        // 渠道原文与上游标识都是长字符串，不会偶然命中，可以照直匹配。
         assert!(
             !rendered.contains(channel_message),
             "渠道原文不得出现在消费者面：{rendered}"
         );
         assert!(
-            !rendered.contains(channel_code),
-            "渠道码不得出现在消费者面：{rendered}"
-        );
-        assert!(
             !rendered.contains(UPSTREAM_TRACE_ID),
             "上游逐请求标识不得出现在消费者面：{rendered}"
+        );
+        // 渠道码按**字段值**核对，不做整串匹配：`403` 这种短码会偶然出现在 UUID 里。
+        let values: Vec<String> = view
+            .as_object()
+            .expect("job view is an object")
+            .values()
+            .map(|value| value.to_string().trim_matches('"').to_owned())
+            .collect();
+        assert!(
+            values.iter().all(|value| value != channel_code),
+            "渠道码不得作为字段值出现在消费者面：{rendered}"
         );
 
         // 终态与预授权必须一致：判成确定失败就释放预授权，进对账就继续握着。
