@@ -37,6 +37,10 @@ impl AdapterFactory for AihubmixAdapterFactory {
                 "size",
                 "output_format",
                 "quality",
+                "background",
+                "output_compression",
+                "moderation",
+                "user",
             ],
             supported_extra_parameters: &[],
             supported_branches: &[
@@ -101,10 +105,24 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
     if properties.contains_key("n") {
         require_type(properties, "n", "integer")?;
     }
-    for name in ["size", "output_format", "quality"] {
+    for name in [
+        "size",
+        "output_format",
+        "quality",
+        "background",
+        "moderation",
+    ] {
         if properties.contains_key(name) {
             require_string_enum(properties, name)?;
         }
+    }
+    for name in ["output_compression"] {
+        if properties.contains_key(name) {
+            require_type(properties, name, "integer")?;
+        }
+    }
+    if properties.contains_key("user") {
+        require_type(properties, "user", "string")?;
     }
     let validator = jsonschema::validator_for(schema).map_err(|error| error.to_string())?;
     let model = properties
@@ -336,7 +354,16 @@ fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError
         "prompt".to_owned(),
         Value::String(required_string(&request.native_parameters, "/prompt")?),
     );
-    for field in ["n", "size", "output_format", "quality"] {
+    for field in [
+        "n",
+        "size",
+        "output_format",
+        "quality",
+        "background",
+        "output_compression",
+        "moderation",
+        "user",
+    ] {
         if let Some(value) = request.native_parameters.get(field) {
             object.insert(field.to_owned(), value.clone());
         }
@@ -764,6 +791,32 @@ mod tests {
         );
         // 调用方与线上都是顶层：不再有 `extra` 这一层包装。
         assert!(body.get("extra").is_none());
+    }
+
+    #[test]
+    fn passes_the_documented_optional_parameters_through() {
+        let mut prepared = request(ImageBranch::PromptOnly);
+        let Value::Object(parameters) = &mut prepared.native_parameters else {
+            panic!("fixture parameters must be an object");
+        };
+        parameters.insert("background".to_owned(), Value::String("opaque".to_owned()));
+        parameters.insert("output_compression".to_owned(), Value::from(80));
+        parameters.insert("moderation".to_owned(), Value::String("low".to_owned()));
+        parameters.insert("user".to_owned(), Value::String("end-user-1".to_owned()));
+        let body = generation_body(&prepared).expect("request should be supported");
+        assert_eq!(
+            body.pointer("/background"),
+            Some(&Value::String("opaque".to_owned()))
+        );
+        assert_eq!(body.pointer("/output_compression"), Some(&Value::from(80)));
+        assert_eq!(
+            body.pointer("/moderation"),
+            Some(&Value::String("low".to_owned()))
+        );
+        assert_eq!(
+            body.pointer("/user"),
+            Some(&Value::String("end-user-1".to_owned()))
+        );
     }
 
     #[test]

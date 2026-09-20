@@ -30,10 +30,18 @@
           "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
           "size": { "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"] },
           "output_format": { "enum": ["png", "jpeg"], "default": "png" },
-          "quality": { "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" }
+          "quality": { "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" },
+          "background": { "enum": ["auto", "opaque", "transparent"], "default": "auto" },
+          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100 },
+          "moderation": { "enum": ["auto", "low"], "default": "auto" },
+          "user": { "type": "string" }
         },
         "allOf": [
-          { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
+          { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
+          {
+            "if": { "properties": { "background": { "const": "transparent" } }, "required": ["background"] },
+            "then": { "properties": { "output_format": { "const": "png" } } }
+          }
         ]
       },
       "price_plan": {

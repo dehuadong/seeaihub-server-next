@@ -157,7 +157,9 @@
 
 **位置差异属于渠道各端点族自己的形态。** 本平台对 AIHubMix 采用的执行路径是**同步**的 `/v1/images/generations` 与 `/v1/images/edits`（§2.6 实测结清），上表第 1 行那条异步面**不使用**——它的包装形态与本平台无关。
 
-**该执行路径上的"已声明未验证"参数**：`background`、`output_compression`、`user` 出现在第 1 行的参数集合里，但**不在**第 2、3 行的顶层参数集合内（那两个端点 `additionalProperties` 为 `false`）。AIHubMix 的发布素材目前把这三项声明为支持（[`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G2），与 `docs/adr/0002`"未证实的参数不开启"不符。相关归属与整改见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
+**`background` / `output_compression` / `user` / `moderation` 的位置（2026-09-20 定）**：它们在第一方**文档**里是 OpenAI 兼容面的顶层参数（AIHubMix 2.5 的机器 Schema 则把它们放在 `/ai/v1` 那族的 `extra` 内，`gpt-image-2` 没有 `moderation`）。按 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)，**文档写明支持的参数直接声明**，不再以"没实测"为由拦截；平台按声明在受理前校验取值。本仓库的 AIHubMix 素材据此把四项声明在**顶层**。
+
+**仍存的一处不一致（如实登记，不在声明上回避）**：上表第 2、3 行（我们实际走的 `/v1/*`）的机器 Schema 只列 `model, n, output_format, prompt, quality, size`（edits 另有 `image, mask`），且 `additionalProperties: false`。也就是说文档的 OpenAI 兼容面比机器 Schema 宽——**某个参数真正需要用时再验证它在 `/v1/*` 上的行为**，那时才值得一次计费调用（零费用的做法：用一个明显非法的取值，若被拒则是"不认识该参数"或"取值非法"，两者都在受理前、不计费；若被接受则说明端点认这个参数）。
 
 ### 2.6 2.5 两款在同步 `/v1` 上的实测（2026-09-19，经用户授权）
 
@@ -250,11 +252,15 @@
 
 **本渠道就绪判定**：③④⑤ 所需事实**齐备**；② 沿用现有 Driver（2.5 实测同构）——**但存在一处发布阻塞，见 2.9**。
 
-### 2.9 素材的参数面：只声明已验证的顶层参数
+### 2.9 素材的参数面：文档支持的都声明在顶层
 
-**执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。本仓库的 AIHubMix 素材因此把参数**全部声明在顶层**：`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`。
+**执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。本仓库的 AIHubMix 素材把参数**全部声明在顶层**：
 
-**四个未经验证的参数一律不声明**：`background`、`output_compression`、`user`、`moderation`（AIHubMix 2.5 的机器 Schema 有前三个与 `moderation`，但我们没有实测过它们在**我们采用的端点**上的行为）。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——收窄是**有证据的本地收窄**，请求带这些参数会在受理前被拒（比"声明了却不发"更安全）。
+`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality` / `background` / `output_compression` / `user`（2.5 两款另有 `moderation`）。
+
+**依据是文档，不是实测**（[`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)）：渠道第一方文档写明支持的参数就声明，平台按声明做受理前取值校验（例如 `background` 的枚举、`output_compression` 的 0–100）；"没实测过"不再作为拦截理由，某个参数真正需要用时再验它在实际端点上的行为。
+
+**取值约束取自文档**：`background` 为 `auto`/`opaque`/`transparent`；`moderation` 为 `auto`/`low`；`output_compression` 为 0–100 的整数；`user` 为字符串。素材里还带一条文档写明的条件：`background = transparent` 时 `output_format` 必须是 `png`。
 
 **2026-09-20 的变化**：此前素材把 `quality` 等放在 `extra` 内、并因此与 Adapter 的声明面互相牵制（当时记为"发布阻塞"）。现在两边都去掉了 `extra`，阻塞不存在了；`quality` 顶层直传（上游在同步 `/v1` 上就是这样）。
 
