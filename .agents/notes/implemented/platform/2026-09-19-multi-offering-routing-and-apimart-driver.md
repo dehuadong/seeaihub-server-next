@@ -90,7 +90,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 ## 已知限制与未决项（不在本次交付范围）
 
 - APIMart 的**图生图/遮罩分支已开放并已受控实测**（2026-09-19，见上）；仍未测的是 `sunburst` 的图生图（与 flare 同渠道族、同端点、同参数面）、`base64` 路径，以及 20MB / 16 张 / 256MB 这些**边界**——代码已按文档上限拒绝（单张 20MB + 单次总量 256MB），但没有逐个压测。
-- **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**（该 ADR 第 8 条把名字约定定性为阶段性兼容规则）；`reference_images` 这类名字改由 Vendor Model Contract 显式声明解决，不再留给"那一层"。此条仅保留为当时的理由，**不再是现行规则**。
+- **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**（0015 把名字约定定性为阶段性兼容规则）；`reference_images` 这类名字改由 Vendor Model Contract 显式声明解决，不再留给"那一层"。此条仅保留为当时的理由，**不再是现行规则**。
 - **`task_id` 不用于跨调用恢复**：现在只做到"失败时把 task id 留下、对账的人能查到"（见上第 10 条）。**拿它自动去补齐结果**需要改造 Attempt 模型——`generation.attempts` 有 `UNIQUE (job_id)`（一个 Job 只能一个 Attempt），且状态机只允许 `reconciliation_required → failed`、**不允许 → succeeded**（有测试钉着，理由是不确定是否已产生费用时不能自作主张，见 `docs/adr/0007`/`0011`）。要做属于独立工作项。
 - 火山方舟/Seedream、直连 OpenAI **用户 2026-09-19 明确暂不做**（先把两家渠道跑通；该范围由工作项 #2 的规划保持不变）；多图与 `stream`/`tools` 同样不在本阶段；
 - 平台**对外价**等运营后台管理设计定了再考虑（工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；

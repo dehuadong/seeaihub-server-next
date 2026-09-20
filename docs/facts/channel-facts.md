@@ -155,7 +155,7 @@
 
 `extra.quality` 与顶层 `quality` 的取值集合相同：`low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）。
 
-⇒ **同一个 `quality`，端点族不同则位置不同**：`/ai/v1` 走 `extra`，OpenAI 兼容的 `/v1/*` 走顶层。这与 2.3 的实测 400 一致（在 `/ai/v1` 顶层传 `quality` 被硬拒）。**参数名不变，只是位置不同**。（此前的括号注写"位置差异属 ② 内部实现"，2026-09-20 更正：位置的**归属**是 Offering Parameter Mapping，不是 Adapter——`docs/adr/0015` 第 2、6 条。）
+⇒ **同一个 `quality`，端点族不同则位置不同**：`/ai/v1` 走 `extra`，OpenAI 兼容的 `/v1/*` 走顶层。这与 2.3 的实测 400 一致（在 `/ai/v1` 顶层传 `quality` 被硬拒）。**参数名不变，只是位置不同**。（此前的括号注写"位置差异属 ② 内部实现"，2026-09-20 更正：位置的**归属**是 Offering Parameter Mapping，不是 Adapter——见 `docs/adr/0015`。）
 
 **⚠️ 但"位置差异属 Adapter 内部"不等于可以脱离端点族声明形状（2026-09-20 收口核对）**：本仓库的 AIHubMix 2.5 发布素材把 `quality`/`background`/`output_compression`/`user` 声明在 **`extra` 内**——那是上表**第 1 行**端点族的形状，而本阶段实际调用的是**第 2、3 行**（`/v1/*`），那两行**不存在 `extra`**。Adapter 因此在出网前把 `extra.quality` 摊平回顶层。后果有两条，均已登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)：
 

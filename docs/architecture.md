@@ -141,4 +141,4 @@ Worker（独立进程，循环领活）                            apps/worker/s
 - **新增一个型号或调整参数面**：只发布新的运行时素材（`config/bootstrap/*.json` 的形状），不重新编译。
 - **换对象存储**：`ASSET_STORE=local|s3`，实现仍在 `crates/object-storage`。
 - **参数合同的归属**：调用方按 **Vendor Model Contract** 提交参数；同一 Vendor Model 在不同 Provider 的字段/位置/枚举差异由 **Offering Parameter Mapping** 在平台内部吸收。决策见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)。
-- **面向消费侧的跨厂商统一简化接口**：**不在本仓库内部**，属后期独立规划（[`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 第 7 条）。**注意：这与上面那条不是同一件事**——"按各模型自己的合同提交"不等于"所有厂商共用一套字段"。
+- **面向消费侧的跨厂商统一简化接口**：**不在本仓库内部**，属后期独立规划（见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。**注意：这与上面那条不是同一件事**——"按各模型自己的合同提交"不等于"所有厂商共用一套字段"。

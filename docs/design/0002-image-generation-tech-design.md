@@ -112,7 +112,7 @@ HTTP 只是应用命令的适配层，可并存三种请求入口而不复制业
 
 **形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而该 Provider 有两个端点族，同一参数的**位置不同**——`/ai/v1/images/generations` 把可选参数放在 `extra` 内，OpenAI 兼容的 `/v1/images/generations` 与 `/v1/images/edits` 则把 `quality` 放在**顶层**、**不存在 `extra`**（`docs/facts/channel-facts.md` §2.5）。本阶段实际调用的是后者。因此：
 
-- 声明"原生能力 Schema"时，字段与位置取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 第 6 条，本节不复制；
+- 声明"原生能力 Schema"时，字段与位置取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；
 - 原文中"`extra` 是上游已声明的受控扩展对象"仅对 `/ai/v1` 成立；在 `/v1/*` 上 `extra` **不是**合法顶层参数，把它留在调用方可见面上会形成"发布校验认一套形状、上行发另一套形状"的翻译层；
 - 上一段清单里的 `background`、`output_compression`、`user` **不在** `/v1/images/generations` 的顶层参数集合内（该端点 `additionalProperties: false`），因此它们在**本阶段调用的路径上属"已声明未验证"**，不应视为已开放能力（差距 G2）；
 - 已知差距（当前素材把 `quality` 声明在 `extra` 内、Adapter 能力面强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。

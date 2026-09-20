@@ -36,7 +36,7 @@
 
 因此：上游是同步响应还是任务式轮询、返回 Base64 还是 URL、返回 token 还是金额——**都是 ② 的内部实现**，不产生领域类型分支，不改状态机，不改表结构。
 
-**⚠️ R1 的边界（2026-09-20，按 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 收窄）**：R1 说的是**传输与响应形态**。**参数的位置与命名不属于 R1 的"内部实现"**——同一参数在调用方可见面上放在顶层还是嵌套对象里、叫什么名字，是 **Offering Parameter Mapping** 的职责（0015 第 2、6 条）；Adapter 只按**已经定形**的参数装载传输。此前"位置差异属 ② 内部实现"的说法被误用到调用方合同上，正是 #6 记录的 G1 病根。
+**⚠️ R1 的边界（2026-09-20，按 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 收窄）**：R1 说的是**传输与响应形态**。**参数的位置与命名不属于 R1 的"内部实现"**——同一参数在调用方可见面上放在顶层还是嵌套对象里、叫什么名字，是 **Offering Parameter Mapping** 的职责（见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）；Adapter 只按**已经定形**的参数装载传输。此前"位置差异属 ② 内部实现"的说法被误用到调用方合同上，正是 #6 记录的 G1 病根。
 
 **R2 · 对外生命周期只有一种。**
 依据：0002 §4「调用方先得到持久 Job，Worker 在后台等待 Provider 响应并维护 lease/heartbeat」「以后是否增加同步等待型公开 API，**不影响这个执行模型**」。

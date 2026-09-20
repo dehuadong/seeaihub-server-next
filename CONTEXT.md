@@ -61,7 +61,7 @@ _Avoid_: 费用、估算值
 _Avoid_: Metered Usage（未曾有代码或文档使用该名）、费用
 
 **Routing Priority**:
-同一 Vendor Model 的候选 Offering 之间的选择顺序，随 Runtime Revision 发布；数字小者优先。它是**发布决定**，不由请求参数或 Adapter 决定，也不由价格自动推导。**选择规则本身目前不是配置项**——运营方能配的是顺序，差距见 `docs/adr/0009` 与工作项 `#6`。
+同一 Vendor Model 的候选 Offering 之间的选择顺序，随 Runtime Revision 发布；数字小者优先。它是**发布决定**，不由请求参数或 Adapter 决定，也不由价格自动推导。
 _Avoid_: 价格优先、负载均衡、把优先级顺序说成"可配置的策略"
 
 **Price Plan**:
