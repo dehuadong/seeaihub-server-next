@@ -20,11 +20,12 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 - **预授权额由服务端定**：请求体里不再有 `max_cost_microusd`；服务端按固定数给
   （`GENERATION_MAX_COST_MICROUSD`，默认 $0.02）。按 Price Snapshot 算该请求的最坏成本、
   以及 `docs/adr/0009` 要求的"低于最小可能成本就受理前拒绝"，都留作后续优化。
-- **两个 OpenAI 兼容入口落地**：`POST /v1/images/generations`（JSON，只收文本，带图直接拒）
-  与 `POST /v1/images/edits`（`multipart/form-data`，`image` 必填、`mask` 可选，文件存成平台
-  资产）。三个入口共用 `CreateImageGenerationRequest` 之后的同一条受理路径；兼容入口只做
-  请求解码、资产绑定与分支断言。**响应仍是异步受理（202 返回 Job）**——要不要再给"等结果"
-  的同步响应形态，属尚未作出的产品选择。
+- **两个 OpenAI 兼容入口落地**：`POST /v1/images/generations`（JSON）与
+  `POST /v1/images/edits`（`multipart/form-data`，`image`/`mask` 是文件部件，自动存成平台
+  资产）。它们与统一入口**是同一个能力**：分支只看请求里有没有 `image`/`mask`，**不按端点
+  断言**——带图的 generations、不带图的 edits 都合法。三个入口共用同一条受理路径；兼容入口
+  只做请求解码与资产绑定。**响应仍是异步受理（202 返回 Job）**——要不要再给"等结果"的
+  同步响应形态，属尚未作出的产品选择。
 
 ## 实际交付
 
@@ -52,7 +53,7 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 | 只有遮罩没有参考图直接拒 | `mask_without_an_image_is_rejected` |
 | `quality` 顶层直传、线上没有 `extra` | `sends_quality_on_the_wire_field`（aihubmix） |
 | 素材与 Adapter 声明面一致 | `accepts_bootstrap_capability_contract`（aihubmix，读真实素材） |
-| 两个兼容入口：解出的分支、图片映射到候选参数路径、Job 照样跑完 | `openai_compatible_entries_accept_and_map_assets` |
+| 两个兼容入口：带图/不带图都合法、分支按内容判定、图片映射到候选参数路径、Job 照样跑完 | `openai_compatible_entries_accept_and_map_assets` |
 
 ## 未做（需要你的决定）
 

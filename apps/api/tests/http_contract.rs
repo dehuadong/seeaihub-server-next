@@ -1470,15 +1470,26 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         "a job accepted through the compat entry must run like any other"
     );
 
-    // 带图的 generations 属于用错入口：直接拒绝，不产生 Job。
-    let rejected = client
+    // 带图的 generations 一样合法：分支看请求内容，不看端点。
+    let conditioned: Value = client
         .post(format!("{}/v1/images/generations", harness.base_url))
         .bearer_auth(&harness.api_key)
-        .json(&json!({"model": harness.model, "prompt": "x", "image": image_asset}))
+        .header(
+            "idempotency-key",
+            format!("compat-gen-img-{}", Uuid::new_v4()),
+        )
+        .json(&json!({
+            "model": harness.model,
+            "prompt": "compat entry with a reference image",
+            "image": image_asset
+        }))
         .send()
         .await
-        .expect("compat generations with an image");
-    assert_eq!(rejected.status(), StatusCode::BAD_REQUEST);
+        .expect("compat generations with an image")
+        .json()
+        .await
+        .expect("compat generations with an image JSON");
+    assert_eq!(conditioned["branch"].as_str(), Some("image_conditioned"));
 
     // edits：multipart，`image` 是文件部件；平台把它存成资产并映射到该候选的参数路径。
     let mask_asset = harness
@@ -1546,6 +1557,27 @@ async fn openai_compatible_entries_accept_and_map_assets() {
         harness.run_worker_until_terminal(edited_id).await,
         "succeeded"
     );
+
+    // 不带图的 edits 同样合法（那就是文生图）。
+    let text_only: Value = client
+        .post(format!("{}/v1/images/edits", harness.base_url))
+        .bearer_auth(&harness.api_key)
+        .header(
+            "idempotency-key",
+            format!("compat-edit-txt-{}", Uuid::new_v4()),
+        )
+        .multipart(
+            reqwest::multipart::Form::new()
+                .text("model", harness.model.to_owned())
+                .text("prompt", "text only through the edits entry"),
+        )
+        .send()
+        .await
+        .expect("compat edits without an image")
+        .json()
+        .await
+        .expect("compat edits without an image JSON");
+    assert_eq!(text_only["branch"].as_str(), Some("prompt_only"));
 
     harness.cleanup().await;
 }

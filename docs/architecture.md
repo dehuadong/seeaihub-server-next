@@ -60,10 +60,10 @@
 | GET | `/v1/assets/{asset_id}` | `download_asset` | 同上，限本账户 |
 | POST | `/v1/image-generations` | `create_generation` | 持 Key 的账户（`model` + 平铺的模型参数 + 可选 `image`/`mask`；幂等键走 `Idempotency-Key` 头） |
 | GET | `/v1/image-generations/{job_id}` | `get_generation` | 同上，限本账户 |
-| POST | `/v1/images/generations` | `create_generation_compat` | 同上（OpenAI 契约的 generations 兼容入口：只收文本） |
-| POST | `/v1/images/edits` | `create_image_edit_compat` | 同上（OpenAI 契约的 edits 兼容入口：`multipart/form-data`，`image` 必填、`mask` 可选） |
+| POST | `/v1/images/generations` | `create_generation_compat` | 同上（OpenAI 契约的路径；JSON，可带 `image`/`mask`） |
+| POST | `/v1/images/edits` | `create_image_edit_compat` | 同上（OpenAI 契约的路径；`multipart/form-data`，`image`/`mask` 是文件部件，可不带） |
 
-三个受理入口（统一入口 + 两个 OpenAI 兼容入口）**共用同一条受理路径**：兼容入口只做请求解码、资产绑定与分支断言，不自己选路、计费或调用 Provider。预授权额由服务端定（`GENERATION_MAX_COST_MICROUSD`，默认 $0.02），不由调用方自报。
+三个受理入口（统一入口 + 两个 OpenAI 兼容入口）**是同一个能力**、共用同一条受理路径：兼容入口只做请求解码与资产绑定，不自己选路、计费或调用 Provider。**分支由请求内容决定**（有没有 `image`/`mask`），任何入口都不按端点断言分支——带图的 generations、不带图的 edits 都合法。预授权额由服务端定（`GENERATION_MAX_COST_MICROUSD`，默认 $0.02），不由调用方自报。
 
 请求体上限 16MB（`DefaultBodyLimit`）；资产字节走对象存储，不经过数据库。
 

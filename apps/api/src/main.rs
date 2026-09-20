@@ -496,26 +496,34 @@ async fn accept_generation(
     ))
 }
 
-/// generations 兼容入口（OpenAI 契约的文生图）：请求体与统一入口同形，但**不接受图片**
-/// ——这个端点的语义就是文生图，带图属于用错入口。
+/// generations 兼容入口（OpenAI 契约的路径）。
+///
+/// 它与编辑入口**是同一个能力**：分支只看请求里有没有 `image` / `mask`，不由端点断言——
+/// 带图的 generations、不带图的 edits 都是合法请求。
 async fn create_generation_compat(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateGenerationBody>,
 ) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
     let account_id = authenticate(&state, &headers).await?;
-    let parameters = body.parameters;
-    if parameters.contains_key("image") || parameters.contains_key("mask") {
-        return Err(ApiError::bad_request(
-            "images_not_allowed",
-            "the generations entry takes text only; use the edits entry for images",
-        ));
-    }
-    accept_generation(&state, account_id, &headers, parameters, Vec::new(), None).await
+    let mut parameters = body.parameters;
+    let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
+    let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
+    accept_generation(
+        &state,
+        account_id,
+        &headers,
+        parameters,
+        image_asset_ids,
+        mask_asset_id,
+    )
+    .await
 }
 
-/// edits 兼容入口（OpenAI 契约的图生图/编辑）：`multipart/form-data`，`image` 必填、
-/// `mask` 可选，两者都是**文件部件**；其余文本部件就是模型参数。
+/// edits 兼容入口（OpenAI 契约的路径）：`multipart/form-data`，`image` 与 `mask` 是**文件
+/// 部件**；其余文本部件就是模型参数。
+///
+/// 没有 `image` 的 edits 同样合法（那就是文生图）——分支由请求内容决定，不由端点断言。
 async fn create_image_edit_compat(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -545,12 +553,6 @@ async fn create_image_edit_compat(
                 parameters.insert(name.clone(), form_scalar(&name, &text));
             }
         }
-    }
-    if image_asset_ids.is_empty() {
-        return Err(ApiError::bad_request(
-            "missing_image",
-            "the edits entry requires an image part",
-        ));
     }
     accept_generation(
         &state,
