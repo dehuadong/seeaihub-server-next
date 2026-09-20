@@ -30,6 +30,8 @@
 
 ### 2.1 端点（三个，来自 `llms.txt`）
 
+> **响应结构台账**：各端点实际返回什么形状、哪一次调用有逐字样本，见 [`out-reference/aihubmix/response-shapes.md`](../../out-reference/aihubmix/response-shapes.md)（外部参考资源，只作证据）。
+
 | 端点 | 形态 | 本仓库现状 |
 | --- | --- | --- |
 | `POST /v1/images/generations` | **同步**，OpenAI 兼容 | **第一阶段即用它**（bootstrap `adapter_key: aihubmix-image-v1`） |
@@ -191,20 +193,6 @@
 ```
 
 （flare 那次 `b64_json` 为 320,708 字符，其余字段同形。）
-- **`quality` 顶层传入即被接受**（无需 `extra`）——与 2.2b 的 Schema 一致
-
-响应（`b64_json` 截断）：
-
-```json
-{ "created": 1789804584, "background": "opaque", "output_format": "png",
-  "quality": "low", "size": "1024x1024",
-  "data": [ { "b64_json": "<244,700 字符 base64 PNG>" } ],
-  "usage": { "input_tokens": 14,
-             "input_tokens_details":  { "image_tokens": 0,   "text_tokens": 14 },
-             "output_tokens": 196,
-             "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
-             "total_tokens": 210 } }
-```
 
 ### 2.7 本渠道独立待办
 
@@ -311,6 +299,8 @@
 > 同样适用 ②③④⑤；与本文件的 AIHubMix 各节**互不推导**。
 
 ### 3.1 端点
+
+> **响应结构台账**：各端点实际返回什么形状、哪一次调用有逐字样本，见 [`out-reference/apimart/response-shapes.md`](../../out-reference/apimart/response-shapes.md)（外部参考资源，只作证据）。
 
 | 端点 | 形态 | 路由是否存在（2026-09-19 零费用探测） |
 | --- | --- | --- |

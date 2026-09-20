@@ -28,6 +28,7 @@
 | 其他已有工件 | 承接总览与未来进度归 `dehuadong/seeaihub-server-next#1`；上游 `dehuadong/seeaihub#674` 只作冻结的历史来源，不再承接新提案或进度 |
 | 外部参考资源 | `out-reference/`，按 Provider 分目录（`aihubmix/`、`apimart/`、`doubao/`、`openai/`、`openrouter/`）。**只作参考，不是工程工件**，定位见下文「外部参考资源」一节 |
 | 决策记录工具 | `scripts/decisions/{lib,update-index,check}.mjs`，随决策记录系统部署的项目副本。已相对 setup 技能自带的原始版本修补链接解析（见下文「决策记录工具」） |
+| 受控采集脚本 | `scripts/probe/response-shapes.ps1`：**唯一**会发真实计费调用的入口（默认演练，必须显式加 `-ConfirmPaidCalls`）。用途是把各渠道的真实响应结构落成脱敏文件到 `out-reference/<provider>/`，并把登记补进该渠道的 `response-shapes.md`。凭证只从环境变量读 |
 
 文件有真实内容时才创建。Agent Notes 分类读取 `.agents/notes/config.json`，当前分类为 `domain`、`platform`、`workflow`，分别覆盖领域语义与状态规则、平台基础设施与运行时保证、仓库级工程约定与 CI 工具。Agent Notes 的正文格式参考 `.agents/notes/templates/record.md`。
 

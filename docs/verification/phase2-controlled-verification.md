@@ -119,7 +119,16 @@ curl -s -D /tmp/hb.txt -o /tmp/hb.json \
 ## 3. 留档要求
 
 每次调用记录：请求参数、HTTP 状态、**响应头**、响应体摘要（脱敏）、计量字段原文、结果尺寸、以及本次归属的 V 编号。
-**不保存**：真实图片 URL、签名参数、`task_id`（可记其存在与长度，不记全文）。
+
+**必须落一份脱敏后的逐字响应文件**（2026-09-19 追加，起因：参考图/遮罩那一轮的逐字报文没留存，只留下文字描述）：
+
+- 位置：`out-reference/<provider>/`，命名 `<端点或主题>-<日期>.json`（与既有 `controlled-probe-2026-09-19.json` 一致）；
+- 内容：`_call`（端点 + 请求体）、`_terminal_response`、`_conclusions` 三个块，URL 与 task id 脱敏（长度级或占位符）；
+- 同时在该渠道的 `response-shapes.md` 台账里登记一行"哪次调用 → 哪个文件"；
+- **只写进文档叙述不算收集**——被判据核查的是文件。
+- 工具：`scripts/probe/response-shapes.ps1`（**唯一**允许发真实计费调用的入口；默认只演练，必须显式加 `-ConfirmPaidCalls`；自动脱敏 URL / task id / `b64_json`）。
+
+**不保存**：真实图片 URL、签名参数、`key`（task id 可记存在与长度，不记全文）。
 
 结论写回：
 - `out-reference/apimart/apimart-response-shape-findings.md`（新建，脱敏）；
