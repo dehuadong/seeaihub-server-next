@@ -37,7 +37,7 @@ const PNG_FIXTURE: &[u8] = &[
 /// 假上游记录下来的请求（方法、路径、解码后的请求体），用于断言 Driver 的线上请求。
 type UpstreamCalls = std::sync::Arc<std::sync::Mutex<Vec<(String, String, String)>>>;
 
-/// APIMart Driver 的真实执行验证（规划 §6 第 13 条等）。
+/// APIMart Driver 的真实执行验证。
 ///
 /// 用**进程内假上游**替代真实 Provider：发布一个 `base_url` 指向 `127.0.0.1` 的
 /// APIMart Offering，让真实 Worker 跑一次完整流程（提交 → 轮询 → 取图 → 归档 → 结算）。
@@ -87,7 +87,7 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
     assert_eq!(media_type, "image/png");
     assert_eq!(byte_count, PNG_FIXTURE.len() as i64);
 
-    // 对账标识落到**已存在**的 attempts.provider_trace_id 列（规划 §4/§6-13）：
+    // 对账标识落到**已存在**的 attempts.provider_trace_id 列：
     // 该列此前只有 fail_job 在写，成功路径不写。
     let trace_id: Option<String> =
         sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE job_id = $1")
@@ -114,7 +114,7 @@ async fn apimart_driver_executes_task_flow_against_local_upstream() {
         submit_body.get("extra").is_none(),
         "APIMart takes parameters at the top level"
     );
-    // 第 24 条「不改写原生字段」：线上请求体的键，名字与 Profile 声明**逐字相同**，
+    // 不改写原生字段：线上请求体的键，名字与 Profile 声明**逐字相同**，
     // 且不出现 Profile 未声明的字段（含内部包装字段）。
     harness.assert_only_declared_fields();
     assert!(
@@ -144,7 +144,7 @@ async fn apimart_driver_uploads_reference_images_before_submitting() {
 
     let key = format!("driver-reference-{}", Uuid::new_v4());
     let mut request = route_request(model, &key, "edit this image");
-    // 绑定路径用的是**厂商自己的字段名**（APIMart 收 `image_urls`，平台不做统一改名）。
+    // 绑定路径用的是该渠道的原生字段名（APIMart 收 `image_urls`）。
     request["asset_bindings"] = json!([
         {"native_parameter_path": "/image_urls/0", "asset_id": asset_id, "position": 0}
     ]);
@@ -169,7 +169,7 @@ async fn apimart_driver_uploads_reference_images_before_submitting() {
         uploaded_url.starts_with("http://127.0.0.1:"),
         "the generation request must carry the uploaded public URL, got {uploaded_url}"
     );
-    // 第 24 条同样适用于带图请求：上线字段必须全是 Profile 声明过的。
+    // 带图请求同理：上线字段必须全是 Profile 声明过的。
     harness.assert_only_declared_fields();
     for (_, _, body) in harness.recorded() {
         assert!(
@@ -286,7 +286,7 @@ struct FakeUpstream {
     _handle: tokio::task::JoinHandle<()>,
 }
 
-/// 假上游的可配置行为，用于构造验收第 9、10 条要的场景。
+/// 假上游的可配置行为，用于构造"查询瞬时失败重试"与"未知状态继续轮询"两类场景。
 #[derive(Default, Clone)]
 struct UpstreamBehaviour {
     /// 任务查询先失败这么多次（返回 500），之后才给正常响应 —— 覆盖"查询可重试"。
@@ -757,7 +757,7 @@ impl DriverHarness {
     /// 线上请求体里不允许出现 Profile 未声明的字段（含内部包装字段）。
     ///
     /// 校验对象是 `config/bootstrap/apimart-gpt-image-2.5-flare.json` 里那份**真实** Profile：
-    /// 契约要求请求体的键名与 Profile 声明逐字相同（验收第 24 条）。
+    /// 契约要求请求体的键名与 Profile 声明逐字相同。
     fn assert_only_declared_fields(&self) {
         let material: Value = serde_json::from_str(include_str!(
             "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
@@ -907,7 +907,7 @@ async fn image_generation_http_contract() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 多 Offering 路由的端到端验证（规划 §6 第 1–4、7 条）。
+/// 多 Offering 路由的端到端验证。
 ///
 /// 需要独立空库（会发布自己的候选集合）。**不启动 Worker**：路由选择发生在
 /// `create_job` 之前的 API 进程内，而 `create_job` 不调用上游——因此本测试
@@ -941,7 +941,7 @@ async fn multiple_active_offerings_route_by_priority() {
         .await
         .expect("contract database");
 
-    // ── 用例 1：两个都合格的候选 → 选中优先级最小的那个（第 1、2、3 条）──
+    // ── 用例 1：两个都合格的候选 → 选中优先级最小的那个 ──
     let model = "route-model-a";
     let published = publish_candidates(
         &client,
@@ -1026,7 +1026,7 @@ async fn multiple_active_offerings_route_by_priority() {
             .expect("chosen offering channel");
     assert_eq!(job_channel, chosen_channel);
 
-    // ── 第 7 条：任务创建失败时，判定记录与 Job 两边都不留下 ──
+    // ── 任务创建失败时，判定记录与 Job 两边都不留下 ──
     // 预授权上限超过账户余额会让 create_job 在写入前失败（扣不动预授权），
     // 此时不该留下判定记录，也不该留下 Job。
     let decisions_before: i64 =
@@ -1068,7 +1068,7 @@ async fn multiple_active_offerings_route_by_priority() {
         "a rejected creation must leave neither a job nor a routing decision"
     );
 
-    // ── 第 7 条补充：幂等重放不重复写判定记录 ──
+    // ── 补充：幂等重放不重复写判定记录 ──
     // 同一个幂等键重放会返回同一个 Job，判定记录也应只有一条（它反映"受理时"的判定）。
     let replay_key = format!("replay-{}", Uuid::new_v4());
     let replay_request = route_request(model, &replay_key, "replayed");
@@ -1105,7 +1105,7 @@ async fn multiple_active_offerings_route_by_priority() {
         "an idempotent replay must not write a second routing decision"
     );
 
-    // ── 用例 3：再发布一次即原子替换该型号的全部 active 候选（第 1 条）──
+    // ── 用例 3：再发布一次即原子替换该型号的全部 active 候选 ──
     let published = publish_candidates(
         &client,
         &base_url,
@@ -1130,7 +1130,7 @@ async fn multiple_active_offerings_route_by_priority() {
 }
 
 /// 第二阶段的**发布素材**要真的能用，并且每个候选要带自己的那份 Profile
-/// （规划 §6 第 21、22 条）。
+/// ——缺一不可：素材发不出去、或候选没带上自己的 Profile，都算没覆盖。
 ///
 /// 用 `config/bootstrap/` 里已备好的 2.5 素材发布：AIHubMix 与 APIMart 供同一型号。
 /// 两家 Profile 内容不同（AIHubMix 有 `extra`，APIMart 参数在顶层），正是"候选各自携带
@@ -1179,7 +1179,7 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         apimart["native_model_id"], aihubmix["native_model_id"],
         "both materials must supply the same vendor model"
     );
-    // 两家的 Profile 内容必须真的不同——否则第 22 条没有被覆盖。
+    // 两家的 Profile 内容必须真的不同——否则这个用例覆盖不到"各自携带 Profile"。
     let aihubmix_schema = &aihubmix["offerings"][0]["capability_schema"];
     let apimart_schema = &apimart["offerings"][0]["capability_schema"];
     assert_ne!(
@@ -1209,7 +1209,7 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         published.text().await
     );
 
-    // 第 22 条：每个候选携带**它自己**的那份 Profile——读回来的 schema 要分别等于
+    // 每个候选携带**它自己**的那份 Profile——读回来的 schema 要分别等于
     // 发布时给各自的那一份，而不是共享同一份。
     let rows = sqlx::query(
         "SELECT o.provider_model_id, o.adapter_key, c.provider_kind, vm.capability_schema
@@ -1234,7 +1234,7 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         schemas[0], schemas[1],
         "each candidate must carry its own profile, not a shared one"
     );
-    // 第 21 条：每个候选的 provider_model_id / adapter_key 与它自己 Profile 的 model.const 一致。
+    // 每个候选的 provider_model_id / adapter_key 与它自己 Profile 的 model.const 一致。
     for (index, expected) in [(0_usize, &aihubmix), (1, &apimart)].iter() {
         let row = &rows[*index];
         let offering = &expected["offerings"][0];
@@ -1255,7 +1255,7 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 第 9 条：任务**查询**的瞬时失败可以重试，Job 最终仍成功。
+/// 任务**查询**的瞬时失败可以重试，Job 最终仍成功。
 ///
 /// 查询是幂等读，重试它不会造成重复副作用；这与"创建请求绝不重发"并不冲突。
 #[tokio::test]
@@ -1283,7 +1283,7 @@ async fn transient_query_failure_is_retried_and_the_job_still_succeeds() {
     outcome.harness.cleanup().await;
 }
 
-/// 第 10 条：未在文档中出现的状态值必须**继续轮询**，不得当失败。
+/// 未在文档中出现的状态值必须**继续轮询**，不得当失败。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn unknown_task_status_keeps_polling_instead_of_failing() {

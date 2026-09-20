@@ -20,7 +20,7 @@ use uuid::Uuid;
 
 /// 发布一个 Vendor Model 的供给。
 ///
-/// 依 `docs/adr/0009` 与规划 §3.1：一次发布携带该模型**完整、有序**的候选集合；
+/// 一次发布携带该模型**完整、有序**的候选集合；
 /// 候选的 `routing_priority` **由数组下标决定**（`0..n-1`），不接受调用方赋号——只有一个来源。
 ///
 /// 形状判别（确定性三例，见 `normalize`）：
@@ -91,7 +91,7 @@ pub struct OfferingDraft {
 /// 计价合同草案。
 ///
 /// `formula` 只在**发布期**用于判别与校验，**不落库**——`pricing.price_plans` 没有该列
-/// （见规划 §3.1「价格字段形态」）。本阶段唯一启用 `token_rates`。
+/// 本阶段唯一启用 `token_rates`。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricePlanDraft {
     pub formula: String,
@@ -277,7 +277,7 @@ impl PublishRuntimeCommand {
         ]
     }
 
-    /// 数组形式下**必须全部为空**的扁平字段（规划 §3.1）。
+    /// 数组形式下**必须全部为空**的扁平字段。
     ///
     /// 除上表外还含 `capability_schema` 与 `price_plan`（见 [`Self::flat_extras_present`]）。
     /// `restrictions` 只在**非空**时才算"被给出"：它带 `#[serde(default)]`，缺省即空对象，
@@ -319,7 +319,7 @@ pub struct ConsideredCandidate {
     pub skip_reason: Option<String>,
 }
 
-/// 受理时的路由判定记录（规划 §3.4）。
+/// 受理时的路由判定记录。
 ///
 /// **不复制** `base_url`/`credential_env` 等发布字段——候选集与顺序的权威是发布物
 /// （`runtime_revisions.snapshot`），本记录只记「受理时用哪些请求侧事实判成了什么」。
@@ -334,7 +334,7 @@ pub struct RoutingDecision {
 ///
 /// 本阶段**唯一启用** `token_rates`。`formula` 不落库（`pricing.price_plans` 没有该列），
 /// 它只是发布期的判别符——因此必须在这里拒绝未知取值，否则"只启用一种形态"只是注释。
-/// 后续若引入金额型口径（见 `docs/adr/0012`），在此放行并同时落地对应列与结算路径。
+/// 后续若引入新的计价形态，在此放行并同时落地对应列与结算路径。
 fn validate_price_formula(price_plan: &PricePlanDraft) -> Result<(), String> {
     if price_plan.formula != "token_rates" {
         return Err(format!(
@@ -349,16 +349,16 @@ fn empty_object() -> Value {
     Value::Object(Map::new())
 }
 
-/// 按 `routing_priority` 升序取**第一个合格候选**（规划 §3.2）。
+/// 按 `routing_priority` 升序取**第一个合格候选**。
 ///
 /// 合格 = 该候选自己的 `restrictions` 允许本次分支与绑定，**且**请求满足该候选**自己的**
 /// `capability_schema`。两个条件都必须用该候选自己的声明判断——这正是「每个 Provider
 /// 各自声明支持面、限制只收窄」的落地方式。
 ///
 /// **无合格候选时返回 `Validation` 错误**，即"在调用上游之前失败"，不回退到能力更宽但
-/// 优先级更低的候选（`docs/adr/0009`）。
+/// 优先级更低的候选。
 ///
-/// 不做的事：不因价格重排候选（`docs/adr/0009`：价格不参与选中）。
+/// 不做的事：不因价格重排候选（价格不参与选中）。
 fn select_candidate(
     command: &CreateImageGeneration,
     branch: ImageBranch,
@@ -366,7 +366,7 @@ fn select_candidate(
     asset_bindings: &[AssetBinding],
 ) -> Result<(PublishedOffering, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
-        // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误（规划 §6-20）。
+        // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误。
         return Err(ApplicationError::NotFound(format!(
             "no active offering for model {}",
             command.native_model_id
@@ -502,7 +502,7 @@ pub struct CompleteJob {
     pub outputs: Vec<AssetRecord>,
     pub evidence: MeteringEvidence,
     pub charge_microusd: u64,
-    /// 上游逐请求标识，写入 `attempts.provider_trace_id` 供人工对账（规划 §4）。
+    /// 上游逐请求标识，写入 `attempts.provider_trace_id` 供人工对账。
     pub provider_trace_id: Option<String>,
 }
 
@@ -561,7 +561,7 @@ pub trait HubRepository: Send + Sync {
 
     /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
     ///
-    /// 同一模型的 active 候选集**永远来自同一个 Revision**（`docs/adr/0009`：发布即原子替换）。
+    /// 同一模型的 active 候选集**永远来自同一个 Revision**（发布即原子替换）。
     /// 无任何 active 候选时返回空 `Vec`，不是错误——由调用方判定"无合格候选"。
     async fn active_offering(
         &self,
@@ -601,7 +601,7 @@ pub trait HubRepository: Send + Sync {
         asset_id: AssetId,
     ) -> Result<AssetRecord, ApplicationError>;
 
-    /// 创建 Job，并与 Job **同事务**写入路由判定记录（规划 §3.4）。
+    /// 创建 Job，并与 Job **同事务**写入路由判定记录。
     async fn create_job(
         &self,
         command: CreateImageGeneration,
@@ -760,7 +760,7 @@ pub trait AdapterFactory: Send + Sync {
     ) -> Result<Arc<dyn ImageAdapter>, ApplicationError>;
 }
 
-/// 按 `adapter_key` 分派的组合工厂（规划 §0 的"装配点"改动，E3）。
+/// 按 `adapter_key` 分派的组合工厂。
 ///
 /// 存在的理由：同一进程要同时服务多个渠道（每个渠道一族 Driver），而
 /// `AdapterFactory` 是单一 trait 对象。**它只是装配，不含渠道语义**——
@@ -979,7 +979,7 @@ impl RuntimeService {
 
 /// 校验「Offering 的限制不超出该候选 Profile 自己声明的范围」。
 ///
-/// 这是"Provider 限制只能**收窄**，不能放宽"的落地（`#2` 计划范围第 4 条、`ADR-0009`）。
+/// 这是"Provider 限制只能**收窄**，不能放宽"的落地。
 /// 与 [`validate_adapter_compatibility`] 的区别：后者比对的是 **Adapter 的能力面**（Driver
 /// 做不到的不许声明）；本函数比对的是 **Profile 自己声明的能力**（供货方不许替厂商放宽）。
 ///
@@ -2140,7 +2140,7 @@ mod tests {
 
     #[test]
     fn restriction_follows_the_vendors_own_parameter_names() {
-        // 平台不统一改名（`ADR-0002`）：APIMart 的参考图字段叫 `image_urls`、
+        // 参考图/遮罩参数按渠道各自的原生名给出：APIMart 的参考图字段叫 `image_urls`、
         // 遮罩叫 `mask_url`。判定办法是名字约定——参考图以 `image` 开头，遮罩含 `mask`。
         let vendor_names = offering_with(
             serde_json::json!({
@@ -2179,7 +2179,7 @@ mod tests {
 
     #[test]
     fn normalize_rejects_unsupported_price_formula() {
-        // 本阶段只启用 token_rates；其余形态（例如 adr/0012 的金额口径）必须显式拒绝，
+        // 本阶段只启用 token_rates；其余计价形态（例如按上游声明金额计价）必须显式拒绝，
         // 而不是静默落库成一个它并不支持的计价形态。
         let mut draft = draft("pm-a");
         draft.price_plan = Some(PricePlanDraft {
@@ -2731,7 +2731,7 @@ mod tests {
         );
     }
 
-    /// 第 11 条的第二种对账：**已确认生成、但归档失败**。
+    /// 第二种对账：**已确认生成、但归档失败**。
     ///
     /// 与第一种（创建阶段失联）的区别在这条路径上体现为**错误码不同**：
     /// 这里是 `result_delivery_failed`，而创建阶段失联用 adapter 报的错误码。

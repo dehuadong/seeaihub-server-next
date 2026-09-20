@@ -142,16 +142,14 @@ pub enum AssetParameterKind {
 }
 
 impl AssetParameterKind {
-    /// 按**参数名**判定这个原生参数装的是哪一类图片。
+    /// 按**参数名**判定这个绑定装的是哪一类图片。
     ///
-    /// 这是平台唯一的一处命名约定（与发布期校验用的是同一个函数，因此运行期与发布期
-    /// 不会各判一套）：名字里含 `mask` 的就是遮罩，以 `image` 开头的就是参考图，
-    /// **其余一律不认**——宁可拒绝，也不猜。参数名本身仍是渠道自己的字段名
-    /// （`docs/adr/0002`：平台不建立跨厂商的统一参数名，也不在内部做渠道参数转换）。
+    /// 这是平台唯一的一处名字约定（发布期校验与运行期用的是同一个函数，不会各判一套）：
+    /// 名字里含 `mask` 的就是遮罩、以 `image` 开头的就是参考图，**其余一律不认**——
+    /// 宁可拒绝，也不猜。
     ///
-    /// 已知代价（**有意的收窄**，见 `docs/adr/0002` 的 2026-09-19 补充决定）：渠道若用
-    /// `reference_images` 这类名字，平台会拒绝该绑定。那种情况由**后期对外消费侧的统一
-    /// 参数转换**解决——统一名到渠道原生名的映射属于那一层，不在这里加名字特例。
+    /// 已知代价（**有意的收窄**）：名字不以 `image` 开头、也不含 `mask` 时（例如
+    /// `reference_images`），平台会拒绝该绑定，而不是按渠道加名字特例。
     pub fn classify(parameter_name: &str) -> Option<Self> {
         if is_mask_parameter_name(parameter_name) {
             Some(Self::Mask)
@@ -163,7 +161,7 @@ impl AssetParameterKind {
     }
 }
 
-/// 资产绑定路径（`/image_urls/0`）的第一段：厂商原生参数名。
+/// 资产绑定路径（`/image_urls/0`）的第一段：参数名。
 pub fn asset_parameter_name(path: &str) -> &str {
     path.trim_start_matches('/')
         .split('/')
@@ -364,10 +362,10 @@ pub struct PublishedOffering {
 
 /// 同一 Vendor Model 的一个候选供给。
 ///
-/// 依 `docs/adr/0009`：同一型号可有多个 active Offering，选中顺序由 `routing_priority`
+/// 同一型号可有多个 active Offering，选中顺序由 `routing_priority`
 /// 决定（数字小者优先，来自发布顺序）。**每个候选自带它自己的 `capability_schema`**——
 /// 因为 `catalog.vendor_models` 的唯一键含 `schema_hash`，两个 Provider 的 Profile 内容
-/// 不同时会产生两行 `vendor_model`（见规划 §3.3）。
+/// 不同时会产生两行 `vendor_model`。
 ///
 /// 与 [`PublishedOffering`] 的关系：字段完全一致，只多 `routing_priority`。
 /// `PublishedOffering` 表示**受理时被选中并固化进 Job 的那一份**；本类型表示**发布物中的候选**。
@@ -417,7 +415,7 @@ impl OfferingCandidate {
 
 /// 一次发布的产物：一个 Runtime Revision 及其为该型号写入的**完整、有序**候选集合。
 ///
-/// 依 `docs/adr/0009`：一次发布携带该模型完整的候选集合，发布即原子替换该模型既有 active 条目，
+/// 一次发布携带该模型完整的候选集合，发布即原子替换该模型既有 active 条目，
 /// 因此同一模型的 active 候选集**永远来自同一个 Revision**，不会出现半套候选。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedRevision {
@@ -516,7 +514,7 @@ mod tests {
 
     #[test]
     fn recognises_vendor_specific_asset_paths() {
-        // 参数名是厂商自己的（`ADR-0002`）：APIMart 的参考图叫 `image_urls`、
+        // 参考图/遮罩参数按渠道各自的原生名给出：APIMart 的参考图叫 `image_urls`、
         // 遮罩叫 `mask_url`，平台不做统一改名。
         let binding = |path: &str, position: u16| AssetBinding {
             native_parameter_path: path.to_owned(),

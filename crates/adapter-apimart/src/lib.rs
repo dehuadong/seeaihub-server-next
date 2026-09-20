@@ -1,15 +1,15 @@
 //! APIMart 的图片生成 Driver（② 层）。
 //!
-//! 依 `#2` 规划 §4 的合同与 `docs/facts/channel-facts.md` §3 的渠道事实：
+//! 本 Driver 的执行形态与渠道事实如下：
 //! 上游是**任务式**（提交拿 `task_id`，轮询到终态，再从结果 URL 取图），
 //! 而 `ImageAdapter::execute` 只有一个入口——因此**提交、轮询、取图都在 `execute` 内完成**。
-//! 平台对外仍是"持久 Job + 可查询"（`docs/design/0004` R1/R2），上游的异步形态不外泄。
+//! 平台对外仍是"持久 Job + 可查询"，上游的异步形态不外泄到调用方。
 //!
 //! 计费相关：任务成功响应含**四分项 `usage`**（`input_tokens_details` 区分 text/image，
 //! 另有 `cached_tokens`），归一到领域 `TokenUsage`。平台按 token × 费率计价，与 AIHubMix
 //! 口径一致；响应里的 `cost`/`credits_cost` **本阶段既不采纳也不留存**（它们受账号折扣
-//! 影响，见 `docs/facts/channel-facts.md` §3.3）——若将来要按上游声明金额结算，那需要先
-//! 结清 `docs/adr/0012` 并扩展领域证据形态，不是在 Driver 里顺手记下就算数。
+//! 影响）——若将来要按上游声明金额结算，那需要先
+//! 立一条新的持久决定并扩展领域证据形态，不是在 Driver 里顺手记下就算数。
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
@@ -52,7 +52,7 @@ impl AdapterFactory for ApimartAdapterFactory {
         (adapter_key == ADAPTER_KEY).then_some(AdapterDescriptor {
             key: ADAPTER_KEY,
             // 机器的输入合同里这些参数**都在顶层**——APIMart 没有 `extra` 包装层
-            // （与 AIHubMix 的 `/ai/v1` 相反；见 `docs/facts/channel-facts.md` §2.5）。
+            // （与 AIHubMix 那条把可选参数包在 `extra` 里的端点族相反）。
             supported_top_level_parameters: &[
                 "model",
                 "prompt",
@@ -73,8 +73,8 @@ impl AdapterFactory for ApimartAdapterFactory {
             // 再用 url 组装生成请求（同样属 ② 层内部实现，不外泄到平台）。
             //
             // 注意：这里声明的是**本 Driver 已实现的能力面**，不等于"已获准发布"。
-            // 两个 APIMart 发布素材当前仍只开放 `prompt_only`——按 `docs/adr/0002`，
-            // 未经真实 wire 验证的能力不开（见 `config/bootstrap/apimart-*.json` 的 `_status`）。
+            // 两个 APIMart 素材的 `allowed_branches` 已在受控验证后开放三条分支；
+            // 未经真实 wire 验证的能力不开，且素材本身仍是"草案 · 未发布"。
             supported_branches: &[
                 ImageBranch::PromptOnly,
                 ImageBranch::ImageConditioned,
@@ -345,7 +345,7 @@ impl ApimartImageAdapter {
                 ));
             }
             // 任务查询是**幂等读**，因此可以安全重试：同一次执行内对瞬时失败退避重试
-            // 若干次（规划 §4 与 §6-9）。这与"创建请求绝不重发"不冲突——重试的是读。
+            // 若干次。这与"创建请求绝不重发"不冲突——重试的是读。
             // 用完次数后仍失败，则按"已受理但没取到结果"进对账（见 `after_acceptance`）。
             let body = match self.query_task(task_id, credential).await {
                 Ok(body) => body,
@@ -383,7 +383,7 @@ impl ApimartImageAdapter {
                     return Err(provider_error(&code, message, RetrySafety::NotRetryable));
                 }
                 // 文档两份取值集合不一致（`submitted`/`processing`/`pending`/`in_progress`），
-                // 且可能出现未列出的取值——**未知取值继续轮询，不得当失败**（规划 §4）。
+                // 且可能出现未列出的取值——**未知取值继续轮询，不得当失败**。
                 _ => {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -444,7 +444,7 @@ impl ImageAdapter for ApimartImageAdapter {
         } else {
             self.upload_assets(&request.assets, credential).await?
         };
-        // 1) 提交。**这一步之后绝不能重发**（规划 §4：创建请求绝不重发）；
+        // 1) 提交。**这一步之后绝不能重发**（创建请求绝不重发）；
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
         let task_id = self.submit(&request, &uploaded, credential).await?;
         // 2) 提交之后的每一步，都把这个 task id 附在错误上：对账的人至少能拿它去上游查。
@@ -495,7 +495,7 @@ impl ApimartImageAdapter {
             images,
             usage,
             // 对账标识：任务式上游的 task id。只写入 attempts.provider_trace_id 供人工对账，
-            // **不用于跨调用自动恢复**（规划 §4/§5.3 的统一边界）。
+            // **不用于跨调用自动恢复**——拿它自动补齐结果需要另一套模型。
             provider_trace_id: Some(task_id.to_owned()),
             response_digest: digest,
         })
@@ -677,11 +677,11 @@ impl TaskData {
             provider_error(
                 "provider_usage_missing",
                 "task response carried no token usage".to_owned(),
-                // 已生成但计量缺失：不得猜测费用（adr/0006），进对账。
+                // 已生成但计量缺失：不得猜测费用，进对账。
                 RetrySafety::AcceptanceUnknown,
             )
         })?;
-        // 分项缺失时**不猜测**文本/图片的划分——直接失败（adr/0006：缺字段不得猜测费用）。
+        // 分项缺失时**不猜测**文本/图片的划分——直接失败（缺字段不得猜测费用）。
         let input = usage.input_tokens_details.as_ref().ok_or_else(|| {
             provider_error(
                 "provider_usage_incomplete",
@@ -793,7 +793,7 @@ struct ErrorBody {
     r#type: Option<String>,
 }
 
-/// **只依据 `error.code` 分类，不依据 HTTP 状态码**（规划 §4）。
+/// **只依据 `error.code` 分类，不依据 HTTP 状态码**。
 ///
 /// 理由：APIMart 的参数校验错误可能以 `500` 承载（`build_request_failed: …`），
 /// 按状态码判断会把"不可重试的参数错误"误判成"受理状态不确定"。
@@ -833,7 +833,7 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
             // 其它 5xx：上游可能已受理。
             Some(500..=599) => RetrySafety::AcceptanceUnknown,
             // 没有可用的 `error.code`（实测：鉴权失败返回的是 `code: ""` 与
-            // `type: "apimart_error"`，见 `docs/facts/channel-facts.md` §3.8）。
+            // `type: "apimart_error"`）。
             // 此时只有凭据/权限类状态码还能证明"请求根本没进到生成"，按确定性拒绝处置；
             // **5xx 仍然不看状态码**——那正是"只依据 code"这条规则要防的情况。
             _ if matches!(status.as_u16(), 401..=403) => RetrySafety::NotRetryable,
@@ -958,7 +958,7 @@ fn after_acceptance(error: AdapterError) -> AdapterError {
 }
 
 /// 连接中断、超时、解析失败：请求**可能已经发出**，因此一律按受理状态不确定处理
-/// （规划 §4 与 §5.3 的统一边界）。
+/// 这是贯穿本 Driver 的统一边界。
 fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
     provider_error(
         "provider_transport_error",
@@ -1041,7 +1041,7 @@ mod tests {
 
     #[test]
     fn usage_without_details_is_rejected_rather_than_guessed() {
-        // adr/0006：缺字段时不得猜测费用。
+        // 缺字段时不得猜测费用。
         let data = task(
             "completed",
             serde_json::json!({
@@ -1166,7 +1166,7 @@ mod tests {
 
     #[test]
     fn query_phase_errors_are_routed_to_reconciliation_not_to_failure() {
-        // 跨阶段例外（规划 §4）：创建已成功后，查询阶段返回「无效的任务ID」（HTTP 400）
+        // 跨阶段例外：创建已成功后，查询阶段返回「无效的任务ID」（HTTP 400）
         // 必须处置为**对账**，而不是"未受理"式的失败并释放预授权。
         let raw = parse_provider_error(StatusCode::BAD_REQUEST, &envelope(400, "无效的任务ID"));
         // 就错误分类本身而言 400 仍是 NotRetryable（它确实是参数/资源问题）……
@@ -1231,7 +1231,7 @@ mod tests {
     fn upload_failures_are_safe_before_acceptance() {
         // 上传发生在提交生成任务之前，所以它的失败不是"受理状态不确定"，
         // 而是**可证明未受理**（`SafeBeforeAcceptance`）——本阶段同样映射为
-        // 失败并释放预授权（`docs/adr/0011`），但不该被标成"确定性拒绝"。
+        // 失败并释放预授权，但不该被标成"确定性拒绝"。
         let raw = parse_provider_error(
             StatusCode::BAD_REQUEST,
             br#"{"error":{"message":"unsupported image type","type":"invalid_request_error"}}"#,

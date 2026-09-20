@@ -46,7 +46,7 @@ async fn main() -> Result<()> {
     repository.migrate().await?;
     let repository_port: Arc<dyn HubRepository> = repository;
     let store: Arc<dyn AssetStore> = Arc::new(ObjectStoreAssetStore::from_env()?);
-    // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（规划 §0 的装配点）。
+    // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
         Arc::new(AdapterRegistry::new(vec![
             Arc::new(AihubmixAdapterFactory),

@@ -95,7 +95,7 @@ impl HubRepository for PgHubRepository {
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         // 同一发布内两个候选的 Profile 内容相同时，`ON CONFLICT` 会归并到同一行
-        // vendor_model；不同时产生两行（规划 §3.3）。这里按 schema_hash 记忆结果，
+        // vendor_model；不同时产生两行。这里按 schema_hash 记忆结果，
         // 避免对同一行重复 INSERT。
         let mut model_ids: BTreeMap<String, VendorModelId> = BTreeMap::new();
         let mut candidates = Vec::with_capacity(offerings.len());
@@ -224,7 +224,7 @@ impl HubRepository for PgHubRepository {
                 "price_source_url": offering.price_source_url,
             }));
         }
-        // 发布即原子替换该模型的全部 active 条目（`docs/adr/0009`）：候选集与顺序
+        // 发布即原子替换该模型的全部 active 条目：候选集与顺序
         // 始终属于同一个 Revision，不存在跨 Revision 并存。
         sqlx::query(
             "UPDATE publication.runtime_entries SET active = false WHERE active AND native_model_id = $1",
@@ -293,7 +293,7 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
         // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它**自己的**
         // vendor_models 行取 capability_schema——两个 Provider 的 Profile 内容不同时
-        // 会有两行 vendor_model（规划 §3.3）。
+        // 会有两行 vendor_model。
         let rows = sqlx::query(
             r#"
             SELECT
@@ -665,7 +665,7 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        // 路由判定与 Job **同事务**写入（规划 §3.4）。构造 Job 失败时不留下只写其一的中间态；
+        // 路由判定与 Job **同事务**写入。构造 Job 失败时不留下只写其一的中间态；
         // 幂等重放分支在上方已 rollback 并返回，不写本表。
         let considered = serde_json::to_value(&routing.considered)
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
