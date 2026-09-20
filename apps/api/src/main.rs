@@ -2,17 +2,18 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     body::Bytes,
-    extract::{DefaultBodyLimit, Path, State},
+    extract::{DefaultBodyLimit, Path, Query, State},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
+use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
     AdapterRegistry, ApplicationError, AssetService, GenerationService, HubRepository,
-    IdentityService, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
-    RuntimeService,
+    IdentityService, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RuntimeService,
 };
 use seeai_domain::{
     AccountId, AssetBinding, AssetId, CreateImageGeneration, ImageBranch, JobId, JobState,
@@ -87,6 +88,7 @@ async fn main() -> Result<()> {
             "/api/v1/reconciliation-cases/{job_id}/refund",
             post(refund_reconciliation),
         )
+        .route("/api/v1/provider-failures", get(list_provider_failures))
         .route("/v1/assets", post(upload_asset))
         .route("/v1/assets/{asset_id}", get(download_asset))
         .route("/v1/image-generations", post(create_generation))
@@ -205,6 +207,98 @@ async fn list_reconciliation_cases(
 ) -> Result<Json<Vec<seeai_application::ReconciliationCaseView>>, ApiError> {
     require_admin(&state, &headers)?;
     Ok(Json(state.reconciliation.list_open().await?))
+}
+
+/// 平台侧失败清单的查询参数：`kind` 为逗号分隔的类别、`since` 为 RFC3339、`limit` 为条数上限。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderFailuresQuery {
+    kind: Option<String>,
+    since: Option<DateTime<Utc>>,
+    limit: Option<u32>,
+}
+
+const DEFAULT_FAILURE_LIMIT: u32 = 100;
+const MAX_FAILURE_LIMIT: u32 = 500;
+
+/// 平台侧失败清单的响应：不翻页，因此必须让调用方看得出结果被截断了。
+#[derive(Debug, Serialize)]
+struct ProviderFailuresResponse {
+    failures: Vec<ProviderFailureView>,
+    count: usize,
+    truncated: bool,
+}
+
+/// 平台侧失败清单（仅管理员）：运营用它发现平台在渠道侧欠费、凭证/配置问题与平台自己的 bug。
+///
+/// 渠道的原始码与原文只在这个管理端视图里出现；其中可能夹带凭证片段，先过滤再返回。
+/// `kind` 的取值与落库值同名（见 `crates/adapter-sdk` 的 `ProviderFailureKind`）：它是本平台
+/// 管理端的取值契约，改枚举名即改接口。不传 `kind` 时只列平台侧事件。
+async fn list_provider_failures(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProviderFailuresQuery>,
+) -> Result<Json<ProviderFailuresResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    let kinds = match query.kind.as_deref().map(str::trim) {
+        Some(raw) if !raw.is_empty() => raw
+            .split(',')
+            .map(str::trim)
+            .map(|value| {
+                ProviderFailureKind::parse(value).ok_or_else(|| {
+                    ApiError::bad_request(
+                        "invalid_failure_kind",
+                        format!("unknown failure kind: {value}"),
+                    )
+                })
+            })
+            .collect::<Result<Vec<_>, _>>()?,
+        _ => Vec::new(),
+    };
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_FAILURE_LIMIT)
+        .clamp(1, MAX_FAILURE_LIMIT);
+    let failures = state
+        .reconciliation
+        .provider_failures(ProviderFailureQuery {
+            kinds,
+            since: query.since,
+            limit,
+        })
+        .await?
+        .into_iter()
+        .map(|mut view| {
+            view.provider_error_message = view
+                .provider_error_message
+                .as_deref()
+                .map(sanitize_provider_text);
+            view
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(ProviderFailuresResponse {
+        count: failures.len(),
+        truncated: failures.len() as u32 == limit,
+        failures,
+    }))
+}
+
+/// 过滤渠道原文里的凭证片段：有的渠道错误消息会回显密钥后几位（形如 `key(abcdef)`）。
+///
+/// 这是**兜底**，不是凭证保护的主力——凭证永远不从环境变量以外的渠道进响应；它只处理
+/// 上游把片段写进错误文本这一种情况。括号没闭合时宁可丢掉后半句，也不把可疑片段放出去。
+fn sanitize_provider_text(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(index) = rest.find("key(") {
+        out.push_str(rest.get(..index).unwrap_or_default());
+        match rest.get(index..).and_then(|tail| tail.find(')')) {
+            Some(end) => rest = rest.get(index + end + 1..).unwrap_or_default(),
+            None => return out,
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 #[derive(Debug, Deserialize)]
@@ -437,4 +531,39 @@ fn init_tracing() {
         .with_env_filter(filter)
         .json()
         .init();
+}
+
+#[cfg(test)]
+mod tests {
+    use super::sanitize_provider_text;
+
+    #[test]
+    fn credential_fragments_are_removed_from_provider_text() {
+        assert_eq!(
+            sanitize_provider_text("Forbidden – key(ab12cd) allowed only from approved IP ranges."),
+            "Forbidden –  allowed only from approved IP ranges."
+        );
+        // 一条消息里出现多次也要全去掉。
+        assert_eq!(
+            sanitize_provider_text("key(aaa) then key(bbb) done"),
+            " then  done"
+        );
+    }
+
+    #[test]
+    fn text_without_credential_fragments_is_untouched() {
+        assert_eq!(
+            sanitize_provider_text("insufficient_user_quota: quota exhausted"),
+            "insufficient_user_quota: quota exhausted"
+        );
+    }
+
+    #[test]
+    fn an_unclosed_fragment_drops_the_rest_of_the_message() {
+        // 宁可丢掉后半句，也不能把括号里的内容放出去。
+        assert_eq!(
+            sanitize_provider_text("Forbidden – key(ab12cd nothing closes this"),
+            "Forbidden – "
+        );
+    }
 }

@@ -1,6 +1,7 @@
 use async_trait::async_trait;
 use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
+pub use seeai_adapter_sdk::ProviderFailureKind;
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, ImageAdapter, PreparedImageRequest, ProviderCredential,
     ProviderSuccess, ResolvedAsset, RetrySafety,
@@ -473,11 +474,75 @@ pub struct ClaimedJob {
     pub lease_expires_at: DateTime<Utc>,
 }
 
+/// 对客错误码：**消费者能看到的只有这三种**。渠道的 HTTP 状态码、错误码与原文一律不出现在对客响应里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PublicErrorCode {
+    /// 平台侧故障：平台在渠道侧欠费、凭证或权限问题、我们自己的参数或配置问题、渠道不可用、被限流。
+    PlatformUnavailable,
+    /// 受理状态不明（已进对账）：结果可能已经产生，消费者应当等对账结论。
+    OutcomeUnknown,
+    /// 消费者的内容被渠道拒绝（审核类）。
+    ContentRejected,
+}
+
+impl PublicErrorCode {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PlatformUnavailable => "platform_unavailable",
+            Self::OutcomeUnknown => "outcome_unknown",
+            Self::ContentRejected => "content_rejected",
+        }
+    }
+
+    /// 写进 Job 的平台侧文案：**不含渠道原文**。
+    #[must_use]
+    pub fn default_message(self) -> &'static str {
+        match self {
+            Self::PlatformUnavailable => "the platform could not complete this request",
+            Self::OutcomeUnknown => "the request outcome is unknown; see reconciliation",
+            Self::ContentRejected => "the submitted content was rejected",
+        }
+    }
+
+    /// 从落库值还原。数据库有 CHECK 约束保证取值；解析不到说明存储被绕过，按错误处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "platform_unavailable" => Some(Self::PlatformUnavailable),
+            "outcome_unknown" => Some(Self::OutcomeUnknown),
+            "content_rejected" => Some(Self::ContentRejected),
+            _ => None,
+        }
+    }
+}
+
+/// 对客码的**唯一**派生规则：消费者内容被拒 → `content_rejected`；受理状态不明 → `outcome_unknown`；否则平台侧故障。
+///
+/// 拿不准一律按平台侧处理——渠道说的"账户余额不足"指的是平台在渠道侧的账户，原样返回会让消费者去充值。
+#[must_use]
+pub fn public_error_code(kind: ProviderFailureKind, retry_safety: RetrySafety) -> PublicErrorCode {
+    if kind == ProviderFailureKind::ConsumerContent {
+        PublicErrorCode::ContentRejected
+    } else if retry_safety == RetrySafety::AcceptanceUnknown {
+        PublicErrorCode::OutcomeUnknown
+    } else {
+        PublicErrorCode::PlatformUnavailable
+    }
+}
+
 #[derive(Debug, Clone)]
 pub struct AttemptFailure {
-    pub code: String,
+    /// 渠道原始码或平台内部码：**只留内部**（Attempt 与对账），不进对客响应。
+    pub provider_code: String,
+    /// 对客码：写进 Job，消费者能看到的唯一一种错误码。
+    pub public_code: PublicErrorCode,
+    /// 渠道原文或平台说明：只留内部。
     pub message: String,
     pub trace_id: Option<String>,
+    /// 平台侧失败类别：决定对客码与"是否属平台侧事件"。
+    pub kind: ProviderFailureKind,
     pub target_state: JobState,
     pub hold_disposition: HoldDisposition,
 }
@@ -528,6 +593,36 @@ pub struct ReconciliationCaseView {
     pub reason: String,
     pub provider_trace_id: Option<String>,
     pub created_at: DateTime<Utc>,
+}
+
+/// 一条平台侧失败记录：运营用它发现平台在渠道侧欠费、凭证/配置问题，以及平台自己的 bug。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderFailureView {
+    pub job_id: JobId,
+    pub account_id: AccountId,
+    /// 客户选的型号；列表里可以直接看出是哪条供给出的问题。
+    pub native_model_id: String,
+    /// 当时选中的 Offering。
+    pub offering_id: OfferingId,
+    /// 渠道类别（例如 AIHubMix / APIMart）；没有渠道信息时为 `None`。
+    pub provider_kind: Option<String>,
+    pub kind: ProviderFailureKind,
+    pub error_code: PublicErrorCode,
+    pub provider_trace_id: Option<String>,
+    /// 渠道原始码：**只在这个管理端视图里出现**，对客响应看不到。
+    pub provider_error_code: Option<String>,
+    /// 渠道原文（已过滤密钥类片段）。
+    pub provider_error_message: Option<String>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 平台侧失败清单的筛选条件。
+#[derive(Debug, Clone)]
+pub struct ProviderFailureQuery {
+    /// 要筛的类别；空表示不在这一层过滤（用例层会把空展开成"平台侧类别"）。
+    pub kinds: Vec<ProviderFailureKind>,
+    pub since: Option<DateTime<Utc>>,
+    pub limit: u32,
 }
 
 #[derive(Debug, Error)]
@@ -654,10 +749,27 @@ pub trait HubRepository: Send + Sync {
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError>;
 
+    /// 平台侧失败清单（供运营发现欠费/凭证/配置问题）：按类别与时间筛。
+    async fn provider_failures(
+        &self,
+        query: ProviderFailureQuery,
+    ) -> Result<Vec<ProviderFailureView>, ApplicationError>;
+
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,
     ) -> Result<(), ApplicationError>;
+}
+
+/// 平台侧失败清单不传类别时的默认集合：只列**平台侧事件**。
+///
+/// 渠道不可用、被限流、消费者内容被拒虽然也记在库里，但不是运营要去修的东西——
+/// 它们要显式按类别才查得到。
+fn default_failure_kinds() -> Vec<ProviderFailureKind> {
+    ProviderFailureKind::ALL
+        .into_iter()
+        .filter(|kind| kind.is_platform_side())
+        .collect()
 }
 
 #[derive(Clone)]
@@ -673,6 +785,28 @@ impl ReconciliationService {
 
     pub async fn list_open(&self) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
         self.repository.list_open_reconciliation_cases().await
+    }
+
+    /// 平台侧失败清单。
+    ///
+    /// 不传类别时只列**平台侧事件**（欠费、凭证/配置问题、平台自己的 bug）；渠道不可用、
+    /// 被限流、消费者内容被拒虽然在库里，但不是运营要去修的，要显式按类别才查得到。
+    pub async fn provider_failures(
+        &self,
+        query: ProviderFailureQuery,
+    ) -> Result<Vec<ProviderFailureView>, ApplicationError> {
+        let kinds = if query.kinds.is_empty() {
+            default_failure_kinds()
+        } else {
+            query.kinds
+        };
+        self.repository
+            .provider_failures(ProviderFailureQuery {
+                kinds,
+                since: query.since,
+                limit: query.limit,
+            })
+            .await
     }
 
     pub async fn refund(
@@ -1408,9 +1542,11 @@ impl WorkerService {
                         &self.worker_id,
                         None,
                         AttemptFailure {
-                            code: "worker_prepare_failed".to_owned(),
+                            provider_code: "worker_prepare_failed".to_owned(),
+                            public_code: PublicErrorCode::PlatformUnavailable,
                             message: error.to_string(),
                             trace_id: None,
+                            kind: ProviderFailureKind::PlatformInternal,
                             target_state: JobState::Failed,
                             hold_disposition: HoldDisposition::Release,
                         },
@@ -1435,9 +1571,11 @@ impl WorkerService {
                         &self.worker_id,
                         Some(attempt_id),
                         AttemptFailure {
-                            code: "credential_unavailable".to_owned(),
+                            provider_code: "credential_unavailable".to_owned(),
+                            public_code: PublicErrorCode::PlatformUnavailable,
                             message: error.to_string(),
                             trace_id: None,
+                            kind: ProviderFailureKind::PlatformInternal,
                             target_state: JobState::Failed,
                             hold_disposition: HoldDisposition::Release,
                         },
@@ -1459,9 +1597,11 @@ impl WorkerService {
                         &self.worker_id,
                         Some(attempt_id),
                         AttemptFailure {
-                            code: "adapter_configuration_failed".to_owned(),
+                            provider_code: "adapter_configuration_failed".to_owned(),
+                            public_code: PublicErrorCode::PlatformUnavailable,
                             message: error.to_string(),
                             trace_id: None,
+                            kind: ProviderFailureKind::PlatformInternal,
                             target_state: JobState::Failed,
                             hold_disposition: HoldDisposition::Release,
                         },
@@ -1485,9 +1625,11 @@ impl WorkerService {
                             &self.worker_id,
                             Some(attempt_id),
                             AttemptFailure {
-                                code: "result_delivery_failed".to_owned(),
+                                provider_code: "result_delivery_failed".to_owned(),
+                                public_code: PublicErrorCode::OutcomeUnknown,
                                 message: error.to_string(),
                                 trace_id: None,
+                                kind: ProviderFailureKind::PlatformInternal,
                                 target_state: JobState::ReconciliationRequired,
                                 hold_disposition: HoldDisposition::RetainForReconciliation,
                             },
@@ -1529,6 +1671,7 @@ impl WorkerService {
                             message,
                             trace_id: None,
                             retry_safety: RetrySafety::AcceptanceUnknown,
+                            kind: ProviderFailureKind::PlatformInternal,
                         }.into());
                     }
                     return result;
@@ -1789,9 +1932,11 @@ fn canonicalize_json(value: &mut Value) {
 fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
     match error {
         AdapterError::Provider(provider) => AttemptFailure {
-            code: provider.code,
+            public_code: public_error_code(provider.kind, provider.retry_safety),
+            provider_code: provider.code,
             message: provider.message,
             trace_id: provider.trace_id,
+            kind: provider.kind,
             target_state: if provider.retry_safety == RetrySafety::AcceptanceUnknown {
                 JobState::ReconciliationRequired
             } else {
@@ -1805,9 +1950,11 @@ fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
         },
         AdapterError::Configuration(message) | AdapterError::UnsupportedInput(message) => {
             AttemptFailure {
-                code: "adapter_rejected".to_owned(),
+                provider_code: "adapter_rejected".to_owned(),
+                public_code: PublicErrorCode::PlatformUnavailable,
                 message,
                 trace_id: None,
+                kind: ProviderFailureKind::PlatformInternal,
                 target_state: JobState::Failed,
                 hold_disposition: HoldDisposition::Release,
             }
@@ -2478,6 +2625,13 @@ mod tests {
             Ok(())
         }
 
+        async fn provider_failures(
+            &self,
+            _query: ProviderFailureQuery,
+        ) -> Result<Vec<ProviderFailureView>, ApplicationError> {
+            Ok(Vec::new())
+        }
+
         async fn list_open_reconciliation_cases(
             &self,
         ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
@@ -2553,6 +2707,7 @@ mod tests {
                     message: "missing verified usage".to_owned(),
                     trace_id: None,
                     retry_safety: RetrySafety::AcceptanceUnknown,
+                    kind: ProviderFailureKind::PlatformInternal,
                 }
                 .into());
             }
@@ -2769,9 +2924,15 @@ mod tests {
             .take()
             .expect("delivery failure must be recorded");
         assert_eq!(
-            failure.code, "result_delivery_failed",
+            failure.provider_code, "result_delivery_failed",
             "the delivery failure must carry its own code, distinct from acceptance-unknown"
         );
+        assert_eq!(
+            failure.public_code,
+            PublicErrorCode::OutcomeUnknown,
+            "the result already exists, so the consumer must wait for the reconciliation outcome"
+        );
+        assert_eq!(failure.kind, ProviderFailureKind::PlatformInternal);
         assert_eq!(failure.target_state, JobState::ReconciliationRequired);
         assert_eq!(
             failure.hold_disposition,
@@ -2785,6 +2946,248 @@ mod tests {
                 .expect("completion lock")
                 .is_none(),
             "no settlement may happen when the result could not be archived"
+        );
+    }
+
+    /// 渠道侧的失败一律说成平台侧故障；只有消费者内容被拒才是消费者的错。
+    #[test]
+    fn channel_failures_are_reported_as_platform_problems() {
+        // (场景, 类别, `retry_safety`, 对客码)
+        let rows = [
+            (
+                "渠道账户欠费：AIHubMix 403 insufficient_user_quota / APIMart 402 payment_required",
+                ProviderFailureKind::PlatformFunding,
+                RetrySafety::NotRetryable,
+                PublicErrorCode::PlatformUnavailable,
+            ),
+            (
+                "渠道侧凭证、权限或渠道被禁用：AIHubMix 403 的其余分支",
+                ProviderFailureKind::PlatformCredential,
+                RetrySafety::NotRetryable,
+                PublicErrorCode::PlatformUnavailable,
+            ),
+            (
+                "渠道用 500 承载的参数错误：APIMart 500 build_request_failed",
+                ProviderFailureKind::UpstreamRejected,
+                RetrySafety::NotRetryable,
+                PublicErrorCode::PlatformUnavailable,
+            ),
+            (
+                "渠道限流",
+                ProviderFailureKind::UpstreamRateLimited,
+                RetrySafety::SafeBeforeAcceptance,
+                PublicErrorCode::PlatformUnavailable,
+            ),
+            (
+                "渠道 5xx、网络中断或响应形状不可用",
+                ProviderFailureKind::UpstreamUnavailable,
+                RetrySafety::SafeBeforeAcceptance,
+                PublicErrorCode::PlatformUnavailable,
+            ),
+            (
+                "拿不准的渠道失败",
+                ProviderFailureKind::Unknown,
+                RetrySafety::NotRetryable,
+                PublicErrorCode::PlatformUnavailable,
+            ),
+            (
+                "受理状态不明：APIMart 409 idempotency_result_indeterminate",
+                ProviderFailureKind::Unknown,
+                RetrySafety::AcceptanceUnknown,
+                PublicErrorCode::OutcomeUnknown,
+            ),
+            (
+                "渠道按幂等子类拒了平台的请求：APIMart 409 idempotency_in_progress / key_reused",
+                ProviderFailureKind::UpstreamRejected,
+                RetrySafety::AcceptanceUnknown,
+                PublicErrorCode::OutcomeUnknown,
+            ),
+            (
+                "渠道不可用且拿不准是否已受理",
+                ProviderFailureKind::UpstreamUnavailable,
+                RetrySafety::AcceptanceUnknown,
+                PublicErrorCode::OutcomeUnknown,
+            ),
+            (
+                "消费者内容被渠道拒绝",
+                ProviderFailureKind::ConsumerContent,
+                RetrySafety::NotRetryable,
+                PublicErrorCode::ContentRejected,
+            ),
+            (
+                "平台自己的问题：租约过期、结果交付失败、配置错误",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::AcceptanceUnknown,
+                PublicErrorCode::OutcomeUnknown,
+            ),
+        ];
+        for (scenario, kind, retry_safety, expected) in rows {
+            assert_eq!(
+                public_error_code(kind, retry_safety),
+                expected,
+                "场景的对客码不符：{scenario}"
+            );
+        }
+    }
+
+    /// 对客码只有三个取值：新增类别或新增 `retry_safety` 都不能让第四个值溜出去。
+    #[test]
+    fn every_failure_kind_stays_inside_the_public_error_whitelist() {
+        let safeties = [
+            RetrySafety::SafeBeforeAcceptance,
+            RetrySafety::NotRetryable,
+            RetrySafety::AcceptanceUnknown,
+        ];
+        for kind in ProviderFailureKind::ALL {
+            for retry_safety in safeties {
+                let code = public_error_code(kind, retry_safety);
+                assert!(
+                    PublicErrorCode::parse(code.as_str()).is_some(),
+                    "{kind:?} 与 {retry_safety:?} 组合出了白名单外的对客码"
+                );
+                assert!(!code.default_message().is_empty());
+            }
+        }
+    }
+
+    /// 平台内部码走的是同一条白名单：`platform_unavailable`，或"结果不明"时的 `outcome_unknown`。
+    ///
+    /// 这些码由平台自己产生（不经渠道），因此必须逐个钉住——它们是"平台自己的 bug/运维缺口"
+    /// 唯一对外的说法。
+    #[test]
+    fn platform_internal_codes_stay_inside_the_public_error_whitelist() {
+        // (平台内部码, 类别, `retry_safety`)——与各写入点的取值一致。
+        let rows = [
+            (
+                "adapter_rejected",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::NotRetryable,
+            ),
+            (
+                "worker_prepare_failed",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::NotRetryable,
+            ),
+            (
+                "credential_unavailable",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::NotRetryable,
+            ),
+            (
+                "adapter_configuration_failed",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::NotRetryable,
+            ),
+            (
+                "result_delivery_failed",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::AcceptanceUnknown,
+            ),
+            (
+                "worker_lease_expired",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::AcceptanceUnknown,
+            ),
+            (
+                "reconciliation_refunded",
+                ProviderFailureKind::PlatformInternal,
+                RetrySafety::NotRetryable,
+            ),
+        ];
+        for (code, kind, retry_safety) in rows {
+            let public = public_error_code(kind, retry_safety);
+            assert!(
+                PublicErrorCode::parse(public.as_str()).is_some(),
+                "{code} 落到了白名单外：{public:?}"
+            );
+            assert_ne!(
+                public,
+                PublicErrorCode::ContentRejected,
+                "{code} 是平台自己的问题，不许说成消费者内容被拒"
+            );
+        }
+    }
+
+    /// 不传类别时只列平台侧事件：渠道不可用、被限流、消费者内容被拒都不在内。
+    #[test]
+    fn the_default_failure_list_covers_only_platform_side_events() {
+        assert_eq!(
+            default_failure_kinds(),
+            vec![
+                ProviderFailureKind::PlatformFunding,
+                ProviderFailureKind::PlatformCredential,
+                ProviderFailureKind::PlatformInternal,
+                ProviderFailureKind::UpstreamRejected,
+                ProviderFailureKind::Unknown,
+            ]
+        );
+    }
+
+    /// `content_rejected` 专指消费者的内容被拒：别的类别都不许用它。
+    #[test]
+    fn only_consumer_content_becomes_a_consumer_error() {
+        let safeties = [
+            RetrySafety::SafeBeforeAcceptance,
+            RetrySafety::NotRetryable,
+            RetrySafety::AcceptanceUnknown,
+        ];
+        for retry_safety in safeties {
+            for kind in ProviderFailureKind::ALL {
+                let code = public_error_code(kind, retry_safety);
+                if kind == ProviderFailureKind::ConsumerContent {
+                    assert_eq!(code, PublicErrorCode::ContentRejected);
+                } else {
+                    assert_ne!(code, PublicErrorCode::ContentRejected);
+                }
+            }
+        }
+    }
+
+    /// 落库值与类型必须一一对应：数据库的 CHECK 约束用的是同一批字符串。
+    #[test]
+    fn stored_failure_kinds_and_public_codes_round_trip() {
+        for kind in ProviderFailureKind::ALL {
+            assert_eq!(ProviderFailureKind::parse(kind.as_str()), Some(kind));
+        }
+        assert_eq!(ProviderFailureKind::parse("provider_error"), None);
+        for code in [
+            PublicErrorCode::PlatformUnavailable,
+            PublicErrorCode::OutcomeUnknown,
+            PublicErrorCode::ContentRejected,
+        ] {
+            assert_eq!(PublicErrorCode::parse(code.as_str()), Some(code));
+        }
+        assert_eq!(PublicErrorCode::parse("402"), None);
+    }
+
+    /// 渠道原始码留在内部，对客码独立派生。
+    #[test]
+    fn adapter_failures_keep_the_channel_code_internal() {
+        let failure = failure_from_adapter(AdapterError::Provider(ProviderCallError {
+            code: "payment_required".to_owned(),
+            message: "account balance is insufficient".to_owned(),
+            trace_id: Some("trace-payment".to_owned()),
+            retry_safety: RetrySafety::NotRetryable,
+            kind: ProviderFailureKind::PlatformFunding,
+        }));
+        assert_eq!(failure.provider_code, "payment_required");
+        assert_eq!(failure.public_code, PublicErrorCode::PlatformUnavailable);
+        assert_eq!(failure.kind, ProviderFailureKind::PlatformFunding);
+        assert_eq!(failure.target_state, JobState::Failed);
+        assert_eq!(failure.hold_disposition, HoldDisposition::Release);
+
+        let unknown = failure_from_adapter(AdapterError::Provider(ProviderCallError {
+            code: "idempotency_result_indeterminate".to_owned(),
+            message: "the request may already be accepted".to_owned(),
+            trace_id: None,
+            retry_safety: RetrySafety::AcceptanceUnknown,
+            kind: ProviderFailureKind::UpstreamRejected,
+        }));
+        assert_eq!(unknown.public_code, PublicErrorCode::OutcomeUnknown);
+        assert_eq!(unknown.target_state, JobState::ReconciliationRequired);
+        assert_eq!(
+            unknown.hold_disposition,
+            HoldDisposition::RetainForReconciliation
         );
     }
 }

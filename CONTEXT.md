@@ -83,3 +83,7 @@ _Avoid_: 用户欠费、`insufficient_balance`（那是消费者余额的语义�
 **Consumer Insufficient Balance**:
 消费者在本平台的账户余额不足。它在**受理之前**就被拒绝，是对客可见、有意义的状态。
 _Avoid_: 与 Platform Funding Failure 混用；把平台在渠道侧的额度问题说成"用户余额不足"
+
+**Consumer-Facing Error Code**（对客错误码）:
+消费者在 Job 上唯一看得到的一类错误标识，只有三个取值：`platform_unavailable`（平台侧故障）、`outcome_unknown`（受理状态不明，已进对账）、`content_rejected`（消费者内容被渠道拒绝）。渠道的 HTTP 状态码、错误码与原文只留内部。内部另记失败类别：欠费、凭证/权限、平台自身、渠道拒绝了平台的请求、渠道不可用、渠道限流、消费者内容、不确定——其中**渠道不可用、渠道限流、消费者内容被拒不是平台侧事件**（可观测，但不是平台要去修的），其余四类与"不确定"算平台侧事件。语义与理由见 `docs/adr/0017`。
+_Avoid_: 把渠道的状态码或错误码当对客码、用 `insufficient_user_quota`/`payment_required` 这类渠道标识符对客、把平台欠费说成消费者余额不足

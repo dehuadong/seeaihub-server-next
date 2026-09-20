@@ -17,7 +17,8 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, GeneratedImage, ImageAdapter, PreparedImageRequest,
-    ProviderCallError, ProviderCredential, ProviderSuccess, ResolvedAsset, RetrySafety,
+    ProviderCallError, ProviderCredential, ProviderFailureKind, ProviderSuccess, ResolvedAsset,
+    RetrySafety,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -243,6 +244,7 @@ impl ApimartImageAdapter {
                 "provider_response_invalid",
                 error.to_string(),
                 RetrySafety::SafeBeforeAcceptance,
+                ProviderFailureKind::Unknown,
             ))
         })?;
         // 这个 URL 会被原样写进生成请求，因此先确认它真的是个 http(s) 地址。
@@ -276,6 +278,7 @@ impl ApimartImageAdapter {
                 "provider_response_invalid",
                 error.to_string(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             )
         })?;
         // 文档明确：`data` 是数组，读 `data[0].task_id`。
@@ -290,6 +293,7 @@ impl ApimartImageAdapter {
                     "submit response carried no task id".to_owned(),
                     // 已被受理但没有 task id：无法对账，且绝不能重发。
                     RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
                 )
             })
     }
@@ -342,6 +346,7 @@ impl ApimartImageAdapter {
                     format!("task {task_id} did not reach a terminal state in time"),
                     // 已受理且仍在跑：既不能当失败，也不能重发。
                     RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
                 ));
             }
             // 任务查询是**幂等读**，因此可以安全重试：同一次执行内对瞬时失败退避重试
@@ -356,6 +361,7 @@ impl ApimartImageAdapter {
                     "provider_response_invalid",
                     error.to_string(),
                     RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
                 )
             })?;
             match parsed.data.status.as_str() {
@@ -380,7 +386,12 @@ impl ApimartImageAdapter {
                                 parsed.data.status.clone(),
                             )
                         });
-                    return Err(provider_error(&code, message, RetrySafety::NotRetryable));
+                    return Err(provider_error(
+                        &code,
+                        message,
+                        RetrySafety::NotRetryable,
+                        ProviderFailureKind::Unknown,
+                    ));
                 }
                 // 文档两份取值集合不一致（`submitted`/`processing`/`pending`/`in_progress`），
                 // 且可能出现未列出的取值——**未知取值继续轮询，不得当失败**。
@@ -480,6 +491,7 @@ impl ApimartImageAdapter {
                     "provider_output_too_large",
                     "provider output exceeded the configured safety limit".to_owned(),
                     RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
                 ));
             }
             images.push(image);
@@ -489,6 +501,7 @@ impl ApimartImageAdapter {
                 "provider_result_empty",
                 "provider returned no images".to_owned(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             ));
         }
         Ok(ProviderSuccess {
@@ -679,6 +692,7 @@ impl TaskData {
                 "task response carried no token usage".to_owned(),
                 // 已生成但计量缺失：不得猜测费用，进对账。
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             )
         })?;
         // 分项缺失时**不猜测**文本/图片的划分——直接失败（缺字段不得猜测费用）。
@@ -687,6 +701,7 @@ impl TaskData {
                 "provider_usage_incomplete",
                 "input_tokens_details is missing".to_owned(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             )
         })?;
         let output = usage.output_tokens_details.as_ref().ok_or_else(|| {
@@ -694,6 +709,7 @@ impl TaskData {
                 "provider_usage_incomplete",
                 "output_tokens_details is missing".to_owned(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             )
         })?;
         // 分项之和必须等于顶层计数，否则我们无法确信哪一项可信。
@@ -704,6 +720,7 @@ impl TaskData {
                 "provider_usage_inconsistent",
                 "token detail buckets do not sum to the reported totals".to_owned(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             ));
         }
         Ok(TokenUsage {
@@ -734,6 +751,7 @@ impl TaskData {
                 "provider_result_missing",
                 "completed task carried no image url".to_owned(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             ));
         }
         Ok(urls)
@@ -770,6 +788,7 @@ async fn read_bytes(response: reqwest::Response, limit: usize) -> Result<Bytes, 
                 "provider_response_too_large",
                 "provider response exceeded the configured safety limit".to_owned(),
                 RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
             ));
         }
         body.extend_from_slice(&chunk);
@@ -841,11 +860,47 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
             _ => RetrySafety::AcceptanceUnknown,
         }
     };
+    // 平台侧失败类别：与 `retry_safety` 用的是同一批信号，但结论是另一个维度。
+    // `409` 的幂等子类标识符可能落在 `error.code`（字符串）或消息文本里，两处都看。
+    let idempotency_text = format!(
+        "{} {}",
+        parsed
+            .as_ref()
+            .and_then(|value| value.error.code.as_ref())
+            .and_then(Value::as_str)
+            .unwrap_or_default(),
+        message
+    );
+    // 第一方口径：这两个子类能证明请求未被受理，属"渠道拒了平台的请求"。
+    // `idempotency_result_indeterminate` 不能证明，落 `Unknown`（拿不准按平台侧处理）。
+    let idempotency_rejected = idempotency_text.contains("idempotency_in_progress")
+        || idempotency_text.contains("idempotency_key_reused");
+    let kind = if message.starts_with("build_request_failed") {
+        // 用 5xx 承载的参数错误仍然是"渠道拒绝了平台的请求"。
+        ProviderFailureKind::UpstreamRejected
+    } else if idempotency_rejected {
+        ProviderFailureKind::UpstreamRejected
+    } else {
+        match raw_code {
+            Some(400) => ProviderFailureKind::UpstreamRejected,
+            Some(401 | 403) => ProviderFailureKind::PlatformCredential,
+            Some(402) => ProviderFailureKind::PlatformFunding,
+            Some(429) => ProviderFailureKind::UpstreamRateLimited,
+            Some(500..=599) => ProviderFailureKind::UpstreamUnavailable,
+            // 没有可用的 `error.code` 时，只有凭据/余额类状态码还能说明是谁的问题。
+            _ => match status.as_u16() {
+                401 | 403 => ProviderFailureKind::PlatformCredential,
+                402 => ProviderFailureKind::PlatformFunding,
+                _ => ProviderFailureKind::Unknown,
+            },
+        }
+    };
     ProviderCallError {
         code,
         message,
         trace_id: None,
         retry_safety,
+        kind,
     }
 }
 
@@ -897,6 +952,8 @@ fn upload_failure(error: AdapterError) -> AdapterError {
             &provider.code,
             provider.message,
             RetrySafety::SafeBeforeAcceptance,
+            // 这里只改 `retry_safety`：内层已经判出的失败类别原样保留。
+            provider.kind,
         ),
         other => other,
     }
@@ -907,6 +964,7 @@ fn upload_transport_error(error: reqwest::Error) -> AdapterError {
         "provider_transport_error",
         error.to_string(),
         RetrySafety::SafeBeforeAcceptance,
+        ProviderFailureKind::UpstreamUnavailable,
     )
 }
 
@@ -918,6 +976,7 @@ fn validate_uploaded_url(raw: &str) -> Result<String, AdapterError> {
             "provider_response_invalid",
             format!("upload response carried no usable http(s) url: {raw}"),
             RetrySafety::SafeBeforeAcceptance,
+            ProviderFailureKind::Unknown,
         )),
     }
 }
@@ -932,12 +991,18 @@ fn upload_filename(asset: &ResolvedAsset) -> String {
     };
     format!("asset-{}.{extension}", asset.sha256)
 }
-fn provider_error(code: &str, message: String, retry_safety: RetrySafety) -> AdapterError {
+fn provider_error(
+    code: &str,
+    message: String,
+    retry_safety: RetrySafety,
+    kind: ProviderFailureKind,
+) -> AdapterError {
     ProviderCallError {
         code: code.to_owned(),
         message,
         trace_id: None,
         retry_safety,
+        kind,
     }
     .into()
 }
@@ -952,6 +1017,8 @@ fn after_acceptance(error: AdapterError) -> AdapterError {
             &provider.code,
             provider.message,
             RetrySafety::AcceptanceUnknown,
+            // 这里只改 `retry_safety`：内层已经判出的失败类别原样保留。
+            provider.kind,
         ),
         other => other,
     }
@@ -964,6 +1031,7 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
         "provider_transport_error",
         error.to_string(),
         RetrySafety::AcceptanceUnknown,
+        ProviderFailureKind::UpstreamUnavailable,
     )
 }
 
@@ -981,6 +1049,7 @@ fn validate_image_magic(bytes: &[u8], media_type: &str) -> Result<(), AdapterErr
             "provider_result_invalid_media",
             format!("result bytes do not match declared media type {media_type}"),
             RetrySafety::AcceptanceUnknown,
+            ProviderFailureKind::Unknown,
         ))
     }
 }
@@ -1086,24 +1155,32 @@ mod tests {
 
     #[test]
     fn error_classification_uses_code_not_status() {
-        // 400 参数错误：未受理。
-        assert_eq!(
-            parse_provider_error(StatusCode::BAD_REQUEST, &envelope(400, "bad")).retry_safety,
-            RetrySafety::NotRetryable
+        // 400 参数错误：未受理；类别上是渠道拒绝了平台的请求。
+        let error = parse_provider_error(StatusCode::BAD_REQUEST, &envelope(400, "bad"));
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRejected);
+        // 401/403：平台与渠道之间的凭据问题；402：平台在渠道侧欠费。
+        let error = parse_provider_error(StatusCode::UNAUTHORIZED, &envelope(401, "no"));
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        assert_eq!(error.kind, ProviderFailureKind::PlatformCredential);
+        let error = parse_provider_error(StatusCode::PAYMENT_REQUIRED, &envelope(402, "pay up"));
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        assert_eq!(error.kind, ProviderFailureKind::PlatformFunding);
+        let error = parse_provider_error(StatusCode::FORBIDDEN, &envelope(403, "no"));
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        assert_eq!(error.kind, ProviderFailureKind::PlatformCredential);
+        // 429 限流：不能证明未生成；类别上是渠道对平台限流。
+        let error =
+            parse_provider_error(StatusCode::TOO_MANY_REQUESTS, &envelope(429, "slow down"));
+        assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRateLimited);
+        // 其它 5xx：渠道不可用。
+        let error = parse_provider_error(
+            StatusCode::INTERNAL_SERVER_ERROR,
+            &envelope(500, "internal error"),
         );
-        // 401/402/403：凭据、余额、权限，重试同一配置无意义。
-        for code in [401, 402, 403] {
-            assert_eq!(
-                parse_provider_error(StatusCode::UNAUTHORIZED, &envelope(code, "no")).retry_safety,
-                RetrySafety::NotRetryable
-            );
-        }
-        // 429 限流：不能证明未生成。
-        assert_eq!(
-            parse_provider_error(StatusCode::TOO_MANY_REQUESTS, &envelope(429, "slow down"))
-                .retry_safety,
-            RetrySafety::AcceptanceUnknown
-        );
+        assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamUnavailable);
     }
 
     #[test]
@@ -1114,6 +1191,8 @@ mod tests {
             &envelope(500, "build_request_failed: unsupported size"),
         );
         assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        // 用 5xx 承载的参数错误，类别上仍然是渠道拒绝了平台的请求。
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRejected);
     }
 
     #[test]
@@ -1132,6 +1211,36 @@ mod tests {
         let error = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, b"not json");
         assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
         assert_eq!(error.code, "http_500");
+    }
+
+    #[test]
+    fn idempotency_subtypes_are_classified_by_the_first_party_criteria() {
+        // 这两个子类能证明请求未被受理：类别上是"渠道拒了平台的请求"。
+        let body = serde_json::json!({"error": {"code": "idempotency_in_progress", "message": "in flight"}});
+        let error = parse_provider_error(
+            StatusCode::CONFLICT,
+            &serde_json::to_vec(&body).expect("body"),
+        );
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRejected);
+        // 受理判定本项不动：第一方允许"未受理"，但收窄 `retry_safety` 是另一件事。
+        assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
+
+        let body = serde_json::json!({"error": {"code": 409, "message": "idempotency_key_reused"}});
+        let error = parse_provider_error(
+            StatusCode::CONFLICT,
+            &serde_json::to_vec(&body).expect("body"),
+        );
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRejected);
+
+        // 这个子类**不能**证明未受理：拿不准按平台侧处理，不许当成"渠道拒绝了我们的请求"。
+        let body = serde_json::json!({
+            "error": {"code": 409, "message": "idempotency_result_indeterminate"}
+        });
+        let error = parse_provider_error(
+            StatusCode::CONFLICT,
+            &serde_json::to_vec(&body).expect("body"),
+        );
+        assert_eq!(error.kind, ProviderFailureKind::Unknown);
     }
 
     #[test]
@@ -1189,10 +1298,12 @@ mod tests {
             &envelope(503, "build_request_failed: unsupported size"),
         );
         assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
-        // 无 code 但带前缀：同样判为未受理。
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRejected);
+        // 无 code 但带前缀：同样判为未受理，也同样是渠道拒绝了平台的请求。
         let body = br#"{"error":{"message":"build_request_failed: bad field"}}"#;
         let error = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, body);
         assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamRejected);
     }
 
     #[test]
@@ -1295,7 +1406,12 @@ mod tests {
             other => panic!("expected a provider error, got {other:?}"),
         }
         // 已经有 trace id 的不覆盖；非 Provider 错误原样返回。
-        let mut existing = provider_error("x", "y".to_owned(), RetrySafety::AcceptanceUnknown);
+        let mut existing = provider_error(
+            "x",
+            "y".to_owned(),
+            RetrySafety::AcceptanceUnknown,
+            ProviderFailureKind::Unknown,
+        );
         if let AdapterError::Provider(provider) = &mut existing {
             provider.trace_id = Some("from-upstream".to_owned());
         }

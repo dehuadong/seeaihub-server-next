@@ -160,7 +160,7 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 - 首期不声明 Provider cancel/poll 能力；
 - 多图虽然存在于 `/ai/v1` Schema，但 `/v1/images/edits` 的机器 Schema 只声明单个二进制 `image`，因此首期正式 Offering 先发布单图 + 可选 mask；多图待真实 `/v1` 合同或可计量 `/ai/v1` 合同成立后再发布。
 
-错误分类首期规则：`400` 归为请求永久错误；`401/403` 归为凭证、权限、余额或异步开通问题；`429/503` 只有在明确未受理时才自动退避重试；`task_status_unavailable`、`upstream_bad_response`、`upstream_unreachable`、`result_delivery_failed` 均不能仅凭错误码断言「未生成」。
+错误分类首期规则：`400` 归为请求永久错误；`401/403` 归为凭证、权限、余额或异步开通问题；`429/503` 只有在明确未受理时才自动退避重试；`task_status_unavailable`、`upstream_bad_response`、`upstream_unreachable`、`result_delivery_failed` 均不能仅凭错误码断言「未生成」。这些规则只决定**平台内部怎么处置**；消费者看到的错误语义由 `docs/adr/0017-provider-errors-are-rewritten-for-consumers.md` 拥有——渠道报的余额、凭证、限流与参数问题都是平台侧故障，不外泄给消费者。
 
 ## 10. Base URL
 

@@ -295,6 +295,18 @@ struct UpstreamBehaviour {
     unknown_status_times: usize,
     /// 非 0 时，资产上传接口固定返回这个错误状态码 —— 覆盖"上传失败即确定未受理"。
     upload_failure_status: u16,
+    /// 提交生成请求时上游的应答方式。
+    submit: SubmitBehaviour,
+}
+
+/// 提交生成请求时上游的应答方式。
+#[derive(Clone, Default)]
+enum SubmitBehaviour {
+    /// 受理成功并返回任务 id（异步上游）。
+    #[default]
+    Accepted,
+    /// 直接以这个状态码与错误体拒绝：欠费、凭证、参数错误、限流等。
+    Rejected { status: u16, body: Value },
 }
 
 async fn start_fake_upstream_with(
@@ -406,6 +418,22 @@ async fn serve_fake_upstream(
         .expect("upload body");
         let head = format!(
             "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+            payload.len()
+        );
+        socket.write_all(head.as_bytes()).await?;
+        socket.write_all(&payload).await?;
+        socket.flush().await?;
+        return Ok(());
+    }
+
+    // 提交生成请求被上游直接拒：欠费、凭证、参数错误、限流都从这里进。
+    if method == "POST"
+        && path.ends_with("/images/generations")
+        && let SubmitBehaviour::Rejected { status, body } = &behaviour.submit
+    {
+        let payload = serde_json::to_vec(body).expect("rejection body");
+        let head = format!(
+            "HTTP/1.1 {status} Error\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
             payload.len()
         );
         socket.write_all(head.as_bytes()).await?;
@@ -619,6 +647,16 @@ impl DriverHarness {
 
     /// 起装置并发布一条供给。`branches` 决定 Profile 声明哪些入口。
     async fn start(branches: &[&str], behaviour: UpstreamBehaviour) -> Self {
+        Self::start_with_provider("APIMart", "apimart-image-v1", branches, behaviour).await
+    }
+
+    /// 同 `start`，但指定渠道方与适配器 —— 两个渠道的错误码与应答形状不同，需要分别覆盖。
+    async fn start_with_provider(
+        provider_kind: &str,
+        adapter_key: &str,
+        branches: &[&str],
+        behaviour: UpstreamBehaviour,
+    ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
         let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
@@ -632,9 +670,13 @@ impl DriverHarness {
             .await
             .expect("contract database");
 
-        let mut draft = candidate("APIMart", "apimart-image-v1", branches);
+        let mut draft = candidate(provider_kind, adapter_key, branches);
         draft["base_url"] = Value::String(upstream.base_url.clone());
-        draft["credential_env"] = Value::String("APIMART_API_KEY".to_owned());
+        let credential_env = match provider_kind {
+            "AIHubMix" => "AIHUBMIX_API_KEY",
+            _ => "APIMART_API_KEY",
+        };
+        draft["credential_env"] = Value::String(credential_env.to_owned());
         let published =
             publish_candidates(&client, &base_url, &admin_token, Self::MODEL, vec![draft]).await;
         assert_eq!(published, StatusCode::OK, "publication must succeed");
@@ -706,6 +748,7 @@ impl DriverHarness {
             .env("ASSET_STORE", "local")
             .env("ASSET_LOCAL_ROOT", &self.asset_root)
             .env("APIMART_API_KEY", "contract-test-key")
+            .env("AIHUBMIX_API_KEY", "contract-test-key")
             .stdout(Stdio::null())
             .stderr(Stdio::null())
             .spawn()
@@ -903,7 +946,7 @@ async fn image_generation_http_contract() {
     assert_eq!(foreign_asset.status(), StatusCode::NOT_FOUND);
 
     verify_reconciliation_contract(&client, &base_url, &admin_token, &api_key, &database_url).await;
-    verify_lease_recovery_contract(&client, &base_url, &api_key, &database_url).await;
+    verify_lease_recovery_contract(&client, &base_url, &admin_token, &api_key, &database_url).await;
     drop_isolated_database(&database_name).await;
 }
 
@@ -1363,6 +1406,267 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
     outcome.harness.cleanup().await;
 }
 
+/// 上游直接拒绝提交时，消费者看到的必须是**平台侧语义**：渠道的状态码、错误码、原文与上游标识一律不外泄。
+///
+/// 渠道说的"余额不足"指的是平台在渠道侧的账户，原样返回会让消费者去充值。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn channel_rejections_reach_consumers_as_platform_problems() {
+    /// 上游逐请求标识（AIHubMix 错误信封里的 `tid`）：只该留在内部。
+    const UPSTREAM_TRACE_ID: &str = "upstream-trace-9f3a";
+    // (渠道方, 适配器, 状态码, 上游错误体, 渠道码, 渠道原文, 对客码, Job 终态, 是否平台侧事件)
+    let cases = [
+        (
+            "APIMart",
+            "apimart-image-v1",
+            402,
+            json!({"error": {"code": 402, "message": "payment_required: account balance is insufficient"}}),
+            "402",
+            "payment_required: account balance is insufficient",
+            "platform_unavailable",
+            "failed",
+            true,
+        ),
+        (
+            "APIMart",
+            "apimart-image-v1",
+            403,
+            json!({"error": {"code": 403, "message": "permission denied for this key"}}),
+            "403",
+            "permission denied for this key",
+            "platform_unavailable",
+            "failed",
+            true,
+        ),
+        (
+            "APIMart",
+            "apimart-image-v1",
+            500,
+            json!({"error": {"code": 500, "message": "build_request_failed: invalid size 9999x9999"}}),
+            "500",
+            "build_request_failed: invalid size 9999x9999",
+            "platform_unavailable",
+            "failed",
+            true,
+        ),
+        (
+            "APIMart",
+            "apimart-image-v1",
+            503,
+            json!({"error": {"code": 503, "message": "idempotency_unavailable"}}),
+            "503",
+            "idempotency_unavailable",
+            "outcome_unknown",
+            "reconciliation_required",
+            false,
+        ),
+        (
+            "AIHubMix",
+            "aihubmix-image-v1",
+            403,
+            json!({"error": {"code": "insufficient_user_quota", "message": "quota exhausted", "tid": UPSTREAM_TRACE_ID}}),
+            "insufficient_user_quota",
+            "quota exhausted",
+            "platform_unavailable",
+            "failed",
+            true,
+        ),
+    ];
+
+    for (
+        provider_kind,
+        adapter_key,
+        status,
+        error_body,
+        channel_code,
+        channel_message,
+        expected_code,
+        expected_state,
+        platform_side,
+    ) in cases
+    {
+        let behaviour = UpstreamBehaviour {
+            submit: SubmitBehaviour::Rejected {
+                status,
+                body: error_body,
+            },
+            ..UpstreamBehaviour::default()
+        };
+        let harness = DriverHarness::start_with_provider(
+            provider_kind,
+            adapter_key,
+            &["prompt_only"],
+            behaviour,
+        )
+        .await;
+        let key = format!("rejected-{status}-{}", Uuid::new_v4());
+        let (job_id, state) = harness
+            .run_job(route_request(harness.model, &key, "rejected prompt"))
+            .await;
+        assert_eq!(
+            state, expected_state,
+            "{provider_kind} 的 {status} 必须落在 {expected_state}"
+        );
+
+        // 消费者面：只有平台码，没有任何渠道字样。
+        let view: Value = Client::new()
+            .get(format!(
+                "{}/v1/image-generations/{job_id}",
+                harness.base_url
+            ))
+            .bearer_auth(&harness.api_key)
+            .send()
+            .await
+            .expect("job view")
+            .json()
+            .await
+            .expect("job view JSON");
+        assert_eq!(
+            view["error_code"].as_str(),
+            Some(expected_code),
+            "消费者看到的对客码不对：{view}"
+        );
+        let rendered = view.to_string();
+        assert!(
+            !rendered.contains(channel_message),
+            "渠道原文不得出现在消费者面：{rendered}"
+        );
+        assert!(
+            !rendered.contains(channel_code),
+            "渠道码不得出现在消费者面：{rendered}"
+        );
+        assert!(
+            !rendered.contains(UPSTREAM_TRACE_ID),
+            "上游逐请求标识不得出现在消费者面：{rendered}"
+        );
+
+        // 内部记录保留渠道原始码、原文与上游标识：出问题时人要能拿去上游核对。
+        let row = sqlx::query(
+            r#"
+            SELECT a.provider_error_code, a.provider_error_message, a.provider_trace_id,
+                   j.failure_kind
+            FROM generation.jobs j
+            JOIN generation.attempts a ON a.job_id = j.id
+            WHERE j.id = $1
+            "#,
+        )
+        .bind(job_id)
+        .fetch_one(&harness.pool)
+        .await
+        .expect("attempt row");
+        let stored_code: Option<String> = row.try_get("provider_error_code").expect("code");
+        assert_eq!(
+            stored_code.as_deref(),
+            Some(channel_code),
+            "渠道原始码必须留在内部记录里"
+        );
+        let stored_message: Option<String> =
+            row.try_get("provider_error_message").expect("message");
+        assert_eq!(stored_message.as_deref(), Some(channel_message));
+        let stored_trace: Option<String> = row.try_get("provider_trace_id").expect("trace");
+        let expected_trace = (provider_kind == "AIHubMix").then_some(UPSTREAM_TRACE_ID);
+        assert_eq!(
+            stored_trace.as_deref(),
+            expected_trace,
+            "上游给的逐请求标识必须留在内部记录里"
+        );
+        let stored_kind: Option<String> = row.try_get("failure_kind").expect("kind");
+        assert!(
+            stored_kind.is_some(),
+            "每个失败路径都必须记录平台侧失败类别"
+        );
+
+        // 运营面（管理员）能看到渠道原始码；这正是不把它放上消费者面的补偿。
+        // 缺省（不传 kind）只列**平台侧事件**：渠道不可用这类可观测事件要显式按类别才查得到。
+        let stored_kind = stored_kind.expect("kind");
+        let listed = |body: &Value| {
+            body["failures"].as_array().is_some_and(|list| {
+                list.iter()
+                    .any(|entry| entry["job_id"].as_str() == Some(&job_id.to_string()))
+            })
+        };
+        let default_list: Value = Client::new()
+            .get(format!("{}/api/v1/provider-failures", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .send()
+            .await
+            .expect("provider failures")
+            .json()
+            .await
+            .expect("provider failures JSON");
+        assert_eq!(
+            listed(&default_list),
+            platform_side,
+            "缺省清单只该列平台侧事件：{default_list}"
+        );
+
+        let filtered: Value = Client::new()
+            .get(format!(
+                "{}/api/v1/provider-failures?kind={stored_kind}",
+                harness.base_url
+            ))
+            .bearer_auth(&harness.admin_token)
+            .send()
+            .await
+            .expect("filtered failures")
+            .json()
+            .await
+            .expect("filtered failures JSON");
+        assert!(
+            listed(&filtered),
+            "按类别筛选必须能查到这条失败：{filtered}"
+        );
+        let entry = filtered["failures"]
+            .as_array()
+            .and_then(|list| {
+                list.iter()
+                    .find(|entry| entry["job_id"].as_str() == Some(&job_id.to_string()))
+            })
+            .expect("entry");
+        assert_eq!(entry["provider_error_code"].as_str(), Some(channel_code));
+        assert_eq!(entry["error_code"].as_str(), Some(expected_code));
+        assert_eq!(entry["kind"].as_str(), Some(stored_kind.as_str()));
+        assert!(
+            entry["offering_id"].as_str().is_some(),
+            "运营要知道是哪条供给出的问题：{entry}"
+        );
+        assert_eq!(
+            filtered["count"].as_u64(),
+            filtered["failures"]
+                .as_array()
+                .map(|list| list.len() as u64),
+            "响应必须如实给出条数"
+        );
+        assert_eq!(filtered["truncated"], json!(false));
+
+        let unknown_kind = Client::new()
+            .get(format!(
+                "{}/api/v1/provider-failures?kind=nonsense",
+                harness.base_url
+            ))
+            .bearer_auth(&harness.admin_token)
+            .send()
+            .await
+            .expect("unknown kind");
+        assert_eq!(unknown_kind.status(), StatusCode::BAD_REQUEST);
+        let anonymous = Client::new()
+            .get(format!("{}/api/v1/provider-failures", harness.base_url))
+            .send()
+            .await
+            .expect("anonymous failures");
+        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        let consumer_key = Client::new()
+            .get(format!("{}/api/v1/provider-failures", harness.base_url))
+            .bearer_auth(&harness.api_key)
+            .send()
+            .await
+            .expect("consumer key on admin route");
+        assert_eq!(consumer_key.status(), StatusCode::FORBIDDEN);
+
+        harness.cleanup().await;
+    }
+}
+
 struct DriverOutcome {
     job_state: String,
     job_id: Uuid,
@@ -1668,13 +1972,17 @@ async fn verify_reconciliation_contract(
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
     }
     let row = sqlx::query(
-        "SELECT j.state, h.status, h.amount_microusd, a.balance_microusd FROM generation.jobs j JOIN ledger.holds h ON h.job_id = j.id JOIN ledger.accounts a ON a.id = j.account_id WHERE j.id = $1",
+        "SELECT j.state, j.error_code, j.failure_kind, h.status, h.amount_microusd, a.balance_microusd FROM generation.jobs j JOIN ledger.holds h ON h.job_id = j.id JOIN ledger.accounts a ON a.id = j.account_id WHERE j.id = $1",
     )
     .bind(job_id)
     .fetch_one(&pool)
     .await
     .expect("resolved state");
     assert_eq!(row.get::<String, _>("state"), "failed");
+    // 退款是一次平台侧处置，不是"消费者的错"：对客码必须仍在白名单内，
+    // 且退款已结清，不该再让消费者"等对账结论"。
+    assert_eq!(row.get::<String, _>("error_code"), "platform_unavailable");
+    assert_eq!(row.get::<String, _>("failure_kind"), "platform_internal");
     assert_eq!(row.get::<String, _>("status"), "released");
     assert_eq!(
         row.get::<i64, _>("balance_microusd"),
@@ -1700,6 +2008,7 @@ async fn verify_reconciliation_contract(
 async fn verify_lease_recovery_contract(
     client: &Client,
     base_url: &str,
+    admin_token: &str,
     api_key: &str,
     database_url: &str,
 ) {
@@ -1792,6 +2101,35 @@ async fn verify_lease_recovery_contract(
     .await
     .expect("recovery case count");
     assert_eq!(case_count, 1);
+
+    // 租约过期是平台自己的事件，不是渠道事件：它同样必须出现在平台侧失败清单里。
+    let failure_kind: Option<String> =
+        sqlx::query_scalar("SELECT failure_kind FROM generation.jobs WHERE id = $1")
+            .bind(submitted_job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("recovery failure kind");
+    assert_eq!(failure_kind.as_deref(), Some("platform_internal"));
+    let internal: Value = client
+        .get(format!(
+            "{base_url}/api/v1/provider-failures?kind=platform_internal"
+        ))
+        .bearer_auth(admin_token)
+        .send()
+        .await
+        .expect("platform internal failures")
+        .json()
+        .await
+        .expect("platform internal failures JSON");
+    let entry = internal
+        .get("failures")
+        .and_then(Value::as_array)
+        .and_then(|list| {
+            list.iter()
+                .find(|entry| entry["job_id"].as_str() == Some(&submitted_job_id.to_string()))
+        })
+        .unwrap_or_else(|| panic!("租约过期的 Job 必须能被按类别查到：{internal}"));
+    assert_eq!(entry["error_code"].as_str(), Some("outcome_unknown"));
 
     let repeated = repository
         .recover_expired_leases()

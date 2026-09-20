@@ -2,7 +2,8 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
     ApplicationError, AssetRecord, AttemptFailure, ClaimedJob, CompleteJob, HoldDisposition,
-    HubRepository, JobView, LeaseRecovery, PublishRuntimeRequest, ReconciliationCaseView,
+    HubRepository, JobView, LeaseRecovery, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
     RefundReconciliationCommand, RoutingDecision,
 };
 use seeai_domain::{
@@ -831,8 +832,9 @@ impl HubRepository for PgHubRepository {
                 r#"
                 UPDATE generation.jobs
                 SET state = 'reconciliation_required',
-                    error_code = 'worker_lease_expired',
-                    error_message = 'worker lease expired after provider submission began',
+                    error_code = 'outcome_unknown',
+                    error_message = 'the request outcome is unknown; see reconciliation',
+                    failure_kind = 'platform_internal',
                     lease_owner = NULL, lease_expires_at = NULL,
                     version = version + 1, updated_at = now()
                 WHERE id = $1 AND state = 'submitting'
@@ -1111,7 +1113,7 @@ impl HubRepository for PgHubRepository {
             .bind(job_id.0)
             .bind(next_state)
             .bind(&failure.trace_id)
-            .bind(&failure.code)
+            .bind(&failure.provider_code)
             .bind(&failure.message)
             .execute(&mut *transaction)
             .await
@@ -1120,7 +1122,7 @@ impl HubRepository for PgHubRepository {
         sqlx::query(
             r#"
             UPDATE generation.jobs
-            SET state = $3, error_code = $4, error_message = $5,
+            SET state = $3, error_code = $4, error_message = $5, failure_kind = $6,
                 lease_owner = NULL, lease_expires_at = NULL,
                 version = version + 1, updated_at = now()
             WHERE id = $1 AND lease_owner = $2
@@ -1129,8 +1131,9 @@ impl HubRepository for PgHubRepository {
         .bind(job_id.0)
         .bind(worker_id)
         .bind(next_state)
-        .bind(&failure.code)
-        .bind(&failure.message)
+        .bind(failure.public_code.as_str())
+        .bind(failure.public_code.default_message())
+        .bind(failure.kind.as_str())
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1226,6 +1229,77 @@ impl HubRepository for PgHubRepository {
             .collect()
     }
 
+    async fn provider_failures(
+        &self,
+        query: ProviderFailureQuery,
+    ) -> Result<Vec<ProviderFailureView>, ApplicationError> {
+        let kinds: Option<Vec<String>> = if query.kinds.is_empty() {
+            None
+        } else {
+            Some(
+                query
+                    .kinds
+                    .iter()
+                    .map(|kind| kind.as_str().to_owned())
+                    .collect(),
+            )
+        };
+        let rows = sqlx::query(
+            r#"
+            SELECT j.id AS job_id, j.account_id, j.native_model_id, j.offering_id,
+                   c.provider_kind, j.failure_kind, j.error_code, j.updated_at,
+                   a.provider_trace_id, a.provider_error_code, a.provider_error_message
+            FROM generation.jobs j
+            LEFT JOIN generation.attempts a ON a.job_id = j.id
+            LEFT JOIN supply.channels c ON c.id = j.channel_id
+            WHERE j.failure_kind IS NOT NULL
+              AND ($1::text[] IS NULL OR j.failure_kind = ANY($1))
+              AND ($2::timestamptz IS NULL OR j.updated_at >= $2)
+            ORDER BY j.updated_at DESC, j.id
+            LIMIT $3
+            "#,
+        )
+        .bind(kinds)
+        .bind(query.since)
+        .bind(i64::from(query.limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let stored_kind: String = row.try_get("failure_kind").map_err(database_error)?;
+                let kind = ProviderFailureKind::parse(&stored_kind).ok_or_else(|| {
+                    ApplicationError::Persistence(format!(
+                        "unknown platform failure kind in storage: {stored_kind}"
+                    ))
+                })?;
+                let stored_code: String = row.try_get("error_code").map_err(database_error)?;
+                let error_code = PublicErrorCode::parse(&stored_code).ok_or_else(|| {
+                    ApplicationError::Persistence(format!(
+                        "unknown public error code in storage: {stored_code}"
+                    ))
+                })?;
+                Ok(ProviderFailureView {
+                    job_id: JobId(row.try_get("job_id").map_err(database_error)?),
+                    account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+                    native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+                    offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
+                    provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+                    kind,
+                    error_code,
+                    provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
+                    provider_error_code: row
+                        .try_get("provider_error_code")
+                        .map_err(database_error)?,
+                    provider_error_message: row
+                        .try_get("provider_error_message")
+                        .map_err(database_error)?,
+                    updated_at: row.try_get("updated_at").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,
@@ -1309,13 +1383,13 @@ impl HubRepository for PgHubRepository {
         sqlx::query(
             r#"
             UPDATE generation.jobs
-            SET state = 'failed', error_code = $2, error_message = $3,
+            SET state = 'failed', error_code = 'platform_unavailable', error_message = $2,
+                failure_kind = 'platform_internal',
                 version = version + 1, updated_at = now()
             WHERE id = $1 AND state = 'reconciliation_required'
             "#,
         )
         .bind(command.job_id.0)
-        .bind("reconciliation_refunded")
         .bind(&command.note)
         .execute(&mut *transaction)
         .await

@@ -5,7 +5,8 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, GeneratedImage, ImageAdapter, PreparedImageRequest,
-    ProviderCallError, ProviderCredential, ProviderSuccess, ResolvedAsset, RetrySafety,
+    ProviderCallError, ProviderCredential, ProviderFailureKind, ProviderSuccess, ResolvedAsset,
+    RetrySafety,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{ImageBranch, TokenUsage};
@@ -439,6 +440,7 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
         message: error.to_string(),
         trace_id: None,
         retry_safety: RetrySafety::AcceptanceUnknown,
+        kind: ProviderFailureKind::UpstreamUnavailable,
     }
     .into()
 }
@@ -476,6 +478,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
             message: error.to_string(),
             trace_id: None,
             retry_safety: RetrySafety::AcceptanceUnknown,
+            kind: ProviderFailureKind::UpstreamUnavailable,
         })
     })?;
     let usage = parsed.usage.into_domain()?;
@@ -489,6 +492,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
                 message: "response item has no b64_json".to_owned(),
                 trace_id: None,
                 retry_safety: RetrySafety::AcceptanceUnknown,
+                kind: ProviderFailureKind::UpstreamUnavailable,
             })
         })?;
         if encoded.len() > MAX_OUTPUT_IMAGE_BYTES.saturating_mul(4).div_ceil(3) + 4 {
@@ -500,6 +504,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
                 message: error.to_string(),
                 trace_id: None,
                 retry_safety: RetrySafety::AcceptanceUnknown,
+                kind: ProviderFailureKind::UpstreamUnavailable,
             })
         })?;
         if decoded.len() > MAX_OUTPUT_IMAGE_BYTES {
@@ -522,6 +527,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
             message: "provider returned no images".to_owned(),
             trace_id: None,
             retry_safety: RetrySafety::AcceptanceUnknown,
+            kind: ProviderFailureKind::UpstreamUnavailable,
         }));
     }
     Ok(ProviderSuccess {
@@ -538,6 +544,7 @@ fn provider_response_too_large() -> AdapterError {
         message: "provider response exceeded the configured safety limit".to_owned(),
         trace_id: None,
         retry_safety: RetrySafety::AcceptanceUnknown,
+        kind: ProviderFailureKind::UpstreamUnavailable,
     }
     .into()
 }
@@ -548,6 +555,7 @@ fn provider_output_too_large() -> AdapterError {
         message: "provider output image exceeded the configured safety limit".to_owned(),
         trace_id: None,
         retry_safety: RetrySafety::AcceptanceUnknown,
+        kind: ProviderFailureKind::UpstreamUnavailable,
     }
     .into()
 }
@@ -577,11 +585,29 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
     } else {
         RetrySafety::NotRetryable
     };
+    // 平台侧失败类别：与 `retry_safety` 用的是同一批信号，但结论是另一个维度。
+    let http_status = status.as_u16();
+    let kind = match code.as_str() {
+        // 渠道侧账户余额不足，属于平台自己的账户问题。
+        "insufficient_user_quota" => ProviderFailureKind::PlatformFunding,
+        "http_401" | "http_403" => ProviderFailureKind::PlatformCredential,
+        "http_429" => ProviderFailureKind::UpstreamRateLimited,
+        "http_400" => ProviderFailureKind::UpstreamRejected,
+        _ if status.is_server_error() => ProviderFailureKind::UpstreamUnavailable,
+        // 没有可用 `code` 时只能看状态码。
+        _ => match http_status {
+            401 | 403 => ProviderFailureKind::PlatformCredential,
+            429 => ProviderFailureKind::UpstreamRateLimited,
+            400 => ProviderFailureKind::UpstreamRejected,
+            _ => ProviderFailureKind::Unknown,
+        },
+    };
     ProviderCallError {
         code,
         message,
         trace_id,
         retry_safety,
+        kind,
     }
 }
 
@@ -608,6 +634,7 @@ fn validate_image_magic(bytes: &[u8], media_type: &str) -> Result<(), AdapterErr
             message: format!("result does not match declared media type {media_type}"),
             trace_id: None,
             retry_safety: RetrySafety::AcceptanceUnknown,
+            kind: ProviderFailureKind::UpstreamUnavailable,
         }))
     }
 }
@@ -654,6 +681,7 @@ impl UsageResponse {
                 message: error.to_string(),
                 trace_id: None,
                 retry_safety: RetrySafety::AcceptanceUnknown,
+                kind: ProviderFailureKind::UpstreamUnavailable,
             })
         })?;
         Ok(usage)
@@ -798,6 +826,7 @@ mod tests {
         let body = br#"{"error":{"message":"not accepted","code":"service_unavailable"}}"#;
         let error = parse_provider_error(StatusCode::SERVICE_UNAVAILABLE, body);
         assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
+        assert_eq!(error.kind, ProviderFailureKind::UpstreamUnavailable);
     }
 
     #[test]
@@ -812,6 +841,33 @@ mod tests {
         let body = br#"{"error":{"message":"unknown","code":"internal_error"}}"#;
         let error = parse_provider_error(StatusCode::INTERNAL_SERVER_ERROR, body);
         assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
+    }
+
+    #[test]
+    fn provider_error_separates_platform_funding_from_platform_credentials() {
+        // 渠道明确说余额不足：属于平台自己在渠道侧的账户问题。
+        let body = br#"{"error":{"message":"quota exhausted","code":"insufficient_user_quota"}}"#;
+        let error = parse_provider_error(StatusCode::FORBIDDEN, body);
+        assert_eq!(error.retry_safety, RetrySafety::NotRetryable);
+        assert_eq!(error.kind, ProviderFailureKind::PlatformFunding);
+        // 403 但不是余额：凭证、权限或白名单问题。
+        let body = br#"{"error":{"message":"forbidden","code":"permission_denied"}}"#;
+        assert_eq!(
+            parse_provider_error(StatusCode::FORBIDDEN, body).kind,
+            ProviderFailureKind::PlatformCredential
+        );
+        // 没有可用 code 的 403 同样按状态码落到凭据类。
+        let body = br#"{"error":{"message":"forbidden"}}"#;
+        assert_eq!(
+            parse_provider_error(StatusCode::FORBIDDEN, body).kind,
+            ProviderFailureKind::PlatformCredential
+        );
+        // 401：凭据问题。
+        let body = br#"{"error":{"message":"invalid key"}}"#;
+        assert_eq!(
+            parse_provider_error(StatusCode::UNAUTHORIZED, body).kind,
+            ProviderFailureKind::PlatformCredential
+        );
     }
 
     #[test]
