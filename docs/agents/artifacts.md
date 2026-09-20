@@ -5,9 +5,7 @@
 本约定管理工程工件的查找、创建、更新和生命周期，不要求生成全部工件。日常文档治理直接处理并检查；实质改变工程合同的修改按工程流程处理。
 
 注册模式：**保留现有**。
-生效日期与依据：2026-09-19，用户在 setup 评审中确认保留现有工件位置，并纠正 `docs/design/` 为独立技术设计 RFC 的权威位置（不使用 `docs/rfcs/`）。
-仓库管理根目录：`E:\workspace\seeaihub-server-next`（Git 顶层，依据为 `docs/design/0001-image-generation.md` 声明本仓库是该服务端的实现映射）。本注册表是该范围的统一入口，表中位置均相对此根目录解析，不随子项目工作目录改变。普通 Markdown 链接仍相对所在文件解析。
-
+生效日期与依据：2026-09-19，用户在 setup 评审中确认保留现有工件位置，并纠正 `docs/design/` 为独立技术设计 RFC 的权威位置（不使用 `docs/rfcs/`）。 
 本仓库为单上下文：根目录 `CONTEXT.md` 是唯一词汇表，不存在 `CONTEXT-MAP.md`。多上下文只分发领域资料；根目录 `CONTEXT-MAP.md` 可指向各项目的 `CONTEXT.md`，本注册表可登记各上下文的工件位置。新建 Agent Notes 统一部署在根目录 `.agents/notes/`，子项目不另建注册表或记录系统。既有分散位置保留其登记归属，合并迁移需单独授权。
 
 ## 新工件归属
@@ -20,15 +18,14 @@
 | Agent Notes / 工程变更与交付记录 | `.agents/notes/proposed/<分类>/YYYY-MM-DD-主题.md`，交付并验证后移至 `implemented/`，否决时移至 `rejected/`；记录工程变更、交付理由及其验证，可引用 Proposal 与 ADR，不复制提案正文与决策正文 |
 | 独立技术设计 RFC | `docs/design/`；需要独立评审、复用或演进时拆出，由提案引用，是技术设计的权威位置。沿用 `NNNN-slug.md` 顺序编号和既有 `主题` / `当前修订` / `状态` 头格式 |
 | 代码结构图 / 落点索引 | `docs/architecture.md`；回答"哪个 crate、文件、表负责什么"。它**只做索引**：分层的职责与规则归 `docs/design/0004-layered-architecture.md`，持久决定归 `docs/adr/`，冲突时以后两者为准。新增或移动文件、增删路由与表时在**同一变更**里同步 |
-| 调查与探索存档 | `docs/research/`；存放**本仓库 Agent 自己做的**调查与探索记录：结论 + 事实/推论/待确认分开 + 来源。**上游或第三方的原始材料放 `out-reference/`**（只作证据、服务不读取）；已归纳定稿的渠道事实放 `docs/facts/`。写法：**只写重点、不过度解读**；推论与待确认必须标明；结论被推翻时保留更正记录，不静默改写 |
+| 调查与探索存档 | `docs/research/`；存放**本仓库 Agent 自己做的**调查与探索记录：结论 + 事实/推论/待确认分开 + 来源。 已归纳定稿的渠道事实放 `docs/facts/`。写法：**只写重点、不过度解读**；推论与待确认必须标明；结论被推翻时保留更正记录，不静默改写 |
 | 独立行为合同 Spec | `docs/specs/`；明确需要时创建，优先更新同一工作已有 Spec |
 | 受控验证清单 | `docs/verification/`，按 `阶段-slug.md` 命名；记录受控验证的步骤、停止条件与留档要求。**停止条件以来源规划为准**，清单只复述与执行 |
 | 汇总事实登记 | `docs/facts/`；把散在原始证据里的渠道事实归纳成单一出处，引用而不复述。含凭证类内容时只记**变量名** |
 | 持久决定 / ADR | **决策的权威位置**：`docs/adr/`，按 `0001-slug.md` 顺序编号，ADR 拥有决策正文；准入判据、退役处理与引用写法见 `docs/agents/domain.md` |
 | 既有工作项 / 阶段进度 | 按 `docs/agents/issue-tracker.md` 配置；既有工作项能明确本次范围、验收及决定时可直接复用，不另建 Proposal |
 | 实施 Ticket | 按跟踪器配置存储与跟踪，关联所属工作项 |
-| 其他已有工件 | 承接总览与未来进度归 `dehuadong/seeaihub-server-next#1`；上游 `dehuadong/seeaihub#674` 只作冻结的历史来源，不再承接新提案或进度 |
-| 外部参考资源 | `out-reference/`，按 Provider 分目录（`aihubmix/`、`apimart/`、`doubao/`、`openai/`、`openrouter/`）。**只作参考，不是工程工件**，定位见下文「外部参考资源」一节 |
+| 外部参考资源 | `out-reference/`， **只作参考，不是工程工件**，定位见下文「外部参考资源」一节 |
 | 决策记录工具 | `scripts/decisions/{lib,update-index,check}.mjs`；生成并检查 Agent Notes 索引，用法见下文「决策记录工具」 |
 | 受控采集脚本 | `scripts/probe/response-shapes.ps1`：**唯一**会发真实计费调用的入口（默认演练，必须显式加 `-ConfirmPaidCalls`）。用途是把各渠道的真实响应结构落成脱敏文件到 `out-reference/<provider>/`，并把登记补进该渠道的 `response-shapes.md`。凭证只从环境变量读 |
 
@@ -62,18 +59,16 @@ Proposal 的工作状态由 `docs/agents/issue-tracker.md` 拥有的 GitHub 标�
 
 ## 外部参考资源
 
-位置：仓库根目录 `out-reference/`，按 Provider 分目录（`aihubmix/`、`apimart/`、`doubao/`、`openai/`、`openrouter/`），存放第一方协议调研、上游 Schema 快照、错误码表与官方示例代码。
-
-目录名表示「外部参考资源」：材料来自本仓库之外的上游或第三方，**不是工程工件，也不表达平台的对外接口合同**，只作证据使用（见仓库根 `AGENTS.md` 的「工程边界」）。顶层只放按 Provider 命名的目录，不放平铺文件；汇总登记类不放这里（见 `docs/facts/`）。
+位置：仓库根目录 `out-reference/`，按 Provider 分目录，存放第一方协议调研、上游 Schema 快照、错误码表与官方示例代码。
+材料来自本仓库之外的上游或第三方，**不是工程工件，也不表达平台的对外接口合同**，只作证据使用。 
 
 使用规则：
 
 - 引用与追踪用代码格式的根路径措辞，不作为构件依赖，也不从代码或配置里读取；
 - **不得**作为运行时数据源：运行中的服务只使用经审核发布的 Runtime Revision，不跟随远端文档或本目录内容变化；
 - 进入平台合同前必须走「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」流程，平台合同以发布后的不可变修订为准；
-- 新增或更新资料时按来源与证据等级标注（事实 / 推论 / 待确认分开），保留来源 URL、抓取时间与版本信息；
-- 第三方示例代码不参与本仓库构建，不纳入 `cargo fmt` / `clippy` / `test` 的验证范围；
-- **凭证纪律**：只保存脱敏后的记录，真实密钥、Bearer token、task ID 与短期 URL 一律不入库（见仓库根 `AGENTS.md` 的「事实与安全」）。
+- 第三方示例代码不参与本仓库构建，不纳入 `cargo fmt` / `clippy` / `test` 的验证范围； 
+- 新增或更新资料由用户负责维护；
 
 **入库范围**：调研笔记、Schema 快照、错误码表与计量证据样本入版本控制，使 `docs/adr/`、`docs/design/` 中的引用在 clone 后可解析；可运行的第三方示例代码排除（`.gitignore` 忽略 `out-reference/doubao/touch_edit_demo/`）。因此 clone 后缺该目录属预期行为，需要时回上游来源重新获取。
 
