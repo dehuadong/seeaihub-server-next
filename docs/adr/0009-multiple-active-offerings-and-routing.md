@@ -1,6 +1,8 @@
 # 同一 Vendor Model 可以有多个 active Offering，选择由已发布优先级与受理前限制决定
 
-> **状态：未生效。** 本文随工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的第二阶段规划起草；**在该规划通过 Plan Review 之前，本文不是实现依据**，也不得被下游工件当作已接受的决策引用。规划正文见 #2 的规划评论（以该 issue 上标注为「当前唯一可执行版本」的那条为准，不在此写死版本号）。
+> **状态：生效（使用中）· 批准记录缺口待用户确认。** 本文随工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的第二阶段规划起草，随该阶段交付落地，其规则在实现中生效并经空库端到端验证（`publication.runtime_entries.routing_priority`、`generation.routing_decisions`、`crates/application` 的 `select_candidate`）。
+>
+> **缺口（2026-09-20 收口核对，如实登记）**：本文原写"在该规划通过 Plan Review 之前，本文不是实现依据"。核对**没有在 #2 上找到可复核的 Plan Review 通过记录**——该 issue 上的规划正文（v5.21）自称"未通过 Plan Review、未进入 Implementation Gate"，而标签却从 `proposal:planning` 直接跳到 `proposal:complete`。按"批准不由文件推断"（`docs/agents/artifacts.md`）的约定，**批准依据待用户事后确认**，不由本 ADR 或收口代理单方推定。本文的规则本身已与实现逐条核对，无冲突。工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 同一 Vendor Model 可以由多个 Offering 供应（不同 Provider、不同 Channel、或同一 Provider 的不同执行策略与价格）。平台不再限制「一个模型只能有一个生效供给」：`publication.runtime_entries` 允许同一 `native_model_id` 存在多条 active 记录，每条带一个 `routing_priority`，数字小者优先；同一模型下 active 候选的优先级必须唯一。
 
@@ -32,4 +34,10 @@
 
 **代价**：路由成为平台自己的责任，必须可观测、可复现；「谁被选中」不再能只从 Offering 表读出来；每次发布必须提交该模型的**完整**候选集合（不能只增量发布一个供给），并且发布是模型级的原子替换——新增一个供给会一并重写该模型的整个候选集合。收益是候选集合与顺序始终与某一个不可变 Revision 对应，选路输入因此可审计、可复现。
 
-**来源**：第二阶段 Planning（`dehuadong/seeaihub-server-next#2`）。多供给路由与「Provider 限制只能收窄 Vendor Model 能力」由该工作项要求；受理不确定时禁止改选由 [0007](./0007-reconciliation-instead-of-automatic-retry.md) 与仓库根 `AGENTS.md` 要求。
+## 待迁移的差距：选择规则本身也必须是发布物
+
+本 ADR 定的"价格不参与选中"继续有效：核心服务不得自行按价格、健康度或列表顺序择优。但**选择规则本身**目前是**硬编码**的一条——"按 `routing_priority` 升序取第一个合格候选"（`crates/application` 的 `select_candidate`）。运营方能配置的只是**顺序**，不是**规则**。
+
+目标形态是：选择规则与候选范围一起由运营侧发布，核心服务只提供"计算每个候选的兼容性事实"这一能力。在迁移完成之前，"优先级升序"就是当前唯一策略，任何声称"可配置策略"的说法都与实现不符。该迁移登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的差距 G3，需另行 Planning 与执行授权。
+
+**来源**：第二阶段 Planning（`dehuadong/seeaihub-server-next#2`）。多供给路由与「Provider 限制只能收窄 Vendor Model 能力」由该工作项要求；受理不确定时禁止改选由 [0007](./0007-reconciliation-instead-of-automatic-retry.md) 与仓库根 `AGENTS.md` 要求。选择规则必须来自发布物这一要求，由 2026-09-19 复审交接文档提出，2026-09-20 收口时登记为差距。

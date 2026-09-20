@@ -1,7 +1,7 @@
 主题: 图片生成服务端的分层架构与更新方式
 当前修订: v1
-状态: 待评审（2026-09-19 起草；用于纠正第二阶段规划中把渠道差异下沉到领域模型的偏差）。**评审指出的两处越界已修**：§4 判据由公理改为「应当能逐项说明理由」并列出三类合法例外 E1/E2/E3；R2 已如实收窄，不再替「消费侧是否可等结果」作决定（该选择列为后续工作项）。
-来源: 依据 `docs/design/0001-image-generation.md`（实现映射）、`docs/design/0002-image-generation-tech-design.md`（技术设计 v5）、`docs/adr/0001`–`0014` 与仓库现状归纳，不引入新决策
+状态: 生效（使用中）· 评审记录缺口待用户确认（2026-09-20 由「待评审」更正，工作项 [#6](https://github.com/dehuadong/seeaihub-server-next/issues/6)）。本文随第二阶段交付落地，并被实现与多份文档引用；**但仓库内没有可复核的设计评审通过记录**——按 [`docs/agents/artifacts.md`](../agents/artifacts.md)（`docs/design/` 的状态头表示**设计评审状态**、批准不由文件推断）的约定，该缺口**待用户事后确认**，不由收口代理单方推定。2026-09-19 起草时用于纠正第二阶段规划中把渠道差异下沉到领域模型的偏差。**评审指出的两处越界已修**：§4 判据由公理改为「应当能逐项说明理由」并列出三类合法例外 E1/E2/E3；R2 已如实收窄，不再替「消费侧是否可等结果」作决定（该选择列为后续工作项）。**本文与 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 的冲突已就地标注**：§1（示意图与表格的 ③ 行）、§2 R1、§3.2、§3.3 的旧表述与 0015 不一致，见各节标注。
+来源: 依据 `docs/design/0001-image-generation.md`（实现映射）、`docs/design/0002-image-generation-tech-design.md`（技术设计 v5）、`docs/adr/0001`–`0015` 与仓库现状归纳，不引入新决策
 
 # 图片生成服务端的分层架构与更新方式
 
@@ -12,7 +12,7 @@
 ```text
 ① Model Protocol ── 对外一致（消费侧契约）            代码发版
 ② Adapter Driver ── 一个 Provider 一族                代码发版
-③ Model Profile  ── 某 Provider 供某型号的合同        运行时版本发布
+③ Model Profile  ── 调用方合同（Vendor Model 级）+ 该 Offering 的承载面  运行时版本发布
 ④ Offering       ── 把 Profile 绑到可售供给           运行时发布
 ⑤ Price          ── 钱的事                            PG 动态配置
 ```
@@ -21,9 +21,11 @@
 | --- | --- | --- | --- | --- |
 | **① Model Protocol** | 对外路由、请求/响应外壳、同步/异步**对外形态** | 应用层 | 代码发版 | `apps/api` 的 HTTP 适配层；`CreateImageGeneration` 命令；`docs/design/0002` §4 |
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、Evidence 提取、错误分类、轮询与取图 | Adapter crate | 代码发版 | `crates/adapter-sdk` + `crates/adapter-*` |
-| **③ Model Profile** | 该 Provider 供应该型号的**支持参数、值域、默认值、组合规则、说明** | 目录 | **运行时版本发布** | `catalog.vendor_models.capability_schema`（随 Runtime Revision 发布） |
+| **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份），以及**该 Offering 能承载的面**（能力子集）：支持参数、值域、默认值、组合规则、说明 | 目录 | **运行时版本发布** | `catalog.vendor_models.capability_schema`（随 Runtime Revision 发布）。**当前实现仍是"每候选各带一份合同"——合同与承载面尚未拆开，见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G5** |
 | **④ Offering** | Provider、上游模型名、用哪个 Driver、渠道限制、优先级 | 供给面 | 运行时发布 | `supply.offerings` + `publication.runtime_entries` |
-| **⑤ Price** | 计价单位、单价或上游金额口径、币种、汇率、生效区间 | 价格 | PG 动态配置 | `pricing.price_plans` |
+| **⑤ Price** | 计价单位、单价、币种、汇率、生效区间（"上游金额口径"这一分支已随 [`docs/adr/0012`](../adr/0012-provider-declared-charge-as-evidence.md) 作废而不再需要：两家渠道都返回分项 token） | 价格 | PG 动态配置 | `pricing.price_plans` |
+
+**① 层的已知差距（2026-09-20 登记）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**当前实现尚未做到**——对外接口把渠道原生参数直接交给调用方（`native_parameters`、`asset_bindings[].native_parameter_path`），于是同一 Vendor Model 的两个候选对调用方的字段形状不同，候选是否合格由调用方写的字段名决定，`routing_priority` 实际上不起决定作用。合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定；差距与工作量登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)，需另行 Planning 与执行授权。
 
 ## 2. 四条不会违反的规则
 
@@ -33,6 +35,8 @@
 依据：0001「Provider 调用、结果格式和**同步/异步差异**封装在 Adapter」；0002 §4「`generations`/`edits` 的 endpoint 与 JSON/multipart 差异只存在于 Adapter」「Provider 同步**不等于**平台同步」。
 
 因此：上游是同步响应还是任务式轮询、返回 Base64 还是 URL、返回 token 还是金额——**都是 ② 的内部实现**，不产生领域类型分支，不改状态机，不改表结构。
+
+**⚠️ R1 的边界（2026-09-20，按 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 收窄）**：R1 说的是**传输与响应形态**。**参数的位置与命名不属于 R1 的"内部实现"**——同一参数在调用方可见面上放在顶层还是嵌套对象里、叫什么名字，是 **Offering Parameter Mapping** 的职责（0015 第 2、6 条）；Adapter 只按**已经定形**的参数装载传输。此前"位置差异属 ② 内部实现"的说法被误用到调用方合同上，正是 #6 记录的 G1 病根。
 
 **R2 · 对外生命周期只有一种。**
 依据：0002 §4「调用方先得到持久 Job，Worker 在后台等待 Provider 响应并维护 lease/heartbeat」「以后是否增加同步等待型公开 API，**不影响这个执行模型**」。
@@ -49,7 +53,7 @@
 **R4 · 钱的形态由 ⑤ 声明，证据由 ② 归一提取。**
 依据：0002 §9 Adapter 能力含 `parse_result` / `extract_evidence` / `classify_error`；§11「价格是运行时 Price Plan 数据，不写进 Adapter 代码」。
 
-因此：Adapter 把上游响应**归一成该 Offering 声明的计价单位所需的证据**；Price Plan 声明按什么计价。上游给 token 就给 token 型证据，上游只给金额就给金额型证据——**这是 ② 的职责，不是领域模型的分叉**。
+因此：Adapter 把上游响应**归一成该 Offering 声明的计价单位所需的证据**；Price Plan 声明按什么计价。上游给 token 就给 token 型证据，上游只给金额就给金额型证据——**这是 ② 的职责，不是领域模型的分叉**。（2026-09-20 补注：金额型证据这一支**本阶段不再需要**——两家渠道都已实测返回分项 token，[`docs/adr/0012`](../adr/0012-provider-declared-charge-as-evidence.md) 随之作废。）
 
 ## 3. 边界上四件容易搞错的事
 
@@ -57,7 +61,10 @@
 Profile（③）声明该 Provider 实际支持什么；Offering（④）的渠道限制只是**在该范围内再收紧**（例如「这个 Offering 只开放 1 张」）。二者是**同一事实的发布位置不同**，不是「从全集推导子集」的证明关系。因此不需要「合成有效 Schema」「禁止正则类参数收窄」这类机制——那是把一个数据发布问题做成了形式化证明问题。
 
 **3.2 同一型号由两个 Provider 供应时，Profile 的粒度。**
-0001 已定「Native Capability Schema、Offering、Channel 和 Price Plan 通过 Runtime Revision 发布」，因此 Profile 是**发布物**，粒度是 **(Vendor Model Revision × Provider)**。两种等效的落法：
+
+> **⚠️ 本节已被 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代（2026-09-20）**：把 Profile 的粒度定为 **(Vendor Model Revision × Provider)**、并"必要时发布两份 capability schema 修订"的做法，会让**调用方合同**随 Provider 分叉——这正是 0015 判定为错位的形状。按 0015，**调用方合同是 Vendor Model 级的唯一一份**；③ 保留的是**该 Offering 能承载的挂载面**（它对哪些参数、哪些值域、哪些分支可执行），差异只在**能力子集**上，不再各自定义一份调用方合同。下面保留原文，仅作历史理由；落实所需的模型改动（合同需要唯一载体、`capability_schema` 的双重身份要拆开）登记为工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的结构性差距 G5。
+
+0001 已定「Native Capability Schema、Offering、Channel 和 Price Plan 通过 Runtime Revision 发布」，因此 Profile 是**发布物**，粒度是 **(Vendor Model Revision × Provider)**。（**已被取代**，见上方标注。）两种等效的落法：
 
 - **落法一（推荐，改动最小）**：Profile 仍随 `catalog.vendor_models` 的 capability schema 发布，但其内容按 **Offering 所声明的 `provider_model_id`** 声明——即「本 Offering 实际可发的参数面」。两个 Provider 供同一型号时，发布两条 Offering，必要时发布两份 capability schema 修订。
 - **落法二**：把 capability schema 直接做成「按 Provider 分列」的一张发布物。
@@ -68,7 +75,7 @@ Profile（③）声明该 Provider 实际支持什么；Offering（④）的渠�
 - `native_model_id`：平台**对外的**型号身份，稳定、用于路由与 Job 固化（0001：「平台 `native_model_id` 与供应商调用所需 `provider_model_id` 分开固化」、ADR-0004）；
 - `provider_model_id`：**该 Provider 实际调用的模型字符串**，由 Offering 携带，**只有 Adapter 使用**（0001：「Adapter 只使用后者组装供应商请求」）。
 
-因此「两个 Provider 供同一型号」在目录里表现为：**两条 Offering，共同指向稳定身份，各自携带自己的 `provider_model_id`**；Provider 的参数面差异则落在各自的 Profile/契约上。这既满足了「同一 Vendor Model 多 Offering」，又不把渠道实现暴露到对外身份上。
+因此「两个 Provider 供同一型号」在目录里表现为：**两条 Offering，共同指向稳定身份，各自携带自己的 `provider_model_id`**；Provider 的**承载面**（能力子集）差异落在各自的发布物上，而**调用方合同不随 Provider 分叉**（[`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。这既满足了「同一 Vendor Model 多 Offering」，又不把渠道实现暴露到对外身份上。
 
 **具体形态**（以第二阶段的真实供给为例）：
 

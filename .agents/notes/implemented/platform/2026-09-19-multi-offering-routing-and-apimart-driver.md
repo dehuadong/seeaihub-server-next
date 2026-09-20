@@ -2,9 +2,9 @@
 title: 第二阶段交付：多 Offering 路由与 APIMart Driver
 status: implemented
 created: 2026-09-19
-updated: 2026-09-19
-approval: seeaihub-server-next#2 记录的用户执行授权（用户明确输入「执行实现」）；范围收口与回扩见该工作项上的规划 §7.5
-verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单元测试、九个空库端到端合同测试与 decisions check 全部通过
+updated: 2026-09-20
+approval: seeaihub-server-next#2 记录的用户执行授权（用户明确输入「执行实现」）。**2026-09-20 核对补充：#2 上找不到可复核的授权记录（38 条评论全部出自同一账号，无授权语句），该批准依据待用户事后确认，不由本记录单方面推定**；本次 2026-09-20 的收口改动由用户"按复审结果执行、之前的决策可以推翻"的指令授权（工作项 [#6](https://github.com/dehuadong/seeaihub-server-next/issues/6)）
+verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单元测试、九个空库端到端合同测试与 decisions check 全部通过（**原记录如此，保留不改**）。**2026-09-20 核对到的差异**：HEAD 处 `apps/api/tests/http_contract.rs` 实际有 **10** 个 `#[ignore]` 用例——第 10 个（`post_acceptance_failure_keeps_the_task_id_for_reconciliation`）由 `3f2129e` 加入，即本记录最终修订的那次提交。**本记录未补跑十个用例，因此不声称"十个全部通过"**；该差异属记录过时，已写入下方更正节第 1 条。
 ---
 
 # 第二阶段交付：多 Offering 路由与 APIMart Driver
@@ -22,7 +22,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 - **资产绑定路径不再写死字段名**：`AssetBinding.native_parameter_path` 现在真正是**厂商原生参数路径**（APIMart 的 `/image_urls/0`、`/mask_url`），不再硬编码 `image`/`images`/`mask`——这正是 `docs/adr/0002` 要求的"由厂商自己的 Schema 声明原生字段路径"。平台只在**一处**判定"这个参数装的是参考图还是遮罩"（名字以 `image` 开头 / 含 `mask`，其余一律拒绝），发布期校验与运行期用的是同一个函数；Driver 侧同样按路径回填，不自己决定键名。
 - **渠道事实**：AIHubMix 2.5 两款与 APIMart 2.5 两款的发布素材；`docs/facts/channel-facts.md` 为渠道事实的单一出处。
 
-技术设计与边界由 [工作项 #2 的规划正文](https://github.com/dehuadong/seeaihub-server-next/issues/2) 与 [分层架构](../../../../docs/design/0004-layered-architecture.md) 拥有，持久决定由 [ADR 目录](../../../../docs/adr/) 拥有（新增 0009–0014）；本记录不复制其正文。
+技术设计与边界由 [工作项 #2 的规划正文](https://github.com/dehuadong/seeaihub-server-next/issues/2) 与 [分层架构](../../../../docs/design/0004-layered-architecture.md) 拥有，持久决定由 [ADR 目录](../../../../docs/adr/) 拥有（本阶段新增 0009–0014；2026-09-20 收口新增 [`0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）；本记录不复制其正文。
 
 ## 验证结果
 
@@ -85,13 +85,29 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 - 领域层改动**不是**为了适应 APIMart，恰恰相反：旧代码把 `image`/`images`/`mask` 三个**渠道字段名**写死在领域里，那才是渠道差异污染领域。现在领域只认识"路径的第一段是厂商参数名"这一件事，认不认得某个名字由一个**与具体渠道无关**的函数（`AssetParameterKind::classify`）回答；换一个字段名不同的 Provider，**不需要再改领域**。
 - 因此它更接近 §4 的 **E1（平台侧新能力）**：把"资产绑到哪个原生参数"从硬编码升级为平台自己的通用能力，而不是新增某渠道的分支。
-- 已知代价：渠道若用不以 `image` 开头、也不含 `mask` 的名字（例如 `reference_images`），平台会**拒绝**该绑定。这是**有意的**——用户 2026-09-19 决定平台内部只认渠道原生参数名，统一参数转换留给**后期对外消费侧**（见下面"未决项"第一条与 `docs/adr/0002` 的补充段）。
+- 已知代价：渠道若用不以 `image` 开头、也不含 `mask` 的名字（例如 `reference_images`），平台会**拒绝**该绑定。这是**有意的**——用户 2026-09-19 决定平台内部只认渠道原生参数名，统一参数转换留给**后期对外消费侧**（见下面"未决项"第一条与 `docs/adr/0002` 的补充段）。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**——调用方所见参数名归 Vendor Model Contract，渠道包装差异归 Offering Parameter Mapping，"拒绝认不出的名字"只是本阶段的兼容规则。上句仅保留为当时的理由。
 
 ## 已知限制与未决项（不在本次交付范围）
 
 - APIMart 的**图生图/遮罩分支已开放并已受控实测**（2026-09-19，见上）；仍未测的是 `sunburst` 的图生图（与 flare 同渠道族、同端点、同参数面）、`base64` 路径，以及 20MB / 16 张 / 256MB 这些**边界**——代码已按文档上限拒绝（单张 20MB + 单次总量 256MB），但没有逐个压测。
-- **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。
+- **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**（该 ADR 第 8 条把名字约定定性为阶段性兼容规则）；`reference_images` 这类名字改由 Vendor Model Contract 显式声明解决，不再留给"那一层"。此条仅保留为当时的理由，**不再是现行规则**。
 - **`task_id` 不用于跨调用恢复**：现在只做到"失败时把 task id 留下、对账的人能查到"（见上第 10 条）。**拿它自动去补齐结果**需要改造 Attempt 模型——`generation.attempts` 有 `UNIQUE (job_id)`（一个 Job 只能一个 Attempt），且状态机只允许 `reconciliation_required → failed`、**不允许 → succeeded**（有测试钉着，理由是不确定是否已产生费用时不能自作主张，见 `docs/adr/0007`/`0011`）。要做属于独立工作项。
 - 火山方舟/Seedream、直连 OpenAI **用户 2026-09-19 明确暂不做**（先把两家渠道跑通；`docs/adr/0014` 第 3、4 条不变）；多图与 `stream`/`tools` 同样不在本阶段；
 - 平台**对外价**等运营后台管理设计定了再考虑（工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；
 - 第 16–18 条验收条件已标为过期，其若要恢复需先结清非 USD 计价或金额型证据。
+
+## 交付后发现并更正的事项（2026-09-20 复审收口）
+
+2026-09-19 的复审交接文档指出：交付记录把"实现已完成 / 已受控验证 / 已获批准上线"混在一起，并质疑对外参数合同的归属。据此只读核对后，更正与登记如下（工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)）：
+
+1. **端到端用例数的差异**：frontmatter 记的"九个"是**当时实际跑过的数目**，不改写；但 HEAD 处实际为 **10** 个 `#[ignore]` 用例，第 10 个由 `3f2129e` 加入（即本记录最后一次修订的那次提交，因此本记录自那时起就已过时）。本记录**未补跑**十个用例，故不声称十个全部通过。
+2. **"已开放"不等于"已上线"**：本记录写 APIMart 的图生图/遮罩"两条分支已开放"，指的是**发布素材里的 `allowed_branches`**，不是产品上线。素材的 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确**本阶段是阶段性任务，不存在上线批准**。
+3. **调用方可见形状取自未被调用的端点族（最实质的一条）**：AIHubMix 素材把 `quality`/`background`/`output_compression`/`user` 声明在 `extra` 内——那是该渠道自有异步 API `/ai/v1/*` 的位置；本阶段实际调用的是 OpenAI 兼容的 `/v1/images/*`，该端点族 `quality` 在**顶层**且**不存在 `extra`**（`docs/facts/channel-facts.md` §2.5）。该形状由 `crates/adapter-aihubmix` 的能力面（把 `extra` 列为顶层参数名）与 `crates/application` 的发布校验强制，Adapter 再在出网时把 `extra.quality` 摊平回顶层，于是形成"发布校验认一套形状、上行发另一套"的翻译层。归属与目标形态见 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，修复登记为 #6 的差距 G1。
+4. **同一模型的两个候选对调用方的字段形状不同**：AIHubMix 素材要求 `extra.quality`、APIMart 素材要求顶层 `quality`，两份 Schema 都是 `additionalProperties: false`。结果是**调用方把参数写在哪，直接决定哪个候选合格**，`routing_priority` 不起决定作用。这是复审"兼容性事实与路由选择必须分开"的实际形态。
+5. **逐个发布素材会静默替换候选**：发布语义是"该模型全部 active 条目原子替换"，`routing_priority` 由候选数组下标决定。现成素材是每渠道一个文件、各含一个候选；**按文件逐个发布会让该模型只剩最后一个候选**。要表达"同一模型两个 Provider"必须把候选合并成一次发布（`apps/api/tests/http_contract.rs` 的用例即合并写法）。登记为 #6 的差距 G4。
+6. **三个"已声明未验证"参数**：素材声明了 `background`、`output_compression`、`user`，但实测的 `/v1/images/generations` 顶层参数集不含这三项且 `additionalProperties: false`，与 `docs/adr/0002`"未证实的参数不开启"不符。登记为 #6 的差距 G2（验证要花钱，须单独批准）。
+7. **路由规则是硬编码的**：运营方能配置的是**顺序**，不是**规则**。已记入 [`docs/adr/0009`](../../../../docs/adr/0009-multiple-active-offerings-and-routing.md) 的"待迁移的差距"节与 #6 的差距 G3。
+8. **`docs/adr/0002` 的补充决定被取代**：原"平台内部只认渠道自己的参数名、统一转换留给对外消费侧"已由 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代；Vendor Model Contract 与 Offering Parameter Mapping 已进入 `CONTEXT.md`。
+9. **授权证据不可复核**：`#2` 的 38 条评论全部出自同一账号、无授权语句，见 frontmatter 的 approval 说明；不作为后续任务的持续授权。
+
+本次收口**未改动实现代码、未发起任何真实渠道调用**。

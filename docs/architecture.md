@@ -38,7 +38,7 @@
 | --- | --- | --- |
 | **① Model Protocol** | 对外路由、请求/响应外壳、对外生命周期 | `apps/api/src/main.rs`（路由与 handler）、`crates/application` 的 `CreateImageGeneration` / `JobView`、`crates/domain` 的 `JobState` |
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、证据提取、错误分类、轮询与取图（**渠道差异只此一处**） | `crates/adapter-sdk`（接口）、`crates/adapter-aihubmix`、`crates/adapter-apimart` |
-| **③ Model Profile** | 某渠道供某型号的合同：支持参数、值域、默认值、组合规则 | 运行时发布物 `catalog.vendor_models.capability_schema`；素材在 `config/bootstrap/*.json` |
+| **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份）与某 Offering 能**承载**的面（能力子集）：支持参数、值域、默认值、组合规则 | 运行时发布物 `catalog.vendor_models.capability_schema`；素材在 `config/bootstrap/*.json`。**当前实现仍是"每候选各带一份"——合同与能力子集尚未拆开，见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与 #6 差距 G5** |
 | **④ Offering** | 渠道、上游模型名、用哪个 Driver、渠道限制、路由优先级 | `supply.offerings` + `publication.runtime_entries`；发布逻辑在 `crates/application` 的 `RuntimeService` |
 | **⑤ Price** | 计价形态、费率、币种 | `pricing.price_plans`；公式在 `crates/domain` 的 `PriceSnapshot::charge_microusd` |
 
@@ -119,7 +119,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移 | 业务规则、SQL、上游调用 |
 | `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
 | `apps/api/tests/http_contract.rs` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**（零外部费用） | 单元测试（在各 crate 内） |
-| `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`AssetBinding`（渠道原生参数路径）、`PriceSnapshot` 计价公式、`TokenUsage` / `MeteringEvidence` | IO、持久化；也不认识任何**具体渠道**——它只知道"绑定路径的第一段是渠道自己的参数名"这一条通用约定 |
+| `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`AssetBinding`（模型参数路径）、`PriceSnapshot` 计价公式、`TokenUsage` / `MeteringEvidence` | IO、持久化；也不认识任何**具体渠道**——它只知道"绑定路径的第一段是参数名"这一条通用约定（该参数名按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属差距 G1） |
 | `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `AssetService` / `GenerationService` / `WorkerService` / `ReconciliationService`）、端口 trait、发布期校验（含"限制只能收窄"）、候选选择、错误→处置映射、结果归档 | SQL、HTTP、上游协议 |
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射 | 业务判定（只执行用例给出的结论） |
 | `crates/object-storage/src/lib.rs` | `AssetStore` 的本地与 S3 实现 | 资产归属与授权（在用例层） |
@@ -140,4 +140,5 @@ Worker（独立进程，循环领活）                            apps/worker/s
 - **新增一个渠道族**：在 `crates/adapter-*` 加 Driver（②），发布新的 Profile/Offering（③④），不动 ① 与领域层——判据与合法例外见 0004 §4。
 - **新增一个型号或调整参数面**：只发布新的运行时素材（`config/bootstrap/*.json` 的形状），不重新编译。
 - **换对象存储**：`ASSET_STORE=local|s3`，实现仍在 `crates/object-storage`。
-- **面向消费侧的统一参数转换**：**不在本仓库内部**，属后期对外消费侧能力（见 [`docs/adr/0002`](adr/0002-native-capability-schema-not-canonical.md) 的补充决定）。
+- **参数合同的归属**：调用方按 **Vendor Model Contract** 提交参数；同一 Vendor Model 在不同 Provider 的字段/位置/枚举差异由 **Offering Parameter Mapping** 在平台内部吸收。决策见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)。
+- **面向消费侧的跨厂商统一简化接口**：**不在本仓库内部**，属后期独立规划（[`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 第 7 条）。**注意：这与上面那条不是同一件事**——"按各模型自己的合同提交"不等于"所有厂商共用一套字段"。

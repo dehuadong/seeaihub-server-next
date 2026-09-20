@@ -7,7 +7,8 @@
 > **没有变的两条**（用户 2026-09-19 再次确认）：**直连 OpenAI** 与**火山方舟 / Seedream** 暂不做，先把这两家渠道跑通——与下面第 3、4 条一致。
 
 1. **Vendor 固定为 `OpenAI`**，本阶段纳入两款 Vendor Model：`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`（退役 `gpt-image-2` 见 [0013](./0013-retire-gpt-image-2-use-2-5-models.md)）。
-2. **首批候选 Provider 为两家：AIHubMix 与 APIMart**。两者供应**同名**的上述两款模型，因此构成「**同一 Vendor Model 由两个不同 Provider 供应**」的真实样本——这正是工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的核心命题。
+2. **首批候选 Provider 为两家：AIHubMix 与 APIMart**。两者在各自目录里都提供同名的上述两款模型，因此构成「**同一 Vendor Model 由两个不同 Provider 供应**」的样本——这正是工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的核心命题。
+   > **身份依据的更正（2026-09-20 收口）**：本项原先写"两者供应**同名**的模型，**因此**构成同一 Vendor Model"。**同名不是依据**——按 [0004](./0004-vendor-and-provider-identities-stay-separate.md) 与复审要求，Provider 不决定 Vendor，同名模型不自动合并。实际依据是**运营方的显式配置决定**：发布命令里声明 `vendor_id: OpenAI` 与同一个 `native_model_id`，两个 Offering 挂在同一 Vendor Model 下（`config/bootstrap/*.json`）。渠道侧提供不了这个证据——APIMart 的目录接口对**所有**模型都返回 `owned_by: custom`（含 `gemini-*`），**既不能证明也不能否证**归属（`docs/facts/channel-facts.md` §3）。因此本项是**运营决定 + 显式配置**，不是"由名称或渠道字段推导出的事实"。
 3. **直连 OpenAI 不纳入首批**：它是**合法**的第二个 Provider（Vendor 与模型名相同，仅调用与账单来源不同，符合 [0004](./0004-vendor-and-provider-identities-stay-separate.md) 的「只新增 Offering/Channel/Price Plan」），但会引入第三组凭证、第三套计量与限额语义。本阶段的四项目标（同一 Vendor Model 多 Provider 路由、Provider 限制收窄、计价选择、安全降级）由两家已可完整验证。直连 OpenAI 保留为后续工作项，其价值是验证「厂商自营 vs 聚合」这一**供应形态差异**，而不是增加候选数量。
 4. **火山方舟 / ByteDance Seedream 移出本阶段**：它是**另一个 Vendor 的另一个 Vendor Model**，与「同一 Vendor Model 多 Provider」正交。保留为「引入新 Vendor Model」的独立工作项；`docs/design/0003-doubao-ark-image-adapter.md` 随之转为该工作项的设计草案，**不废弃**。
 
@@ -19,9 +20,11 @@
 
 - **不推翻任何 ADR**：[0004](./0004-vendor-and-provider-identities-stay-separate.md) 要求 Vendor 与 Provider 身份在目录中分开固化，并预告「其他 Provider 也供应同一模型时只新增 Offering/Channel/Price Plan」——本决策正是该预告的落地。
 - **[0009](./0009-multiple-active-offerings-and-routing.md) 的路由规则首次有了真实对象**：此前只能以「同一 Provider 的两个 SKU」充当多候选，那验证不了 Provider 侧差异；现在两个候选来自**不同 Provider**。
-- **[0012](./0012-provider-declared-charge-as-evidence.md) 是否仍需要，取决于两家的计价维度核实结果**（见下），继续维持「待批准」。
+- **[0012](./0012-provider-declared-charge-as-evidence.md) 已作废**（2026-09-20 更正）：两家的计价维度已由受控实测结清——都返回四分项 token，不需要金额型证据。此前写"继续维持待批准"已过时。
 
 ## 未决的关键事实（决定本阶段范围大小）
+
+> **状态：已结清（2026-09-20 更正）。** 本节起草时把"两家的计价维度口径不一致"列为实施期必须结清的受控验证项。实测结果：**两家都返回四分项 token `usage`**（AIHubMix 见 `docs/facts/channel-facts.md` §2.6；APIMart 见同文件 §3.3、§3.9）。因此上文"若两家都按 token 计量则 0010 的联合类型与 0012 在本阶段都不需要"这一分支**成立**：[0012](./0012-provider-declared-charge-as-evidence.md) **作废**，[0010](./0010-metering-evidence-is-unit-bearing.md) 的原则继续有效，**不需要**金额型证据。下面保留原文，仅作历史理由。
 
 两家对同款模型的**计价维度口径不一致**，需要以受控验证结清（**不在本决策内**，且不得在未获批准时发起计费调用）：
 

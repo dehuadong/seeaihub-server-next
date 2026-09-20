@@ -155,7 +155,14 @@
 
 `extra.quality` 与顶层 `quality` 的取值集合相同：`low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）。
 
-⇒ **同一个 `quality`，端点族不同则位置不同**：`/ai/v1` 走 `extra`，OpenAI 兼容的 `/v1/*` 走顶层。这与 2.3 的实测 400 一致（在 `/ai/v1` 顶层传 `quality` 被硬拒）。**参数名不变，只是位置不同**（`0004` R1：位置差异属 ② 内部实现）。
+⇒ **同一个 `quality`，端点族不同则位置不同**：`/ai/v1` 走 `extra`，OpenAI 兼容的 `/v1/*` 走顶层。这与 2.3 的实测 400 一致（在 `/ai/v1` 顶层传 `quality` 被硬拒）。**参数名不变，只是位置不同**。（此前的括号注写"位置差异属 ② 内部实现"，2026-09-20 更正：位置的**归属**是 Offering Parameter Mapping，不是 Adapter——`docs/adr/0015` 第 2、6 条。）
+
+**⚠️ 但"位置差异属 Adapter 内部"不等于可以脱离端点族声明形状（2026-09-20 收口核对）**：本仓库的 AIHubMix 2.5 发布素材把 `quality`/`background`/`output_compression`/`user` 声明在 **`extra` 内**——那是上表**第 1 行**端点族的形状，而本阶段实际调用的是**第 2、3 行**（`/v1/*`），那两行**不存在 `extra`**。Adapter 因此在出网前把 `extra.quality` 摊平回顶层。后果有两条，均已登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)：
+
+- 调用方被要求写一个**实际未被调用**的端点族的字段布局（差距 G1）；
+- 同一 Vendor Model 的另一个候选（APIMart）要求顶层 `quality`，两份 Schema 又都是 `additionalProperties: false`，于是**参数位置成了隐形的渠道选择器**——调用方把参数写在哪，决定哪个候选合格，`routing_priority` 不起决定作用。
+
+**三个参数在 `/v1/*` 上属"已声明未验证"**：`background`、`output_compression`、`user` 出现在第 1 行的 `extra` 内，但**不在**第 2、3 行的顶层参数集合里，而那两个端点的 `additionalProperties` 均为 `false`。**AIHubMix 的**发布素材目前把这三项声明为支持（差距 G2），与 `docs/adr/0002`"未证实的参数不开启"不符。（APIMart 素材顶层自身的参数面不受此条影响。）相关归属与整改见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 ### 2.6 2.5 两款在同步 `/v1` 上的实测（2026-09-19，经用户授权）
 
@@ -411,9 +418,9 @@
 
 **平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。
 
-**发布状态：三条分支已开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 已加上 `image_conditioned` / `masked`（`max_images: 16`）。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——验证已完成：上传返回、`image_urls` 形态、`mask_url` 同用、以及 `usage.input_image_tokens` 四件事都在**一次真实调用**里结清；另外我们**自己的服务**（API + Worker，真实凭证）也对着真实上游跑通了同一条路径（§5.6）。
+**发布素材状态：三条分支已开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 已加上 `image_conditioned` / `masked`（`max_images: 16`）。**注意这是发布素材里的能力声明，不是产品上线**——素材 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确本阶段是阶段性任务、不存在上线批准。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——验证已完成：上传返回、`image_urls` 形态、`mask_url` 同用、以及 `usage.input_image_tokens` 四件事都在**一次真实调用**里结清；另外我们**自己的服务**（API + Worker，真实凭证）也对着真实上游跑通了同一条路径（§5.6）。
 
-**参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`，`AssetBinding.native_parameter_path` 就是这些原生参数路径（`/image_urls/0`、`/mask_url`）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）与其补充决定（统一参数转换属后期对外消费侧）。平台只在**一处**判定"这个参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩、其余一律拒绝（发布期与运行期共用同一个函数）。
+**参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`，`AssetBinding.native_parameter_path` 就是这些原生参数路径（`/image_urls/0`、`/mask_url`）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩、其余一律拒绝（发布期与运行期共用同一个函数）。**合同归属的更正（2026-09-20）**：原文此处还引用了 `0002` 的补充决定（"统一参数转换属后期对外消费侧"）。该补充决定已被 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代——调用方所见参数名归 **Vendor Model Contract**，"原生名"的落位由 **Offering Parameter Mapping** 承担；"平台内部不改渠道名"这一**当前实现事实**仍然成立，但它是映射层尚未落位的现状，不是既定归属（差距见工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)）。
 
 **未做**：`sunburst` 的图生图未单独实测（与 flare 同渠道族、同端点、同参数面）；`base64` 路径未测；20MB / 16 张 / 256MB 这些**边界**未逐个压测（只说单张 20MB 上限来自文档，代码里已按此拒绝并另有总量上限）。
 
@@ -463,6 +470,7 @@
 #### 3.9.3 平台侧现在怎么用这些数（以及没有做什么）
 
 - 平台结算用的是**已发布 `price_plan` 的费率 × 真实分项 token**。两个 APIMart 素材的 `price_plan` 现在填的是上游公开费率——它现在的角色是**结算基数**，不是"平台对外定价决定"。
+- **`owned_by` 不携带厂商信息（2026-09-20 登记）**：APIMart 的目录接口响应对**所有**模型都返回 `"owned_by": "custom"`（含 `gemini-*` 等明确非 OpenAI 的模型），因此它**既不能证明也不能否证**某个 `gpt-image-*` 的 Vendor 归属。原始材料见 `out-reference/apimart/catalog-models.json`。⇒ 本仓库 `vendor_id: OpenAI` 是**运营方的显式配置决定**（`docs/adr/0014`），不是由渠道字段推导出来的事实。
 - **平台对外价尚未决定**：要不要在基数之上加价、要不要把账号折扣让给消费侧，都是**后期产品决定**（跟踪工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。本阶段**只固化成本价**。
 - 上游声明的 `cost`（APIMart）是**折后账号价**，随账号分组变化；它作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（`docs/adr/0012` 在本阶段作废的原因之一）。
 

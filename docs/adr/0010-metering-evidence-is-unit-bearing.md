@@ -1,6 +1,8 @@
 # 计量证据承载单位，计价必须声明维度
 
-> **状态：未生效。** 本文随工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的第二阶段规划起草；**在该规划通过 Plan Review 之前，本文不是实现依据**，也不得被下游工件当作已接受的决策引用。规划正文见 #2 的规划评论（以该 issue 上标注为「当前唯一可执行版本」的那条为准，不在此写死版本号）。
+> **状态：生效（使用中）· 批准记录缺口待用户确认。** 本文随工作项 [seeaihub-server-next#2](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的第二阶段规划起草，随该阶段交付落地，其规则在实现中生效并经真实调用验证（两家的证据形态见下方事实更正）。
+>
+> **缺口（2026-09-20 收口核对，如实登记）**：本文原写"在该规划通过 Plan Review 之前，本文不是实现依据"。核对**没有在 #2 上找到可复核的 Plan Review 通过记录**（同一 issue 的规划正文自称未进入 Implementation Gate）。按"批准不由文件推断"的约定，**批准依据待用户事后确认**。本文的规则本身已与实现逐条核对，无冲突。工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 结算不假设「计量必然是 token」，而是要求 **Metering Evidence 是带单位的计量量**、**Price Plan 显式声明它按哪个维度计价**。已应用的维度是 **token**：分项 token 数（`input_text_tokens` / `input_image_tokens` / `output_text_tokens` / `output_image_tokens` 等）。
 
@@ -10,7 +12,7 @@
 
 **不得由金额反推计量量**——即不能拿上游声明的扣费金额除出一个「用量」再当计量事实用（[0006](./0006-no-settlement-without-metering-evidence.md) 的禁止项）。金额是结果，不是计量。
 
-**「金额本身能否作为结算事实」不由本条决定**。那是一个**独立的持久决定**，属主是 [0012](./0012-provider-declared-charge-as-evidence.md)（Provider 声明的扣费金额作为计量证据）。本条只规定：
+**「金额本身能否作为结算事实」不由本条决定**。那是一个**独立的持久决定**，属主原是 [0012](./0012-provider-declared-charge-as-evidence.md)（Provider 声明的扣费金额作为计量证据）；**该问题已由事实结清、0012 已作废**（2026-09-20）：两家渠道都返回分项 token，**不需要**金额型证据，本阶段不再有"金额能否作为计量证据"的开口。本条只规定：
 
 - 若某个 Offering 走「计量量 × 已发布单价」这条主路径，则它的 Evidence 必须是**带单位的计量量**，不得写成金额；
 - 两个形态**不得在同一 Offering 上并存或隐含切换**，由 Price Plan 在受理时固定；
@@ -24,4 +26,6 @@
 
 **本阶段不预判「要不要扩展证据形态」**：APIMart 的响应到底给分项 token 还是只给金额，属实施期受控验证要结清的事实。在结清之前，本条只声明原则（计量承单位、计价声明维度、不得由金额反推计量量），**不为推测的形态先造机制**。真实形状确定后，若需要扩展，按最小改动另行修订。
 
-**来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（见 `docs/research/gpt-image-2-inferera-research.md`）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。
+**事实更正（2026-09-20）**：上面两段写"APIMart 的响应形状尚未由真实调用结清"。该前提**已结清**——APIMart 的任务完成响应**含四分项 `usage`**（`input_tokens_details` 区分 text/image），与 AIHubMix 同构。因此**已应用的计量维度仍只有 token 一条**，[0012](./0012-provider-declared-charge-as-evidence.md) 随之作废。依据：`docs/facts/channel-facts.md` §3.3、§3.9。本 ADR 的原则（计量承单位、计价声明维度、不得由金额反推计量量）**不因此改变**。
+
+**来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（见 `docs/research/gpt-image-2-inferera-research.md`）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。**后一项已由 2026-09-19 的受控实测结清**（见上方事实更正）。
