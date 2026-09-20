@@ -128,7 +128,7 @@ function Save-Shape([string] $provider, [string] $probe, $call, $response, [int]
   $text = Protect-Json ($doc | ConvertTo-Json -Depth 12)
   [System.IO.File]::WriteAllText($file, $text)
   Write-Host ("已写入 {0}" -f $file) -ForegroundColor Green
-  Write-Host ("  请接着做两件事：在 docs/facts/channel-facts.md §5 记一行调用留档；在 out-reference/{0}/response-shapes.md 登记这个文件。" -f $provider)
+  Write-Host ("  请接着做两件事：在 docs/verification/paid-provider-calls.md 记一行调用留档；在 out-reference/{0}/response-shapes.md 登记这个文件。" -f $provider)
 }
 
 function New-TestImages([string] $dir) {
@@ -209,4 +209,4 @@ foreach ($item in $plan) {
 
 Remove-Item -Recurse -Force $work -ErrorAction SilentlyContinue
 Write-Host ''
-Write-Host '采集完成。别忘了：docs/facts/channel-facts.md §5 记调用留档；response-shapes.md 登记文件。' -ForegroundColor Yellow
+Write-Host '采集完成。别忘了：docs/verification/paid-provider-calls.md 记调用留档；response-shapes.md 登记文件。' -ForegroundColor Yellow

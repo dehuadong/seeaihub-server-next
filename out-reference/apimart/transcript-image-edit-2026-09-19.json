@@ -131,7 +131,7 @@
         "credits": 0.11374,
         "elapsed_seconds": 10
       },
-      "note": "上游报文由 Worker 直接消费，未打印；上表的上游侧数字来自用户提供的控制台面板（转录见 docs/facts/channel-facts.md §3.9.4）"
+      "note": "上游报文由 Worker 直接消费，未打印；上表的上游侧数字来自用户提供的控制台面板（转录见 docs/facts/channel-facts.md §5.4）"
     }
   ]
 }

@@ -6,7 +6,7 @@
 
 ## 0. 一句话现状（2026-09-19）
 
-**来源分级**：**本仓库受控实测** = 经用户授权、由本仓库 Agent 发起并留档（`docs/facts/channel-facts.md` §5 有留档）；本目录里没有"用户早期采集"的 APIMart 样本。
+**来源分级**：**本仓库受控实测** = 经用户授权、由本仓库 Agent 发起并留档（`docs/verification/paid-provider-calls.md` 有留档）；本目录里没有"用户早期采集"的 APIMart 样本。
 
 | 端点 | 实测过？ | 有独立样本文件？ | 哪几次 | 结构记在哪 |
 | --- | --- | --- | --- | --- |
@@ -82,7 +82,7 @@
 | --- | --- |
 | `data.result.images[]` | 每项为 `{ "url": [<字符串>], "expires_at": <unix秒> }`——**`url` 是数组**（与生成页示例一致）；`expires_at` 说明结果 URL 会过期，必须立刻下载转存 |
 | `data.usage` | **四分项**：`input_tokens_details{cached_tokens,image_tokens,text_tokens}`、`output_tokens_details{image_tokens,text_tokens}` + `total_tokens`；**参考图会真实计入 `image_tokens`**（1024×1024 ⇒ 1024） |
-| `data.cost` / `data.credits_cost` | 上游**声明的**实际扣费（折后账号价）与 Credits（`= cost × 10`）。平台**不把它当计量事实**，只作**成本价**与对账核对（`docs/facts/channel-facts.md` §3.9） |
+| `data.cost` / `data.credits_cost` | 上游**声明的**实际扣费（折后账号价）与 Credits（`= cost × 10`）。平台**不把它当计量事实**，只作**成本价**与对账核对（`docs/facts/channel-facts.md` §5） |
 | 其它 | `actual_time`（实际耗时秒）、`estimated_time`、`progress`、`created`/`completed` |
 
 ## 4. 错误信封
@@ -102,7 +102,7 @@
 
 ## 5. 相关记录
 
-- 渠道事实（归纳后）：`docs/facts/channel-facts.md` §3.3（响应形状）、§3.7/§3.8/§3.9（上传、错误、计费）；
+- 渠道事实（归纳后）：`docs/facts/channel-facts.md` §3.3（响应形状）、§3.7/§3.8（上传、错误）、§5（成本口径）；
 - 原始逐字样本：`controlled-probe-2026-09-19.json`；
 - 请求侧合同：`schema-gpt-image-2.5-flare.input.json`、`generation.md`、`gpt-image-2.5-generation.cn.md`、`tasks-status.cn.md`、`uploads-images.cn.md`；
 - 另一个渠道的对应台账：`out-reference/aihubmix/response-shapes.md`。
@@ -120,4 +120,4 @@ pwsh -File scripts/probe/response-shapes.ps1 -Provider apimart -Probe image_edit
 pwsh -File scripts/probe/response-shapes.ps1 -Provider apimart -Probe image_edit -ConfirmPaidCalls
 ```
 
-脚本会自动脱敏 URL 与 task id，并在结束时提醒补两处登记（`docs/facts/channel-facts.md` §5 与本文档）。
+脚本会自动脱敏 URL 与 task id，并在结束时提醒补两处登记（`docs/verification/paid-provider-calls.md` 与本文档）。

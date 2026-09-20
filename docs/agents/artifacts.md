@@ -20,8 +20,8 @@
 | 代码结构图 / 落点索引 | `docs/architecture.md`；回答"哪个 crate、文件、表负责什么"。它**只做索引**：分层的职责与规则归 `docs/design/0004-layered-architecture.md`，持久决定归 `docs/adr/`，冲突时以后两者为准。新增或移动文件、增删路由与表时在**同一变更**里同步 |
 | 调查与探索存档 | `docs/research/`；存放**本仓库 Agent 自己做的**调查与探索记录：结论 + 事实/推论/待确认分开 + 来源。 已归纳定稿的渠道事实放 `docs/facts/`。写法：**只写重点、不过度解读**；推论与待确认必须标明；结论被推翻时保留更正记录，不静默改写 |
 | 独立行为合同 Spec | `docs/specs/`；明确需要时创建，优先更新同一工作已有 Spec |
-| 受控验证清单 | `docs/verification/`，按 `阶段-slug.md` 命名；记录受控验证的步骤、停止条件与留档要求。**停止条件以来源规划为准**，清单只复述与执行 |
-| 汇总事实登记 | `docs/facts/`；把散在原始证据里的渠道事实归纳成单一出处，引用而不复述。含凭证类内容时只记**变量名** |
+| 受控验证清单 | `docs/verification/`，按 `阶段-slug.md` 命名；记录受控验证的步骤、停止条件与留档要求。**停止条件以来源规划为准**，清单只复述与执行。真实计费调用的留档固定在 `docs/verification/paid-provider-calls.md`（授权依据、次数、花费、样本位置），不写进渠道事实台账 |
+| 汇总事实登记 | `docs/facts/`；把散在原始证据里的渠道事实归纳成单一出处，引用而不复述。含凭证类内容时只记**变量名**。**只放结论**：原始形状、逐字样本与调用流水分别归 `out-reference/<provider>/` 与 `docs/verification/paid-provider-calls.md` |
 | 持久决定 / ADR | **决策的权威位置**：`docs/adr/`，按 `0001-slug.md` 顺序编号，ADR 拥有决策正文；准入判据、退役处理与引用写法见 `docs/agents/domain.md` |
 | 既有工作项 / 阶段进度 | 按 `docs/agents/issue-tracker.md` 配置；既有工作项能明确本次范围、验收及决定时可直接复用，不另建 Proposal |
 | 实施 Ticket | 按跟踪器配置存储与跟踪，关联所属工作项 |

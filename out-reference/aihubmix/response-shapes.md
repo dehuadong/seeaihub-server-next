@@ -9,7 +9,7 @@
 **来源分级**（这份台账里每行都标）：
 
 - **用户早期采集**：仓库建立（提交 `1fe462a`）时随库进来的样本，采集时间见响应里的 `created`——**不是**本仓库的受控实测；
-- **本仓库受控实测**：经用户授权、由本仓库 Agent 发起并留档的调用（`docs/facts/channel-facts.md` §5 有留档）。
+- **本仓库受控实测**：经用户授权、由本仓库 Agent 发起并留档的调用（`docs/verification/paid-provider-calls.md` 有留档）。
 
 | 端点 | 实测过？ | 有独立样本文件？ | 谁采集的 | 结构记在哪 |
 | --- | --- | --- | --- | --- |
@@ -135,4 +135,4 @@ pwsh -File scripts/probe/response-shapes.ps1 -Provider aihubmix -Probe generatio
 pwsh -File scripts/probe/response-shapes.ps1 -Provider aihubmix -Probe async -ConfirmPaidCalls
 ```
 
-脚本会写好 `out-reference/aihubmix/probe-<日期>-<probe>.json`（自动脱敏 URL / task id / `b64_json`），并在结束时提醒补两处登记：`docs/facts/channel-facts.md` §5 与本文档 §0 的表格。
+脚本会写好 `out-reference/aihubmix/probe-<日期>-<probe>.json`（自动脱敏 URL / task id / `b64_json`），并在结束时提醒补两处登记：`docs/verification/paid-provider-calls.md` 与本文档 §0 的表格。

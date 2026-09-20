@@ -17,7 +17,7 @@
 > | V5 | `n` / `quality` 的实际行为 | **已删除**：属上游生成行为，非平台合同事实 |
 > | V6 | APIMart 机器 schema（只读） | **已结清**：`/v1/models/{model}/schema` 与 `/v1/models` 均已取到（§3.4/§3.5） |
 >
-> **本文当前没有待执行项。** 本阶段之后出现的待验证项——**APIMart 的参考图/遮罩路径**——已于 2026-09-19 **在用户批准下执行完毕**，结果见 `docs/facts/channel-facts.md` §5.6：
+> **本文当前没有待执行项。** 本阶段之后出现的待验证项——**APIMart 的参考图/遮罩路径**——已于 2026-09-19 **在用户批准下执行完毕**，结果见 `paid-provider-calls.md` §6：
 >
 > 1. ✅ 上传接口真实返回 `{url, filename, content_type, bytes, created_at}`（URL 主机是 `getapib.org`，与文档示例的 `upload.apimart.ai` 不同）；
 > 2. ✅ `image_urls` **接受字符串数组**（上传页示例的对象数组写法不成立）；
@@ -26,7 +26,7 @@
 >
 > 实际用量：上传 2 次 + 生成 2 次（1 次直连探合同、1 次走我们自己的 API + Worker），花费不足 $0.03，未超批准时的 $1 上限。两个发布素材据此放开 `image_conditioned` / `masked`。
 >
-> 另：原「预算 ¥20 / $1」是我提的建议值，**偏高了**——实际只用了 7 次 `n=1 quality=low` 提交（见 `docs/facts/channel-facts.md` §5.4）。
+> 另：原「预算 ¥20 / $1」是我提的建议值，**偏高了**——实际只用了 7 次 `n=1 quality=low` 提交（见 `paid-provider-calls.md` §4）。
 >
 > **以下原文保留，作为历史记录与执行模板。**
 

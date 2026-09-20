@@ -281,7 +281,7 @@
 
 - **事实**：公开的 `/ai/v1` Task 对象没有 `usage` 字段；OpenAI 兼容本地样本有 `usage`。[任务对象](https://docs.aihubmix.com/en/api/async-tasks.md#task-object) · [本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
 - **待确认**：AIHubMix 是否通过任务详情、响应 Header、账单查询 API 或其他记录提供异步任务的文本/图片 token 分项和最终扣费。
-- **待确认**：缓存输入、舍入、最低扣费、失败计费、促销/折扣的权威规则（**缓存不由我们建模**：按 Tokens 计费不区分缓存，见 `docs/facts/channel-facts.md` §3.9.2）。`output_blocked` 明确称不收生成费，但 `output_policy_violation` 可能仍按既有审核计费规则处理。[任务错误](https://docs.aihubmix.com/en/api/async-tasks.md#task-errors)
+- **待确认**：缓存输入、舍入、最低扣费、失败计费、促销/折扣的权威规则（**缓存不由我们建模**：按 Tokens 计费不区分缓存，见 `docs/facts/channel-facts.md` §5.2）。`output_blocked` 明确称不收生成费，但 `output_policy_violation` 可能仍按既有审核计费规则处理。[任务错误](https://docs.aihubmix.com/en/api/async-tasks.md#task-errors)
 - **推论**：价格配置必须版本化并保留四种可能的 money rate；结算应优先使用 Provider 权威用量或账单记录，不应用图片尺寸自行反推 token。
 - **推论**：若 `/ai/v1` 最终无法提供可审计用量，需在以下方案中做明确选择后才能生产计费：使用可返回 usage 的 `/v1` 端点、接入 AIHubMix 账单记录、或采用经过验证的固定/预估计价并向用户明确其性质。
 
