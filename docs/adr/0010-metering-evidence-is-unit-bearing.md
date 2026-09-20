@@ -28,4 +28,4 @@
 
 **事实更正（2026-09-20）**：上面两段写"APIMart 的响应形状尚未由真实调用结清"。该前提**已结清**——APIMart 的任务完成响应**含四分项 `usage`**（`input_tokens_details` 区分 text/image），与 AIHubMix 同构。因此**已应用的计量维度仍只有 token 一条**，[0012](./0012-provider-declared-charge-as-evidence.md) 随之作废。依据：`docs/facts/channel-facts.md` §3.3、§3.9。本 ADR 的原则（计量承单位、计价声明维度、不得由金额反推计量量）**不因此改变**。
 
-**来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（见 `docs/research/gpt-image-2-inferera-research.md`）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。**后一项已由 2026-09-19 的受控实测结清**（见上方事实更正）。
+**来源**：第二阶段 Planning。实测依据：AIHubMix 的 OpenAI 兼容端点在样本中返回分项 token `usage`（原记录在 `docs/research/gpt-image-2-inferera-research.md`，**该存档已于 2026-09-20 被移除、提交 `ed140c2`**；结论已归纳进 `docs/facts/channel-facts.md` §2）；APIMart 任务响应（文档示例）返回 `cost`/`credits_cost` 金额，其分项 `usage` 是否在场尚未实测（见 `out-reference/apimart/billing-basis.md` 与 `tasks-status.cn.md`）。**后一项已由 2026-09-19 的受控实测结清**（见上方事实更正）。

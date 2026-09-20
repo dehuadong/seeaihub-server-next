@@ -2,7 +2,7 @@
 
 **决策**：作为项目运营方，**决定不再把 `gpt-image-2` 作为在售模型**，后续使用 `gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst` 两款。同时，`gpt-image-2-official` 与 `gpt-image-2` **视为同一模型**，二者的差异只在命名与所提供的参数能力。
 
-**这是运营/产品决定，不是从上游公告推导出的事实。** 记录此点很重要：本仓库没有、也不需要「`gpt-image-2` 已被上游退役」的平台侧证据（实测见 `docs/research/gpt-image-2.5-schema-research.md` §4：AIHubMix 退役清单未含该模型）。**决定的下游后果与上游是否公告无关**——目录里卖什么由运营方定，平台的职责是让「退役旧供给、发布新供给」这件事可执行、可审计、可回滚。
+**这是运营/产品决定，不是从上游公告推导出的事实。** 记录此点很重要：本仓库没有、也不需要「`gpt-image-2` 已被上游退役」的平台侧证据（当时的实测记录在 `docs/research/gpt-image-2.5-schema-research.md` §4：AIHubMix 退役清单未含该模型；**该存档已于 2026-09-20 被移除、提交 `ed140c2`**，继续有效的渠道事实见 `docs/facts/channel-facts.md` §2）。**决定的下游后果与上游是否公告无关**——目录里卖什么由运营方定，平台的职责是让「退役旧供给、发布新供给」这件事可执行、可审计、可回滚。
 
 ## 后果
 
@@ -30,4 +30,4 @@
 - [0012](./0012-provider-declared-charge-as-evidence.md)（Provider 声明的扣费金额作为**第二类**计量证据）：**已因上面的事实更正而作废**——两家渠道都返回四分项 token，不需要金额型证据。（原文写的是"是否仍需要取决于实测结果，因此保持待批准"；该状态已被事实更正取代。）
 - 与 [`0004`](./0004-vendor-and-provider-identities-stay-separate.md) 一致：换模型只影响 Vendor Model 与 Offering/Channel/Price Plan，不合并 Vendor 与 Provider 身份。
 
-**来源**：用户（项目运营方）于 2026-09-19 在第二阶段讨论中的明确决定。平台侧只读核对见 `docs/research/gpt-image-2.5-schema-research.md`（含 AIHubMix 两款的机器 Schema 对比、`quality` 位置随端点族变化、退役清单未含 `gpt-image-2` 的实测）。**APIMart 侧的核对不在那份文件里**（一个渠道的调研不夹带另一个渠道的结论，见 `docs/design/0004` R1）；它的模型供应、参数边界与计量事实见 `out-reference/apimart/apimart-image-api-research.md` 与 `docs/facts/channel-facts.md` §3。
+**来源**：用户（项目运营方）于 2026-09-19 在第二阶段讨论中的明确决定。平台侧只读核对原在 `docs/research/gpt-image-2.5-schema-research.md`（含 AIHubMix 两款的机器 Schema 对比、`quality` 位置随端点族变化、退役清单未含 `gpt-image-2` 的实测；**该存档已于 2026-09-20 被移除、提交 `ed140c2`**，继续有效的部分已归纳进 `docs/facts/channel-facts.md` §2.5）。**APIMart 侧的核对不在那份文件里**（一个渠道的调研不夹带另一个渠道的结论，见 `docs/design/0004` R1）；它的模型供应、参数边界与计量事实见 `out-reference/apimart/apimart-image-api-research.md` 与 `docs/facts/channel-facts.md` §3。

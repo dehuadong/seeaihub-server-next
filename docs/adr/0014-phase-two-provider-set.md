@@ -33,4 +33,4 @@
 
 若两家都按 token 计量，则 [0010](./0010-metering-evidence-is-unit-bearing.md) 的联合类型与 [0012](./0012-provider-declared-charge-as-evidence.md) 在本阶段都不需要，范围显著缩小；若 APIMart 侧只有张数或只有金额，则两者都需要。**该事实以只读取证无法结清，属于实施期的显式受控验证项。**
 
-**来源**：用户（项目运营方）于 2026-09-19 授权由本 Agent 确定第二阶段范围。只读实测证据见 `docs/research/gpt-image-2.5-schema-research.md`（AIHubMix 两款 2.5 的机器 Schema 对比、与 `gpt-image-2` 的 `quality` 差异）与 `out-reference/apimart/apimart-image-api-research.md`（APIMart 的供应声明、价格页 6 档、`quality` 边界与计价口径张力）。
+**来源**：用户（项目运营方）于 2026-09-19 授权由本 Agent 确定第二阶段范围。只读实测证据原在 `docs/research/gpt-image-2.5-schema-research.md`（**该存档已于 2026-09-20 被移除、提交 `ed140c2`**；其中继续有效的结论已归纳进 `docs/facts/channel-facts.md` §2.5）与 `out-reference/apimart/apimart-image-api-research.md`（APIMart 的供应声明、价格页 6 档、`quality` 边界与计价口径张力）。

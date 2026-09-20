@@ -2,7 +2,7 @@
 title: 独立图片生成服务端第一阶段交付
 status: implemented
 created: 2026-09-19
-updated: 2026-09-19
+updated: 2026-09-20
 approval: seeaihub-server-next#1 记录的用户执行授权；历史设计批准来自 seeaihub#674 技术设计 v5
 verification: 2026-09-19 fmt、clippy、workspace tests、空库 PostgreSQL HTTP contract 与 decisions check 全部通过
 ---
@@ -31,7 +31,7 @@ verification: 2026-09-19 fmt、clippy、workspace tests、空库 PostgreSQL HTTP
 - `cargo test --workspace --all-features`：PASS，22 项 Rust 测试通过；
 - 空库执行 `cargo test -p seeai-api --test http_contract -- --ignored`：PASS，覆盖动态发布、API 隔离、对账只退款、无 capture、租约在提交前后分别恢复，以及提交后不会再次入队；
 - Implementation Review 第 2 轮：Standards PASS、Spec PASS，material findings 为 0；
-- 真实 Provider 的历史受控验证见 [AIHubMix 调研第 13 节](../../../../docs/research/gpt-image-2-inferera-research.md#13-受控实测结果2026-09-18)，本次收口没有再次执行付费调用；
+- 真实 Provider 的历史受控验证（第一阶段 2026-09-18）见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) §2.3（渠道事实的单一出处）；**其原始调研存档 `docs/research/` 已于 2026-09-20 被移除（提交 `ed140c2`）**，本次收口没有再次执行付费调用；
 - `node scripts/decisions/check.mjs`：PASS，索引与本地链接有效。
 
 ## 后续边界

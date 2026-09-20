@@ -23,7 +23,7 @@
 
 实测 token：generations 文本输入 24、图片输入 0、图片输出 196、总计 220；edits 文本输入 27、图片输入 1024、图片输出 196、总计 1247。
 
-没有保存密钥、task ID 或短期 URL。完整脱敏记录见 `docs/research/gpt-image-2-inferera-research.md`（仓库管理根目录下，外部参考资源，不是平台接口合同）。
+没有保存密钥、task ID 或短期 URL。完整脱敏记录原在 `docs/research/gpt-image-2-inferera-research.md`（**该存档已于 2026-09-20 被移除，提交 `ed140c2`**）；已归纳的渠道事实现在只以 `docs/facts/channel-facts.md` 为出处。
 
 ## 2. 身份与供给登记
 
