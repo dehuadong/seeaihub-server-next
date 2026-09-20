@@ -1,7 +1,7 @@
 {
-  "_comment": "APIMart 供给 gpt-image-2.5-flare 的运行时发布素材（新形状）。来源见 docs/facts/channel-facts.md §3。",
-  "_status": "草案 · 未发布。文生图与图生图/遮罩均已受控实测（2026-09-19：一次带参考图 + 遮罩的真实调用，见 docs/facts/channel-facts.md §5.6），三条分支据此开放。",
-  "_evidence": "受控实测（out-reference/apimart/controlled-probe-2026-09-19.json 与 docs/facts/channel-facts.md §5.3/§5.6）：任务成功响应含四分项 usage，input_tokens_details 区分 text/image（带参考图时 image_tokens=1024）。机器 Schema 明确 Idempotency-Key，并声明 `image_urls`（string[]）与 `mask_url`；实测确认 `image_urls` 接受**字符串数组**、`mask_url` 可与之同用。上传接口合同见 §3.7，原始材料 out-reference/apimart/uploads-images.cn.md。",
+  "_comment": "APIMart 供给 gpt-image-2.5-flare 的运行时发布素材（新形状）。参数面与费率取自上游公开口径与受控实测。",
+  "_status": "草案 · 未发布。文生图与图生图/遮罩均已受控实测（2026-09-19：一次带参考图 + 遮罩的真实调用），三条分支据此开放。",
+  "_evidence": "受控实测（原始样本 out-reference/apimart/controlled-probe-2026-09-19.json）：任务成功响应含四分项 usage，input_tokens_details 区分 text/image（带参考图时 image_tokens=1024）。机器 Schema 明确 Idempotency-Key，并声明 `image_urls`（string[]）与 `mask_url`；实测确认 `image_urls` 接受**字符串数组**、`mask_url` 可与之同用。上传接口的原始材料见 out-reference/apimart/uploads-images.cn.md。",
   "_channel_differences": "本渠道与 AIHubMix 的差异全部落在 ② Adapter Driver：上游是任务式（提交→轮询→取图），参数在顶层（无 extra 包装），base_url 为 api.apib.ai。",
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-flare",
@@ -88,7 +88,7 @@
         "text_output_microusd_per_million": 10000000,
         "image_output_microusd_per_million": 30000000,
         "source_url": "https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md",
-        "_note": "这四个费率取自上游公开的按 Tokens 计费口径，是平台侧的结算基数。本渠道的成本价由上游在任务响应里直接声明（`cost`），不需要按费率再算一遍；见 docs/facts/channel-facts.md §3.9。**平台对外价尚未决定**（属后期产品决定，见工作项 #5）。"
+        "_note": "这四个费率取自上游公开的按 Tokens 计费口径，是平台侧的结算基数。本渠道的成本价由上游在任务响应里直接声明（`cost`），不需要按费率再算一遍。**平台对外价尚未决定**（属后期产品决定）。"
       }
     }
   ]

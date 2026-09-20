@@ -513,7 +513,7 @@ mod tests {
     }
 
     #[test]
-    fn recognises_vendor_specific_asset_paths() {
+    fn derives_parameter_name_kind_and_array_from_path() {
         // 参考图/遮罩参数按渠道各自的原生名给出：APIMart 的参考图叫 `image_urls`、
         // 遮罩叫 `mask_url`，平台不做统一改名。
         let binding = |path: &str, position: u16| AssetBinding {

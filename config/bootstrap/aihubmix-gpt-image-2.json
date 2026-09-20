@@ -1,5 +1,5 @@
 {
-  "_comment": "测试用发布素材：AIHubMix 供给 gpt-image-2（第一阶段在售供给），用新形状（offerings + price_plan）表达。三个读取者：apps/api/tests/http_contract.rs 两处、crates/adapter-aihubmix 的 accepts_bootstrap_capability_contract。",
+  "_comment": "测试用发布素材：AIHubMix 供给 gpt-image-2（第一阶段在售供给），用新形状（offerings + price_plan）表达。仅供测试读取，不作为在售供给。",
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2",
   "native_revision": "2026-09-18-validated-1.3",

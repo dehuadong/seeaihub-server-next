@@ -1,5 +1,5 @@
 {
-  "_comment": "AIHubMix 供给 gpt-image-2.5-flare 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。来源见 docs/facts/channel-facts.md §2.6/§2.8/§2.9。",
+  "_comment": "AIHubMix 供给 gpt-image-2.5-flare 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。参数面与费率取自上游公开口径与实测。",
   "_status": "草案 · 未发布。需「执行实现」授权后方可用于生产。",
   "_evidence": "2.5 两款在同步 /v1 上实测与 gpt-image-2 同构（四分项 usage）；quality 在 /v1 为顶层参数；本阶段不声明 extra.moderation（Adapter 声明面不含它）。",
   "vendor_id": "OpenAI",

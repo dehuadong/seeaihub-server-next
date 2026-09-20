@@ -2139,7 +2139,7 @@ mod tests {
     }
 
     #[test]
-    fn restriction_follows_the_vendors_own_parameter_names() {
+    fn restriction_recognises_image_and_mask_parameters_by_name() {
         // 参考图/遮罩参数按渠道各自的原生名给出：APIMart 的参考图字段叫 `image_urls`、
         // 遮罩叫 `mask_url`。判定办法是名字约定——参考图以 `image` 开头，遮罩含 `mask`。
         let vendor_names = offering_with(
