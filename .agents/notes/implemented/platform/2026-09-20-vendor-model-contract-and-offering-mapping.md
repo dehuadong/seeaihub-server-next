@@ -36,6 +36,12 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 
 图片字段合同外一律 400（不丢弃、不走 503）；`defaults` 加发布期校验 R6；对客目录必做、形状如上；**路由策略层暂不引入**，沿用 `ADR-0009` 的优先级选路（交接文档那条记为被取代，等真出现多个互相竞争的供给再谈）。
 
+## 厂商侧证据（2026-09-20，用户告知）
+
+- OpenAI 最新上线提供 **`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`** 两种模型；**与旧模型的核心区别是支持 `low`/`medium`/`high`/`xhigh`/`max`/`auto` 六档质量设置**。⇒ 这两个模型名**是厂商侧真实模型**（此前只能从渠道侧看到，属"未证"），`quality` 的六档与默认 `auto` 也据此归厂商侧，不再算渠道 schema 的推断。
+- 仓库里那份 OpenAI 官方快照（`out-reference/openai/openai-images-api.md`）正文只覆盖到 `gpt-image-2`，**不含 2.5**，且**全仓没有任何文档引用它**——2.5 的其余特有项（例如 `size` 上限是否仍 `3840x2160`、16 的倍数与 1:3~3:1 约束是否照旧）仍按"沿用 gpt-image 家族面、未对 2.5 单独确认"标注，不冒充已确认。
+- 素材迁移（一个 Vendor Model 一份顶层合同 + AIHubMix / APIMart 两条 offering）与逐项出处清单见提交历史与素材自身的 `_evidence`。
+
 ## 未做 / 边界
 
 - 尺寸声明里的"默认档位"没做成声明项（平台补的 `defaults` 会参与换算）。
