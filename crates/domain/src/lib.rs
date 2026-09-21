@@ -7,6 +7,7 @@ use uuid::Uuid;
 
 mod image_parameters;
 mod parameter_mapping;
+mod size_spec;
 pub use image_parameters::{
     ImageInputs, ImageParameterKind, contract_image_parameter_kind, declared_parameter_names,
     declared_reference_image_limit, declares_mask_parameter, declares_reference_image_parameter,
@@ -15,8 +16,10 @@ pub use image_parameters::{
     platform_image_parameters, take_contract_image_inputs,
 };
 pub use parameter_mapping::{
-    apply_parameter_defaults, declared_field_names, declares_parameter, is_used_parameter_value,
+    SizeMapping, apply_parameter_defaults, apply_size_mapping, declared_field_names,
+    declared_size_mapping, declares_parameter, is_used_parameter_value,
 };
+pub use size_spec::{SizeForm, SizeProfile, SizeSpec, convert_size};
 
 macro_rules! id_type {
     ($name:ident) => {
@@ -225,7 +228,7 @@ impl PriceSnapshot {
 /// 三份内容各有归属，且都随 Job 冻结，事后再看仍是受理当时那一份：
 /// - `capability_schema`：该 Vendor Model 的**调用方合同**（模型级唯一一份，落库后不再改）；
 /// - `carrier_schema`：这条供给**能承载**合同里的哪些字段（各供给可以不同）；
-/// - `parameter_mapping`：把合同值转成渠道包装的声明（本阶段只随行携带，内容由后续步骤补）。
+/// - `parameter_mapping`：把合同值转成渠道包装的声明（显式默认值与尺寸换算，随 Job 一起冻结）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedOffering {
     pub runtime_revision_id: RuntimeRevisionId,

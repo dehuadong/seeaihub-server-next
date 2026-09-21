@@ -9,10 +9,10 @@ use seeai_domain::{
     AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, ImageParameterKind,
     JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, PriceRates,
     PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_parameter_defaults,
-    contract_image_parameter_kind, declared_field_names, declared_parameter_names,
-    declared_reference_image_limit, declares_mask_parameter, declares_parameter,
-    declares_reference_image_parameter, is_used_parameter_value, place_image_inputs,
-    platform_image_parameters,
+    apply_size_mapping, contract_image_parameter_kind, declared_field_names,
+    declared_parameter_names, declared_reference_image_limit, declared_size_mapping,
+    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
+    is_used_parameter_value, place_image_inputs, platform_image_parameters,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -103,7 +103,7 @@ pub struct OfferingDraft {
     /// 这条供给**能承载**合同里的哪些字段。
     #[serde(default)]
     pub carrier_schema: Option<Value>,
-    /// 把合同值转成渠道包装的声明。本阶段只随行落库并随 Job 冻结，映射内容由后续步骤补。
+    /// 把合同值转成渠道包装的声明（显式默认值与尺寸换算）。随发布落库、随 Job 冻结。
     #[serde(default = "empty_object")]
     pub parameter_mapping: Value,
     /// 承载面的**旧名字**（过渡期）：只在没有 `carrier_schema` 时顶替它。
@@ -146,7 +146,7 @@ impl PricePlanDraft {
 pub struct NormalizedOffering {
     /// 这条供给**能承载**合同里的哪些字段。
     pub carrier_schema: Value,
-    /// 这条供给自己的合同值 → 渠道包装声明（本阶段只携带）。
+    /// 这条供给自己的合同值 → 渠道包装声明。
     pub parameter_mapping: Value,
     pub restrictions: Value,
     pub provider_kind: String,
@@ -1210,6 +1210,10 @@ impl RuntimeService {
                 ApplicationError::Validation(format!("unknown adapter {}", offering.adapter_key))
             })?;
         validate_adapter_compatibility(&offering, &descriptor)?;
+        // 尺寸换算声明也是**发布数据**：源字段必须在合同里（否则客户端提交不了它）、目标字段必须
+        // 被这条供给的承载面声明（否则换算出来的值发不出去），档案必须成形状。写歪了在这里拒绝，
+        // 不让它到受理期才变成一条"这条候选换算不出"的平台侧故障。
+        validate_size_mapping(contract, &offering)?;
         // 限制只能收窄：供货方不得声明这条供给的承载面自己都没声明的能力。
         validate_restrictions_within_profile(&offering)?;
         // Driver 侧的发布校验看的是**承载面**：这条供给实际会往线文里写的字段面。
@@ -1381,6 +1385,42 @@ fn carrier_properties(
         .ok_or_else(|| {
             ApplicationError::Validation("carrier_schema.properties is required".to_owned())
         })
+}
+
+/// 校验映射里的**尺寸换算声明**：它必须是这条供给真能执行的一件事。
+///
+/// 三条边界，与"承载面 ⊆ 合同 ⊆ Driver 能写上线文的名字"同一条道理——声明了却做不到，就是
+/// 声明与行为分了家：
+///
+/// - 源字段必须在**合同**里：客户端提交不了的名字当不了换算的输入；
+/// - 目标字段必须被这条供给的**承载面**声明：换算出来的值要发得出去；
+/// - 档案必须成形状（档位/比例/像素三样各就各位）：它随发布携带，写歪了就不该发出去。
+///
+/// 声明写歪时**不**按"没有声明"处理：那会让调用方与运营都以为换算发生了，而线上原样上行。
+fn validate_size_mapping(
+    contract: &Value,
+    offering: &NormalizedOffering,
+) -> Result<(), ApplicationError> {
+    let Some(mapping) = declared_size_mapping(&offering.parameter_mapping).map_err(|reason| {
+        ApplicationError::Validation(format!("parameter_mapping.size: {reason}"))
+    })?
+    else {
+        return Ok(());
+    };
+    for name in &mapping.source {
+        if !declares_parameter(contract, name) {
+            return Err(ApplicationError::Validation(format!(
+                "parameter_mapping.size reads {name}, which the vendor model contract does not declare"
+            )));
+        }
+    }
+    if !declares_parameter(&offering.carrier_schema, &mapping.target) {
+        return Err(ApplicationError::Validation(format!(
+            "parameter_mapping.size writes {}, which this offering's carrier surface does not declare",
+            mapping.target
+        )));
+    }
+    Ok(())
 }
 
 /// 校验「承载面 ⊆ 该 Driver 能写上线文的字段名」，分支与图片数上限照旧。
@@ -1894,14 +1934,20 @@ fn contract_image_input_present(request: &CreateImageGenerationRequest, name: &s
 /// 这条候选不合格，返回原因写进路由判定记录。这正是"声明了承载面"的意义——供给说了自己能把哪些
 /// 字段带到线上，平台不替它加码。
 ///
+/// 唯一的例外是**被尺寸换算消耗**的字段：那条供给把它当作换算的输入（比例 + 档位 → 像素），
+/// 而不是要原样发出去的字段。它表达得了这次请求，只是表达成另一个样子——像素面渠道的线上根本
+/// 没有 `resolution` 这个名字，正因为有换算它才承载得了这个请求。换算本身失败（档案缺那一格、
+/// 取值不成形状）同样是"这条候选不合格"，理由照旧写进判定记录。
+///
 /// 合格之后才组装要落进 Job、并发给上游的参数面：
 /// 1. 按承载面留下名字：调用方给了空值、承载面又没声明这个字段时，在这里去掉（空值不携带信息，
 ///    而发一个承载面没声明的名字给上游，只会得到上游自己的一套解释）；
 /// 2. 把参考图与遮罩落到这条候选**自己声明的**参数名上（声明不了就是不合格，绝不静默丢图）；
 /// 3. 注入映射声明的**显式默认值**：调用方没给的字段由平台定，而不是由渠道自己的默认值定；
-/// 4. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
-///    平台不替它省。放在最后是因为前两步都可能把必填项补上（图落在承载面的名字上、默认值注入），
-///    先判会把"其实跑得通"的候选误判成不合格。
+/// 4. 按映射声明做**尺寸换算**：这一步最后做，换算出来的值就是最终要发出去的那个值；
+/// 5. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
+///    平台不替它省。放在最后是因为前几步都可能把必填项补上（图落在承载面的名字上、默认值注入、
+///    尺寸换算写进目标字段），先判会把"其实跑得通"的候选误判成不合格。
 ///
 /// 返回的是"这条候选不合格"的原因，不是请求级错误：换一条承载面更宽的候选仍然可能跑通，
 /// 所以它写进路由判定记录，而不是直接回给调用方。
@@ -1910,8 +1956,12 @@ fn prepare_carrier_parameters(
     request: &CreateImageGenerationRequest,
     offering: &PublishedOffering,
 ) -> Result<Value, String> {
+    let size = declared_size_mapping(&offering.parameter_mapping)?;
     for (name, value) in contract_parameters {
         if !is_used_parameter_value(value) {
+            continue;
+        }
+        if size.as_ref().is_some_and(|mapping| mapping.consumes(name)) {
             continue;
         }
         if !declares_parameter(&offering.carrier_schema, name) {
@@ -1933,6 +1983,18 @@ fn prepare_carrier_parameters(
         &offering.parameter_mapping,
         &mut parameters,
     );
+    if let Some(size) = &size {
+        // 换算结果写进承载面声明的目标字段。发布期已经拦下"目标字段没被承载面声明"的映射，
+        // 这里再判一次是因为落库的那一行也可能来自更早的发布：宁可判这条候选不合格，
+        // 也不往线上写一个它没声明过的字段。
+        if !declares_parameter(&offering.carrier_schema, &size.target) {
+            return Err(format!(
+                "this offering's size mapping writes {}, which it does not declare",
+                size.target
+            ));
+        }
+        apply_size_mapping(size, contract_parameters, &mut parameters)?;
+    }
     let missing: Vec<&str> = offering
         .carrier_schema
         .get("required")
@@ -2510,6 +2572,72 @@ mod tests {
             serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 16}),
         );
         assert!(validate_restrictions_within_profile(&unbounded).is_err());
+    }
+
+    /// 尺寸换算声明也是**发布数据**：源字段在合同里、目标字段在承载面里、档案成形状，才准发布。
+    ///
+    /// 写歪的声明不按"没有声明"处理——那会让换算静默不发生，调用方与运营都以为它发生了。
+    #[test]
+    fn the_size_mapping_must_be_something_this_offering_can_execute() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        let carrier = serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"}
+        });
+        let size_mapping = serde_json::json!({
+            "size": {
+                "source": ["size", "resolution"],
+                "target": "size",
+                "form": "pixels",
+                "profile": {"2K": {"2:3": "1664x2496"}}
+            }
+        });
+        let mut offering = offering_with(carrier.clone(), serde_json::json!({}));
+        offering.parameter_mapping = size_mapping.clone();
+        assert!(
+            validate_size_mapping(&contract, &offering).is_ok(),
+            "源字段在合同里、目标字段在承载面里、档案成形状：这条声明可以发布"
+        );
+
+        // 源字段不在合同里：客户端提交不了它，换算没有输入。
+        let mut bad = offering.clone();
+        bad.parameter_mapping = serde_json::json!({
+            "size": {"source": ["aspect_ratio"], "target": "size", "form": "pixels"}
+        });
+        let error =
+            validate_size_mapping(&contract, &bad).expect_err("source outside the contract");
+        assert!(error.to_string().contains("aspect_ratio"), "{error}");
+
+        // 目标字段不在承载面里：换算出来的值发不出去。
+        let mut bad = offering.clone();
+        bad.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"}
+        }));
+        let error = validate_size_mapping(&contract, &bad).expect_err("target outside the carrier");
+        assert!(error.to_string().contains("writes size"), "{error}");
+
+        // 档案不成形状：档位/比例/像素三样没各就各位。
+        let mut bad = offering.clone();
+        bad.parameter_mapping = serde_json::json!({
+            "size": {"source": ["size"], "target": "size", "form": "pixels", "profile": []}
+        });
+        let error = validate_size_mapping(&contract, &bad).expect_err("a profile must be a table");
+        assert!(
+            error.to_string().contains("parameter_mapping.size"),
+            "{error}"
+        );
+
+        // 没声明尺寸换算：这条供给不做换算，照常发布。
+        let mut plain = offering.clone();
+        plain.parameter_mapping = serde_json::json!({});
+        assert!(validate_size_mapping(&contract, &plain).is_ok());
     }
 
     /// 一份只声明给定顶层字段的合同/承载面。

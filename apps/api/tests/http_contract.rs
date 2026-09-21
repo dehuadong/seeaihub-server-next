@@ -3233,6 +3233,267 @@ async fn explicit_defaults_reach_the_upstream_request_body() {
     harness.cleanup().await;
 }
 
+/// Seedream 5.0 lite 的 2K 档映射表：厂商文档里"分辨率档位 × 宽高比 → 宽高像素值"的那张表。
+///
+/// 它出现在用例里只是**发布数据**：平台代码里没有任何厂商的档位表，档案随发布携带，接新厂商
+/// 只发一份新档案。
+fn lite_2k_profile() -> Value {
+    json!({
+        "2K": {
+            "1:1": "2048x2048",
+            "4:3": "2304x1728",
+            "16:9": "2848x1600",
+            "3:2": "2496x1664",
+            "2:3": "1664x2496",
+            "21:9": "3136x1344"
+        }
+    })
+}
+
+/// 合同给"比例 + 档位"、供给要像素：平台在**组装期**查档案换算，线上那个字段是换算后的像素值。
+///
+/// 这条供给是像素面渠道（线上根本没有 `resolution` 这个名字），它承载得了这次请求全靠映射里
+/// 那份尺寸声明：`resolution` 是换算的输入，不是要原样上行的字段。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_size_conversion_reaches_the_upstream_request_body() {
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    // 合同（模型级）：调用方可以给比例与档位两个字段。
+    draft["capability_schema"] = surface_schema(json!({
+        "model": {"const": Harness::MODEL},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"},
+        "resolution": {"type": "string"}
+    }));
+    // 承载面：这条供给只往线上写 `size` 一个尺寸字段。
+    draft["carrier_schema"] = surface_schema(json!({
+        "model": {"const": Harness::MODEL},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"}
+    }));
+    draft["parameter_mapping"] = json!({
+        "size": {
+            "source": ["size", "resolution"],
+            "target": "size",
+            "form": "pixels",
+            "profile": lite_2k_profile()
+        }
+    });
+    let harness =
+        Harness::start_with_draft(draft, UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64)
+            .await;
+
+    let key = format!("size-converted-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "a 2:3 poster at 2K");
+    request["size"] = json!("2:3");
+    request["resolution"] = json!("2K");
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("尺寸换算", &body);
+
+    let submit_body = harness.submit_body("/v1/images/generations");
+    assert_eq!(
+        submit_body["size"], "1664x2496",
+        "线上那个字段必须是换算后的像素值：{submit_body}"
+    );
+    assert!(
+        submit_body.get("resolution").is_none(),
+        "换算的输入字段不再原样上行：{submit_body}"
+    );
+    harness.assert_only_declared_fields(&request);
+    // 内部 Job 里存的就是这次真正发出去的东西：Driver 只看到渠道要的形态。
+    let stored: Value = sqlx::query_scalar(
+        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("native parameters");
+    assert_eq!(stored["size"], "1664x2496", "{stored}");
+    assert!(stored.get("resolution").is_none(), "{stored}");
+    assert_job_succeeded(&harness, &key).await;
+    harness.cleanup().await;
+}
+
+/// 档案里缺那一格：这条候选**不合格**（原因写进判定记录），有别的候选就落到它，没有就 503。
+///
+/// 换算不出不是"参数错"：请求本身完全符合合同（比例与档位都给了），是这条供给的档案里没有
+/// 3K 那一格。因此对客只能是平台侧故障，绝不退回调用方给的原值、也绝不猜一个近似值。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_size_combination_the_profile_lacks_makes_the_candidate_ineligible() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "size-profile-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"},
+        "resolution": {"type": "string"}
+    }));
+    // 像素面供给：档案里只有 2K 那一档。
+    let pixel_carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"}
+    }));
+    let pixel_mapping = json!({
+        "size": {
+            "source": ["size", "resolution"],
+            "target": "size",
+            "form": "pixels",
+            "profile": lite_2k_profile()
+        }
+    });
+    // 比例 + 档位面供给：两个字段原样承载，不做换算。
+    let ratio_carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"},
+        "resolution": {"type": "string"}
+    }));
+
+    // ── 用例 1：优先级 0 的候选档案里没有 3K → 落到优先级 1 的候选，判定记录写明原因 ──
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "size-1",
+        contract.clone(),
+        vec![
+            (
+                "aihubmix-image-v1",
+                pixel_carrier.clone(),
+                pixel_mapping.clone(),
+            ),
+            ("apimart-image-v1", ratio_carrier.clone(), json!({})),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "两条候选各带自己的尺寸声明");
+
+    let mut request = route_request(model, "a 2:3 poster at 3K");
+    request["size"] = json!("2:3");
+    request["resolution"] = json!("3K");
+    let key = format!("size-skip-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "换算不出只是这条候选不合格，下一条照常受理：{body}"
+    );
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("the request must have been accepted");
+    let (chosen, considered): (Uuid, Value) = {
+        let row = sqlx::query(
+            "SELECT chosen_offering_id, considered FROM generation.routing_decisions WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("routing decision row must exist");
+        (
+            row.try_get("chosen_offering_id").expect("chosen"),
+            row.try_get("considered").expect("considered"),
+        )
+    };
+    let considered = considered.as_array().expect("considered is an array");
+    assert_eq!(considered.len(), 2, "两个候选都要进判定记录");
+    assert_eq!(considered[0]["eligible"], false);
+    assert!(
+        considered[0]["skip_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("2:3") && reason.contains("3K")),
+        "落选原因必须写明档案缺哪一格：{considered:?}"
+    );
+    assert_eq!(considered[1]["eligible"], true);
+    let expected: Uuid = sqlx::query_scalar(
+        "SELECT re.offering_id FROM publication.runtime_entries re
+         WHERE re.active AND re.gateway_model = $1 AND re.routing_priority = 1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("priority 1 offering");
+    assert_eq!(chosen, expected, "第一条换算不出，就该落到下一条");
+
+    // ── 用例 2：同一个型号只留像素面那条 → 一条候选都不合格 → 平台侧故障 ──
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "size-2",
+        contract.clone(),
+        vec![(
+            "aihubmix-image-v1",
+            pixel_carrier.clone(),
+            pixel_mapping.clone(),
+        )],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    let key = format!("size-none-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "档案缺那一格不是消费者的参数错：{body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "平台侧供给问题必须说成平台侧故障：{body}"
+    );
+    assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
+    assert_public_only("尺寸换算不出", &body);
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    assert_eq!(
+        jobs_after, jobs_before,
+        "换算不出是在受理前失败的，不该留下执行记录"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
 /// 一个只声明给定顶层字段的封闭对象 schema（合同与承载面都用它）。
 fn surface_schema(properties: Value) -> Value {
     json!({
