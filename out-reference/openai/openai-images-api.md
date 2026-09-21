@@ -8,7 +8,7 @@
 
 > 最新上线提供 gpt-image-2.5-flare 与 gpt-image-2.5-sunburst 两种模型；与旧模型的核心区别是支持 low（低）、medium（中）、high（高）、xhigh（超高）、max（最高）和 auto（自动）质量设置。
 
-以下内容基于早期的模型 gpt-image-2，最新资料以官方最新文档为准（见上方链接）。
+
 
 ## 端点
 
