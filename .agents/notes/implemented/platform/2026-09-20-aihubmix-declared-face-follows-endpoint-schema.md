@@ -17,10 +17,11 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 | --- | --- | --- |
 | `background`、`output_compression`、`user`（2.5 另有 `moderation`） | **没有这四个**（`additionalProperties: false`；它们属 `/ai/v1` 族的 `extra`） | 删除 |
 | 一条 `allOf`：`background=transparent` → `output_format=png` | 没有（因为 `background` 不存在） | 删除 |
-| `size`：enum `["auto","1024x1024","1536x1024","1024x1536"]` | `string|null`，**无枚举** | 去掉枚举，只留类型 |
-| `output_format`：enum `["png","jpeg"]` + default `png` | `string|null`，**无枚举**，default `png` | 去掉枚举，保留 default |
+| `size`：enum `["auto","1024x1024","1536x1024","1024x1536"]` | `anyOf`：`const "auto"` 或 `pattern "^[0-9]+x[0-9]+$"` | 按 schema 的 `anyOf` 声明（自造的四个像素值删掉） |
+| `output_format`：enum `["png","jpeg"]` + default `png` | 2.5 是 `png`/`jpeg`/`webp`、`gpt-image-2` 是 `png`/`jpeg`，default `png` | 按各自 schema 的值集声明（2.5 补上 `webp`） |
 | `quality`（gpt-image-2）：含 `auto`、default `auto` | enum 只有 `low`/`medium`/`high`，**无 default** | 改成三个值、去掉 default |
-| `prompt`/`image`/`mask` 的 `minLength`/`maxLength` | 只有 `type: string` | 去掉自造的长度约束 |
+| `prompt` 的 `minLength`/`maxLength` | **在 schema 里**（2.5 另有 `maxLength 32000`） | 保留（不是自造约束） |
+| `image`/`mask` 只有 `type: string` | 编辑端是二进制部件（`format: binary`） | 补 `format` |
 
 对得上、保留不动的：`model`（收窄成 `const` 是平台路由需要）、`prompt`、`image`/`mask`、`n`（1–10、default 1）、2.5 的 `quality` 枚举与 default、`output_format` 的 default `png`。`image` 在 edits 端必填、在 generations 端不存在，正好对应平台"有图走 edits、无图走 generations"的分流。
 
@@ -28,7 +29,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 
 - **口径**：声明面以**该模型对应端点**的 `request.schema` 为准（字段、枚举、取值范围都取它），不以第一方文档的宽面为准。写进 [`ADR-0002`](../../../../docs/adr/0002-native-capability-schema-not-canonical.md) 与 [`ADR-0018`](../../../../docs/adr/0018-open-parameters-by-first-party-docs.md) 的 2026-09-20 修订。
 - **Driver 能力面保留**：`AdapterDescriptor.supported_top_level_parameters` 不动（它只是"这个 Adapter 能承载什么"的上限，不是这次发布的声明面）。因此 AIHubMix 仍可发布声明 `background` 等名字的素材；要不要发由素材决定。
-- **发布期校验放宽一处**：`crates/adapter-aihubmix/src/lib.rs` 原先要求 `size`/`output_format`/`quality` 必须带字符串枚举；端点 schema 对 `size`/`output_format` 只声明类型，故改为"类型必须是 string，枚举可有可无（有则必须是字符串枚举）"。`background`/`moderation` 仍要求枚举。
+- **发布期校验放宽一处**：`crates/adapter-aihubmix/src/lib.rs` 原先要求 `size`/`output_format`/`quality` 必须带字符串 `enum`；端点 schema 用 `anyOf` 的 `const`/`pattern` 表达 `size` 的值集，`output_format` 则可能只给 `type`，所以改为"类型必须是 string，`enum` 可有可无（有则必须是字符串枚举）"。`background`/`moderation` 仍要求枚举。
 - 素材的 `_comment`/`_evidence` 注明参数面来源（哪份端点快照）。
 
 ## 验证
@@ -44,3 +45,4 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 
 - `n`、`quality`、`size`、`output_format` 在 schema 里都允许 `null`；素材按平台的空值约定只声明非空类型（`null` 等于"没给"），没有把 `["string","null"]` 写进声明面。
 - `model` 声明成 `const`（端点 schema 只写 `string`）：这是平台为了把请求路由到该型号而做的收窄，保留。
+- `size` 用 `anyOf`（`const` + `pattern`）而不是 `enum`：照 schema 的表达方式抄，不把它改写成枚举。

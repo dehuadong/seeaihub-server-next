@@ -24,12 +24,12 @@
         "required": ["model", "prompt"],
         "properties": {
           "model": { "const": "gpt-image-2.5-flare" },
-          "prompt": { "type": "string" },
-          "image": { "type": "string" },
-          "mask": { "type": "string" },
+          "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
+          "image": { "type": "string", "format": "binary" },
+          "mask": { "type": "string", "format": "binary" },
           "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
-          "size": { "type": "string" },
-          "output_format": { "type": "string", "default": "png" },
+          "size": { "type": "string", "anyOf": [{ "const": "auto" }, { "pattern": "^[0-9]+x[0-9]+$" }] },
+          "output_format": { "type": "string", "enum": ["png", "jpeg", "webp"], "default": "png" },
           "quality": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" }
         },
         "allOf": [

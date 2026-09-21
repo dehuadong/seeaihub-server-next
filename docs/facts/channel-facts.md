@@ -258,7 +258,7 @@
 
 `model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image` 只在 edits 端、且必填；generations 端没有 `image`/`mask`）。
 
-**字段、枚举与取值范围都取自该模型对应端点的 `request.schema`**（快照见 `out-reference/aihubmix/schema-gpt-image-2*.endpoints.json`）：`n` 为 1–10、默认 1；`quality` 2.5 两款是 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）、`gpt-image-2` 只有 `low`/`medium`/`high`；`output_format` 只有类型与默认值 `png`、`size` 只有类型——**schema 没给枚举的，素材不发明枚举**。
+**字段、枚举与取值范围都取自该模型对应端点的 `request.schema`**（快照见 `out-reference/aihubmix/schema-gpt-image-2*.endpoints.json`）：`prompt` 有 `minLength 1`（2.5 另有 `maxLength 32000`）；`n` 为 1–10、默认 1；`quality` 2.5 两款是 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）、`gpt-image-2` 只有 `low`/`medium`/`high`；`size` 是 `auto` 或 `宽x高`（schema 用 `anyOf` 的 `const` + `pattern` 表达，不是枚举）；`output_format` 是 `png`/`jpeg`/`webp`（`gpt-image-2` 无 `webp`）、默认 `png`；`image`/`mask` 在编辑端是**二进制部件**（schema 标 `format: binary`）。**schema 怎么表达就怎么声明**（枚举、`anyOf`、`format` 都照抄），不自己发明也不省略。
 
 **当前阶段平台不校验取值**（枚举、区间、类型都不管），但**按选中候选声明的参数面过滤**：候选声明过的参数原样发给上游，没声明的直接丢掉（不报错、不发上游）。哪些参数需要把取值管起来，等一份明确的清单（用户 2026-09-20 说明后期统一整理）。
 
