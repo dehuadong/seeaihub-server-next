@@ -491,6 +491,26 @@ fn start_api(
     (base_url, admin_token, ApiProcess { child })
 }
 
+/// 起一个真实 Worker 进程（丢弃返回值即结束它）。
+///
+/// 环境变量只有一份，两个调用点（[`Harness`] 与直接起进程的用例）共用：两家渠道的凭证都写在
+/// 测试进程的环境里，取值只在进程内假上游上用过，不写入配置、日志或响应。
+fn spawn_worker_process(database_url: &str) -> WorkerProcess {
+    let child = Command::new(worker_binary())
+        .env("DATABASE_URL", database_url)
+        .env("WORKER_ID", "driver-contract-worker")
+        .env("WORKER_POLL_INTERVAL_MS", "200")
+        .env("WORKER_LEASE_SECONDS", "300")
+        .env("PROVIDER_TIMEOUT_SECONDS", "60")
+        .env("APIMART_API_KEY", "contract-test-key")
+        .env("AIHUBMIX_API_KEY", "contract-test-key")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("worker process should start");
+    WorkerProcess { child }
+}
+
 /// 一个真实 Worker 进程。
 ///
 /// `Drop` 时结束它：断言失败也不会留下孤儿 Worker 把二进制锁住（那会让下一次
@@ -637,19 +657,7 @@ impl Harness {
 
     /// 起一个真实 Worker 进程（丢弃返回值即结束它）。
     fn spawn_worker(&self) -> WorkerProcess {
-        let child = Command::new(worker_binary())
-            .env("DATABASE_URL", &self.database_url)
-            .env("WORKER_ID", "driver-contract-worker")
-            .env("WORKER_POLL_INTERVAL_MS", "200")
-            .env("WORKER_LEASE_SECONDS", "300")
-            .env("PROVIDER_TIMEOUT_SECONDS", "60")
-            .env("APIMART_API_KEY", "contract-test-key")
-            .env("AIHUBMIX_API_KEY", "contract-test-key")
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("worker process should start");
-        WorkerProcess { child }
+        spawn_worker_process(&self.database_url)
     }
 
     /// 走同步入口发一次 JSON 请求，并起真实 Worker 把它跑到终态。
@@ -4159,6 +4167,364 @@ async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_paramete
         status,
         StatusCode::GATEWAY_TIMEOUT,
         "没有图就是普通的文生图：{body}"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 假上游记录里某条路径上**最近一次**提交报文（JSON 形态）。
+fn last_submit_body(calls: &UpstreamCalls, path: &str) -> Value {
+    let raw = calls
+        .lock()
+        .expect("calls lock")
+        .iter()
+        .rfind(|call| call.method == "POST" && call.path == path)
+        .map(|call| call.body.clone())
+        .expect("the driver must submit a generation request");
+    serde_json::from_slice(&raw).expect("submit body is JSON")
+}
+
+/// 假上游记录里某条路径上的调用次数。
+fn count_calls(calls: &UpstreamCalls, method: &str, path: &str) -> usize {
+    calls
+        .lock()
+        .expect("calls lock")
+        .iter()
+        .filter(|call| call.method == method && call.path == path)
+        .count()
+}
+
+/// 这次请求的**选路判定**：`(选中的候选, 完整取舍画面)`。内部事实，对客看不见。
+async fn routing_of(pool: &PgPool, key: &str) -> (Uuid, Vec<Value>) {
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(key)
+            .fetch_one(pool)
+            .await
+            .expect("the request must have created a job");
+    let row = sqlx::query(
+        "SELECT chosen_offering_id, considered FROM generation.routing_decisions WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(pool)
+    .await
+    .expect("routing decision row must exist");
+    (
+        row.try_get("chosen_offering_id").expect("chosen"),
+        row.try_get::<Value, _>("considered")
+            .expect("considered")
+            .as_array()
+            .cloned()
+            .unwrap_or_default(),
+    )
+}
+
+/// 被选中的候选属于哪个渠道。
+async fn chosen_provider_kind(pool: &PgPool, offering_id: Uuid) -> String {
+    sqlx::query_scalar(
+        "SELECT c.provider_kind FROM supply.offerings o
+         JOIN supply.channels c ON c.id = o.channel_id
+         WHERE o.id = $1",
+    )
+    .bind(offering_id)
+    .fetch_one(pool)
+    .await
+    .expect("the chosen offering must have a channel")
+}
+
+/// 新形状的 2.5 素材（**一个 Vendor Model 一份文件**）端到端跑一遍：同一个型号只落**一份合同**，
+/// 两条供给各带自己的承载面与参数映射，选路按承载面走。
+///
+/// 三条请求各钉一件事：
+/// - 只带 `prompt`：首选的 AIHubMix 承载得了，请求就该落在它身上；
+/// - 带 `background`：AIHubMix 的同步 /v1 面收不了这个字段 → 该候选**不合格**（判定记录写明原因）、
+///   改道 APIMart，且这个字段要原样出现在发给 APIMart 的报文里；
+/// - 带参考图：合同字段叫 `image`，APIMart 线上叫 `image_urls`，靠改名落到渠道字段名上
+///   （报文里不许出现 `image`）。
+///
+/// 两家渠道各起一个进程内假上游：线上形状不同（一家同步回图、一家任务式），所以"报文里到底是
+/// 哪个字段名"只能按真正收到请求的那一方来判。全程零外部调用。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let client = Client::new();
+    let aihubmix_calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+    let apimart_calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+    let aihubmix_upstream = start_fake_upstream_with(
+        aihubmix_calls.clone(),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+    )
+    .await;
+    let apimart_upstream =
+        start_fake_upstream_with(apimart_calls.clone(), UpstreamBehaviour::apimart()).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64);
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // ── 两份素材各自发布：一个 Vendor Model 一份文件，顶层一份合同 + 两条候选 ──
+    for material in [
+        include_str!("../../../config/bootstrap/gpt-image-2.5-flare.json"),
+        include_str!("../../../config/bootstrap/gpt-image-2.5-sunburst.json"),
+    ] {
+        let mut material: Value = serde_json::from_str(material).expect("material parses");
+        let model = material["native_model_id"]
+            .as_str()
+            .expect("native model id")
+            .to_owned();
+        let offerings = material["offerings"]
+            .as_array_mut()
+            .expect("offerings must be an array");
+        assert_eq!(
+            offerings.len(),
+            2,
+            "一份素材两条供给：AIHubMix 首选、APIMart 次之"
+        );
+        // 上游地址换成这个用例的两个假上游，各按渠道给：凭证仍只从环境变量读。
+        for offering in offerings.iter_mut() {
+            offering["base_url"] = Value::String(match offering["provider_kind"].as_str() {
+                Some("AIHubMix") => aihubmix_upstream.base_url.clone(),
+                Some("APIMart") => apimart_upstream.base_url.clone(),
+                other => panic!("unexpected provider kind {other:?}"),
+            });
+        }
+        let published = client
+            .post(format!("{base_url}/api/v1/runtime-revisions"))
+            .bearer_auth(&admin_token)
+            .json(&material)
+            .send()
+            .await
+            .expect("publication request");
+        assert_eq!(
+            published.status(),
+            StatusCode::OK,
+            "{model} 素材必须能发布：{:?}",
+            published.text().await
+        );
+
+        // 合同是**模型级唯一一份**：这个型号只落一行，两条候选都挂在它下面。
+        let contracts: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM catalog.vendor_models
+             WHERE vendor_id = 'OpenAI' AND native_model_id = $1",
+        )
+        .bind(&model)
+        .fetch_one(&pool)
+        .await
+        .expect("contract count");
+        assert_eq!(contracts, 1, "一个 Vendor Model 只能有一份合同");
+        let rows = sqlx::query(
+            "SELECT re.vendor_model_id, c.provider_kind, o.carrier_schema, o.parameter_mapping,
+                    vm.capability_schema
+             FROM publication.runtime_entries re
+             JOIN supply.offerings o ON o.id = re.offering_id
+             JOIN supply.channels c ON c.id = o.channel_id
+             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+             WHERE re.active AND re.gateway_model = $1
+             ORDER BY re.routing_priority",
+        )
+        .bind(&model)
+        .fetch_all(&pool)
+        .await
+        .expect("candidate rows");
+        assert_eq!(rows.len(), 2, "两个渠道都要成为可用候选");
+        let vendor_model_ids: Vec<Uuid> = rows
+            .iter()
+            .map(|row| row.try_get("vendor_model_id").expect("vendor model"))
+            .collect();
+        assert_eq!(
+            vendor_model_ids[0], vendor_model_ids[1],
+            "两条候选必须挂在同一份合同（同一个 Vendor Model）上"
+        );
+        let kinds: Vec<String> = rows
+            .iter()
+            .map(|row| row.try_get("provider_kind").expect("provider kind"))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec!["AIHubMix".to_owned(), "APIMart".to_owned()],
+            "下标 0 是首选：AIHubMix"
+        );
+
+        let carriers: Vec<Value> = rows
+            .iter()
+            .map(|row| row.try_get("carrier_schema").expect("carrier"))
+            .collect();
+        assert_ne!(
+            carriers[0], carriers[1],
+            "两条供给各带自己的承载面，不是共用一份"
+        );
+        // 这个用例的差集就在这里：AIHubMix 的同步 /v1 面收不了 `background`，APIMart 收得了。
+        assert!(
+            carriers[0]["properties"].get("background").is_none(),
+            "AIHubMix 的 /v1 面没有 background"
+        );
+        assert!(
+            carriers[1]["properties"].get("background").is_some(),
+            "APIMart 收得了 background"
+        );
+        // 承载面的每个字段名都要能从合同到达：合同直接声明，或被改名接过去（供给不能凭空多出参数）。
+        for (index, row) in rows.iter().enumerate() {
+            let carrier: Value = row.try_get("carrier_schema").expect("carrier");
+            let contract: Value = row.try_get("capability_schema").expect("contract");
+            let mapping: Value = row.try_get("parameter_mapping").expect("mapping");
+            let wires: Vec<Value> = mapping["rename"]
+                .as_object()
+                .map(|renames| renames.values().cloned().collect())
+                .unwrap_or_default();
+            assert_eq!(
+                contract["properties"]["model"]["const"], model,
+                "两条候选读到的都是这个型号的合同"
+            );
+            for name in carrier["properties"]
+                .as_object()
+                .expect("carrier properties")
+                .keys()
+            {
+                let declared = contract["properties"]
+                    .as_object()
+                    .expect("contract properties")
+                    .contains_key(name);
+                let renamed = wires
+                    .iter()
+                    .any(|wire| wire.as_str() == Some(name.as_str()));
+                assert!(declared || renamed, "候选 {index} 的 {name} 必须从合同可达");
+            }
+        }
+        // APIMart 的图片字段靠**改名**接到合同字段上（合同叫 image/mask，线上叫 image_urls/mask_url）。
+        let aihubmix_mapping: Value = rows[0].try_get("parameter_mapping").expect("mapping");
+        assert_eq!(
+            aihubmix_mapping,
+            json!({}),
+            "AIHubMix 与合同同型（size 都是像素型），不需要映射"
+        );
+        let apimart_mapping: Value = rows[1].try_get("parameter_mapping").expect("mapping");
+        assert_eq!(apimart_mapping["rename"]["image"], "image_urls");
+        assert_eq!(apimart_mapping["rename"]["mask"], "mask_url");
+    }
+
+    // 三条请求共用一个真实 Worker：它只领 Job，不知道这次用例在验什么。
+    let _worker = spawn_worker_process(&database_url);
+
+    // ── 用例 1：只带 prompt → 首选（AIHubMix）承载得了，就落在它身上 ──
+    let key = format!("contract-aihubmix-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &json!({"model": "gpt-image-2.5-flare", "prompt": "雨天窗边的阅读角"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "首选供给必须跑通：{body}");
+    assert_sync_success("只带 prompt 的请求", &body);
+    let (chosen, considered) = routing_of(&pool, &key).await;
+    assert_eq!(
+        chosen_provider_kind(&pool, chosen).await,
+        "AIHubMix",
+        "两条候选都合格时按优先级选第一个：{considered:?}"
+    );
+    assert!(
+        considered
+            .iter()
+            .all(|candidate| candidate["eligible"] == true),
+        "两条候选都该合格：{considered:?}"
+    );
+    assert_eq!(
+        count_calls(&aihubmix_calls, "POST", "/v1/images/generations"),
+        1,
+        "请求落在 AIHubMix，报文就该发到它的上游"
+    );
+    assert_eq!(
+        count_calls(&apimart_calls, "POST", "/v1/images/generations"),
+        0,
+        "没落到 APIMart 就不该有它的生成请求"
+    );
+
+    // ── 用例 2：带 background → AIHubMix 承载不了，改道 APIMart，字段原样上行 ──
+    let key = format!("contract-background-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &json!({
+            "model": "gpt-image-2.5-flare",
+            "prompt": "白色运动鞋，透明背景",
+            "background": "transparent"
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "改道之后要真的跑通：{body}");
+    assert_sync_success("带 background 的请求", &body);
+    let (chosen, considered) = routing_of(&pool, &key).await;
+    assert_eq!(considered.len(), 2, "两个候选都要进判定记录");
+    assert_eq!(
+        considered[0]["eligible"], false,
+        "AIHubMix 承载不了请求用到的 background：{considered:?}"
+    );
+    assert!(
+        considered[0]["skip_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("background")),
+        "落选原因必须写明承载不了哪个字段：{considered:?}"
+    );
+    assert_eq!(considered[1]["eligible"], true);
+    assert_eq!(
+        chosen_provider_kind(&pool, chosen).await,
+        "APIMart",
+        "第一条承载不了就该落到下一条：{considered:?}"
+    );
+    let submit = last_submit_body(&apimart_calls, "/v1/images/generations");
+    assert_eq!(
+        submit["background"], "transparent",
+        "承载得了的字段必须原样上行：{submit}"
+    );
+
+    // ── 用例 3：带参考图 → 合同字段名不上线，渠道字段名上 ──
+    let key = format!("contract-image-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &json!({
+            "model": "gpt-image-2.5-sunburst",
+            "prompt": "保留商品主体，把背景换成米白色摄影棚",
+            // `background` 在这里只是把请求逼到 APIMart：AIHubMix 收不了它。
+            "background": "opaque",
+            "image": png_data_url()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "带图请求要真的跑通：{body}");
+    assert_sync_success("带参考图的请求", &body);
+    let (chosen, _) = routing_of(&pool, &key).await;
+    assert_eq!(chosen_provider_kind(&pool, chosen).await, "APIMart");
+    // 内联图先换成渠道要的公网 URL，再按**渠道字段名**装进生成请求。
+    assert_eq!(
+        count_calls(&apimart_calls, "POST", "/v1/uploads/images"),
+        1,
+        "内联参考图必须先上传换成公网 URL"
+    );
+    let submit = last_submit_body(&apimart_calls, "/v1/images/generations");
+    assert!(
+        submit.get("image").is_none(),
+        "合同字段名 `image` 不许出现在 APIMart 的报文里：{submit}"
+    );
+    let urls = submit["image_urls"]
+        .as_array()
+        .unwrap_or_else(|| panic!("APIMart 线上字段名是 image_urls 数组：{submit}"));
+    assert_eq!(urls.len(), 1, "{submit}");
+    assert!(
+        urls[0]
+            .as_str()
+            .is_some_and(|url| url.starts_with("http://127.0.0.1:")),
+        "上传换回来的公网 URL 才该上行：{submit}"
     );
 
     pool.close().await;
