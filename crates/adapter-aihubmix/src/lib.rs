@@ -58,13 +58,13 @@ impl AdapterFactory for AihubmixAdapterFactory {
     fn validate_publication(
         &self,
         adapter_key: &str,
-        capability_schema: &Value,
+        carrier_schema: &Value,
         restrictions: &Value,
     ) -> Result<(), String> {
         if adapter_key != ADAPTER_KEY {
             return Err(format!("unknown adapter {adapter_key}"));
         }
-        validate_aihubmix_publication(capability_schema, restrictions)
+        validate_aihubmix_publication(carrier_schema, restrictions)
     }
 
     fn create(
@@ -84,15 +84,22 @@ impl AdapterFactory for AihubmixAdapterFactory {
     }
 }
 
-fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result<(), String> {
-    let properties = schema
+/// 校验这条供给的**承载面**（它声明要往线文里写的字段面）本 Driver 能不能执行。
+///
+/// 看承载面而不是合同：合同是客户端那一侧的面（模型级唯一一份），Driver 只关心
+/// "这条供给实际要发的字段与分支，本端点能不能收下并跑通"。
+fn validate_aihubmix_publication(
+    carrier_schema: &Value,
+    restrictions: &Value,
+) -> Result<(), String> {
+    let properties = carrier_schema
         .get("properties")
         .and_then(Value::as_object)
-        .ok_or_else(|| "capability schema properties are required".to_owned())?;
-    let required = schema
+        .ok_or_else(|| "carrier schema properties are required".to_owned())?;
+    let required = carrier_schema
         .get("required")
         .and_then(Value::as_array)
-        .ok_or_else(|| "capability schema required list is missing".to_owned())?;
+        .ok_or_else(|| "carrier schema required list is missing".to_owned())?;
     for name in ["model", "prompt"] {
         if !required.iter().any(|value| value.as_str() == Some(name)) {
             return Err(format!("AIHubMix adapter requires native parameter {name}"));
@@ -128,7 +135,7 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
     if properties.contains_key("user") {
         require_type(properties, "user", "string")?;
     }
-    let validator = jsonschema::validator_for(schema).map_err(|error| error.to_string())?;
+    let validator = jsonschema::validator_for(carrier_schema).map_err(|error| error.to_string())?;
     let model = properties
         .get("model")
         .and_then(|value| value.get("const"))
@@ -146,7 +153,7 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
             ]
         });
     // 最小请求用的图片取值就是调用方能给的形态：内联 data URL 或公网 URL。
-    // 平台不再有"资产引用"这种值，Profile 也不该按它校验。
+    // 平台不再有"资产引用"这种值，承载面也不该按它校验。
     let image = "https://example.invalid/reference.png";
     let mask = "data:image/png;base64,AAAA";
     let cases = [
@@ -168,7 +175,7 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
             && !validator.is_valid(&instance)
         {
             return Err(format!(
-                "capability schema rejects the adapter's minimal {branch} request"
+                "carrier schema rejects the adapter's minimal {branch} request"
             ));
         }
     }
@@ -176,12 +183,12 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
         serde_json::json!({"model": model}),
         serde_json::json!({"model": model, "prompt": 1}),
         serde_json::json!({"model": model, "prompt": "x", "unknown": true}),
-        // 遮罩不能脱离参考图：这份合同必须自己把这种请求判成非法。
+        // 遮罩不能脱离参考图：这份承载面必须自己把这种请求判成非法。
         serde_json::json!({"model": model, "prompt": "x", "mask": mask}),
     ] {
         if validator.is_valid(&invalid) {
             return Err(
-                "capability schema accepts an input the adapter cannot safely execute".to_owned(),
+                "carrier schema accepts an input the adapter cannot safely execute".to_owned(),
             );
         }
     }

@@ -2397,15 +2397,16 @@ async fn multiple_active_offerings_route_by_priority() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 第二阶段的**发布素材**要真的能用，并且每个候选要带自己的那份 Profile
-/// ——缺一不可：素材发不出去、或候选没带上自己的 Profile，都算没覆盖。
+/// 第二阶段的**发布素材**要真的能用：同一个 Vendor Model 只落**一份合同**，
+/// 而每个候选各带**自己的承载面**——缺一不可：素材发不出去、或候选没带上自己的承载面，
+/// 都算没覆盖。
 ///
 /// 用 `config/bootstrap/` 里已备好的 2.5 素材发布：AIHubMix 与 APIMart 供同一型号。
-/// 两家 Profile 内容不同（AIHubMix 有参考图/遮罩字段，APIMart 参数在顶层），正是"候选各自
-/// 携带 Profile"要覆盖的情形。
+/// 两家能承载的字段面不同（AIHubMix 收 `image` / `mask`，APIMart 收 `image_urls` / `mask_url`），
+/// 正是"合同一份、承载面各一份"要覆盖的情形。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
+async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
     let client = Client::new();
@@ -2431,21 +2432,38 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         apimart["native_model_id"], aihubmix["native_model_id"],
         "both materials must supply the same vendor model"
     );
-    // 两家的 Profile 内容必须真的不同——否则这个用例覆盖不到"各自携带 Profile"。
-    let aihubmix_schema = &aihubmix["offerings"][0]["capability_schema"];
-    let apimart_schema = &apimart["offerings"][0]["capability_schema"];
+    // 两家能承载的面必须真的不同——否则这个用例覆盖不到"承载面各自一份"。
+    let aihubmix_carrier = aihubmix["offerings"][0]["capability_schema"].clone();
+    let apimart_carrier = apimart["offerings"][0]["capability_schema"].clone();
     assert_ne!(
-        aihubmix_schema, apimart_schema,
-        "this test only covers condition 22 if the two profiles actually differ"
+        aihubmix_carrier, apimart_carrier,
+        "this test only covers the split surface if the two carriers actually differ"
     );
 
-    // 合并成一次发布：两个候选，顺序即优先级。
+    // 合并成一次发布：**顶层一份合同** + 两个候选，顺序即优先级。
+    // 合同取两家承载面的**名字并集**：名字收得住即可，同一个名字的取值形态怎么统一
+    // 是尺寸语义那一步的事，本步只把"字段面"这条边界立住。
+    let contract = contract_over(&[&aihubmix_carrier, &apimart_carrier]);
+    let mut aihubmix_offering = aihubmix["offerings"][0].clone();
+    let mut apimart_offering = apimart["offerings"][0].clone();
+    for (offering, carrier) in [
+        (&mut aihubmix_offering, &aihubmix_carrier),
+        (&mut apimart_offering, &apimart_carrier),
+    ] {
+        // 承载面改用新名字，并去掉旧字段：这个用例走的必须是新形状。
+        offering["carrier_schema"] = carrier.clone();
+        offering
+            .as_object_mut()
+            .expect("offering object")
+            .remove("capability_schema");
+    }
     let merged = json!({
         "vendor_id": aihubmix["vendor_id"],
         "native_model_id": aihubmix["native_model_id"],
         "native_revision": "stage-two-material-1",
         "actor": "contract-test",
-        "offerings": [aihubmix["offerings"][0], apimart["offerings"][0]]
+        "capability_schema": contract,
+        "offerings": [aihubmix_offering, apimart_offering]
     });
     let published = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
@@ -2461,10 +2479,26 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         published.text().await
     );
 
-    // 每个候选携带**它自己**的那份 Profile——读回来的 schema 要分别等于
-    // 发布时给各自的那一份，而不是共享同一份。
+    // 合同是**模型级唯一一份**：同一个型号的这一版只落一行，内容就是顶层那一份。
+    let contracts = sqlx::query(
+        "SELECT id, capability_schema FROM catalog.vendor_models
+         WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = 'stage-two-material-1'",
+    )
+    .bind(aihubmix["vendor_id"].as_str().expect("vendor id"))
+    .bind(&model)
+    .fetch_all(&pool)
+    .await
+    .expect("contract rows");
+    assert_eq!(contracts.len(), 1, "one contract per vendor model revision");
+    let stored_contract: Value = contracts[0].try_get("capability_schema").expect("contract");
+    assert_eq!(
+        stored_contract, merged["capability_schema"],
+        "the stored contract must be the one given at the top level"
+    );
+
+    // 每个候选携带**它自己**的承载面，而合同只读那一份。
     let rows = sqlx::query(
-        "SELECT o.provider_model_id, o.adapter_key, c.provider_kind, vm.capability_schema
+        "SELECT o.provider_model_id, o.adapter_key, o.carrier_schema, c.provider_kind, vm.capability_schema
          FROM publication.runtime_entries re
          JOIN supply.offerings o ON o.id = re.offering_id
          JOIN supply.channels c ON c.id = o.channel_id
@@ -2478,15 +2512,14 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
     .expect("candidate rows");
     assert_eq!(rows.len(), 2, "both providers must be active candidates");
 
-    let schemas: Vec<Value> = rows
+    let carriers: Vec<Value> = rows
         .iter()
-        .map(|row| row.try_get("capability_schema").expect("schema"))
+        .map(|row| row.try_get("carrier_schema").expect("carrier"))
         .collect();
     assert_ne!(
-        schemas[0], schemas[1],
-        "each candidate must carry its own profile, not a shared one"
+        carriers[0], carriers[1],
+        "each candidate must carry its own surface, not a shared one"
     );
-    // 每个候选的 provider_model_id / adapter_key 与它自己 Profile 的 model.const 一致。
     for (index, expected) in [(0_usize, &aihubmix), (1, &apimart)].iter() {
         let row = &rows[*index];
         let offering = &expected["offerings"][0];
@@ -2495,17 +2528,509 @@ async fn stage_two_bootstrap_material_publishes_with_per_candidate_profiles() {
         assert_eq!(provider_model_id, offering["provider_model_id"]);
         assert_eq!(adapter_key, offering["adapter_key"]);
         assert_eq!(
-            schemas[*index], offering["capability_schema"],
-            "candidate {index} must carry its own profile"
+            carriers[*index], offering["capability_schema"],
+            "candidate {index} must carry its own surface"
         );
+        // 每个候选读到的合同都是同一份，且它的 `model.const` 就是该型号。
+        let contract: Value = row.try_get("capability_schema").expect("contract");
+        assert_eq!(contract, stored_contract);
+        assert_eq!(contract["properties"]["model"]["const"], model);
+        // 承载面的每个字段名都要在合同里（R1 的判据，这里独立复核一遍）。
+        for name in carriers[*index]["properties"]
+            .as_object()
+            .expect("carrier properties")
+            .keys()
+        {
+            assert!(
+                contract["properties"]
+                    .as_object()
+                    .expect("contract properties")
+                    .contains_key(name),
+                "carrier field {name} must be declared by the contract"
+            );
+        }
+    }
+
+    // 快照指纹跟着"合同 + 承载面"走：两个候选承载面不同，指纹就该不同。
+    let snapshot: Value = sqlx::query_scalar(
+        "SELECT snapshot FROM publication.runtime_revisions rr
+         JOIN publication.runtime_entries re ON re.runtime_revision_id = rr.id
+         WHERE re.active AND re.gateway_model = $1 LIMIT 1",
+    )
+    .bind(&model)
+    .fetch_one(&pool)
+    .await
+    .expect("runtime revision snapshot");
+    let candidates = snapshot["candidates"]
+        .as_array()
+        .expect("snapshot candidates");
+    assert_eq!(candidates.len(), 2);
+    for candidate in candidates {
+        assert!(
+            candidate.get("schema_hash").is_none(),
+            "快照指纹必须覆盖合同与承载面，不再是只有一份 schema 的哈希"
+        );
+        assert!(candidate["contract_carrier_hash"].is_string());
+    }
+    assert_ne!(
+        candidates[0]["contract_carrier_hash"], candidates[1]["contract_carrier_hash"],
+        "different carriers must produce different snapshot fingerprints"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 两份承载面的**字段名并集**，做成一份封闭的模型级合同。
+fn contract_over(carriers: &[&Value]) -> Value {
+    let mut properties = serde_json::Map::new();
+    for carrier in carriers {
+        for (name, definition) in carrier["properties"]
+            .as_object()
+            .expect("carrier declares properties")
+        {
+            properties
+                .entry(name.clone())
+                .or_insert_with(|| definition.clone());
+        }
+    }
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": properties
+    })
+}
+
+/// 现有三份 AIHubMix 素材（**旧形状**：offering 级 `capability_schema`）照常能发布：
+/// 过渡期里合同与承载面都回退到那一份声明面，不必等素材改写。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn legacy_aihubmix_materials_still_publish() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let materials = [
+        include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.json"),
+        include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.5-flare.json"),
+        include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.5-sunburst.json"),
+    ];
+    for material in materials {
+        let command: Value = serde_json::from_str(material).expect("material parses");
+        let model = command["native_model_id"]
+            .as_str()
+            .expect("native model id")
+            .to_owned();
+        let response = client
+            .post(format!("{base_url}/api/v1/runtime-revisions"))
+            .bearer_auth(&admin_token)
+            .json(&command)
+            .send()
+            .await
+            .expect("publication request");
         assert_eq!(
-            schemas[*index]["properties"]["model"]["const"], model,
-            "each profile's model.const must equal the vendor model identity"
+            response.status(),
+            StatusCode::OK,
+            "旧形状素材必须照常可发布：{model}"
         );
+        // 回退的结果：合同就是那份声明面，承载面与它同值，同一个型号只落一行。
+        let rows = sqlx::query(
+            "SELECT vm.capability_schema, o.carrier_schema
+             FROM catalog.vendor_models vm
+             JOIN supply.offerings o ON o.vendor_model_id = vm.id
+             WHERE vm.native_model_id = $1",
+        )
+        .bind(&model)
+        .fetch_all(&pool)
+        .await
+        .expect("contract rows");
+        assert_eq!(rows.len(), 1, "{model} 只能落一行合同");
+        let contract: Value = rows[0].try_get("capability_schema").expect("contract");
+        let carrier: Value = rows[0].try_get("carrier_schema").expect("carrier");
+        assert_eq!(contract, command["offerings"][0]["capability_schema"]);
+        assert_eq!(carrier, contract);
     }
 
     pool.close().await;
     drop_isolated_database(&database_name).await;
+}
+
+/// 承载面 ⊆ 合同（R1）：供给不能凭空多出调用方可提交的字段。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn carrier_field_outside_the_contract_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+
+    let model = "contract-boundary-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    // 承载面多声明了 `quality`：合同里没有它，客户端按合同提交永远不会发这个名字。
+    let carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "contract-boundary-1",
+        contract,
+        vec![("aihubmix-image-v1", carrier)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a carrier field the contract does not declare must be rejected"
+    );
+
+    // 把 `quality` 补进合同后同一份承载面就能发布：拒绝的是那条边界，不是 `quality` 本身。
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "contract-boundary-2",
+        contract,
+        vec![("aihubmix-image-v1", carrier)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 承载面 ⊆ Driver 能写上线文的字段名（R2）：声明了发不出去的字段就拒绝。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn carrier_field_the_driver_cannot_write_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+
+    let model = "driver-boundary-model";
+    // `resolution` 是 APIMart 那一侧的渠道字段名，AIHubMix 的 Driver 写不出去。
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "resolution": {"type": "string", "enum": ["1k", "2k"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "driver-boundary-1",
+        contract.clone(),
+        vec![("aihubmix-image-v1", contract.clone())],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a carrier field the driver cannot write must be rejected"
+    );
+
+    // 同一份声明面挂到能写 `resolution` 的 Driver 上就能发布：判的是"发得出去吗"。
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "driver-boundary-2",
+        contract.clone(),
+        vec![("apimart-image-v1", contract)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 合同行不可变：同一 (vendor, model, revision) 重发幂等、不就地改写；
+/// 内容不同的重发要拒绝；新修订才落新行。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idempotent() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "immutable-contract-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let publish = |revision: &'static str, contract: Value| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        let admin_token = admin_token.clone();
+        async move {
+            publish_with_surfaces(
+                &client,
+                &base_url,
+                &admin_token,
+                model,
+                revision,
+                contract.clone(),
+                vec![("aihubmix-image-v1", contract)],
+            )
+            .await
+        }
+    };
+
+    assert_eq!(
+        publish("immutable-1", contract.clone()).await,
+        StatusCode::OK
+    );
+    let first = contract_row(&pool, model, "immutable-1").await;
+    // 同一修订重发（内容相同）：幂等——还是那一行，且**没有**被改写（时间戳与内容都不变）。
+    assert_eq!(
+        publish("immutable-1", contract.clone()).await,
+        StatusCode::OK
+    );
+    let again = contract_row(&pool, model, "immutable-1").await;
+    assert_eq!(again.0, first.0, "a republish must not create a second row");
+    assert_eq!(
+        again.1, first.1,
+        "a republish must not rewrite the contract"
+    );
+    assert_eq!(
+        again.2, first.2,
+        "a republish must not touch the row at all"
+    );
+
+    // 同一修订换个合同：拒绝。合同落库后不可改，改合同要发新修订。
+    let changed = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string"}
+    }));
+    assert_eq!(
+        publish("immutable-1", changed).await,
+        StatusCode::BAD_REQUEST,
+        "the same revision must not accept a different contract"
+    );
+    let after = contract_row(&pool, model, "immutable-1").await;
+    assert_eq!(
+        after, first,
+        "a rejected republish must leave the row untouched"
+    );
+
+    // 新修订落新行：同一个模型可以有多版合同，但每一版只有一份。
+    assert_eq!(
+        publish("immutable-2", contract.clone()).await,
+        StatusCode::OK
+    );
+    let revisions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM catalog.vendor_models WHERE native_model_id = $1")
+            .bind(model)
+            .fetch_one(&pool)
+            .await
+            .expect("contract revision count");
+    assert_eq!(revisions, 2, "a new revision is a new contract row");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 承载面随 Job 冻结：发布换了承载面之后，旧 Job 读到的仍是它受理时那一份。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn carrier_surface_is_frozen_into_the_job() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 同步入口会等到超时（没有 Worker）：给小值，别让用例白等。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "frozen-carrier-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    // 受理时这条供给能承载 `quality`。
+    let accepted_carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "frozen-1",
+        contract.clone(),
+        vec![("aihubmix-image-v1", accepted_carrier.clone())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    let key = format!("frozen-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(model, "frozen carrier"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("the request must have created a job");
+
+    // 换一版发布：这条供给**不再**承载 `quality`（收窄了承载面）。
+    let narrowed_carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "frozen-2",
+        contract.clone(),
+        vec![("aihubmix-image-v1", narrowed_carrier.clone())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    // 走真实的读取路径取这台 Job：它读到的承载面仍是受理时那一份。
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("repository");
+    let claimed = repository
+        .claim_next_job("frozen-carrier-worker", chrono::Duration::seconds(30))
+        .await
+        .expect("claim")
+        .expect("the accepted job must be claimable");
+    assert_eq!(claimed.job.id.0, job_id);
+    assert_eq!(
+        claimed.job.offering.carrier_schema, accepted_carrier,
+        "the job must keep the carrier surface it was accepted with"
+    );
+    assert_eq!(claimed.job.offering.capability_schema, contract);
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 一个只声明给定顶层字段的封闭对象 schema（合同与承载面都用它）。
+fn surface_schema(properties: Value) -> Value {
+    json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": properties
+    })
+}
+
+/// 发布一份"顶层合同 + 若干候选（各自承载面）"的命令，返回状态码。
+async fn publish_with_surfaces(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    model: &str,
+    revision: &str,
+    contract: Value,
+    carriers: Vec<(&str, Value)>,
+) -> StatusCode {
+    let offerings = carriers
+        .into_iter()
+        .map(|(adapter_key, carrier)| {
+            json!({
+                "provider_kind": if adapter_key == "apimart-image-v1" { "APIMart" } else { "AIHubMix" },
+                "adapter_key": adapter_key,
+                "provider_model_id": model,
+                "base_url": "http://127.0.0.1:1",
+                "credential_env": "AIHUBMIX_API_KEY",
+                "restrictions": {"allowed_branches": ["prompt_only"], "max_images": 0},
+                "carrier_schema": carrier,
+                "price_plan": {
+                    "formula": "token_rates",
+                    "currency": "USD",
+                    "text_input_microusd_per_million": 5_000_000,
+                    "image_input_microusd_per_million": 8_000_000,
+                    "text_output_microusd_per_million": 10_000_000,
+                    "image_output_microusd_per_million": 30_000_000,
+                    "source_url": "https://example.invalid/price"
+                }
+            })
+        })
+        .collect::<Vec<_>>();
+    let body = json!({
+        "vendor_id": "OpenAI",
+        "native_model_id": model,
+        "native_revision": revision,
+        "actor": "contract-test",
+        "capability_schema": contract,
+        "offerings": offerings
+    });
+    client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("runtime publication")
+        .status()
+}
+
+/// 某一份合同的落库事实：`(id, 合同内容, created_at)`。
+async fn contract_row(pool: &PgPool, model: &str, revision: &str) -> (Uuid, Value, String) {
+    let row = sqlx::query(
+        "SELECT id, capability_schema, created_at::text AS created_at
+         FROM catalog.vendor_models WHERE native_model_id = $1 AND native_revision = $2",
+    )
+    .bind(model)
+    .bind(revision)
+    .fetch_one(pool)
+    .await
+    .expect("contract row");
+    (
+        row.try_get("id").expect("contract id"),
+        row.try_get("capability_schema").expect("contract"),
+        row.try_get("created_at").expect("created at"),
+    )
 }
 
 /// 增量迁移必须在**已经建过库**的环境里跑得通。
@@ -2569,6 +3094,251 @@ async fn images_pass_through_migration_applies_on_an_existing_database() {
     .await
     .expect("table probe");
     assert_eq!(assets_table, 0, "资产表必须被删掉");
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 增量迁移还要能处理**已经存在的老数据**：同一 (vendor, model, revision) 可能已有多行
+/// （老形状按内容分叉），迁移必须自己合并，而不是直接失败。
+///
+/// 这里先在只应用了早期迁移的库上造出这种数据（两行同一个型号、一个供给与一台 Job 指向
+/// 较早那一行），再补上整批迁移，确认合并结果与承载面回填都对。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn vendor_model_contract_migration_merges_existing_duplicate_rows() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用这次改动之前的迁移（`0006` 之前，含上一轮的 `0005`）。
+    let staged = std::env::temp_dir().join(format!("seeai-early-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < "0006" {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy early migration");
+        }
+    }
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+
+    // 2) 老形状的数据：同一个型号的两行合同（内容不同，老唯一键含内容哈希所以能并存），
+    //    供给与 Job 都指向**较早**的那一行。
+    let older = Uuid::new_v4();
+    let newer = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let offering = Uuid::new_v4();
+    let price_plan = Uuid::new_v4();
+    let revision = Uuid::new_v4();
+    let account = Uuid::new_v4();
+    let job = Uuid::new_v4();
+    let older_surface = json!({"surface": "older"});
+    let newer_surface = json!({"surface": "newer"});
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash, created_at)
+         VALUES ($1,'OpenAI','legacy-model','legacy-revision',$2,'hash-older', now() - interval '1 hour')",
+    )
+    .bind(older)
+    .bind(&older_surface)
+    .execute(&pool)
+    .await
+    .expect("legacy vendor model row");
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash, created_at)
+         VALUES ($1,'OpenAI','legacy-model','legacy-revision',$2,'hash-newer', now())",
+    )
+    .bind(newer)
+    .bind(&newer_surface)
+    .execute(&pool)
+    .await
+    .expect("newer vendor model row");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')",
+    )
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("channel fixture");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions)
+         VALUES ($1,$2,$3,'aihubmix-image-v1','legacy-model','{}'::jsonb)",
+    )
+    .bind(offering)
+    .bind(older)
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("offering fixture");
+    sqlx::query(
+        "INSERT INTO pricing.price_plans
+             (id, offering_id, currency, text_input_microusd_per_million, image_input_microusd_per_million,
+              text_output_microusd_per_million, image_output_microusd_per_million, source_url, approved_by)
+         VALUES ($1,$2,'USD',0,0,0,0,'https://example.invalid/price','migration-test')",
+    )
+    .bind(price_plan)
+    .bind(offering)
+    .execute(&pool)
+    .await
+    .expect("price plan fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_revisions (id, snapshot, published_by)
+         VALUES ($1,'{}'::jsonb,'migration-test')",
+    )
+    .bind(revision)
+    .execute(&pool)
+    .await
+    .expect("runtime revision fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_entries
+             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active)
+         VALUES ($1,$2,$3,$4,'legacy-model',true)",
+    )
+    .bind(revision)
+    .bind(older)
+    .bind(offering)
+    .bind(price_plan)
+    .execute(&pool)
+    .await
+    .expect("runtime entry fixture");
+    sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 0)")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .expect("account fixture");
+    sqlx::query(
+        "INSERT INTO generation.jobs
+             (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
+              native_parameters, runtime_revision_id, vendor_model_id, offering_id, channel_id,
+              price_snapshot, max_cost_microusd)
+         VALUES ($1,$2,'legacy-job','hash','accepted','prompt_only','legacy-model',
+                 '{}'::jsonb,$3,$4,$5,$6,'{}'::jsonb,1)",
+    )
+    .bind(job)
+    .bind(account)
+    .bind(revision)
+    .bind(older)
+    .bind(offering)
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("legacy job fixture");
+
+    // 3) 再应用完整迁移集：合并必须自己跑通，不能因为已有重复行就失败。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the merge migration must apply on an already-built database");
+
+    // 4) 合并结果：只留最新那一行；指向被删行的供给 / 条目 / Job 改挂到它。
+    let remaining: Vec<(Uuid, Value)> = sqlx::query(
+        "SELECT id, capability_schema FROM catalog.vendor_models WHERE native_model_id = 'legacy-model'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("merged contract rows")
+    .iter()
+    .map(|row| {
+        (
+            row.try_get("id").expect("id"),
+            row.try_get("capability_schema").expect("contract"),
+        )
+    })
+    .collect();
+    assert_eq!(remaining.len(), 1, "duplicate contract rows must be merged");
+    assert_eq!(remaining[0].0, newer, "the newest row must survive");
+    assert_eq!(remaining[0].1, newer_surface);
+
+    // 承载面按**它当时指向的那一行**补好：老供给与老 Job 读到的仍是它们当时那份面。
+    let offering_row =
+        sqlx::query("SELECT vendor_model_id, carrier_schema FROM supply.offerings WHERE id = $1")
+            .bind(offering)
+            .fetch_one(&pool)
+            .await
+            .expect("offering after merge");
+    assert_eq!(
+        offering_row
+            .try_get::<Uuid, _>("vendor_model_id")
+            .expect("vendor model"),
+        newer,
+        "the offering must be re-pointed at the surviving contract row"
+    );
+    assert_eq!(
+        offering_row
+            .try_get::<Value, _>("carrier_schema")
+            .expect("carrier"),
+        older_surface
+    );
+    let job_row = sqlx::query(
+        "SELECT vendor_model_id, carrier_schema, parameter_mapping FROM generation.jobs WHERE id = $1",
+    )
+    .bind(job)
+    .fetch_one(&pool)
+    .await
+    .expect("job after merge");
+    assert_eq!(
+        job_row
+            .try_get::<Uuid, _>("vendor_model_id")
+            .expect("vendor model"),
+        newer
+    );
+    assert_eq!(
+        job_row
+            .try_get::<Value, _>("carrier_schema")
+            .expect("carrier"),
+        older_surface,
+        "the job must keep the carrier surface it was accepted with"
+    );
+    assert_eq!(
+        job_row
+            .try_get::<Value, _>("parameter_mapping")
+            .expect("mapping"),
+        json!({})
+    );
+    let entry_model: Uuid = sqlx::query_scalar(
+        "SELECT vendor_model_id FROM publication.runtime_entries WHERE offering_id = $1",
+    )
+    .bind(offering)
+    .fetch_one(&pool)
+    .await
+    .expect("runtime entry after merge");
+    assert_eq!(entry_model, newer);
+
+    // 唯一键与列的形状：内容哈希不再是身份的一部分，它本身也不在了。
+    let schema_hash_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'catalog' AND table_name = 'vendor_models' AND column_name = 'schema_hash'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("schema_hash probe");
+    assert_eq!(schema_hash_columns, 0, "内容哈希不再参与身份");
+    let duplicate_insert = sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1,'OpenAI','legacy-model','legacy-revision','{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate_insert.is_err(),
+        "the unique key must be (vendor, model, revision) now"
+    );
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);

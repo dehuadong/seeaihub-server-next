@@ -85,13 +85,13 @@ impl AdapterFactory for ApimartAdapterFactory {
     fn validate_publication(
         &self,
         adapter_key: &str,
-        capability_schema: &Value,
+        carrier_schema: &Value,
         restrictions: &Value,
     ) -> Result<(), String> {
         if adapter_key != ADAPTER_KEY {
             return Err(format!("unknown adapter {adapter_key}"));
         }
-        validate_apimart_publication(capability_schema, restrictions)
+        validate_apimart_publication(carrier_schema, restrictions)
     }
 
     fn create(
@@ -111,15 +111,22 @@ impl AdapterFactory for ApimartAdapterFactory {
     }
 }
 
-fn validate_apimart_publication(schema: &Value, restrictions: &Value) -> Result<(), String> {
-    let properties = schema
+/// 校验这条供给的**承载面**（它声明要往线文里写的字段面）本 Driver 能不能执行。
+///
+/// 看承载面而不是合同：合同是客户端那一侧的面（模型级唯一一份），Driver 只关心
+/// "这条供给实际要发的字段，本端点能不能收下"。
+fn validate_apimart_publication(
+    carrier_schema: &Value,
+    restrictions: &Value,
+) -> Result<(), String> {
+    let properties = carrier_schema
         .get("properties")
         .and_then(Value::as_object)
-        .ok_or_else(|| "capability schema properties are required".to_owned())?;
-    let required = schema
+        .ok_or_else(|| "carrier schema properties are required".to_owned())?;
+    let required = carrier_schema
         .get("required")
         .and_then(Value::as_array)
-        .ok_or_else(|| "capability schema required list is missing".to_owned())?;
+        .ok_or_else(|| "carrier schema required list is missing".to_owned())?;
     for name in ["model", "prompt"] {
         if !required.iter().any(|value| value.as_str() == Some(name)) {
             return Err(format!("APIMart adapter requires native parameter {name}"));

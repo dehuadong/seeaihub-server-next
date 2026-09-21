@@ -14,7 +14,6 @@ use seeai_domain::{
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row, postgres::PgPoolOptions};
-use std::collections::BTreeMap;
 use uuid::Uuid;
 
 #[derive(Debug, Clone)]
@@ -55,6 +54,7 @@ impl PgHubRepository {
                 j.native_parameters, j.idempotency_key,
                 j.request_hash, j.max_cost_microusd, j.created_at, j.updated_at,
                 vm.id AS vendor_model_id, vm.native_revision, vm.capability_schema,
+                j.carrier_schema, j.parameter_mapping,
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
                 j.runtime_revision_id, j.price_snapshot
@@ -87,6 +87,7 @@ impl HubRepository for PgHubRepository {
             native_model_id,
             native_revision,
             actor,
+            capability_schema,
             offerings,
         } = request;
         if offerings.is_empty() {
@@ -95,42 +96,60 @@ impl HubRepository for PgHubRepository {
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        // 同一发布内两个候选的 Profile 内容相同时，`ON CONFLICT` 会归并到同一行
-        // vendor_model；不同时产生两行。这里按 schema_hash 记忆结果，
-        // 避免对同一行重复 INSERT。
-        let mut model_ids: BTreeMap<String, VendorModelId> = BTreeMap::new();
-        let mut candidates = Vec::with_capacity(offerings.len());
-        let mut snapshot_entries = Vec::with_capacity(offerings.len());
-        for offering in &offerings {
-            let schema_bytes = serde_json::to_vec(&offering.capability_schema)
-                .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-            let schema_hash = hex::encode(Sha256::digest(schema_bytes));
-            let vendor_model_id = if let Some(existing) = model_ids.get(&schema_hash) {
-                *existing
-            } else {
-                let persisted: Uuid = sqlx::query_scalar(
+        // 合同行**不可变**：同一个 (vendor, model, revision) 只落一行，已有行一律复用，
+        // 绝不就地改写。这样"Job 固定受理时版本"才成立——旧 Job 事后读到的合同与它受理时
+        // 逐字相同。要改合同就发新修订（新修订是新行）。
+        //
+        // 同一修订重发是幂等的：内容相同就复用那一行（不产生第二行）；内容不同则明确拒绝，
+        // 而不是把旧合同悄悄改掉——那会让已受理的 Job 与它对不上。
+        let vendor_model_id = match sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO catalog.vendor_models
+                (id, vendor_id, native_model_id, native_revision, capability_schema)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (vendor_id, native_model_id, native_revision) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(VendorModelId::new().0)
+        .bind(&vendor_id)
+        .bind(&native_model_id)
+        .bind(&native_revision)
+        .bind(&capability_schema)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        {
+            Some(id) => VendorModelId(id),
+            None => {
+                let existing = sqlx::query(
                     r#"
-                    INSERT INTO catalog.vendor_models
-                        (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash)
-                    VALUES ($1, $2, $3, $4, $5, $6)
-                    ON CONFLICT (vendor_id, native_model_id, native_revision, schema_hash)
-                    DO UPDATE SET capability_schema = EXCLUDED.capability_schema
-                    RETURNING id
+                    SELECT id, capability_schema FROM catalog.vendor_models
+                    WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = $3
                     "#,
                 )
-                .bind(VendorModelId::new().0)
                 .bind(&vendor_id)
                 .bind(&native_model_id)
                 .bind(&native_revision)
-                .bind(&offering.capability_schema)
-                .bind(&schema_hash)
                 .fetch_one(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-                let id = VendorModelId(persisted);
-                model_ids.insert(schema_hash.clone(), id);
-                id
-            };
+                let stored: Value = existing
+                    .try_get("capability_schema")
+                    .map_err(database_error)?;
+                if stored != capability_schema {
+                    transaction.rollback().await.map_err(database_error)?;
+                    return Err(ApplicationError::Validation(format!(
+                        "vendor model {native_model_id} already has a contract for revision {native_revision}; \
+                         the contract is immutable, so publish a new revision"
+                    )));
+                }
+                VendorModelId(existing.try_get("id").map_err(database_error)?)
+            }
+        };
+        let mut candidates = Vec::with_capacity(offerings.len());
+        let mut snapshot_entries = Vec::with_capacity(offerings.len());
+        for offering in &offerings {
             let channel_id = ChannelId::new();
             sqlx::query(
                 r#"
@@ -150,8 +169,9 @@ impl HubRepository for PgHubRepository {
             sqlx::query(
                 r#"
                 INSERT INTO supply.offerings
-                    (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions, enabled)
-                VALUES ($1, $2, $3, $4, $5, $6, true)
+                    (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
+                     restrictions, carrier_schema, parameter_mapping, enabled)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
                 "#,
             )
             .bind(offering_id.0)
@@ -160,6 +180,8 @@ impl HubRepository for PgHubRepository {
             .bind(&offering.adapter_key)
             .bind(&offering.provider_model_id)
             .bind(&offering.restrictions)
+            .bind(&offering.carrier_schema)
+            .bind(&offering.parameter_mapping)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -193,7 +215,9 @@ impl HubRepository for PgHubRepository {
                 channel_id,
                 gateway_model: native_model_id.clone(),
                 native_revision: native_revision.clone(),
-                capability_schema: offering.capability_schema.clone(),
+                capability_schema: capability_schema.clone(),
+                carrier_schema: offering.carrier_schema.clone(),
+                parameter_mapping: offering.parameter_mapping.clone(),
                 restrictions: offering.restrictions.clone(),
                 adapter_key: offering.adapter_key.clone(),
                 provider_model_id: offering.provider_model_id.clone(),
@@ -216,7 +240,7 @@ impl HubRepository for PgHubRepository {
                 "base_url": offering.base_url,
                 "credential_env": offering.credential_env,
                 "restrictions": offering.restrictions,
-                "schema_hash": schema_hash,
+                "contract_carrier_hash": contract_carrier_hash(&capability_schema, &offering.carrier_schema)?,
                 "currency": offering.rates.currency,
                 "text_input_microusd_per_million": offering.rates.text_input_microusd_per_million,
                 "image_input_microusd_per_million": offering.rates.image_input_microusd_per_million,
@@ -292,15 +316,15 @@ impl HubRepository for PgHubRepository {
         &self,
         native_model_id: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
-        // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它**自己的**
-        // vendor_models 行取 capability_schema——两个 Provider 的 Profile 内容不同时
-        // 会有两行 vendor_model。
+        // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它所属的那一行
+        // vendor_models 取**合同**（模型级唯一一份），并从它自己的 offering 行取**承载面**——
+        // 同一型号的候选共享一份合同，各自带自己的承载面。
         let rows = sqlx::query(
             r#"
             SELECT
                 rr.id AS runtime_revision_id,
                 vm.id AS vendor_model_id, re.gateway_model, vm.native_revision,
-                vm.capability_schema,
+                vm.capability_schema, o.carrier_schema, o.parameter_mapping,
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
                 p.id AS price_plan_id, p.currency,
@@ -575,8 +599,9 @@ impl HubRepository for PgHubRepository {
                 id, account_id, idempotency_key, request_hash, state, branch,
                 gateway_model, native_parameters,
                 runtime_revision_id, vendor_model_id, offering_id, channel_id,
+                carrier_schema, parameter_mapping,
                 price_snapshot, max_cost_microusd
-            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13)
+            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
             "#,
         )
         .bind(job_id.0)
@@ -590,6 +615,8 @@ impl HubRepository for PgHubRepository {
         .bind(offering.vendor_model_id.0)
         .bind(offering.offering_id.0)
         .bind(offering.channel_id.0)
+        .bind(&offering.carrier_schema)
+        .bind(&offering.parameter_mapping)
         .bind(&price_snapshot)
         .bind(max_cost)
         .execute(&mut *transaction)
@@ -1448,6 +1475,8 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
         gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,
         capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+        carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
+        parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
         restrictions: row.try_get("restrictions").map_err(database_error)?,
         adapter_key: row.try_get("adapter_key").map_err(database_error)?,
         provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
@@ -1483,6 +1512,9 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
 
 fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, ApplicationError> {
     let price_snapshot: Value = row.try_get("price_snapshot").map_err(database_error)?;
+    // 合同从 vendor_model 行取（它落库后不再改，因此读到的永远是受理当时那一份）；
+    // 承载面与映射从 **Job 自己那两列**取——它们是受理时随 Job 冻结的快照，
+    // 不跟着发布物走，所以改发布之后旧 Job 读到的仍是旧承载面。
     let offering = PublishedOffering {
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,
@@ -1493,6 +1525,8 @@ fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, A
         gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,
         capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+        carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
+        parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
         restrictions: row.try_get("restrictions").map_err(database_error)?,
         adapter_key: row.try_get("adapter_key").map_err(database_error)?,
         provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
@@ -1566,4 +1600,18 @@ fn to_u64(value: i64) -> Result<u64, ApplicationError> {
 
 fn database_error(error: impl std::fmt::Display) -> ApplicationError {
     ApplicationError::Persistence(error.to_string())
+}
+
+/// 发布物的内容指纹：把**合同**与这条供给的**承载面**一起哈希。
+///
+/// 路由判定记的是"受理时考虑了哪些候选、谁被选中"，事后要能核对当时那份合同与承载面是否
+/// 还是现在这两份——因此快照里留的是两者的合体指纹，而不是只有其中一份。
+/// 字段顺序不影响结果：`serde_json` 的对象按键排序，同一份内容无论怎么写都得到同一个哈希。
+fn contract_carrier_hash(contract: &Value, carrier: &Value) -> Result<String, ApplicationError> {
+    let bytes = serde_json::to_vec(&serde_json::json!({
+        "contract": contract,
+        "carrier": carrier,
+    }))
+    .map_err(|error| ApplicationError::Validation(error.to_string()))?;
+    Ok(hex::encode(Sha256::digest(bytes)))
 }

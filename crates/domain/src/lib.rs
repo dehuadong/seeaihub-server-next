@@ -216,6 +216,12 @@ impl PriceSnapshot {
     }
 }
 
+/// 受理时被选中、并随 Job 固化下来的那一份供给。
+///
+/// 三份内容各有归属，且都随 Job 冻结，事后再看仍是受理当时那一份：
+/// - `capability_schema`：该 Vendor Model 的**调用方合同**（模型级唯一一份，落库后不再改）；
+/// - `carrier_schema`：这条供给**能承载**合同里的哪些字段（各供给可以不同）；
+/// - `parameter_mapping`：把合同值转成渠道包装的声明（本阶段只随行携带，内容由后续步骤补）。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct PublishedOffering {
     pub runtime_revision_id: RuntimeRevisionId,
@@ -225,6 +231,8 @@ pub struct PublishedOffering {
     pub gateway_model: String,
     pub native_revision: String,
     pub capability_schema: Value,
+    pub carrier_schema: Value,
+    pub parameter_mapping: Value,
     pub restrictions: Value,
     pub adapter_key: String,
     pub provider_model_id: String,
@@ -237,9 +245,10 @@ pub struct PublishedOffering {
 /// 同一 Vendor Model 的一个候选供给。
 ///
 /// 同一型号可有多个 active Offering，选中顺序由 `routing_priority`
-/// 决定（数字小者优先，来自发布顺序）。**每个候选自带它自己的 `capability_schema`**——
-/// 因为 `catalog.vendor_models` 的唯一键含 `schema_hash`，两个 Provider 的 Profile 内容
-/// 不同时会产生两行 `vendor_model`。
+/// 决定（数字小者优先，来自发布顺序）。同一型号的候选**共享同一份合同**
+/// （`catalog.vendor_models` 的唯一键是 `(vendor_id, native_model_id, native_revision)`，
+/// 合同是模型级的唯一一份），**各自带自己的 `carrier_schema`**——渠道包装不同，
+/// 这条供给能承载的字段面就不同。
 ///
 /// 与 [`PublishedOffering`] 的关系：字段完全一致，只多 `routing_priority`。
 /// `PublishedOffering` 表示**受理时被选中并固化进 Job 的那一份**；本类型表示**发布物中的候选**。
@@ -251,8 +260,12 @@ pub struct OfferingCandidate {
     pub channel_id: ChannelId,
     pub gateway_model: String,
     pub native_revision: String,
-    /// 该候选**自己的**能力声明，由它自己的 `vendor_model` 行带来。
+    /// 该型号的调用方合同，由它所属的那一行 `vendor_model` 带来。
     pub capability_schema: Value,
+    /// 这条候选**自己**能承载的字段面，由它自己的 `offering` 行带来。
+    pub carrier_schema: Value,
+    /// 这条候选自己的合同值 → 渠道包装的声明。
+    pub parameter_mapping: Value,
     pub restrictions: Value,
     pub adapter_key: String,
     pub provider_model_id: String,
@@ -276,6 +289,8 @@ impl OfferingCandidate {
             gateway_model: self.gateway_model,
             native_revision: self.native_revision,
             capability_schema: self.capability_schema,
+            carrier_schema: self.carrier_schema,
+            parameter_mapping: self.parameter_mapping,
             restrictions: self.restrictions,
             adapter_key: self.adapter_key,
             provider_model_id: self.provider_model_id,

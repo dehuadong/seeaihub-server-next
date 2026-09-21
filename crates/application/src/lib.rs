@@ -24,6 +24,9 @@ use uuid::Uuid;
 /// 一次发布携带该模型**完整、有序**的候选集合；
 /// 候选的 `routing_priority` **由数组下标决定**（`0..n-1`），不接受调用方赋号——只有一个来源。
 ///
+/// 合同是**模型级唯一一份**（[`Self::capability_schema`]）；每个候选各自声明它**能承载**的
+/// 字段面（[`OfferingDraft::carrier_schema`]）。
+///
 /// 形状判别（确定性三例，见 `normalize`）：
 /// - `offerings` 为 `Some(非空)` ⇒ **数组形式**；扁平字段必须全部为空；
 /// - `offerings` 为 `None` ⇒ **扁平形式**；扁平字段必须全部齐备，等价于一元素数组；
@@ -33,7 +36,11 @@ pub struct PublishRuntimeCommand {
     pub vendor_id: String,
     pub native_model_id: String,
     pub native_revision: String,
-    /// 数组形式下由每个 `Offerings` 自带；扁平形式下必填。
+    /// **Vendor Model Contract**：调用方合同的唯一一份，模型级。
+    ///
+    /// 数组形式下可以省略：那时回退用候选自带的旧字段（过渡期里承载面与合同还是同一份），
+    /// 但要求它们彼此完全一致——合同只有一份，同一个模型落成两份合同正是要收掉的分叉。
+    /// 扁平形式下必填。
     #[serde(default)]
     pub capability_schema: Option<Value>,
     #[serde(default = "empty_object")]
@@ -49,6 +56,12 @@ pub struct PublishRuntimeCommand {
     pub base_url: Option<String>,
     #[serde(default)]
     pub credential_env: Option<String>,
+    /// 扁平形式的单个供给**能承载**的字段面；缺省时与扁平形式的合同同值。
+    #[serde(default)]
+    pub carrier_schema: Option<Value>,
+    /// 扁平形式的合同值 → 渠道包装声明。数组形式下必须为 `None`。
+    #[serde(default = "empty_object")]
+    pub parameter_mapping: Value,
     /// 数组形式的多个供给，顺序即 `routing_priority`。
     #[serde(default)]
     pub offerings: Option<Vec<OfferingDraft>>,
@@ -70,6 +83,8 @@ pub struct PublishRuntimeRequest {
     pub native_model_id: String,
     pub native_revision: String,
     pub actor: String,
+    /// 该模型的调用方合同（模型级唯一一份，落库后不再改）。
+    pub capability_schema: Value,
     /// 有序候选集：下标即 `routing_priority`。
     pub offerings: Vec<NormalizedOffering>,
 }
@@ -83,6 +98,13 @@ pub struct OfferingDraft {
     pub credential_env: String,
     #[serde(default = "empty_object")]
     pub restrictions: Value,
+    /// 这条供给**能承载**合同里的哪些字段。
+    #[serde(default)]
+    pub carrier_schema: Option<Value>,
+    /// 把合同值转成渠道包装的声明。本阶段只随行落库并随 Job 冻结，映射内容由后续步骤补。
+    #[serde(default = "empty_object")]
+    pub parameter_mapping: Value,
+    /// 承载面的**旧名字**（过渡期）：只在没有 `carrier_schema` 时顶替它。
     #[serde(default)]
     pub capability_schema: Option<Value>,
     #[serde(default)]
@@ -120,7 +142,10 @@ impl PricePlanDraft {
 /// 归一后的单个供给：形状判别与必填校验都已完成，`routing_priority` 已按下标定好。
 #[derive(Debug, Clone)]
 pub struct NormalizedOffering {
-    pub capability_schema: Value,
+    /// 这条供给**能承载**合同里的哪些字段。
+    pub carrier_schema: Value,
+    /// 这条供给自己的合同值 → 渠道包装声明（本阶段只携带）。
+    pub parameter_mapping: Value,
     pub restrictions: Value,
     pub provider_kind: String,
     pub adapter_key: String,
@@ -132,28 +157,83 @@ pub struct NormalizedOffering {
     pub routing_priority: i32,
 }
 
+/// 归一后的整份发布：**一份模型级合同** + 有序候选集。
+#[derive(Debug, Clone)]
+pub struct NormalizedPublication {
+    pub contract: Value,
+    pub offerings: Vec<NormalizedOffering>,
+}
+
 impl PublishRuntimeCommand {
     /// 消费命令，产出已校验的发布请求。
     #[must_use]
-    pub fn into_request(self, offerings: Vec<NormalizedOffering>) -> PublishRuntimeRequest {
+    pub fn into_request(
+        self,
+        capability_schema: Value,
+        offerings: Vec<NormalizedOffering>,
+    ) -> PublishRuntimeRequest {
         PublishRuntimeRequest {
             vendor_id: self.vendor_id,
             native_model_id: self.native_model_id,
             native_revision: self.native_revision,
             actor: self.actor,
+            capability_schema,
             offerings,
         }
     }
 
-    /// 把两种形状归一到同一个有序候选列表。
+    /// 把两种形状归一到"一份合同 + 一个有序候选列表"。
     ///
     /// 这是发布接口**唯一**的形状判别点：`apps/api` 的 `Json<PublishRuntimeCommand>` 反序列化
-    /// 之后，下游只处理 `Vec<NormalizedOffering>`。
-    pub fn normalize(&self) -> Result<Vec<NormalizedOffering>, ApplicationError> {
-        match &self.offerings {
-            Some(drafts) => self.normalize_array(drafts),
-            None => self.normalize_flat(),
+    /// 之后，下游只处理 [`NormalizedPublication`]。
+    pub fn normalize(&self) -> Result<NormalizedPublication, ApplicationError> {
+        let offerings = match &self.offerings {
+            Some(drafts) => self.normalize_array(drafts)?,
+            None => self.normalize_flat()?,
+        };
+        Ok(NormalizedPublication {
+            contract: self.resolve_contract()?,
+            offerings,
+        })
+    }
+
+    /// 解析本次发布的**唯一一份合同**。
+    ///
+    /// 顶层给了就用顶层；顶层没给才回退到候选自带的旧字段——过渡期里老素材（承载面与合同
+    /// 还是同一份）因此照常可发布。回退时要求所有候选的旧字段**完全一致**：合同是模型级的
+    /// 唯一一份，两份不同的内容不能同时成为同一个模型的合同，否则"客户端按合同提交"就没了依据。
+    fn resolve_contract(&self) -> Result<Value, ApplicationError> {
+        if let Some(contract) = &self.capability_schema {
+            return Ok(contract.clone());
         }
+        let mut resolved: Option<Value> = None;
+        for (index, draft) in self
+            .offerings
+            .as_deref()
+            .unwrap_or_default()
+            .iter()
+            .enumerate()
+        {
+            let Some(legacy) = &draft.capability_schema else {
+                return Err(ApplicationError::Validation(format!(
+                    "capability_schema is required: declare the vendor model contract at the top level, \
+                     or a legacy per-offering capability_schema (offerings[{index}] has neither)"
+                )));
+            };
+            match &resolved {
+                None => resolved = Some(legacy.clone()),
+                Some(first) if first == legacy => {}
+                Some(_) => {
+                    return Err(ApplicationError::Validation(
+                        "offerings declare different capability schemas; the contract is one per vendor \
+                         model, so declare it once at the top level"
+                            .to_owned(),
+                    ));
+                }
+            }
+        }
+        resolved
+            .ok_or_else(|| ApplicationError::Validation("capability_schema is required".to_owned()))
     }
 
     fn normalize_array(
@@ -170,25 +250,32 @@ impl PublishRuntimeCommand {
                 "offerings is present, so the flat field {field} must be omitted"
             )));
         }
-        if let Some(field) = self.flat_extras_present() {
-            return Err(ApplicationError::Validation(format!(
-                "offerings is present, so the flat field {field} must be omitted"
-            )));
-        }
         if self.flat_restrictions_present() {
             return Err(ApplicationError::Validation(
                 "offerings is present, so the flat field restrictions must be omitted".to_owned(),
+            ));
+        }
+        if self.flat_parameter_mapping_present() {
+            return Err(ApplicationError::Validation(
+                "offerings is present, so the flat field parameter_mapping must be omitted"
+                    .to_owned(),
             ));
         }
         drafts
             .iter()
             .enumerate()
             .map(|(index, draft)| {
-                let capability_schema = draft.capability_schema.clone().ok_or_else(|| {
-                    ApplicationError::Validation(format!(
-                        "offerings[{index}].capability_schema is required"
-                    ))
-                })?;
+                // 承载面：新名字优先，缺了才用旧名字顶替（过渡期）。两者都没有就拒绝——
+                // 供给说不清自己能承载什么，发布期就没法判它是否落在合同与 Driver 之内。
+                let carrier_schema = draft
+                    .carrier_schema
+                    .clone()
+                    .or_else(|| draft.capability_schema.clone())
+                    .ok_or_else(|| {
+                        ApplicationError::Validation(format!(
+                            "offerings[{index}].carrier_schema is required"
+                        ))
+                    })?;
                 let price_plan = draft.price_plan.clone().ok_or_else(|| {
                     ApplicationError::Validation(format!(
                         "offerings[{index}].price_plan is required"
@@ -200,7 +287,8 @@ impl PublishRuntimeCommand {
                     ))
                 })?;
                 Ok(NormalizedOffering {
-                    capability_schema,
+                    carrier_schema,
+                    parameter_mapping: draft.parameter_mapping.clone(),
                     restrictions: draft.restrictions.clone(),
                     provider_kind: draft.provider_kind.clone(),
                     adapter_key: draft.adapter_key.clone(),
@@ -238,7 +326,12 @@ impl PublishRuntimeCommand {
         validate_price_formula(&price_plan)
             .map_err(|message| ApplicationError::Validation(format!("price_plan: {message}")))?;
         Ok(vec![NormalizedOffering {
-            capability_schema,
+            // 扁平形式只有一个候选：承载面缺省时与合同同值，等价于"这份供给承载合同的全部字段"。
+            carrier_schema: self
+                .carrier_schema
+                .clone()
+                .unwrap_or_else(|| capability_schema.clone()),
+            parameter_mapping: self.parameter_mapping.clone(),
             restrictions: self.restrictions.clone(),
             provider_kind: self
                 .provider_kind
@@ -280,29 +373,30 @@ impl PublishRuntimeCommand {
 
     /// 数组形式下**必须全部为空**的扁平字段。
     ///
-    /// 除上表外还含 `capability_schema` 与 `price_plan`（见 [`Self::flat_extras_present`]）。
-    /// `restrictions` 只在**非空**时才算"被给出"：它带 `#[serde(default)]`，缺省即空对象，
-    /// 无法与显式写 `{}` 区分——而空的 `restrictions` 不携带信息，忽略它没有风险。
+    /// 除上表外还含 `carrier_schema` 与 `price_plan`：它们是"单个供给"的东西，数组形式里
+    /// 每个候选自带。**顶层 `capability_schema` 不在此列**——它是模型级合同，数组形式下同样
+    /// 允许（也推荐）写在顶层。
+    /// `restrictions` 与 `parameter_mapping` 只在**非空**时才算"被给出"：它们带
+    /// `#[serde(default)]`，缺省即空对象，无法与显式写 `{}` 区分——而空值不携带信息，
+    /// 忽略它没有风险。
     fn first_present_flat_field(&self) -> Option<&'static str> {
         self.flat_fields()
             .into_iter()
             .find_map(|(name, value)| value.is_some().then_some(name))
-    }
-
-    /// 扁平形式里那两个"不是简单字符串"的字段是否被给出。
-    fn flat_extras_present(&self) -> Option<&'static str> {
-        if self.capability_schema.is_some() {
-            return Some("capability_schema");
-        }
-        if self.price_plan.is_some() {
-            return Some("price_plan");
-        }
-        None
+            .or_else(|| self.carrier_schema.is_some().then_some("carrier_schema"))
+            .or_else(|| self.price_plan.is_some().then_some("price_plan"))
     }
 
     /// `restrictions` 是否被显式给出（见 [`Self::first_present_flat_field`] 的说明）。
     fn flat_restrictions_present(&self) -> bool {
         self.restrictions
+            .as_object()
+            .is_some_and(|map| !map.is_empty())
+    }
+
+    /// `parameter_mapping` 是否被显式给出（判法同上：非空才算）。
+    fn flat_parameter_mapping_present(&self) -> bool {
+        self.parameter_mapping
             .as_object()
             .is_some_and(|map| !map.is_empty())
     }
@@ -353,8 +447,8 @@ fn empty_object() -> Value {
 /// 按 `routing_priority` 升序取**第一个合格候选**。
 ///
 /// 合格 = 该候选自己的 `restrictions` 允许本次分支与图片张数，**且**请求能满足该候选
-/// **自己的** `capability_schema`（必填项在场、图片能落到它声明的参数名上）。
-/// 两个条件都必须用该候选自己的声明判断——这正是「每个 Provider 各自声明支持面、
+/// **自己的** `carrier_schema`（必填项在场、图片能落到它声明的参数名上）。
+/// 两个条件都必须用该候选自己的声明判断——这正是「每条供给各自声明承载面、
 /// 限制只收窄」的落地方式。
 ///
 /// **无合格候选时返回 `Validation` 错误**，即"在调用上游之前失败"，不回退到能力更宽但
@@ -906,10 +1000,14 @@ impl IdentityService {
 pub trait AdapterFactory: Send + Sync {
     fn descriptor(&self, adapter_key: &str) -> Option<AdapterDescriptor>;
 
+    /// Driver 侧的发布校验：这份**承载面**（这条供给会往线文里写的字段面）与这些限制，
+    /// 本 Driver 能不能执行。
+    ///
+    /// 看的是承载面而不是合同：合同是客户端那一侧的面，Driver 不据它判自己能否执行。
     fn validate_publication(
         &self,
         adapter_key: &str,
-        capability_schema: &Value,
+        carrier_schema: &Value,
         restrictions: &Value,
     ) -> Result<(), String>;
 
@@ -953,12 +1051,12 @@ impl AdapterFactory for AdapterRegistry {
     fn validate_publication(
         &self,
         adapter_key: &str,
-        capability_schema: &Value,
+        carrier_schema: &Value,
         restrictions: &Value,
     ) -> Result<(), String> {
         match self.find(adapter_key) {
             Some(factory) => {
-                factory.validate_publication(adapter_key, capability_schema, restrictions)
+                factory.validate_publication(adapter_key, carrier_schema, restrictions)
             }
             None => Err(format!("unknown adapter {adapter_key}")),
         }
@@ -1000,9 +1098,9 @@ impl RuntimeService {
 
     /// 发布一个 Vendor Model 的供给（完整候选集合）。
     ///
-    /// 顺序：形状归一到 `Vec<NormalizedOffering>` → 命令级字段校验 → **逐候选**校验
-    /// （schema 封闭性、`model.const`、base_url、计价、Adapter 兼容性）→ 交给仓库逐项写入。
-    /// 校验不通过时不产生任何 revision 行。
+    /// 顺序：形状归一到 [`NormalizedPublication`] → 命令级字段校验 → **合同**校验 →
+    /// **逐候选**校验（承载面落在合同与 Driver 之内、base_url、计价、Adapter 兼容性）→
+    /// 交给仓库逐项写入。校验不通过时不产生任何 revision 行。
     pub async fn publish(
         &self,
         command: PublishRuntimeCommand,
@@ -1019,12 +1117,16 @@ impl RuntimeService {
                 )));
             }
         }
-        let offerings = command.normalize()?;
+        let NormalizedPublication {
+            contract,
+            offerings,
+        } = command.normalize()?;
+        validate_contract(&command.native_model_id, &contract)?;
         let mut normalized = Vec::with_capacity(offerings.len());
         for offering in offerings {
-            normalized.push(self.validate_offering(&command, offering)?);
+            normalized.push(self.validate_offering(&contract, offering)?);
         }
-        let request = command.into_request(normalized);
+        let request = command.into_request(contract, normalized);
         let revision = self.repository.publish_runtime(request).await?;
         Ok(revision)
     }
@@ -1032,38 +1134,13 @@ impl RuntimeService {
     /// 校验单个候选，并归一化它的 `base_url`。
     fn validate_offering(
         &self,
-        command: &PublishRuntimeCommand,
+        contract: &Value,
         mut offering: NormalizedOffering,
     ) -> Result<NormalizedOffering, ApplicationError> {
-        jsonschema::validator_for(&offering.capability_schema)
+        jsonschema::validator_for(&offering.carrier_schema)
             .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        // 候选的身份必须与发布声明的型号一致：`model.const` 就是该 Provider 自己的
-        // 模型名，发布期据此拒绝「把 A 型号的 Profile 挂到 B 型号上」。
-        if offering
-            .capability_schema
-            .pointer("/properties/model/const")
-            .and_then(Value::as_str)
-            != Some(command.native_model_id.as_str())
-        {
-            return Err(ApplicationError::Validation(
-                "capability_schema model.const must equal native_model_id".to_owned(),
-            ));
-        }
-        if offering
-            .capability_schema
-            .get("type")
-            .and_then(Value::as_str)
-            != Some("object")
-            || offering
-                .capability_schema
-                .get("additionalProperties")
-                .and_then(Value::as_bool)
-                != Some(false)
-        {
-            return Err(ApplicationError::Validation(
-                "capability_schema must be a closed object schema".to_owned(),
-            ));
-        }
+        // 供给不能凭空多出调用方可提交的字段：承载面必须落在合同里。
+        validate_carrier_within_contract(contract, &offering.carrier_schema)?;
         let mut base_url = offering.base_url.trim().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
             return Err(ApplicationError::Validation(
@@ -1120,12 +1197,14 @@ impl RuntimeService {
                 ApplicationError::Validation(format!("unknown adapter {}", offering.adapter_key))
             })?;
         validate_adapter_compatibility(&offering, &descriptor)?;
-        // 限制只能收窄：供货方不得声明 Profile 自己都没声明的能力。
+        // 限制只能收窄：供货方不得声明这条供给的承载面自己都没声明的能力。
         validate_restrictions_within_profile(&offering)?;
+        // Driver 侧的发布校验看的是**承载面**：这条供给实际会往线文里写的字段面。
+        // 合同是客户端那一侧的面，Driver 不需要、也不该据它判自己能不能执行。
         self.adapters
             .validate_publication(
                 &offering.adapter_key,
-                &offering.capability_schema,
+                &offering.carrier_schema,
                 &offering.restrictions,
             )
             .map_err(ApplicationError::Validation)?;
@@ -1138,19 +1217,19 @@ impl RuntimeService {
     }
 }
 
-/// 校验「Offering 的限制不超出该候选 Profile 自己声明的范围」。
+/// 校验「Offering 的限制不超出这条供给**自己承载的面**」。
 ///
 /// 这是"Provider 限制只能**收窄**，不能放宽"的落地。
-/// 与 [`validate_adapter_compatibility`] 的区别：后者比对的是 **Adapter 的能力面**（Driver
-/// 做不到的不许声明）；本函数比对的是 **Profile 自己声明的能力**（供货方不许替厂商放宽）。
+/// 与 [`validate_adapter_compatibility`] 的区别：后者比对的是 **Driver 的传输能力**（线上写不出去
+/// 的字段名不许声明）；本函数比对的是 **这条供给自己声明的承载面**（供货方不许替厂商放宽）。
 ///
 /// Restrictions 的形状很小，目前只有两项，因此可判定地检查两项：
-/// - `allowed_branches`：每个分支都必须能在 Profile 的 `required`/`properties` 下成立；
-/// - `max_images`：不得超过 Profile 对参考图数量的声明。
+/// - `allowed_branches`：每个分支都必须能在承载面的 `required`/`properties` 下成立；
+/// - `max_images`：不得超过承载面对参考图数量的声明。
 fn validate_restrictions_within_profile(
     offering: &NormalizedOffering,
 ) -> Result<(), ApplicationError> {
-    let schema = &offering.capability_schema;
+    let schema = &offering.carrier_schema;
     let properties = schema.get("properties").and_then(Value::as_object);
     let required: Vec<&str> = schema
         .get("required")
@@ -1168,7 +1247,7 @@ fn validate_restrictions_within_profile(
         for branch in branches {
             let (name, described) = match branch.as_str() {
                 Some("prompt_only") => ("prompt_only", declares("prompt")),
-                // 图生图/编辑需要参考图输入：Profile 必须声明一个名字以 `image`
+                // 图生图/编辑需要参考图输入：承载面必须声明一个名字以 `image`
                 // 开头的参数（`image`/`images`/`image_urls`）。
                 Some("image_conditioned") => (
                     "image_conditioned",
@@ -1192,7 +1271,7 @@ fn validate_restrictions_within_profile(
             };
             if !described {
                 return Err(ApplicationError::Validation(format!(
-                    "restriction allows branch {name}, which the profile does not declare"
+                    "restriction allows branch {name}, which the carrier surface does not declare"
                 )));
             }
         }
@@ -1202,19 +1281,19 @@ fn validate_restrictions_within_profile(
         .get("max_images")
         .and_then(Value::as_u64)
     {
-        // 限制只能收窄：Profile 没承诺收图上限（数组没写 `maxItems`）时，任何正的 `max_images`
-        // 都算凭空放宽，同样拒绝。`0` 不需要 Profile 声明任何参考图参数。
+        // 限制只能收窄：承载面没承诺收图上限（数组没写 `maxItems`）时，任何正的 `max_images`
+        // 都算凭空放宽，同样拒绝。`0` 不需要承载面声明任何参考图参数。
         if max_images > 0 {
             match declared_reference_image_limit(schema) {
                 Some(declared) if max_images <= declared => {}
                 Some(declared) => {
                     return Err(ApplicationError::Validation(format!(
-                        "restriction allows {max_images} image(s), but the profile declares at most {declared}"
+                        "restriction allows {max_images} image(s), but the carrier surface declares at most {declared}"
                     )));
                 }
                 None => {
                     return Err(ApplicationError::Validation(format!(
-                        "restriction allows {max_images} image(s), but the profile declares no reference image count"
+                        "restriction allows {max_images} image(s), but the carrier surface declares no reference image count"
                     )));
                 }
             }
@@ -1223,24 +1302,112 @@ fn validate_restrictions_within_profile(
     Ok(())
 }
 
+/// 校验**模型级合同**：必须是封闭对象 schema，且 `model.const` 就是本次发布的型号。
+///
+/// 为什么校验在合同上而不是在每个候选上：合同是模型级唯一一份，落库后不再改；
+/// 候选的承载面只是它的子集（见 [`validate_carrier_within_contract`]），
+/// 因此"身份与型号一致"这件事只需在这里判一次。
+fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), ApplicationError> {
+    jsonschema::validator_for(contract)
+        .map_err(|error| ApplicationError::Validation(error.to_string()))?;
+    // 合同的身份必须与发布声明的型号一致：`model.const` 就是该 Provider 自己的模型名，
+    // 发布期据此拒绝「把 A 型号的合同挂到 B 型号上」。
+    if contract
+        .pointer("/properties/model/const")
+        .and_then(Value::as_str)
+        != Some(native_model_id)
+    {
+        return Err(ApplicationError::Validation(
+            "capability_schema model.const must equal native_model_id".to_owned(),
+        ));
+    }
+    if contract.get("type").and_then(Value::as_str) != Some("object")
+        || contract
+            .get("additionalProperties")
+            .and_then(Value::as_bool)
+            != Some(false)
+    {
+        return Err(ApplicationError::Validation(
+            "capability_schema must be a closed object schema".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 校验「承载面 ⊆ 合同」：供给不能凭空多出调用方可提交的字段。
+///
+/// 判据是**顶层字段名**：承载面声明了这个名字，合同就必须也声明它——否则这条供给会承载一个
+/// 客户端根本提交不了的参数（客户端按合同提交，合同里没有的名字它不会发），声明与行为就分了家。
+///
+/// 只比名字、不比定义：同一个名字在两边各自描述（例如 `size` 的取值形态）是后续步骤的事，
+/// 本步先把"字段面"这条边界立住。
+fn validate_carrier_within_contract(
+    contract: &Value,
+    carrier: &Value,
+) -> Result<(), ApplicationError> {
+    carrier_properties(carrier)?;
+    let contract_fields = declared_field_names(contract);
+    for field in declared_field_names(carrier) {
+        if !contract_fields.contains(&field) {
+            return Err(ApplicationError::Validation(format!(
+                "carrier schema declares {field}, which the vendor model contract does not"
+            )));
+        }
+    }
+    Ok(())
+}
+
+/// 一份 schema 声明的**顶层字段名**：`properties` 的键，加上 `required` 里列出的名字。
+///
+/// 两处都算：`required` 里的名字同样是"这份 schema 声明的字段"，漏掉它会让校验看起来通过了、
+/// 实际却放行了一个没声明的名字。
+fn declared_field_names(schema: &Value) -> Vec<&str> {
+    let mut names: Vec<&str> = schema
+        .get("properties")
+        .and_then(Value::as_object)
+        .map(|map| map.keys().map(String::as_str).collect())
+        .unwrap_or_default();
+    if let Some(required) = schema.get("required").and_then(Value::as_array) {
+        for name in required.iter().filter_map(Value::as_str) {
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+    }
+    names
+}
+
+/// 承载面的 `properties`：承载面必须是一份**声明了字段**的对象 schema。
+///
+/// 缺了它，R1/R2 都会"没有字段可查"而静默通过——那种通过毫无意义，因此在这里明确失败。
+fn carrier_properties(
+    carrier: &Value,
+) -> Result<&serde_json::Map<String, Value>, ApplicationError> {
+    carrier
+        .get("properties")
+        .and_then(Value::as_object)
+        .ok_or_else(|| {
+            ApplicationError::Validation("carrier_schema.properties is required".to_owned())
+        })
+}
+
+/// 校验「承载面 ⊆ 该 Driver 能写上线文的字段名」，分支与图片数上限照旧。
+///
+/// `AdapterDescriptor::supported_top_level_parameters` 的语义是**传输能力**：这个 Driver 能往
+/// 线文里写哪些字段名。它**不是**"调用方能提交哪些参数"——调用方看到的是合同，渠道包装的差异
+/// 由承载面与映射承担。声明了写不出去的字段名，等于声明了一个发不出去的参数，因此在这里拒绝。
 fn validate_adapter_compatibility(
     offering: &NormalizedOffering,
     descriptor: &AdapterDescriptor,
 ) -> Result<(), ApplicationError> {
-    let properties = offering
-        .capability_schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .ok_or_else(|| {
-            ApplicationError::Validation("capability_schema.properties is required".to_owned())
-        })?;
-    for parameter in properties.keys() {
+    let properties = carrier_properties(&offering.carrier_schema)?;
+    for parameter in declared_field_names(&offering.carrier_schema) {
         if !descriptor
             .supported_top_level_parameters
-            .contains(&parameter.as_str())
+            .contains(&parameter)
         {
             return Err(ApplicationError::Validation(format!(
-                "adapter {} does not support native parameter {parameter}",
+                "adapter {} cannot write parameter {parameter} on the wire",
                 descriptor.key
             )));
         }
@@ -1353,8 +1520,8 @@ impl GenerationService {
         let candidates = self.repository.active_offering(&request.model).await?;
         let (offering, native_parameters, routing) =
             select_candidate(&request, branch, &candidates)?;
-        // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按声明面过滤的结果）：
-        // 上游目录变了、或另一个候选的声明面更窄，都不该让同一个幂等键算出不同的哈希。
+        // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按承载面过滤的结果）：
+        // 上游目录变了、或另一个候选的承载面更窄，都不该让同一个幂等键算出不同的哈希。
         let request_hash = request_hash(&request)?;
         self.repository
             .create_job(
@@ -1433,7 +1600,7 @@ impl WorkerService {
         // 图片输入已经在 Job 的原生参数里（受理期落在候选自己的参数名上，未声明的名字那时就被
         // 丢掉了），这里只是把它交给 Driver：平台不读字节、不核对摘要。
         //
-        // 一并把"哪些名字是平台自己装好的"算出来交给 Driver：归属由**候选声明面 + 分支**决定，
+        // 一并把"哪些名字是平台自己装好的"算出来交给 Driver：归属由**候选承载面 + 分支**决定，
         // 两者都在 Job 里冻结了，所以这份名单是确定的、与调用方这一次恰好给了什么取值无关。
         // Driver 不自己按取值的形状猜归属——那样会把一个像图的普通参数误当成平台的图。
         let prepared = PreparedImageRequest {
@@ -1441,7 +1608,7 @@ impl WorkerService {
             branch: claimed.job.branch,
             native_parameters: claimed.job.native_parameters.clone(),
             platform_parameters: platform_image_parameters(
-                &claimed.job.offering.capability_schema,
+                &claimed.job.offering.carrier_schema,
                 claimed.job.branch,
             ),
         };
@@ -1665,16 +1832,17 @@ fn validate_restrictions(
     Ok(())
 }
 
-/// 受理前的准备：**先按候选的声明面过滤参数，再**把参考图与遮罩落到该候选**自己声明的参数名**上，
+/// 受理前的准备：**先按候选的承载面过滤参数，再**把参考图与遮罩落到该候选**自己声明的参数名**上，
 /// 最后检查必填项在场。
 ///
-/// 过滤落在"选中候选之后、写 Job 之前"：调用方发了但该候选没声明的参数名在这里直接丢掉，
-/// 既不报错，也不会跟着 Job 与请求走去上游。选路之前不能过滤——那时还不知道是哪一份声明面。
+/// 过滤落在"选中候选之后、写 Job 之前"：调用方发了但该候选承载不了的参数名在这里直接丢掉，
+/// 既不报错，也不会跟着 Job 与请求走去上游。选路之前不能过滤——那时还不知道是哪一份承载面。
 ///
-/// 仍**不**校验参数的取值合法性（枚举、区间、类型都不管）：声明过的参数取值原样交给上游，
+/// 判据是**承载面**而不是合同：合同说客户端能提交什么，承载面说这条供给能把它带到线上。
+/// 请求里的取值本身仍**不**校验（枚举、区间、类型都不管）：承载面声明过的参数取值原样交给上游，
 /// 平台不替它改写。哪些参数需要把取值管起来，等有一份明确的清单后再加，加在这里。
 ///
-/// `model` 与图片在校验前注入，所以它们照样参与"必填项在场"的判断。图片参数名来自同一份声明面，
+/// `model` 与图片在校验前注入，所以它们照样参与"必填项在场"的判断。图片参数名来自同一份承载面，
 /// 过滤留得下它们——装载的图不会被丢掉。
 fn prepare_native_parameters(
     request: &CreateImageGenerationRequest,
@@ -1683,11 +1851,11 @@ fn prepare_native_parameters(
     let supplied = request.native_parameters.as_object().ok_or_else(|| {
         ApplicationError::Validation("native_parameters must be an object".to_owned())
     })?;
-    let mut object = declared_parameter_names(&offering.capability_schema, supplied);
-    // `model` 是对外的平台型号名，由平台自己落；它本来就在候选的声明面里（`model.const`）。
+    let mut object = declared_parameter_names(&offering.carrier_schema, supplied);
+    // `model` 是对外的平台型号名，由平台自己落；它本来就在候选的承载面里（`model.const`）。
     object.insert("model".to_owned(), Value::String(request.model.clone()));
     place_image_inputs(
-        &offering.capability_schema,
+        &offering.carrier_schema,
         &mut object,
         &request.reference_images,
         request.mask.as_deref(),
@@ -1695,7 +1863,7 @@ fn prepare_native_parameters(
     .map_err(ApplicationError::Validation)?;
     let instance = Value::Object(object);
     let required = offering
-        .capability_schema
+        .carrier_schema
         .get("required")
         .and_then(Value::as_array)
         .cloned()
@@ -1808,6 +1976,7 @@ mod tests {
     };
 
     fn offering() -> PublishedOffering {
+        let carrier = carrier_schema();
         PublishedOffering {
             runtime_revision_id: RuntimeRevisionId::new(),
             vendor_model_id: VendorModelId::new(),
@@ -1815,17 +1984,10 @@ mod tests {
             channel_id: ChannelId::new(),
             gateway_model: "gpt-image-2".to_owned(),
             native_revision: "2026-04-21".to_owned(),
-            capability_schema: serde_json::json!({
-                "type": "object",
-                "additionalProperties": false,
-                "required": ["model", "prompt"],
-                "properties": {
-                    "model": {"const": "gpt-image-2"},
-                    "prompt": {"type": "string", "minLength": 1},
-                    "image": {"type": "string"},
-                    "mask": {"type": "string"}
-                }
-            }),
+            // 这份夹具里合同与承载面同值：它要覆盖的是受理侧"按承载面过滤与装载"的行为。
+            capability_schema: carrier.clone(),
+            carrier_schema: carrier,
+            parameter_mapping: serde_json::json!({}),
             restrictions: serde_json::json!({
                 "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
                 "max_images": 1
@@ -1847,6 +2009,21 @@ mod tests {
                 captured_at: Utc::now(),
             },
         }
+    }
+
+    /// 夹具里那条供给**能承载**的字段面。
+    fn carrier_schema() -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string", "minLength": 1},
+                "image": {"type": "string"},
+                "mask": {"type": "string"}
+            }
+        })
     }
 
     fn schema(model: &str) -> Value {
@@ -1873,6 +2050,8 @@ mod tests {
             provider_model_id: None,
             base_url: None,
             credential_env: None,
+            carrier_schema: None,
+            parameter_mapping: serde_json::json!({}),
             offerings: None,
             price_plan: None,
             actor: "tester".to_owned(),
@@ -1891,6 +2070,7 @@ mod tests {
         }
     }
 
+    /// 一个候选：**过渡期的老素材形状**——只给 offering 级旧字段，合同由它回退得来。
     fn draft(provider_model_id: &str) -> OfferingDraft {
         OfferingDraft {
             provider_kind: "AIHubMix".to_owned(),
@@ -1899,8 +2079,19 @@ mod tests {
             base_url: "https://api.inferera.com".to_owned(),
             credential_env: "AIHUBMIX_API_KEY".to_owned(),
             restrictions: serde_json::json!({}),
+            carrier_schema: None,
+            parameter_mapping: serde_json::json!({}),
             capability_schema: Some(schema("gpt-image-2.5-flare")),
             price_plan: Some(price_plan()),
+        }
+    }
+
+    /// 一个候选：**新形状**——承载面用新名字声明，合同留给顶层。
+    fn carrier_draft(provider_model_id: &str, carrier: Value) -> OfferingDraft {
+        OfferingDraft {
+            carrier_schema: Some(carrier),
+            capability_schema: None,
+            ..draft(provider_model_id)
         }
     }
 
@@ -1923,16 +2114,17 @@ mod tests {
             ..base_command()
         };
         let normalized = command.normalize().expect("array form is valid");
-        assert_eq!(normalized.len(), 3);
+        assert_eq!(normalized.offerings.len(), 3);
         // 优先级只有一个来源：数组下标。
         assert_eq!(
             normalized
+                .offerings
                 .iter()
                 .map(|offering| offering.routing_priority)
                 .collect::<Vec<_>>(),
             vec![0, 1, 2]
         );
-        assert_eq!(normalized[1].provider_model_id, "pm-b");
+        assert_eq!(normalized.offerings[1].provider_model_id, "pm-b");
     }
 
     #[test]
@@ -1948,8 +2140,10 @@ mod tests {
             ..base_command()
         };
         let normalized = command.normalize().expect("flat form is valid");
-        assert_eq!(normalized.len(), 1);
-        assert_eq!(normalized[0].routing_priority, 0);
+        assert_eq!(normalized.offerings.len(), 1);
+        assert_eq!(normalized.offerings[0].routing_priority, 0);
+        // 扁平形式没另给承载面：它承载合同声明的全部字段。
+        assert_eq!(normalized.offerings[0].carrier_schema, normalized.contract);
     }
 
     #[test]
@@ -1976,15 +2170,16 @@ mod tests {
     }
 
     #[test]
-    fn normalize_requires_capability_schema_and_price_plan_per_offering() {
-        let mut without_schema = draft("pm-a");
-        without_schema.capability_schema = None;
+    fn normalize_requires_a_carrier_schema_and_price_plan_per_offering() {
+        let mut without_carrier = draft("pm-a");
+        without_carrier.carrier_schema = None;
+        without_carrier.capability_schema = None;
         let command = PublishRuntimeCommand {
-            offerings: Some(vec![without_schema]),
+            offerings: Some(vec![without_carrier]),
             ..base_command()
         };
-        let error = command.normalize().expect_err("schema is required");
-        assert!(error.to_string().contains("capability_schema"), "{error}");
+        let error = command.normalize().expect_err("carrier is required");
+        assert!(error.to_string().contains("carrier_schema"), "{error}");
 
         let mut without_price = draft("pm-a");
         without_price.price_plan = None;
@@ -1996,15 +2191,110 @@ mod tests {
         assert!(error.to_string().contains("price_plan"), "{error}");
     }
 
-    /// 造一个用于兼容性校验的候选：Profile 只声明给定的字段。
+    /// 数组形式下顶层给合同、候选给承载面：新形状的正常用法。
+    #[test]
+    fn array_form_takes_the_contract_from_the_top_level_and_the_carrier_from_each_offering() {
+        let contract = schema("gpt-image-2.5-flare");
+        let carrier = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2.5-flare"},
+            "prompt": {"type": "string", "minLength": 1}
+        }));
+        let command = PublishRuntimeCommand {
+            capability_schema: Some(contract.clone()),
+            offerings: Some(vec![
+                carrier_draft("pm-a", carrier.clone()),
+                carrier_draft("pm-b", carrier.clone()),
+            ]),
+            ..base_command()
+        };
+        let normalized = command.normalize().expect("array form is valid");
+        assert_eq!(normalized.contract, contract);
+        assert_eq!(normalized.offerings[0].carrier_schema, carrier);
+        assert_eq!(normalized.offerings[1].carrier_schema, carrier);
+    }
+
+    /// 顶层合同优先：候选自带的旧字段这时是**承载面**，不再是合同。
+    #[test]
+    fn top_level_contract_wins_over_the_legacy_offering_field() {
+        let contract = schema("gpt-image-2.5-flare");
+        let legacy = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2.5-flare"},
+                "prompt": {"type": "string"}
+            }
+        });
+        let command = PublishRuntimeCommand {
+            capability_schema: Some(contract.clone()),
+            offerings: Some(vec![OfferingDraft {
+                capability_schema: Some(legacy.clone()),
+                ..draft("pm-a")
+            }]),
+            ..base_command()
+        };
+        let normalized = command.normalize().expect("top-level contract wins");
+        assert_eq!(normalized.contract, contract);
+        assert_eq!(normalized.offerings[0].carrier_schema, legacy);
+    }
+
+    /// 过渡期回退：顶层没给合同，老素材那份 offering 级声明面同时当合同与承载面。
+    #[test]
+    fn legacy_offering_schema_falls_back_to_the_contract() {
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![draft("pm-a")]),
+            ..base_command()
+        };
+        let normalized = command
+            .normalize()
+            .expect("legacy material still publishes");
+        assert_eq!(normalized.contract, schema("gpt-image-2.5-flare"));
+        assert_eq!(normalized.offerings[0].carrier_schema, normalized.contract);
+    }
+
+    /// 回退时各候选的旧字段必须一致：合同只有一份，两份内容不能同时当合同。
+    #[test]
+    fn legacy_offering_schemas_that_disagree_are_rejected() {
+        let other = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2.5-flare"},
+                "prompt": {"type": "string"},
+                "image_urls": {"type": "array", "items": {"type": "string"}}
+            }
+        });
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![
+                draft("pm-a"),
+                OfferingDraft {
+                    capability_schema: Some(other),
+                    ..draft("pm-b")
+                },
+            ]),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("two different contracts for one model must be rejected");
+        assert!(
+            error.to_string().contains("different capability schemas"),
+            "{error}"
+        );
+    }
+
+    /// 造一个用于兼容性校验的候选：承载面只声明给定的字段。
     fn offering_with(schema_properties: Value, restrictions: Value) -> NormalizedOffering {
         NormalizedOffering {
-            capability_schema: serde_json::json!({
+            carrier_schema: serde_json::json!({
                 "type": "object",
                 "additionalProperties": false,
                 "required": ["model", "prompt"],
                 "properties": schema_properties
             }),
+            parameter_mapping: serde_json::json!({}),
             restrictions,
             provider_kind: "AIHubMix".to_owned(),
             adapter_key: "aihubmix-image-v1".to_owned(),
@@ -2132,6 +2422,118 @@ mod tests {
         assert!(validate_restrictions_within_profile(&unbounded).is_err());
     }
 
+    /// 一份只声明给定顶层字段的合同/承载面。
+    fn surface(properties: Value) -> Value {
+        serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": properties
+        })
+    }
+
+    /// 一个"能写这几个字段名上线文"的 Driver。
+    fn descriptor() -> AdapterDescriptor {
+        AdapterDescriptor {
+            key: "aihubmix-image-v1",
+            supported_top_level_parameters: &["model", "prompt", "image", "mask", "quality"],
+            supported_extra_parameters: &[],
+            supported_branches: &[
+                ImageBranch::PromptOnly,
+                ImageBranch::ImageConditioned,
+                ImageBranch::Masked,
+            ],
+            max_images: 1,
+        }
+    }
+
+    /// R1：承载面声明了合同里没有的字段 ⇒ 供给凭空多出调用方可提交的参数，拒绝。
+    #[test]
+    fn carrier_field_the_contract_does_not_declare_is_rejected() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"}
+        }));
+        let carrier = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "quality": {"type": "string"}
+        }));
+        let error = validate_carrier_within_contract(&contract, &carrier)
+            .expect_err("a field outside the contract must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("which the vendor model contract does not"),
+            "{error}"
+        );
+    }
+
+    /// R2：承载面声明了这个 Driver 写不出去的字段名 ⇒ 声明了发不出去，拒绝。
+    #[test]
+    fn carrier_field_the_driver_cannot_write_is_rejected() {
+        let mut offering = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "resolution": {"type": "string"}
+            }),
+            serde_json::json!({}),
+        );
+        offering.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        let error = validate_adapter_compatibility(&offering, &descriptor())
+            .expect_err("a field the driver cannot write must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("cannot write parameter resolution"),
+            "{error}"
+        );
+    }
+
+    /// 承载面落在合同与 Driver 之内时通过：两个边界各判一次，缺一不可。
+    #[test]
+    fn carrier_within_the_contract_and_the_driver_is_accepted() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "image": {"type": "string"},
+            "quality": {"type": "string"}
+        }));
+        let mut offering = offering_with(
+            serde_json::json!({
+                "model": {"const": "m"},
+                "prompt": {"type": "string"},
+                "image": {"type": "string"},
+                "quality": {"type": "string"}
+            }),
+            serde_json::json!({"allowed_branches": ["prompt_only"], "max_images": 0}),
+        );
+        offering.carrier_schema = contract.clone();
+        assert!(validate_carrier_within_contract(&contract, &offering.carrier_schema).is_ok());
+        assert!(validate_adapter_compatibility(&offering, &descriptor()).is_ok());
+    }
+
+    /// 合同的身份就是发布的型号：`model.const` 不符即拒绝（换型号要发新的合同）。
+    #[test]
+    fn contract_identity_must_match_the_published_model() {
+        let contract = schema("gpt-image-2.5-flare");
+        assert!(validate_contract("gpt-image-2.5-flare", &contract).is_ok());
+        let error = validate_contract("another-model", &contract)
+            .expect_err("a contract for another model must be rejected");
+        assert!(error.to_string().contains("model.const"), "{error}");
+        // 不封闭的 schema 不是合同：调用方写错字段名会被静默收下。
+        let open = serde_json::json!({
+            "type": "object",
+            "properties": {"model": {"const": "m"}, "prompt": {"type": "string"}}
+        });
+        assert!(validate_contract("m", &open).is_err());
+    }
+
     #[test]
     fn normalize_rejects_unsupported_price_formula() {
         // 本阶段只启用 token_rates；其余计价形态（例如按上游声明金额计价）必须显式拒绝，
@@ -2192,7 +2594,7 @@ mod tests {
         // 没声明的参数名（渠道一手参数、`seed`、`foo`）在受理期就丢掉——不报错，
         // 也不会跟着 Job 走去上游。
         let mut vendor = offering();
-        vendor.capability_schema = serde_json::json!({
+        vendor.carrier_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["model", "prompt"],
@@ -2228,7 +2630,7 @@ mod tests {
     fn filtering_does_not_drop_the_images_the_platform_places() {
         // 装载用的名字取自同一份声明面，所以"先过滤、再装载"不会把图丢掉。
         let mut vendor = offering();
-        vendor.capability_schema = serde_json::json!({
+        vendor.carrier_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["model", "prompt"],
@@ -2289,7 +2691,7 @@ mod tests {
     fn places_images_into_the_vendors_own_array_parameter() {
         // 调用方只给参考图/遮罩；装到 `image_urls` / `mask_url` 是平台按候选声明做的映射。
         let mut vendor = offering();
-        vendor.capability_schema = serde_json::json!({
+        vendor.carrier_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["model", "prompt"],
@@ -2315,7 +2717,7 @@ mod tests {
 
         // 候选的参数面里没有装参考图的参数：这个候选表达不了，直接不合格。
         let mut text_only = offering();
-        text_only.capability_schema = serde_json::json!({
+        text_only.carrier_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
             "required": ["model", "prompt"],

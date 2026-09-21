@@ -234,10 +234,17 @@ impl ProviderFailureKind {
     }
 }
 
+/// 一个 Driver 的**传输能力**声明：它在线上能写什么。
+///
+/// `supported_top_level_parameters` 的语义是"这个 Driver 能写上线文的**字段名**"，
+/// **不是**"调用方能提交哪些参数"——调用方看到的是该 Vendor Model 的合同，渠道包装的差异
+/// 由供给的承载面与参数映射在平台内部吸收。发布期据此判"这条供给声明要写的字段，发得出去吗"。
 #[derive(Debug, Clone)]
 pub struct AdapterDescriptor {
     pub key: &'static str,
+    /// 能写上线文的**顶层字段名**。
     pub supported_top_level_parameters: &'static [&'static str],
+    /// 能写进某个嵌套容器里的字段名；容器本身同样必须是上表里的一个顶层字段名。
     pub supported_extra_parameters: &'static [&'static str],
     pub supported_branches: &'static [ImageBranch],
     pub max_images: u64,
