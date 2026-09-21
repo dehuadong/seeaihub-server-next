@@ -4564,7 +4564,8 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
 
         // 对客目录：这个型号必须查得到，`contract` 逐字就是发布的那一份——
         // "库里发布成了"与"调用方按目录建表单建得对"是两件事，这里把后一件也钉住。
-        let (status, catalog) = get_catalog(&client, &base_url, &api_key).await;
+        // 目录公开，所以这里照调用方最常见的取法来：不带任何鉴权头。
+        let (status, catalog) = get_catalog(&client, &base_url, None).await;
         assert_eq!(status, StatusCode::OK, "{catalog}");
         let entry = catalog["data"]
             .as_array()
@@ -5757,13 +5758,19 @@ async fn verify_lease_recovery_contract(
 }
 
 /// 取一次对客目录（`GET /v1/models`）。
-async fn get_catalog(client: &Client, base_url: &str, api_key: &str) -> (StatusCode, Value) {
-    let response = client
-        .get(format!("{base_url}/v1/models"))
-        .bearer_auth(api_key)
-        .send()
-        .await
-        .expect("catalog request");
+///
+/// `api_key` 给 `None` 就**一个鉴权头都不带**：目录是公开的，这才是调用方最常见的取法。
+async fn get_catalog(
+    client: &Client,
+    base_url: &str,
+    api_key: Option<&str>,
+) -> (StatusCode, Value) {
+    let request = client.get(format!("{base_url}/v1/models"));
+    let request = match api_key {
+        Some(key) => request.bearer_auth(key),
+        None => request,
+    };
+    let response = request.send().await.expect("catalog request");
     let status = response.status();
     let raw = response.text().await.expect("catalog body");
     (
@@ -5774,6 +5781,8 @@ async fn get_catalog(client: &Client, base_url: &str, api_key: &str) -> (StatusC
 
 /// 对客目录：`GET /v1/models` 只列**当前真的能调**的型号，合同就是发布的那一份。
 ///
+/// 目录**公开**：不带任何鉴权头就能取，乱给的 Key 也不会把它变成 401——调用方要先知道有哪些
+/// 型号、各自的参数面，才建得出表单。
 /// 判据与受理期选路**同一条**（生效的发布条目 + 启用的供给 + 启用的渠道）：目录里列出的型号
 /// 必须真的提交得起来。列着却提交不了比不列更糟——调用方会照它建表单，然后在提交时落空。
 /// 本用例只读发布物与目录，不起 Worker、不连上游：零外部调用。
@@ -5791,26 +5800,21 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
         .await
         .expect("contract database");
 
-    // ── 没有 Key：401，且走现有的对客错误信封；乱给的 Key 同样是 401 ──
-    let unauthorized = client
-        .get(format!("{base_url}/v1/models"))
-        .send()
-        .await
-        .expect("catalog request");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
-    let envelope: Value = unauthorized.json().await.expect("error envelope");
+    // ── 目录公开：不带任何鉴权头也 200；乱给的 Key 同样不影响它 ──
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK, "公开目录不该要 Key：{catalog}");
+    assert_public_only("无鉴权头的目录请求", &catalog);
     assert_eq!(
-        envelope["error"]["code"].as_str(),
-        Some("authorization_required")
+        catalog,
+        json!({"data": []}),
+        "还没发布任何型号时，目录是空列表而不是错误：{catalog}"
     );
-    assert_public_only("无 Key 的目录请求", &envelope);
-    let rejected = client
-        .get(format!("{base_url}/v1/models"))
-        .bearer_auth("sk_seeai_not_a_real_key")
-        .send()
-        .await
-        .expect("catalog request with an unknown key");
-    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+    let (status, catalog) = get_catalog(&client, &base_url, Some("sk_seeai_not_a_real_key")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "目录根本不读 Authorization，乱给的 Key 也不该被拒：{catalog}"
+    );
 
     // 两个型号、两份不同的合同：目录里每一条都必须带**它自己**那份，且逐字一致。
     let model = "catalog-model-a";
@@ -5842,8 +5846,8 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
         assert_eq!(status, StatusCode::OK, "{name} 必须发布成功");
     }
 
-    // ── 带 Key：两个型号都在，形状是 `{name, vendor, revision, contract}` ──
-    let (status, catalog) = get_catalog(&client, &base_url, &api_key).await;
+    // ── 两个型号都在，形状是 `{name, vendor, revision, contract}`；照旧不带鉴权头 ──
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK, "got {catalog}");
     assert_public_only("目录", &catalog);
     assert_eq!(
@@ -5880,7 +5884,7 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
     .execute(&pool)
     .await
     .expect("disable the offering");
-    let (_, catalog) = get_catalog(&client, &base_url, &api_key).await;
+    let (_, catalog) = get_catalog(&client, &base_url, None).await;
     let names: Vec<&str> = catalog["data"]
         .as_array()
         .expect("data is an array")
@@ -5914,12 +5918,12 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
     .execute(&pool)
     .await
     .expect("disable the channel");
-    let (status, catalog) = get_catalog(&client, &base_url, &api_key).await;
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         catalog,
         json!({"data": []}),
-        "一个可调型号都没有时，目录是空列表而不是错误：{catalog}"
+        "供给与渠道全停用后，目录是空列表而不是错误：{catalog}"
     );
 
     pool.close().await;

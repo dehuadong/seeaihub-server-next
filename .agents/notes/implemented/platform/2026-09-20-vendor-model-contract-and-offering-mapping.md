@@ -19,7 +19,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 - **S1b 受理期规则**：R4 按**合同**过滤（合同外字段丢弃、缺必填 400）；R5 逐候选要求"请求实际用到的字段"都在其承载面里，不合格原因进 `routing_decisions`；**全部不合格 → 503 `platform_unavailable`**（平台侧供给问题，不再算消费者 400）；`parameter_mapping.defaults` 注入。
 - **S2 `size` 三义**：领域新增 `SizeSpec`（像素/比例/档位）+ 换算算法；**尺寸档案作为发布数据**放在 `parameter_mapping.size`，生产代码里没有任何厂商档位表；组装期换算（`2:3`+`2K` → `1664x2496`），档案缺格 → 该候选不合格。
 - **S3 映射声明化**：`rename`（合同名 → 线上名，承载判据与 R1 相应扩展为"从合同可达"）、`enum_map`（取值映射，表外取值 → 候选不合格）、**R6**（`defaults` 的键必须合同里有且承载得了，否则发布 400）、**合同外图片字段一律 400 `invalid_parameter`**（丢图等于悄悄退化成文生图）。
-- **S4 对客目录**：`GET /v1/models`（同一 API Key）→ `{data:[{name, vendor, revision, contract}]}`；只列"生效发布里至少有一条 enabled 供给（渠道也启用）"的模型；`contract` 逐字就是发布的那份合同；响应不含 `offering`/`channel`/`provider_kind`/`provider_model_id`/`adapter_key`/job 标识。
+- **S4 对客目录**：`GET /v1/models`（**公开，无需鉴权**）→ `{data:[{name, vendor, revision, contract}]}`；只列"生效发布里至少有一条 enabled 供给（渠道也启用）"的模型；`contract` 逐字就是发布的那份合同；响应不含 `offering`/`channel`/`provider_kind`/`provider_model_id`/`adapter_key`/job 标识。目录公开：客户端要先知道有哪些模型与各自参数面才建得出表单，而目录里没有渠道或内部信息。
 
 ## 验证
 

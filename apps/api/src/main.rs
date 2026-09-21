@@ -365,15 +365,13 @@ impl From<PublishedModel> for ModelCatalogEntry {
 
 /// 对客目录：当前**真的能调**的模型，以及每个模型那份发布的合同。
 ///
-/// 鉴权与生成入口是**同一把 API Key**：目录属于同一个面，不另立一套凭证。
-/// 取数与判据在仓库层（与受理期选路同一条），这里只做投射——目录里不出现渠道、供给、
-/// 驱动或任何执行记录；型号身份与合同就够客户端建表单了。
+/// **公开，不校验 Key**：客户端得先知道有哪些模型、各自的参数面长什么样，才建得出表单；
+/// 表单都还没建起来的时候先要凭证，等于逼调用方为了看一眼目录去开户。目录本身只有型号身份
+/// 与合同，不含渠道、供给、驱动或任何执行记录，公开它不泄露内部信息。
+/// 取数与判据在仓库层（与受理期选路同一条），这里只做投射。
 async fn list_models(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<ModelCatalogResponse>, ApiError> {
-    // 目录不按账户分片（同一个平台型号对所有账户都一样），但 Key 仍然必须有效。
-    authenticate(&state, &headers).await?;
     let data = state
         .runtime
         .published_models()
