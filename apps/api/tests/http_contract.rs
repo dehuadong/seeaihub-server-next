@@ -4330,16 +4330,53 @@ async fn chosen_provider_kind(pool: &PgPool, offering_id: Uuid) -> String {
     .expect("the chosen offering must have a channel")
 }
 
+/// 把一份 2.5 素材发布到这次用例的两个进程内假上游上：上游地址按渠道替换，其余一字不改。
+///
+/// 返回**换过地址的**素材、发布状态与响应正文——用例后半段还要按同一份声明做断言，所以替换必须
+/// 发生在返回的那一份上。凭证仍只从环境变量读，这里不碰。
+async fn publish_2_5_material(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    mut material: Value,
+    aihubmix_upstream: &str,
+    apimart_upstream: &str,
+) -> (Value, StatusCode, String) {
+    for offering in material["offerings"]
+        .as_array_mut()
+        .expect("offerings must be an array")
+    {
+        offering["base_url"] = Value::String(match offering["provider_kind"].as_str() {
+            Some("AIHubMix") => aihubmix_upstream.to_owned(),
+            Some("APIMart") => apimart_upstream.to_owned(),
+            other => panic!("unexpected provider kind {other:?}"),
+        });
+    }
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(admin_token)
+        .json(&material)
+        .send()
+        .await
+        .expect("publication request");
+    let status = response.status();
+    let body = response.text().await.expect("publication body");
+    (material, status, body)
+}
+
 /// 新形状的 2.5 素材（**一个 Vendor Model 一份文件**）端到端跑一遍：同一个型号只落**一份合同**，
 /// 两条供给各带自己的承载面与参数映射，选路按承载面走。
 ///
-/// 三条请求各钉一件事：
+/// 四条请求各钉一件事：
 /// - 只带 `prompt`：首选的 AIHubMix 承载得了，请求就该落在它身上；
-/// - 带 `background`：AIHubMix 的承载面没声明这个字段（它的字段面按 /v1 端点的机器 Schema 声明，
-///   而渠道文档比机器 Schema 宽）→ 该候选**不合格**（判定记录写明原因）、改道 APIMart，且这个字段
-///   要原样出现在发给 APIMart 的报文里；
-/// - 带参考图：合同字段叫 `image`，APIMart 线上叫 `image_urls`，靠改名落到渠道字段名上
-///   （报文里不许出现 `image`），内联图先经上传接口换成公网 URL。
+/// - 带 `background` / `output_compression` / `moderation`：承载面按**厂商契约**声明，两家都承载
+///   得了这三项（聚合渠道转售上游能力，"渠道没写"不构成"渠道不能"），因此照旧落在首选上，三个
+///   字段逐字上行；
+/// - 带参考图：先把 AIHubMix 这条供给收窄成只允许文生图（**限制差异由测试自己构造**，不拿承载面
+///   字段的有无制造差异），于是它因**分支限制**不合格（判定记录写明原因）、改道 APIMart；合同
+///   字段叫 `image`，APIMart 线上叫 `image_urls`，靠改名落到渠道字段名上（报文里不许出现
+///   `image`），内联图先经上传接口换成公网 URL；
+/// - 带参考图 + 遮罩：同样因分支限制落到 APIMart，`image_urls` 与 `mask_url` 两个渠道名都得上线。
 ///
 /// 两家渠道各起一个进程内假上游：线上形状不同（一家同步回图、一家任务式），所以"报文里到底是
 /// 哪个字段名"只能按真正收到请求的那一方来判。全程零外部调用。
@@ -4370,40 +4407,30 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         include_str!("../../../config/bootstrap/gpt-image-2.5-flare.json"),
         include_str!("../../../config/bootstrap/gpt-image-2.5-sunburst.json"),
     ] {
-        let mut material: Value = serde_json::from_str(material).expect("material parses");
-        let model = material["native_model_id"]
-            .as_str()
-            .expect("native model id")
-            .to_owned();
-        let offerings = material["offerings"]
-            .as_array_mut()
-            .expect("offerings must be an array");
+        let material: Value = serde_json::from_str(material).expect("material parses");
         assert_eq!(
-            offerings.len(),
+            material["offerings"]
+                .as_array()
+                .expect("offerings must be an array")
+                .len(),
             2,
             "一份素材两条供给：AIHubMix 首选、APIMart 次之"
         );
         // 上游地址换成这个用例的两个假上游，各按渠道给：凭证仍只从环境变量读。
-        for offering in offerings.iter_mut() {
-            offering["base_url"] = Value::String(match offering["provider_kind"].as_str() {
-                Some("AIHubMix") => aihubmix_upstream.base_url.clone(),
-                Some("APIMart") => apimart_upstream.base_url.clone(),
-                other => panic!("unexpected provider kind {other:?}"),
-            });
-        }
-        let published = client
-            .post(format!("{base_url}/api/v1/runtime-revisions"))
-            .bearer_auth(&admin_token)
-            .json(&material)
-            .send()
-            .await
-            .expect("publication request");
-        assert_eq!(
-            published.status(),
-            StatusCode::OK,
-            "{model} 素材必须能发布：{:?}",
-            published.text().await
-        );
+        let (material, status, body) = publish_2_5_material(
+            &client,
+            &base_url,
+            &admin_token,
+            material,
+            &aihubmix_upstream.base_url,
+            &apimart_upstream.base_url,
+        )
+        .await;
+        let model = material["native_model_id"]
+            .as_str()
+            .expect("native model id")
+            .to_owned();
+        assert_eq!(status, StatusCode::OK, "{model} 素材必须能发布：{body}");
 
         // 合同是**模型级唯一一份**：这个型号只落一行，两条候选都挂在它下面。
         let contracts: i64 = sqlx::query_scalar(
@@ -4456,17 +4483,31 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             carriers[0], carriers[1],
             "两条供给各带自己的承载面，不是共用一份"
         );
-        // 这个用例的差集就在这里：AIHubMix 的承载面没声明 `background`（它的字段面按 /v1 端点的
-        // 机器 Schema 声明），APIMart 声明了。**承载面没声明不等于渠道收不了**：渠道文档的请求
-        // 参数表把 background 写上了，只是这一版没按文档把它补进承载面。
-        assert!(
-            carriers[0]["properties"].get("background").is_none(),
-            "AIHubMix 的承载面没声明 background"
+        // 承载面按**厂商契约**声明：聚合渠道转售的就是上游模型的能力，因此 AIHubMix 与 APIMart
+        // 一样声明 `background` / `output_compression` / `moderation`，枚举与默认值照厂商契约。
+        // 反过来说，承载面声明了就意味着平台会把字段发出去——渠道不接受是渠道报错，不是平台静默
+        // 把字段吞掉。
+        for name in ["background", "output_compression", "moderation"] {
+            assert!(
+                carriers[0]["properties"].get(name).is_some(),
+                "AIHubMix 的承载面要按厂商契约声明 {name}"
+            );
+            assert!(
+                carriers[1]["properties"].get(name).is_some(),
+                "APIMart 的承载面声明了 {name}"
+            );
+        }
+        assert_eq!(
+            carriers[0]["properties"]["background"]["enum"],
+            json!(["auto", "opaque", "transparent"]),
+            "background 的枚举照厂商契约"
         );
-        assert!(
-            carriers[1]["properties"].get("background").is_some(),
-            "APIMart 声明了 background"
+        assert_eq!(carriers[0]["properties"]["background"]["default"], "auto");
+        assert_eq!(
+            carriers[0]["properties"]["output_compression"]["default"],
+            100
         );
+        assert_eq!(carriers[0]["properties"]["moderation"]["default"], "auto");
         // 参考图两边都声明成数组：AIHubMix 按厂商契约的 edit 面（`file[]`，≤16），APIMart 按
         // 自己的文档（`image_urls`，≤16）——收图上限与这个形态是同一件事，写歪了发布期就拒。
         assert_eq!(
@@ -4515,7 +4556,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         assert_eq!(apimart_mapping["rename"]["mask"], "mask_url");
     }
 
-    // 三条请求共用一个真实 Worker：它只领 Job，不知道这次用例在验什么。
+    // 四条请求共用一个真实 Worker：它只领 Job，不知道这次用例在验什么。
     let _worker = spawn_worker_process(&database_url);
 
     // ── 用例 1：只带 prompt → 首选（AIHubMix）承载得了，就落在它身上 ──
@@ -4553,8 +4594,12 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "没落到 APIMart 就不该有它的生成请求"
     );
 
-    // ── 用例 2：带 background → AIHubMix 承载不了，改道 APIMart，字段原样上行 ──
-    let key = format!("contract-background-{}", Uuid::new_v4());
+    // ── 用例 2：带 background / output_compression / moderation → 两家都承载得了，首选照旧 ──
+    //
+    // 承载面按**厂商契约**声明，这三项不是"APIMart 特有的差异"：AIHubMix 这条供给同样声明了
+    // 它们，所以请求落在首选上，三个字段逐字上行。渠道不接受某个取值时表现为渠道报错——平台
+    // 不静默丢字段、也不替调用方改值。
+    let key = format!("contract-optional-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &base_url,
         &api_key,
@@ -4563,62 +4608,132 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         &json!({
             "model": "gpt-image-2.5-flare",
             "prompt": "白色运动鞋，透明背景",
-            "background": "transparent"
+            "background": "transparent",
+            "output_compression": 80,
+            "moderation": "low"
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "改道之后要真的跑通：{body}");
-    assert_sync_success("带 background 的请求", &body);
+    assert_eq!(status, StatusCode::OK, "首选供给必须跑通：{body}");
+    assert_sync_success("带三个可选参数的请求", &body);
     let (chosen, considered) = routing_of(&pool, &key).await;
-    assert_eq!(considered.len(), 2, "两个候选都要进判定记录");
-    assert_eq!(
-        considered[0]["eligible"], false,
-        "AIHubMix 承载不了请求用到的 background：{considered:?}"
-    );
-    assert!(
-        considered[0]["skip_reason"]
-            .as_str()
-            .is_some_and(|reason| reason.contains("background")),
-        "落选原因必须写明承载不了哪个字段：{considered:?}"
-    );
-    assert_eq!(considered[1]["eligible"], true);
     assert_eq!(
         chosen_provider_kind(&pool, chosen).await,
-        "APIMart",
-        "第一条承载不了就该落到下一条：{considered:?}"
+        "AIHubMix",
+        "两家都承载得了这三项，首选照旧：{considered:?}"
     );
-    let submit = last_submit_body(&apimart_calls, "/v1/images/generations");
+    assert!(
+        considered
+            .iter()
+            .all(|candidate| candidate["eligible"] == true),
+        "两条候选都该合格：{considered:?}"
+    );
+    let submit = last_submit_body(&aihubmix_calls, "/v1/images/generations");
     assert_eq!(
         submit["background"], "transparent",
         "承载得了的字段必须原样上行：{submit}"
     );
+    assert_eq!(submit["output_compression"], 80, "{submit}");
+    assert_eq!(submit["moderation"], "low", "{submit}");
 
-    // ── 用例 3：带参考图 → 合同字段名不上线，渠道字段名上 ──
-    let key = format!("contract-image-{}", Uuid::new_v4());
+    // ── 收窄素材：把 AIHubMix 这条供给的 `allowed_branches` 收成只允许 `prompt_only` ──
+    //
+    // 落选触发用**测试自己构造的真实限制差异**，不用承载面字段的有无：两家现在按厂商契约声明
+    // 同一批字段，靠字段差制造落选会把"渠道转售上游能力"验成相反的样子。收窄 `restrictions`
+    // 是它的正当用法（限制只收窄、不放宽），带图请求因此真的落不到这条供给上。合同一字不改，
+    // 同一个型号仍是**同一行**合同，替换的是 active 候选集。
+    for material in [
+        include_str!("../../../config/bootstrap/gpt-image-2.5-flare.json"),
+        include_str!("../../../config/bootstrap/gpt-image-2.5-sunburst.json"),
+    ] {
+        let mut variant: Value = serde_json::from_str(material).expect("material parses");
+        let model = variant["native_model_id"]
+            .as_str()
+            .expect("native model id")
+            .to_owned();
+        let mut narrowed = false;
+        for offering in variant["offerings"]
+            .as_array_mut()
+            .expect("offerings must be an array")
+        {
+            if offering["provider_kind"] == "AIHubMix" {
+                // 只走文生图：带图与带遮罩的请求都不该落在它身上；既然不承诺收图，上限就是 0。
+                offering["restrictions"] = json!({
+                    "allowed_branches": ["prompt_only"],
+                    "max_images": 0
+                });
+                narrowed = true;
+            }
+        }
+        assert!(narrowed, "{model} 的变体必须收窄 AIHubMix 这条供给");
+        let (_, status, body) = publish_2_5_material(
+            &client,
+            &base_url,
+            &admin_token,
+            variant,
+            &aihubmix_upstream.base_url,
+            &apimart_upstream.base_url,
+        )
+        .await;
+        assert_eq!(
+            status,
+            StatusCode::OK,
+            "{model} 的变体素材必须能发布：{body}"
+        );
+        // 发布即原子替换该模型的 active 候选：现在生效的就是这份收窄过的声明。
+        let restrictions: Value = sqlx::query_scalar(
+            "SELECT o.restrictions FROM publication.runtime_entries re
+             JOIN supply.offerings o ON o.id = re.offering_id
+             JOIN supply.channels c ON c.id = o.channel_id
+             WHERE re.active AND re.gateway_model = $1 AND c.provider_kind = 'AIHubMix'",
+        )
+        .bind(&model)
+        .fetch_one(&pool)
+        .await
+        .expect("the narrowed AIHubMix entry must be active");
+        assert_eq!(
+            restrictions,
+            json!({"allowed_branches": ["prompt_only"], "max_images": 0}),
+            "{model} 的变体发布后，AIHubMix 这条供给只允许文生图"
+        );
+    }
+
+    // ── 用例 3：带参考图 → 收窄过的 AIHubMix 因**分支限制**不合格，改道 APIMart，字段按渠道名上行 ──
+    let uploads_before = count_calls(&apimart_calls, "POST", "/v1/uploads/images");
+    let key = format!("contract-branch-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &base_url,
         &api_key,
         "/v1/images/generations",
         &key,
         &json!({
-            "model": "gpt-image-2.5-sunburst",
+            "model": "gpt-image-2.5-flare",
             "prompt": "保留商品主体，把背景换成米白色摄影棚",
-            // `background` 在这里只是把请求逼到 APIMart：AIHubMix 的承载面没声明它。
-            "background": "opaque",
             "image": [png_data_url()]
         }),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "带图请求要真的跑通：{body}");
+    assert_eq!(status, StatusCode::OK, "改道之后要真的跑通：{body}");
     assert_sync_success("带参考图的请求", &body);
-    let (chosen, _) = routing_of(&pool, &key).await;
-    assert_eq!(chosen_provider_kind(&pool, chosen).await, "APIMart");
-    // 内联图先换成渠道要的公网 URL，再按**渠道字段名**装进生成请求。
+    let (chosen, considered) = routing_of(&pool, &key).await;
+    assert_eq!(considered.len(), 2, "两个候选都要进判定记录");
     assert_eq!(
-        count_calls(&apimart_calls, "POST", "/v1/uploads/images"),
-        1,
-        "内联参考图必须先上传换成公网 URL"
+        considered[0]["eligible"], false,
+        "AIHubMix 这条供给收窄成只允许文生图，带图请求不该合格：{considered:?}"
     );
+    assert!(
+        considered[0]["skip_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("image_conditioned")),
+        "落选原因必须写明是哪条限制拦下的：{considered:?}"
+    );
+    assert_eq!(considered[1]["eligible"], true);
+    assert_eq!(
+        chosen_provider_kind(&pool, chosen).await,
+        "APIMart",
+        "第一条不合格就该落到下一条：{considered:?}"
+    );
+    // 内联图先换成渠道要的公网 URL，再按**渠道字段名**装进生成请求。
     let submit = last_submit_body(&apimart_calls, "/v1/images/generations");
     assert!(
         submit.get("image").is_none(),
@@ -4633,6 +4748,60 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             .as_str()
             .is_some_and(|url| url.starts_with("http://127.0.0.1:")),
         "上传换回来的公网 URL 才该上行：{submit}"
+    );
+    assert_eq!(
+        count_calls(&apimart_calls, "POST", "/v1/uploads/images") - uploads_before,
+        1,
+        "内联参考图必须先上传换成公网 URL"
+    );
+
+    // ── 用例 4：带参考图 + 遮罩 → 遮罩分支同样被收窄掉，两个渠道字段名都上线 ──
+    let key = format!("contract-masked-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &json!({
+            "model": "gpt-image-2.5-sunburst",
+            "prompt": "只改遮罩圈出的背景",
+            "image": [png_data_url()],
+            "mask": png_data_url()
+        }),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "带遮罩的请求要真的跑通：{body}");
+    assert_sync_success("带参考图与遮罩的请求", &body);
+    let (chosen, considered) = routing_of(&pool, &key).await;
+    assert_eq!(
+        chosen_provider_kind(&pool, chosen).await,
+        "APIMart",
+        "遮罩分支同样被收窄掉：{considered:?}"
+    );
+    assert!(
+        considered[0]["skip_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("masked")),
+        "落选原因必须写明是哪条限制拦下的：{considered:?}"
+    );
+    let submit = last_submit_body(&apimart_calls, "/v1/images/generations");
+    assert!(
+        submit.get("image").is_none() && submit.get("mask").is_none(),
+        "合同字段名 `image` / `mask` 都不许出现在 APIMart 的报文里：{submit}"
+    );
+    assert_eq!(
+        submit["image_urls"].as_array().map(Vec::len),
+        Some(1),
+        "{submit}"
+    );
+    assert!(
+        submit["mask_url"].as_str().is_some(),
+        "遮罩要按渠道字段名 `mask_url` 上线：{submit}"
+    );
+    assert_eq!(
+        count_calls(&apimart_calls, "POST", "/v1/uploads/images") - uploads_before,
+        3,
+        "用例 3 的参考图与用例 4 的参考图、遮罩各上传一次"
     );
 
     pool.close().await;

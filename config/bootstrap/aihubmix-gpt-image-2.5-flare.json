@@ -1,7 +1,7 @@
 {
-  "_comment": "AIHubMix 供给 gpt-image-2.5-flare 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。参数面按该模型 /v1 族端点的 request.schema 声明，费率取自上游公开口径与实测。",
+  "_comment": "AIHubMix 供给 gpt-image-2.5-flare 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。参数面按**厂商契约**声明（聚合渠道转售上游能力，渠道机器 Schema 写没写不构成渠道不能），费率取自上游公开口径与实测。",
   "_status": "草案 · 未发布。需「执行实现」授权后方可用于生产。",
-  "_evidence": "2.5 两款在 AIHubMix 的同步执行路径上实测与 gpt-image-2 同构（四分项 usage）；参数面取自 out-reference/aihubmix/schema-gpt-image-2.5-flare.endpoints.json 的 /v1/images/generations 与 /v1/images/edits。",
+  "_evidence": "2.5 两款在 AIHubMix 的同步执行路径上实测与 gpt-image-2 同构（四分项 usage）；参数面按**厂商契约**声明，渠道 /v1 端点的 request.schema 只作字段名与传输形态的参考（out-reference/aihubmix/schema-gpt-image-2.5-flare.endpoints.json 的 /v1/images/generations 与 /v1/images/edits）。",
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-flare",
   "native_revision": "2026-09-19-validated-1.0",
@@ -30,7 +30,10 @@
           "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
           "size": { "type": "string", "anyOf": [{ "const": "auto" }, { "pattern": "^[0-9]+x[0-9]+$" }] },
           "output_format": { "type": "string", "enum": ["png", "jpeg", "webp"], "default": "png" },
-          "quality": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" }
+          "quality": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" },
+          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
+          "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
+          "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" }
         },
         "allOf": [
           { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }

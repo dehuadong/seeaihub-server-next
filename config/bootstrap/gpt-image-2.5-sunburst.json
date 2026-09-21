@@ -14,7 +14,7 @@
     "contract.moderation": "厂商一手：generate 页（low/auto，默认 auto）。",
     "contract.image_mask": "厂商一手：edit 页——参考图是 `file` 或 `file[]`（最多 16 张）、`mask` 可选；该页当前的字段形状是 `images[]` 与 `mask` 对象（URL 或 file_id），对客契约沿用平台自己的字段名 `image`/`mask`（受理侧按这三个名字取图，再由承载面把图落到渠道字段名上）。**契约按厂商契约把 `image` 声明成字符串数组（≤16）、`mask` 声明成字符串，都不写 `format: binary`**：那是 multipart 的传输痕迹，不是参数语义——值是公网 URL 还是 data URL、到渠道那一步要不要变成文件部件，都属传输侧的事，由 Driver 按渠道要的形态处理。",
     "contract.mask_requires_image": "平台判断：遮罩只划定编辑范围，脱离参考图没有意义——与平台按名字角色装载图片的既有约定一致，因此写成声明而不是留给上游报错。",
-    "offering.aihubmix.carrier_schema": "渠道面：该模型 /v1 端点的 request.schema（out-reference/aihubmix/schema-gpt-image-2.5-sunburst.endpoints.json 的 /v1/images/generations 与 /v1/images/edits）——字段名、枚举与取值范围照抄；参考图按**厂商契约**的 edit 面声明成 `file[]`（≤16），不照抄 `format: binary`（理由见 contract.image_mask）。**没有 background/output_compression/moderation**：那几项不在 /v1 端点的机器 Schema 快照里。用户 2026-09-20 更正指出，渠道自己的请求参数表（out-reference/aihubmix/gpt-image-2.md）把 background/output_compression/moderation/user/input_fidelity 都写了——**属文档比机器 Schema 宽**；本版仍按机器 Schema 声明这条供给的承载面，是否按文档补进来留待后续决定。",
+    "offering.aihubmix.carrier_schema": "厂商契约：这条供给承载的字段面按**厂商契约**声明，不拿渠道自己的机器 Schema 或参数表来判宽窄——聚合渠道转售的就是上游模型的能力，「渠道没写」不构成「渠道不能」。因此 `background`（auto/opaque/transparent，默认 auto）、`output_compression`（0–100，默认 100）、`moderation`（auto/low，默认 auto）与 APIMart 对等声明，枚举与默认值照厂商契约；参考图按厂商契约的 edit 面声明成数组（≤16），不照抄 `format: binary`（理由见 contract.image_mask）。渠道若不接受某个已声明的取值，就表现为渠道报错：平台不静默降级，也不替渠道把字段吞掉。",
     "offering.aihubmix.image_inputs": "厂商契约 + 实测：edit 端点的 `image` 支持 `file[]`（最多 16 张）——对客契约里的 `image` 是同一个角色，承载面因此按字符串数组声明（≤16）。**多张参考图已实测成立**：旧仓库（seeaihub）的探针脚本 tests/image-generation/aihubmix_gpt_image_2_edit_probe.py 用 `POST /v1/images/edits` 发两张参考图成功（依据是多图融合示例）；**线上字段名是重复的 `image[]`，重复单值 `image` 会 400**——渠道机器 Schema 里那个单值 `image: string` 只是 schema 的简化（JSON Schema 表达不了 multipart 的重复字段），不是上限。**编码由 Driver 按张数承担**（一张发 `image`、多张发 `image[]`），不写进合同与承载面。16 是厂商契约的上限，未逐一压测，不为此花钱。`restrictions.max_images` 必须与承载面形态一致（数组 `maxItems` 16），否则发布期会以「限制超出承载面承诺」拒掉。",
     "offering.aihubmix.size": "渠道面：端点 schema 的 `size` 就是 `auto` 或 `宽x高`（像素型），与合同同型——因此不需要换算，也不声明尺寸档案，`parameter_mapping` 为空。",
     "offering.apimart.carrier_schema": "渠道面：APIMart 的 2.5 生成文档快照（out-reference/apimart/gpt-image-2.5-generation.cn.md）——字段与取值范围按该文档声明，文档里没出现的字段一律不声明。",
@@ -101,7 +101,10 @@
             "type": "string",
             "enum": ["low", "medium", "high", "xhigh", "max", "auto"],
             "default": "auto"
-          }
+          },
+          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
+          "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
+          "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" }
         },
         "allOf": [
           { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
