@@ -6,12 +6,16 @@ use thiserror::Error;
 use uuid::Uuid;
 
 mod image_parameters;
+mod parameter_mapping;
 pub use image_parameters::{
     ImageInputs, ImageParameterKind, contract_image_parameter_kind, declared_parameter_names,
     declared_reference_image_limit, declares_mask_parameter, declares_reference_image_parameter,
     image_inputs, image_parameter_kind, image_parameter_values, is_mask_parameter,
     is_reference_image_parameter, mask_value, place_image_inputs, platform_image_parameter,
     platform_image_parameters, take_contract_image_inputs,
+};
+pub use parameter_mapping::{
+    apply_parameter_defaults, declared_field_names, declares_parameter, is_used_parameter_value,
 };
 
 macro_rules! id_type {

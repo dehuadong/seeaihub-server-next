@@ -6,10 +6,12 @@ use seeai_adapter_sdk::{
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, JobId, JobState,
-    MeteringEvidence, OfferingCandidate, OfferingId, PriceRates, PublishedOffering,
-    PublishedRevision, RuntimeRevisionId, declared_parameter_names, declared_reference_image_limit,
-    declares_mask_parameter, declares_reference_image_parameter, place_image_inputs,
+    AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, ImageParameterKind,
+    JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, PriceRates,
+    PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_parameter_defaults,
+    contract_image_parameter_kind, declared_field_names, declared_parameter_names,
+    declared_reference_image_limit, declares_mask_parameter, declares_parameter,
+    declares_reference_image_parameter, is_used_parameter_value, place_image_inputs,
     platform_image_parameters,
 };
 use serde::{Deserialize, Serialize};
@@ -446,13 +448,16 @@ fn empty_object() -> Value {
 
 /// 按 `routing_priority` 升序取**第一个合格候选**。
 ///
-/// 合格 = 该候选自己的 `restrictions` 允许本次分支与图片张数，**且**请求能满足该候选
-/// **自己的** `carrier_schema`（必填项在场、图片能落到它声明的参数名上）。
-/// 两个条件都必须用该候选自己的声明判断——这正是「每条供给各自声明承载面、
-/// 限制只收窄」的落地方式。
+/// 合格 = 该候选自己的 `restrictions` 允许本次分支与图片张数，**且**这条供给的承载面能承载
+/// 这次请求**实际用到**的每个字段（图片要能落到它声明的参数名上）。两个条件都必须用该候选
+/// 自己的声明判断——这正是「每条供给各自声明承载面、限制只收窄」的落地方式。
 ///
-/// **无合格候选时返回 `Validation` 错误**，即"在调用上游之前失败"，不回退到能力更宽但
-/// 优先级更低的候选。
+/// 请求本身先按**合同**校验一次（缺必填、合同外的字段）：那是调用方的参数问题，与选路无关，
+/// 因此在这里直接失败，不进候选取舍。
+///
+/// **一条候选都不合格时返回 [`ApplicationError::NoEligibleOffering`]**：请求本身没违反合同，
+/// 是平台的供给面承载不了它——对客必须表现为平台侧故障，不是参数错。同样在调用上游之前失败，
+/// 不回退到能力更宽但优先级更低的候选（候选已经全试过了）。
 ///
 /// 不做的事：不因价格重排候选（价格不参与选中）。
 fn select_candidate(
@@ -468,6 +473,8 @@ fn select_candidate(
         )));
     }
     let revision_id = candidates[0].runtime_revision_id;
+    // 合同是模型级唯一一份，同一型号的候选共享它：请求按合同校验只做一次，与选路无关。
+    let contract_parameters = contract_parameter_face(request, &candidates[0].capability_schema)?;
     // 把每个候选连它的取舍结果一起算出来。`considered` 要记录**完整**的取舍画面，
     // 而不是"评估到命中为止"的部分清单——它是判定记录，不是求值轨迹。
     let evaluated: Vec<(PublishedOffering, Value, ConsideredCandidate)> = candidates
@@ -476,8 +483,8 @@ fn select_candidate(
             let published = candidate.clone().into_published();
             let mut skip_reason = None;
             let mut parameters = Value::Null;
-            match prepare_native_parameters(request, &published) {
-                Err(error) => skip_reason = Some(error.to_string()),
+            match prepare_carrier_parameters(&contract_parameters, request, &published) {
+                Err(reason) => skip_reason = Some(reason),
                 Ok(prepared) => {
                     if let Err(error) = validate_restrictions(
                         branch,
@@ -530,8 +537,8 @@ fn select_candidate(
         })
         .collect::<Vec<_>>()
         .join("; ");
-    Err(ApplicationError::Validation(format!(
-        "no eligible offering for model {} (revision {revision_id}): {reasons}",
+    Err(ApplicationError::NoEligibleOffering(format!(
+        "no offering can carry this request for model {} (revision {revision_id}): {reasons}",
         request.model
     )))
 }
@@ -760,6 +767,12 @@ pub struct ProviderFailureQuery {
 pub enum ApplicationError {
     #[error("validation failed: {0}")]
     Validation(String),
+    /// 该型号有 active 供给，但**没有一条能承载这次请求**。
+    ///
+    /// 与 [`Self::Validation`] 分开：请求本身违反合同（缺必填）是调用方的问题；一条候选都
+    /// 表达不了这次请求，是平台的供给面不够宽——对客必须说成平台侧故障，不是参数错。
+    #[error("no eligible offering: {0}")]
+    NoEligibleOffering(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
@@ -1346,9 +1359,8 @@ fn validate_carrier_within_contract(
     carrier: &Value,
 ) -> Result<(), ApplicationError> {
     carrier_properties(carrier)?;
-    let contract_fields = declared_field_names(contract);
     for field in declared_field_names(carrier) {
-        if !contract_fields.contains(&field) {
+        if !declares_parameter(contract, field) {
             return Err(ApplicationError::Validation(format!(
                 "carrier schema declares {field}, which the vendor model contract does not"
             )));
@@ -1357,29 +1369,9 @@ fn validate_carrier_within_contract(
     Ok(())
 }
 
-/// 一份 schema 声明的**顶层字段名**：`properties` 的键，加上 `required` 里列出的名字。
-///
-/// 两处都算：`required` 里的名字同样是"这份 schema 声明的字段"，漏掉它会让校验看起来通过了、
-/// 实际却放行了一个没声明的名字。
-fn declared_field_names(schema: &Value) -> Vec<&str> {
-    let mut names: Vec<&str> = schema
-        .get("properties")
-        .and_then(Value::as_object)
-        .map(|map| map.keys().map(String::as_str).collect())
-        .unwrap_or_default();
-    if let Some(required) = schema.get("required").and_then(Value::as_array) {
-        for name in required.iter().filter_map(Value::as_str) {
-            if !names.contains(&name) {
-                names.push(name);
-            }
-        }
-    }
-    names
-}
-
 /// 承载面的 `properties`：承载面必须是一份**声明了字段**的对象 schema。
 ///
-/// 缺了它，R1/R2 都会"没有字段可查"而静默通过——那种通过毫无意义，因此在这里明确失败。
+/// 缺了它，两条边界校验都会"没有字段可查"而静默通过——那种通过毫无意义，因此在这里明确失败。
 fn carrier_properties(
     carrier: &Value,
 ) -> Result<&serde_json::Map<String, Value>, ApplicationError> {
@@ -1832,56 +1824,131 @@ fn validate_restrictions(
     Ok(())
 }
 
-/// 受理前的准备：**先按候选的承载面过滤参数，再**把参考图与遮罩落到该候选**自己声明的参数名**上，
-/// 最后检查必填项在场。
+/// 受理的第一步：请求按**合同**校验，产出"这次请求在合同面里的参数"。
 ///
-/// 过滤落在"选中候选之后、写 Job 之前"：调用方发了但该候选承载不了的参数名在这里直接丢掉，
-/// 既不报错，也不会跟着 Job 与请求走去上游。选路之前不能过滤——那时还不知道是哪一份承载面。
+/// 合同是模型级唯一一份，同一型号的候选共享它，所以这件事只做一次、与选路无关。它回答两件事：
 ///
-/// 判据是**承载面**而不是合同：合同说客户端能提交什么，承载面说这条供给能把它带到线上。
-/// 请求里的取值本身仍**不**校验（枚举、区间、类型都不管）：承载面声明过的参数取值原样交给上游，
-/// 平台不替它改写。哪些参数需要把取值管起来，等有一份明确的清单后再加，加在这里。
+/// - **字段归属**：合同里没有的字段在这里丢掉，**不报错**——调用方多发一个平台不认的字段不该
+///   让整次请求失败；而"这个字段在命中的候选上存不存在"本身随选路变化，逐次报错会把选路结果
+///   变成调用方的负担。
+/// - **必填在场**：合同说必填的字段必须给出。`model` 由平台自己落，参考图与遮罩已按契约字段名
+///   从参数面里取出（图片不走普通参数），所以这两处单独算在场。
 ///
-/// `model` 与图片在校验前注入，所以它们照样参与"必填项在场"的判断。图片参数名来自同一份承载面，
-/// 过滤留得下它们——装载的图不会被丢掉。
-fn prepare_native_parameters(
+/// 判据是**合同**而不是承载面：合同说客户端能提交什么，承载面说这条供给能把它带到线上——
+/// 后者由 [`prepare_carrier_parameters`] 逐候选判。请求里的取值本身仍**不**校验
+/// （枚举、区间、类型都不管）：合同声明过的参数取值原样交给上游，平台不替它改写。
+///
+/// "在场"与 [`is_used_parameter_value`] 的"用到"是**两个判据**：前者回答"调用方说了这个字段吗"
+/// （缺位或 `null` 算没说），后者回答"这次请求真的依赖它吗"（空串、空数组也算没给）。
+/// 必填按前者判——合同要的是这个字段出现，取值合不合适不是这里的事。
+fn contract_parameter_face(
     request: &CreateImageGenerationRequest,
-    offering: &PublishedOffering,
-) -> Result<Value, ApplicationError> {
+    contract: &Value,
+) -> Result<Map<String, Value>, ApplicationError> {
     let supplied = request.native_parameters.as_object().ok_or_else(|| {
         ApplicationError::Validation("native_parameters must be an object".to_owned())
     })?;
-    let mut object = declared_parameter_names(&offering.carrier_schema, supplied);
-    // `model` 是对外的平台型号名，由平台自己落；它本来就在候选的承载面里（`model.const`）。
-    object.insert("model".to_owned(), Value::String(request.model.clone()));
-    place_image_inputs(
-        &offering.carrier_schema,
-        &mut object,
-        &request.reference_images,
-        request.mask.as_deref(),
-    )
-    .map_err(ApplicationError::Validation)?;
-    let instance = Value::Object(object);
-    let required = offering
-        .carrier_schema
+    let mut parameters = declared_parameter_names(contract, supplied);
+    // `model` 是对外的平台型号名，由平台自己落；它本来就在合同里（`model.const`）。
+    parameters.insert("model".to_owned(), Value::String(request.model.clone()));
+    let required = contract
         .get("required")
         .and_then(Value::as_array)
         .cloned()
         .unwrap_or_default();
     let mut missing = Vec::new();
     for name in required.iter().filter_map(Value::as_str) {
-        if instance.get(name).is_none_or(Value::is_null) {
-            missing.push(name.to_owned());
+        if parameters.get(name).is_some_and(|value| !value.is_null())
+            || contract_image_input_present(request, name)
+        {
+            continue;
         }
+        missing.push(name.to_owned());
     }
     if missing.is_empty() {
-        Ok(instance)
+        Ok(parameters)
     } else {
         Err(ApplicationError::Validation(format!(
             "missing required parameter(s): {}",
             missing.join(", ")
         )))
     }
+}
+
+/// 合同字段名下的图片输入是否"在场"。
+///
+/// 参考图与遮罩在受理侧就按契约字段名从参数面里取了出来（它们有自己的去处：选路后落到候选声明的
+/// 参数名上），因此 `parameters` 里没有它们。但调用方**确实给了**——合同把它们声明成必填时，
+/// 不能因为"平台自己把图挪走了"就判成缺参数。
+fn contract_image_input_present(request: &CreateImageGenerationRequest, name: &str) -> bool {
+    match contract_image_parameter_kind(name) {
+        Some(ImageParameterKind::Reference) => !request.reference_images.is_empty(),
+        Some(ImageParameterKind::Mask) => request.mask.is_some(),
+        None => false,
+    }
+}
+
+/// 受理的第二步：这条供给承载得了这次请求吗？承载得了就把参数面组装出来。
+///
+/// **承载校验**：请求里**实际用到**的每个字段（非空值）都必须在这条候选的承载面里；缺一个就是
+/// 这条候选不合格，返回原因写进路由判定记录。这正是"声明了承载面"的意义——供给说了自己能把哪些
+/// 字段带到线上，平台不替它加码。
+///
+/// 合格之后才组装要落进 Job、并发给上游的参数面：
+/// 1. 按承载面留下名字：调用方给了空值、承载面又没声明这个字段时，在这里去掉（空值不携带信息，
+///    而发一个承载面没声明的名字给上游，只会得到上游自己的一套解释）；
+/// 2. 把参考图与遮罩落到这条候选**自己声明的**参数名上（声明不了就是不合格，绝不静默丢图）；
+/// 3. 注入映射声明的**显式默认值**：调用方没给的字段由平台定，而不是由渠道自己的默认值定；
+/// 4. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
+///    平台不替它省。放在最后是因为前两步都可能把必填项补上（图落在承载面的名字上、默认值注入），
+///    先判会把"其实跑得通"的候选误判成不合格。
+///
+/// 返回的是"这条候选不合格"的原因，不是请求级错误：换一条承载面更宽的候选仍然可能跑通，
+/// 所以它写进路由判定记录，而不是直接回给调用方。
+fn prepare_carrier_parameters(
+    contract_parameters: &Map<String, Value>,
+    request: &CreateImageGenerationRequest,
+    offering: &PublishedOffering,
+) -> Result<Value, String> {
+    for (name, value) in contract_parameters {
+        if !is_used_parameter_value(value) {
+            continue;
+        }
+        if !declares_parameter(&offering.carrier_schema, name) {
+            return Err(format!(
+                "this offering cannot carry parameter {name}, which the request uses"
+            ));
+        }
+    }
+    let mut parameters = declared_parameter_names(&offering.carrier_schema, contract_parameters);
+    place_image_inputs(
+        &offering.carrier_schema,
+        &mut parameters,
+        &request.reference_images,
+        request.mask.as_deref(),
+    )?;
+    apply_parameter_defaults(
+        &offering.capability_schema,
+        &offering.carrier_schema,
+        &offering.parameter_mapping,
+        &mut parameters,
+    );
+    let missing: Vec<&str> = offering
+        .carrier_schema
+        .get("required")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(Value::as_str)
+        .filter(|name| parameters.get(*name).is_none_or(Value::is_null))
+        .collect();
+    if !missing.is_empty() {
+        return Err(format!(
+            "this offering requires parameter(s) {}, which the request does not provide",
+            missing.join(", ")
+        ));
+    }
+    Ok(Value::Object(parameters))
 }
 
 fn request_hash<T: Serialize>(value: &T) -> Result<String, ApplicationError> {
@@ -2024,6 +2091,29 @@ mod tests {
                 "mask": {"type": "string"}
             }
         })
+    }
+
+    /// 把一个已发布供给变成"发布物里的候选"：字段完全一致，只多 `routing_priority`。
+    fn candidate_of(offering: &PublishedOffering, routing_priority: i32) -> OfferingCandidate {
+        OfferingCandidate {
+            runtime_revision_id: offering.runtime_revision_id,
+            vendor_model_id: offering.vendor_model_id,
+            offering_id: offering.offering_id,
+            channel_id: offering.channel_id,
+            gateway_model: offering.gateway_model.clone(),
+            native_revision: offering.native_revision.clone(),
+            capability_schema: offering.capability_schema.clone(),
+            carrier_schema: offering.carrier_schema.clone(),
+            parameter_mapping: offering.parameter_mapping.clone(),
+            restrictions: offering.restrictions.clone(),
+            adapter_key: offering.adapter_key.clone(),
+            provider_model_id: offering.provider_model_id.clone(),
+            provider_kind: offering.provider_kind.clone(),
+            base_url: offering.base_url.clone(),
+            credential_env: offering.credential_env.clone(),
+            price_snapshot: offering.price_snapshot.clone(),
+            routing_priority,
+        }
     }
 
     fn schema(model: &str) -> Value {
@@ -2582,29 +2672,46 @@ mod tests {
         }
     }
 
-    #[test]
-    fn validates_prompt_only_native_request() {
-        let request = image_request(serde_json::json!({"prompt": "hello"}));
-        assert!(prepare_native_parameters(&request, &offering()).is_ok());
+    /// 请求按合同校验之后留下的参数面（合同外的字段已丢弃）。测试里用它把"按合同校验"与
+    /// "逐候选承载校验"分开看。
+    fn contract_face(
+        request: &CreateImageGenerationRequest,
+        offering: &PublishedOffering,
+    ) -> Map<String, Value> {
+        contract_parameter_face(request, &offering.capability_schema)
+            .expect("the fixture request satisfies the contract")
     }
 
     #[test]
-    fn parameters_the_candidate_never_declared_are_dropped_without_an_error() {
-        // 声明过的参数取值不校验：类型不对也照原样留下。
-        // 没声明的参数名（渠道一手参数、`seed`、`foo`）在受理期就丢掉——不报错，
-        // 也不会跟着 Job 走去上游。
+    fn validates_prompt_only_native_request() {
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let vendor = offering();
+        let face = contract_face(&request, &vendor);
+        assert_eq!(
+            face.keys().collect::<Vec<_>>(),
+            vec!["model", "prompt"],
+            "`model` 由平台自己落，其余按合同留下"
+        );
+        assert!(prepare_carrier_parameters(&face, &request, &vendor).is_ok());
+    }
+
+    /// 合同里没有的字段在受理期丢掉——不报错，也不会跟着 Job 走去上游。
+    ///
+    /// 判据是**合同**：调用方多发一个平台不认的字段（渠道一手参数、`seed`、纯属多余的 `foo`）
+    /// 不该让整次请求失败；而"这个字段在命中的候选上存不存在"本身随选路变化，逐次报错会把
+    /// 选路结果变成调用方的负担。
+    #[test]
+    fn parameters_the_contract_never_declared_are_dropped_without_an_error() {
         let mut vendor = offering();
-        vendor.carrier_schema = serde_json::json!({
-            "type": "object",
-            "additionalProperties": false,
-            "required": ["model", "prompt"],
-            "properties": {
-                "model": {"const": "gpt-image-2"},
-                "prompt": {"type": "string", "minLength": 1},
-                "n": {"type": "integer"},
-                "quality": {"enum": ["low", "high"]}
-            }
-        });
+        // 合同与承载面这次同值：这条用例验的是"合同外的字段"，与承载面无关。
+        let declared = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string", "minLength": 1},
+            "n": {"type": "integer"},
+            "quality": {"enum": ["low", "high"]}
+        }));
+        vendor.capability_schema = declared.clone();
+        vendor.carrier_schema = declared;
         let request = image_request(serde_json::json!({
             "prompt": "hello",
             "n": "not-a-number",
@@ -2614,16 +2721,59 @@ mod tests {
             "foo": "bar",
             "image_with_roles": [{"role": "reference", "url": "https://example.invalid/a.png"}]
         }));
-        let prepared = prepare_native_parameters(&request, &vendor)
-            .expect("undeclared parameters are dropped, not rejected");
-        let object = prepared.as_object().expect("an object");
+        let face = contract_face(&request, &vendor);
         assert_eq!(
-            object.keys().collect::<Vec<_>>(),
+            face.keys().collect::<Vec<_>>(),
             vec!["model", "n", "prompt", "quality"],
-            "只有声明过的名字留到 Job 里：{prepared}"
+            "只有合同声明过的名字留到 Job 里：{face:?}"
         );
-        assert_eq!(object.get("n"), Some(&serde_json::json!("not-a-number")));
-        assert_eq!(object.get("quality"), Some(&serde_json::json!("high")));
+        // 合同声明过的参数取值不校验：类型不对也照原样留下。
+        assert_eq!(face.get("n"), Some(&serde_json::json!("not-a-number")));
+        assert_eq!(face.get("quality"), Some(&serde_json::json!("high")));
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect("the carrier declares every field the request uses");
+        assert_eq!(prepared, Value::Object(face));
+    }
+
+    /// 请求**用到的**字段必须在这条候选的承载面里；缺了就是这条候选不合格。
+    ///
+    /// 注意它与"请求违反合同"是两件事：请求本身没问题（`quality` 在合同里），只是这条供给
+    /// 承载不了它——所以这条候选落选、换下一条，而不是把整次请求判成参数错。
+    #[test]
+    fn a_used_field_the_carrier_cannot_carry_makes_the_candidate_ineligible() {
+        let mut vendor = offering();
+        vendor.capability_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "quality": {"enum": ["low", "high"]}
+        }));
+        // 承载面收窄：这条供给承载不了 `quality`。
+        vendor.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"}
+        }));
+        let request = image_request(serde_json::json!({"prompt": "hello", "quality": "high"}));
+        let face = contract_face(&request, &vendor);
+        let reason = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect_err("the carrier cannot carry quality");
+        assert!(reason.contains("quality"), "{reason}");
+
+        // 调用方没用这个字段（空值＝没给）：这条候选照样合格，空位也不会被发上去。
+        for empty in [
+            serde_json::json!(null),
+            serde_json::json!(""),
+            serde_json::json!([]),
+        ] {
+            let request =
+                image_request(serde_json::json!({"prompt": "hello", "quality": empty.clone()}));
+            let face = contract_face(&request, &vendor);
+            let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+                .unwrap_or_else(|error| panic!("`{empty}` 是没给，候选该合格：{error}"));
+            assert!(
+                prepared.get("quality").is_none(),
+                "承载面没声明的空位不该发上去：{prepared}"
+            );
+        }
     }
 
     #[test]
@@ -2648,7 +2798,9 @@ mod tests {
         }));
         request.reference_images = vec!["data:image/png;base64,AAAA".to_owned()];
         request.mask = Some("data:image/png;base64,BBBB".to_owned());
-        let prepared = prepare_native_parameters(&request, &vendor).expect("images are placed");
+        let face = contract_face(&request, &vendor);
+        let prepared =
+            prepare_carrier_parameters(&face, &request, &vendor).expect("images are placed");
         assert_eq!(
             prepared.get("image_urls"),
             Some(&serde_json::json!(["data:image/png;base64,AAAA"]))
@@ -2668,19 +2820,45 @@ mod tests {
         );
     }
 
+    /// 合同说必填的字段必须给出；缺了就是调用方的参数错（400），与选路无关。
     #[test]
     fn missing_required_parameters_are_rejected() {
         let request = image_request(serde_json::json!({}));
-        let error = prepare_native_parameters(&request, &offering())
+        let error = contract_parameter_face(&request, &offering().capability_schema)
             .expect_err("a missing required parameter must fail");
         assert!(error.to_string().contains("prompt"), "{error}");
+
+        // 参考图与遮罩已被受理侧按契约字段名取出，但合同把它们声明成必填时不能算缺：
+        // 调用方**确实给了**这张图。
+        let with_image_required = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt", "image"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string"},
+                "image": {"type": "string"}
+            }
+        });
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        assert!(
+            contract_parameter_face(&request, &with_image_required)
+                .expect_err("no image was given")
+                .to_string()
+                .contains("image")
+        );
+        request.reference_images = vec!["https://example.invalid/a.png".to_owned()];
+        assert!(contract_parameter_face(&request, &with_image_required).is_ok());
     }
 
     #[test]
     fn places_reference_images_on_the_candidates_own_parameter() {
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
         request.reference_images = vec!["https://example.invalid/a.png".to_owned()];
-        let prepared = prepare_native_parameters(&request, &offering()).expect("images are placed");
+        let vendor = offering();
+        let face = contract_face(&request, &vendor);
+        let prepared =
+            prepare_carrier_parameters(&face, &request, &vendor).expect("images are placed");
         assert_eq!(
             prepared.get("image"),
             Some(&Value::String("https://example.invalid/a.png".to_owned()))
@@ -2705,7 +2883,11 @@ mod tests {
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
         request.reference_images = vec!["data:image/png;base64,AAAA".to_owned()];
         request.mask = Some("data:image/png;base64,BBBB".to_owned());
-        let prepared = prepare_native_parameters(&request, &vendor).expect("images are placed");
+        // 合同（`offering()` 的那一份）把参考图与遮罩声明成 `image` / `mask`，
+        // 而这条承载面把同一件事声明成 `image_urls` / `mask_url`：图片按**承载面**的名字落。
+        let face = contract_face(&request, &vendor);
+        let prepared =
+            prepare_carrier_parameters(&face, &request, &vendor).expect("images are placed");
         assert_eq!(
             prepared.get("image_urls"),
             Some(&serde_json::json!(["data:image/png;base64,AAAA"]))
@@ -2715,8 +2897,9 @@ mod tests {
             Some(&Value::String("data:image/png;base64,BBBB".to_owned()))
         );
 
-        // 候选的参数面里没有装参考图的参数：这个候选表达不了，直接不合格。
+        // 承载面里没有装参考图的参数：这条供给表达不了，直接不合格（不静默丢图）。
         let mut text_only = offering();
+        text_only.capability_schema = vendor.capability_schema.clone();
         text_only.carrier_schema = serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -2726,7 +2909,182 @@ mod tests {
                 "prompt": {"type": "string", "minLength": 1}
             }
         });
-        assert!(prepare_native_parameters(&request, &text_only).is_err());
+        let face = contract_face(&request, &text_only);
+        assert!(prepare_carrier_parameters(&face, &request, &text_only).is_err());
+    }
+
+    /// 显式默认值：调用方没给、映射声明了、且合同与承载面都声明了这个字段 → 注入。
+    ///
+    /// 注入发生在组装参数面的最后一步，所以它会跟着 Job 落库、并出现在发给上游的报文里——
+    /// 渠道自己那套默认值（例如上游把水印默认打开）因此再也用不上。
+    #[test]
+    fn explicit_defaults_fill_the_fields_the_caller_left_out() {
+        let mut vendor = offering();
+        vendor.capability_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "watermark": {"type": "boolean"}
+        }));
+        vendor.carrier_schema = vendor.capability_schema.clone();
+        vendor.parameter_mapping = serde_json::json!({"defaults": {"watermark": false}});
+
+        // 调用方没给：注入默认值。
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let face = contract_face(&request, &vendor);
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor).expect("carried");
+        assert_eq!(
+            prepared.get("watermark"),
+            Some(&serde_json::json!(false)),
+            "调用方没给的字段该由平台定，而不是由渠道的默认值定：{prepared}"
+        );
+
+        // 调用方给了：用调用方的值，一个字都不改。
+        let request = image_request(serde_json::json!({"prompt": "hello", "watermark": true}));
+        let face = contract_face(&request, &vendor);
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor).expect("carried");
+        assert_eq!(prepared.get("watermark"), Some(&serde_json::json!(true)));
+
+        // 承载面承载不了这个字段：不注入（发出去只会得到上游自己的一套解释）。
+        vendor.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"}
+        }));
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let face = contract_face(&request, &vendor);
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor).expect("carried");
+        assert!(prepared.get("watermark").is_none(), "{prepared}");
+    }
+
+    /// 承载面**自己声明的必填字段**也得在场：供给说了"这次请求必须带上它"，平台不替它省。
+    ///
+    /// 与"请求用到的字段"是两件事：这是承载面**要求**的字段，不是调用方用到的字段。判它的时机
+    /// 也重要——要等图落到承载面的名字上、默认值注入之后，否则会把跑得通的候选误判成不合格。
+    #[test]
+    fn a_carrier_required_field_the_request_never_provides_makes_the_candidate_ineligible() {
+        let mut vendor = offering();
+        vendor.capability_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "watermark": {"type": "boolean"}
+        }));
+        // 承载面把 `watermark` 声明成必填（在合同里它只是可选项）。
+        vendor.carrier_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt", "watermark"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string"},
+                "watermark": {"type": "boolean"}
+            }
+        });
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let face = contract_face(&request, &vendor);
+        let reason = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect_err("the carrier requires watermark");
+        assert!(reason.contains("watermark"), "{reason}");
+
+        // 映射给了默认值：承载面要的字段被补上，这条候选就合格了。
+        vendor.parameter_mapping = serde_json::json!({"defaults": {"watermark": false}});
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect("the default fills the required field");
+        assert_eq!(prepared.get("watermark"), Some(&serde_json::json!(false)));
+
+        // 参考图同理：承载面要的参考图字段由平台装载的图补上。
+        let mut vendor = offering();
+        vendor.capability_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "image": {"type": "string"}
+        }));
+        vendor.carrier_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt", "image"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string"},
+                "image": {"type": "string"}
+            }
+        });
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        let face = contract_face(&request, &vendor);
+        assert!(prepare_carrier_parameters(&face, &request, &vendor).is_err());
+        request.reference_images = vec!["https://example.invalid/a.png".to_owned()];
+        let face = contract_face(&request, &vendor);
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect("the placed image fills the required field");
+        assert_eq!(
+            prepared.get("image"),
+            Some(&Value::String("https://example.invalid/a.png".to_owned()))
+        );
+    }
+
+    /// 选路：第一个候选承载不了请求用到的字段 → 落到下一条，判定记录写明为什么。
+    ///
+    /// 一条都不合格时**不是**参数错：请求本身没违反合同，是平台的供给面承载不了它。
+    #[test]
+    fn routing_skips_a_candidate_that_cannot_carry_a_used_field() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "quality": {"enum": ["low", "high"]}
+        }));
+        // 优先级 0 的候选承载面窄（承载不了 `quality`），优先级 1 的候选承载得了。
+        let mut narrow = offering();
+        narrow.capability_schema = contract.clone();
+        narrow.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"}
+        }));
+        let mut wide = offering();
+        wide.capability_schema = contract.clone();
+        wide.carrier_schema = contract.clone();
+        // 两条候选是不同的供给：判定记录按 offering_id 记选中者。
+        wide.offering_id = OfferingId::new();
+
+        let request = image_request(serde_json::json!({"prompt": "hello", "quality": "high"}));
+        let branch = request.branch().expect("prompt only");
+        let (chosen, parameters, decision) = select_candidate(
+            &request,
+            branch,
+            &[candidate_of(&narrow, 0), candidate_of(&wide, 1)],
+        )
+        .expect("the second candidate can carry quality");
+        assert_eq!(chosen.offering_id, wide.offering_id);
+        assert_eq!(parameters.get("quality"), Some(&serde_json::json!("high")));
+        assert_eq!(
+            decision.considered.len(),
+            2,
+            "判定记录要记全，不是记到命中为止"
+        );
+        assert!(!decision.considered[0].eligible);
+        assert!(
+            decision.considered[0]
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("quality")),
+            "落选原因必须写明承载不了哪个字段：{:?}",
+            decision.considered[0].skip_reason
+        );
+        assert!(decision.considered[1].eligible);
+        assert!(decision.considered[1].skip_reason.is_none());
+
+        // 一条都不合格：平台侧供给问题，与"请求违反合同"分开报。
+        let error = select_candidate(&request, branch, &[candidate_of(&narrow, 0)])
+            .expect_err("no candidate can carry quality");
+        assert!(
+            matches!(error, ApplicationError::NoEligibleOffering(_)),
+            "{error}"
+        );
+        // 请求本身违反合同（缺必填）：仍然是参数错。
+        let missing_prompt = image_request(serde_json::json!({"quality": "high"}));
+        let error = select_candidate(&missing_prompt, branch, &[candidate_of(&narrow, 0)])
+            .expect_err("prompt is missing");
+        assert!(matches!(error, ApplicationError::Validation(_)), "{error}");
+        // 该型号一条 active 供给都没有：是"不存在"，不是"承载不了"。
+        let error = select_candidate(&request, branch, &[]).expect_err("no active offering");
+        assert!(matches!(error, ApplicationError::NotFound(_)), "{error}");
     }
 
     #[test]

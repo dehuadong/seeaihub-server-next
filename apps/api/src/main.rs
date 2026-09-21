@@ -668,6 +668,13 @@ impl From<ApplicationError> for ApiError {
     fn from(error: ApplicationError) -> Self {
         let (status, code) = match error {
             ApplicationError::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
+            ApplicationError::NoEligibleOffering(ref reason) => {
+                // 请求本身没违反合同，是平台的供给面承载不了它：对客说成平台侧故障，不是参数错。
+                // 它发生在受理之前、没有 Job 可以记录，所以这里留一条日志——平台侧的供给问题
+                // 必须能被运营发现（"一条候选都承载不了"往往意味着发布时少声明了一个字段）。
+                tracing::warn!(reason = %reason, "no offering can carry the request");
+                (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
+            }
             ApplicationError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApplicationError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             ApplicationError::InsufficientBalance => {

@@ -2954,6 +2954,285 @@ async fn carrier_surface_is_frozen_into_the_job() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 请求**用到的**字段落在合同里、但某条候选的承载面承载不了：该候选落选、换下一条。
+///
+/// 一条都承载不了时是**平台侧供给问题**：对客必须是平台侧故障（503），不是消费者的参数错（400）。
+/// 请求本身违反合同（缺必填）仍然是 400——两者不能混成同一个码。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_field_a_carrier_cannot_carry_skips_it_and_fails_platform_side_when_none_can() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "carry-boundary-model";
+    // 合同声明了 `quality`（调用方能提交它），但只有一条供给承载得了。
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let narrow = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let wide = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+
+    // ── 用例 1：优先级 0 的候选承载不了 → 落到优先级 1 的候选，判定记录写明原因 ──
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "carry-1",
+        contract.clone(),
+        vec![
+            ("aihubmix-image-v1", narrow.clone()),
+            ("apimart-image-v1", wide.clone()),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "两条候选各带自己的承载面");
+
+    let mut request = route_request(model, "carry this");
+    request["quality"] = json!("high");
+    let key = format!("carry-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker，受理后只会等到超时：{body}"
+    );
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("the request must have been accepted");
+    let (chosen, considered): (Uuid, Value) = {
+        let row = sqlx::query(
+            "SELECT chosen_offering_id, considered FROM generation.routing_decisions WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("routing decision row must exist");
+        (
+            row.try_get("chosen_offering_id").expect("chosen"),
+            row.try_get("considered").expect("considered"),
+        )
+    };
+    let considered = considered.as_array().expect("considered is an array");
+    assert_eq!(considered.len(), 2, "两个候选都要进判定记录");
+    assert_eq!(considered[0]["eligible"], false);
+    assert!(
+        considered[0]["skip_reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("quality")),
+        "落选原因必须写明承载不了哪个字段：{considered:?}"
+    );
+    assert_eq!(considered[1]["eligible"], true);
+    let expected: Uuid = sqlx::query_scalar(
+        "SELECT re.offering_id FROM publication.runtime_entries re
+         WHERE re.active AND re.gateway_model = $1 AND re.routing_priority = 1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("priority 1 offering");
+    assert_eq!(
+        chosen, expected,
+        "第一条承载不了请求用到的字段，就该落到下一条"
+    );
+
+    // ── 用例 2：同一个型号只留承载面窄的那条 → 一条候选都不合格 ──
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "carry-2",
+        contract.clone(),
+        vec![("aihubmix-image-v1", narrow.clone())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    let key = format!("carry-none-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "平台承载不了不是消费者的参数错：{body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "平台侧供给问题必须说成平台侧故障：{body}"
+    );
+    assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
+    assert_public_only("无可用供给", &body);
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    assert_eq!(
+        jobs_after, jobs_before,
+        "承载不了是在受理前失败的，不该留下执行记录"
+    );
+
+    // ── 用例 3：同一条供给、调用方**没用到** `quality` → 照常受理 ──
+    let key = format!("carry-unused-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(model, "no quality given"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没用到那个字段就该照常受理：{body}"
+    );
+
+    // ── 用例 3b：**合同里没有**的字段照旧丢掉、请求照常受理 ──
+    // 与上面"合同有、承载面没有"的处置必须分开：前者丢掉不报错，后者是平台侧故障。
+    // 所以判据面真的是合同，而不是这条窄承载面——合同外的字段连承载校验都进不去。
+    let key = format!("carry-unknown-{}", Uuid::new_v4());
+    let mut request = route_request(model, "a field the contract never declared");
+    request["seed"] = json!(7);
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "合同外的字段该丢掉、请求照常受理：{body}"
+    );
+    let stored: Value = sqlx::query_scalar(
+        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("the accepted job must keep its parameters");
+    assert!(
+        stored.get("seed").is_none(),
+        "合同外的字段不许跟着 Job 走去上游：{stored}"
+    );
+
+    // ── 用例 4：请求本身违反合同（缺必填）仍然是 400 ──
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        "carry-missing-prompt-0001",
+        &json!({"model": model, "quality": "high"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert_eq!(body["error"]["code"].as_str(), Some("validation_error"));
+    assert_public_only("缺必填项", &body);
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 映射声明的**显式默认值**必须出现在发给上游的报文里：调用方没给该字段时由平台补上，
+/// 调用方给了就一个字都不改——渠道自己那套默认值（例如上游把水印默认打开）因此再也用不上。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn explicit_defaults_reach_the_upstream_request_body() {
+    // 素材形状照旧（AIHubMix 声明得了 `quality`），只是这条供给挂了一份显式默认值：
+    // 调用方不给 `quality` 时，平台自己发一个 `low`，而不是让上游按它的默认值走。
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    draft["capability_schema"]["properties"]["quality"] =
+        json!({"type": "string", "enum": ["low", "high"]});
+    draft["parameter_mapping"] = json!({"defaults": {"quality": "low"}});
+    let harness =
+        Harness::start_with_draft(draft, UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64)
+            .await;
+
+    // 1) 调用方没给 `quality`：默认值跟着报文上行，也留在内部参数面里。
+    let key = format!("defaults-{}", Uuid::new_v4());
+    let request = route_request(harness.model, "no quality given");
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("显式默认值", &body);
+    let submit_body = harness.submit_body("/v1/images/generations");
+    assert_eq!(
+        submit_body["quality"], "low",
+        "默认值必须出现在上游报文里：{submit_body}"
+    );
+    harness.assert_only_declared_fields(&request);
+    let stored: Value = sqlx::query_scalar(
+        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("native parameters");
+    assert_eq!(
+        stored["quality"], "low",
+        "Job 里存的就是这次真正发出去的东西：{stored}"
+    );
+    assert_job_succeeded(&harness, &key).await;
+
+    // 2) 调用方给了：用调用方的值，不被默认值覆盖。
+    let key = format!("defaults-given-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "quality given");
+    request["quality"] = json!("high");
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let submit_body = harness.submit_body("/v1/images/generations");
+    assert_eq!(
+        submit_body["quality"], "high",
+        "调用方给了就用调用方的值：{submit_body}"
+    );
+    harness.assert_only_declared_fields(&request);
+    assert_job_succeeded(&harness, &key).await;
+    harness.cleanup().await;
+}
+
 /// 一个只声明给定顶层字段的封闭对象 schema（合同与承载面都用它）。
 fn surface_schema(properties: Value) -> Value {
     json!({
@@ -2974,9 +3253,34 @@ async fn publish_with_surfaces(
     contract: Value,
     carriers: Vec<(&str, Value)>,
 ) -> StatusCode {
+    publish_with_mappings(
+        client,
+        base_url,
+        admin_token,
+        model,
+        revision,
+        contract,
+        carriers
+            .into_iter()
+            .map(|(adapter_key, carrier)| (adapter_key, carrier, json!({})))
+            .collect(),
+    )
+    .await
+}
+
+/// 同 `publish_with_surfaces`，但每个候选自带一份**参数映射**（目前只有显式默认值一块）。
+async fn publish_with_mappings(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    model: &str,
+    revision: &str,
+    contract: Value,
+    carriers: Vec<(&str, Value, Value)>,
+) -> StatusCode {
     let offerings = carriers
         .into_iter()
-        .map(|(adapter_key, carrier)| {
+        .map(|(adapter_key, carrier, parameter_mapping)| {
             json!({
                 "provider_kind": if adapter_key == "apimart-image-v1" { "APIMart" } else { "AIHubMix" },
                 "adapter_key": adapter_key,
@@ -2985,6 +3289,7 @@ async fn publish_with_surfaces(
                 "credential_env": "AIHUBMIX_API_KEY",
                 "restrictions": {"allowed_branches": ["prompt_only"], "max_images": 0},
                 "carrier_schema": carrier,
+                "parameter_mapping": parameter_mapping,
                 "price_plan": {
                     "formula": "token_rates",
                     "currency": "USD",
