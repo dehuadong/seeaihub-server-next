@@ -3511,6 +3511,245 @@ async fn a_size_combination_the_profile_lacks_makes_the_candidate_ineligible() {
     drop_isolated_database(&database_name).await;
 }
 
+/// `auto` 的语义是"由模型按提示词自己决定最佳比例"：它只原样透传、永不换算。
+///
+/// 声明了尺寸换算的供给收不了它——那条候选落选（原因写进判定记录），有别的候选就落过去；纯透传的
+/// 供给把 `auto` 原样写进 Job。一条候选都收不了时是平台侧故障，不是参数错。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_auto_size_is_passed_through_and_never_converted() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "auto-size-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"},
+        "resolution": {"type": "string"}
+    }));
+    // 像素面供给：声明了尺寸换算，只收得了具体尺寸。
+    let pixel_carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"}
+    }));
+    let pixel_mapping = json!({
+        "size": {
+            "source": ["size", "resolution"],
+            "target": "size",
+            "form": "pixels",
+            "profile": lite_2k_profile()
+        }
+    });
+    // 比例 + 档位面供给：尺寸原样承载、不做换算——`auto` 就落在这条上。
+    let plain_carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"},
+        "resolution": {"type": "string"}
+    }));
+
+    // ── 用例 1：换算供给收不了 `auto` → 落到纯透传的候选，`auto` 原样进 Job ──
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "auto-1",
+        contract.clone(),
+        vec![
+            (
+                "aihubmix-image-v1",
+                pixel_carrier.clone(),
+                pixel_mapping.clone(),
+            ),
+            ("apimart-image-v1", plain_carrier.clone(), json!({})),
+        ],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "两条候选各带自己的尺寸声明");
+
+    let mut request = route_request(model, "let the model pick the size");
+    request["size"] = json!("auto");
+    let key = format!("auto-skip-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "收不了 `auto` 只是这条候选不合格，下一条照常受理：{body}"
+    );
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("the request must have been accepted");
+    let (chosen, considered): (Uuid, Value) = {
+        let row = sqlx::query(
+            "SELECT chosen_offering_id, considered FROM generation.routing_decisions WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&pool)
+        .await
+        .expect("routing decision row must exist");
+        (
+            row.try_get("chosen_offering_id").expect("chosen"),
+            row.try_get("considered").expect("considered"),
+        )
+    };
+    let considered = considered.as_array().expect("considered is an array");
+    assert_eq!(considered.len(), 2, "两个候选都要进判定记录");
+    assert_eq!(considered[0]["eligible"], false);
+    assert!(
+        considered[0]["skip_reason"].as_str().is_some_and(|reason| {
+            reason.contains("auto") && reason.contains("cannot be converted")
+        }),
+        "落选原因必须写明 `auto` 只能原样透传、不能换算：{considered:?}"
+    );
+    assert_eq!(considered[1]["eligible"], true);
+    let expected: Uuid = sqlx::query_scalar(
+        "SELECT re.offering_id FROM publication.runtime_entries re
+         WHERE re.active AND re.gateway_model = $1 AND re.routing_priority = 1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("priority 1 offering");
+    assert_eq!(
+        chosen, expected,
+        "换算供给收不了 `auto`，就该落到纯透传的那条"
+    );
+    // Job 里存的就是这次真正要发出去的东西：`auto` 原样，没有被算成一个比例。
+    let stored: Value = sqlx::query_scalar(
+        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&pool)
+    .await
+    .expect("native parameters");
+    assert_eq!(stored["size"], "auto", "`auto` 必须原样上行：{stored}");
+
+    // ── 用例 2：只留换算供给 → 一条候选都收不了 `auto` → 平台侧故障 ──
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "auto-2",
+        contract.clone(),
+        vec![(
+            "aihubmix-image-v1",
+            pixel_carrier.clone(),
+            pixel_mapping.clone(),
+        )],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    let key = format!("auto-none-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_ne!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "收不了 `auto` 不是消费者的参数错：{body}"
+    );
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "平台侧供给问题必须说成平台侧故障：{body}"
+    );
+    assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
+    assert_public_only("收不了 auto", &body);
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&pool)
+        .await
+        .expect("job count");
+    assert_eq!(
+        jobs_after, jobs_before,
+        "选不出候选是在受理前失败的，不该留下执行记录"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 没声明尺寸换算的供给（纯透传）不过换算函数：`auto` 原样出现在发给上游的报文里。
+///
+/// 这正是"渠道收 `auto`"的样子（承载面自己声明了那个字段）：平台原样发出去，让模型自己决定最佳
+/// 比例，不替它算一个。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_auto_size_reaches_the_upstream_request_body_untouched() {
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    // 合同与承载面都声明 `size`，但**没有**尺寸换算声明：尺寸原样上行。
+    draft["capability_schema"] = surface_schema(json!({
+        "model": {"const": Harness::MODEL},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"}
+    }));
+    draft["carrier_schema"] = surface_schema(json!({
+        "model": {"const": Harness::MODEL},
+        "prompt": {"type": "string", "minLength": 1},
+        "size": {"type": "string"}
+    }));
+    draft["parameter_mapping"] = json!({});
+    let harness =
+        Harness::start_with_draft(draft, UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64)
+            .await;
+
+    let key = format!("auto-pass-through-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "let the model pick the size");
+    request["size"] = json!("auto");
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request.clone())
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("auto 透传", &body);
+
+    let submit_body = harness.submit_body("/v1/images/generations");
+    assert_eq!(
+        submit_body["size"], "auto",
+        "`auto` 必须原样发给上游：{submit_body}"
+    );
+    harness.assert_only_declared_fields(&request);
+    let stored: Value = sqlx::query_scalar(
+        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("native parameters");
+    assert_eq!(stored["size"], "auto", "{stored}");
+    assert_job_succeeded(&harness, &key).await;
+    harness.cleanup().await;
+}
+
 /// 改名：合同字段承载面承载不了、但改名把它落到承载面声明的名字上时，这条供给照样跑得通。
 ///
 /// 断言两处都是**线上形态**：发给假上游的报文里是线上字段名，Job 里存的也是它——合同字段名

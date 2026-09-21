@@ -1,24 +1,27 @@
-//! 图像尺寸参数的三型，以及它们之间的换算。
+//! 图像尺寸参数的四型，以及它们之间的换算。
 //!
-//! 同一个尺寸在不同厂商、不同渠道上写着三种东西：**像素**（`1024x1024`）、**宽高比**（`16:9`）、
-//! **分辨率档位**（`2K`）。于是同一个字段名（`size`）在三个模型上可以有三义，而客户端提交的是
-//! **合同**声明的那一义、渠道要的可能是另一义。这一层只做两件事：把一个取值认成三型中的一型，
+//! 同一个尺寸在不同厂商、不同渠道上写着三种具体的东西：**像素**（`1024x1024`）、**宽高比**
+//! （`16:9`）、**分辨率档位**（`2K`）；此外还有第四型 `auto`——它不是一个尺寸，而是"由模型按
+//! 提示词自己决定最佳比例"。于是同一个字段名（`size`）在几个模型上可以有好几义，而客户端提交的
+//! 是**合同**声明的那一义、渠道要的可能是另一义。这一层只做两件事：把一个取值认成四型中的一型，
 //! 并按一份**发布数据**（比例 × 档位 → 像素的档案）在它们之间换算。
 //!
-//! 三条边界：
+//! 四条边界：
 //!
 //! 1. **档案是数据，不是代码**：任何厂商的具体档位表都不写在这里。`SizeProfile` 只把随发布
 //!    携带的那张表解析成一个可查的结构；接一个新厂商只发一份新档案，不改代码。
-//! 2. **判型看取值本身**：`2K` 是档位、`16:9` 是比例、`1024x1024` 是像素，靠字符串的形状判定，
-//!    与它出现在哪个字段名上无关（`size`、`resolution`、`aspect_ratio` 都可能是任意一型）。
-//!    因此"这个字段是哪一型"不必在合同里再声明一遍——合同本来就只声明字段与类型，而调用方
-//!    提交的是取值。
+//! 2. **判型看取值本身**：`2K` 是档位、`16:9` 是比例、`1024x1024` 是像素、`auto` 是"让模型
+//!    自己决定"，靠字符串的形状判定，与它出现在哪个字段名上无关（`size`、`resolution`、
+//!    `aspect_ratio` 都可能是任意一型）。因此"这个字段是哪一型"不必在合同里再声明一遍——合同
+//!    本来就只声明字段与类型，而调用方提交的是取值。
 //! 3. **换算不出就明确失败**：档案里没有那一格，返回错误（受理侧据此判这条候选不合格），
 //!    绝不退回一个近似值、也绝不把调用方已经说过的那一型悄悄丢掉。
+//! 4. **`auto` 只透传、永不换算**：它说的是"让模型自己挑"，平台替它算一个比例就是把模型的
+//!    决定权拿走了，而算出来的那个尺寸与调用方要的东西毫无关系。承载面收得了它的渠道原样发
+//!    出去，收不了的渠道明确失败、这条候选因此不合格。
 //!
-//! 三型之间只做一种换算：**（比例 + 档位）↔ 像素**。单独一个比例、单独一个档位都换算不出像素
-//! （同一档位下有很多比例，同一个比例下有很多档位），那种组合一律失败而不是被猜一个值。
-//! `auto` 这类"由上游自己决定尺寸"的取值不是三型之一，因此声明了尺寸换算的供给承载不了它。
+//! 可换算的三型之间只做一种换算：**（比例 + 档位）↔ 像素**。单独一个比例、单独一个档位都换算
+//! 不出像素（同一档位下有很多比例，同一个比例下有很多档位），那种组合一律失败而不是被猜一个值。
 
 use serde_json::Value;
 use std::{
@@ -26,19 +29,21 @@ use std::{
     fmt::{Display, Formatter},
 };
 
-/// 尺寸取值属于哪一型。映射声明里写的就是这三型的名字。
+/// 尺寸取值属于哪一型。映射声明里写的就是这四型的名字。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SizeForm {
     Pixels,
     Ratio,
     Tier,
+    /// 由模型自己决定：它不是一个具体尺寸，因此没有可换算的形态。
+    Auto,
 }
 
 impl SizeForm {
-    /// 三型的稳定名字：声明里写 `pixels` / `ratio` / `tier`。
-    pub const ALL: [Self; 3] = [Self::Pixels, Self::Ratio, Self::Tier];
+    /// 四型的稳定名字：声明里写 `pixels` / `ratio` / `tier` / `auto`。
+    pub const ALL: [Self; 4] = [Self::Pixels, Self::Ratio, Self::Tier, Self::Auto];
 
-    /// 声明里的名字还原成型别；不是这三型的名字则为 `None`。
+    /// 声明里的名字还原成型别；不是这四型的名字则为 `None`。
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         Self::ALL.into_iter().find(|form| form.as_str() == value)
@@ -50,30 +55,47 @@ impl SizeForm {
             Self::Pixels => "pixels",
             Self::Ratio => "ratio",
             Self::Tier => "tier",
+            Self::Auto => "auto",
         }
     }
 }
 
-/// 一个尺寸取值：三型中的一型。
+/// 一个尺寸取值：四型中的一型。
 ///
-/// 取值本身是字符串（`1024x1024` / `16:9` / `2K`），`Display` 就是它的线上形态；
+/// 取值本身是字符串（`1024x1024` / `16:9` / `2K` / `auto`），`Display` 就是它的线上形态；
 /// 比例与档位在这里**已经规范化**（比例约分、档位统一大写 K），因此同一个尺寸的不同写法
-/// （`32:18` 与 `16:9`、`2k` 与 `2K`）在这一层之后是同一个值。
+/// （`32:18` 与 `16:9`、`2k` 与 `2K`）在这一层之后是同一个值。`auto` 没有可规范化的内容——
+/// 它本来就不是一个尺寸，线上原样就是 `auto`。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum SizeSpec {
-    Pixels { width: u32, height: u32 },
-    Ratio { ratio: String },
-    Tier { tier: String },
+    Pixels {
+        width: u32,
+        height: u32,
+    },
+    Ratio {
+        ratio: String,
+    },
+    Tier {
+        tier: String,
+    },
+    /// 由模型自己决定最佳比例：只原样透传，永不参与换算。
+    Auto,
 }
 
 impl SizeSpec {
-    /// 按取值的形状判型：`宽x高` 是像素、`a:b` 是比例、`数字K` 是档位，其余一律报错。
+    /// 按取值的形状判型：`宽x高` 是像素、`a:b` 是比例、`数字K` 是档位、`auto` 是"让模型自己
+    /// 决定"，其余一律报错。
     ///
     /// 宽、高、比例的两边、档位数字都必须**是正整数**：`0x1024`、`16:0`、`0K` 都不是一个尺寸。
     /// 不做 trim、不认别名：调用方写的字面量就是它说的那个尺寸，平台不替它收拾写法。
     pub fn parse(value: &str) -> Result<Self, String> {
         if value.is_empty() {
             return Err("a size must not be empty".to_owned());
+        }
+        if value == "auto" {
+            // `auto` 是唯一一个"不是一个具体尺寸"的取值：它说的是"由模型自己决定最佳比例"，
+            // 因此没有宽高、比例或档位可以规范化。
+            return Ok(Self::Auto);
         }
         if let Some((width, height)) = split_pair(value, 'x').or_else(|| split_pair(value, 'X')) {
             return Ok(Self::Pixels {
@@ -103,6 +125,7 @@ impl SizeSpec {
             Self::Pixels { .. } => SizeForm::Pixels,
             Self::Ratio { .. } => SizeForm::Ratio,
             Self::Tier { .. } => SizeForm::Tier,
+            Self::Auto => SizeForm::Auto,
         }
     }
 }
@@ -113,6 +136,7 @@ impl Display for SizeSpec {
             Self::Pixels { width, height } => write!(formatter, "{width}x{height}"),
             Self::Ratio { ratio } => formatter.write_str(ratio),
             Self::Tier { tier } => formatter.write_str(tier),
+            Self::Auto => formatter.write_str("auto"),
         }
     }
 }
@@ -218,6 +242,9 @@ impl SizeProfile {
 ///   多出来的那一型会被无声丢掉，等于平台替调用方决定了尺寸。
 /// - **目标型别没给** → 只有（比例 + 档位）↔ 像素这一种换算，且必须能在档案里查到那一格。
 ///
+/// `auto` 不参与任何换算：目标形态本身就是 `auto` 时原样通过（它只透传），其余情形一律明确失败
+/// ——平台不替模型算一个比例，也不把调用方说的 `auto` 丢掉。
+///
 /// 其余组合一律失败，理由与"档案缺那一格"相同：猜一个值会让调用方拿到的图与它要的尺寸无关，
 /// 而这种错在图上完全看不出来。
 pub fn convert_size(
@@ -225,7 +252,20 @@ pub fn convert_size(
     profile: &SizeProfile,
     values: &[SizeSpec],
 ) -> Result<SizeSpec, String> {
-    let (pixels, ratio, tier) = collect_size_values(values)?;
+    let (pixels, ratio, tier, auto) = collect_size_values(values)?;
+    if auto {
+        // `auto` 的语义是"由模型按提示词自己决定最佳比例"，平台不替它算一个比例：它只原样透传、
+        // 永不换算。目标形态本身就是 `auto` 时原样通过；否则这条候选收不了它——把 `auto` 换算成
+        // 别的形态，等于平台替模型做了这个决定。请求同时给了别的尺寸取值时同样失败：那些取值会
+        // 被无声丢掉，与"多出来的那一型会被悄悄丢掉"是同一条理由。
+        if form == SizeForm::Auto && pixels.is_none() && ratio.is_none() && tier.is_none() {
+            return Ok(SizeSpec::Auto);
+        }
+        return Err(auto_is_pass_through_only(
+            form,
+            &given_forms(pixels.is_some(), ratio.is_some(), tier.is_some()),
+        ));
+    }
     match (form, pixels, ratio, tier) {
         // 已经是供给要的那一型：直接用，不查档案。
         (SizeForm::Pixels, Some(SizeSpec::Pixels { width, height }), None, None) => {
@@ -266,14 +306,16 @@ pub fn convert_size(
     }
 }
 
-/// 按型别归位后的尺寸取值：像素、比例、档位各自最多一个（同型给出两个不同的值是含糊）。
-type GivenSize<'a> = (Option<SizeSpec>, Option<&'a str>, Option<&'a str>);
+/// 按型别归位后的尺寸取值：像素、比例、档位各自最多一个（同型给出两个不同的值是含糊），
+/// 外加"这次请求给的是不是 `auto`"。
+type GivenSize<'a> = (Option<SizeSpec>, Option<&'a str>, Option<&'a str>, bool);
 
 /// 取值按型别归位：同一型给出两个不同的值（例如两个档位）是**含糊**，直接报错。
 fn collect_size_values(values: &[SizeSpec]) -> Result<GivenSize<'_>, String> {
     let mut pixels = None;
     let mut ratio = None;
     let mut tier = None;
+    let mut auto = false;
     for value in values {
         match value {
             SizeSpec::Pixels { width, height } => {
@@ -288,9 +330,11 @@ fn collect_size_values(values: &[SizeSpec]) -> Result<GivenSize<'_>, String> {
             }
             SizeSpec::Ratio { ratio: given } => set_once(&mut ratio, given.as_str(), "ratio")?,
             SizeSpec::Tier { tier: given } => set_once(&mut tier, given.as_str(), "tier")?,
+            // `auto` 没有可归位的型别：它给几次都是同一个意思，因此只记"给过"。
+            SizeSpec::Auto => auto = true,
         }
     }
-    Ok((pixels, ratio, tier))
+    Ok((pixels, ratio, tier, auto))
 }
 
 fn set_once<T: PartialEq + Display>(
@@ -309,8 +353,47 @@ fn set_once<T: PartialEq + Display>(
     }
 }
 
+/// 这一组取值里的 `auto` 收不了：说清"它只能原样透传、不能换算"，让判定记录里看得懂。
+///
+/// 两种情形都落到这里，但理由不同：目标形态不是 `auto` 时，平台不能替模型算一个比例；目标形态
+/// 就是 `auto` 而请求还给了别的尺寸取值时，那些取值会被无声丢掉。两者都是"平台不许替调用方
+/// 决定尺寸"。
+fn auto_is_pass_through_only(form: SizeForm, others: &[&str]) -> String {
+    if form == SizeForm::Auto {
+        format!(
+            "this offering passes `auto` through as it is and cannot convert the request's other size values ({}) into it",
+            others.join(" + ")
+        )
+    } else {
+        format!(
+            "`auto` lets the model decide the size itself, so it can only be passed through as it is and cannot be converted to {}",
+            form.as_str()
+        )
+    }
+}
+
 /// 这一组取值没法变成供给要的那一型：说清"要哪一型、给的是哪几型"，让判定记录里看得懂。
 fn unusable_size(form: SizeForm, pixels: bool, ratio: bool, tier: bool) -> String {
+    let given = given_forms(pixels, ratio, tier);
+    if given.is_empty() {
+        return "the request gives no size value".to_owned();
+    }
+    if form == SizeForm::Auto {
+        // 这条供给只把 `auto` 原样透传：把调用方明确给的尺寸换成"让模型自己挑"同样是替它决定尺寸。
+        return format!(
+            "this offering only passes `auto` through and cannot convert the request's size ({}) into it",
+            given.join(" + ")
+        );
+    }
+    format!(
+        "this offering sizes images in {} and cannot use the request's size ({})",
+        form.as_str(),
+        given.join(" + ")
+    )
+}
+
+/// 这一组取值给了哪几型。
+fn given_forms(pixels: bool, ratio: bool, tier: bool) -> Vec<&'static str> {
     let mut given = Vec::new();
     if pixels {
         given.push("pixels");
@@ -321,14 +404,7 @@ fn unusable_size(form: SizeForm, pixels: bool, ratio: bool, tier: bool) -> Strin
     if tier {
         given.push("a tier");
     }
-    if given.is_empty() {
-        return "the request gives no size value".to_owned();
-    }
-    format!(
-        "this offering sizes images in {} and cannot use the request's size ({})",
-        form.as_str(),
-        given.join(" + ")
-    )
+    given
 }
 
 /// 档案里的一个键：按期望的型别解析并取规范化后的形态。
@@ -369,7 +445,7 @@ fn dimension(text: &str, whole: &str) -> Result<u32, String> {
 
 fn not_a_size(value: &str) -> String {
     format!(
-        "`{value}` is not a size: expected pixels (`1024x1024`), a ratio (`16:9`) or a tier (`2K`)"
+        "`{value}` is not a size: expected pixels (`1024x1024`), a ratio (`16:9`), a tier (`2K`) or `auto`"
     )
 }
 
@@ -428,7 +504,7 @@ mod tests {
     }
 
     #[test]
-    fn parses_the_three_forms_and_normalises_them() {
+    fn parses_the_four_forms_and_normalises_them() {
         for (value, expected) in [
             (
                 "1024x1024",
@@ -488,6 +564,8 @@ mod tests {
                     tier: "4K".to_owned(),
                 },
             ),
+            // 第四型：不是一个具体尺寸，线上原样就是 `auto`。
+            ("auto", SizeSpec::Auto),
         ] {
             let parsed =
                 SizeSpec::parse(value).unwrap_or_else(|error| panic!("`{value}`: {error}"));
@@ -504,20 +582,24 @@ mod tests {
             SizeForm::Ratio
         );
         assert_eq!(SizeSpec::parse("2K").expect("tier").form(), SizeForm::Tier);
-        // 型别的名字只有那三个。
+        assert_eq!(
+            SizeSpec::parse("auto").expect("auto").form(),
+            SizeForm::Auto
+        );
+        // 型别的名字就是这四个。
         assert_eq!(SizeForm::parse("pixels"), Some(SizeForm::Pixels));
         assert_eq!(SizeForm::parse("ratio"), Some(SizeForm::Ratio));
         assert_eq!(SizeForm::parse("tier"), Some(SizeForm::Tier));
+        assert_eq!(SizeForm::parse("auto"), Some(SizeForm::Auto));
         assert_eq!(SizeForm::parse("pixel"), None);
         assert_eq!(SizeForm::Pixels.as_str(), "pixels");
+        assert_eq!(SizeForm::Auto.as_str(), "auto");
     }
 
     #[test]
-    fn rejects_anything_that_is_not_one_of_the_three_forms() {
+    fn rejects_anything_that_is_not_one_of_the_four_forms() {
         for value in [
             "",
-            // `auto` 是"由上游自己决定尺寸"，不是三型之一。
-            "auto",
             "1024",
             "1024x",
             "x1024",
@@ -545,6 +627,11 @@ mod tests {
             "2KB",
             "99999999999999K",
             "1024x99999999999999",
+            // `auto` 只有这一个写法：它不是"随便什么写法都能认"的别名。
+            "AUTO",
+            "Auto",
+            " auto",
+            "auto ",
         ] {
             let error = SizeSpec::parse(value)
                 .err()
@@ -554,6 +641,62 @@ mod tests {
                 "报错要说清这不是一个尺寸：`{value}` → {error}"
             );
         }
+    }
+
+    /// `auto` 的语义是"由模型按提示词自己决定最佳比例"：它只原样透传，永不换算。
+    #[test]
+    fn auto_is_only_passed_through_and_never_converted() {
+        let lite = profile(lite_2k());
+        let auto = [SizeSpec::parse("auto").expect("auto")];
+        // 目标形态本身就是 `auto`：原样通过，档案用不上。
+        assert_eq!(
+            convert_size(SizeForm::Auto, &SizeProfile::default(), &auto)
+                .expect("auto passes through"),
+            SizeSpec::Auto
+        );
+        // 目标形态是别的形态：明确失败，错误信息说清"只能原样透传、不能换算"。
+        for form in [SizeForm::Pixels, SizeForm::Ratio, SizeForm::Tier] {
+            let error =
+                convert_size(form, &lite, &auto).expect_err("auto is not convertible at all");
+            assert!(
+                error.contains("auto")
+                    && error.contains("passed through")
+                    && error.contains("cannot be converted"),
+                "报错要说清 `auto` 只能原样透传、不能换算：{error}"
+            );
+        }
+        // 目标形态就是 `auto`，但请求还给了别的尺寸取值：那些取值会被无声丢掉，因此失败。
+        let error = convert_size(
+            SizeForm::Auto,
+            &lite,
+            &[SizeSpec::Auto, SizeSpec::parse("2K").expect("tier")],
+        )
+        .expect_err("the tier would be silently dropped");
+        assert!(
+            error.contains("a tier") && error.contains("cannot convert"),
+            "{error}"
+        );
+        // 目标形态是 `auto`、请求给的是像素：不能把调用方说的尺寸换成"让模型自己挑"。
+        let error = convert_size(
+            SizeForm::Auto,
+            &lite,
+            &[SizeSpec::parse("1024x1024").expect("pixels")],
+        )
+        .expect_err("pixels cannot become auto");
+        assert!(
+            error.contains("`auto`") && error.contains("cannot convert"),
+            "{error}"
+        );
+        // 同一个 `auto` 给两次不是含糊：它就是同一个值。
+        assert_eq!(
+            convert_size(
+                SizeForm::Auto,
+                &lite,
+                &[SizeSpec::Auto, SizeSpec::parse("auto").expect("auto")]
+            )
+            .expect("auto twice is the same value"),
+            SizeSpec::Auto
+        );
     }
 
     #[test]

@@ -3536,6 +3536,90 @@ mod tests {
         assert!(prepared.get("resolution").is_none(), "{prepared}");
     }
 
+    /// `auto`（由模型自己决定）只原样透传：声明了尺寸换算的供给收不了它，纯透传的供给照常带上它。
+    ///
+    /// 换算声明说的是"把合同的尺寸变成这条供给要的那一型"，而 `auto` 不是一个可换算的尺寸——替它
+    /// 算一个比例就是把模型的决定权拿走了。这条候选因此落选、换下一条；一条都收不了时是平台侧
+    /// 供给问题，不是调用方的参数错。
+    #[test]
+    fn auto_is_passed_through_and_a_size_converting_offering_cannot_take_it() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        // 优先级 0 的候选声明了尺寸换算（它要像素）；优先级 1 的候选把尺寸原样承载。
+        let mut converting = offering();
+        converting.capability_schema = contract.clone();
+        converting.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"}
+        }));
+        converting.parameter_mapping = serde_json::json!({
+            "size": {
+                "source": ["size", "resolution"],
+                "target": "size",
+                "form": "pixels",
+                "profile": {"2K": {"2:3": "1664x2496"}}
+            }
+        });
+        let mut pass_through = offering();
+        pass_through.capability_schema = contract.clone();
+        pass_through.carrier_schema = contract.clone();
+        pass_through.offering_id = OfferingId::new();
+
+        let request = image_request(serde_json::json!({"prompt": "hello", "size": "auto"}));
+        let face = contract_face(&request, &converting);
+        // 声明了换算的供给：明确落选，原因写清 `auto` 只能原样透传、不能换算。
+        let reason = prepare_carrier_parameters(&face, &request, &converting)
+            .expect_err("a size-converting offering cannot take auto");
+        assert!(
+            reason.contains("auto") && reason.contains("cannot be converted"),
+            "{reason}"
+        );
+        // 纯透传的供给：`auto` 原样留在参数面上。
+        let prepared = prepare_carrier_parameters(&face, &request, &pass_through)
+            .expect("the pass-through offering carries auto as it is");
+        assert_eq!(
+            prepared.get("size"),
+            Some(&serde_json::json!("auto")),
+            "{prepared}"
+        );
+
+        // 有别的候选就落过去：判定记录写明优先级 0 为什么落选。
+        let branch = request.branch().expect("prompt only");
+        let (chosen, parameters, decision) = select_candidate(
+            &request,
+            branch,
+            &[candidate_of(&converting, 0), candidate_of(&pass_through, 1)],
+        )
+        .expect("the pass-through candidate carries auto");
+        assert_eq!(chosen.offering_id, pass_through.offering_id);
+        assert_eq!(parameters.get("size"), Some(&serde_json::json!("auto")));
+        assert!(!decision.considered[0].eligible);
+        assert!(
+            decision.considered[0]
+                .skip_reason
+                .as_deref()
+                .is_some_and(
+                    |reason| reason.contains("auto") && reason.contains("cannot be converted")
+                ),
+            "落选原因必须写明 `auto` 不能换算：{:?}",
+            decision.considered[0].skip_reason
+        );
+        assert!(decision.considered[1].eligible);
+
+        // 一条都收不了 `auto`：不是参数错，是平台侧供给问题。
+        let error = select_candidate(&request, branch, &[candidate_of(&converting, 0)])
+            .expect_err("no candidate can take auto");
+        assert!(
+            matches!(error, ApplicationError::NoEligibleOffering(_)),
+            "{error}"
+        );
+    }
+
     /// 取值映射：组装期把合同取值换成线上取值；表里没有这个取值 → 这条候选**不合格**（不猜、
     /// 不透传原值），原因写进路由判定记录，有别的候选就落过去。
     #[test]

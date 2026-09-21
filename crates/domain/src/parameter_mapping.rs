@@ -15,12 +15,15 @@
 //! 映射表把合同取值翻成线上取值；表里没有的取值**明确失败**，既不猜近似值、也不把合同取值原样
 //! 透传——透传出去的那个取值对这条渠道没有意义，而调用方以为平台已经按声明映射过了。
 //!
-//! **尺寸换算**：同一个字段名（`size`）在不同模型上是三种东西（像素 / 比例 / 档位），客户端按
-//! 合同提交一型、渠道可能要另一型。映射声明这条供给要哪一型、由合同里的哪几个字段喂它、
+//! **尺寸换算**：同一个字段名（`size`）在不同模型上是三种具体的东西（像素 / 比例 / 档位），客户端
+//! 按合同提交一型、渠道可能要另一型。映射声明这条供给要哪一型、由合同里的哪几个字段喂它、
 //! 写进线上哪个字段，以及（需要查表时）随发布携带的那份**比例 × 档位 → 像素**档案。
 //! 档案放在这里而不是合同里：换算表是**这条供给**为了把合同形态变成自己要的形态才需要的，
 //! 同一个模型的像素面渠道与比例+档位面渠道各要各的一份；合同是模型级唯一一份、落库后不再改，
 //! 把渠道差异抬进合同会让"换一个渠道"变成"改模型合同、发新修订"。
+//!
+//! 尺寸取值还有第四型 `auto`（"由模型自己决定"）：它只原样透传、永不换算，所以声明了尺寸换算的
+//! 供给收不了它（除非它声明的目标形态本身就是 `auto`）。
 //!
 //! 注入默认值的判据是**合同 + 这条供给承载得了**：两边都成立才注入。合同没声明，说明调用方根本
 //! 提交不了它，注入等于平台凭空多出一个调用方看不见的参数；承载不了（承载面没声明、改名也没把它
@@ -1014,6 +1017,40 @@ mod tests {
             declared_size_mapping(&serde_json::json!({"size": null})),
             Ok(None)
         );
+    }
+
+    /// 没声明尺寸换算的供给（纯透传）根本不经过换算函数：`auto` 照常原样上行。
+    ///
+    /// 换算只在映射声明了 `size` 时才发生（[`declared_size_mapping`] 为 `None` 就没有这一步），
+    /// 因此"承载面收得了 `auto`"的渠道不会被平台拿去算一个比例。
+    #[test]
+    fn a_supply_without_a_size_declaration_passes_auto_through_untouched() {
+        let mapping = serde_json::json!({"rename": {"size": "resolution"}});
+        assert_eq!(
+            declared_size_mapping(&mapping).expect("no size declaration is not an error"),
+            None,
+            "没有尺寸声明就没有换算这一步，`auto` 不会经过 convert_size"
+        );
+        let renames = declared_renames(&mapping).expect("a rename is declared");
+        let mut parameters = Map::from_iter([
+            ("prompt".to_owned(), serde_json::json!("x")),
+            ("size".to_owned(), serde_json::json!("auto")),
+        ]);
+        apply_parameter_renames(
+            &schema(serde_json::json!({
+                "prompt": {"type": "string"},
+                "resolution": {"type": "string"}
+            })),
+            renames.as_ref(),
+            &mut parameters,
+        )
+        .expect("the wire name is declared");
+        assert_eq!(
+            parameters.get("resolution"),
+            Some(&serde_json::json!("auto")),
+            "纯透传供给把 `auto` 原样带到线上：{parameters:?}"
+        );
+        assert!(!parameters.contains_key("size"), "{parameters:?}");
     }
 
     /// 目标字段与源字段同名时（`size` 换算成 `size`），换算结果就写回同一个名字。
