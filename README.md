@@ -4,10 +4,12 @@
 
 ## 当前纵切
 
-- 一个 `CreateImageGeneration` 应用命令和持久 Job；
-- 两个渠道族的 Adapter：AIHubMix（`https://api.inferera.com`，同步）与 APIMart（`https://api.apib.ai`，任务式）；
+- 一个 `CreateImageGeneration` 应用命令和内部持久 Generation Job（对客不可见）；
+- 两个渠道族的 Adapter：AIHubMix（`https://api.inferera.com`，同步）与 APIMart（`https://api.apib.ai`，任务式，只在 Adapter 内部）；
+- 对客只有两条同步路径：`POST /v1/images/generations`（JSON）与 `POST /v1/images/edits`（multipart）；参考图/遮罩用公网 URL 或 data URL 给出；
 - 无图片走上游的文生图接口；有图片、可选遮罩则按渠道自己的参数走图生图/编辑；
-- PostgreSQL 固化 Runtime Revision、Job、Attempt、Price Snapshot 和账本；对象存储承载 Asset；
+- 结果按渠道原形返回：渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，平台不落盘静态素材；
+- PostgreSQL 固化 Runtime Revision、Job、Attempt、Price Snapshot 和账本；
 - 对账案例可由管理员查询（含上游对账标识），并以幂等业务键退款、释放预授权。
 
 上架或调整模型时，向管理接口发布一份新的运行时配置即可，不需要重新编译。
@@ -37,9 +39,7 @@ cargo run -p seeai-worker
 
 启动前把渠道凭证放进环境变量（变量名由发布素材的 `credential_env` 指定，例如 `AIHUBMIX_API_KEY`、`APIMART_API_KEY`）。密钥不会写入数据库；Channel 只保存环境变量名称。
 
-默认使用本地对象目录；把 `ASSET_STORE` 改为 `s3` 后可使用 Compose 自动创建的 MinIO `seeai-assets` bucket。
-
-输入资产角色只接受 `image` 或 `mask`。Mask 必须是带 alpha 通道的 PNG，并且尺寸与输入图片一致。
+参考图与遮罩是**参数值**：公网 URL 或 `data:image/…;base64,…`（遮罩用 PNG data URL）。平台不落盘、不校验其内容——上游不接受就会报错。
 
 ## 验证
 

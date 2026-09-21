@@ -1,16 +1,16 @@
 use async_trait::async_trait;
-use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
-pub use seeai_adapter_sdk::ProviderFailureKind;
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, ImageAdapter, PreparedImageRequest, ProviderCredential,
-    ProviderSuccess, ResolvedAsset, RetrySafety,
+    ProviderSuccess, RetrySafety,
 };
+pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AssetBinding, AssetId, AssetParameterKind, AttemptId, CreateImageGeneration,
-    GenerationJob, ImageBranch, JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId,
-    PriceRates, PublishedOffering, PublishedRevision, RuntimeRevisionId, asset_parameter_path,
-    is_image_parameter_name, is_mask_parameter_name, set_native_parameter_at_path,
+    AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, JobId, JobState,
+    MeteringEvidence, OfferingCandidate, OfferingId, PriceRates, PublishedOffering,
+    PublishedRevision, RuntimeRevisionId, declared_parameter_names, declared_reference_image_limit,
+    declares_mask_parameter, declares_reference_image_parameter, place_image_inputs,
+    platform_image_parameters,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -352,55 +352,20 @@ fn empty_object() -> Value {
 
 /// 按 `routing_priority` 升序取**第一个合格候选**。
 ///
-/// 合格 = 该候选自己的 `restrictions` 允许本次分支与绑定，**且**请求满足该候选**自己的**
-/// `capability_schema`。两个条件都必须用该候选自己的声明判断——这正是「每个 Provider
-/// 各自声明支持面、限制只收窄」的落地方式。
+/// 合格 = 该候选自己的 `restrictions` 允许本次分支与图片张数，**且**请求能满足该候选
+/// **自己的** `capability_schema`（必填项在场、图片能落到它声明的参数名上）。
+/// 两个条件都必须用该候选自己的声明判断——这正是「每个 Provider 各自声明支持面、
+/// 限制只收窄」的落地方式。
 ///
 /// **无合格候选时返回 `Validation` 错误**，即"在调用上游之前失败"，不回退到能力更宽但
 /// 优先级更低的候选。
 ///
 /// 不做的事：不因价格重排候选（价格不参与选中）。
-/// 把调用方给的角色落到某个候选的装载路径上。
-///
-/// 候选表达不了调用方要的图片输入（参数面里没有装参考图/遮罩的参数）就是**不合格**——
-/// 选路按"这份合同它能不能表达"判定，而不是按调用方恰好写了哪个渠道字段名。
-fn bind_assets(
-    capability_schema: &Value,
-    request: &CreateImageGenerationRequest,
-) -> Result<Vec<AssetBinding>, ApplicationError> {
-    let mut bindings = Vec::with_capacity(request.image_asset_ids.len() + 1);
-    for (index, asset_id) in request.image_asset_ids.iter().enumerate() {
-        let path = asset_parameter_path(capability_schema, AssetParameterKind::Image, index)
-            .ok_or_else(|| {
-                ApplicationError::Validation(
-                    "this offering cannot take a reference image".to_owned(),
-                )
-            })?;
-        bindings.push(AssetBinding {
-            native_parameter_path: path,
-            asset_id: *asset_id,
-            position: u16::try_from(index).unwrap_or(u16::MAX),
-        });
-    }
-    if let Some(mask_id) = request.mask_asset_id {
-        let path = asset_parameter_path(capability_schema, AssetParameterKind::Mask, 0)
-            .ok_or_else(|| {
-                ApplicationError::Validation("this offering cannot take a mask".to_owned())
-            })?;
-        bindings.push(AssetBinding {
-            native_parameter_path: path,
-            asset_id: mask_id,
-            position: 0,
-        });
-    }
-    Ok(bindings)
-}
-
 fn select_candidate(
     request: &CreateImageGenerationRequest,
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
-) -> Result<(PublishedOffering, Vec<AssetBinding>, RoutingDecision), ApplicationError> {
+) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
         // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误。
         return Err(ApplicationError::NotFound(format!(
@@ -411,24 +376,23 @@ fn select_candidate(
     let revision_id = candidates[0].runtime_revision_id;
     // 把每个候选连它的取舍结果一起算出来。`considered` 要记录**完整**的取舍画面，
     // 而不是"评估到命中为止"的部分清单——它是判定记录，不是求值轨迹。
-    let evaluated: Vec<(PublishedOffering, Vec<AssetBinding>, ConsideredCandidate)> = candidates
+    let evaluated: Vec<(PublishedOffering, Value, ConsideredCandidate)> = candidates
         .iter()
         .map(|candidate| {
             let published = candidate.clone().into_published();
             let mut skip_reason = None;
-            let mut bindings = Vec::new();
-            match bind_assets(&published.capability_schema, request) {
+            let mut parameters = Value::Null;
+            match prepare_native_parameters(request, &published) {
                 Err(error) => skip_reason = Some(error.to_string()),
-                Ok(resolved) => {
-                    bindings = resolved;
-                    if let Err(error) =
-                        validate_restrictions(branch, &bindings, &candidate.restrictions)
-                    {
+                Ok(prepared) => {
+                    if let Err(error) = validate_restrictions(
+                        branch,
+                        request.reference_images.len(),
+                        &candidate.restrictions,
+                    ) {
                         skip_reason = Some(error.to_string());
-                    } else if let Err(error) =
-                        validate_native_request(request, &published, &bindings)
-                    {
-                        skip_reason = Some(error.to_string());
+                    } else {
+                        parameters = prepared;
                     }
                 }
             }
@@ -439,7 +403,7 @@ fn select_candidate(
                 eligible: skip_reason.is_none(),
                 skip_reason,
             };
-            (published, bindings, considered)
+            (published, parameters, considered)
         })
         .collect();
     // 第一个合格候选胜出；不合格的留作诊断信息。
@@ -451,13 +415,14 @@ fn select_candidate(
             .iter()
             .map(|(_, _, considered)| considered.clone())
             .collect::<Vec<_>>();
-        let (published, bindings, _) = evaluated.into_iter().nth(chosen).expect("index just found");
+        let (published, parameters, _) =
+            evaluated.into_iter().nth(chosen).expect("index just found");
         let decision = RoutingDecision {
             runtime_revision_id: revision_id,
             chosen_offering_id: published.offering_id,
             considered,
         };
-        return Ok((published, bindings, decision));
+        return Ok((published, parameters, decision));
     }
     let reasons = evaluated
         .iter()
@@ -477,12 +442,11 @@ fn select_candidate(
     )))
 }
 
-/// 对客受理请求：调用方按**合同**给字段，图片用平台资产 id 指名。
+/// 对客受理请求：调用方按**合同**给字段，图片直接给公网 URL 或 data URL。
 ///
-/// 这是**接收入口**的形状，与落库的 [`CreateImageGeneration`] 分开：那个是"已经落到某个候选
-/// 的装载面"的形态（图片带具体参数路径），落库与 Worker 只看后者。两者之间的换算就是
-/// Offering Parameter Mapping 的第一块：调用方给 `image` / `mask`，平台按选中候选声明的
-/// 参数面决定装到哪个字段（`/image`、`/image_urls/0`、`/mask_url`…）。
+/// 这是**接收入口**的形状，与落库的 [`CreateImageGeneration`] 分开：后者的 `native_parameters`
+/// 里图片已经落在被选中候选自己的参数名上（`image`、`image_urls`、`mask`、`mask_url`…），
+/// 落库与 Worker 只看后者。两者之间的换算就是 Offering Parameter Mapping 的第一块。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateImageGenerationRequest {
     pub account_id: AccountId,
@@ -491,10 +455,12 @@ pub struct CreateImageGenerationRequest {
     pub model: String,
     /// 合同里的模型参数（扁平，不再有 `native_parameters` 外壳；图片不走这里）。
     pub native_parameters: Value,
+    /// 参考图：调用方给的 `image` / `image_urls`（同义）归一到这里，每项是公网 URL 或 data URL。
     #[serde(default)]
-    pub image_asset_ids: Vec<AssetId>,
+    pub reference_images: Vec<String>,
+    /// 遮罩：PNG data URL。
     #[serde(default)]
-    pub mask_asset_id: Option<AssetId>,
+    pub mask: Option<String>,
     /// 幂等键：来自 `Idempotency-Key` 请求头，缺省时由接口层生成一个。
     pub idempotency_key: String,
 }
@@ -504,10 +470,7 @@ impl CreateImageGenerationRequest {
     ///
     /// 只有遮罩没有参考图直接拒绝（遮罩是"编辑范围"，没有可编辑的图没有意义）。
     pub fn branch(&self) -> Result<ImageBranch, ApplicationError> {
-        match (
-            self.image_asset_ids.is_empty(),
-            self.mask_asset_id.is_some(),
-        ) {
+        match (self.reference_images.is_empty(), self.mask.is_some()) {
             (true, true) => Err(ApplicationError::Validation(
                 "mask requires an input image".to_owned(),
             )),
@@ -518,39 +481,26 @@ impl CreateImageGenerationRequest {
     }
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct AssetRecord {
-    pub id: AssetId,
-    pub account_id: AccountId,
-    pub role: String,
-    pub object_key: String,
-    pub media_type: String,
-    pub byte_count: u64,
-    pub width: u32,
-    pub height: u32,
-    pub sha256: String,
-    pub created_at: DateTime<Utc>,
-}
-
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct OutputAsset {
-    pub record: AssetRecord,
-    #[serde(skip)]
-    pub bytes: Bytes,
-}
-
+/// **内部**的 Job 视图：同步门面等终态时读它，管理员面与测试也从这里看结果。
+///
+/// 它不是对客的异步任务协议——对客只有同步入口，不会拿到 `job_id`，也没有可查询的任务接口；
+/// Job 是内部的执行与审计记录（状态机服务于崩溃恢复与运营处置）。
+///
+/// `data` 只在成功时出现、`error_code` 只在失败时出现——两者不会同时在场。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct JobView {
-    pub id: JobId,
-    pub account_id: AccountId,
+    pub job_id: JobId,
     pub state: String,
     pub branch: ImageBranch,
     /// 对外的模型字段：平台型号名。
     pub model: String,
-    pub result_asset_ids: Vec<AssetId>,
-    pub error_code: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error_code: Option<String>,
+    /// 当次结果的信封：每项只有渠道给的 `url` 或 `b64_json`，平台不改写、不下载。
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub data: Option<Vec<GeneratedImage>>,
 }
 
 #[derive(Debug, Clone)]
@@ -650,7 +600,8 @@ pub struct CompleteJob {
     pub job_id: JobId,
     pub worker_id: String,
     pub attempt_id: AttemptId,
-    pub outputs: Vec<AssetRecord>,
+    /// 当次结果的信封：渠道给什么就是什么。
+    pub images: Vec<GeneratedImage>,
     pub evidence: MeteringEvidence,
     pub charge_microusd: u64,
     /// 上游逐请求标识，写入 `attempts.provider_trace_id` 供人工对账。
@@ -721,14 +672,12 @@ pub enum ApplicationError {
     Conflict(String),
     #[error("insufficient balance")]
     InsufficientBalance,
-    #[error("too many jobs in flight")]
+    #[error("too many requests in flight")]
     TooManyInFlight,
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("persistence error: {0}")]
     Persistence(String),
-    #[error("object storage error: {0}")]
-    ObjectStorage(String),
     #[error("provider result requires reconciliation: {0}")]
     Reconciliation(String),
 }
@@ -775,14 +724,6 @@ pub trait HubRepository: Send + Sync {
     ) -> Result<(), ApplicationError>;
 
     async fn account_for_api_key(&self, key_hash: &str) -> Result<AccountId, ApplicationError>;
-
-    async fn insert_asset(&self, asset: AssetRecord) -> Result<(), ApplicationError>;
-
-    async fn get_asset(
-        &self,
-        account_id: AccountId,
-        asset_id: AssetId,
-    ) -> Result<AssetRecord, ApplicationError>;
 
     /// 创建 Job，并与 Job **同事务**写入路由判定记录。
     async fn create_job(
@@ -960,18 +901,6 @@ impl IdentityService {
             .account_for_api_key(&sha256_hex(plaintext.as_bytes()))
             .await
     }
-}
-
-#[async_trait]
-pub trait AssetStore: Send + Sync {
-    async fn put(
-        &self,
-        object_key: &str,
-        bytes: Bytes,
-        media_type: &str,
-    ) -> Result<(), ApplicationError>;
-
-    async fn get(&self, object_key: &str) -> Result<Bytes, ApplicationError>;
 }
 
 pub trait AdapterFactory: Send + Sync {
@@ -1241,13 +1170,14 @@ fn validate_restrictions_within_profile(
                 Some("prompt_only") => ("prompt_only", declares("prompt")),
                 // 图生图/编辑需要参考图输入：Profile 必须声明一个名字以 `image`
                 // 开头的参数（`image`/`images`/`image_urls`）。
-                Some("image_conditioned") => {
-                    ("image_conditioned", declares_image_parameter(schema))
-                }
+                Some("image_conditioned") => (
+                    "image_conditioned",
+                    declares_reference_image_parameter(schema),
+                ),
                 // 遮罩编辑还需要遮罩输入，且遮罩不能脱离参考图。
                 Some("masked") => (
                     "masked",
-                    declares_image_parameter(schema) && declares_mask_parameter(schema),
+                    declares_reference_image_parameter(schema) && declares_mask_parameter(schema),
                 ),
                 Some(other) => {
                     return Err(ApplicationError::Validation(format!(
@@ -1272,65 +1202,25 @@ fn validate_restrictions_within_profile(
         .get("max_images")
         .and_then(Value::as_u64)
     {
-        let declared = declared_image_maximum(schema);
-        if max_images > declared {
-            return Err(ApplicationError::Validation(format!(
-                "restriction allows {max_images} image(s), but the profile declares at most {declared}"
-            )));
+        // 限制只能收窄：Profile 没承诺收图上限（数组没写 `maxItems`）时，任何正的 `max_images`
+        // 都算凭空放宽，同样拒绝。`0` 不需要 Profile 声明任何参考图参数。
+        if max_images > 0 {
+            match declared_reference_image_limit(schema) {
+                Some(declared) if max_images <= declared => {}
+                Some(declared) => {
+                    return Err(ApplicationError::Validation(format!(
+                        "restriction allows {max_images} image(s), but the profile declares at most {declared}"
+                    )));
+                }
+                None => {
+                    return Err(ApplicationError::Validation(format!(
+                        "restriction allows {max_images} image(s), but the profile declares no reference image count"
+                    )));
+                }
+            }
         }
     }
     Ok(())
-}
-
-/// Profile 是否声明了参考图参数。
-///
-/// 与运行期用的是**同一个判定**（[`is_image_parameter_name`]），因此"发布期允许的分支"
-/// 与"运行期认得的绑定路径"不会各判一套。
-fn declares_image_parameter(schema: &Value) -> bool {
-    declared_image_maximum(schema) > 0
-}
-
-/// Profile 是否声明了遮罩参数（名字含 `mask`）。
-fn declares_mask_parameter(schema: &Value) -> bool {
-    declared_properties(schema)
-        .is_some_and(|properties| properties.keys().any(|name| is_mask_parameter_name(name)))
-}
-
-fn declared_properties(schema: &Value) -> Option<&serde_json::Map<String, Value>> {
-    schema.get("properties").and_then(Value::as_object)
-}
-
-/// Profile 对参考图数量的声明上限。
-///
-/// 只看名字以 `image` 开头的参数（与运行期的绑定判定是同一个函数）：数组形式取
-/// `maxItems`；只有单值形式（`image`）时按 1 计；声明了数组却没写 `maxItems`
-/// 视为**没有承诺上限**，也就不能支撑任何 `max_images > 0` 的限制
-/// （限制只能收窄，不能凭空放宽）。
-fn declared_image_maximum(schema: &Value) -> u64 {
-    let Some(properties) = declared_properties(schema) else {
-        return 0;
-    };
-    let mut scalar = false;
-    let mut maximum = 0_u64;
-    for (name, field) in properties {
-        if !is_image_parameter_name(name) {
-            continue;
-        }
-        match field.get("type").and_then(Value::as_str) {
-            Some("array") => {
-                maximum = maximum.max(field.get("maxItems").and_then(Value::as_u64).unwrap_or(0));
-            }
-            Some("string") => scalar = true,
-            _ => {}
-        }
-    }
-    if maximum > 0 {
-        maximum
-    } else if scalar {
-        1
-    } else {
-        0
-    }
 }
 
 fn validate_adapter_compatibility(
@@ -1411,96 +1301,12 @@ fn validate_adapter_compatibility(
 }
 
 #[derive(Clone)]
-pub struct AssetService {
-    repository: Arc<dyn HubRepository>,
-    store: Arc<dyn AssetStore>,
-}
-
-impl AssetService {
-    #[must_use]
-    pub fn new(repository: Arc<dyn HubRepository>, store: Arc<dyn AssetStore>) -> Self {
-        Self { repository, store }
-    }
-
-    pub async fn upload(
-        &self,
-        account_id: AccountId,
-        role: &str,
-        media_type: &str,
-        bytes: Bytes,
-    ) -> Result<AssetRecord, ApplicationError> {
-        if !matches!(role, "image" | "mask") {
-            return Err(ApplicationError::Validation(
-                "asset role must be image or mask".to_owned(),
-            ));
-        }
-        validate_input_media(media_type, &bytes)?;
-        if role == "mask" && (media_type != "image/png" || !matches!(bytes.get(25), Some(4 | 6))) {
-            return Err(ApplicationError::Validation(
-                "mask must be a PNG with an alpha channel".to_owned(),
-            ));
-        }
-        let dimensions = imagesize::blob_size(&bytes)
-            .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        let asset_id = AssetId::new();
-        let digest = sha256_hex(&bytes);
-        let extension = match media_type {
-            "image/png" => "png",
-            "image/jpeg" => "jpg",
-            "image/webp" => "webp",
-            _ => {
-                return Err(ApplicationError::Validation(format!(
-                    "unsupported media type {media_type}"
-                )));
-            }
-        };
-        let object_key = format!("inputs/{account_id}/{asset_id}.{extension}");
-        self.store
-            .put(&object_key, bytes.clone(), media_type)
-            .await?;
-        let record = AssetRecord {
-            id: asset_id,
-            account_id,
-            role: role.to_owned(),
-            object_key,
-            media_type: media_type.to_owned(),
-            byte_count: u64::try_from(bytes.len())
-                .map_err(|_| ApplicationError::Validation("asset is too large".to_owned()))?,
-            width: u32::try_from(dimensions.width)
-                .map_err(|_| ApplicationError::Validation("asset width is too large".to_owned()))?,
-            height: u32::try_from(dimensions.height).map_err(|_| {
-                ApplicationError::Validation("asset height is too large".to_owned())
-            })?,
-            sha256: digest,
-            created_at: Utc::now(),
-        };
-        self.repository.insert_asset(record.clone()).await?;
-        Ok(record)
-    }
-
-    pub async fn download(
-        &self,
-        account_id: AccountId,
-        asset_id: AssetId,
-    ) -> Result<(AssetRecord, Bytes), ApplicationError> {
-        let record = self.repository.get_asset(account_id, asset_id).await?;
-        let bytes = self.store.get(&record.object_key).await?;
-        if sha256_hex(&bytes) != record.sha256 {
-            return Err(ApplicationError::ObjectStorage(format!(
-                "asset {asset_id} digest mismatch"
-            )));
-        }
-        Ok((record, bytes))
-    }
-}
-
-#[derive(Clone)]
 pub struct GenerationService {
     repository: Arc<dyn HubRepository>,
     /// 预授权额（microusd）：**服务端定的固定数**，不由调用方自报。
     ///
-    /// 现状是"一个固定数"，属粗判；按 Price Snapshot 算这次请求的最坏成本是后续优化
-    /// （`docs/adr/0009` 要求的"低于最小可能成本就受理前拒绝"要在那时一并实现）。
+    /// 现状是"一个固定数"，属粗判：它够跑通，也是上限。按 Price Snapshot 算出这次请求
+    /// 最坏要花多少、并在低于该成本时于受理前拒绝，是后续优化——那时这项才会变准。
     max_cost_microusd: u64,
     /// 该账户同时能有多少个**在跑**的生成任务（默认 1）。
     ///
@@ -1534,7 +1340,6 @@ impl GenerationService {
             ));
         }
         let branch = request.branch()?;
-        self.validate_input_assets(&request).await?;
         // 并发上限：一个账户同时只跑这么多个，多出来的在受理前就拒掉。
         // 同一个幂等键的重发不占名额：那种请求会去重成原来那个 Job（见 `create_job`）。
         if self
@@ -1546,17 +1351,17 @@ impl GenerationService {
             return Err(ApplicationError::TooManyInFlight);
         }
         let candidates = self.repository.active_offering(&request.model).await?;
-        let (offering, asset_bindings, routing) = select_candidate(&request, branch, &candidates)?;
-        // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的路径）：上游目录变了不该
-        // 让同一个幂等键算出不同的哈希。
+        let (offering, native_parameters, routing) =
+            select_candidate(&request, branch, &candidates)?;
+        // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按声明面过滤的结果）：
+        // 上游目录变了、或另一个候选的声明面更窄，都不该让同一个幂等键算出不同的哈希。
         let request_hash = request_hash(&request)?;
         self.repository
             .create_job(
                 CreateImageGeneration {
                     account_id: request.account_id,
                     gateway_model: request.model,
-                    native_parameters: request.native_parameters,
-                    asset_bindings,
+                    native_parameters,
                     idempotency_key: request.idempotency_key,
                     max_cost_microusd: self.max_cost_microusd,
                 },
@@ -1566,45 +1371,6 @@ impl GenerationService {
                 routing,
             )
             .await
-    }
-
-    /// 输入资产必须属于本账户、角色对得上，且遮罩与参考图同尺寸。
-    async fn validate_input_assets(
-        &self,
-        request: &CreateImageGenerationRequest,
-    ) -> Result<(), ApplicationError> {
-        let mut image_dimensions = None;
-        for asset_id in &request.image_asset_ids {
-            let asset = self
-                .repository
-                .get_asset(request.account_id, *asset_id)
-                .await?;
-            if !matches!(asset.role.as_str(), "image" | "output") {
-                return Err(ApplicationError::Validation(format!(
-                    "asset {} cannot be used as an image",
-                    asset.id
-                )));
-            }
-            image_dimensions.get_or_insert((asset.width, asset.height));
-        }
-        if let Some(mask_id) = request.mask_asset_id {
-            let asset = self
-                .repository
-                .get_asset(request.account_id, mask_id)
-                .await?;
-            if asset.role != "mask" {
-                return Err(ApplicationError::Validation(format!(
-                    "asset {} is not a mask",
-                    asset.id
-                )));
-            }
-            if Some((asset.width, asset.height)) != image_dimensions {
-                return Err(ApplicationError::Validation(
-                    "mask dimensions must match the input image".to_owned(),
-                ));
-            }
-        }
-        Ok(())
     }
 
     pub async fn get(
@@ -1618,7 +1384,6 @@ impl GenerationService {
 
 pub struct WorkerService {
     repository: Arc<dyn HubRepository>,
-    store: Arc<dyn AssetStore>,
     adapters: Arc<dyn AdapterFactory>,
     credentials: Arc<dyn CredentialProvider>,
     worker_id: String,
@@ -1629,7 +1394,6 @@ pub struct WorkerService {
 impl WorkerService {
     pub fn new(
         repository: Arc<dyn HubRepository>,
-        store: Arc<dyn AssetStore>,
         adapters: Arc<dyn AdapterFactory>,
         credentials: Arc<dyn CredentialProvider>,
         worker_id: String,
@@ -1643,7 +1407,6 @@ impl WorkerService {
         }
         Ok(Self {
             repository,
-            store,
             adapters,
             credentials,
             worker_id,
@@ -1667,27 +1430,20 @@ impl WorkerService {
 
     async fn execute(&self, claimed: ClaimedJob) -> Result<(), ApplicationError> {
         let attempt_id = AttemptId::new();
-        let prepared = match self.prepare(&claimed.job).await {
-            Ok(prepared) => prepared,
-            Err(error) => {
-                self.repository
-                    .fail_job(
-                        claimed.job.id,
-                        &self.worker_id,
-                        None,
-                        AttemptFailure {
-                            provider_code: "worker_prepare_failed".to_owned(),
-                            public_code: PublicErrorCode::PlatformUnavailable,
-                            message: error.to_string(),
-                            trace_id: None,
-                            kind: ProviderFailureKind::PlatformInternal,
-                            target_state: JobState::Failed,
-                            hold_disposition: HoldDisposition::Release,
-                        },
-                    )
-                    .await?;
-                return Ok(());
-            }
+        // 图片输入已经在 Job 的原生参数里（受理期落在候选自己的参数名上，未声明的名字那时就被
+        // 丢掉了），这里只是把它交给 Driver：平台不读字节、不核对摘要。
+        //
+        // 一并把"哪些名字是平台自己装好的"算出来交给 Driver：归属由**候选声明面 + 分支**决定，
+        // 两者都在 Job 里冻结了，所以这份名单是确定的、与调用方这一次恰好给了什么取值无关。
+        // Driver 不自己按取值的形状猜归属——那样会把一个像图的普通参数误当成平台的图。
+        let prepared = PreparedImageRequest {
+            provider_model_id: claimed.job.offering.provider_model_id.clone(),
+            branch: claimed.job.branch,
+            native_parameters: claimed.job.native_parameters.clone(),
+            platform_parameters: platform_image_parameters(
+                &claimed.job.offering.capability_schema,
+                claimed.job.branch,
+            ),
         };
         let request_digest = request_digest(&prepared)?;
         self.repository
@@ -1822,37 +1578,6 @@ impl WorkerService {
         }
     }
 
-    async fn prepare(&self, job: &GenerationJob) -> Result<PreparedImageRequest, ApplicationError> {
-        let mut assets = Vec::with_capacity(job.asset_bindings.len());
-        for binding in &job.asset_bindings {
-            let record = self
-                .repository
-                .get_asset(job.account_id, binding.asset_id)
-                .await?;
-            let bytes = self.store.get(&record.object_key).await?;
-            let digest = sha256_hex(&bytes);
-            if digest != record.sha256 {
-                return Err(ApplicationError::ObjectStorage(format!(
-                    "asset {} digest mismatch",
-                    record.id
-                )));
-            }
-            assets.push(ResolvedAsset {
-                native_parameter_path: binding.native_parameter_path.clone(),
-                position: binding.position,
-                media_type: record.media_type,
-                sha256: record.sha256,
-                bytes,
-            });
-        }
-        Ok(PreparedImageRequest {
-            provider_model_id: job.offering.provider_model_id.clone(),
-            branch: job.branch,
-            native_parameters: job.native_parameters.clone(),
-            assets,
-        })
-    }
-
     async fn complete_success(
         &self,
         job: &GenerationJob,
@@ -1870,45 +1595,18 @@ impl WorkerService {
                 job.max_cost_microusd
             )));
         }
-        let mut outputs = Vec::with_capacity(success.images.len());
-        for (index, image) in success.images.into_iter().enumerate() {
-            let asset_id = AssetId::new();
-            let dimensions = imagesize::blob_size(&image.bytes)
-                .map_err(|error| ApplicationError::ObjectStorage(error.to_string()))?;
-            let extension = match image.media_type.as_str() {
-                "image/jpeg" => "jpg",
-                "image/webp" => "webp",
-                _ => "png",
-            };
-            let object_key = format!("outputs/{}/{index}-{asset_id}.{extension}", job.id);
-            self.store
-                .put(&object_key, image.bytes.clone(), &image.media_type)
-                .await?;
-            outputs.push(AssetRecord {
-                id: asset_id,
-                account_id: job.account_id,
-                role: "output".to_owned(),
-                object_key,
-                media_type: image.media_type,
-                byte_count: u64::try_from(image.bytes.len()).map_err(|_| {
-                    ApplicationError::ObjectStorage("output is too large".to_owned())
-                })?,
-                width: u32::try_from(dimensions.width).map_err(|_| {
-                    ApplicationError::ObjectStorage("output width is too large".to_owned())
-                })?,
-                height: u32::try_from(dimensions.height).map_err(|_| {
-                    ApplicationError::ObjectStorage("output height is too large".to_owned())
-                })?,
-                sha256: image.sha256,
-                created_at: Utc::now(),
-            });
+        // 结果只是"当次信封"：渠道给 url 就留 url、给 base64 就留 base64，平台不看内容。
+        if success.images.is_empty() {
+            return Err(ApplicationError::Reconciliation(
+                "provider returned no image".to_owned(),
+            ));
         }
         self.repository
             .complete_job(CompleteJob {
                 job_id: job.id,
                 worker_id: self.worker_id.clone(),
                 attempt_id,
-                outputs,
+                images: success.images,
                 evidence: MeteringEvidence {
                     attempt_id,
                     provider_response_digest: success.response_digest,
@@ -1937,7 +1635,7 @@ fn validate_idempotency_key(value: &str) -> Result<(), ApplicationError> {
 
 fn validate_restrictions(
     branch: ImageBranch,
-    bindings: &[AssetBinding],
+    image_count: usize,
     restrictions: &Value,
 ) -> Result<(), ApplicationError> {
     if let Some(allowed) = restrictions
@@ -1955,10 +1653,6 @@ fn validate_restrictions(
             )));
         }
     }
-    let image_count = bindings
-        .iter()
-        .filter(|binding| binding.kind() == Some(AssetParameterKind::Image))
-        .count();
     let max_images = restrictions
         .get("max_images")
         .and_then(Value::as_u64)
@@ -1971,26 +1665,35 @@ fn validate_restrictions(
     Ok(())
 }
 
-/// 受理前的检查：**只要求合同的必填项在场，取值一律放行**。
+/// 受理前的准备：**先按候选的声明面过滤参数，再**把参考图与遮罩落到该候选**自己声明的参数名**上，
+/// 最后检查必填项在场。
 ///
-/// 现在**不**校验已知参数的取值合法性（枚举、区间、类型、未知字段都不管）：渠道自己的长尾
-/// 参数不必由平台逐个声明，调用方也不会因为多写一个参数被整体拒掉。哪些参数需要把取值管起来，
-/// 等有一份明确的清单后再加，加在这里。
+/// 过滤落在"选中候选之后、写 Job 之前"：调用方发了但该候选没声明的参数名在这里直接丢掉，
+/// 既不报错，也不会跟着 Job 与请求走去上游。选路之前不能过滤——那时还不知道是哪一份声明面。
 ///
-/// `model` 与图片绑定在校验前注入，所以它们照样参与"必填项在场"的判断。
-fn validate_native_request(
+/// 仍**不**校验参数的取值合法性（枚举、区间、类型都不管）：声明过的参数取值原样交给上游，
+/// 平台不替它改写。哪些参数需要把取值管起来，等有一份明确的清单后再加，加在这里。
+///
+/// `model` 与图片在校验前注入，所以它们照样参与"必填项在场"的判断。图片参数名来自同一份声明面，
+/// 过滤留得下它们——装载的图不会被丢掉。
+fn prepare_native_parameters(
     request: &CreateImageGenerationRequest,
     offering: &PublishedOffering,
-    bindings: &[AssetBinding],
-) -> Result<(), ApplicationError> {
-    let mut instance = request.native_parameters.clone();
-    let object = instance.as_object_mut().ok_or_else(|| {
+) -> Result<Value, ApplicationError> {
+    let supplied = request.native_parameters.as_object().ok_or_else(|| {
         ApplicationError::Validation("native_parameters must be an object".to_owned())
     })?;
+    let mut object = declared_parameter_names(&offering.capability_schema, supplied);
+    // `model` 是对外的平台型号名，由平台自己落；它本来就在候选的声明面里（`model.const`）。
     object.insert("model".to_owned(), Value::String(request.model.clone()));
-    for binding in bindings {
-        inject_asset_placeholder(object, binding)?;
-    }
+    place_image_inputs(
+        &offering.capability_schema,
+        &mut object,
+        &request.reference_images,
+        request.mask.as_deref(),
+    )
+    .map_err(ApplicationError::Validation)?;
+    let instance = Value::Object(object);
     let required = offering
         .capability_schema
         .get("required")
@@ -2004,27 +1707,13 @@ fn validate_native_request(
         }
     }
     if missing.is_empty() {
-        Ok(())
+        Ok(instance)
     } else {
         Err(ApplicationError::Validation(format!(
             "missing required parameter(s): {}",
             missing.join(", ")
         )))
     }
-}
-
-fn inject_asset_placeholder(
-    object: &mut Map<String, Value>,
-    binding: &AssetBinding,
-) -> Result<(), ApplicationError> {
-    // 写入规则（标量赋值 / 数组追加）与 Driver 回填 URL 时共用同一份实现。
-    set_native_parameter_at_path(
-        object,
-        &binding.native_parameter_path,
-        Value::String(format!("asset://{}", binding.asset_id)),
-    )
-    .map(|_| ())
-    .map_err(ApplicationError::Validation)
 }
 
 fn request_hash<T: Serialize>(value: &T) -> Result<String, ApplicationError> {
@@ -2037,23 +1726,14 @@ fn request_hash<T: Serialize>(value: &T) -> Result<String, ApplicationError> {
 }
 
 fn request_digest(request: &PreparedImageRequest) -> Result<String, ApplicationError> {
-    let assets = request
-        .assets
-        .iter()
-        .map(|asset| {
-            serde_json::json!({
-                "path": asset.native_parameter_path,
-                "position": asset.position,
-                "media_type": asset.media_type,
-                "sha256": asset.sha256,
-            })
-        })
-        .collect::<Vec<_>>();
+    // 摘要是"这一次请求"的身份，所以连平台自己装好的参数名一起纳入：名单决定了 Driver 把哪些
+    // 名字当图片、哪些按原样交给上游，它变了就是另一次请求。名单由受理时的候选面与分支算出，
+    // 因此同一份 Job 重复执行得到的摘要稳定可比。
     let mut value = serde_json::json!({
         "provider_model_id": request.provider_model_id,
         "branch": request.branch,
         "native_parameters": request.native_parameters,
-        "assets": assets,
+        "platform_parameters": request.platform_parameters,
     });
     canonicalize_json(&mut value);
     let bytes = serde_json::to_vec(&value)
@@ -2108,26 +1788,6 @@ fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
             }
         }
     }
-}
-
-fn validate_input_media(media_type: &str, bytes: &[u8]) -> Result<(), ApplicationError> {
-    let valid = match media_type {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        _ => false,
-    };
-    if !valid {
-        return Err(ApplicationError::Validation(
-            "media type does not match file signature".to_owned(),
-        ));
-    }
-    if bytes.len() > 16 * 1024 * 1024 {
-        return Err(ApplicationError::Validation(
-            "asset exceeds 16 MiB".to_owned(),
-        ));
-    }
-    Ok(())
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -2514,8 +2174,8 @@ mod tests {
             account_id: AccountId::new(),
             model: "gpt-image-2".to_owned(),
             native_parameters: parameters,
-            image_asset_ids: Vec::new(),
-            mask_asset_id: None,
+            reference_images: Vec::new(),
+            mask: None,
             idempotency_key: "request-0001".to_owned(),
         }
     }
@@ -2523,42 +2183,111 @@ mod tests {
     #[test]
     fn validates_prompt_only_native_request() {
         let request = image_request(serde_json::json!({"prompt": "hello"}));
-        assert!(validate_native_request(&request, &offering(), &[]).is_ok());
+        assert!(prepare_native_parameters(&request, &offering()).is_ok());
     }
 
     #[test]
-    fn loose_and_unknown_parameters_are_passed_through() {
-        // 现在不校验取值：类型不对的已知参数、没见过的参数都放行——渠道的长尾参数不必由
-        // 平台逐个声明，调用方也不会因为多写一个参数被整体拒掉。
+    fn parameters_the_candidate_never_declared_are_dropped_without_an_error() {
+        // 声明过的参数取值不校验：类型不对也照原样留下。
+        // 没声明的参数名（渠道一手参数、`seed`、`foo`）在受理期就丢掉——不报错，
+        // 也不会跟着 Job 走去上游。
+        let mut vendor = offering();
+        vendor.capability_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string", "minLength": 1},
+                "n": {"type": "integer"},
+                "quality": {"enum": ["low", "high"]}
+            }
+        });
         let request = image_request(serde_json::json!({
             "prompt": "hello",
             "n": "not-a-number",
-            "channel_specific_knob": {"a": 1}
+            "quality": "high",
+            "channel_specific_knob": {"a": 1},
+            "seed": 7,
+            "foo": "bar",
+            "image_with_roles": [{"role": "reference", "url": "https://example.invalid/a.png"}]
         }));
-        assert!(validate_native_request(&request, &offering(), &[]).is_ok());
+        let prepared = prepare_native_parameters(&request, &vendor)
+            .expect("undeclared parameters are dropped, not rejected");
+        let object = prepared.as_object().expect("an object");
+        assert_eq!(
+            object.keys().collect::<Vec<_>>(),
+            vec!["model", "n", "prompt", "quality"],
+            "只有声明过的名字留到 Job 里：{prepared}"
+        );
+        assert_eq!(object.get("n"), Some(&serde_json::json!("not-a-number")));
+        assert_eq!(object.get("quality"), Some(&serde_json::json!("high")));
+    }
+
+    #[test]
+    fn filtering_does_not_drop_the_images_the_platform_places() {
+        // 装载用的名字取自同一份声明面，所以"先过滤、再装载"不会把图丢掉。
+        let mut vendor = offering();
+        vendor.capability_schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string", "minLength": 1},
+                "image_urls": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                "mask_url": {"type": "string"}
+            }
+        });
+        let mut request = image_request(serde_json::json!({
+            "prompt": "hello",
+            "image_with_roles": [],
+            "seed": 1
+        }));
+        request.reference_images = vec!["data:image/png;base64,AAAA".to_owned()];
+        request.mask = Some("data:image/png;base64,BBBB".to_owned());
+        let prepared = prepare_native_parameters(&request, &vendor).expect("images are placed");
+        assert_eq!(
+            prepared.get("image_urls"),
+            Some(&serde_json::json!(["data:image/png;base64,AAAA"]))
+        );
+        assert_eq!(
+            prepared.get("mask_url"),
+            Some(&Value::String("data:image/png;base64,BBBB".to_owned()))
+        );
+        assert_eq!(
+            prepared
+                .as_object()
+                .expect("an object")
+                .keys()
+                .collect::<Vec<_>>(),
+            vec!["image_urls", "mask_url", "model", "prompt"],
+            "未声明的名字一个都不留：{prepared}"
+        );
     }
 
     #[test]
     fn missing_required_parameters_are_rejected() {
         let request = image_request(serde_json::json!({}));
-        let error = validate_native_request(&request, &offering(), &[])
+        let error = prepare_native_parameters(&request, &offering())
             .expect_err("a missing required parameter must fail");
         assert!(error.to_string().contains("prompt"), "{error}");
     }
 
     #[test]
-    fn injects_image_binding_before_schema_validation() {
+    fn places_reference_images_on_the_candidates_own_parameter() {
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
-        request.image_asset_ids.push(AssetId::new());
-        let bindings = bind_assets(&offering().capability_schema, &request).expect("image binding");
-        assert_eq!(bindings.len(), 1);
-        assert_eq!(bindings[0].native_parameter_path, "/image");
-        assert!(validate_native_request(&request, &offering(), &bindings).is_ok());
+        request.reference_images = vec!["https://example.invalid/a.png".to_owned()];
+        let prepared = prepare_native_parameters(&request, &offering()).expect("images are placed");
+        assert_eq!(
+            prepared.get("image"),
+            Some(&Value::String("https://example.invalid/a.png".to_owned()))
+        );
     }
 
     #[test]
-    fn injects_array_bindings_into_the_vendors_own_array_parameter() {
-        // 调用方只给 image/mask；装到 `image_urls` / `mask_url` 是平台按候选声明做的映射。
+    fn places_images_into_the_vendors_own_array_parameter() {
+        // 调用方只给参考图/遮罩；装到 `image_urls` / `mask_url` 是平台按候选声明做的映射。
         let mut vendor = offering();
         vendor.capability_schema = serde_json::json!({
             "type": "object",
@@ -2572,15 +2301,17 @@ mod tests {
             }
         });
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
-        request.image_asset_ids.push(AssetId::new());
-        request.mask_asset_id = Some(AssetId::new());
-        let bindings = bind_assets(&vendor.capability_schema, &request).expect("bindings");
-        let paths = bindings
-            .iter()
-            .map(|binding| binding.native_parameter_path.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(paths, vec!["/image_urls/0", "/mask_url"]);
-        assert!(validate_native_request(&request, &vendor, &bindings).is_ok());
+        request.reference_images = vec!["data:image/png;base64,AAAA".to_owned()];
+        request.mask = Some("data:image/png;base64,BBBB".to_owned());
+        let prepared = prepare_native_parameters(&request, &vendor).expect("images are placed");
+        assert_eq!(
+            prepared.get("image_urls"),
+            Some(&serde_json::json!(["data:image/png;base64,AAAA"]))
+        );
+        assert_eq!(
+            prepared.get("mask_url"),
+            Some(&Value::String("data:image/png;base64,BBBB".to_owned()))
+        );
 
         // 候选的参数面里没有装参考图的参数：这个候选表达不了，直接不合格。
         let mut text_only = offering();
@@ -2593,13 +2324,25 @@ mod tests {
                 "prompt": {"type": "string", "minLength": 1}
             }
         });
-        assert!(bind_assets(&text_only.capability_schema, &request).is_err());
+        assert!(prepare_native_parameters(&request, &text_only).is_err());
     }
 
     #[test]
-    fn mask_without_an_image_is_rejected() {
+    fn branch_follows_the_images_the_caller_sent() {
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
-        request.mask_asset_id = Some(AssetId::new());
+        assert_eq!(
+            request.branch().expect("prompt only"),
+            ImageBranch::PromptOnly
+        );
+        request.reference_images = vec!["https://example.invalid/a.png".to_owned()];
+        assert_eq!(
+            request.branch().expect("image conditioned"),
+            ImageBranch::ImageConditioned
+        );
+        request.mask = Some("data:image/png;base64,BBBB".to_owned());
+        assert_eq!(request.branch().expect("masked"), ImageBranch::Masked);
+        // 只有遮罩没有参考图：结构性规则，直接拒绝。
+        request.reference_images.clear();
         assert!(request.branch().is_err());
     }
 
@@ -2688,18 +2431,6 @@ mod tests {
             &self,
             _key_hash: &str,
         ) -> Result<AccountId, ApplicationError> {
-            unused_repository()
-        }
-
-        async fn insert_asset(&self, _asset: AssetRecord) -> Result<(), ApplicationError> {
-            unused_repository()
-        }
-
-        async fn get_asset(
-            &self,
-            _account_id: AccountId,
-            _asset_id: AssetId,
-        ) -> Result<AssetRecord, ApplicationError> {
             unused_repository()
         }
 
@@ -2818,44 +2549,6 @@ mod tests {
         }
     }
 
-    struct WorkerStore {
-        events: Arc<Mutex<Vec<&'static str>>>,
-        keys: Mutex<Vec<String>>,
-        /// 置 true 时 `put` 失败，用于构造"已确认生成但归档失败"的路径。
-        fail_put: bool,
-    }
-
-    #[async_trait]
-    impl AssetStore for WorkerStore {
-        async fn put(
-            &self,
-            object_key: &str,
-            _bytes: Bytes,
-            _media_type: &str,
-        ) -> Result<(), ApplicationError> {
-            self.events
-                .lock()
-                .map_err(|error| ApplicationError::ObjectStorage(error.to_string()))?
-                .push("store");
-            if self.fail_put {
-                return Err(ApplicationError::ObjectStorage(
-                    "archive unavailable in worker test".to_owned(),
-                ));
-            }
-            self.keys
-                .lock()
-                .map_err(|error| ApplicationError::ObjectStorage(error.to_string()))?
-                .push(object_key.to_owned());
-            Ok(())
-        }
-
-        async fn get(&self, _object_key: &str) -> Result<Bytes, ApplicationError> {
-            Err(ApplicationError::ObjectStorage(
-                "unused object read in worker test".to_owned(),
-            ))
-        }
-    }
-
     struct WorkerAdapter {
         succeeds: bool,
         calls: AtomicUsize,
@@ -2883,16 +2576,8 @@ mod tests {
                 }
                 .into());
             }
-            let bytes = Bytes::from(
-                hex::decode("89504e470d0a1a0a0000000d49484452000000010000000108060000001f15c4890000000d4944415478da6364f8cff01f0005fe02fe5dc638590000000049454e44ae426082")
-                    .expect("PNG fixture must decode"),
-            );
             Ok(ProviderSuccess {
-                images: vec![GeneratedImage {
-                    media_type: "image/png".to_owned(),
-                    sha256: sha256_hex(&bytes),
-                    bytes,
-                }],
+                images: vec![GeneratedImage::from_base64("iVBORw0KGgo=".to_owned())],
                 usage: TokenUsage {
                     input_tokens: 9,
                     input_text_tokens: 9,
@@ -2945,7 +2630,7 @@ mod tests {
         }
     }
 
-    fn worker_job() -> GenerationJob {
+    fn worker_job(max_cost_microusd: u64) -> GenerationJob {
         GenerationJob {
             id: JobId::new(),
             account_id: AccountId::new(),
@@ -2953,24 +2638,18 @@ mod tests {
             branch: ImageBranch::PromptOnly,
             gateway_model: "gpt-image-2".to_owned(),
             native_parameters: serde_json::json!({"prompt": "worker contract"}),
-            asset_bindings: Vec::new(),
             offering: offering(),
             idempotency_key: "worker-contract-1".to_owned(),
             request_hash: "request-hash".to_owned(),
-            max_cost_microusd: 20_000,
+            max_cost_microusd,
             created_at: Utc::now(),
             updated_at: Utc::now(),
         }
     }
 
-    fn worker(
-        repository: Arc<WorkerRepository>,
-        store: Arc<WorkerStore>,
-        adapter: Arc<WorkerAdapter>,
-    ) -> WorkerService {
+    fn worker(repository: Arc<WorkerRepository>, adapter: Arc<WorkerAdapter>) -> WorkerService {
         WorkerService::new(
             repository,
-            store,
             Arc::new(WorkerAdapterFactory { adapter }),
             Arc::new(WorkerCredentialProvider),
             "worker-test".to_owned(),
@@ -2981,30 +2660,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn worker_archives_output_before_evidence_settlement() {
+    async fn worker_settles_the_provider_image_envelope_with_the_evidence() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let repository = Arc::new(WorkerRepository::new(worker_job(), events.clone()));
-        let store = Arc::new(WorkerStore {
-            events: events.clone(),
-            keys: Mutex::new(Vec::new()),
-            fail_put: false,
-        });
+        let repository = Arc::new(WorkerRepository::new(worker_job(20_000), events.clone()));
         let adapter = Arc::new(WorkerAdapter {
             succeeds: true,
             calls: AtomicUsize::new(0),
         });
 
         assert!(
-            worker(repository.clone(), store, adapter.clone())
+            worker(repository.clone(), adapter.clone())
                 .run_once()
                 .await
                 .expect("worker run must succeed")
         );
         assert_eq!(adapter.calls.load(Ordering::SeqCst), 1);
-        assert_eq!(
-            *events.lock().expect("event lock"),
-            vec!["store", "complete"]
-        );
+        assert_eq!(*events.lock().expect("event lock"), vec!["complete"]);
         let completion = repository
             .completion
             .lock()
@@ -3013,26 +2684,25 @@ mod tests {
             .expect("job must complete");
         assert_eq!(completion.evidence.usage.total_tokens, 205);
         assert_eq!(completion.charge_microusd, 5_925);
-        assert_eq!(completion.outputs.len(), 1);
+        assert_eq!(
+            completion.images,
+            vec![GeneratedImage::from_base64("iVBORw0KGgo=".to_owned())],
+            "结果信封必须原样落到 Job：渠道给 base64 就留 base64"
+        );
         assert!(repository.failure.lock().expect("failure lock").is_none());
     }
 
     #[tokio::test]
     async fn worker_sends_ambiguous_provider_response_to_reconciliation_once() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let repository = Arc::new(WorkerRepository::new(worker_job(), events.clone()));
-        let store = Arc::new(WorkerStore {
-            events,
-            keys: Mutex::new(Vec::new()),
-            fail_put: false,
-        });
+        let repository = Arc::new(WorkerRepository::new(worker_job(20_000), events.clone()));
         let adapter = Arc::new(WorkerAdapter {
             succeeds: false,
             calls: AtomicUsize::new(0),
         });
 
         assert!(
-            worker(repository.clone(), store, adapter.clone())
+            worker(repository.clone(), adapter.clone())
                 .run_once()
                 .await
                 .expect("worker run must converge")
@@ -3058,28 +2728,23 @@ mod tests {
         );
     }
 
-    /// 第二种对账：**已确认生成、但归档失败**。
+    /// 第二种对账：**上游已确认生成、但平台无法结清**（实际费用超过受理时的预授权）。
     ///
     /// 与第一种（创建阶段失联）的区别在这条路径上体现为**错误码不同**：
     /// 这里是 `result_delivery_failed`，而创建阶段失联用 adapter 报的错误码。
     /// 两者都进对账并保留预授权，但性质可分。
     #[tokio::test]
-    async fn worker_sends_delivery_failure_to_reconciliation_with_its_own_code() {
+    async fn worker_sends_settlement_failure_to_reconciliation_with_its_own_code() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let repository = Arc::new(WorkerRepository::new(worker_job(), events.clone()));
-        // 上游成功，但归档不可用——生成已经发生，因此只能对账，不能当失败。
-        let store = Arc::new(WorkerStore {
-            events,
-            keys: Mutex::new(Vec::new()),
-            fail_put: true,
-        });
+        // 预授权 1 microusd，而这次生成的费用是 5_925：生成已经发生，因此只能对账，不能当失败。
+        let repository = Arc::new(WorkerRepository::new(worker_job(1), events.clone()));
         let adapter = Arc::new(WorkerAdapter {
             succeeds: true,
             calls: AtomicUsize::new(0),
         });
 
         assert!(
-            worker(repository.clone(), store, adapter.clone())
+            worker(repository.clone(), adapter.clone())
                 .run_once()
                 .await
                 .expect("worker run must converge")
@@ -3087,17 +2752,17 @@ mod tests {
         assert_eq!(
             adapter.calls.load(Ordering::SeqCst),
             1,
-            "the provider was called exactly once; delivery failure must not retry it"
+            "the provider was called exactly once; a settlement failure must not retry it"
         );
         let failure = repository
             .failure
             .lock()
             .expect("failure lock")
             .take()
-            .expect("delivery failure must be recorded");
+            .expect("settlement failure must be recorded");
         assert_eq!(
             failure.provider_code, "result_delivery_failed",
-            "the delivery failure must carry its own code, distinct from acceptance-unknown"
+            "the settlement failure must carry its own code, distinct from acceptance-unknown"
         );
         assert_eq!(
             failure.public_code,
@@ -3117,7 +2782,7 @@ mod tests {
                 .lock()
                 .expect("completion lock")
                 .is_none(),
-            "no settlement may happen when the result could not be archived"
+            "no settlement may happen when the actual charge exceeds the authorization"
         );
     }
 
@@ -3232,11 +2897,6 @@ mod tests {
         let rows = [
             (
                 "adapter_rejected",
-                ProviderFailureKind::PlatformInternal,
-                RetrySafety::NotRetryable,
-            ),
-            (
-                "worker_prepare_failed",
                 ProviderFailureKind::PlatformInternal,
                 RetrySafety::NotRetryable,
             ),

@@ -13,7 +13,6 @@ seeai-adapter-aihubmix = { path = "../../crates/adapter-aihubmix" }
 seeai-adapter-apimart = { path = "../../crates/adapter-apimart" }
 seeai-adapter-sdk = { path = "../../crates/adapter-sdk" }
 seeai-application = { path = "../../crates/application" }
-seeai-object-storage = { path = "../../crates/object-storage" }
 seeai-persistence = { path = "../../crates/persistence" }
 tokio.workspace = true
 tracing.workspace = true

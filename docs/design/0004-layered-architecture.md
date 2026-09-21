@@ -25,7 +25,7 @@
 | **④ Offering** | Provider、上游模型名、用哪个 Driver、渠道限制、优先级 | 供给面 | 运行时发布 | `supply.offerings` + `publication.runtime_entries` |
 | **⑤ Price** | 计价单位、单价、币种、汇率、生效区间（"上游金额口径"这一分支经实测**不需要**：两家渠道都返回分项 token） | 价格 | PG 动态配置 | `pricing.price_plans` |
 
-**① 层的已知差距（2026-09-20 登记，同日部分收口）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**已做掉的**：对客请求体改成**扁平**（不再有 `native_parameters` 外壳）、图片改用 OpenAI 契约的 `image` / `mask`（平台资产 id），参数路径与 `position` 不再出现在调用方面前；AIHubMix 素材与 Adapter 的 `extra` 包装已去掉（`quality` 顶层）。**仍存在的**：其余字段名与取值仍随候选不同（例如同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 且另有 `resolution`），调用方仍要看命中哪个候选；合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定，剩余收口对应的差距登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
+**① 层的已知差距（2026-09-20 登记，同日部分收口）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**已做掉的**：对客请求体改成**扁平**（不再有 `native_parameters` 外壳）、图片改用 OpenAI 契约的 `image` / `mask`（值为公网 URL 或 data URL，平台不再托管素材），参数路径与 `position` 不再出现在调用方面前；AIHubMix 素材与 Adapter 的 `extra` 包装已去掉（`quality` 顶层）。**仍存在的**：其余字段名与取值仍随候选不同（例如同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 且另有 `resolution`），调用方仍要看命中哪个候选；合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定，剩余收口对应的差距登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 ## 2. 四条不会违反的规则
 
@@ -116,6 +116,6 @@ gpt-image-2.5-flare                      <APIMart 实际接受的模型名>  ←
 ## 5. 与既有工件的关系
 
 - 本文只归纳，**不取代** `0001`（实现映射）与 `0002`（技术设计，v5 已评审通过）；冲突时以 `0002` 为准。
-- 持久决策仍在 `docs/adr/`。本文引用的依据来自 `0001`、`0002`、`adr/0001`（统一 Command）、`adr/0003`（PG 事实权威）、`adr/0004`（Vendor/Provider 身份分离）、`adr/0006`（证据门槛）、`adr/0007`（不自动重提）、`adr/0008`（自有对象存储为结果）。
+- 持久决策仍在 `docs/adr/`。本文引用的依据来自 `0001`、`0002`、`adr/0001`（统一 Command）、`adr/0003`（PG 事实权威）、`adr/0004`（Vendor/Provider 身份分离）、`adr/0006`（证据门槛）、`adr/0007`（不自动重提）、`adr/0019`（图片按渠道原形进原形出、不落盘静态资产，取代 `adr/0008`）。
 - 本文的用途是**约束后续规划**：新增 Provider 的工作量应按 §4 的清单评估，不得把渠道差异下沉为领域模型改动。
 - **落点索引**：本文说"每层负责什么、由谁拥有"；具体落在哪个 crate、哪个文件、哪张表，见 [`docs/architecture.md`](../architecture.md)（那份文档只做索引，职责与规则仍以本文为准，冲突时以本文为准）。

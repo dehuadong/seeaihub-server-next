@@ -15,27 +15,5 @@ services:
     volumes:
       - seeai-postgres:/var/lib/postgresql/data
 
-  minio:
-    image: quay.io/minio/minio:latest
-    command: server /data --console-address ":9001"
-    environment:
-      MINIO_ROOT_USER: minio
-      MINIO_ROOT_PASSWORD: minio-secret
-    ports:
-      - "59000:9000"
-      - "59001:9001"
-    volumes:
-      - seeai-minio:/data
-
-  minio-init:
-    image: quay.io/minio/mc:latest
-    depends_on:
-      - minio
-    entrypoint: >-
-      /bin/sh -c "until mc alias set local http://minio:9000 minio minio-secret;
-      do sleep 1; done;
-      mc mb --ignore-existing local/seeai-assets"
-
 volumes:
   seeai-postgres:
-  seeai-minio:

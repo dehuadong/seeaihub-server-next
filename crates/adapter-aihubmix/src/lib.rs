@@ -1,15 +1,17 @@
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, GeneratedImage, ImageAdapter, PreparedImageRequest,
-    ProviderCallError, ProviderCredential, ProviderFailureKind, ProviderSuccess, ResolvedAsset,
-    RetrySafety,
+    AdapterDescriptor, AdapterError, DecodedImage, GeneratedImage, ImageAdapter,
+    PreparedImageRequest, ProviderCallError, ProviderCredential, ProviderFailureKind,
+    ProviderSuccess, RetrySafety, decode_data_url, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
-use seeai_domain::{ImageBranch, TokenUsage};
+use seeai_domain::{
+    ImageBranch, ImageInputs, ImageParameterKind, TokenUsage, image_inputs,
+    platform_image_parameter,
+};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -18,8 +20,9 @@ use url::Url;
 
 pub const ADAPTER_KEY: &str = "aihubmix-image-v1";
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
-const MAX_OUTPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TOTAL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
+/// 单张输入图（参考图或遮罩）在内存里的上限：data URL 就地解码、公网 URL 自己下载，
+/// 两种形态都不落盘，因此必须有上限兜住内存。
+const MAX_INPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
 
 #[derive(Debug, Default)]
 pub struct AihubmixAdapterFactory;
@@ -141,6 +144,10 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
                 Value::String("masked".to_owned()),
             ]
         });
+    // 最小请求用的图片取值就是调用方能给的形态：内联 data URL 或公网 URL。
+    // 平台不再有"资产引用"这种值，Profile 也不该按它校验。
+    let image = "https://example.invalid/reference.png";
+    let mask = "data:image/png;base64,AAAA";
     let cases = [
         (
             "prompt_only",
@@ -148,11 +155,11 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
         ),
         (
             "image_conditioned",
-            serde_json::json!({"model": model, "prompt": "x", "image": "asset://image"}),
+            serde_json::json!({"model": model, "prompt": "x", "image": image}),
         ),
         (
             "masked",
-            serde_json::json!({"model": model, "prompt": "x", "image": "asset://image", "mask": "asset://mask"}),
+            serde_json::json!({"model": model, "prompt": "x", "image": image, "mask": mask}),
         ),
     ];
     for (branch, instance) in cases {
@@ -168,7 +175,8 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
         serde_json::json!({"model": model}),
         serde_json::json!({"model": model, "prompt": 1}),
         serde_json::json!({"model": model, "prompt": "x", "unknown": true}),
-        serde_json::json!({"model": model, "prompt": "x", "mask": "asset://mask"}),
+        // 遮罩不能脱离参考图：这份合同必须自己把这种请求判成非法。
+        serde_json::json!({"model": model, "prompt": "x", "mask": mask}),
     ] {
         if validator.is_valid(&invalid) {
             return Err(
@@ -270,27 +278,7 @@ impl AihubmixImageAdapter {
         request: &PreparedImageRequest,
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError> {
-        validate_edit_assets(request)?;
-        let image = single_asset(request, "/image")?;
-        let mut form = multipart::Form::new()
-            .text("model", request.provider_model_id.clone())
-            .text(
-                "prompt",
-                required_string(&request.native_parameters, "/prompt")?,
-            );
-        for (name, value) in passthrough_parameters(request) {
-            if let Some(text) = scalar_text(value) {
-                form = form.text(name.clone(), text);
-            }
-        }
-        form = form.part("image", asset_part(image, "image")?);
-        if let Some(mask) = request
-            .assets
-            .iter()
-            .find(|asset| asset.native_parameter_path == "/mask")
-        {
-            form = form.part("mask", asset_part(mask, "mask")?);
-        }
+        let form = self.edit_form(request).await?;
         let response = self
             .client
             .post(self.endpoint(request.branch)?)
@@ -301,19 +289,168 @@ impl AihubmixImageAdapter {
             .map_err(ambiguous_transport_error)?;
         parse_response(response).await
     }
+
+    /// 组好编辑请求的 multipart 表单。
+    ///
+    /// 单独拆出来，是为了让"部件名从哪来"能被直接验证：测试把这份表单摊成将要发出去的字节，
+    /// 看 `name="…"` 到底是谁（见测试里的 `multipart_body`）。
+    async fn edit_form(
+        &self,
+        request: &PreparedImageRequest,
+    ) -> Result<multipart::Form, AdapterError> {
+        let inputs = single_image_inputs(request)?;
+        let reference_part = image_part_name(request, ImageParameterKind::Reference)?;
+        let image = self.image_bytes(&inputs.reference_images[0]).await?;
+        let mut form = multipart::Form::new()
+            .text("model", request.provider_model_id.clone())
+            .text(
+                "prompt",
+                required_string(&request.native_parameters, "/prompt")?,
+            );
+        for (name, value) in passthrough_parameters(request) {
+            // 标量转成文本部件；数组与对象**没有**可用的表示法，于是明确失败——
+            // 见 [`multipart_text`] 里为什么不做"序列化成 JSON 文本"这种替代形态。
+            form = form.text(name.clone(), multipart_text(name, value)?);
+        }
+        form = form.part(reference_part.to_owned(), image_part(image)?);
+        if let Some(mask) = &inputs.mask {
+            let mask_part = image_part_name(request, ImageParameterKind::Mask)?;
+            let mask = self.image_bytes(mask).await?;
+            form = form.part(mask_part.to_owned(), image_part(mask)?);
+        }
+        Ok(form)
+    }
+
+    /// 把一种图片形态取成字节：`data:` URL 就地解码，公网 URL 自己下载（只在内存里）。
+    ///
+    /// 这一步发生在生成请求之前，所以失败时**上游什么都没收到**：按可证明未受理处理
+    /// （Job 失败并释放预授权），不进对账。
+    async fn image_bytes(&self, value: &str) -> Result<DecodedImage, AdapterError> {
+        match classify_image_value(value)? {
+            ImageValue::Inline(value) => decode_inline_image(value),
+            ImageValue::Remote(url) => self.download_image(url).await,
+        }
+    }
+
+    /// 公网 URL 自己下载：带超时（用本 Driver 的 HTTP 客户端）与体积上限，只在内存里。
+    async fn download_image(&self, url: &str) -> Result<DecodedImage, AdapterError> {
+        let response = self
+            .client
+            .get(url)
+            .send()
+            .await
+            .map_err(reference_image_unavailable)?;
+        let status = response.status();
+        if !status.is_success() {
+            return Err(reference_image_unavailable(format!(
+                "reference image returned HTTP {}",
+                status.as_u16()
+            )));
+        }
+        let media_type = response
+            .headers()
+            .get(reqwest::header::CONTENT_TYPE)
+            .and_then(|value| value.to_str().ok())
+            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
+            .unwrap_or_else(|| "image/png".to_owned());
+        let bytes = read_limited(response, MAX_INPUT_IMAGE_BYTES)
+            .await
+            .map_err(|error| reference_image_unavailable(error.to_string()))?;
+        Ok(DecodedImage { media_type, bytes })
+    }
 }
 
-fn validate_edit_assets(request: &PreparedImageRequest) -> Result<(), AdapterError> {
-    if request
-        .assets
-        .iter()
-        .any(|asset| asset.native_parameter_path.starts_with("/images/"))
-    {
+/// 参考图/遮罩的两种允许形态。
+#[derive(Debug)]
+enum ImageValue<'a> {
+    /// `data:image/…;base64,…`：就地解码。
+    Inline(&'a str),
+    /// 公网 http(s) 地址：自己下载。
+    Remote(&'a str),
+}
+
+fn classify_image_value(value: &str) -> Result<ImageValue<'_>, AdapterError> {
+    if value.starts_with("data:") {
+        return Ok(ImageValue::Inline(value));
+    }
+    if is_http_url(value) {
+        return Ok(ImageValue::Remote(value));
+    }
+    Err(AdapterError::UnsupportedInput(format!(
+        "a reference image must be an http(s) url or a data url, got {value}"
+    )))
+}
+
+fn decode_inline_image(value: &str) -> Result<DecodedImage, AdapterError> {
+    let decoded = decode_data_url(value).map_err(AdapterError::UnsupportedInput)?;
+    ensure_input_size(decoded.bytes.len())?;
+    Ok(decoded)
+}
+
+/// 这个 Driver 的编辑端点只吃一张参考图（外加一张遮罩）：多给的直接拒绝，不静默丢掉。
+fn single_image_inputs(request: &PreparedImageRequest) -> Result<ImageInputs, AdapterError> {
+    let inputs = image_inputs(&request.native_parameters, &request.platform_parameters)
+        .map_err(AdapterError::UnsupportedInput)?;
+    if inputs.reference_images.is_empty() {
+        return Err(AdapterError::UnsupportedInput(
+            "the edit endpoint needs one reference image".to_owned(),
+        ));
+    }
+    if inputs.reference_images.len() > 1 {
         return Err(AdapterError::UnsupportedInput(
             "the metered /v1 edit endpoint is published for one image only".to_owned(),
         ));
     }
+    Ok(inputs)
+}
+
+/// 编辑路径上图片部件的名字：**取自平台名单**，不写死。
+///
+/// 名单里的名字就是被选中候选自己声明的参数名（受理时按候选声明面与分支算好、随请求冻结），
+/// 所以 Profile 把参考图声明成 `image_urls` 时，线上部件名跟着变成 `image_urls`——平台不改写
+/// 渠道参数名。哪个名字是遮罩仍按候选面的判定函数分（`image_parameter_kind` 看名字的形状，
+/// 与取值无关）。
+///
+/// 名单里找不到这个角色：这份候选表达不了这次请求，按"装不下/表达不了"明确失败。绝不退回一个
+/// 写死的名字——那会把图塞进上游根本没声明过的字段，而且错得无声无息。
+fn image_part_name(
+    request: &PreparedImageRequest,
+    kind: ImageParameterKind,
+) -> Result<&str, AdapterError> {
+    platform_image_parameter(&request.platform_parameters, kind).ok_or_else(|| {
+        let role = match kind {
+            ImageParameterKind::Reference => "reference image",
+            ImageParameterKind::Mask => "mask",
+        };
+        AdapterError::UnsupportedInput(format!(
+            "the offering declares no {role} parameter, so the edit endpoint has no part to carry it"
+        ))
+    })
+}
+
+fn ensure_input_size(bytes: usize) -> Result<(), AdapterError> {
+    if bytes > MAX_INPUT_IMAGE_BYTES {
+        return Err(AdapterError::UnsupportedInput(format!(
+            "the reference image exceeds the {MAX_INPUT_IMAGE_BYTES}-byte limit"
+        )));
+    }
     Ok(())
+}
+
+/// 按上限读满一个响应体（下载参考图时用，避免把内存读穿）。
+async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Bytes, AdapterError> {
+    let mut body = BytesMut::new();
+    let mut stream = response.bytes_stream();
+    while let Some(chunk) = stream.next().await {
+        let chunk = chunk.map_err(ambiguous_transport_error)?;
+        if body.len().saturating_add(chunk.len()) > limit {
+            return Err(AdapterError::UnsupportedInput(format!(
+                "the reference image exceeds the {limit}-byte limit"
+            )));
+        }
+        body.extend_from_slice(&chunk);
+    }
+    Ok(body.freeze())
 }
 
 #[async_trait]
@@ -352,10 +489,17 @@ fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError
     Ok(Value::Object(object))
 }
 
-/// 平台自己产的字段与图片参数之外的参数，**原样透传**给上游。
+/// 平台自己装好的参数名与图片参数之外的参数，**原样**交给上游。
 ///
-/// 平台只按合同校验**已知**参数的取值，未知参数交给上游（渠道自己的长尾参数因此不必逐个
-/// 由平台声明）；图片由 `assets` 回填，所以这里跳过它们的参数名。
+/// 到手的参数面本身就是候选声明面里的子集（未声明的名字在受理期就按声明面丢掉了，见
+/// `seeai_domain`），所以这里不做"认不认识"的判别，只跳过两类：平台自己落的 `model`/`prompt`，
+/// 以及**平台装载进去的那些图片参数名**（名单由受理时算好，见
+/// [`PreparedImageRequest::platform_parameters`]）——图片在这条链路上走文件部件，走了 JSON 体
+/// 就会既重复又形态不对。其余名字逐字过去，取值一个都不改：归属不看取值的形状，
+/// 所以名字像图也不会让它消失。
+///
+/// 唯一的例外是空值：`null` 表示"这一处没有给"，与平台的图片参数无关，也不是一个参数值，
+/// 因此不进请求体（全平台共用的空值约定，见 `seeai_domain`）。
 fn passthrough_parameters(request: &PreparedImageRequest) -> Vec<(&String, &Value)> {
     let Value::Object(parameters) = &request.native_parameters else {
         return Vec::new();
@@ -365,19 +509,12 @@ fn passthrough_parameters(request: &PreparedImageRequest) -> Vec<(&String, &Valu
         .filter(|(name, value)| {
             !matches!(name.as_str(), "model" | "prompt")
                 && !value.is_null()
-                && !request.assets.iter().any(|asset| {
-                    asset_parameter_name(&asset.native_parameter_path) == name.as_str()
-                })
+                && !request
+                    .platform_parameters
+                    .iter()
+                    .any(|declared| declared == *name)
         })
         .collect()
-}
-
-/// 参数路径（`/image_urls/0`）的第一段：参数名。
-fn asset_parameter_name(path: &str) -> &str {
-    path.trim_start_matches('/')
-        .split('/')
-        .next()
-        .unwrap_or_default()
 }
 
 fn required_string(parameters: &Value, pointer: &str) -> Result<String, AdapterError> {
@@ -391,7 +528,23 @@ fn required_string(parameters: &Value, pointer: &str) -> Result<String, AdapterE
         })
 }
 
-/// multipart 文本部件只接受字符串：标量转成文本，对象/数组不装。
+/// multipart 文本部件只接受标量：字符串、数字、布尔各自转成文本，**数组与对象明确失败**。
+///
+/// 为什么失败而不是找一个替代形态：multipart 的文本部件承载不了数组与对象，它们在这条线上
+/// 没有可用的表示法。把数组序列化成一段 JSON 文本发过去，等于替上游发明一种它没有文档的形状
+/// （多值究竟是重复同名字段、还是收一段 JSON，只有渠道文档说了才算数），上游很可能把它当成
+/// 一个普通字符串——错得无声无息；而像从前那样返回 `None` 把它跳过，则是把调用方给的参数
+/// 直接丢掉。两者都不做：这条路径上遇到不可承载的取值就报错，让调用方自己把它换成上游承认的
+/// 形状（或改走 JSON 入口，那里任何 JSON 取值都能逐字过去）。
+fn multipart_text(name: &str, value: &Value) -> Result<String, AdapterError> {
+    scalar_text(value).ok_or_else(|| {
+        AdapterError::UnsupportedInput(format!(
+            "the multipart edit endpoint cannot carry `{name}`: {value} is not a scalar, and this \
+             endpoint has no textual form for arrays or objects"
+        ))
+    })
+}
+
 fn scalar_text(value: &Value) -> Option<String> {
     match value {
         Value::String(value) => Some(value.clone()),
@@ -401,30 +554,12 @@ fn scalar_text(value: &Value) -> Option<String> {
     }
 }
 
-fn single_asset<'a>(
-    request: &'a PreparedImageRequest,
-    path: &str,
-) -> Result<&'a ResolvedAsset, AdapterError> {
-    let matches = request
-        .assets
-        .iter()
-        .filter(|asset| asset.native_parameter_path == path)
-        .collect::<Vec<_>>();
-    match matches.as_slice() {
-        [asset] => Ok(*asset),
-        [] => Err(AdapterError::UnsupportedInput(format!(
-            "missing asset binding {path}"
-        ))),
-        _ => Err(AdapterError::UnsupportedInput(format!(
-            "multiple assets bound to {path}"
-        ))),
-    }
-}
-
-fn asset_part(asset: &ResolvedAsset, name: &str) -> Result<multipart::Part, AdapterError> {
-    multipart::Part::bytes(asset.bytes.to_vec())
-        .file_name(format!("{name}.{}", extension_for(&asset.media_type)))
-        .mime_str(&asset.media_type)
+/// 一张输入图变成 multipart 文件部件：文件名与 MIME 按解码出的媒体类型给。
+fn image_part(image: DecodedImage) -> Result<multipart::Part, AdapterError> {
+    let name = format!("image.{}", extension_for(&image.media_type));
+    multipart::Part::bytes(image.bytes.to_vec())
+        .file_name(name)
+        .mime_str(&image.media_type)
         .map_err(|error| AdapterError::UnsupportedInput(error.to_string()))
 }
 
@@ -434,6 +569,20 @@ fn extension_for(media_type: &str) -> &'static str {
         "image/webp" => "webp",
         _ => "png",
     }
+}
+
+/// 参考图取不到字节（公网 URL 下载失败、或它不是 http(s) 地址）。
+///
+/// 生成请求还没发出去，所以是**可证明未受理**：Job 直接失败并释放预授权，不进对账。
+fn reference_image_unavailable(message: impl std::fmt::Display) -> AdapterError {
+    ProviderCallError {
+        code: "reference_image_unavailable".to_owned(),
+        message: message.to_string(),
+        trace_id: None,
+        retry_safety: RetrySafety::SafeBeforeAcceptance,
+        kind: ProviderFailureKind::Unknown,
+    }
+    .into()
 }
 
 fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
@@ -484,45 +633,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
         })
     })?;
     let usage = parsed.usage.into_domain()?;
-    let media_type = media_type_for_format(parsed.output_format.as_deref());
-    let mut images = Vec::with_capacity(parsed.data.len());
-    let mut total_output_bytes = 0_usize;
-    for item in parsed.data {
-        let encoded = item.b64_json.ok_or_else(|| {
-            AdapterError::Provider(ProviderCallError {
-                code: "provider_result_missing".to_owned(),
-                message: "response item has no b64_json".to_owned(),
-                trace_id: None,
-                retry_safety: RetrySafety::AcceptanceUnknown,
-                kind: ProviderFailureKind::UpstreamUnavailable,
-            })
-        })?;
-        if encoded.len() > MAX_OUTPUT_IMAGE_BYTES.saturating_mul(4).div_ceil(3) + 4 {
-            return Err(provider_output_too_large());
-        }
-        let decoded = STANDARD.decode(encoded).map_err(|error| {
-            AdapterError::Provider(ProviderCallError {
-                code: "provider_result_invalid_base64".to_owned(),
-                message: error.to_string(),
-                trace_id: None,
-                retry_safety: RetrySafety::AcceptanceUnknown,
-                kind: ProviderFailureKind::UpstreamUnavailable,
-            })
-        })?;
-        if decoded.len() > MAX_OUTPUT_IMAGE_BYTES {
-            return Err(provider_output_too_large());
-        }
-        total_output_bytes = total_output_bytes.saturating_add(decoded.len());
-        if total_output_bytes > MAX_TOTAL_OUTPUT_BYTES {
-            return Err(provider_output_too_large());
-        }
-        validate_image_magic(&decoded, media_type)?;
-        images.push(GeneratedImage {
-            media_type: media_type.to_owned(),
-            sha256: sha256_hex(&decoded),
-            bytes: Bytes::from(decoded),
-        });
-    }
+    let images = images_from_response(parsed.data)?;
     if images.is_empty() {
         return Err(AdapterError::Provider(ProviderCallError {
             code: "provider_result_empty".to_owned(),
@@ -540,21 +651,35 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
     })
 }
 
+/// 上游给什么就留什么：给 `url` 就留 `url`、给 base64 就留 `b64_json`。
+///
+/// 两个都给时保留 `url`（体积小，且与本渠道的默认形态一致）；两个都没有说明这条响应
+/// 不可用，按"结果缺失"失败——绝不猜一个空图出来。
+fn images_from_response(data: Vec<ImageData>) -> Result<Vec<GeneratedImage>, AdapterError> {
+    let mut images = Vec::with_capacity(data.len());
+    for item in data {
+        let image = match (item.url, item.b64_json) {
+            (Some(url), _) => GeneratedImage::from_url(url),
+            (None, Some(b64_json)) => GeneratedImage::from_base64(b64_json),
+            (None, None) => {
+                return Err(AdapterError::Provider(ProviderCallError {
+                    code: "provider_result_missing".to_owned(),
+                    message: "response item carries neither url nor b64_json".to_owned(),
+                    trace_id: None,
+                    retry_safety: RetrySafety::AcceptanceUnknown,
+                    kind: ProviderFailureKind::UpstreamUnavailable,
+                }));
+            }
+        };
+        images.push(image);
+    }
+    Ok(images)
+}
+
 fn provider_response_too_large() -> AdapterError {
     ProviderCallError {
         code: "provider_response_too_large".to_owned(),
         message: "provider response exceeded the configured safety limit".to_owned(),
-        trace_id: None,
-        retry_safety: RetrySafety::AcceptanceUnknown,
-        kind: ProviderFailureKind::UpstreamUnavailable,
-    }
-    .into()
-}
-
-fn provider_output_too_large() -> AdapterError {
-    ProviderCallError {
-        code: "provider_output_too_large".to_owned(),
-        message: "provider output image exceeded the configured safety limit".to_owned(),
         trace_id: None,
         retry_safety: RetrySafety::AcceptanceUnknown,
         kind: ProviderFailureKind::UpstreamUnavailable,
@@ -613,34 +738,6 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
     }
 }
 
-fn media_type_for_format(format: Option<&str>) -> &'static str {
-    match format {
-        Some("jpeg") | Some("jpg") => "image/jpeg",
-        Some("webp") => "image/webp",
-        _ => "image/png",
-    }
-}
-
-fn validate_image_magic(bytes: &[u8], media_type: &str) -> Result<(), AdapterError> {
-    let valid = match media_type {
-        "image/png" => bytes.starts_with(b"\x89PNG\r\n\x1a\n"),
-        "image/jpeg" => bytes.starts_with(&[0xff, 0xd8, 0xff]),
-        "image/webp" => bytes.len() >= 12 && &bytes[..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        _ => false,
-    };
-    if valid {
-        Ok(())
-    } else {
-        Err(AdapterError::Provider(ProviderCallError {
-            code: "provider_result_media_mismatch".to_owned(),
-            message: format!("result does not match declared media type {media_type}"),
-            trace_id: None,
-            retry_safety: RetrySafety::AcceptanceUnknown,
-            kind: ProviderFailureKind::UpstreamUnavailable,
-        }))
-    }
-}
-
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
 }
@@ -648,12 +745,14 @@ fn sha256_hex(bytes: &[u8]) -> String {
 #[derive(Debug, Deserialize)]
 struct ImageResponse {
     data: Vec<ImageData>,
-    output_format: Option<String>,
     usage: UsageResponse,
 }
 
 #[derive(Debug, Deserialize)]
 struct ImageData {
+    #[serde(default)]
+    url: Option<String>,
+    #[serde(default)]
     b64_json: Option<String>,
 }
 
@@ -711,9 +810,15 @@ struct ErrorBody {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use seeai_adapter_sdk::ResolvedAsset;
+    use seeai_domain::platform_image_parameters;
 
     fn request(branch: ImageBranch) -> PreparedImageRequest {
+        request_for(&published_schema(), branch)
+    }
+
+    /// 按某个候选声明面造一份受理产物：名单与线上**同一处推导**（候选声明的参数名 + 分支），
+    /// 测试里不另抄一份名字。
+    fn request_for(schema: &Value, branch: ImageBranch) -> PreparedImageRequest {
         PreparedImageRequest {
             provider_model_id: "gpt-image-2".to_owned(),
             branch,
@@ -724,8 +829,30 @@ mod tests {
                 "output_format": "png",
                 "quality": "low"
             }),
-            assets: Vec::new(),
+            platform_parameters: platform_image_parameters(schema, branch),
         }
+    }
+
+    /// 发布素材里那份 Profile 的参数面（声明的是 `image` / `mask`）。
+    fn published_schema() -> Value {
+        published_offering(&published_config())["capability_schema"].clone()
+    }
+
+    /// 把 Driver 组好的编辑表单摊成**将要发出去的字节**：`name="…"` 就是上游收到的东西。
+    ///
+    /// 不起上游也不走网络：测试里的图都是内联 data URL，取字节这一步没有任何 IO。
+    /// （表单的字节流由 reqwest 自己拼装，这里只是把它读出来。）
+    async fn multipart_body(request: &PreparedImageRequest) -> Result<String, AdapterError> {
+        let adapter =
+            AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
+                .expect("adapter config should be valid");
+        let form = adapter.edit_form(request).await?;
+        let chunks = form.into_stream().collect::<Vec<_>>().await;
+        let mut body = Vec::new();
+        for chunk in chunks {
+            body.extend_from_slice(&chunk.expect("the form should stream"));
+        }
+        Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
     /// 发布素材现在是"数组形式"：Profile 与 restrictions 在 `offerings[0]` 内。
@@ -828,33 +955,251 @@ mod tests {
         );
     }
 
+    /// 到手的每一个参数都原样进请求体：名字不改，取值也不改。
+    ///
+    /// 这是个**防御性**用例：按现行规则，本用例塞进来的名字在受理期就按候选声明面丢掉了，
+    /// 到不了 Driver（到手的参数面本来就是声明面里的子集）。之所以还要这么写，是为了钉住
+    /// Driver **自己**的判断依据：它不按名字、也不按取值的形状重新解释任何参数——名字以 `image`
+    /// 开头、取值是对象数组的一手参数（渠道文档里写明的形状）在它眼里同样只是一个普通参数。
+    /// 将来上游过滤一旦放松，这里会立刻看得见。
     #[test]
-    fn forwards_parameters_it_does_not_know() {
-        // 平台不逐个声明渠道的长尾参数：没见过的键原样发给上游。
+    fn every_parameter_it_receives_goes_upstream_verbatim() {
         let mut prepared = request(ImageBranch::PromptOnly);
         let Value::Object(parameters) = &mut prepared.native_parameters else {
             panic!("fixture parameters must be an object");
         };
         parameters.insert("channel_specific_knob".to_owned(), Value::from(7));
+        parameters.insert(
+            "image_with_roles".to_owned(),
+            serde_json::json!([{"role": "reference", "url": "https://example.invalid/a.png"}]),
+        );
         let body = generation_body(&prepared).expect("request should be supported");
         assert_eq!(
             body.pointer("/channel_specific_knob"),
             Some(&Value::from(7))
+        );
+        assert_eq!(
+            body.pointer("/image_with_roles/0/role"),
+            Some(&Value::String("reference".to_owned()))
+        );
+        // 声明过的可选参数一并原样过去（`request()` 的声明面里有 `quality`）。
+        assert_eq!(
+            body.pointer("/quality"),
+            Some(&Value::String("low".to_owned()))
+        );
+    }
+
+    /// Driver 不按名字或取值的形状重新解释参数：`images` 留在原地，不会被当成参考图。
+    ///
+    /// 归属只看平台名单（名单里是候选声明、平台装载过的那些名字）：名字不在名单里的参数，
+    /// Driver 既不拿它当图、也不把它的值改写成上游 URL。这也是个**防御性**用例：`images` 没被
+    /// 这份候选声明，正常链路上在受理期就丢了，到不了这里；把它直接塞进请求，是为了钉住
+    /// Driver 的判断依据始终是名单，而不是"这个名字看起来像图"。
+    #[test]
+    fn a_received_parameter_is_never_reinterpreted_by_its_shape() {
+        let mut prepared = request(ImageBranch::PromptOnly);
+        let Value::Object(parameters) = &mut prepared.native_parameters else {
+            panic!("fixture parameters must be an object");
+        };
+        parameters.insert(
+            "images".to_owned(),
+            serde_json::json!(["https://example.invalid/u.png"]),
+        );
+        let body = generation_body(&prepared).expect("request should be supported");
+        assert_eq!(
+            body.pointer("/images"),
+            Some(&serde_json::json!(["https://example.invalid/u.png"])),
+            "到手的参数逐字上行：{body}"
+        );
+        assert!(
+            body.pointer("/image").is_none(),
+            "名单里没有 `images`：Driver 不按形状把它认领成参考图，也不改写名字：{body}"
+        );
+    }
+
+    /// multipart 的编辑路径：到手的一手参数**要么进文本部件、要么明确失败**，不许被默默跳过。
+    ///
+    /// 标量照旧进文本部件；数组在 multipart 里没有平台承认的表示法，于是报错并点名是哪个参数
+    /// （`multipart_text` 里写了为什么不做"序列化成 JSON 文本"这种替代形态）。用例里塞进来的
+    /// 两个名字同样越过了受理期的声明面过滤（正常链路上到不了这里），钉的是这条路径的处置
+    /// 不依赖"这个名字认不认识"：标量有文本部件形态、数组明确失败，两条都在。
+    #[test]
+    fn received_parameters_on_the_multipart_path_are_never_dropped_silently() {
+        let mut prepared = request(ImageBranch::ImageConditioned);
+        prepared.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": "data:image/png;base64,AAAA",
+            "channel_specific_knob": "scalar",
+            // 名字像图、取值是字符串数组，但不在名单里：Driver 只当它是普通参数，
+            // 而 multipart 没有能承载数组的文本部件形态。
+            "images": ["https://example.invalid/u.png"]
+        });
+        let scalar = multipart_text("channel_specific_knob", &Value::from("scalar"))
+            .expect("标量有文本部件形态");
+        assert_eq!(scalar, "scalar");
+        let error = multipart_text(
+            "images",
+            &serde_json::json!(["https://example.invalid/u.png"]),
+        )
+        .expect_err("数组在这条路径上没有表示法");
+        let message = error.to_string();
+        assert!(message.contains("images"), "报错必须点名参数：{message}");
+        // 名单里的图片参数不在这条透传链路上：它们走文件部件。
+        assert!(
+            !passthrough_parameters(&prepared)
+                .iter()
+                .any(|(name, _)| name.as_str() == "image")
         );
     }
 
     #[test]
     fn rejects_multiple_images_on_metered_edit_contract() {
         let mut value = request(ImageBranch::ImageConditioned);
-        value.assets = vec![ResolvedAsset {
-            native_parameter_path: "/images/0".to_owned(),
-            position: 0,
-            media_type: "image/png".to_owned(),
-            sha256: "abc".to_owned(),
-            bytes: Bytes::from_static(b"image"),
-        }];
-        let error = validate_edit_assets(&value).expect_err("multi-image edit must be rejected");
+        value.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
+        });
+        let error = single_image_inputs(&value).expect_err("multi-image edit must be rejected");
         assert!(error.to_string().contains("one image only"));
+        // 一张参考图可以被接受；遮罩一并带出来。
+        let mut masked = request(ImageBranch::Masked);
+        masked.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": "data:image/png;base64,AAAA",
+            "mask": "data:image/png;base64,BBBB"
+        });
+        let inputs = single_image_inputs(&masked).expect("one reference image plus a mask");
+        assert_eq!(inputs.reference_images.len(), 1);
+        assert!(inputs.mask.is_some());
+        // 没有参考图：编辑端点没有可编辑的图，直接拒绝。
+        assert!(single_image_inputs(&request(ImageBranch::ImageConditioned)).is_err());
+    }
+
+    #[test]
+    fn images_are_not_sent_as_text_parameters() {
+        // 图片走文件部件：JSON 体里不许再出现 `image` / `mask` 的字符串值。
+        let mut prepared = request(ImageBranch::Masked);
+        prepared.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": "data:image/png;base64,AAAA",
+            "mask": "data:image/png;base64,BBBB"
+        });
+        let names = passthrough_parameters(&prepared)
+            .into_iter()
+            .map(|(name, _)| name.clone())
+            .collect::<Vec<_>>();
+        assert!(!names.iter().any(|name| name == "image" || name == "mask"));
+    }
+
+    /// 部件名与候选声明面同源：Profile 把参考图参数声明成 `image_urls`（**不是** `image`）时，
+    /// 线上 multipart 的部件名就是 `image_urls`。
+    ///
+    /// 断言看的是表单摊成的字节里那些 `name="…"`——写死名字的实现会在这里发出 `name="image"`，
+    /// 于是把图塞进上游根本没声明过的字段：静默改名。名字由名单给出，所以这里换个声明面就换名字。
+    #[tokio::test]
+    async fn edit_part_names_are_the_names_the_profile_declared() {
+        let schema = serde_json::json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string"},
+                "image_urls": {"type": "array", "items": {"type": "string"}, "maxItems": 1},
+                "mask_url": {"type": "string"}
+            }
+        });
+        let mut prepared = request_for(&schema, ImageBranch::Masked);
+        prepared.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image_urls": ["data:image/png;base64,AAAA"],
+            "mask_url": "data:image/png;base64,BBBB"
+        });
+        let rendered = multipart_body(&prepared)
+            .await
+            .expect("the candidate can express both inputs");
+        assert!(rendered.contains("name=\"image_urls\""), "{rendered}");
+        assert!(rendered.contains("name=\"mask_url\""), "{rendered}");
+        assert!(
+            !rendered.contains("name=\"image\"") && !rendered.contains("name=\"mask\""),
+            "部件名不许退回写死的 image / mask：{rendered}"
+        );
+        // 名单为空（候选一张图都没声明）：这次请求表达不了——明确失败，同样不退回写死的名字。
+        let mut unclaimed = request(ImageBranch::ImageConditioned);
+        unclaimed.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": "data:image/png;base64,AAAA"
+        });
+        unclaimed.platform_parameters = Vec::new();
+        assert!(matches!(
+            multipart_body(&unclaimed).await,
+            Err(AdapterError::UnsupportedInput(_))
+        ));
+    }
+
+    #[test]
+    fn keeps_the_shape_the_provider_gave() {
+        let url = images_from_response(vec![ImageData {
+            url: Some("https://example.invalid/a.png".to_owned()),
+            b64_json: None,
+        }])
+        .expect("a url is a usable result");
+        assert_eq!(
+            url,
+            vec![GeneratedImage::from_url(
+                "https://example.invalid/a.png".to_owned()
+            )]
+        );
+        let base64 = images_from_response(vec![ImageData {
+            url: None,
+            b64_json: Some("AAAA".to_owned()),
+        }])
+        .expect("base64 is a usable result");
+        assert_eq!(base64, vec![GeneratedImage::from_base64("AAAA".to_owned())]);
+        // 两个都给时保留 url；两个都没有就是不可用的结果。
+        let both = images_from_response(vec![ImageData {
+            url: Some("https://example.invalid/a.png".to_owned()),
+            b64_json: Some("AAAA".to_owned()),
+        }])
+        .expect("both shapes are usable");
+        assert_eq!(
+            both,
+            vec![GeneratedImage::from_url(
+                "https://example.invalid/a.png".to_owned()
+            )],
+            "两个都给时只留 url：结果信封里永远只有一种取图方式"
+        );
+        assert!(
+            images_from_response(vec![ImageData {
+                url: None,
+                b64_json: None
+            }])
+            .is_err()
+        );
+    }
+
+    #[test]
+    fn inline_data_urls_are_decoded_in_memory() {
+        let decoded =
+            decode_inline_image("data:image/png;base64,iVBORw0KGgo=").expect("decodes in memory");
+        assert_eq!(decoded.media_type, "image/png");
+        assert_eq!(
+            &decoded.bytes[..],
+            &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
+        );
+        // 不是 http(s) 也不是 data URL 的值一律拒绝，不猜。
+        let error = classify_image_value("asset://not-a-thing")
+            .expect_err("an unknown shape must be rejected");
+        assert!(error.to_string().contains("http(s) url"));
+        // 公网地址走下载那一支，data URL 走解码那一支——两条路只有一处判定。
+        assert!(matches!(
+            classify_image_value("https://example.invalid/a.png"),
+            Ok(ImageValue::Remote(_))
+        ));
+        assert!(matches!(
+            classify_image_value("data:image/png;base64,AAAA"),
+            Ok(ImageValue::Inline(_))
+        ));
     }
 
     #[test]

@@ -9,15 +9,14 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
-bytes.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
 http.workspace = true
 seeai-adapter-aihubmix = { path = "../../crates/adapter-aihubmix" }
 seeai-adapter-apimart = { path = "../../crates/adapter-apimart" }
+seeai-adapter-sdk = { path = "../../crates/adapter-sdk" }
 seeai-application = { path = "../../crates/application" }
 seeai-domain = { path = "../../crates/domain" }
-seeai-object-storage = { path = "../../crates/object-storage" }
 seeai-persistence = { path = "../../crates/persistence" }
 serde.workspace = true
 serde_json.workspace = true

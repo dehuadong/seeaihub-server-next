@@ -8,15 +8,16 @@
 ## 工程边界
 
 - `apps/api`：HTTP 控制面与图片生成入口。
-- `apps/worker`：领取持久 Job、调用 Provider、归档结果和结算。
+- `apps/worker`：领取持久 Job、调用 Provider、落账与结算。
 - `crates/domain`：稳定领域类型与状态规则，不依赖数据库、HTTP 或 Provider。
 - `crates/application`：用例与端口，编排领域对象。
-- `crates/persistence`、`crates/object-storage`、`crates/adapter-*`：基础设施实现。
+- `crates/persistence`、`crates/adapter-*`：基础设施实现。
 - 模块通过公开接口通信；基础设施不得反向拥有目录、Job 或账本规则。
 
 ## 事实与安全
 
-- PostgreSQL 是业务事实权威；缓存和对象存储清单不是事实来源。
+- PostgreSQL 是业务事实权威；缓存不是事实来源。
+- 图片不落盘：请求里的图就是参数值（公网 URL 或 data URL），结果按渠道原形回（`url` 或 `b64_json`）。
 - Provider 凭证只从环境变量读取，不写入配置、日志、响应或测试 fixture。
 - Provider 创建请求状态不确定时进入 `reconciliation_required`，不得自动重提。
 - 模型 Schema、Offering、Channel、Price Plan 经不可变 Runtime Revision 发布；请求与 Job 固定受理时版本。

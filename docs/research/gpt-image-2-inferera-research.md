@@ -324,7 +324,7 @@
 
 1. **推论**：平台 Job 状态与 Provider Task 状态分层保存；平台可有 `accepted/dispatching/running/succeeded/failed/cancel_requested/cancelled/reconciliation_required`，Adapter 再把上游五种状态映射进来。
 2. **推论**：在 Provider 没有幂等键时，一个 Attempt 只能由一个 Worker 提交一次；模糊失败不能由通用重试器重新创建。
-3. **推论**：输入图片先进入平台 Asset，再由 Adapter 转成 URL/Data URI/Base64；输出在任务完成后立即归档到平台 Asset。
+3. **推论**：输入图片先进入平台 Asset，再由 Adapter 转成 URL/Data URI/Base64；输出在任务完成后立即归档到平台 Asset。**（2026-09-20 作废）**：平台不再托管静态素材——输入就是参数值（公网 URL 或 data URL），输出按渠道原形（`url` 或 `b64_json`）交回；见 `docs/adr/0019`。
 4. **推论**：在飞任务必须固定凭据版本引用。统一 `/ai/v1/tasks` 甚至要求使用创建任务的同一 API Key 读取，因此轮询/下载不能随意切换新密钥。[统一任务隔离](https://docs.aihubmix.com/en/api/async-tasks.md#unified-tasks)
 
 ### 11.4 计费

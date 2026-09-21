@@ -19,6 +19,7 @@
 | 2026-09-20 | [APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"](./implemented/platform/2026-09-20-apimart-failure-narrowing.md) | platform | implemented |
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-20 | [对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra](./implemented/platform/2026-09-20-flat-request-body-and-asset-roles.md) | platform | implemented |
+| 2026-09-20 | [图片按渠道原形进原形出：不落盘静态资产，也不提供异步形态](./implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md) | platform | implemented |
 | 2026-09-19 | [独立图片生成服务端第一阶段交付](./implemented/platform/2026-09-19-initial-image-generation-vertical-slice.md) | platform | implemented |
 | 2026-09-19 | [第二阶段交付：多 Offering 路由与 APIMart Driver](./implemented/platform/2026-09-19-multi-offering-routing-and-apimart-driver.md) | platform | implemented |
 
@@ -40,13 +41,14 @@ Vendor/Vendor Model/Provider/Offering/Channel 等模型供给语义、Runtime Re
 
 ### 平台基础设施与运行时
 
-PostgreSQL 持久化与迁移、对象存储与 Asset 承载、Adapter 边界与 Provider 调用、API/Worker 进程编排、配置与运行时保证
+PostgreSQL 持久化与迁移、请求与结果的传输形态、Adapter 边界与 Provider 调用、API/Worker 进程编排、配置与运行时保证
 
 | 首次提出 | 记录 | 分类 | 生命周期 |
 | --- | --- | --- | --- |
 | 2026-09-20 | [APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"](./implemented/platform/2026-09-20-apimart-failure-narrowing.md) | platform | implemented |
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-20 | [对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra](./implemented/platform/2026-09-20-flat-request-body-and-asset-roles.md) | platform | implemented |
+| 2026-09-20 | [图片按渠道原形进原形出：不落盘静态资产，也不提供异步形态](./implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md) | platform | implemented |
 | 2026-09-19 | [独立图片生成服务端第一阶段交付](./implemented/platform/2026-09-19-initial-image-generation-vertical-slice.md) | platform | implemented |
 | 2026-09-19 | [第二阶段交付：多 Offering 路由与 APIMart Driver](./implemented/platform/2026-09-19-multi-offering-routing-and-apimart-driver.md) | platform | implemented |
 

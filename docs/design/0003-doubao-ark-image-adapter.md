@@ -10,7 +10,7 @@
 
 **为什么另立本文而不是并入 [0002-image-generation-tech-design.md](./0002-image-generation-tech-design.md)**：0002 的 §5（原生能力 Schema 的理由）、§6（计量证据）、§9（Adapter 首期能力与错误分类）都**只对 AIHubMix 成立**——它假定 token 计量、Base64 同响应返回、`additionalProperties: false` 的上游。第二个 Provider 在这三处都不成立（按张计量、预签名 URL 异步取图、静默放行未知字段）。把两套 Provider 合同塞进同一份设计会让 0002 无法独立演进，因此按 `docs/agents/artifacts.md`「独立技术设计 RFC 需要独立评审、复用或演进时拆出」的规定另立本文。0002 保持其已评审通过状态，其通用部分（统一 Command、身份分离、Revision 发布、归档优先）继续有效。
 
-**本文件与 ADR 的职责边界**：持久决定在 `docs/adr/`（本设计引用 [0002](../adr/0002-native-capability-schema-not-canonical.md)、[0003](../adr/0003-postgresql-is-source-of-truth.md)、[0004](../adr/0004-vendor-and-provider-identities-stay-separate.md)、[0006](../adr/0006-no-settlement-without-metering-evidence.md)、[0007](../adr/0007-reconciliation-instead-of-automatic-retry.md)、[0008](../adr/0008-own-object-storage-is-the-platform-result.md)、[0009](../adr/0009-multiple-active-offerings-and-routing.md)、[0011](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)），本文只承载该 Provider 的技术设计细节，不复制决策正文。本 Provider 选择哪种执行策略属本文承载的技术设计细节。
+**本文件与 ADR 的职责边界**：持久决定在 `docs/adr/`（本设计引用 [0002](../adr/0002-native-capability-schema-not-canonical.md)、[0003](../adr/0003-postgresql-is-source-of-truth.md)、[0004](../adr/0004-vendor-and-provider-identities-stay-separate.md)、[0006](../adr/0006-no-settlement-without-metering-evidence.md)、[0007](../adr/0007-reconciliation-instead-of-automatic-retry.md)、[0009](../adr/0009-multiple-active-offerings-and-routing.md)、[0011](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)），本文只承载该 Provider 的技术设计细节，不复制决策正文。本 Provider 选择哪种执行策略属本文承载的技术设计细节。
 
 ## 1. Provider 与模型身份
 
@@ -92,14 +92,16 @@
 
 「单图请求是否仍可能出现 `data[].error`」**未实测**，因此上表两种情形都实现。
 
+> **2026-09-20 前提作废**：本文写于"平台落盘静态资产、结果先归档再标成功"的前提下。那一层已由 [`docs/adr/0019`](../adr/0019-images-pass-through-without-asset-storage.md) 撤销（[`docs/adr/0008`](../adr/0008-own-object-storage-is-the-platform-result.md) 已退役）：平台不下载、不解码、不归档，渠道给 `url` 就给 `url`。本文若落地，§2.5 的"取图/魔数校验/归档"与 §3.1 里由输入资产推导的 `input_image_count` 都要按新契约重写；其余（渠道事实、参数表、价格）不受影响。
+
 ### 2.5 取图
 
-结果 `url` 是 TOS 预签名 URL（URL 参数含 `X-Tos-Expires=86400`，即 24 小时）。**下载由 Adapter 在 `execute` 内完成**，并完成魔数校验与尺寸解析后返回字节：
+结果 `url` 是 TOS 预签名 URL（URL 参数含 `X-Tos-Expires=86400`，即 24 小时）。**按现行契约，这个 URL 原样成为结果信封回到调用方**（平台不代取）；下面是原设计，仅作历史：
 
-- `WorkerService` 不需要新增「拉取上游 URL」的端口能力，`AssetStore` 仍只服务自有对象存储；
+- `WorkerService` 不需要新增「拉取上游 URL」的端口能力；
 - 下载耗时计入 Adapter 调用预算。现有 `PROVIDER_TIMEOUT_SECONDS=660` 与 `WORKER_LEASE_SECONDS=900` 留有余量，`execute_with_heartbeat` 在等待期间持续续租；Adapter 必须在超时前返回，并区分「调用超时」与「下载超时」；
 - 下载失败 / URL 过期 ⇒ 已确认生成、未交付 ⇒ 对账，**不重新生成**；
-- 结果必须先归档到自有对象存储才能标记成功（ADR-0008）。
+- ~~结果必须先归档到自有对象存储才能标记成功~~（该前置已作废）。
 
 **仍未实测**：下载是否需要额外鉴权。实施期受控验证必须覆盖（见 §6）。
 
@@ -113,7 +115,7 @@ MeteredUsage::Images { generated_images, images: [ { size, width, height } ], in
 
 - `generated_images` 是**唯一 Provider 计量事实**（声明计费了几张）；
 - `images[].size` 是**计价所需的 Provider 结果属性**（决定每张落在哪个像素档位），与前者角色不同但缺一不可；
-- `input_image_count` 是**受理时固化的请求侧事实**（由 `PreparedImageRequest.assets` 中 `native_path == "/image"` 的项计数），**不是** Provider 计量事实——放进 Evidence 是因为计价公式需要它。实测基础模型**不返回** `usage.input_images`，故不能从响应取；「非 pro 是否承诺不返回」在一手文档中未获承诺（保留该保留）；
+- `input_image_count` 是**受理时固化的请求侧事实**（按候选声明的参考图参数里实际给了几项计数——原设计写的是从 `PreparedImageRequest.assets` 数，该类型已随资产层撤销，按新契约改为数参数值），**不是** Provider 计量事实——放进 Evidence 是因为计价公式需要它。实测基础模型**不返回** `usage.input_images`，故不能从响应取；「非 pro 是否承诺不返回」在一手文档中未获承诺（保留该保留）；
 - 金额 = Provider 事实 × 已发布单价，不是平台估算。硬约束见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
 ### 3.2 首期 Price Plan
@@ -150,13 +152,13 @@ MeteredUsage::Images { generated_images, images: [ { size, width, height } ], in
 
 - **无异步任务、无 task id、无幂等键**：唯一对账标识是响应头 `x-request-id`。因此「受理是否确定」在本 Provider 上**只能降级、不能技术恢复**——`reconciliation_required` 无法自动收敛，只能人工提单。这是相对 AIHubMix `/ai/v1` 的能力倒退。
 - **无账单/用量 API**（实测 `/api/v3/billing/*`、`/api/v3/usage` 均 404）：费用只能在火山控制台人工核对，对账流程不得假设存在 Provider 账单 API。
-- **未知字段静默放行**：平台必须自己受理前校验，不能依赖上游拒绝（见 `docs/adr/0002`）。
+- **未知字段静默放行**：平台必须自己在受理前处置（按候选声明面过滤、没声明的丢弃），不能依赖上游拒绝（见 `docs/adr/0002` 与 `docs/adr/0018` 的同日修订）。
 - **不提供机器可读 schema 端点**：Native Capability Schema 的上游「版本」只能记为文档页 + 抓取时间，不得伪造版本号。
 
 ## 6. 验收条件（本 Provider 部分）
 
 - 文生图与图生图（单参考图）两分支各产出可核验 `MeteredUsage::Images`；
-- `output_format=webp`、`size='1x1'`、`n=2`、未知字段四类请求在**受理前**被平台拒绝，且零上游调用；
+- `output_format=webp`、`size='1x1'`、`n=2` 三类请求在**受理前**被平台拒绝，且零上游调用；未知字段按现行规则**丢弃**（不报错、不发上游）；
 - 结果在 Adapter 内完成下载与魔数校验；下载失败 ⇒ 对账且无第二次上游 POST；
 - `data[].error` 的两种情形（`generated_images` 为 0 / 大于 0）各有可判定测试；
 - 内容审核拒绝的真实 code 经一次受控付费调用确认，并据此校正分类表；

@@ -9,6 +9,8 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 
 # 对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
 
+> **失效范围（2026-09-20 同日）**：本条里"图片是平台资产 id""有 202 受理与 job_id 轮询"的部分**已作废**——平台不再托管静态素材，对客只有同步形态。取代记录见 [图片按渠道原形进原形出](./2026-09-20-images-pass-through-without-asset-storage.md)；决策见 `docs/adr/0019`。其余（扁平请求体、`Idempotency-Key`、服务端定预授权额、参数放行）仍有效。
+
 ## 追加（同日，按用户的四条决定）
 
 - **对外的模型字段就是 `model`**：请求里不再有 `native_model_id`（那是内部/发布侧的名字），

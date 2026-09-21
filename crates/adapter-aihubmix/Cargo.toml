@@ -21,5 +21,10 @@ serde_json.workspace = true
 sha2.workspace = true
 url.workspace = true
 
+[dev-dependencies]
+# 测试要自己驱动一次 async 组装（把 multipart 表单摊成字节）。只借现成的运行时，不起上游、
+# 不走网络：表单里的图都是内联 data URL，取字节这一步没有任何 IO。
+tokio.workspace = true
+
 [lints]
 workspace = true

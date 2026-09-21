@@ -259,7 +259,7 @@
 `model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality` / `background` / `output_compression` / `user`（2.5 两款另有 `moderation`）。
 
 **依据是文档，不是实测**（[`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)）：渠道第一方文档写明支持的参数就声明；"没实测过"不再作为拦截理由，某个参数真正需要用时再验它在实际端点上的行为。
-**当前阶段平台不校验取值**（枚举、区间、类型、未知字段都不管），只要求合同的必填项在场：请求参数一律放行透传，哪些参数需要把取值管起来，等一份明确的清单（用户 2026-09-20 说明后期统一整理）。
+**当前阶段平台不校验取值**（枚举、区间、类型都不管），但**按选中候选声明的参数面过滤**：候选声明过的参数原样发给上游，没声明的直接丢掉（不报错、不发上游）。哪些参数需要把取值管起来，等一份明确的清单（用户 2026-09-20 说明后期统一整理）。
 
 **取值约束取自文档**：`background` 为 `auto`/`opaque`/`transparent`；`moderation` 为 `auto`/`low`；`output_compression` 为 0–100 的整数；`user` 为字符串。素材里还带一条文档写明的条件：`background = transparent` 时 `output_format` 必须是 `png`。
 
@@ -428,11 +428,11 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 **带参考图时的计量（实测）**：`usage` 仍是四分项，且 `input_tokens_details.image_tokens` **真的会涨**（512×512 参考图 ⇒ **1024**，与文档口径一致），`text_tokens` 为提示词长度；平台按 `TokenUsage` 归一后结算，与上游自报金额只差固定折扣（见 §3.3、留档 §6）。
 
-**平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。
+**平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。**2026-09-20 补**：平台不再托管素材，所以这条只对**调用方给 data URL** 的情况成立（那时才需要解码后上传换 URL）；调用方给公网 URL 时逐字透传，不上传。
 
 **发布素材状态：三条分支已开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 已加上 `image_conditioned` / `masked`（`max_images: 16`）。**注意这是发布素材里的能力声明，不是产品上线**——素材 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确本阶段是阶段性任务、不存在上线批准。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——验证已完成：上传返回、`image_urls` 形态、`mask_url` 同用、以及 `usage.input_image_tokens` 四件事都在**一次真实调用**里结清；另外我们**自己的服务**（API + Worker，真实凭证）也对着真实上游跑通了同一条路径（留档 §6）。
 
-**参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`，`AssetBinding.native_parameter_path` 就是这些原生参数路径（`/image_urls/0`、`/mask_url`）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩、其余一律拒绝（发布期与运行期共用同一个函数）。**合同归属的更正（2026-09-20）**：原文此处还引用了 `0002` 的补充决定（"统一参数转换属后期对外消费侧"）。该补充决定已被 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代——调用方所见参数名归 **Vendor Model Contract**，"原生名"的落位由 **Offering Parameter Mapping** 承担；"平台内部不改渠道名"这一**当前实现事实**仍然成立，但它是映射层尚未落位的现状，不是既定归属（差距见工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)）。
+**参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`（调用方给的是 `image`/`mask`，Adapter 落到这两个字段上）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个**候选声明**的参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩（两者都像时以遮罩为准）、其余一律拒绝（发布期与运行期共用同一个函数）；这套判定只管落位，不用来拦截调用方字段——调用方那些该候选**没声明**的参数在受理时就被丢掉了（不会到这一层，也不会发给上游）。**合同归属的更正（2026-09-20）**：原文此处还引用了 `0002` 的补充决定（"统一参数转换属后期对外消费侧"）。该补充决定已被 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代——调用方所见参数名归 **Vendor Model Contract**，"原生名"的落位由 **Offering Parameter Mapping** 承担；"平台内部不改渠道名"这一**当前实现事实**仍然成立，但它是映射层尚未落位的现状，不是既定归属（差距见工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)）。
 
 **未做**：`sunburst` 的图生图未单独实测（与 flare 同渠道族、同端点、同参数面）；`base64` 路径未测；20MB / 16 张 / 256MB 这些**边界**未逐个压测（只说单张 20MB 上限来自文档，代码里已按此拒绝并另有总量上限）。
 

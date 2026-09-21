@@ -38,7 +38,6 @@
     ├── domain/
     ├── application/
     ├── persistence/
-    ├── object-storage/
     ├── adapter-sdk/
     └── adapter-aihubmix/
 ```

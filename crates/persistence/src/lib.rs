@@ -1,15 +1,15 @@
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
-    ApplicationError, AssetRecord, AttemptFailure, ClaimedJob, CompleteJob, HoldDisposition,
-    HubRepository, JobView, LeaseRecovery, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
-    RefundReconciliationCommand, RoutingDecision,
+    ApplicationError, AttemptFailure, ClaimedJob, CompleteJob, HoldDisposition, HubRepository,
+    JobView, LeaseRecovery, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
+    RoutingDecision,
 };
 use seeai_domain::{
-    AccountId, AssetId, AttemptId, ChannelId, CreateImageGeneration, GenerationJob, ImageBranch,
-    JobId, OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot,
-    PublishedOffering, PublishedRevision, RuntimeRevisionId, VendorModelId,
+    AccountId, AttemptId, ChannelId, CreateImageGeneration, GenerationJob, ImageBranch, JobId,
+    OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PublishedOffering,
+    PublishedRevision, RuntimeRevisionId, VendorModelId,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -52,7 +52,7 @@ impl PgHubRepository {
             r#"
             SELECT
                 j.id, j.account_id, j.state, j.branch, j.gateway_model,
-                j.native_parameters, j.asset_bindings, j.idempotency_key,
+                j.native_parameters, j.idempotency_key,
                 j.request_hash, j.max_cost_microusd, j.created_at, j.updated_at,
                 vm.id AS vendor_model_id, vm.native_revision, vm.capability_schema,
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
@@ -513,50 +513,6 @@ impl HubRepository for PgHubRepository {
         Ok(AccountId(account_id))
     }
 
-    async fn insert_asset(&self, asset: AssetRecord) -> Result<(), ApplicationError> {
-        sqlx::query(
-            r#"
-            INSERT INTO generation.assets
-                (id, account_id, role, object_key, media_type, byte_count, width, height, sha256, created_at)
-            VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-            "#,
-        )
-        .bind(asset.id.0)
-        .bind(asset.account_id.0)
-        .bind(asset.role)
-        .bind(asset.object_key)
-        .bind(asset.media_type)
-        .bind(to_i64(asset.byte_count)?)
-        .bind(i64::from(asset.width))
-        .bind(i64::from(asset.height))
-        .bind(asset.sha256)
-        .bind(asset.created_at)
-        .execute(&self.pool)
-        .await
-        .map_err(database_error)?;
-        Ok(())
-    }
-
-    async fn get_asset(
-        &self,
-        account_id: AccountId,
-        asset_id: AssetId,
-    ) -> Result<AssetRecord, ApplicationError> {
-        let row = sqlx::query(
-            r#"
-            SELECT id, account_id, role, object_key, media_type, byte_count, width, height, sha256, created_at
-            FROM generation.assets WHERE id = $1 AND account_id = $2
-            "#,
-        )
-        .bind(asset_id.0)
-        .bind(account_id.0)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)?
-        .ok_or_else(|| ApplicationError::NotFound(format!("asset {asset_id}")))?;
-        row_to_asset(&row)
-    }
-
     async fn create_job(
         &self,
         command: CreateImageGeneration,
@@ -613,16 +569,14 @@ impl HubRepository for PgHubRepository {
         let hold_id = Uuid::new_v4();
         let price_snapshot = serde_json::to_value(&offering.price_snapshot)
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
-        let bindings = serde_json::to_value(&command.asset_bindings)
-            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
         sqlx::query(
             r#"
             INSERT INTO generation.jobs (
                 id, account_id, idempotency_key, request_hash, state, branch,
-                gateway_model, native_parameters, asset_bindings,
+                gateway_model, native_parameters,
                 runtime_revision_id, vendor_model_id, offering_id, channel_id,
                 price_snapshot, max_cost_microusd
-            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14)
+            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13)
             "#,
         )
         .bind(job_id.0)
@@ -632,7 +586,6 @@ impl HubRepository for PgHubRepository {
         .bind(branch_name(branch))
         .bind(&command.gateway_model)
         .bind(&command.native_parameters)
-        .bind(&bindings)
         .bind(offering.runtime_revision_id.0)
         .bind(offering.vendor_model_id.0)
         .bind(offering.offering_id.0)
@@ -693,7 +646,6 @@ impl HubRepository for PgHubRepository {
             branch,
             gateway_model: command.gateway_model,
             native_parameters: command.native_parameters,
-            asset_bindings: command.asset_bindings,
             offering,
             idempotency_key: command.idempotency_key,
             request_hash,
@@ -710,8 +662,8 @@ impl HubRepository for PgHubRepository {
     ) -> Result<JobView, ApplicationError> {
         let row = sqlx::query(
             r#"
-            SELECT id, account_id, state, branch, gateway_model, result_asset_ids,
-                   error_code, error_message, created_at, updated_at
+            SELECT id, state, branch, gateway_model, result_images,
+                   error_code, created_at, updated_at
             FROM generation.jobs WHERE id = $1 AND account_id = $2
             "#,
         )
@@ -721,18 +673,21 @@ impl HubRepository for PgHubRepository {
         .await
         .map_err(database_error)?
         .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
-        let result_ids: Vec<Uuid> = row.try_get("result_asset_ids").map_err(database_error)?;
+        let images: Option<Value> = row.try_get("result_images").map_err(database_error)?;
         Ok(JobView {
-            id: JobId(row.try_get("id").map_err(database_error)?),
-            account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+            job_id: JobId(row.try_get("id").map_err(database_error)?),
             state: row.try_get("state").map_err(database_error)?,
             branch: parse_branch(row.try_get("branch").map_err(database_error)?)?,
             // 平台上就叫 `gateway_model`，对外接口叫 `model`；厂商原生名在 vendor_models 上。
             model: row.try_get("gateway_model").map_err(database_error)?,
-            result_asset_ids: result_ids.into_iter().map(AssetId).collect(),
-            error_code: row.try_get("error_code").map_err(database_error)?,
             created_at: row.try_get("created_at").map_err(database_error)?,
             updated_at: row.try_get("updated_at").map_err(database_error)?,
+            error_code: row.try_get("error_code").map_err(database_error)?,
+            // 结果信封只在成功时写入；没写就是没有结果，不是空数组。
+            data: images
+                .map(serde_json::from_value)
+                .transpose()
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
         })
     }
 
@@ -944,7 +899,7 @@ impl HubRepository for PgHubRepository {
             job_id,
             worker_id,
             attempt_id,
-            outputs,
+            images,
             evidence,
             charge_microusd,
             provider_trace_id,
@@ -972,30 +927,6 @@ impl HubRepository for PgHubRepository {
                 "provider charge exceeded authorization".to_owned(),
             ));
         }
-        let mut result_ids = Vec::with_capacity(outputs.len());
-        for asset in outputs {
-            result_ids.push(asset.id.0);
-            sqlx::query(
-                r#"
-                INSERT INTO generation.assets
-                    (id, account_id, role, object_key, media_type, byte_count, width, height, sha256, created_at)
-                VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10)
-                "#,
-            )
-            .bind(asset.id.0)
-            .bind(asset.account_id.0)
-            .bind(asset.role)
-            .bind(asset.object_key)
-            .bind(asset.media_type)
-            .bind(to_i64(asset.byte_count)?)
-            .bind(i64::from(asset.width))
-            .bind(i64::from(asset.height))
-            .bind(asset.sha256)
-            .bind(asset.created_at)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
-        }
         if evidence.attempt_id != attempt_id {
             return Err(ApplicationError::Persistence(
                 "metering evidence attempt does not match completion".to_owned(),
@@ -1019,17 +950,20 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        // 结果只是当次信封：渠道给什么就存什么，平台不下载、不归档。
+        let result_images = serde_json::to_value(&images)
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
         sqlx::query(
             r#"
             UPDATE generation.jobs
-            SET state = 'succeeded', result_asset_ids = $3, lease_owner = NULL,
+            SET state = 'succeeded', result_images = $3, lease_owner = NULL,
                 lease_expires_at = NULL, version = version + 1, updated_at = now()
             WHERE id = $1 AND lease_owner = $2
             "#,
         )
         .bind(job_id.0)
         .bind(&worker_id)
-        .bind(&result_ids)
+        .bind(&result_images)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1569,7 +1503,6 @@ fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, A
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
     };
     let state: String = row.try_get("state").map_err(database_error)?;
-    let bindings: Value = row.try_get("asset_bindings").map_err(database_error)?;
     Ok(GenerationJob {
         id: JobId(row.try_get("id").map_err(database_error)?),
         account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
@@ -1577,31 +1510,12 @@ fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, A
         branch: parse_branch(row.try_get("branch").map_err(database_error)?)?,
         gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_parameters: row.try_get("native_parameters").map_err(database_error)?,
-        asset_bindings: serde_json::from_value(bindings)
-            .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
         offering,
         idempotency_key: row.try_get("idempotency_key").map_err(database_error)?,
         request_hash: row.try_get("request_hash").map_err(database_error)?,
         max_cost_microusd: to_u64(row.try_get("max_cost_microusd").map_err(database_error)?)?,
         created_at: row.try_get("created_at").map_err(database_error)?,
         updated_at: row.try_get("updated_at").map_err(database_error)?,
-    })
-}
-
-fn row_to_asset(row: &sqlx::postgres::PgRow) -> Result<AssetRecord, ApplicationError> {
-    Ok(AssetRecord {
-        id: AssetId(row.try_get("id").map_err(database_error)?),
-        account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
-        role: row.try_get("role").map_err(database_error)?,
-        object_key: row.try_get("object_key").map_err(database_error)?,
-        media_type: row.try_get("media_type").map_err(database_error)?,
-        byte_count: to_u64(row.try_get("byte_count").map_err(database_error)?)?,
-        width: u32::try_from(row.try_get::<i32, _>("width").map_err(database_error)?)
-            .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
-        height: u32::try_from(row.try_get::<i32, _>("height").map_err(database_error)?)
-            .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
-        sha256: row.try_get("sha256").map_err(database_error)?,
-        created_at: row.try_get("created_at").map_err(database_error)?,
     })
 }
 

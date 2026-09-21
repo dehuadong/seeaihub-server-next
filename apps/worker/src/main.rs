@@ -4,9 +4,8 @@ use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_adapter_sdk::ProviderCredential;
 use seeai_application::{
-    AdapterRegistry, ApplicationError, AssetStore, CredentialProvider, HubRepository, WorkerService,
+    AdapterRegistry, ApplicationError, CredentialProvider, HubRepository, WorkerService,
 };
-use seeai_object_storage::ObjectStoreAssetStore;
 use seeai_persistence::PgHubRepository;
 use std::{env, sync::Arc, time::Duration};
 use tracing::{error, info};
@@ -45,7 +44,6 @@ async fn main() -> Result<()> {
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
     let repository_port: Arc<dyn HubRepository> = repository;
-    let store: Arc<dyn AssetStore> = Arc::new(ObjectStoreAssetStore::from_env()?);
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
         Arc::new(AdapterRegistry::new(vec![
@@ -54,7 +52,6 @@ async fn main() -> Result<()> {
         ]));
     let worker = WorkerService::new(
         repository_port,
-        store,
         adapters,
         Arc::new(EnvironmentCredentialProvider),
         worker_id.clone(),

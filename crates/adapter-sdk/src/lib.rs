@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
 use seeai_domain::{ImageBranch, TokenUsage};
 use serde::{Deserialize, Serialize};
@@ -31,28 +32,100 @@ impl Debug for ProviderCredential {
     }
 }
 
-#[derive(Debug, Clone)]
-pub struct ResolvedAsset {
-    pub native_parameter_path: String,
-    pub position: u16,
-    pub media_type: String,
-    pub sha256: String,
-    pub bytes: Bytes,
-}
-
+/// 一次执行的输入：被选中候选的原生参数（图片输入已经在里面，落在该候选自己的参数名上）。
 #[derive(Debug, Clone)]
 pub struct PreparedImageRequest {
     pub provider_model_id: String,
     pub branch: ImageBranch,
     pub native_parameters: Value,
-    pub assets: Vec<ResolvedAsset>,
+    /// **平台自己装好的参数名**，受理时按候选声明面与分支算好后随请求一起冻结。
+    ///
+    /// Driver 靠它分清"哪些参数是平台的图"与"哪些参数是普通的声明参数"：名单里的名字才是
+    /// 平台装载的参考图/遮罩，其余名字按原样交给上游。归属因此不看取值的形状——
+    /// 调用方给一个叫 `images` 的字符串数组（渠道文档里的原生名）不会被误认成平台的图。
+    ///
+    /// 到手的参数面本身已经是候选声明面里的子集（没声明的名字在受理期就丢掉了），
+    /// 所以名单只用来分角色，不用来判"这个参数认不认识"。
+    ///
+    /// 名单与 [`PreparedImageRequest::native_parameters`] 是同一份快照的两半：前者说"哪些名字
+    /// 是平台的"，后者说"这些名字下的取值是什么"，两者都来自受理时固化的那一次请求。
+    pub platform_parameters: Vec<String>,
 }
 
-#[derive(Debug, Clone)]
-pub struct GeneratedImage {
+/// 一次生成的一张图：**渠道给什么就是什么**——给 `url` 就留 `url`、给 base64 就留 `b64_json`。
+///
+/// 形状本身保证"恰好其一"：只有两种取图方式，没有"两项都在"或"一项都没有"的表示法。
+/// 平台不下载、不解码、不归档，因此也不需要第三种形态。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GeneratedImage {
+    /// 上游给的是公网地址（或它自己的临时链接）。
+    #[serde(rename = "url")]
+    Url(String),
+    /// 上游给的是内联 base64。
+    #[serde(rename = "b64_json")]
+    B64Json(String),
+}
+
+impl GeneratedImage {
+    /// 上游给的是公网地址。
+    #[must_use]
+    pub fn from_url(url: String) -> Self {
+        Self::Url(url)
+    }
+
+    /// 上游给的是内联 base64。
+    #[must_use]
+    pub fn from_base64(b64_json: String) -> Self {
+        Self::B64Json(b64_json)
+    }
+}
+
+/// 是不是公网 http(s) 地址：参考图与遮罩允许的另一种形态（另一种是 data URL）。
+#[must_use]
+pub fn is_http_url(value: &str) -> bool {
+    value.starts_with("http://") || value.starts_with("https://")
+}
+
+/// 一份**在内存里**的输入图：媒体类型加上字节。
+///
+/// 平台不落盘，所以一张输入图在 Driver 手里的形态就是这两样；用具名类型而不是
+/// `(String, Bytes)`，免得调用处把两者写反、也免得读代码的人要去数第几个位置是什么。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DecodedImage {
     pub media_type: String,
     pub bytes: Bytes,
-    pub sha256: String,
+}
+
+/// 解一个 `data:<media-type>;base64,<payload>`。
+///
+/// 不是 data URL、或者载荷不是 base64，都返回 `Err`：调用方据此改按公网 URL 处理，
+/// 而不是拿到一堆坏字节。
+pub fn decode_data_url(value: &str) -> Result<DecodedImage, String> {
+    let rest = value
+        .strip_prefix("data:")
+        .ok_or_else(|| "not a data url".to_owned())?;
+    let (meta, payload) = rest
+        .split_once(',')
+        .ok_or_else(|| "data url carries no comma".to_owned())?;
+    let (media_type, encoding) = match meta.split_once(';') {
+        Some((media_type, encoding)) => (media_type, encoding),
+        None => (meta, ""),
+    };
+    if encoding != "base64" {
+        return Err(format!("unsupported data url encoding `{encoding}`"));
+    }
+    let bytes = STANDARD
+        .decode(payload)
+        .map_err(|error| format!("data url payload is not valid base64: {error}"))?;
+    let media_type = if media_type.is_empty() {
+        "application/octet-stream".to_owned()
+    } else {
+        media_type.to_owned()
+    };
+    Ok(DecodedImage {
+        media_type,
+        bytes: Bytes::from(bytes),
+    })
 }
 
 #[derive(Debug, Clone)]
@@ -63,8 +136,8 @@ pub struct ProviderSuccess {
     /// 上游逐请求标识（例如任务式上游的 task id），**只用于对账**：
     /// 不参与计价，也不属于计量证据（见 `CONTEXT.md` 的 `Generation Attempt`）。
     ///
-    /// 平台把它落到已存在的 `attempts.provider_trace_id` 列。注意：本仓库**不用它做
-    /// 跨调用恢复**（那需要新增列与拆分端口，属后续工作项）——创建响应失联一律进对账。
+    /// 平台把它落到已存在的 `attempts.provider_trace_id` 列。注意：本仓库**只用它做人工
+    /// 对账**，不用它自动把结果取回来（那需要另一套模型与列）——创建响应失联一律进对账。
     pub provider_trace_id: Option<String>,
 }
 
@@ -200,4 +273,60 @@ pub trait ImageAdapter: Send + Sync {
         request: PreparedImageRequest,
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError>;
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn decodes_inline_data_urls_into_bytes() {
+        let encoded = STANDARD.encode([0x89_u8, b'P', b'N', b'G']);
+        let decoded =
+            decode_data_url(&format!("data:image/png;base64,{encoded}")).expect("data url decodes");
+        assert_eq!(decoded.media_type, "image/png");
+        assert_eq!(&decoded.bytes[..], &[0x89, b'P', b'N', b'G']);
+        // 不带媒体类型时保持中性，不假装知道格式。
+        let decoded = decode_data_url("data:;base64,AAAA").expect("decodes");
+        assert_eq!(decoded.media_type, "application/octet-stream");
+        for bad in [
+            "https://example.invalid/a.png",
+            "data:image/png,notbase64",
+            "data:image/png;base64",
+        ] {
+            assert!(decode_data_url(bad).is_err(), "`{bad}` is not a data url");
+        }
+        assert!(is_http_url("https://example.invalid/a.png"));
+        assert!(!is_http_url("data:image/png;base64,AAAA"));
+    }
+
+    #[test]
+    fn generated_images_keep_only_the_shape_the_provider_gave() {
+        let url = GeneratedImage::from_url("https://example.invalid/a.png".to_owned());
+        assert_eq!(
+            serde_json::to_value(&url).expect("serializes"),
+            serde_json::json!({"url": "https://example.invalid/a.png"})
+        );
+        let base64 = GeneratedImage::from_base64("AAAA".to_owned());
+        assert_eq!(
+            serde_json::to_value(&base64).expect("serializes"),
+            serde_json::json!({"b64_json": "AAAA"})
+        );
+        // 读回来还是同一种形态（结果信封落库、再读出来）。
+        assert_eq!(
+            serde_json::from_value::<GeneratedImage>(serde_json::json!({"url": "u"}))
+                .expect("a url reads back"),
+            GeneratedImage::from_url("u".to_owned())
+        );
+        // 形状本身就是"恰好其一"：两项都在、一项都没有都不是合法的图。
+        for impossible in [
+            serde_json::json!({}),
+            serde_json::json!({"url": "u", "b64_json": "b"}),
+        ] {
+            assert!(
+                serde_json::from_value::<GeneratedImage>(impossible.clone()).is_err(),
+                "{impossible} 不是恰好一项"
+            );
+        }
+    }
 }

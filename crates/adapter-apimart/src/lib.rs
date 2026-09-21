@@ -1,9 +1,9 @@
 //! APIMart 的图片生成 Driver（② 层）。
 //!
 //! 本 Driver 的执行形态与渠道事实如下：
-//! 上游是**任务式**（提交拿 `task_id`，轮询到终态，再从结果 URL 取图），
-//! 而 `ImageAdapter::execute` 只有一个入口——因此**提交、轮询、取图都在 `execute` 内完成**。
-//! 平台对外仍是"持久 Job + 可查询"，上游的异步形态不外泄到调用方。
+//! 上游是**任务式**（提交拿 `task_id`，轮询到终态，再拿结果地址）——这是**本 Driver 内部**
+//! 的实现细节：平台对外是同步的，调用方既看不到 task id，也没有任何"去查任务"的协议。
+//! 因此提交、轮询、取结果都在 `execute` 内完成。
 //!
 //! 计费相关：任务成功响应含**四分项 `usage`**（`input_tokens_details` 区分 text/image，
 //! 另有 `cached_tokens`），归一到领域 `TokenUsage`。平台按 token × 费率计价，与 AIHubMix
@@ -17,12 +17,13 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, GeneratedImage, ImageAdapter, PreparedImageRequest,
-    ProviderCallError, ProviderCredential, ProviderFailureKind, ProviderSuccess, ResolvedAsset,
-    RetrySafety,
+    ProviderCallError, ProviderCredential, ProviderFailureKind, ProviderSuccess, RetrySafety,
+    decode_data_url, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
-    AssetParameterKind, ImageBranch, TokenUsage, asset_parameter_name, set_native_parameter_at_path,
+    ImageBranch, ImageParameterKind, TokenUsage, image_inputs, image_parameter_kind,
+    image_parameter_values, mask_value,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -34,8 +35,6 @@ use url::Url;
 pub const ADAPTER_KEY: &str = "apimart-image-v1";
 
 const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
-const MAX_OUTPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-const MAX_TOTAL_OUTPUT_BYTES: usize = 64 * 1024 * 1024;
 /// 轮询间隔。文档建议 2~5 秒，取偏小值以缩短 Job 驻留时间。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// 单次任务查询的瞬时失败重试次数上限（幂等读才允许重试）。
@@ -52,8 +51,6 @@ impl AdapterFactory for ApimartAdapterFactory {
     fn descriptor(&self, adapter_key: &str) -> Option<AdapterDescriptor> {
         (adapter_key == ADAPTER_KEY).then_some(AdapterDescriptor {
             key: ADAPTER_KEY,
-            // 机器的输入合同里这些参数**都在顶层**——APIMart 没有 `extra` 包装层
-            // （与 AIHubMix 那条把可选参数包在 `extra` 里的端点族相反）。
             supported_top_level_parameters: &[
                 "model",
                 "prompt",
@@ -160,7 +157,7 @@ fn validate_apimart_publication(schema: &Value, restrictions: &Value) -> Result<
 pub struct ApimartImageAdapter {
     client: Client,
     base_url: Url,
-    /// 整轮（提交 + 轮询 + 取图）的墙钟上限。
+    /// 整轮（提交 + 轮询到终态）的墙钟上限。
     deadline: Duration,
 }
 
@@ -186,46 +183,110 @@ impl ApimartImageAdapter {
             .map_err(|error| AdapterError::Configuration(error.to_string()))
     }
 
-    /// 把平台资产上传到上游，换取可用于生成请求的公网 URL。
+    /// 把一种图片输入换成"可以直接发给上游"的公网 URL。
     ///
-    /// 上游明确不再接受在生成请求里直接传 base64，参考图与遮罩必须先上传。
-    /// 这些上传都发生在**提交生成任务之前**，因此任何失败都只能推出同一个结论：
+    /// 上游只接受**公网可访问的 URL**，不接受生成请求里直接带 base64。因此：
+    /// - `data:` URL 就地解码后上传换 URL（内存里做，平台不保存）；
+    /// - 公网 URL 原样透传（平台不下载、不搬运，也不改写它）。
+    ///
+    /// 这一步发生在**提交生成任务之前**，因此任何失败都只能推出同一个结论：
     /// 生成任务**可证明未受理**（`SafeBeforeAcceptance`）——按失败处置、释放预授权，
     /// 不进对账。至于那次上传请求本身有没有被上游受理，与平台的处置无关：
     /// 上传没有需要人工对账的副作用。
-    async fn upload_assets(
+    async fn resolve_url(
         &self,
-        assets: &[ResolvedAsset],
+        value: &str,
         credential: &ProviderCredential,
-    ) -> Result<Vec<UploadedAsset>, AdapterError> {
-        // 上游另有一条"单次请求上传总量"上限，先按平台侧能算出的部分挡住。
-        let total: usize = assets.iter().map(|asset| asset.bytes.len()).sum();
-        ensure_total_upload_within_limit(total)?;
-        let mut uploaded = Vec::with_capacity(assets.len());
-        for asset in assets {
-            uploaded.push(self.upload_asset(asset, credential).await?);
+    ) -> Result<String, AdapterError> {
+        if value.starts_with("data:") {
+            let decoded = decode_data_url(value).map_err(AdapterError::UnsupportedInput)?;
+            if decoded.bytes.len() > MAX_UPLOAD_BYTES {
+                return Err(AdapterError::UnsupportedInput(format!(
+                    "an inline image is {} bytes, above the provider upload limit of {MAX_UPLOAD_BYTES} bytes",
+                    decoded.bytes.len()
+                )));
+            }
+            return self
+                .upload_image(&decoded.bytes, &decoded.media_type, credential)
+                .await;
         }
-        Ok(uploaded)
+        if is_http_url(value) {
+            return Ok(value.to_owned());
+        }
+        Err(AdapterError::UnsupportedInput(format!(
+            "a reference image must be an http(s) url or a data url, got {value}"
+        )))
     }
 
-    async fn upload_asset(
+    /// 把一次请求里的所有图片输入换算成公网 URL，保持它们各自的参数名与形状。
+    ///
+    /// 只走**平台自己的名单**（受理时按候选声明面与分支算好，见
+    /// [`PreparedImageRequest::platform_parameters`]）：名单里的参数名是 Profile 声明、平台受理时
+    /// 写进去的，这里只替换取值；名单外的名字一个都不碰——它们只是到手的普通参数，既不上传也不
+    /// 改写，逐字交给上游（没声明的名字在受理期就已经按声明面丢掉了，根本到不了这里）。
+    /// 形状（标量 / 数组）保持不变，数组顺序即调用方给的顺序。
+    async fn resolve_images(
         &self,
-        asset: &ResolvedAsset,
+        request: &PreparedImageRequest,
         credential: &ProviderCredential,
-    ) -> Result<UploadedAsset, AdapterError> {
-        if asset.bytes.len() > MAX_UPLOAD_BYTES {
-            return Err(AdapterError::UnsupportedInput(format!(
-                "asset {} exceeds the provider upload limit of {MAX_UPLOAD_BYTES} bytes",
-                asset.sha256
-            )));
+    ) -> Result<Map<String, Value>, AdapterError> {
+        let parameters = request.native_parameters.as_object().ok_or_else(|| {
+            AdapterError::UnsupportedInput("parameters must be an object".to_owned())
+        })?;
+        let mut resolved = Map::new();
+        for name in &request.platform_parameters {
+            let Some(value) = parameters.get(name) else {
+                continue;
+            };
+            // 名单里的名字按候选声明面分清角色；取值、名字与空值约定都来自 `seeai_domain`：
+            // `null` 与空串是"这一处没有图"，不上行；非字符串条目在那里已经被拒，这里不再自己判一遍。
+            match image_parameter_kind(name) {
+                None => {}
+                Some(ImageParameterKind::Reference) => {
+                    let values = image_parameter_values(name, value)
+                        .map_err(AdapterError::UnsupportedInput)?;
+                    let mut urls = Vec::with_capacity(values.len());
+                    for text in values {
+                        urls.push(Value::String(self.resolve_url(text, credential).await?));
+                    }
+                    if urls.is_empty() {
+                        continue;
+                    }
+                    // 形状（标量 / 数组）保持调用方给的样子；数组里空出来的格子不占位。
+                    let replaced = if matches!(value, Value::Array(_)) {
+                        Value::Array(urls)
+                    } else {
+                        urls.into_iter().next().expect("just checked non-empty")
+                    };
+                    resolved.insert(name.clone(), replaced);
+                }
+                Some(ImageParameterKind::Mask) => {
+                    let Some(text) =
+                        mask_value(name, value).map_err(AdapterError::UnsupportedInput)?
+                    else {
+                        continue;
+                    };
+                    let url = self.resolve_url(text, credential).await?;
+                    resolved.insert(name.clone(), Value::String(url));
+                }
+            }
         }
-        let part = reqwest::multipart::Part::bytes(asset.bytes.to_vec())
-            .file_name(upload_filename(asset))
-            .mime_str(&asset.media_type)
+        Ok(resolved)
+    }
+
+    /// 上传一份字节，换回可用于生成请求的公网 URL。
+    async fn upload_image(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        credential: &ProviderCredential,
+    ) -> Result<String, AdapterError> {
+        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
+            .file_name(upload_filename(bytes, media_type))
+            .mime_str(media_type)
             .map_err(|error| {
                 AdapterError::UnsupportedInput(format!(
-                    "unsupported asset media type {}: {error}",
-                    asset.media_type
+                    "unsupported image media type {media_type}: {error}"
                 ))
             })?;
         let form = reqwest::multipart::Form::new().part("file", part);
@@ -248,22 +309,39 @@ impl ApimartImageAdapter {
             ))
         })?;
         // 这个 URL 会被原样写进生成请求，因此先确认它真的是个 http(s) 地址。
-        let url = validate_uploaded_url(&parsed.url).map_err(upload_failure)?;
-        Ok(UploadedAsset {
-            url,
-            native_parameter_path: asset.native_parameter_path.clone(),
-            position: asset.position,
-        })
+        validate_uploaded_url(&parsed.url).map_err(upload_failure)
+    }
+
+    /// 一次请求里所有内联图片的总量上限（上游口径：单次生成请求 256MB）。
+    ///
+    /// 只统计**平台自己的名单**里那些图片参数：名单外的取值平台不上传，也就不该为它申请内存。
+    fn ensure_total_upload_within_limit(
+        request: &PreparedImageRequest,
+    ) -> Result<(), AdapterError> {
+        let inputs = image_inputs(&request.native_parameters, &request.platform_parameters)
+            .map_err(AdapterError::UnsupportedInput)?;
+        let mut total = 0_usize;
+        for text in inputs.reference_images.iter().chain(inputs.mask.iter()) {
+            if let Ok(decoded) = decode_data_url(text) {
+                total = total.saturating_add(decoded.bytes.len());
+            }
+        }
+        if total > MAX_TOTAL_UPLOAD_BYTES {
+            return Err(AdapterError::UnsupportedInput(format!(
+                "inline images total {total} bytes, above the provider limit of {MAX_TOTAL_UPLOAD_BYTES} bytes"
+            )));
+        }
+        Ok(())
     }
 
     /// 提交生成请求，返回 `task_id`。
     async fn submit(
         &self,
         request: &PreparedImageRequest,
-        uploaded: &[UploadedAsset],
+        resolved: &Map<String, Value>,
         credential: &ProviderCredential,
     ) -> Result<String, AdapterError> {
-        let body = generation_body(request, uploaded)?;
+        let body = generation_body(request, resolved)?;
         let response = self
             .client
             .post(self.endpoint("v1/images/generations")?)
@@ -404,39 +482,6 @@ impl ApimartImageAdapter {
             }
         }
     }
-
-    /// 下载结果图。上游 URL 短期有效，且要求同一 Bearer 凭据。
-    async fn fetch_image(
-        &self,
-        url: &str,
-        credential: &ProviderCredential,
-    ) -> Result<GeneratedImage, AdapterError> {
-        let response = self
-            .client
-            .get(url)
-            .bearer_auth(credential.expose())
-            .send()
-            .await
-            .map_err(ambiguous_transport_error)?;
-        let status = response.status();
-        if !status.is_success() {
-            let body = read_body(response).await?;
-            return Err(parse_provider_error(status, &body).into());
-        }
-        let content_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned());
-        let media_type = content_type.unwrap_or_else(|| "image/png".to_owned());
-        let bytes = read_bytes(response, MAX_OUTPUT_IMAGE_BYTES).await?;
-        validate_image_magic(&bytes, &media_type)?;
-        Ok(GeneratedImage {
-            sha256: sha256_hex(&bytes),
-            media_type,
-            bytes,
-        })
-    }
 }
 
 #[async_trait]
@@ -451,16 +496,13 @@ impl ImageAdapter for ApimartImageAdapter {
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError> {
         // 0) 参考图与遮罩：上游只接受**公网可访问的 URL**（且不再接受 base64），
-        //    因此先把平台资产上传换 url。失败时生成任务**尚未提交**，处置是失败，
-        //    不是对账——预授权照常释放。
-        let uploaded = if request.assets.is_empty() {
-            Vec::new()
-        } else {
-            self.upload_assets(&request.assets, credential).await?
-        };
+        //    所以内联 data URL 先上传换 url、公网 URL 原样透传。失败时生成任务**尚未提交**，
+        //    处置是失败，不是对账——预授权照常释放。
+        Self::ensure_total_upload_within_limit(&request)?;
+        let resolved = self.resolve_images(&request, credential).await?;
         // 1) 提交。**这一步之后绝不能重发**（创建请求绝不重发）；
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
-        let task_id = self.submit(&request, &uploaded, credential).await?;
+        let task_id = self.submit(&request, &resolved, credential).await?;
         // 2) 提交之后的每一步，都把这个 task id 附在错误上：对账的人至少能拿它去上游查。
         self.finish(&task_id, credential)
             .await
@@ -469,7 +511,7 @@ impl ImageAdapter for ApimartImageAdapter {
 }
 
 impl ApimartImageAdapter {
-    /// 提交**已经成功**之后的部分：轮询到终态 → 抽计量 → 取图。
+    /// 提交**已经成功**之后的部分：轮询到终态 → 抽计量 → 收集结果信封。
     ///
     /// 单独拆出来，是为了让"给失败附上 task id"这件事只有一处
     /// （见 [`with_task_id`]）——这一段的任何失败都会进对账，没有 task id 就查不了。
@@ -483,22 +525,12 @@ impl ApimartImageAdapter {
         let task = self.poll(task_id, credential).await?;
         let usage = task.usage()?;
         let digest = task.response_digest(task_id);
-        // 取图。结果 URL 带 expires_at，必须立刻下载并转存。
-        let mut images = Vec::new();
-        let mut total_output_bytes = 0_usize;
-        for url in task.image_urls()? {
-            let image = self.fetch_image(&url, credential).await?;
-            total_output_bytes = total_output_bytes.saturating_add(image.bytes.len());
-            if total_output_bytes > MAX_TOTAL_OUTPUT_BYTES {
-                return Err(provider_error(
-                    "provider_output_too_large",
-                    "provider output exceeded the configured safety limit".to_owned(),
-                    RetrySafety::AcceptanceUnknown,
-                    ProviderFailureKind::Unknown,
-                ));
-            }
-            images.push(image);
-        }
+        // 结果地址原样交给调用方：平台不下载、不转存，也不替上游承诺链接的有效期。
+        let images = task
+            .image_urls()?
+            .into_iter()
+            .map(GeneratedImage::from_url)
+            .collect::<Vec<_>>();
         if images.is_empty() {
             return Err(provider_error(
                 "provider_result_empty",
@@ -538,7 +570,7 @@ fn with_task_id(error: AdapterError, task_id: &str) -> AdapterError {
 
 fn generation_body(
     request: &PreparedImageRequest,
-    uploaded: &[UploadedAsset],
+    resolved: &Map<String, Value>,
 ) -> Result<Value, AdapterError> {
     let mut object = Map::new();
     object.insert(
@@ -549,61 +581,32 @@ fn generation_body(
         "prompt".to_owned(),
         required_string(&request.native_parameters, "/prompt")?,
     );
-    // 其余参数**原样透传**：平台只按合同校验**已知**参数的取值，未知参数交给上游
-    // （渠道自己的长尾参数因此不必逐个由平台声明）。图片由 `uploaded` 回填，这里跳过它们。
+    // 其余参数**原样**交给上游：到手的参数面已经是候选声明面里的子集（未声明的名字在受理期
+    // 就按声明面丢掉了），所以这里不做"认不认识"的判别，只跳过多出来的 `model`/`prompt` 与
+    // **平台装载过的那些图片参数名**（名单由受理时算好，见
+    // [`PreparedImageRequest::platform_parameters`]）——图片在下面回填成换算后的公网 URL，
+    // 原值再进一次只会把 data URL 一起发上去。其余名字逐字过去，取值一个都不改：归属不看取值
+    // 的形状，所以名字像图也不会被认领或改写。`null` 表示"这一处没有给"，不是参数值，照旧不进请求体。
     if let Value::Object(parameters) = &request.native_parameters {
         for (name, value) in parameters {
             if matches!(name.as_str(), "model" | "prompt")
                 || value.is_null()
-                || name == "image_urls"
+                || request
+                    .platform_parameters
+                    .iter()
+                    .any(|declared| declared == name)
             {
                 continue;
             }
             object.insert(name.clone(), value.clone());
         }
     }
-    // 参考图与遮罩用**上传后拿到的公网 URL**回填到它们各自的参数路径。
-    // 参数名（`image_urls`、`mask_url`）由 Profile 声明，Driver 不自己决定名字。
-    // 认不出的路径直接报错：宁可失败，也不能把一张图悄悄丢掉。
-    for asset in uploaded {
-        if asset.kind().is_none() {
-            return Err(AdapterError::UnsupportedInput(format!(
-                "asset binding path {} is not an image parameter this driver recognises",
-                asset.native_parameter_path
-            )));
-        }
-    }
-    let mut images: Vec<&UploadedAsset> = uploaded
-        .iter()
-        .filter(|asset| asset.kind() == Some(AssetParameterKind::Image))
-        .collect();
-    // 按调用方给的位置排序（`sort_by_key` 稳定，同位置时保持绑定顺序），
-    // 与平台注入资产占位符时的数组顺序一致。
-    images.sort_by_key(|asset| asset.position);
-    for asset in images {
-        insert_url_at_path(&mut object, &asset.native_parameter_path, &asset.url)?;
-    }
-    if let Some(mask) = uploaded
-        .iter()
-        .find(|asset| asset.kind() == Some(AssetParameterKind::Mask))
-    {
-        insert_url_at_path(&mut object, &mask.native_parameter_path, &mask.url)?;
+    // 参考图与遮罩回填到**它们各自的参数名**上（`image_urls`、`mask_url` 由 Profile 声明，
+    // 平台受理时写到那里，Driver 不自己决定名字），取值已经全部是公网 URL。
+    for (name, value) in resolved {
+        object.insert(name.clone(), value.clone());
     }
     Ok(Value::Object(object))
-}
-
-/// 把 URL 写到 `native_parameter_path` 指向的位置。
-///
-/// 写入规则（标量赋值 / 数组追加）与平台注入资产占位符时共用同一份实现
-/// （[`set_native_parameter_at_path`]），不允许两边各判一套。
-fn insert_url_at_path(
-    object: &mut Map<String, Value>,
-    path: &str,
-    url: &str,
-) -> Result<(), AdapterError> {
-    set_native_parameter_at_path(object, path, Value::String(url.to_owned()))
-        .map(|_| ())
-        .map_err(AdapterError::UnsupportedInput)
 }
 
 fn required_string(parameters: &Value, pointer: &str) -> Result<Value, AdapterError> {
@@ -916,33 +919,9 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
 
 /// 上传接口的文件大小上限（上游文档：20MB）。
 const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
-/// 单次生成请求里参考图的总量上限（上游文档：256MB）。
+/// 单次生成请求里图片的总量上限（上游文档：256MB）。只对**内联**图片有意义：
+/// 公网 URL 是原样透传的，平台不去读它的字节。
 const MAX_TOTAL_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
-
-/// 一次请求里所有参考图的字节总量是否在上游允许范围内。
-fn ensure_total_upload_within_limit(total: usize) -> Result<(), AdapterError> {
-    if total > MAX_TOTAL_UPLOAD_BYTES {
-        return Err(AdapterError::UnsupportedInput(format!(
-            "assets total {total} bytes, above the provider limit of {MAX_TOTAL_UPLOAD_BYTES} bytes"
-        )));
-    }
-    Ok(())
-}
-
-/// 已上传到上游的资产：拿到公网 URL 后回填进生成请求。
-#[derive(Debug, Clone)]
-struct UploadedAsset {
-    url: String,
-    native_parameter_path: String,
-    position: u16,
-}
-
-impl UploadedAsset {
-    /// 这个资产装的是参考图还是遮罩——判定与平台用的是同一个函数。
-    fn kind(&self) -> Option<AssetParameterKind> {
-        AssetParameterKind::classify(asset_parameter_name(&self.native_parameter_path))
-    }
-}
 
 #[derive(Debug, Deserialize)]
 struct UploadResponse {
@@ -983,14 +962,14 @@ fn validate_uploaded_url(raw: &str) -> Result<String, AdapterError> {
 }
 
 /// 上传时的文件名。上游按扩展名与 MIME 判定类型，因此按媒体类型给一个规整的名字。
-fn upload_filename(asset: &ResolvedAsset) -> String {
-    let extension = match asset.media_type.as_str() {
+fn upload_filename(bytes: &[u8], media_type: &str) -> String {
+    let extension = match media_type {
         "image/jpeg" => "jpg",
         "image/webp" => "webp",
         "image/gif" => "gif",
         _ => "png",
     };
-    format!("asset-{}.{extension}", asset.sha256)
+    format!("image-{}.{extension}", sha256_hex(bytes))
 }
 fn provider_error(
     code: &str,
@@ -1070,7 +1049,7 @@ fn unaccepted_idempotency(status: StatusCode, text: &str) -> Option<UnacceptedId
 /// `429` 用 HTTP 状态码而不是 `error.code`：该码可能是空串；幂等子类的标识符落在 `code`
 /// 或消息文本里，两处都看（`code` 已由 [`parse_provider_error`] 归一）。
 ///
-/// **只在创建请求这一处收窄**：轮询、取图与上传阶段的同名状态码都不适用——
+/// **只在创建请求这一处收窄**：轮询与上传阶段的同名状态码都不适用——
 /// 那时任务已经受理（见 [`after_acceptance`]），或者压根不是"创建"这个动作。
 fn narrow_submit_rejection(status: StatusCode, error: AdapterError) -> AdapterError {
     let AdapterError::Provider(provider) = &error else {
@@ -1094,25 +1073,6 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
         RetrySafety::AcceptanceUnknown,
         ProviderFailureKind::UpstreamUnavailable,
     )
-}
-
-fn validate_image_magic(bytes: &[u8], media_type: &str) -> Result<(), AdapterError> {
-    let ok = match media_type {
-        "image/png" => bytes.starts_with(&[0x89, b'P', b'N', b'G']),
-        "image/jpeg" => bytes.starts_with(&[0xFF, 0xD8, 0xFF]),
-        "image/webp" => bytes.len() >= 12 && &bytes[0..4] == b"RIFF" && &bytes[8..12] == b"WEBP",
-        _ => false,
-    };
-    if ok {
-        Ok(())
-    } else {
-        Err(provider_error(
-            "provider_result_invalid_media",
-            format!("result bytes do not match declared media type {media_type}"),
-            RetrySafety::AcceptanceUnknown,
-            ProviderFailureKind::Unknown,
-        ))
-    }
 }
 
 fn sha256_hex(bytes: &[u8]) -> String {
@@ -1501,7 +1461,7 @@ mod tests {
 
     #[test]
     fn post_acceptance_failures_are_never_narrowed() {
-        // 同一批状态码出现在**已受理之后**（轮询、取图）时，一律仍按受理状态不确定处理：
+        // 同一批状态码出现在**已受理之后**（轮询阶段）时，一律仍按受理状态不确定处理：
         // 任务已经在跑，把它当失败会让平台白付一次生成。
         for (status, body) in [
             (
@@ -1525,17 +1485,16 @@ mod tests {
 
     #[test]
     fn upload_filename_follows_the_media_type() {
-        let asset = |media_type: &str| ResolvedAsset {
-            native_parameter_path: "/images/0".to_owned(),
-            position: 0,
-            media_type: media_type.to_owned(),
-            sha256: "abc123".to_owned(),
-            bytes: Bytes::from_static(b"image"),
-        };
-        assert_eq!(upload_filename(&asset("image/jpeg")), "asset-abc123.jpg");
-        assert_eq!(upload_filename(&asset("image/webp")), "asset-abc123.webp");
-        assert_eq!(upload_filename(&asset("image/gif")), "asset-abc123.gif");
-        assert_eq!(upload_filename(&asset("image/png")), "asset-abc123.png");
+        let bytes = b"image";
+        assert!(upload_filename(bytes, "image/jpeg").ends_with(".jpg"));
+        assert!(upload_filename(bytes, "image/webp").ends_with(".webp"));
+        assert!(upload_filename(bytes, "image/gif").ends_with(".gif"));
+        assert!(upload_filename(bytes, "image/png").ends_with(".png"));
+        // 文件名里带上内容摘要：同一张图重复上传时上游看到同一个名字。
+        assert_eq!(
+            upload_filename(bytes, "image/png"),
+            upload_filename(bytes, "image/png")
+        );
     }
 
     #[test]
@@ -1645,88 +1604,175 @@ mod tests {
     }
 
     #[test]
-    fn total_upload_size_is_capped_like_the_per_file_limit() {
-        assert!(ensure_total_upload_within_limit(MAX_TOTAL_UPLOAD_BYTES).is_ok());
-        assert!(ensure_total_upload_within_limit(MAX_TOTAL_UPLOAD_BYTES + 1).is_err());
+    fn total_inline_upload_size_is_capped_like_the_per_file_limit() {
+        // 公网 URL 不计入：平台不读它的字节。只有内联 data URL 需要挡住总量。
+        let inline = |payload: String| PreparedImageRequest {
+            provider_model_id: "gpt-image-2.5-flare".to_owned(),
+            branch: ImageBranch::ImageConditioned,
+            native_parameters: serde_json::json!({
+                "prompt": "x",
+                "image_urls": [format!("data:image/png;base64,{payload}")]
+            }),
+            platform_parameters: vec!["image_urls".to_owned()],
+        };
+        assert!(
+            ApimartImageAdapter::ensure_total_upload_within_limit(&inline("A".repeat(1024)))
+                .is_ok()
+        );
+        let mut public = inline("A".repeat(1024));
+        public.native_parameters = serde_json::json!({
+            "prompt": "x",
+            "image_urls": ["https://example.invalid/very-large.png"]
+        });
+        assert!(
+            ApimartImageAdapter::ensure_total_upload_within_limit(&public).is_ok(),
+            "a public url is passed through, so it costs the platform nothing"
+        );
+        // 名单外的图名参数不参与统计：平台不上传它，也就不为它申请内存。
+        // （这类没声明的名字在受理期就按声明面丢掉了，到不了 Driver；这条钉的是换算只看名单。）
+        let mut unclaimed = inline("A".repeat(1024));
+        unclaimed.native_parameters = serde_json::json!({
+            "prompt": "x",
+            "images": [format!("data:image/png;base64,{}", "A".repeat(MAX_TOTAL_UPLOAD_BYTES))]
+        });
+        assert!(
+            ApimartImageAdapter::ensure_total_upload_within_limit(&unclaimed).is_ok(),
+            "名单外的参数不是平台的图，不算进上传总量"
+        );
+        // 超过上游总量上限的内联图片直接拒绝，不去为它申请那么多内存。
+        let oversized = (MAX_TOTAL_UPLOAD_BYTES / 3 + 8) * 4;
+        assert!(
+            ApimartImageAdapter::ensure_total_upload_within_limit(&inline("A".repeat(oversized)))
+                .is_err()
+        );
     }
 
+    /// Driver 收到的参数面**已经**是候选声明面里的子集：受理期按声明面过滤过了。
+    ///
+    /// 所以这里没有"认不认识这个参数"的判别——到手的每个名字（声明过的 `n`、`resolution`
+    /// 与任何别的名字）都原样进请求体，取值一个都不改。
     #[test]
-    fn forwards_parameters_it_does_not_know() {
-        // 平台不逐个声明渠道的长尾参数：没见过的键原样发给上游。
+    fn every_parameter_it_receives_goes_upstream_verbatim() {
         let mut prepared = PreparedImageRequest {
             provider_model_id: "gpt-image-2".to_owned(),
             branch: ImageBranch::PromptOnly,
             native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
-            assets: Vec::new(),
+            platform_parameters: Vec::new(),
         };
         let Value::Object(parameters) = &mut prepared.native_parameters else {
             panic!("fixture parameters must be an object");
         };
         parameters.insert("channel_specific_knob".to_owned(), Value::from(7));
-        let body = generation_body(&prepared, &[]).expect("supported");
+        parameters.insert("resolution".to_owned(), Value::from("2k"));
+        parameters.insert(
+            "image_with_roles".to_owned(),
+            serde_json::json!([{"role": "reference", "url": "https://example.invalid/a.png"}]),
+        );
+        let body = generation_body(&prepared, &Map::new()).expect("supported");
         assert_eq!(
             body.pointer("/channel_specific_knob"),
             Some(&Value::from(7))
         );
+        assert_eq!(body.pointer("/resolution"), Some(&Value::from("2k")));
+        assert_eq!(
+            body.pointer("/image_with_roles/0/role"),
+            Some(&Value::from("reference"))
+        );
     }
 
-    #[test]
-    fn generation_body_refuses_asset_paths_it_cannot_classify() {
-        // 受理期已经会拒 `/seed_image` 这类路径；这里再兜一层——绝不静默丢掉一张图。
-        let request = PreparedImageRequest {
+    /// 归属只看平台名单，不看取值的形状：名字不在名单里，Driver 既不换算它，也不改写它。
+    ///
+    /// 受理期已经按候选声明面过滤过，没声明的名字**根本到不了 Driver**；这条用例钉的是
+    /// Driver 这一侧的行为：`images`（即使带着 data URL）不在名单里，就不参与换算——平台不会
+    /// 解码上传、把它改成上游 URL，请求体里它仍是原样。
+    #[tokio::test]
+    async fn an_images_array_outside_the_platform_list_is_not_converted() {
+        let adapter =
+            ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(1)).expect("config");
+        let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+        let inline = "data:image/png;base64,AAAA";
+        let prepared = PreparedImageRequest {
             provider_model_id: "gpt-image-2.5-flare".to_owned(),
-            branch: ImageBranch::ImageConditioned,
-            native_parameters: serde_json::json!({"prompt": "x"}),
-            assets: Vec::new(),
+            branch: ImageBranch::PromptOnly,
+            native_parameters: serde_json::json!({
+                "prompt": "test",
+                "images": [inline]
+            }),
+            platform_parameters: Vec::new(),
         };
-        let uploaded = vec![UploadedAsset {
-            url: "https://up.example/a.png".to_owned(),
-            native_parameter_path: "/seed_image".to_owned(),
-            position: 0,
-        }];
-        let error = generation_body(&request, &uploaded).expect_err("unknown path must fail");
-        assert!(error.to_string().contains("/seed_image"), "{error}");
+        // `http://127.0.0.1:1` 上没有任何东西可以连：一旦它真去上传就会失败，
+        // 因此这个用例通过本身就证明 data URL 没有被拿去上传。
+        let resolved = adapter
+            .resolve_images(&prepared, &credential)
+            .await
+            .expect("名单外没有图片要换算");
+        assert!(resolved.is_empty(), "名单外没有可换算的图片：{resolved:?}");
+        let body = generation_body(&prepared, &resolved).expect("supported");
+        assert_eq!(
+            body.pointer("/images"),
+            Some(&serde_json::json!([inline])),
+            "到手的参数逐字上行：{body}"
+        );
+        assert!(
+            body.pointer("/image_urls").is_none(),
+            "名单里没有的名字不会被改写成候选声明的图片字段：{body}"
+        );
     }
 
     #[test]
-    fn generation_body_uses_the_uploaded_urls_at_their_parameter_paths() {
+    fn generation_body_carries_the_resolved_image_urls_at_their_parameter_names() {
         let request = PreparedImageRequest {
             provider_model_id: "gpt-image-2.5-flare".to_owned(),
             branch: ImageBranch::Masked,
-            native_parameters: serde_json::json!({"prompt": "edit this"}),
-            assets: Vec::new(),
+            native_parameters: serde_json::json!({
+                "prompt": "edit this",
+                "image_urls": ["data:image/png;base64,AAAA"],
+                "mask_url": "data:image/png;base64,BBBB"
+            }),
+            platform_parameters: vec!["image_urls".to_owned(), "mask_url".to_owned()],
         };
-        // 故意打乱顺序：装配时按位置排序，线上数组顺序必须与调用方一致。
-        let uploaded = vec![
-            UploadedAsset {
-                url: "https://up.example/second.png".to_owned(),
-                native_parameter_path: "/image_urls/1".to_owned(),
-                position: 1,
-            },
-            UploadedAsset {
-                url: "https://up.example/mask.png".to_owned(),
-                native_parameter_path: "/mask_url".to_owned(),
-                position: 0,
-            },
-            UploadedAsset {
-                url: "https://up.example/first.png".to_owned(),
-                native_parameter_path: "/image_urls/0".to_owned(),
-                position: 0,
-            },
-        ];
-        let body = generation_body(&request, &uploaded).expect("body");
+        // 换算结果由 `resolve_images` 给出：这里只验装配（顺序与参数名逐字保持）。
+        let mut resolved = Map::new();
+        resolved.insert(
+            "image_urls".to_owned(),
+            serde_json::json!(["https://up.example/a.png"]),
+        );
+        resolved.insert(
+            "mask_url".to_owned(),
+            Value::String("https://up.example/mask.png".to_owned()),
+        );
+        let body = generation_body(&request, &resolved).expect("body");
         assert_eq!(
             body["image_urls"],
-            serde_json::json!([
-                "https://up.example/first.png",
-                "https://up.example/second.png"
-            ]),
-            "参考图必须保持调用方顺序，且只能是上传后的公网 URL"
+            serde_json::json!(["https://up.example/a.png"])
         );
         assert_eq!(body["mask_url"], "https://up.example/mask.png");
+        assert!(
+            !body.to_string().contains("data:image"),
+            "内联图片绝不能以 data URL 形态出现在上行请求里：{body}"
+        );
         assert!(
             !body.to_string().contains("asset://"),
             "本地资产引用绝不能出现在上行请求里"
         );
+    }
+
+    #[tokio::test]
+    async fn public_urls_pass_through_without_being_uploaded_or_downloaded() {
+        // 上游只吃公网 URL：data URL 才需要上传换 URL，公网 URL 原样透传。
+        let adapter =
+            ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(1)).expect("config");
+        let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+        let resolved = adapter
+            .resolve_url("https://example.invalid/a.png", &credential)
+            .await
+            .expect("a public url needs no network round trip");
+        assert_eq!(resolved, "https://example.invalid/a.png");
+        // 不是 http(s) 也不是 data URL 的值一律拒绝，不猜。
+        let error = adapter
+            .resolve_url("asset://not-a-thing", &credential)
+            .await
+            .expect_err("an unknown shape must be rejected");
+        assert!(error.to_string().contains("http(s) url"));
     }
 }

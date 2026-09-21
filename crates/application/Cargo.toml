@@ -7,10 +7,8 @@ license.workspace = true
 
 [dependencies]
 async-trait.workspace = true
-bytes.workspace = true
 chrono.workspace = true
 hex.workspace = true
-imagesize.workspace = true
 jsonschema.workspace = true
 seeai-adapter-sdk = { path = "../adapter-sdk" }
 seeai-domain = { path = "../domain" }

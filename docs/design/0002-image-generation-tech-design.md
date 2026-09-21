@@ -7,9 +7,11 @@
 
 本文是本仓库图片生成技术设计的权威副本，对应历史提案 [seeaihub#674](https://github.com/dehuadong/seeaihub/issues/674) 的技术设计 v5。上游原 issue 与评论保持不动，只作为冻结的历史来源；本仓库后续提案与进度由 [seeaihub-server-next#1](https://github.com/dehuadong/seeaihub-server-next/issues/1) 及其后续工作项拥有，技术设计以本文为准。
 
-修订关系：v5 基于 2026-09-18 的真实付费验证，取代 v4 的「生产路径优先使用 `/ai/v1` 统一异步接口」结论；v4 的 Provider/Vendor 身份、Native Schema 发布、资产归档和安全重试规则继续有效并已并入本文；v3 的统一 Command/Job 与「文生图、图生图同阶段」结论同样继续有效。v1、v2、v3、v4 的逐版全文仍保留在上游 issue 评论中，作为修订历史，不复制到本仓库。
+修订关系：v5 基于 2026-09-18 的真实付费验证，取代 v4 的「生产路径优先使用 `/ai/v1` 统一异步接口」结论；v4 的 Provider/Vendor 身份、Native Schema 发布与安全重试规则继续有效并已并入本文（其中的**资产归档**已于 2026-09-20 作废，见下方更正）；v3 的统一 Command/Job 与「文生图、图生图同阶段」结论同样继续有效。v1、v2、v3、v4 的逐版全文仍保留在上游 issue 评论中，作为修订历史，不复制到本仓库。
 
-配套工件：实现映射见 [0001-image-generation.md](./0001-image-generation.md)；从本设计抽取的持久决策见 `docs/adr/`（编号 0001–0008）。
+**2026-09-20 就地更正（非修订级变更）**：本文原写的"输入侧先落成 Asset 并校验 MIME/魔数/尺寸/摘要""结果必须先归档到自有对象存储才算成功""对客有 202 受理与 job_id 轮询"三条**已作废**——图片按渠道原形进原形出，平台不落盘静态资产，对客只有同步形态。依据 [`docs/adr/0019`](../adr/0019-images-pass-through-without-asset-storage.md)，取代 [`docs/adr/0008`](../adr/0008-own-object-storage-is-the-platform-result.md)（已退役）。下文涉及之处已就地改写；Job/Attempt/计量证据/对账/结算不受影响，仍是内部执行与审计单位。
+
+配套工件：实现映射见 [0001-image-generation.md](./0001-image-generation.md)；从本设计抽取的持久决策见 `docs/adr/`。
 
 ## 1. 实测结论
 
@@ -32,35 +34,34 @@ Provider 与 Vendor 不合并：以后其他 Provider 也供应 `gpt-image-2` �
 
 ## 3. 统一应用命令与生命周期
 
-文生图、图生图以及厂商支持时的 mask 编辑是同一个图片生成业务能力的不同输入分支，共用一个 Command、Job、Attempt、Asset、Evidence 和结算流程。决策依据见 `docs/adr/0001-unified-image-generation-command.md`。
+文生图、图生图以及厂商支持时的 mask 编辑是同一个图片生成业务能力的不同输入分支，共用一个 Command、Job、Attempt、Evidence 和结算流程。决策依据见 `docs/adr/0001-unified-image-generation-command.md`。
 
 ```text
 CreateImageGenerationRequest {        // 调用方看到的形状（对客接口）
   model,                             // 对外的模型字段＝平台型号名（运营发布时的型号标识）
   <合同里的模型参数，扁平放顶层>,        // prompt / n / size / quality / …
-  image: <asset id> | [<asset id>…], // 参考图（OpenAI 契约的字段名）
-  mask:  <asset id>,                 // 可选；遮罩
+  image | image_urls,                // 参考图（同义、二选一）：公网 URL 或 data:image/…;base64,…
+  mask,                              // 可选；PNG data URL
   // 幂等键走 `Idempotency-Key` 请求头；预授权额由服务端定，调用方不报
 }
 
 CreateImageGeneration {               // 落库与 Worker 看到的形状（已落到某个候选的装载面）
-  native_model_id,                   // 库里这一列装的也是平台型号名；三方命名的收口另做
-  native_parameters,                  // 同上，但图片已按该候选声明映射成具体路径
-  asset_bindings,                     // [{native_parameter_path, asset_id, position}]
+  gateway_model,                     // 库里这一列装的也是平台型号名；三方命名的收口另做
+  native_parameters,                  // 同上，但图片已按该候选声明映射成具体参数名
   idempotency_key,
   max_cost_microusd,                  // 服务端按固定数给的预授权额
 }
 ```
 
-两者的换算就是 Offering Parameter Mapping 的起点：调用方只给 `image` / `mask`，平台按选中候选声明的参数面决定装到 `/image`、`/image_urls/0` 还是 `/mask_url`；候选表达不了就是不合格，选路据此判定。
+两者的换算就是 Offering Parameter Mapping 的起点：调用方只给 `image` / `mask`，平台按选中候选声明的参数面决定装到 `/image`、`/image_urls/0` 还是 `/mask_url`；候选表达不了就是不合格，选路据此判定。图片**只是参数值**——平台不持有字节、不给它独立身份，因此没有"资产绑定"这一层（`docs/adr/0019`）。
 
 请求分支判定（发布期/请求期派生结果，不是客户端字段）：
 
 | 条件 | 内部判定 | 约束 |
 | --- | --- | --- |
 | 无 `image`、无 `mask` | prompt-only | 使用厂商原生文生图参数合同 |
-| 有 `image`、无 `mask` | image-conditioned | 校验厂商原生图片数量、MIME、字节和其他字段 |
-| 有 `image`、有 `mask` | masked | 仅在厂商原生支持时启用；mask 必须满足原生尺寸/通道规则 |
+| 有 `image`、无 `mask` | image-conditioned | 图**只是参数值**（公网 URL 或 data URL）：平台不校验内容、MIME、字节或数量，交给渠道判 |
+| 有 `image`、有 `mask` | masked | 仅在候选声明支持时启用；mask 同样是参数值，尺寸/通道由渠道校验 |
 | 无 `image`、有 `mask` | 非法 | 调用上游前失败 |
 
 Job 状态机（所有分支共用）：
@@ -71,9 +72,9 @@ accepted → leased → submitting → submitted/running → succeeded
                                       └→ reconciliation_required
 ```
 
-Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、Native Parameters 摘要、Asset Bindings 与 Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
+Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、Native Parameters 摘要与 Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
-HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务逻辑：统一图片生成入口（`/v1/image-generations`）、generations 兼容入口（`/v1/images/generations`，JSON）、edits 兼容入口（`/v1/images/edits`，`multipart/form-data`）。三个入口**能力相同**：分支只看请求里有没有 `image`/`mask`，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。三个入口都调用同一个受理路径（`CreateImageGenerationRequest`）；兼容入口只负责请求解码与 Asset Binding，不能自己选路、计费或调用 Provider。**响应形态有两个**（2026-09-20 定）：统一入口按本平台的异步合同回 `202 { job_id}`；两个 OpenAI 兼容入口按 OpenAI SDK 的期望**同步**回结果（受理后等终态，成功 `{created, data:[{b64_json}]}`，失败 OpenAI 错误信封），内部流水线相同。
+HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations`（JSON）与 `/v1/images/edits`（`multipart/form-data`，`image`/`mask` 是文件部件）。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。multipart 上 `image`/`mask` 既可以是文件部件（字节只在内存里转成 data URL 语义），也可以是文本部件（值按 URL/data URL 读）——两者同一套语义，但同一个字段不能既当文件又当文本。
 
 ## 4. 执行路径与接口职责
 
@@ -87,7 +88,7 @@ HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务
        ├─ 无 image/images → POST /v1/images/generations
        └─ 有 image/images → POST /v1/images/edits
                               └─ mask 可选
-  → Base64 解码并归档 Asset
+  → 上游给的 url / b64_json 原样成为结果信封
   → usage → MeteringEvidence
   → Price Snapshot 结算
 ```
@@ -97,7 +98,7 @@ HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务
 - 平台应用层仍只有一个 Command、一个 Job 和一个结算流程；
 - 文生图/图生图判定仍来自原生图片参数，不新增平台 `operation` 字段；
 - `generations`/`edits` 的 endpoint 与 JSON/multipart 差异只存在于 Adapter；
-- Provider 同步不等于平台同步：调用方先得到持久 Job，Worker 在后台等待 Provider 响应并维护 lease/heartbeat；
+- Job 的推进仍是后台的（Worker 领活、租约与心跳），但**对客没有异步形态**：调用方在一次请求里等结果；
 - 以后是否增加同步等待型公开 API，不影响这个执行模型。
 
 这正好落实「`image.generations.sync.v1` 与 task 协议不应成为领域拆分，生命周期差异由 Adapter 处理」的方向。决策依据见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
@@ -108,7 +109,7 @@ HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务
 
 以 AIHubMix 无需鉴权的机器 Schema 为上游证据。导入后形成平台自己的不可变 `NativeImageCapabilitySchema` 修订，至少保存：来源 URL、抓取时间、内容摘要、上游 schema 版本和人工审核记录；必填 `model`、`prompt`；`image` 与 `images` 的同义/归并关系（`images` 最多 16 张）；`mask` 必须与 `image` 或非空 `images` 同时存在；`n` 为 1–10、默认 1；`output_format` 为 `png`/`jpeg`、默认 `png`；`size` 的原生值与图生图分支的受限集合；`quality`/`background`/`output_compression`/`user` 四项可选参数及其透明背景、压缩格式的组合约束（**字段位置以该 Offering 实际调用的端点为定，见下**；其中后三项在本阶段采用的执行路径上属**已声明未验证**，见下）；`async`、`webhook_url`、`webhook_events_filter` 的原生条件；未声明字段失败关闭。
 
-**未声明字段失败关闭是平台自己的防线**（2026-09-19 更正）：本句原先依赖「上游 `additionalProperties: false`」这一对该上游的观察。第二个 Provider 的实测表明上游可能**静默接受未声明字段并降级为默认值**，因此这道校验必须由平台在受理前执行，不能外包给上游。决策不变，见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
+**未声明字段由平台在受理前处置**（2026-09-19 更正 + 2026-09-20 用户定处置）：本句原先依赖「上游 `additionalProperties: false`」这一对该上游的观察。第二个 Provider 的实测表明上游可能**静默接受未声明字段并降级为默认值**，因此这层处置必须由平台在受理前执行，不能外包给上游。**2026-09-20 定为丢弃**：按选中候选声明的参数面过滤，没声明的直接丢掉（不报错、也不发上游），见 `docs/adr/0018-open-parameters-by-first-party-docs.md` 的同日修订。
 
 运行时请求不实时依赖 AIHubMix Schema 地址。更新流程是「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」，旧 Job 继续使用受理时固定的旧修订。
 
@@ -117,7 +118,7 @@ HTTP 只是应用命令的适配层，三种请求入口并存而不复制业务
 - 上一段清单里的 `background`、`output_compression`、`user` **不在**本阶段采用的执行路径的参数集合内，因此属"已声明未验证"，不应视为已开放能力（[`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G2）；
 - 已知差距（当前素材把可选参数声明在本 Offering 未采用的那一族端点的形状下，Adapter 能力面又强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。
 
-已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未知字段拒绝、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。「未知字段拒绝」是**平台自己的**受理前校验：上游不保证拒绝未声明字段（2026-09-19 实测另一 Provider 静默接受并降级为默认值），因此不能依赖上游返回错误来兜底。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md`。
+已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未声明字段丢弃、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。「未声明字段丢弃」是**平台自己的**受理前处置：上游不保证拒绝未声明字段（2026-09-19 实测另一 Provider 静默接受并降级为默认值），因此不能依赖上游返回错误来兜底。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md` 与 `docs/adr/0018-open-parameters-by-first-party-docs.md`。
 
 ## 6. 计量证据与结算
 
@@ -135,7 +136,7 @@ attempt_id
 
 Adapter 从 `/v1` 成功响应提取这些字段；结算模块只读取强类型 Evidence 和 Job 固化的 Price Snapshot。价格仍是运行时配置，当前公开候选为文本输入 `$5/M`、图片输入 `$8/M`、图片输出 `$30/M`。
 
-响应字段与总量必须满足内部一致性校验；缺字段、负数、总量不一致或响应解析失败时，不得猜测费用，进入对账。成功结果 Base64 必须先解码、校验并归档，随后才能把 Job 标为成功。结算门槛见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
+响应字段与总量必须满足内部一致性校验；缺字段、负数、总量不一致或响应解析失败时，不得猜测费用，进入对账。结果**不再解码归档**：上游给什么形态就存什么形态（`url` 或 `b64_json`），随后把 Job 标为成功。结算门槛见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
 ## 7. 同步 Provider 调用的可靠性边界
 
@@ -150,15 +151,15 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 
 该选择优先保证不重复出图和不重复产生上游成本，代价是极少数模糊失败不能自动恢复结果。Reconciliation Case 保留预授权，当前只允许管理员以幂等业务键退款并释放全部预授权；没有可核验 Metering Evidence 时不能人工确认扣款。以后若要根据上游账单确认扣款，必须另立设计，先定义可核验证据合同。每次处置写入不可变账本和审计。决策依据见 `docs/adr/0006-no-settlement-without-metering-evidence.md` 与 `docs/adr/0007-reconciliation-instead-of-automatic-retry.md`。
 
-## 8. 输入与输出资产
+## 8. 输入与输出图片
 
-- 平台 Asset 先完成权限、MIME、魔数、大小和摘要校验，再由 Adapter 编码成 AIHubMix 接受的 URL/data URI/base64 形式；
-- `image`/`images`/`mask` 仍保留 AIHubMix 原生字段语义，平台只把 Asset 引用绑定到这些字段；
-- AIHubMix 输出 URL 约 30 分钟失效，且下载需同一 Bearer；成功任务必须先归档到自有对象存储，再向平台 Job 标记成功；
+- 参考图/遮罩就是普通参数值：公网 URL 原样交给上游，data URL 就地解码后按上游要的形态发出去（AIHubMix 的编辑端点要文件部件，所以要字节）；
+- `image`/`images`/`mask` 仍保留 AIHubMix 原生字段语义，平台只把它们放到这些字段上；
+- AIHubMix 输出 URL 约 30 分钟失效，且下载可能需同一 Bearer。平台**不代取**：渠道给 `b64_json` 就回 base64、给 `url` 就回 URL，长期保存由调用方自己负责（决策见 `docs/adr/0019-images-pass-through-without-asset-storage.md`）；
 - 上游 URL 和 Bearer 不返回给平台调用方，不作为永久结果；
-- 当前正式 `/v1` 路径没有可查询 task id；响应解析、Base64 解码、校验或归档失败导致是否已生成、是否已计费不确定时，进入 `reconciliation_required`，不得自动重新提交。只有将来发布带可查询任务标识的新执行策略时，才允许在同一 Attempt 内恢复下载/归档。
+- 当前正式 `/v1` 路径没有可查询 task id；响应解析失败导致是否已生成、是否已计费不确定时，进入 `reconciliation_required`，不得自动重新提交。只有将来发布带可查询任务标识的新执行策略时，才允许在同一 Attempt 内恢复取结果。
 
-`AssetBinding` 记录 `native_parameter_path`、`asset_id` 与 `position`；输入图片不直接塞进普通 JSON 或业务表。决策依据见 `docs/adr/0008-own-object-storage-is-the-platform-result.md`。
+图片就是**候选声明的那个参数的值**（`/image`、`/image_urls/0`、`/mask_url`）；平台不持有字节、不给它独立身份，因此没有资产表，也没有资产引用。决策依据见 `docs/adr/0019-images-pass-through-without-asset-storage.md`。
 
 ## 9. Adapter 首期能力
 
@@ -188,7 +189,7 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 - 两条成功响应均能生成强类型 token Evidence，并按相同 Price Snapshot 机制结算；
 - Worker 可以安全承载长时间同步调用，客户端连接不等待 Provider；
 - 进程在提交中断开后 Job 进入 reconciliation，不发生第二次 Provider POST；
-- Base64 结果归档后才完成 Job，业务表不长期保存大段 Base64；
+- 结果信封（`url` 或 `b64_json`）写回 Job 后才完成 Job；平台不归档字节，`b64_json` 会原样出现在对客响应里；
 - 首期 Offering 拒绝未经发布的多图和冲突参数；
 - 新模型、Schema、Offering 和 Price Plan 仍通过 Runtime Revision 动态发布，不重编译数据面；
 - 没有可核验 Metering Evidence 时禁止正式结算发布。

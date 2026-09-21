@@ -1,9 +1,8 @@
 use anyhow::{Context, Result};
 use axum::{
     Json, Router,
-    body::Bytes,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{get, post},
 };
@@ -12,13 +11,14 @@ use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
-    AdapterRegistry, ApplicationError, AssetService, CreateImageGenerationRequest,
+    AdapterRegistry, ApplicationError, CreateImageGenerationRequest, GeneratedImage,
     GenerationService, HubRepository, IdentityService, JobView, ProviderFailureKind,
     ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
     RefundReconciliationCommand, RuntimeService,
 };
-use seeai_domain::{AccountId, AssetId, ImageBranch, JobId, JobState};
-use seeai_object_storage::ObjectStoreAssetStore;
+use seeai_domain::{
+    AccountId, ImageInputs, ImageParameterKind, JobId, contract_image_parameter_kind,
+};
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -35,9 +35,8 @@ struct AppState {
     identity: IdentityService,
     runtime: RuntimeService,
     reconciliation: ReconciliationService,
-    assets: AssetService,
     generations: GenerationService,
-    /// 兼容入口等任务跑完的最长时间。
+    /// 同步入口等任务跑完的最长时间。
     sync_wait: Duration,
 }
 
@@ -53,7 +52,6 @@ async fn main() -> Result<()> {
     let admin_token: Arc<str> = Arc::from(required_env("ADMIN_TOKEN")?);
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
-    let store = Arc::new(ObjectStoreAssetStore::from_env()?);
     let repository_port: Arc<dyn HubRepository> = repository;
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
@@ -67,7 +65,6 @@ async fn main() -> Result<()> {
         identity: IdentityService::new(repository_port.clone()),
         runtime: RuntimeService::new(repository_port.clone(), adapters),
         reconciliation: ReconciliationService::new(repository_port.clone()),
-        assets: AssetService::new(repository_port.clone(), store),
         sync_wait: generation_sync_wait()?,
         generations: GenerationService::new(
             repository_port,
@@ -96,12 +93,8 @@ async fn main() -> Result<()> {
             post(refund_reconciliation),
         )
         .route("/api/v1/provider-failures", get(list_provider_failures))
-        .route("/v1/assets", post(upload_asset))
-        .route("/v1/assets/{asset_id}", get(download_asset))
-        .route("/v1/image-generations", post(create_generation))
-        .route("/v1/image-generations/{job_id}", get(get_generation))
-        .route("/v1/images/generations", post(create_generation_compat))
-        .route("/v1/images/edits", post(create_image_edit_compat))
+        .route("/v1/images/generations", post(generate_image))
+        .route("/v1/images/edits", post(edit_image))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(tower_http::request_id::SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -336,44 +329,9 @@ async fn refund_reconciliation(
     Ok(StatusCode::NO_CONTENT)
 }
 
-async fn upload_asset(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    body: Bytes,
-) -> Result<(StatusCode, Json<seeai_application::AssetRecord>), ApiError> {
-    let account_id = authenticate(&state, &headers).await?;
-    let media_type = headers
-        .get(header::CONTENT_TYPE)
-        .and_then(|value| value.to_str().ok())
-        .ok_or_else(|| ApiError::bad_request("missing_content_type", "Content-Type is required"))?;
-    let role = headers
-        .get("x-asset-role")
-        .and_then(|value| value.to_str().ok())
-        .unwrap_or("image");
-    let asset = state
-        .assets
-        .upload(account_id, role, media_type, body)
-        .await?;
-    Ok((StatusCode::CREATED, Json(asset)))
-}
-
-async fn download_asset(
-    State(state): State<AppState>,
-    Path(asset_id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Response, ApiError> {
-    let account_id = authenticate(&state, &headers).await?;
-    let (record, bytes) = state.assets.download(account_id, AssetId(asset_id)).await?;
-    let content_type = HeaderValue::from_str(&record.media_type).map_err(|_| {
-        ApiError::bad_request("invalid_asset_media_type", "Asset media type is invalid")
-    })?;
-    Ok(([(header::CONTENT_TYPE, content_type)], bytes).into_response())
-}
-
-/// 受理请求：**平铺**的模型参数 + 平台自己的控制字段。
+/// 受理请求：**平铺**的模型参数 + 图片字段（`image` 与 `image_urls` 同义二选一，`mask` 是遮罩）。
 ///
-/// 调用方按合同把模型参数写在顶层（不再有 `native_parameters` 外壳），图片用 `image` /
-/// `mask` 指名平台资产 id；平台按选中候选声明的参数面决定装到哪个字段上。
+/// 图片直接是公网 URL 或 `data:image/…;base64,…`——平台不换 id、不上传、不落盘。
 #[derive(Debug, Deserialize)]
 struct CreateGenerationBody {
     #[serde(flatten)]
@@ -391,166 +349,96 @@ fn idempotency_key(headers: &HeaderMap) -> String {
         .unwrap_or_else(|| Uuid::new_v4().to_string())
 }
 
-/// 取出 `image`（一个 id 或 id 数组）并从参数里删掉它。
-fn take_asset_ids(
+/// 取参考图与遮罩：认哪些字段、空值怎么算，全在 `seeai_domain` 里；这里只把领域的话翻成对客的
+/// `invalid_parameter`。
+///
+/// 受理侧只认契约字段名（`image`、`image_urls`、`mask`），**不按名字像不像图片去判**：渠道
+/// 文档里的一手参数（例如带角色的图片列表）因此不会被平台误截；它们留在请求参数里，
+/// 由选路后的声明面过滤决定留不留。
+fn take_contract_image_inputs(
     parameters: &mut Map<String, Value>,
-    name: &str,
-) -> Result<Vec<AssetId>, ApiError> {
-    match parameters.remove(name) {
-        None | Some(Value::Null) => Ok(Vec::new()),
-        Some(Value::String(id)) => Ok(vec![parse_asset_id(name, &id)?]),
-        Some(Value::Array(items)) => items
-            .into_iter()
-            .map(|item| match item {
-                Value::String(id) => parse_asset_id(name, &id),
-                other => Err(invalid_asset_reference(name, &other)),
-            })
-            .collect(),
-        Some(other) => Err(invalid_asset_reference(name, &other)),
-    }
+) -> Result<ImageInputs, ApiError> {
+    seeai_domain::take_contract_image_inputs(parameters)
+        .map_err(|message| ApiError::bad_request("invalid_parameter", message))
 }
 
-/// 取出 `mask`（只接受一个 id）并从参数里删掉它。
-fn take_asset_id(
-    parameters: &mut Map<String, Value>,
-    name: &str,
-) -> Result<Option<AssetId>, ApiError> {
-    match parameters.remove(name) {
-        None | Some(Value::Null) => Ok(None),
-        Some(Value::String(id)) => Ok(Some(parse_asset_id(name, &id)?)),
-        Some(other) => Err(invalid_asset_reference(name, &other)),
-    }
+/// 对客的成功响应：只有 `created` 与 `data`。
+///
+/// 这里**结构上**就没有 job、没有任务的字段——内部的执行记录不投射成对客协议；
+/// `data` 每项只有渠道给的 `url` 或 `b64_json`。
+#[derive(Debug, Serialize)]
+struct SyncImageResponse {
+    created: i64,
+    data: Vec<GeneratedImage>,
 }
 
-fn parse_asset_id(name: &str, value: &str) -> Result<AssetId, ApiError> {
-    Uuid::parse_str(value.trim()).map(AssetId).map_err(|_| {
-        ApiError::bad_request(
-            "invalid_asset_id",
-            format!("{name} is not a valid asset id: {value}"),
-        )
-    })
-}
-
-fn invalid_asset_reference(name: &str, value: &Value) -> ApiError {
-    ApiError::bad_request(
-        "invalid_asset_reference",
-        format!("{name} must be an asset id or an array of asset ids, got {value}"),
-    )
+/// 对客的错误信封（沿用 OpenAI 的形状），对客码仍是平台那三个。
+#[derive(Debug, Serialize)]
+struct SyncErrorResponse {
+    error: SyncErrorBody,
 }
 
 #[derive(Debug, Serialize)]
-struct CreateGenerationResponse {
-    job_id: JobId,
-    state: JobState,
-    branch: ImageBranch,
-    created_at: chrono::DateTime<chrono::Utc>,
+struct SyncErrorBody {
+    message: &'static str,
+    #[serde(rename = "type")]
+    error_type: &'static str,
+    code: &'static str,
 }
 
-/// 统一入口：平铺的模型参数 + `image` / `mask`（平台资产 id）。
-async fn create_generation(
-    State(state): State<AppState>,
-    headers: HeaderMap,
-    Json(body): Json<CreateGenerationBody>,
-) -> Result<(StatusCode, Json<CreateGenerationResponse>), ApiError> {
-    let account_id = authenticate(&state, &headers).await?;
-    let mut parameters = body.parameters;
-    let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
-    let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
-    let accepted = accept_generation(
-        &state,
-        account_id,
-        &headers,
-        parameters,
-        image_asset_ids,
-        mask_asset_id,
-    )
-    .await?;
-    Ok((StatusCode::ACCEPTED, Json(accepted)))
-}
-
-/// 三个入口共用的受理路径：解码差异只到"参数 + 图片角色"为止，之后完全一样。
+/// generations 入口（JSON）：与 edits 入口**是同一个能力**，只是请求编码不同。
 ///
-/// 兼容入口不自己选路、计费或调用 Provider——它们只做请求解码与资产绑定，分支由参数与图片角色决定。
-async fn accept_generation(
-    state: &AppState,
-    account_id: AccountId,
-    headers: &HeaderMap,
-    mut parameters: Map<String, Value>,
-    image_asset_ids: Vec<AssetId>,
-    mask_asset_id: Option<AssetId>,
-) -> Result<CreateGenerationResponse, ApiError> {
-    let model = parameters
-        .remove("model")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| ApiError::bad_request("missing_model", "model is required"))?;
-    let job = state
-        .generations
-        .create(CreateImageGenerationRequest {
-            account_id,
-            model,
-            native_parameters: Value::Object(parameters),
-            image_asset_ids,
-            mask_asset_id,
-            idempotency_key: idempotency_key(headers),
-        })
-        .await?;
-    Ok(CreateGenerationResponse {
-        job_id: job.id,
-        state: job.state,
-        branch: job.branch,
-        created_at: job.created_at,
-    })
-}
-
-/// generations 兼容入口（OpenAI 契约的路径）。
-///
-/// 它与编辑入口**是同一个能力**：分支只看请求里有没有 `image` / `mask`，不由端点断言——
-/// 带图的 generations、不带图的 edits 都是合法请求。
-async fn create_generation_compat(
+/// 分支只看请求里有没有参考图 / 遮罩，不由端点断言——带图的 generations、不带图的 edits
+/// 都是合法请求。
+async fn generate_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     Json(body): Json<CreateGenerationBody>,
 ) -> Result<Response, ApiError> {
     let account_id = authenticate(&state, &headers).await?;
     let mut parameters = body.parameters;
-    let image_asset_ids = take_asset_ids(&mut parameters, "image")?;
-    let mask_asset_id = take_asset_id(&mut parameters, "mask")?;
-    accept_compat_generation(
+    let inputs = take_contract_image_inputs(&mut parameters)?;
+    run_sync_generation(
         &state,
         account_id,
         &headers,
         parameters,
-        image_asset_ids,
-        mask_asset_id,
+        inputs.reference_images,
+        inputs.mask,
     )
     .await
 }
 
-/// edits 兼容入口（OpenAI 契约的路径）：`multipart/form-data`，`image` 与 `mask` 是**文件
-/// 部件**；其余文本部件就是模型参数。
+/// edits 入口（`multipart/form-data`）：`image` 与 `mask` 是**文件部件**。
 ///
-/// 没有 `image` 的 edits 同样合法（那就是文生图）——分支由请求内容决定，不由端点断言。
-async fn create_image_edit_compat(
+/// 文件只留在内存里，转成 `data:` URL 语义交给 Driver——**不落盘、不上传**。
+/// 没有 `image` 的 edits 同样合法（那就是文生图）。
+/// 图片字段也可以走文本部件（与 JSON 入口同一套语义），但同一个字段不能既当文件又当文本。
+async fn edit_image(
     State(state): State<AppState>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     let account_id = authenticate(&state, &headers).await?;
     let mut parameters = Map::new();
-    let mut image_asset_ids = Vec::new();
-    let mut mask_asset_id = None;
+    let mut file_inputs = ImageInputs::default();
     while let Some(field) = multipart
         .next_field()
         .await
         .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
     {
         let name = field.name().unwrap_or_default().to_owned();
-        match name.as_str() {
-            "image" => {
-                image_asset_ids.push(upload_form_asset(&state, account_id, "image", field).await?);
+        // 只有契约字段名才是平台自己管的图片部件，带文件名的就当图片字节；其余名字按文本参数
+        // 留在请求里，等选路后按候选的声明面处置（渠道文档里的一手参数不会被"像图片"就截走，
+        // 没被候选声明的名字也不会跟着请求走去上游）。
+        match contract_image_parameter_kind(&name) {
+            Some(ImageParameterKind::Reference) if field.file_name().is_some() => {
+                file_inputs
+                    .reference_images
+                    .push(form_image_data_url(field).await?);
             }
-            "mask" => {
-                mask_asset_id = Some(upload_form_asset(&state, account_id, "mask", field).await?);
+            Some(ImageParameterKind::Mask) if field.file_name().is_some() => {
+                file_inputs.mask = Some(form_image_data_url(field).await?);
             }
             _ => {
                 let text = field.text().await.map_err(|error| {
@@ -560,126 +448,37 @@ async fn create_image_edit_compat(
             }
         }
     }
-    accept_compat_generation(
+    let text_inputs = take_contract_image_inputs(&mut parameters)?;
+    if !text_inputs.reference_images.is_empty() && !file_inputs.reference_images.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_parameter",
+            "image was given both as a file part and as a text field",
+        ));
+    }
+    if text_inputs.mask.is_some() && file_inputs.mask.is_some() {
+        return Err(ApiError::bad_request(
+            "invalid_parameter",
+            "mask was given both as a file part and as a text field",
+        ));
+    }
+    let reference_images = if file_inputs.reference_images.is_empty() {
+        text_inputs.reference_images
+    } else {
+        file_inputs.reference_images
+    };
+    run_sync_generation(
         &state,
         account_id,
         &headers,
         parameters,
-        image_asset_ids,
-        mask_asset_id,
+        reference_images,
+        file_inputs.mask.or(text_inputs.mask),
     )
     .await
 }
 
-/// 兼容入口的受理与响应：受理之后**等任务跑到终态**，按 OpenAI 的形状把图片交回去。
-///
-/// OpenAI 的客户端调这两个路径时，期望在同一个响应里直接拿到图片；我们的流水线是异步的
-/// （受理 → Worker 执行），所以这里给它一个同步门面：等不到就返回 504，并把 `job_id` 写进
-/// 错误信息里，调用方可以改用 `/v1/image-generations/{job_id}` 自己轮询。
-async fn accept_compat_generation(
-    state: &AppState,
-    account_id: AccountId,
-    headers: &HeaderMap,
-    parameters: Map<String, Value>,
-    image_asset_ids: Vec<AssetId>,
-    mask_asset_id: Option<AssetId>,
-) -> Result<Response, ApiError> {
-    let accepted = accept_generation(
-        state,
-        account_id,
-        headers,
-        parameters,
-        image_asset_ids,
-        mask_asset_id,
-    )
-    .await?;
-    let job_id = accepted.job_id;
-    let deadline = tokio::time::Instant::now() + state.sync_wait;
-    loop {
-        let view = state.generations.get(account_id, job_id).await?;
-        match view.state.as_str() {
-            "succeeded" => return openai_image_response(state, account_id, view).await,
-            "failed" | "reconciliation_required" => {
-                let code = view.error_code.as_deref().unwrap_or("platform_unavailable");
-                return Ok(openai_error_response(code));
-            }
-            _ if tokio::time::Instant::now() >= deadline => {
-                return Ok(openai_error_response_with(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "job_still_running",
-                    "server_error",
-                    &format!(
-                        "the job is still running; query /v1/image-generations/{job_id} for the result"
-                    ),
-                ));
-            }
-            _ => tokio::time::sleep(Duration::from_millis(250)).await,
-        }
-    }
-}
-
-/// 成功：OpenAI 的形状 `{created, data:[{b64_json}]}`。
-async fn openai_image_response(
-    state: &AppState,
-    account_id: AccountId,
-    view: JobView,
-) -> Result<Response, ApiError> {
-    let mut data = Vec::with_capacity(view.result_asset_ids.len());
-    for asset_id in view.result_asset_ids {
-        let (_record, bytes) = state.assets.download(account_id, asset_id).await?;
-        data.push(json!({ "b64_json": STANDARD.encode(&bytes) }));
-    }
-    Ok(Json(json!({
-        "created": view.updated_at.timestamp(),
-        "data": data,
-    }))
-    .into_response())
-}
-
-/// 失败：仍用 OpenAI 的错误信封，对客码沿用平台那三个。
-fn openai_error_response(public_code: &str) -> Response {
-    match public_code {
-        "content_rejected" => openai_error_response_with(
-            StatusCode::BAD_REQUEST,
-            public_code,
-            "invalid_request_error",
-            "the submitted content was rejected",
-        ),
-        "outcome_unknown" => openai_error_response_with(
-            StatusCode::BAD_GATEWAY,
-            public_code,
-            "server_error",
-            "the request outcome is unknown; see reconciliation",
-        ),
-        _ => openai_error_response_with(
-            StatusCode::BAD_GATEWAY,
-            public_code,
-            "server_error",
-            "the platform could not complete this request",
-        ),
-    }
-}
-
-fn openai_error_response_with(
-    status: StatusCode,
-    code: &str,
-    error_type: &str,
-    message: &str,
-) -> Response {
-    (
-        status,
-        Json(json!({ "error": { "message": message, "type": error_type, "code": code } })),
-    )
-        .into_response()
-}
-
-/// 把 multipart 里的文件部件存成平台资产，返回它的 id。
-async fn upload_form_asset(
-    state: &AppState,
-    account_id: AccountId,
-    role: &str,
-    field: Field<'_>,
-) -> Result<AssetId, ApiError> {
+/// 把 multipart 的图片部件转成 `data:` URL：字节只在内存里过一手，平台不保存。
+async fn form_image_data_url(field: Field<'_>) -> Result<String, ApiError> {
     let media_type = field
         .content_type()
         .map(str::to_owned)
@@ -688,11 +487,10 @@ async fn upload_form_asset(
         .bytes()
         .await
         .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
-    let asset = state
-        .assets
-        .upload(account_id, role, &media_type, bytes)
-        .await?;
-    Ok(asset.id)
+    Ok(format!(
+        "data:{media_type};base64,{}",
+        STANDARD.encode(&bytes)
+    ))
 }
 
 /// 表单里除文件外的部件都是字符串；只有整数型参数还原成数字（`n`），其余保持字符串
@@ -706,15 +504,108 @@ fn form_scalar(name: &str, text: &str) -> Value {
     Value::String(text.to_owned())
 }
 
-async fn get_generation(
-    State(state): State<AppState>,
-    Path(job_id): Path<Uuid>,
-    headers: HeaderMap,
-) -> Result<Json<seeai_application::JobView>, ApiError> {
-    let account_id = authenticate(&state, &headers).await?;
-    Ok(Json(
-        state.generations.get(account_id, JobId(job_id)).await?,
-    ))
+/// 两个入口共用的受理与响应：内部照旧走 Job 流水线，对外**等它跑到终态**再回图片。
+///
+/// 同步门面：等不到就按失败回 504——对客只说"这次没在时限内拿到结果"，不提内部的执行记录、
+/// 也不指路任何查询接口（对客没有这样的接口）。
+async fn run_sync_generation(
+    state: &AppState,
+    account_id: AccountId,
+    headers: &HeaderMap,
+    mut parameters: Map<String, Value>,
+    reference_images: Vec<String>,
+    mask: Option<String>,
+) -> Result<Response, ApiError> {
+    let model = parameters
+        .remove("model")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| ApiError::bad_request("missing_model", "model is required"))?;
+    let job = state
+        .generations
+        .create(CreateImageGenerationRequest {
+            account_id,
+            model,
+            native_parameters: Value::Object(parameters),
+            reference_images,
+            mask,
+            idempotency_key: idempotency_key(headers),
+        })
+        .await?;
+    let job_id = job.id;
+    let deadline = tokio::time::Instant::now() + state.sync_wait;
+    loop {
+        let view = state.generations.get(account_id, job_id).await?;
+        match view.state.as_str() {
+            "succeeded" => return Ok(sync_image_response(view)),
+            "failed" | "reconciliation_required" => {
+                let code = view.error_code.as_deref().unwrap_or("platform_unavailable");
+                return Ok(sync_error_response(code));
+            }
+            _ if tokio::time::Instant::now() >= deadline => {
+                return Ok(sync_error_response_with(
+                    StatusCode::GATEWAY_TIMEOUT,
+                    "result_pending",
+                    "server_error",
+                    "the request did not finish within the time limit; it is treated as failed",
+                ));
+            }
+            _ => tokio::time::sleep(Duration::from_millis(250)).await,
+        }
+    }
+}
+
+/// 成功：`{created, data:[{url|b64_json}]}`——渠道给什么就是什么，平台不下载、不转码。
+fn sync_image_response(view: JobView) -> Response {
+    Json(SyncImageResponse {
+        created: view.updated_at.timestamp(),
+        data: view.data.unwrap_or_default(),
+    })
+    .into_response()
+}
+
+/// 失败：仍用 OpenAI 的错误信封，对客码沿用平台那三个。
+///
+/// 落库的 `error_code` 有 CHECK 约束保证只可能是这三个；认不出的按平台侧故障说。
+fn sync_error_response(public_code: &str) -> Response {
+    match public_code {
+        "content_rejected" => sync_error_response_with(
+            StatusCode::BAD_REQUEST,
+            "content_rejected",
+            "invalid_request_error",
+            "the submitted content was rejected",
+        ),
+        "outcome_unknown" => sync_error_response_with(
+            StatusCode::BAD_GATEWAY,
+            "outcome_unknown",
+            "server_error",
+            "the platform could not confirm the outcome of this request",
+        ),
+        _ => sync_error_response_with(
+            StatusCode::BAD_GATEWAY,
+            "platform_unavailable",
+            "server_error",
+            "the platform could not complete this request",
+        ),
+    }
+}
+
+fn sync_error_response_with(
+    status: StatusCode,
+    code: &'static str,
+    error_type: &'static str,
+    message: &'static str,
+) -> Response {
+    (
+        status,
+        Json(SyncErrorResponse {
+            error: SyncErrorBody {
+                message,
+                error_type,
+                code,
+            },
+        }),
+    )
+        .into_response()
 }
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId, ApiError> {
@@ -787,7 +678,6 @@ impl From<ApplicationError> for ApiError {
             }
             ApplicationError::Configuration(_)
             | ApplicationError::Persistence(_)
-            | ApplicationError::ObjectStorage(_)
             | ApplicationError::Reconciliation(_) => {
                 (StatusCode::INTERNAL_SERVER_ERROR, "internal_error")
             }
@@ -839,7 +729,8 @@ fn generation_max_cost_microusd() -> Result<u64> {
     }
 }
 
-/// 兼容入口等任务跑完的窗口（秒，默认 120）：超了就把 job id 交回调用方自己去查。
+/// 同步入口等任务跑完的窗口（秒，默认 120）：超了就按失败回 504——对客没有可查询的
+/// 执行记录，所以这个窗口之外拿不到图，只能由调用方自己重来。
 fn generation_sync_wait() -> Result<Duration> {
     let seconds = match env::var("GENERATION_SYNC_WAIT_SECONDS") {
         Ok(value) if !value.trim().is_empty() => value

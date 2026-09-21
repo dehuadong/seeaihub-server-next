@@ -37,20 +37,22 @@ _Avoid_: Provider、Offering
 _Avoid_: 配置文件、当前缓存
 
 **Generation Job**:
-平台已经受理、可持久恢复的一次图片生成业务请求。
-_Avoid_: Provider Task、HTTP 请求
+**内部的**执行与审计记录：平台已受理、可持久恢复的一次图片生成请求。它承载路由判定、计量证据、对账与结算，**对客不可见**——平台对消费者只有同步调用，不提供任务号轮询，也不把这条记录投射成对客协议。
+_Avoid_: 对客任务、任务号、Provider Task、HTTP 请求
 
 **Generation Attempt**:
 Generation Job 对某个 Offering 和 Channel 发起的一次外部副作用尝试。它同时承载对账标识（Provider 的逐请求标识，例如响应头 `x-request-id`），该标识只用于对账，不参与计价，也不属于 Metering Evidence。
 _Avoid_: 重试、Job
 
-**Asset**:
-经平台授权和校验、由对象存储承载的输入或输出媒体引用。
-_Avoid_: 外部 URL、Base64 字符串
+**Reference Image / Mask**（参考图与遮罩）:
+调用方给出的图片参数值：公网 URL 或 `data:image/…;base64,…`（遮罩为 PNG data URL）。它**只是参数值**——平台不落盘、不校验其内容、不给它独立身份，由渠道决定接受什么形态、拒绝什么形态。
 
-**Asset Binding**:
-把一张输入 Asset 绑到某个**模型参数**上的记录（`native_parameter_path`、`asset_id`、`position`）。路径的第一段是**该 Vendor Model Contract 声明的参数名**；路径带第二段表示该参数是数组（例如 `/image_urls/0`）。把它变成某个 Offering 实际要求的渠道包装，属 **Offering Parameter Mapping**。平台只在**一处**判定这个参数装的是参考图还是遮罩：名字以 `image` 开头的是参考图、名字含 `mask` 的是遮罩、**其余一律拒绝**（宁可拒绝也不猜；发布期校验与运行期用的是同一个函数）——这是**本阶段的兼容规则**，不是长期通用协议，其归属见 `docs/adr/0015`。
-_Avoid_: 统一图片字段、Canonical image 参数、把渠道参数名当作模型参数名、在每个渠道重复一套判定
+平台认**调用方契约字段**只有两个名字：`image` 与 `image_urls`（同义、二选一，只有两边都给了非空值才算冲突），以及 `mask`。其余参数按**选中候选**的 `capability_schema.properties` 过滤：候选声明过的照原样发给上游，没声明的**直接丢掉**（不报错、也不发上游）。候选**声明**的参数名另有一套判定：名字以 `image` 开头的是参考图、含 `mask` 的是遮罩（**两者都像时以遮罩为准**）、其余一律拒绝——这一套判定只用于"把调用方的图落到该候选的哪个参数上"，不用于拦截调用方字段。
+_Avoid_: Asset、资产、素材库、把渠道参数名当作模型参数名、在每个渠道重复一套判定
+
+**Result Envelope**（结果信封）:
+上游交付结果时给的 `url` 或 `b64_json`，原样进入对客响应的 `data[]`（每项只保留其中之一）。平台**不下载、不解码、不归档**；链接的有效期与长期保存由调用方自己负责。
+_Avoid_: 平台结果资产、归档、本地副本
 
 **Metering Evidence**:
 Provider 成功响应或账单中可核验的计量事实，不包含平台价格计算结果。对账标识**不属于**本词条的一部分——它由 Generation Attempt 自己承载，见 `Generation Attempt`。
