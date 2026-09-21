@@ -341,6 +341,26 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 `model`（`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`）、`prompt`、`size`（`auto` + 15 比例 + 精确像素）、`resolution`（`1k/2k/4k`）、`quality`（`low/medium/high/xhigh/max/auto`，默认 `auto`）、`n`（`1~4`）、`output_format`、`output_compression`、`background`、`moderation`（默认 `low`）、`image_urls`（≤16，**仅公网可访问 URL**）。
 
+**`size` 与 `resolution` 的取值与默认值（2026-09-20 复核）**：
+
+| 参数 | 默认 | 取值 | 说明 |
+| --- | --- | --- | --- |
+| `size` | **`auto`** | `auto` + 15 个比例（`1:1` `3:2` `2:3` `4:3` `3:4` `5:4` `4:5` `16:9` `9:16` `2:1` `1:2` `21:9` `9:21` `3:1` `1:3`）+ 精确像素（如 `1600x1200`） | 文档明写**图生图时建议不传** `size`，由系统按输入图比例与 `resolution` 算 |
+| `resolution` | **`1k`** | `1k` / `2k` / `4k` | **与"比例形式的 `size`"配合**决定实际输出像素；`size` 用精确像素时**该字段被忽略** |
+
+**精确像素的合法性**（渠道文档明写的四条）：宽高均为 `16` 的倍数、任意单边 ≤ `3840`、长边与短边之比 ≤ `3:1`、总像素 `655,360` ~ `8,294,400`；**高于 2560×1440 属实验性范围**（稳定性可能低于常用分辨率）。
+
+**比例 × 档位 → 像素的映射表存在**（15 比例 × 3 档，本文不复述整表）。**两个特征值**：
+
+- `4k` 的 `1:1` 是 **`2880×2880`**，**不是** 3840；
+- `4k` 下**只有 8 个比例能到 3840**：`16:9` / `9:16` / `2:1` / `1:2` / `21:9` / `9:21` / `3:1` / `1:3`；其余 7 个比例的长边都到不了 3840。
+
+**来源**：`out-reference/apimart/gpt-image-2.5-generation.cn.md`（2026-09-19 抓取）＋ 2026-09-20 与上游文档 `https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md` **逐句复核一致**。
+
+> ⚠️ **`gpt-image-2` 的尺寸档案不能沿用到 2.5。** `out-reference/apimart/apimart-image-api-research.md` 里的三条尺寸口径——`4k` = 3840、"`auto` 回落 `1:1`"、"不传 `size` ⇒ 输出分辨率 = 输入图分辨率"——**全是 `gpt-image-2` 口径**，与 2.5 的文档不一致：2.5 是"`auto` 由**模型**按提示词或参考图决定"、"不传 `size` 时按**输入图比例** + `resolution` 算"。2.5 的尺寸事实一律以本节为准，**不得**用旧材料反推。
+
+**未结清：`size` 的厂商原生语义。** OpenAI 原生接口收的是哪一种尺寸形态（像素 / 比例 / 档位），以及原生是否真有 `resolution` 这个字段，**均未核**——两次抓 OpenAI 官方页都是 `403`。⇒ 在此之前，上面的取值与映射只是 **APIMart 的渠道口径**，**不得**当作 OpenAI 的合同（`vendor_id: OpenAI` 是运营方的配置决定，见 §5.3）。
+
 ### 3.3 任务成功响应（**2026-09-19 实测结清**）
 
 **实测原文**（`gpt-image-2.5-flare`、`n=1`、`size=1:1`、`resolution=1k`、`quality=low`；原始记录见 `out-reference/apimart/controlled-probe-2026-09-19.json`）：
