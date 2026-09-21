@@ -668,6 +668,9 @@ impl From<ApplicationError> for ApiError {
     fn from(error: ApplicationError) -> Self {
         let (status, code) = match error {
             ApplicationError::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
+            // 调用方这次请求在参数上不成立（例如合同没声明图片字段却带了图）：与一般校验失败分开，
+            // 说得更具体，调用方才知道该去掉哪个字段或换模型。
+            ApplicationError::InvalidParameter(_) => (StatusCode::BAD_REQUEST, "invalid_parameter"),
             ApplicationError::NoEligibleOffering(ref reason) => {
                 // 请求本身没违反合同，是平台的供给面承载不了它：对客说成平台侧故障，不是参数错。
                 // 它发生在受理之前、没有 Job 可以记录，所以这里留一条日志——平台侧的供给问题

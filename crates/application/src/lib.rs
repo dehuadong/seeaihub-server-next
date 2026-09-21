@@ -7,12 +7,14 @@ use seeai_adapter_sdk::{
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
     AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, ImageParameterKind,
-    JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, PriceRates,
-    PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_parameter_defaults,
-    apply_size_mapping, contract_image_parameter_kind, declared_field_names,
-    declared_parameter_names, declared_reference_image_limit, declared_size_mapping,
-    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
-    is_used_parameter_value, place_image_inputs, platform_image_parameters,
+    JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
+    PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_enum_maps,
+    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
+    contract_image_parameter_kind, declared_defaults, declared_enum_maps, declared_field_names,
+    declared_parameter_names, declared_reference_image_limit, declared_renames,
+    declared_size_mapping, declares_mask_parameter, declares_parameter,
+    declares_reference_image_parameter, is_used_parameter_value, place_image_inputs,
+    platform_image_parameters,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -767,6 +769,11 @@ pub struct ProviderFailureQuery {
 pub enum ApplicationError {
     #[error("validation failed: {0}")]
     Validation(String),
+    /// 调用方这次请求本身在**参数上**不成立：图片字段是"合同外字段丢弃"的例外，合同没为它留位置
+    /// 时不能丢（丢图等于悄悄生成一张没有参考图的图），因此单独一个类别——对客要说得比一般校验
+    /// 失败更具体。
+    #[error("invalid parameter: {0}")]
+    InvalidParameter(String),
     /// 该型号有 active 供给，但**没有一条能承载这次请求**。
     ///
     /// 与 [`Self::Validation`] 分开：请求本身违反合同（缺必填）是调用方的问题；一条候选都
@@ -1152,8 +1159,13 @@ impl RuntimeService {
     ) -> Result<NormalizedOffering, ApplicationError> {
         jsonschema::validator_for(&offering.carrier_schema)
             .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        // 供给不能凭空多出调用方可提交的字段：承载面必须落在合同里。
-        validate_carrier_within_contract(contract, &offering.carrier_schema)?;
+        // 供给不能凭空多出调用方可提交的字段：承载面必须落在合同里（改名的桥与尺寸换算的目标
+        // 也算"从合同来的"，见该函数）。
+        validate_carrier_within_contract(
+            contract,
+            &offering.carrier_schema,
+            &offering.parameter_mapping,
+        )?;
         let mut base_url = offering.base_url.trim().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
             return Err(ApplicationError::Validation(
@@ -1214,6 +1226,8 @@ impl RuntimeService {
         // 被这条供给的承载面声明（否则换算出来的值发不出去），档案必须成形状。写歪了在这里拒绝，
         // 不让它到受理期才变成一条"这条候选换算不出"的平台侧故障。
         validate_size_mapping(contract, &offering)?;
+        // 改名表、取值映射表与显式默认值同样是发布数据，判据同一条：声明了却做不到就不该发出去。
+        validate_parameter_mapping(contract, &offering)?;
         // 限制只能收窄：供货方不得声明这条供给的承载面自己都没声明的能力。
         validate_restrictions_within_profile(&offering)?;
         // Driver 侧的发布校验看的是**承载面**：这条供给实际会往线文里写的字段面。
@@ -1353,22 +1367,118 @@ fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), Appl
 
 /// 校验「承载面 ⊆ 合同」：供给不能凭空多出调用方可提交的字段。
 ///
-/// 判据是**顶层字段名**：承载面声明了这个名字，合同就必须也声明它——否则这条供给会承载一个
-/// 客户端根本提交不了的参数（客户端按合同提交，合同里没有的名字它不会发），声明与行为就分了家。
+/// 判据是**顶层字段名**，但要认得出"从合同来的名字"：承载面声明的是**线上字段名**，同一个字段
+/// 在这条供给的线上完全可以叫另一个名字，而那个名字同样是从合同来的、不是供给凭空多出来的。
+/// 因此一个承载面字段算数，当且仅当它满足下面任意一条：
 ///
-/// 只比名字、不比定义：同一个名字在两边各自描述（例如 `size` 的取值形态）是后续步骤的事，
-/// 本步先把"字段面"这条边界立住。
+/// - 合同直接声明了它；
+/// - 改名表把某个**合同字段**改到它身上（线上换个名字）；
+/// - 它是尺寸换算的**目标字段**（换算的源字段在合同里，算出来的值写在这个名字上）。
+///
+/// 只比名字、不比定义：同一个名字在两边各自描述（例如 `size` 的取值形态）由映射与换算承担。
 fn validate_carrier_within_contract(
     contract: &Value,
     carrier: &Value,
+    mapping: &Value,
 ) -> Result<(), ApplicationError> {
     carrier_properties(carrier)?;
+    let renames = declared_renames(mapping).map_err(|reason| {
+        ApplicationError::Validation(format!("parameter_mapping.rename: {reason}"))
+    })?;
+    let size_target = declared_size_mapping(mapping)
+        .map_err(|reason| {
+            ApplicationError::Validation(format!("parameter_mapping.size: {reason}"))
+        })?
+        .map(|mapping| mapping.target);
     for field in declared_field_names(carrier) {
-        if !declares_parameter(contract, field) {
+        if declares_parameter(contract, field) {
+            continue;
+        }
+        let renamed_from_contract = renames.as_ref().is_some_and(|renames| {
+            renames.iter().any(|(source, wire)| {
+                wire.as_str() == field && declares_parameter(contract, source)
+            })
+        });
+        let converted_from_contract = size_target.as_deref() == Some(field);
+        if !renamed_from_contract && !converted_from_contract {
             return Err(ApplicationError::Validation(format!(
                 "carrier schema declares {field}, which the vendor model contract does not"
             )));
         }
+    }
+    Ok(())
+}
+
+/// 校验映射里的**改名表**、**取值映射表**与**显式默认值**：它们都必须是这条供给真能做到的事。
+///
+/// 三条边界，与"承载面 ⊆ 合同 ⊆ Driver 能写上线文的名字"同一条道理——声明了却做不到，就是
+/// 声明与行为分了家：
+///
+/// - 改名的**源**必须在合同里：调用方提交不了的名字没有值可改；
+/// - 改名的**目标**必须被这条供给的承载面声明：改出来的名字发不出去，等于没改；
+/// - 取值映射的字段必须"合同里有、这条供给承载得了"，否则这张表永远不会被用到；
+/// - 显式默认值的每个键必须被这条供给承载（承载面声明，或经改名落到一个声明的名字上）：
+///   声明了一个发不出去的默认值，就是"声明了却发不出去"。
+///
+/// 声明写歪时**不**按"没有声明"处理：那会让调用方与运营都以为映射发生了，而线上原样上行。
+fn validate_parameter_mapping(
+    contract: &Value,
+    offering: &NormalizedOffering,
+) -> Result<(), ApplicationError> {
+    let mapping = &offering.parameter_mapping;
+    let renames = declared_renames(mapping).map_err(|reason| {
+        ApplicationError::Validation(format!("parameter_mapping.rename: {reason}"))
+    })?;
+    let enum_maps = declared_enum_maps(mapping).map_err(|reason| {
+        ApplicationError::Validation(format!("parameter_mapping.enum_map: {reason}"))
+    })?;
+    if let Some(renames) = &renames {
+        for (source, wire) in renames {
+            if !declares_parameter(contract, source) {
+                return Err(ApplicationError::Validation(format!(
+                    "parameter_mapping.rename reads {source}, which the vendor model contract does not declare"
+                )));
+            }
+            if !declares_parameter(&offering.carrier_schema, wire) {
+                return Err(ApplicationError::Validation(format!(
+                    "parameter_mapping.rename writes {wire}, which this offering's carrier surface does not declare"
+                )));
+            }
+        }
+    }
+    if let Some(enum_maps) = &enum_maps {
+        for name in enum_maps.keys() {
+            validate_mapped_field(contract, offering, renames.as_ref(), name, "enum_map")?;
+        }
+    }
+    if let Some(defaults) = declared_defaults(mapping) {
+        for name in defaults.keys() {
+            validate_mapped_field(contract, offering, renames.as_ref(), name, "defaults")?;
+        }
+    }
+    Ok(())
+}
+
+/// 映射里声明的一个**合同字段名**必须"合同里有、这条供给承载得了"：两样缺一，这份声明就是死的。
+///
+/// 合同没声明它，调用方根本提交不了这个字段，映射没有输入；这条供给承载不了它，映射出来的东西
+/// 发不出去。`kind` 只用于把出错的是哪一块说清楚。
+fn validate_mapped_field(
+    contract: &Value,
+    offering: &NormalizedOffering,
+    renames: Option<&ParameterRenames>,
+    name: &str,
+    kind: &str,
+) -> Result<(), ApplicationError> {
+    if !declares_parameter(contract, name) {
+        return Err(ApplicationError::Validation(format!(
+            "parameter_mapping.{kind} declares {name}, which the vendor model contract does not"
+        )));
+    }
+    if !carries_parameter(&offering.carrier_schema, renames, name) {
+        return Err(ApplicationError::Validation(format!(
+            "parameter_mapping.{kind} declares {name}, which this offering's carrier surface cannot carry"
+        )));
     }
     Ok(())
 }
@@ -1873,6 +1983,9 @@ fn validate_restrictions(
 ///   变成调用方的负担。
 /// - **必填在场**：合同说必填的字段必须给出。`model` 由平台自己落，参考图与遮罩已按契约字段名
 ///   从参数面里取出（图片不走普通参数），所以这两处单独算在场。
+/// - **图片字段是"合同外字段丢弃"的例外**：参考图与遮罩不是多带的旋钮，而是这次请求的实质。
+///   合同没为它们留位置时不能丢——丢图等于悄悄生成一张没有参考图的图，还照样计费；也不能说成
+///   平台侧故障（供给面没问题，是这个模型不接图）。一律按参数错拒掉，让调用方换模型或去掉参考图。
 ///
 /// 判据是**合同**而不是承载面：合同说客户端能提交什么，承载面说这条供给能把它带到线上——
 /// 后者由 [`prepare_carrier_parameters`] 逐候选判。请求里的取值本身仍**不**校验
@@ -1885,6 +1998,20 @@ fn contract_parameter_face(
     request: &CreateImageGenerationRequest,
     contract: &Value,
 ) -> Result<Map<String, Value>, ApplicationError> {
+    // 图片字段按**角色**认（名字以 `image` 开头的是参考图、含 `mask` 的是遮罩），与候选声明面
+    // 用的是同一份判据：`image` 与 `image_urls` 在合同里同义，合同声明了其中任何一个都算留了位置。
+    if !request.reference_images.is_empty() && !declares_reference_image_parameter(contract) {
+        return Err(ApplicationError::InvalidParameter(format!(
+            "the contract for model {} declares no reference image parameter; drop the reference image or use a model that takes one",
+            request.model
+        )));
+    }
+    if request.mask.is_some() && !declares_mask_parameter(contract) {
+        return Err(ApplicationError::InvalidParameter(format!(
+            "the contract for model {} declares no mask parameter; drop the mask or use a model that takes one",
+            request.model
+        )));
+    }
     let supplied = request.native_parameters.as_object().ok_or_else(|| {
         ApplicationError::Validation("native_parameters must be an object".to_owned())
     })?;
@@ -1930,22 +2057,26 @@ fn contract_image_input_present(request: &CreateImageGenerationRequest, name: &s
 
 /// 受理的第二步：这条供给承载得了这次请求吗？承载得了就把参数面组装出来。
 ///
-/// **承载校验**：请求里**实际用到**的每个字段（非空值）都必须在这条候选的承载面里；缺一个就是
+/// **承载校验**：请求里**实际用到**的每个字段（非空值）都必须被这条候选承载；缺一个就是
 /// 这条候选不合格，返回原因写进路由判定记录。这正是"声明了承载面"的意义——供给说了自己能把哪些
-/// 字段带到线上，平台不替它加码。
+/// 字段带到线上，平台不替它加码。承载的判据不只看承载面声明：某个合同字段承载面没声明、但映射
+/// 的**改名表**把它落到了承载面声明的名字上时，这条供给照样承载得了它（只是线上叫另一个名字）。
 ///
-/// 唯一的例外是**被尺寸换算消耗**的字段：那条供给把它当作换算的输入（比例 + 档位 → 像素），
-/// 而不是要原样发出去的字段。它表达得了这次请求，只是表达成另一个样子——像素面渠道的线上根本
-/// 没有 `resolution` 这个名字，正因为有换算它才承载得了这个请求。换算本身失败（档案缺那一格、
-/// 取值不成形状）同样是"这条候选不合格"，理由照旧写进判定记录。
+/// 两个例外都算"表达得了这次请求，只是表达成另一个样子"：
+/// - **被尺寸换算消耗**的字段：那条供给把它当作换算的输入（比例 + 档位 → 像素），而不是要原样
+///   发出去的字段——像素面渠道的线上根本没有 `resolution` 这个名字，正因为有换算它才承载得了；
+/// - 换算本身失败（档案缺那一格、取值不成形状）同样是"这条候选不合格"，理由照旧写进判定记录。
 ///
 /// 合格之后才组装要落进 Job、并发给上游的参数面：
-/// 1. 按承载面留下名字：调用方给了空值、承载面又没声明这个字段时，在这里去掉（空值不携带信息，
-///    而发一个承载面没声明的名字给上游，只会得到上游自己的一套解释）；
+/// 1. 按承载留下名字：承载面声明了这个名字就用它，否则用改名表映射出来的**线上名字**；两边都
+///    落不到的名字（含调用方给了空值的）在这里去掉——空值不携带信息，而发一个承载不了的字段名
+///    给上游，只会得到上游自己的一套解释；
 /// 2. 把参考图与遮罩落到这条候选**自己声明的**参数名上（声明不了就是不合格，绝不静默丢图）；
 /// 3. 注入映射声明的**显式默认值**：调用方没给的字段由平台定，而不是由渠道自己的默认值定；
-/// 4. 按映射声明做**尺寸换算**：这一步最后做，换算出来的值就是最终要发出去的那个值；
-/// 5. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
+/// 4. 按映射声明做**尺寸换算**：这一步在改名之前做，因为换算的源字段是**合同字段名**；
+/// 5. 改名：把还没落到线上的合同字段名换成这条供给线上要发的名字；
+/// 6. 按**取值映射表**把取值换成线上取值：表里没有的取值让这条候选不合格（不猜、不透传原值）；
+/// 7. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
 ///    平台不替它省。放在最后是因为前几步都可能把必填项补上（图落在承载面的名字上、默认值注入、
 ///    尺寸换算写进目标字段），先判会把"其实跑得通"的候选误判成不合格。
 ///
@@ -1956,7 +2087,10 @@ fn prepare_carrier_parameters(
     request: &CreateImageGenerationRequest,
     offering: &PublishedOffering,
 ) -> Result<Value, String> {
-    let size = declared_size_mapping(&offering.parameter_mapping)?;
+    let mapping = &offering.parameter_mapping;
+    let renames = declared_renames(mapping)?;
+    let enum_maps = declared_enum_maps(mapping)?;
+    let size = declared_size_mapping(mapping)?;
     for (name, value) in contract_parameters {
         if !is_used_parameter_value(value) {
             continue;
@@ -1964,13 +2098,20 @@ fn prepare_carrier_parameters(
         if size.as_ref().is_some_and(|mapping| mapping.consumes(name)) {
             continue;
         }
-        if !declares_parameter(&offering.carrier_schema, name) {
+        if !carries_parameter(&offering.carrier_schema, renames.as_ref(), name) {
             return Err(format!(
                 "this offering cannot carry parameter {name}, which the request uses"
             ));
         }
     }
-    let mut parameters = declared_parameter_names(&offering.carrier_schema, contract_parameters);
+    // 参数面此时还在**合同名字**上：默认值按合同字段名注入、尺寸换算按合同字段名取输入，改名与
+    // 取值映射放到最后统一落到线上形态。落不进承载面的名字在这里就被丢掉，与"未声明的参数不上行"
+    // 是同一条规则。
+    let mut parameters = contract_parameters
+        .iter()
+        .filter(|(name, _)| carries_parameter(&offering.carrier_schema, renames.as_ref(), name))
+        .map(|(name, value)| (name.clone(), value.clone()))
+        .collect::<Map<_, _>>();
     place_image_inputs(
         &offering.carrier_schema,
         &mut parameters,
@@ -1980,7 +2121,8 @@ fn prepare_carrier_parameters(
     apply_parameter_defaults(
         &offering.capability_schema,
         &offering.carrier_schema,
-        &offering.parameter_mapping,
+        renames.as_ref(),
+        declared_defaults(mapping),
         &mut parameters,
     );
     if let Some(size) = &size {
@@ -1994,6 +2136,15 @@ fn prepare_carrier_parameters(
             ));
         }
         apply_size_mapping(size, contract_parameters, &mut parameters)?;
+    }
+    apply_parameter_renames(&offering.carrier_schema, renames.as_ref(), &mut parameters)?;
+    if let Some(enum_maps) = &enum_maps {
+        apply_enum_maps(
+            &offering.carrier_schema,
+            renames.as_ref(),
+            enum_maps,
+            &mut parameters,
+        )?;
     }
     let missing: Vec<&str> = offering
         .carrier_schema
@@ -2677,7 +2828,7 @@ mod tests {
             "prompt": {"type": "string"},
             "quality": {"type": "string"}
         }));
-        let error = validate_carrier_within_contract(&contract, &carrier)
+        let error = validate_carrier_within_contract(&contract, &carrier, &serde_json::json!({}))
             .expect_err("a field outside the contract must be rejected");
         assert!(
             error
@@ -2732,8 +2883,188 @@ mod tests {
             serde_json::json!({"allowed_branches": ["prompt_only"], "max_images": 0}),
         );
         offering.carrier_schema = contract.clone();
-        assert!(validate_carrier_within_contract(&contract, &offering.carrier_schema).is_ok());
+        assert!(
+            validate_carrier_within_contract(
+                &contract,
+                &offering.carrier_schema,
+                &serde_json::json!({})
+            )
+            .is_ok()
+        );
         assert!(validate_adapter_compatibility(&offering, &descriptor()).is_ok());
+    }
+
+    /// R1 的另一面：承载面声明的是**线上字段名**，合同字段经改名落到它身上时，它同样是"从合同来的"，
+    /// 不是供给凭空多出来的参数；尺寸换算的目标字段同理。
+    #[test]
+    fn a_carrier_field_reachable_from_the_contract_is_accepted() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"}
+        }));
+        // 线上叫 `resolution`：合同里没有这个名字，但改名把它从合同的 `size` 接了过来。
+        let carrier = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        let mapping = serde_json::json!({"rename": {"size": "resolution"}});
+        assert!(
+            validate_carrier_within_contract(&contract, &carrier, &mapping).is_ok(),
+            "改名接过来的线上名字不算凭空多出"
+        );
+        // 没有改名表时同一个承载面就是凭空多出：`resolution` 在合同里没有、也没人接它。
+        let error = validate_carrier_within_contract(&contract, &carrier, &serde_json::json!({}))
+            .expect_err("without the bridge it is a field the contract does not declare");
+        assert!(error.to_string().contains("resolution"), "{error}");
+        // 改名接的是**合同里没有的**字段：那条线上名字仍然没有来源，照样拒绝。
+        let dangling = serde_json::json!({"rename": {"aspect_ratio": "resolution"}});
+        assert!(validate_carrier_within_contract(&contract, &carrier, &dangling).is_err());
+
+        // 尺寸换算的目标字段同理：源字段在合同里，算出来的值写在这个线上名字上。
+        let size_contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        let pixel_carrier = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "pixels": {"type": "string"}
+        }));
+        let size_mapping = serde_json::json!({
+            "size": {
+                "source": ["size", "resolution"],
+                "target": "pixels",
+                "form": "pixels",
+                "profile": {"2K": {"1:1": "2048x2048"}}
+            }
+        });
+        assert!(
+            validate_carrier_within_contract(&size_contract, &pixel_carrier, &size_mapping).is_ok(),
+            "换算的目标字段是从合同的源字段来的"
+        );
+    }
+
+    /// 改名表本身必须是这条供给真能做到的事：源在合同里、目标在承载面里，缺一就拒绝。
+    #[test]
+    fn a_rename_must_bridge_the_contract_and_the_carrier() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"}
+        }));
+        let carrier = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        let mut offering = offering_with(carrier.clone(), serde_json::json!({}));
+        offering.carrier_schema = carrier.clone();
+        offering.parameter_mapping = serde_json::json!({"rename": {"size": "resolution"}});
+        assert!(
+            validate_parameter_mapping(&contract, &offering).is_ok(),
+            "源在合同里、目标在承载面里：这份改名声明可以发布"
+        );
+
+        // 源不在合同里：调用方提交不了这个名字，改名没有输入。
+        offering.parameter_mapping = serde_json::json!({"rename": {"aspect_ratio": "resolution"}});
+        let error = validate_parameter_mapping(&contract, &offering)
+            .expect_err("a rename source outside the contract");
+        assert!(error.to_string().contains("aspect_ratio"), "{error}");
+
+        // 目标不在承载面里：改出来的名字发不出去，等于没改。
+        offering.parameter_mapping = serde_json::json!({"rename": {"size": "pixels"}});
+        let error = validate_parameter_mapping(&contract, &offering)
+            .expect_err("a rename target outside the carrier");
+        assert!(error.to_string().contains("pixels"), "{error}");
+
+        // 声明得不成形状：不按"没有声明"处理，发布期就拒绝。
+        offering.parameter_mapping = serde_json::json!({"rename": "size"});
+        let error =
+            validate_parameter_mapping(&contract, &offering).expect_err("a malformed rename table");
+        assert!(
+            error.to_string().contains("parameter_mapping.rename"),
+            "{error}"
+        );
+    }
+
+    /// 取值映射表的字段必须"合同里有、这条供给承载得了"，否则这张表永远不会被用到。
+    #[test]
+    fn an_enum_map_must_name_a_field_the_contract_and_the_carrier_share() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "quality": {"type": "string"}
+        }));
+        let mut offering = offering_with(contract.clone(), serde_json::json!({}));
+        offering.carrier_schema = contract.clone();
+        offering.parameter_mapping =
+            serde_json::json!({"enum_map": {"quality": {"high": "xhigh"}}});
+        assert!(validate_parameter_mapping(&contract, &offering).is_ok());
+
+        // 承载面承载不了它：这张表在这条供给上永远不会生效。
+        offering.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"}
+        }));
+        let error = validate_parameter_mapping(&contract, &offering)
+            .expect_err("the carrier cannot carry quality");
+        assert!(error.to_string().contains("enum_map"), "{error}");
+
+        // 合同里没有它：调用方提交不了这个字段，表没有输入。
+        offering.carrier_schema = contract.clone();
+        offering.parameter_mapping = serde_json::json!({"enum_map": {"seed": {"1": "2"}}});
+        let error = validate_parameter_mapping(&contract, &offering)
+            .expect_err("the contract does not declare seed");
+        assert!(error.to_string().contains("seed"), "{error}");
+    }
+
+    /// 显式默认值的每个键必须被这条供给承载：声明了一个发不出去的默认值，就是"声明了却发不出去"。
+    #[test]
+    fn a_default_the_offering_cannot_carry_is_rejected_at_publication() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "watermark": {"type": "boolean"}
+        }));
+        let mut offering = offering_with(contract.clone(), serde_json::json!({}));
+        offering.carrier_schema = contract.clone();
+        offering.parameter_mapping = serde_json::json!({"defaults": {"watermark": false}});
+        assert!(validate_parameter_mapping(&contract, &offering).is_ok());
+
+        // 承载面承载不了 `watermark`：这条默认值注入不进去，声明与行为分了家。
+        offering.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"}
+        }));
+        let error = validate_parameter_mapping(&contract, &offering)
+            .expect_err("a default outside what the carrier can carry");
+        assert!(error.to_string().contains("defaults"), "{error}");
+
+        // 合同里没有这个字段：调用方提交不了它，这条默认值同样永远不会生效。
+        offering.carrier_schema = contract.clone();
+        offering.parameter_mapping = serde_json::json!({"defaults": {"seed": 7}});
+        let error = validate_parameter_mapping(&contract, &offering)
+            .expect_err("a default outside the contract");
+        assert!(error.to_string().contains("seed"), "{error}");
+
+        // 经改名落到承载面声明的名字上：这条供给承载得了它，声明有效。
+        offering.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "m"},
+            "prompt": {"type": "string"},
+            "xwatermark": {"type": "boolean"}
+        }));
+        offering.parameter_mapping = serde_json::json!({
+            "rename": {"watermark": "xwatermark"},
+            "defaults": {"watermark": false}
+        });
+        assert!(
+            validate_parameter_mapping(&contract, &offering).is_ok(),
+            "改名接过来的字段照样承载得了这条默认值"
+        );
     }
 
     /// 合同的身份就是发布的型号：`model.const` 不符即拒绝（换型号要发新的合同）。
@@ -2979,6 +3310,61 @@ mod tests {
         assert!(contract_parameter_face(&request, &with_image_required).is_ok());
     }
 
+    /// 合同没为图片留位置时，带图请求是**参数错**——不是"合同外字段丢弃"（丢图等于悄悄生成一张
+    /// 没有参考图的图），也不是平台侧故障（供给面没问题，是这个模型不接图）。
+    #[test]
+    fn an_image_the_contract_never_declared_is_an_invalid_parameter() {
+        let text_only = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"}
+        }));
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        request.reference_images = vec!["data:image/png;base64,AAAA".to_owned()];
+        let error = contract_parameter_face(&request, &text_only)
+            .expect_err("a contract without an image field cannot take a reference image");
+        assert!(
+            matches!(error, ApplicationError::InvalidParameter(_)),
+            "带图请求必须说成参数错：{error}"
+        );
+        assert!(error.to_string().contains("reference image"), "{error}");
+
+        // 遮罩同理：合同留了参考图的位置、没留遮罩的位置，带遮罩的请求还是参数错。
+        let no_mask = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "image": {"type": "string"}
+        }));
+        let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+        request.reference_images = vec!["data:image/png;base64,AAAA".to_owned()];
+        request.mask = Some("data:image/png;base64,BBBB".to_owned());
+        let error = contract_parameter_face(&request, &no_mask)
+            .expect_err("a contract without a mask field cannot take a mask");
+        assert!(
+            matches!(error, ApplicationError::InvalidParameter(_)),
+            "{error}"
+        );
+        assert!(error.to_string().contains("mask"), "{error}");
+
+        // 合同声明了其中**任意一个**同义字段就算留了位置：`image` 与 `image_urls` 是一回事。
+        for name in ["image", "image_urls"] {
+            let contract = surface(serde_json::json!({
+                "model": {"const": "gpt-image-2"},
+                "prompt": {"type": "string"},
+                name: {"type": "string"}
+            }));
+            let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+            request.reference_images = vec!["https://example.invalid/a.png".to_owned()];
+            assert!(
+                contract_parameter_face(&request, &contract).is_ok(),
+                "合同声明了 {name} 就该收下这张图"
+            );
+        }
+
+        // 请求没带图：合同里有没有图片字段都不影响。
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        assert!(contract_parameter_face(&request, &text_only).is_ok());
+    }
+
     #[test]
     fn places_reference_images_on_the_candidates_own_parameter() {
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
@@ -3081,6 +3467,120 @@ mod tests {
         let face = contract_face(&request, &vendor);
         let prepared = prepare_carrier_parameters(&face, &request, &vendor).expect("carried");
         assert!(prepared.get("watermark").is_none(), "{prepared}");
+    }
+
+    /// 改名：合同字段承载面承载不了、但改名把它落到一个承载面声明的名字上时，这条供给照样承载得了
+    /// 这次请求；组装出来的参数面里是**线上那个名字**，Job 里存的也是线上形态。
+    #[test]
+    fn a_renamed_parameter_is_written_under_the_wire_name() {
+        let mut vendor = offering();
+        vendor.capability_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"}
+        }));
+        // 承载面声明的是线上字段名：这条供给线上叫 `resolution`。
+        vendor.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        vendor.parameter_mapping = serde_json::json!({"rename": {"size": "resolution"}});
+
+        let request = image_request(serde_json::json!({"prompt": "hello", "size": "1:1"}));
+        let face = contract_face(&request, &vendor);
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect("the rename bridges size to resolution");
+        assert_eq!(
+            prepared.get("resolution"),
+            Some(&serde_json::json!("1:1")),
+            "线上那个名字才是要发的东西：{prepared}"
+        );
+        assert!(prepared.get("size").is_none(), "{prepared}");
+
+        // 请求**用到**的字段承载不了（承载面没有它、改名也没接它）：这条候选不合格。
+        vendor.parameter_mapping = serde_json::json!({});
+        let request = image_request(serde_json::json!({"prompt": "hello", "size": "1:1"}));
+        let face = contract_face(&request, &vendor);
+        let reason = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect_err("without the rename the carrier cannot carry size");
+        assert!(reason.contains("size"), "{reason}");
+
+        // 承载面自己声明了这个名字：改名表对它不生效，名字原样上行。
+        vendor.parameter_mapping = serde_json::json!({"rename": {"size": "resolution"}});
+        vendor.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "size": {"type": "string"},
+            "resolution": {"type": "string"}
+        }));
+        let request = image_request(serde_json::json!({"prompt": "hello", "size": "1:1"}));
+        let face = contract_face(&request, &vendor);
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor).expect("carried");
+        assert_eq!(prepared.get("size"), Some(&serde_json::json!("1:1")));
+        assert!(prepared.get("resolution").is_none(), "{prepared}");
+    }
+
+    /// 取值映射：组装期把合同取值换成线上取值；表里没有这个取值 → 这条候选**不合格**（不猜、
+    /// 不透传原值），原因写进路由判定记录，有别的候选就落过去。
+    #[test]
+    fn an_enum_map_replaces_the_value_and_an_unmapped_one_skips_the_candidate() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "quality": {"type": "string"}
+        }));
+        // 优先级 0 的候选只会把 `high` 映射出去；优先级 1 的候选原样承载取值。
+        let mut mapped = offering();
+        mapped.capability_schema = contract.clone();
+        mapped.carrier_schema = contract.clone();
+        mapped.parameter_mapping = serde_json::json!({"enum_map": {"quality": {"high": "xhigh"}}});
+        let mut wide = offering();
+        wide.capability_schema = contract.clone();
+        wide.carrier_schema = contract.clone();
+        wide.offering_id = OfferingId::new();
+
+        // 表里有这个取值：换成线上取值，报文里就是映射后的那个。
+        let request = image_request(serde_json::json!({"prompt": "hello", "quality": "high"}));
+        let face = contract_face(&request, &mapped);
+        let prepared = prepare_carrier_parameters(&face, &request, &mapped).expect("mapped");
+        assert_eq!(
+            prepared.get("quality"),
+            Some(&serde_json::json!("xhigh")),
+            "线上那个取值才是要发的东西：{prepared}"
+        );
+
+        // 表里没有这个取值：这条候选不合格，换下一条；一条都承载不了时是平台侧供给问题。
+        let request = image_request(serde_json::json!({"prompt": "hello", "quality": "low"}));
+        let branch = request.branch().expect("prompt only");
+        let (chosen, parameters, decision) = select_candidate(
+            &request,
+            branch,
+            &[candidate_of(&mapped, 0), candidate_of(&wide, 1)],
+        )
+        .expect("the second candidate carries the value as it is");
+        assert_eq!(chosen.offering_id, wide.offering_id);
+        assert_eq!(parameters.get("quality"), Some(&serde_json::json!("low")));
+        assert!(!decision.considered[0].eligible);
+        assert!(
+            decision.considered[0]
+                .skip_reason
+                .as_deref()
+                .is_some_and(|reason| reason.contains("quality")),
+            "落选原因必须写明是哪个字段的取值映射不了：{:?}",
+            decision.considered[0].skip_reason
+        );
+        let error = select_candidate(&request, branch, &[candidate_of(&mapped, 0)])
+            .expect_err("no candidate can map this value");
+        assert!(
+            matches!(error, ApplicationError::NoEligibleOffering(_)),
+            "{error}"
+        );
+
+        // 调用方没用到这个字段：映射表无事可做，照常受理。
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let face = contract_face(&request, &mapped);
+        assert!(prepare_carrier_parameters(&face, &request, &mapped).is_ok());
     }
 
     /// 承载面**自己声明的必填字段**也得在场：供给说了"这次请求必须带上它"，平台不替它省。

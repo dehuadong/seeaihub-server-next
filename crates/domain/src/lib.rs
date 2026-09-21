@@ -16,8 +16,10 @@ pub use image_parameters::{
     platform_image_parameters, take_contract_image_inputs,
 };
 pub use parameter_mapping::{
-    SizeMapping, apply_parameter_defaults, apply_size_mapping, declared_field_names,
-    declared_size_mapping, declares_parameter, is_used_parameter_value,
+    ParameterEnumMaps, ParameterRenames, SizeMapping, apply_enum_maps, apply_parameter_defaults,
+    apply_parameter_renames, apply_size_mapping, carries_parameter, declared_defaults,
+    declared_enum_maps, declared_field_names, declared_renames, declared_size_mapping,
+    declares_parameter, is_used_parameter_value, wire_parameter_name,
 };
 pub use size_spec::{SizeForm, SizeProfile, SizeSpec, convert_size};
 
