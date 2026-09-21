@@ -1,6 +1,6 @@
 {
   "_comment": "gpt-image-2.5-sunburst 的运行时发布素材（合同 + 多供给形状）：顶层 capability_schema 是这个 Vendor Model 的**厂商合同**（客户端按它提交），下面两条 offering 各带自己的**承载面**与**参数映射**——AIHubMix 走 OpenAI 兼容面（首选），APIMart 走任务式面（次选）。APIMart 的承载面统一按**像素**声明 size（默认 auto）：渠道文档明确「size 用精确像素格式时 resolution 会被忽略」，因此不需要比例/档位换算，也不需要一次产出两个字段。",
-  "_status": "草案 · 未发布。需「执行实现」授权后方可用于生产。",
+  "_status": "已发布到开发库（seeai_next）；生产未批准。",
   "_evidence": {
     "总览": "厂商一手：out-reference/openai/openai-images-generate-2026-09-20.md 与 out-reference/openai/openai-images-edit-2026-09-20.md（2026-09-20 抓取的 OpenAI 官方端点页，model 枚举与各字段说明都明确列出 gpt-image-2.5-flare/-sunburst）；家族面旧快照 out-reference/openai/openai-images-api.md 另存一份（其头注同样载明 2.5 两款）。渠道面：out-reference/aihubmix/schema-gpt-image-2.5-sunburst.endpoints.json 与 out-reference/apimart/gpt-image-2.5-generation.cn.md。",
     "contract.model": "厂商一手：generate 页的 model 枚举明列 gpt-image-2.5-sunburst 与 gpt-image-2.5-flare（含各自的 2026-09-08 快照）——不再是「渠道侧名字待证」。",
