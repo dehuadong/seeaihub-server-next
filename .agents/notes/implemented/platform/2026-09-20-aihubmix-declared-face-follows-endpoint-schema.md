@@ -9,6 +9,12 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 
 # AIHubMix 素材的声明面对齐端点 request.schema
 
+> **失效范围（2026-09-20 晚）**：本记录的**口径**——"声明面以该模型对应端点的 `request.schema` 为准"——已被**按厂商契约声明**取代：聚合渠道转售的就是上游模型的能力，**渠道机器 Schema 写没写不构成渠道不能**；渠道若不接受某个已声明的取值，就表现为渠道报错，平台不静默降级、也不替渠道吞掉字段。促成改口的实测是 `/v1` 族虽然机器 Schema 里没有 `background`，端点却**接受并落实**了 `background=transparent`（`docs/facts/channel-facts.md` §2.14）。取代记录见 [合同与承载面分层、映射声明化与对客目录](./2026-09-20-vendor-model-contract-and-offering-mapping.md)。
+>
+> **仍然有效的部分**：Driver 能力面（`supported_top_level_parameters`）保留；`size` 照 schema 的表达方式用 `anyOf` 而不是改写成枚举；`prompt` 的 `minLength`/`maxLength` 不是自造约束；发布期校验那处放宽（类型必须是 string、`enum` 可有可无）保留。
+>
+> **素材位置已变**：本文提到的三份旧形状素材（`aihubmix-gpt-image-2.5-flare.json`、`-sunburst.json`）已退役，现为 `config/bootstrap/gpt-image-2.5-{flare,sunburst}.json`（顶层一份合同 + AIHubMix / APIMart 两条供给，声明面在各自的 `carrier_schema`）；`config/bootstrap/aihubmix-gpt-image-2.json` 作为旧形状夹具保留。
+
 ## 问题
 
 三份 AIHubMix 发布素材（`config/bootstrap/aihubmix-gpt-image-2.5-flare.json`、`-sunburst.json`、`aihubmix-gpt-image-2.json`）的 `capability_schema.properties` 与它们**实际调用的端点**对不上。本平台走的是 OpenAI 兼容的 `/v1` 族，而素材里混进了 `/ai/v1` 那族才有的字段，还有几处枚举是自己发明的：

@@ -1,5 +1,7 @@
 # OpenAI Images API（gpt-image-2）参数参考
 
+> **时效标注（2026-09-20 补）**：本文**没有抓取时间戳**，正文（端点、字段、`size` 取值、模型枚举）**只覆盖到 `gpt-image-2`**，不含 2.5 两款。2026-09-20 已另抓三份带时间戳的官方快照并**明确覆盖 `gpt-image-2.5-flare` / `-sunburst`**：同目录的 `openai-images-generate-2026-09-20.md`（Create image）、`openai-images-edit-2026-09-20.md`（Create image edit）、`openai-image-generation-guide-2026-09-20.md`（使用说明）。**凡涉及 2.5 的事实以那三份为准**，本文只作家族面（gpt-image-2）的参照。
+
 > **本文是 OpenAI 官方 API 契约，与任何网关/中转服务无关。**
 > [Create image](https://developers.openai.com/api/reference/resources/images/methods/generate/index.md)、
 > [Create image edit](https://developers.openai.com/api/reference/resources/images/methods/edit/index.md)

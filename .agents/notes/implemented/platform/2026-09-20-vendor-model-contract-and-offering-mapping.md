@@ -4,7 +4,7 @@ status: implemented
 created: 2026-09-20
 updated: 2026-09-20
 approval: 用户 2026-09-20 明确"方向需求很明确，你自己判断，提供设计方案落实"，并在讨论中确认三条裁定（图片字段合同外一律 400、defaults 加发布期校验、对客目录必做且暂不引入路由策略层）
-verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **33 passed / 0 failed**（由收口者逐片重跑，零真实计费调用）
+verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **37 passed / 0 failed**（由收口者逐片重跑，零真实计费调用）。后续 AIHubMix 承载面补齐（`background`/`output_compression`/`moderation` 按厂商契约声明）与多图 `image[]`（参考图声明成数组 ≤16、Driver 按张数编码 `image`/`image[]`）已并入同一批素材与用例。
 ---
 
 # 合同与承载面分层、映射声明化与对客目录（#10 落地）
@@ -55,3 +55,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 - 承载面已声明的名字优先于 `rename`（文档化的确定性规则）。
 - 渠道停用也会让型号从目录消失（否则目录会列出一个提交即 404 的型号）。
 - 真正的多厂商素材（Google/ByteDance 各自的合同与承载面）尚未发布；三家各一份素材的联调与真机验证仍未做。
+
+## 相关记录
+
+- **取代** [AIHubMix 素材的声明面对齐端点 request.schema](./2026-09-20-aihubmix-declared-face-follows-endpoint-schema.md)：那份"声明面以端点 `request.schema` 为准"的口径，在本层（合同与承载面分层）落位后改为**按厂商契约声明**——承载面照厂商契约声明，渠道不接受就表现为渠道报错。失效范围见该记录头注。

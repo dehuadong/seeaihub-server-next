@@ -901,7 +901,7 @@ mod tests {
     /// 测试里不另抄一份名字。
     fn request_for(schema: &Value, branch: ImageBranch) -> PreparedImageRequest {
         PreparedImageRequest {
-            provider_model_id: "gpt-image-2".to_owned(),
+            provider_model_id: "gpt-image-2.5-flare".to_owned(),
             branch,
             native_parameters: serde_json::json!({
                 "prompt": "test",
@@ -914,9 +914,9 @@ mod tests {
         }
     }
 
-    /// 发布素材里那份 Profile 的参数面（声明的是 `image` / `mask`）。
+    /// 发布素材里那条 AIHubMix 供给的**承载面**（声明的是 `image` / `mask`）。
     fn published_schema() -> Value {
-        published_offering(&published_config())["capability_schema"].clone()
+        published_offering(&published_config())["carrier_schema"].clone()
     }
 
     /// 把 Driver 组好的编辑表单摊成**将要发出去的字节**：`name="…"` 就是上游收到的东西。
@@ -936,10 +936,10 @@ mod tests {
         Ok(String::from_utf8_lossy(&body).into_owned())
     }
 
-    /// 发布素材现在是"数组形式"：Profile 与 restrictions 在 `offerings[0]` 内。
+    /// 在售素材是"一份合同 + 两条供给"：AIHubMix 这条在下标 0，声明面在 `carrier_schema` 里。
     fn published_config() -> Value {
         serde_json::from_str(include_str!(
-            "../../../config/bootstrap/aihubmix-gpt-image-2.json"
+            "../../../config/bootstrap/gpt-image-2.5-flare.json"
         ))
         .expect("bootstrap config should parse")
     }
@@ -955,7 +955,7 @@ mod tests {
         AihubmixAdapterFactory
             .validate_publication(
                 offering["adapter_key"].as_str().expect("adapter key"),
-                &offering["capability_schema"],
+                &offering["carrier_schema"],
                 &offering["restrictions"],
             )
             .expect("bootstrap contract should be executable");
@@ -973,13 +973,13 @@ mod tests {
     #[test]
     fn rejects_schema_with_wrong_prompt_type() {
         let mut config = published_config();
-        config["offerings"][0]["capability_schema"]["properties"]["prompt"]["type"] =
+        config["offerings"][0]["carrier_schema"]["properties"]["prompt"]["type"] =
             Value::String("integer".to_owned());
         let offering = published_offering(&config).clone();
         let error = AihubmixAdapterFactory
             .validate_publication(
                 ADAPTER_KEY,
-                &offering["capability_schema"],
+                &offering["carrier_schema"],
                 &offering["restrictions"],
             )
             .expect_err("wrong prompt type must be rejected");
@@ -991,7 +991,7 @@ mod tests {
     #[test]
     fn a_reference_image_declared_as_a_string_array_is_executable() {
         let mut config = published_config();
-        config["offerings"][0]["capability_schema"]["properties"]["image"] = serde_json::json!({
+        config["offerings"][0]["carrier_schema"]["properties"]["image"] = serde_json::json!({
             "type": "array",
             "items": {"type": "string"},
             "minItems": 1,
@@ -1001,18 +1001,18 @@ mod tests {
         AihubmixAdapterFactory
             .validate_publication(
                 ADAPTER_KEY,
-                &offering["capability_schema"],
+                &offering["carrier_schema"],
                 &offering["restrictions"],
             )
             .expect("a string array reference image is executable");
 
-        config["offerings"][0]["capability_schema"]["properties"]["image"]["items"]["type"] =
+        config["offerings"][0]["carrier_schema"]["properties"]["image"]["items"]["type"] =
             Value::String("integer".to_owned());
         let offering = published_offering(&config).clone();
         let error = AihubmixAdapterFactory
             .validate_publication(
                 ADAPTER_KEY,
-                &offering["capability_schema"],
+                &offering["carrier_schema"],
                 &offering["restrictions"],
             )
             .expect_err("array items that are not strings must be rejected");

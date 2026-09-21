@@ -591,7 +591,7 @@ impl Harness {
         };
         let mut draft = candidate(provider_kind, adapter_key, branches);
         draft["credential_env"] = Value::String(credential_env.to_owned());
-        Self::start_with_draft(draft, behaviour, max_concurrent_jobs).await
+        Self::start_with_draft(draft, None, behaviour, max_concurrent_jobs).await
     }
 
     /// 同 `start`，但用**素材里的真实声明面**发布（而不是测试手写的最小 Profile）。
@@ -599,23 +599,31 @@ impl Harness {
     /// 参数面过滤按候选声明的字段名走，所以"哪些参数会被留下"只有在真实声明面上才验得准：
     /// 手写的最小 Profile 里除了 `prompt` 什么都没有，一过滤就把所有参数都丢了。
     async fn start_with_bootstrap(behaviour: UpstreamBehaviour, max_concurrent_jobs: u64) -> Self {
-        let material: Value = match behaviour.provider {
-            ProviderShape::Aihubmix => serde_json::from_str(include_str!(
-                "../../../config/bootstrap/aihubmix-gpt-image-2.5-flare.json"
-            )),
-            ProviderShape::Apimart => serde_json::from_str(include_str!(
-                "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
-            )),
-        }
+        // 一份素材里有两条供给：下标 0 是 AIHubMix、下标 1 是 APIMart。按用例要起的那家假上游取一条；
+        // 合同仍取素材**顶层那一份**——改名的源名（`image` / `mask`）只在合同里，承载面里是线上名。
+        let material: Value = serde_json::from_str(include_str!(
+            "../../../config/bootstrap/gpt-image-2.5-flare.json"
+        ))
         .expect("bootstrap material parses");
-        let mut draft = material["offerings"][0].clone();
+        let index = match behaviour.provider {
+            ProviderShape::Aihubmix => 0,
+            ProviderShape::Apimart => 1,
+        };
+        let mut draft = material["offerings"][index].clone();
         // 上游地址换成这个用例的假上游；凭证仍从环境变量读，值只写在测试进程环境里。
         draft["base_url"] = Value::String("http://127.0.0.1:1".to_owned());
-        Self::start_with_draft(draft, behaviour, max_concurrent_jobs).await
+        Self::start_with_draft(
+            draft,
+            Some(material["capability_schema"].clone()),
+            behaviour,
+            max_concurrent_jobs,
+        )
+        .await
     }
 
     async fn start_with_draft(
         mut draft: Value,
+        contract: Option<Value>,
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
     ) -> Self {
@@ -643,8 +651,15 @@ impl Harness {
             .as_object()
             .cloned()
             .expect("published candidate must declare a wire surface");
-        let published =
-            publish_candidates(&client, &base_url, &admin_token, Self::MODEL, vec![draft]).await;
+        let published = publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            Self::MODEL,
+            contract,
+            vec![draft],
+        )
+        .await;
         assert_eq!(published, StatusCode::OK, "publication must succeed");
 
         Self {
@@ -2330,6 +2345,7 @@ async fn multiple_active_offerings_route_by_priority() {
         &base_url,
         &admin_token,
         model,
+        None,
         vec![
             candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
             candidate("APIMart", "apimart-image-v1", &["prompt_only"]),
@@ -2500,6 +2516,7 @@ async fn multiple_active_offerings_route_by_priority() {
         &base_url,
         &admin_token,
         model,
+        None,
         vec![candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"])],
     )
     .await;
@@ -2519,13 +2536,13 @@ async fn multiple_active_offerings_route_by_priority() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 第二阶段的**发布素材**要真的能用：同一个 Vendor Model 只落**一份合同**，
+/// 第二阶段的**发布素材**要真的能用：一个 Vendor Model 一份文件、只落**一份合同**，
 /// 而每个候选各带**自己的承载面**——缺一不可：素材发不出去、或候选没带上自己的承载面，
 /// 都算没覆盖。
 ///
-/// 用 `config/bootstrap/` 里已备好的 2.5 素材发布：AIHubMix 与 APIMart 供同一型号。
-/// 两家能承载的字段面不同（AIHubMix 收 `image` / `mask`，APIMart 收 `image_urls` / `mask_url`），
-/// 正是"合同一份、承载面各一份"要覆盖的情形。
+/// 素材本身就是完整的发布命令（顶层一份合同 + 两条供给），所以直接按它发布：
+/// AIHubMix 下标 0（收 `image` / `mask`），APIMart 下标 1（收 `image_urls` / `mask_url`），
+/// 两家能承载的字段面不同，正是"合同一份、承载面各一份"要覆盖的情形。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers() {
@@ -2537,60 +2554,45 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
         .await
         .expect("contract database");
 
-    // 两份素材分别是各自的完整发布命令（一个候选）。
-    let aihubmix: Value = serde_json::from_str(include_str!(
-        "../../../config/bootstrap/aihubmix-gpt-image-2.5-flare.json"
+    let material: Value = serde_json::from_str(include_str!(
+        "../../../config/bootstrap/gpt-image-2.5-flare.json"
     ))
-    .expect("AIHubMix 2.5 material parses");
-    let apimart: Value = serde_json::from_str(include_str!(
-        "../../../config/bootstrap/apimart-gpt-image-2.5-flare.json"
-    ))
-    .expect("APIMart 2.5 material parses");
-    let model = aihubmix["native_model_id"]
+    .expect("2.5 material parses");
+    let model = material["native_model_id"]
         .as_str()
         .expect("native model id")
         .to_owned();
+    let revision = material["native_revision"]
+        .as_str()
+        .expect("native revision")
+        .to_owned();
+    let offerings = material["offerings"]
+        .as_array()
+        .expect("offerings must be an array")
+        .clone();
+    assert_eq!(offerings.len(), 2, "一份素材两条供给");
     assert_eq!(
-        apimart["native_model_id"], aihubmix["native_model_id"],
-        "both materials must supply the same vendor model"
+        offerings[0]["provider_kind"], "AIHubMix",
+        "下标 0 是首选：AIHubMix"
+    );
+    assert_eq!(
+        offerings[1]["provider_kind"], "APIMart",
+        "下标 1 是次选：APIMart"
     );
     // 两家能承载的面必须真的不同——否则这个用例覆盖不到"承载面各自一份"。
-    let aihubmix_carrier = aihubmix["offerings"][0]["capability_schema"].clone();
-    let apimart_carrier = apimart["offerings"][0]["capability_schema"].clone();
+    let carriers = [
+        offerings[0]["carrier_schema"].clone(),
+        offerings[1]["carrier_schema"].clone(),
+    ];
     assert_ne!(
-        aihubmix_carrier, apimart_carrier,
+        carriers[0], carriers[1],
         "this test only covers the split surface if the two carriers actually differ"
     );
 
-    // 合并成一次发布：**顶层一份合同** + 两个候选，顺序即优先级。
-    // 合同取两家承载面的**名字并集**：名字收得住即可，同一个名字的取值形态怎么统一
-    // 是尺寸语义那一步的事，本步只把"字段面"这条边界立住。
-    let contract = contract_over(&[&aihubmix_carrier, &apimart_carrier]);
-    let mut aihubmix_offering = aihubmix["offerings"][0].clone();
-    let mut apimart_offering = apimart["offerings"][0].clone();
-    for (offering, carrier) in [
-        (&mut aihubmix_offering, &aihubmix_carrier),
-        (&mut apimart_offering, &apimart_carrier),
-    ] {
-        // 承载面改用新名字，并去掉旧字段：这个用例走的必须是新形状。
-        offering["carrier_schema"] = carrier.clone();
-        offering
-            .as_object_mut()
-            .expect("offering object")
-            .remove("capability_schema");
-    }
-    let merged = json!({
-        "vendor_id": aihubmix["vendor_id"],
-        "native_model_id": aihubmix["native_model_id"],
-        "native_revision": "stage-two-material-1",
-        "actor": "contract-test",
-        "capability_schema": contract,
-        "offerings": [aihubmix_offering, apimart_offering]
-    });
     let published = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(&admin_token)
-        .json(&merged)
+        .json(&material)
         .send()
         .await
         .expect("publication request");
@@ -2604,23 +2606,25 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
     // 合同是**模型级唯一一份**：同一个型号的这一版只落一行，内容就是顶层那一份。
     let contracts = sqlx::query(
         "SELECT id, capability_schema FROM catalog.vendor_models
-         WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = 'stage-two-material-1'",
+         WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = $3",
     )
-    .bind(aihubmix["vendor_id"].as_str().expect("vendor id"))
+    .bind(material["vendor_id"].as_str().expect("vendor id"))
     .bind(&model)
+    .bind(&revision)
     .fetch_all(&pool)
     .await
     .expect("contract rows");
     assert_eq!(contracts.len(), 1, "one contract per vendor model revision");
     let stored_contract: Value = contracts[0].try_get("capability_schema").expect("contract");
     assert_eq!(
-        stored_contract, merged["capability_schema"],
+        stored_contract, material["capability_schema"],
         "the stored contract must be the one given at the top level"
     );
 
     // 每个候选携带**它自己**的承载面，而合同只读那一份。
     let rows = sqlx::query(
-        "SELECT o.provider_model_id, o.adapter_key, o.carrier_schema, c.provider_kind, vm.capability_schema
+        "SELECT o.provider_model_id, o.adapter_key, o.carrier_schema, o.parameter_mapping,
+                c.provider_kind, vm.capability_schema
          FROM publication.runtime_entries re
          JOIN supply.offerings o ON o.id = re.offering_id
          JOIN supply.channels c ON c.id = o.channel_id
@@ -2634,41 +2638,54 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
     .expect("candidate rows");
     assert_eq!(rows.len(), 2, "both providers must be active candidates");
 
-    let carriers: Vec<Value> = rows
+    let stored_carriers: Vec<Value> = rows
         .iter()
         .map(|row| row.try_get("carrier_schema").expect("carrier"))
         .collect();
     assert_ne!(
-        carriers[0], carriers[1],
+        stored_carriers[0], stored_carriers[1],
         "each candidate must carry its own surface, not a shared one"
     );
-    for (index, expected) in [(0_usize, &aihubmix), (1, &apimart)].iter() {
-        let row = &rows[*index];
-        let offering = &expected["offerings"][0];
+    for (index, offering) in offerings.iter().enumerate() {
+        let row = &rows[index];
         let provider_model_id: String = row.try_get("provider_model_id").expect("provider model");
         let adapter_key: String = row.try_get("adapter_key").expect("adapter key");
         assert_eq!(provider_model_id, offering["provider_model_id"]);
         assert_eq!(adapter_key, offering["adapter_key"]);
         assert_eq!(
-            carriers[*index], offering["capability_schema"],
+            stored_carriers[index], offering["carrier_schema"],
             "candidate {index} must carry its own surface"
+        );
+        assert_eq!(
+            stored_carriers[index], carriers[index],
+            "候选带上线的承载面必须逐字就是素材里那一份"
         );
         // 每个候选读到的合同都是同一份，且它的 `model.const` 就是该型号。
         let contract: Value = row.try_get("capability_schema").expect("contract");
         assert_eq!(contract, stored_contract);
         assert_eq!(contract["properties"]["model"]["const"], model);
-        // 承载面的每个字段名都要在合同里（R1 的判据，这里独立复核一遍）。
-        for name in carriers[*index]["properties"]
+        // 承载面的每个字段名都要**从合同可达**（R1 的判据，这里独立复核一遍）：要么合同直接声明，
+        // 要么被 `rename` 接过去——线上名不必等于合同名（APIMart 的 `image_urls` 就是这么来的）。
+        let mapping: Value = row.try_get("parameter_mapping").expect("mapping");
+        let wires: Vec<Value> = mapping["rename"]
+            .as_object()
+            .map(|renames| renames.values().cloned().collect())
+            .unwrap_or_default();
+        for name in stored_carriers[index]["properties"]
             .as_object()
             .expect("carrier properties")
             .keys()
         {
+            let declared = contract["properties"]
+                .as_object()
+                .expect("contract properties")
+                .contains_key(name);
+            let renamed = wires
+                .iter()
+                .any(|wire| wire.as_str() == Some(name.as_str()));
             assert!(
-                contract["properties"]
-                    .as_object()
-                    .expect("contract properties")
-                    .contains_key(name),
-                "carrier field {name} must be declared by the contract"
+                declared || renamed,
+                "carrier field {name} must be reachable from the contract"
             );
         }
     }
@@ -2703,32 +2720,14 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
     drop_isolated_database(&database_name).await;
 }
 
-/// 两份承载面的**字段名并集**，做成一份封闭的模型级合同。
-fn contract_over(carriers: &[&Value]) -> Value {
-    let mut properties = serde_json::Map::new();
-    for carrier in carriers {
-        for (name, definition) in carrier["properties"]
-            .as_object()
-            .expect("carrier declares properties")
-        {
-            properties
-                .entry(name.clone())
-                .or_insert_with(|| definition.clone());
-        }
-    }
-    json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["model", "prompt"],
-        "properties": properties
-    })
-}
-
-/// 现有三份 AIHubMix 素材（**旧形状**：offering 级 `capability_schema`）照常能发布：
-/// 过渡期里合同与承载面都回退到那一份声明面，不必等素材改写。
+/// 仍留在 `config/bootstrap/` 的那一份**旧形状**素材（offering 级 `capability_schema`，没有顶层
+/// 合同、也没有 `carrier_schema`）照常能发布：过渡期里合同与承载面都回退到那一份声明面。
+///
+/// 这是**唯一**还按旧形状读的素材，留着就是为了这条语义——新形状的素材走的是上面那些用例，
+/// 旧形状的可发布性没有别的证据可依。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn legacy_aihubmix_materials_still_publish() {
+async fn legacy_aihubmix_material_still_publishes() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
     let client = Client::new();
@@ -2737,46 +2736,42 @@ async fn legacy_aihubmix_materials_still_publish() {
         .await
         .expect("contract database");
 
-    let materials = [
-        include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.json"),
-        include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.5-flare.json"),
-        include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.5-sunburst.json"),
-    ];
-    for material in materials {
-        let command: Value = serde_json::from_str(material).expect("material parses");
-        let model = command["native_model_id"]
-            .as_str()
-            .expect("native model id")
-            .to_owned();
-        let response = client
-            .post(format!("{base_url}/api/v1/runtime-revisions"))
-            .bearer_auth(&admin_token)
-            .json(&command)
-            .send()
-            .await
-            .expect("publication request");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "旧形状素材必须照常可发布：{model}"
-        );
-        // 回退的结果：合同就是那份声明面，承载面与它同值，同一个型号只落一行。
-        let rows = sqlx::query(
-            "SELECT vm.capability_schema, o.carrier_schema
-             FROM catalog.vendor_models vm
-             JOIN supply.offerings o ON o.vendor_model_id = vm.id
-             WHERE vm.native_model_id = $1",
-        )
-        .bind(&model)
-        .fetch_all(&pool)
+    // 只留这一份：它是仓库里唯一还带 offering 级 `capability_schema` 的素材，
+    // 也是这条"旧形状照常可发布"语义的唯一夹具。
+    let material = include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.json");
+    let command: Value = serde_json::from_str(material).expect("material parses");
+    let model = command["native_model_id"]
+        .as_str()
+        .expect("native model id")
+        .to_owned();
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&command)
+        .send()
         .await
-        .expect("contract rows");
-        assert_eq!(rows.len(), 1, "{model} 只能落一行合同");
-        let contract: Value = rows[0].try_get("capability_schema").expect("contract");
-        let carrier: Value = rows[0].try_get("carrier_schema").expect("carrier");
-        assert_eq!(contract, command["offerings"][0]["capability_schema"]);
-        assert_eq!(carrier, contract);
-    }
+        .expect("publication request");
+    assert_eq!(
+        response.status(),
+        StatusCode::OK,
+        "旧形状素材必须照常可发布：{model}"
+    );
+    // 回退的结果：合同就是那份声明面，承载面与它同值，同一个型号只落一行。
+    let rows = sqlx::query(
+        "SELECT vm.capability_schema, o.carrier_schema
+         FROM catalog.vendor_models vm
+         JOIN supply.offerings o ON o.vendor_model_id = vm.id
+         WHERE vm.native_model_id = $1",
+    )
+    .bind(&model)
+    .fetch_all(&pool)
+    .await
+    .expect("contract rows");
+    assert_eq!(rows.len(), 1, "{model} 只能落一行合同");
+    let contract: Value = rows[0].try_get("capability_schema").expect("contract");
+    let carrier: Value = rows[0].try_get("carrier_schema").expect("carrier");
+    assert_eq!(contract, command["offerings"][0]["capability_schema"]);
+    assert_eq!(carrier, contract);
 
     pool.close().await;
     drop_isolated_database(&database_name).await;
@@ -3306,9 +3301,13 @@ async fn explicit_defaults_reach_the_upstream_request_body() {
     draft["capability_schema"]["properties"]["quality"] =
         json!({"type": "string", "enum": ["low", "high"]});
     draft["parameter_mapping"] = json!({"defaults": {"quality": "low"}});
-    let harness =
-        Harness::start_with_draft(draft, UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64)
-            .await;
+    let harness = Harness::start_with_draft(
+        draft,
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
 
     // 1) 调用方没给 `quality`：默认值跟着报文上行，也留在内部参数面里。
     let key = format!("defaults-{}", Uuid::new_v4());
@@ -3401,9 +3400,13 @@ async fn the_size_conversion_reaches_the_upstream_request_body() {
             "profile": lite_2k_profile()
         }
     });
-    let harness =
-        Harness::start_with_draft(draft, UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64)
-            .await;
+    let harness = Harness::start_with_draft(
+        draft,
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
 
     let key = format!("size-converted-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "a 2:3 poster at 2K");
@@ -3824,9 +3827,13 @@ async fn the_auto_size_reaches_the_upstream_request_body_untouched() {
         "size": {"type": "string"}
     }));
     draft["parameter_mapping"] = json!({});
-    let harness =
-        Harness::start_with_draft(draft, UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64)
-            .await;
+    let harness = Harness::start_with_draft(
+        draft,
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
 
     let key = format!("auto-pass-through-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "let the model pick the size");
@@ -3877,7 +3884,7 @@ async fn a_renamed_field_reaches_the_upstream_under_the_wire_name() {
         "resolution": {"type": "string"}
     }));
     draft["parameter_mapping"] = json!({"rename": {"size": "resolution"}});
-    let harness = Harness::start_with_draft(draft, UpstreamBehaviour::apimart(), 64).await;
+    let harness = Harness::start_with_draft(draft, None, UpstreamBehaviour::apimart(), 64).await;
 
     let key = format!("renamed-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "a 1:1 poster");
@@ -4554,6 +4561,23 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         let apimart_mapping: Value = rows[1].try_get("parameter_mapping").expect("mapping");
         assert_eq!(apimart_mapping["rename"]["image"], "image_urls");
         assert_eq!(apimart_mapping["rename"]["mask"], "mask_url");
+
+        // 对客目录：这个型号必须查得到，`contract` 逐字就是发布的那一份——
+        // "库里发布成了"与"调用方按目录建表单建得对"是两件事，这里把后一件也钉住。
+        let (status, catalog) = get_catalog(&client, &base_url, &api_key).await;
+        assert_eq!(status, StatusCode::OK, "{catalog}");
+        let entry = catalog["data"]
+            .as_array()
+            .expect("catalog data")
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(model.as_str()))
+            .unwrap_or_else(|| panic!("{model} 必须在目录里：{catalog}"));
+        assert_eq!(entry["vendor"].as_str(), Some("OpenAI"));
+        assert_eq!(entry["revision"], material["native_revision"]);
+        assert_eq!(
+            entry["contract"], material["capability_schema"],
+            "目录里的合同必须与发布的那一份逐字一致"
+        );
     }
 
     // 四条请求共用一个真实 Worker：它只领 Job，不知道这次用例在验什么。
@@ -5294,25 +5318,43 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
     })
 }
 
+/// 发布一组候选。`contract` 给 `Some` 时用它当**模型级合同**（新形状素材顶层那一份）；
+/// 给 `None` 时沿用旧形状：候选自己那份 `capability_schema` 既是承载面也是合同。
 async fn publish_candidates(
     client: &Client,
     base_url: &str,
     admin_token: &str,
     model: &str,
+    contract: Option<Value>,
     mut offerings: Vec<Value>,
 ) -> StatusCode {
     for offering in &mut offerings {
-        offering["capability_schema"]["properties"]["model"]["const"] =
-            Value::String(model.to_owned());
+        // 线上名以**承载面**为准；`model.const` 跟着本次发布的型号走。旧形状没有承载面，
+        // 那份 `capability_schema` 就是它，两者落在同一处。
+        let surface = if offering
+            .get("carrier_schema")
+            .is_some_and(|value| !value.is_null())
+        {
+            &mut offering["carrier_schema"]
+        } else {
+            &mut offering["capability_schema"]
+        };
+        surface["properties"]["model"]["const"] = Value::String(model.to_owned());
         offering["provider_model_id"] = Value::String(model.to_owned());
     }
-    let body = json!({
+    let mut body = json!({
         "vendor_id": "OpenAI",
         "native_model_id": model,
         "native_revision": "route-test-1",
         "actor": "contract-test",
         "offerings": offerings
     });
+    if let Some(mut contract) = contract {
+        // 合同里的 `model.const` 必须等于 `native_model_id`（发布期的硬判据），所以它也跟着
+        // 本次发布的型号走——素材里写的是厂商型号名，测试用的是自己的网关型号名。
+        contract["properties"]["model"]["const"] = Value::String(model.to_owned());
+        body["capability_schema"] = contract;
+    }
     client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
@@ -5330,7 +5372,7 @@ fn route_request(model: &str, prompt: &str) -> Value {
 
 /// 合同里的文生图请求体（bootstrap 素材的模型名）。
 fn generation_request_body(prompt: &str) -> Value {
-    json!({"model": "gpt-image-2", "prompt": prompt, "n": 1, "quality": "low"})
+    json!({"model": "gpt-image-2.5-flare", "prompt": prompt, "n": 1, "quality": "low"})
 }
 
 /// 带幂等键的测试构造体：受理时把它提到 `Idempotency-Key` 请求头。
@@ -5405,9 +5447,10 @@ async fn issue_key(client: &Client, base_url: &str, admin_token: &str, account_i
         .to_owned()
 }
 
+/// 发布一份 2.5 素材：对客面的用例都按它的合同提交（模型名见 `generation_request_body`）。
 async fn publish_bootstrap(client: &Client, base_url: &str, admin_token: &str) {
     let config: Value = serde_json::from_str(include_str!(
-        "../../../config/bootstrap/aihubmix-gpt-image-2.json"
+        "../../../config/bootstrap/gpt-image-2.5-flare.json"
     ))
     .expect("bootstrap config");
     let response = client
@@ -5420,9 +5463,10 @@ async fn publish_bootstrap(client: &Client, base_url: &str, admin_token: &str) {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
+/// 型号身份对不上时必须被发布期拒掉：把合同里的 `model.const` 与 `native_model_id` 拆开。
 async fn reject_mismatched_model_identity(client: &Client, base_url: &str, admin_token: &str) {
     let mut config: Value = serde_json::from_str(include_str!(
-        "../../../config/bootstrap/aihubmix-gpt-image-2.json"
+        "../../../config/bootstrap/gpt-image-2.5-flare.json"
     ))
     .expect("bootstrap config");
     config["native_model_id"] = Value::String("different-model".to_owned());

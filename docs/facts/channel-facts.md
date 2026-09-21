@@ -211,7 +211,7 @@
 - ~~`gpt-image-2.5-flare` 单独调用~~ → **已测（2.6）** ✅
 - ~~AIHubMix 的响应头里到底有没有逐请求标识~~ → **已测：有，`X-Request-ID`（§2.6）** ✅
 - 2.5 两款在**异步 `/ai/v1`** 上是否同样无 `usage` —— **未测**，且**不必测**：任务对象格式本身不带计量已由第一阶段 §13.1 三场景证实，且 `/ai/v1` 已判定不作为正式计费路径（2026-09-20 复核：该端点不带 `async` 时同样是任务对象，同样无 `usage`）；
-- 带参考图的编辑路径（`/v1/images/edits`，multipart）—— 第一阶段在 `gpt-image-2` 上测过（图片输入 1024 tokens），**2.5 未测**。
+- ~~带参考图的编辑路径（`/v1/images/edits`，multipart）—— 第一阶段在 `gpt-image-2` 上测过（图片输入 1024 tokens），**2.5 未测**~~ → **已测（§2.14）**：2.5 一次调用发**两张**参考图（重复 `image[]` 部件）+ `background=transparent`，HTTP 200、图片输入 2545 tokens ✅
 
 ### 2.8 发布 2.5 供给所需的渠道侧事实（就绪清单）
 
@@ -223,8 +223,8 @@
 | --- | --- | --- |
 | `model.const` 字面值 | `gpt-image-2` | **`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`**（各与 `native_model_id` 同名） |
 | `quality` 取值 | `low`/`medium`/`high` | **新增 `xhigh`、`max`**，共 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）；在本平台采用的同步 `/v1` 端点上是**顶层**参数 |
-| `moderation` | **无** | 上游 `/ai/v1` 机器 Schema 有（`auto`/`low`）；**本平台素材不声明**（它属 `/ai/v1` 那族，我们走的 `/v1` 族没有这个字段） |
-| `background` | 上游有 | 上游 `/ai/v1` 有；**本平台素材不声明**（同上，属 `/ai/v1` 那族） |
+| `moderation` | **无** | 上游 `/ai/v1` 机器 Schema 有（`auto`/`low`）；**素材按厂商契约声明**（2026-09-20 晚更正：不再因"`/v1` 族 Schema 没有"而收回，见 §2.9） |
+| `background` | 上游有 | 上游 `/ai/v1` 有；**素材按厂商契约声明**（同上；`transparent` 已被实测落实，见 §2.14） |
 | `n` | `min 1, max 10` | `min 1, max 10`（**同**） |
 
 **Offering（④）参数**：
@@ -264,14 +264,18 @@
 
 **2026-09-20 的两轮变化**：先把 `quality` 等从 `extra` 内提到顶层（那一轮还按第一方文档把 `background`/`output_compression`/`user`/`moderation` 声明在顶层）；同日又按端点 `request.schema` **收回那四项、去掉 `size`/`output_format` 自造的枚举、并修正 `gpt-image-2` 的 `quality`**（schema 里它没有 `auto`）。口径是：**声明面以端点 `request.schema` 为准，不以文档的宽面为准**（依据见 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md) 与 [`ADR-0002`](../adr/0002-native-capability-schema-not-canonical.md) 的 2026-09-20 修订）。
 
+**（2026-09-20 晚更正：上一段的"以端点 Schema 为准"已被取代）** 声明面改为**按厂商契约**：聚合渠道转售的就是上游模型的能力，**渠道机器 Schema 写没写不构成渠道不能**；渠道若不接受某个已声明的取值，就表现为**渠道报错**，平台不静默降级、也不替渠道把字段吞掉。据此 `background` / `output_compression` / `moderation` 重新按厂商契约声明（枚举与默认值照厂商契约，不再以"这两个端点没有这四项"为由收回），参考图按厂商契约声明成字符串数组（≤16），`size` 按厂商的**像素型**声明。促成这次改口的是一条实测：`/v1/*` 的机器 Schema 里确实没有 `background`，但端点**接受并落实**了 `background=transparent`（§2.14）——窄 Schema 不等于端点不认。**唯一不变的是型号差异**：`gpt-image-2` 的 `quality` 仍按它自己的取值集合（不含 `auto`），那是型号面的事、不是渠道宽窄的事。
+
 ### 2.10 已生成的发布素材
 
 | 文件 | 内容 |
 | --- | --- |
-| `config/bootstrap/aihubmix-gpt-image-2.5-flare.json` | AIHubMix → `gpt-image-2.5-flare` 的 Profile + Offering + Price（草案） |
-| `config/bootstrap/aihubmix-gpt-image-2.5-sunburst.json` | 同上，`sunburst` |
+| `config/bootstrap/gpt-image-2.5-flare.json` | `gpt-image-2.5-flare` 的**厂商合同**（顶层 `capability_schema`）+ 两条承载面（AIHubMix 下标 0、APIMart 下标 1）+ 各自 `price_plan`（草案） |
+| `config/bootstrap/gpt-image-2.5-sunburst.json` | 同上，`sunburst` |
 
-两个文件都通过发布校验（顶层参数面与 Adapter 的 `AdapterDescriptor` 一致；见 `crates/application` 的 `validate_adapter_compatibility`）。
+**（2026-09-20 晚更正）** 本节此前列的是**旧形状**的两份 AIHubMix 单供给素材（`aihubmix-gpt-image-2.5-flare.json` / `-sunburst.json`，顶层 `capability_schema` 兼作渠道面）；合同与承载面分层后，同一型号改成上面这两份"一份合同 + 多供给"的素材，旧形状文件已退役。
+
+两个文件都通过发布校验（承载面字段从合同可达、落到 Driver 能写上线文的字段名、`defaults` 键在合同里；见 `crates/application` 的发布期校验）。
 
 **前置（文件内 `_status` 已写明）**：未获「执行实现」授权前不得用于生产；素材是"草案 · 未发布"。
 
@@ -316,6 +320,29 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 1. **"余额不足"说的是我们**：`insufficient_user_quota` 是**平台在渠道侧的账户欠费**（`CONTEXT.md` 的 `Platform Funding Failure`），**不得原样返回给消费客户端**；403 的其余分支（账号禁用、IP 白名单、令牌不支持该模型、渠道被禁用）也全是**我们与渠道之间的配置/资质问题**。
 2. **没有"服务器错误"这一档**：该页的 503 只有"没有可用渠道"与"被官方限速"两种含义，属渠道侧/上游侧问题，不是"我们调它时它崩了"。
 3. **分类不能只靠字符串匹配**：多数分支没有错误标识符，文本还可能是上游透传——所以要以**状态码兜底**，并保留原始文本供人工核对。
+
+### 2.14 编辑面实测：两张参考图 + `background=transparent`（2026-09-20，一次真实调用）
+
+`POST https://api.inferera.com/v1/images/edits`（`multipart/form-data`），`model=gpt-image-2.5-flare`：
+
+| 项 | 值 |
+| --- | --- |
+| 参考图 | **两张**，用**重复的 `image[]` 部件**提交（不是两次单值 `image`） |
+| 其余参数 | `background=transparent`、`output_format=png`、`n=1`、`size=1024x1024`、`quality=low` |
+| 结果 | **HTTP 200**；响应顶层 `background: "transparent"` |
+| 产物 | **RGBA PNG（PNG color type 6，带 alpha 通道）1,495,027 bytes** |
+| `usage` | `input_tokens 2589`（`input_tokens_details.image_tokens 2545`）/ `output_tokens 196` |
+
+**两条结论**：
+
+1. **该渠道接受并落实 `background=transparent`**：不但在响应里回显，产物的 PNG 头也确实是带 alpha 的 **RGBA**（不是 RGB）。这正是 §2.5 记的那处"文档面比机器 Schema 宽"的实测答案——**Schema 窄不等于端点不认**，所以素材按**厂商契约**声明这些字段（§2.9 的 2026-09-20 晚更正）。
+2. **多张参考图经 `image[]` 可用**：两张参考图一次提交成功；**重复单值 `image` 会 400**（家族面既有记录，见 §2.6 附近的实测与素材 `_evidence`）。⇒ 素材按张数决定编码（一张 `image`、多张 `image[]`）是对的。
+
+**与计费的关系**：图片输入 token 由 0 涨到 **2545**（两张参考图），四分项 `usage` 形状不变，② 的同步解码器仍不需要新分支。
+
+**边界（未做）**：**没有逐像素核对透明区域**（只核了 PNG 色彩类型与响应回显）；**16 张上限未压测**（不为此花钱）；`output_compression`、`moderation` 未在真实调用里用过。
+
+**样本位置**：这次调用的请求脚本与产物（`probe.ps1`、`two-refs-transparent.png`）在本机探测目录 `.data/probe-2026-09-20/`，**未入库**（该目录不入版本控制）；本节只转录与结论有关的事实。
 
 ## 3. APIMart
 
@@ -432,6 +459,7 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 - ~~`Idempotency-Key` 是否定义~~ → **机器 Schema 明确声明**（§3.4）✅
 - **异步状态取值集合** —— 本次实测见到的终态为 `completed`；完整集合仍以两份文档的**并集**处理（未知取值继续轮询，不得当失败）。**未逐一实测**，属 ② 层实现时按并集容错即可，不阻塞；
 - **`image_urls` 图生图路径** —— **已受控实测结清**（见 §3.7、留档 §6）；
+- ~~2.5 是否接受 `mask_url`（该字段不在 2.5 的生成文档里）~~ → **已实测：接受**，提交 200、轮询到 `completed`（§3.11）✅；遮罩是否**生效**只有弱信号，未严格证明。
 - **`sunburst` 型号** —— 未单独实测（目录中已确认在册，`endpoint_types` 与 flare 相同）；图生图按同渠道族 flare 的实测开放。
 
 ### 3.7 参考图与遮罩：必须先上传（**2026-09-19 已受控实测结清**）
@@ -456,7 +484,7 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 **平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。**2026-09-20 补**：平台不再托管素材，所以这条只对**调用方给 data URL** 的情况成立（那时才需要解码后上传换 URL）；调用方给公网 URL 时逐字透传，不上传。
 
-**发布素材状态：三条分支已开放。** 两个 `config/bootstrap/apimart-gpt-image-2.5-*.json` 的 `allowed_branches` 已加上 `image_conditioned` / `masked`（`max_images: 16`）。**注意这是发布素材里的能力声明，不是产品上线**——素材 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确本阶段是阶段性任务、不存在上线批准。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——验证已完成：上传返回、`image_urls` 形态、`mask_url` 同用、以及 `usage.input_image_tokens` 四件事都在**一次真实调用**里结清；另外我们**自己的服务**（API + Worker，真实凭证）也对着真实上游跑通了同一条路径（留档 §6）。
+**发布素材状态：三条分支已开放。** `config/bootstrap/gpt-image-2.5-*.json` 里那条 APIMart 供给的 `allowed_branches` 已加上 `image_conditioned` / `masked`（`max_images: 16`）。（本节原先指的是两份 `config/bootstrap/apimart-gpt-image-2.5-*.json` 单供给素材；2026-09-20 晚并入"一份合同 + 多供给"的新素材后，那两份旧形状文件已退役。）**注意这是发布素材里的能力声明，不是产品上线**——素材 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确本阶段是阶段性任务、不存在上线批准。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——验证已完成：上传返回、`image_urls` 形态、`mask_url` 同用、以及 `usage.input_image_tokens` 四件事都在**一次真实调用**里结清；另外我们**自己的服务**（API + Worker，真实凭证）也对着真实上游跑通了同一条路径（留档 §6）。
 
 **参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`（调用方给的是 `image`/`mask`，Adapter 落到这两个字段上）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个**候选声明**的参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩（两者都像时以遮罩为准）、其余一律拒绝（发布期与运行期共用同一个函数）；这套判定只管落位，不用来拦截调用方字段——调用方那些该候选**没声明**的参数在受理时就被丢掉了（不会到这一层，也不会发给上游）。**合同归属的更正（2026-09-20）**：原文此处还引用了 `0002` 的补充决定（"统一参数转换属后期对外消费侧"）。该补充决定已被 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代——调用方所见参数名归 **Vendor Model Contract**，"原生名"的落位由 **Offering Parameter Mapping** 承担；"平台内部不改渠道名"这一**当前实现事实**仍然成立，但它是映射层尚未落位的现状，不是既定归属（差距见工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)）。
 
@@ -503,6 +531,27 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 1. **`500` 会被用来承载参数错误**：示例 message 为 `build_request_failed: invalid size: 3:5, allowed: …`。若按"500 ⇒ 结果不明 ⇒ 进对账"处理，会把一个纯粹可修正的请求错误升级成人工对账。
 2. **失败任务会退款**：`failed` 状态写明"reserved funds are refunded"，`/v1/usage` 也写明失败与失败后退款的调用不计入、部分成功的批次按实际交付张数计费。这影响"失败是否产生成本"的判断，但不改变平台的证据门槛。
+
+### 3.11 `mask_url` 在 2.5 上被接受（2026-09-20，两次真实调用：同一请求带/不带遮罩）
+
+流程与 §3.7 一致：先 `POST /v1/uploads/images` 把参考图与遮罩换成公网 URL，再 `POST /v1/images/generations` 提交（`model=gpt-image-2.5-flare`、`image_urls` + `mask_url`、`size=1:1`、`resolution=1k`、`quality=low`）。两次调用的差别**只有 `mask_url` 的有无**。
+
+| 项 | 带 `mask_url` | 不带 `mask_url` |
+| --- | --- | --- |
+| 提交 | HTTP 200，拿到 `task_id` | 同 |
+| 轮询 | 到 `completed` | 同 |
+| `usage` | `input_tokens 1048`（`image_tokens 1024`）/ `output_tokens 196` | **完全相同** |
+| `cost` | `0.011354` | **完全相同** |
+
+**结论 1：2.5 接受 `mask_url`。** 该字段**不在** `gpt-image-2.5` 的生成文档字段表里（§3.2 的参数清单没有它），但提交与出图都正常，没有"未知字段"类报错。⇒ 素材**按厂商契约**声明遮罩（§2.9 晚更正的同一条口径），而不是因为渠道文档没写就收回。**代价如实登记**：渠道将来若真拒绝它，表现会是渠道报错，不是平台静默丢字段。
+
+**结论 2：遮罩是否真的"生效"只有弱信号，未严格证明。** 把两张产物与输入图按**每 8 像素采样**比对：遮罩椭圆**内**的差异像素占 **21%**，**全图**为 **79.9%**——方向对（遮罩内改动明显更少），但生成本身是随机的、请求里**没有 `seed`**，两次产物本来就不同，所以这只说明"遮罩区域改动更少"，**不能证明遮罩被严格遵从**。要严格证明得固定 `seed` 或多轮对照，本次没做。
+
+**与成本口径的一致性**：两次 `cost` 都是 `0.011354`。按公开费率手算 `24×$5 + 1024×$8 + 196×$30` per 1M = **14192 microusd**，乘面板自报的 `Group ratio 0.8` = **11354 microusd**，与上游 `cost` 逐位相同——§5.4 记的"整笔 −20%"在这一笔上再次成立。
+
+**边界（未做）**：`sunburst` 的遮罩路径未单独实测（同渠道族、同端点、同参数面）；遮罩尺寸/通道的**边界**（与参考图不等比、非 512×512）未压测。
+
+**样本位置**：这两次调用的脚本与产物（`apimart-mask-probe.ps1` 带遮罩、`apimart-mask-control.ps1` 不带、`apimart-25-{mask,nomask}-result.png`、`mask-ellipse.png`）在本机探测目录 `.data/probe-2026-09-20/`，**未入库**。
 
 ## 4. 不跨渠道合并（原写法的更正）
 
