@@ -8,7 +8,7 @@ pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
     AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, ImageParameterKind,
     JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
-    PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_enum_maps,
+    PublishedModel, PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_enum_maps,
     apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
     contract_image_parameter_kind, declared_defaults, declared_enum_maps, declared_field_names,
     declared_parameter_names, declared_reference_image_limit, declared_renames,
@@ -814,6 +814,13 @@ pub trait HubRepository: Send + Sync {
         gateway_model: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError>;
 
+    /// 对客目录的取数：当前真的能调的模型，一个型号一条，带它那份模型级合同。
+    ///
+    /// 判据与 [`Self::active_offering`] **同一条**（生效的发布条目 + 启用的供给 + 启用的渠道）：
+    /// 目录里列出的型号必须真的受理得起来——取不到任何候选的型号，受理期对调用方是"不存在"，
+    /// 因此也不该出现在目录里。一个可调型号都没有时返回空集合，不是错误。
+    async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError>;
+
     async fn create_account(
         &self,
         account_id: AccountId,
@@ -1149,6 +1156,14 @@ impl RuntimeService {
         let request = command.into_request(contract, normalized);
         let revision = self.repository.publish_runtime(request).await?;
         Ok(revision)
+    }
+
+    /// 对客目录：当前真的能调的模型与它们的合同。
+    ///
+    /// 合同取的就是**发布的那一份**，不另造简化结构：目录说的与受理时校验的必须是同一份，
+    /// 否则客户端照目录建的表单会被另一套规则拒掉。
+    pub async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
+        self.repository.published_models().await
     }
 
     /// 校验单个候选，并归一化它的 `base_url`。
@@ -3783,6 +3798,10 @@ mod tests {
             &self,
             _native_model_id: &str,
         ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
             unused_repository()
         }
 

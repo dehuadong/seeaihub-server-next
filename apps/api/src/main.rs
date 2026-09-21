@@ -17,7 +17,8 @@ use seeai_application::{
     RefundReconciliationCommand, RuntimeService,
 };
 use seeai_domain::{
-    AccountId, ImageInputs, ImageParameterKind, JobId, contract_image_parameter_kind,
+    AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel,
+    contract_image_parameter_kind,
 };
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
@@ -95,6 +96,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/provider-failures", get(list_provider_failures))
         .route("/v1/images/generations", post(generate_image))
         .route("/v1/images/edits", post(edit_image))
+        .route("/v1/models", get(list_models))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(tower_http::request_id::SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -327,6 +329,59 @@ async fn refund_reconciliation(
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 对客目录的响应：与生成入口一样用 `data` 承载列表。
+#[derive(Debug, Serialize)]
+struct ModelCatalogResponse {
+    data: Vec<ModelCatalogEntry>,
+}
+
+/// 目录里的一条：型号的公开身份 + 它那份发布的合同。
+///
+/// 字段名是对客协议的取值，与内部的 [`PublishedModel`] 分开：内部字段改名不该动对客协议。
+#[derive(Debug, Serialize)]
+struct ModelCatalogEntry {
+    /// 客户端提交 `model` 时用的名字。
+    name: String,
+    /// 厂商：目录属性，同一个厂商模型可以由多条渠道供给。
+    vendor: String,
+    /// 合同修订。
+    revision: String,
+    /// 该模型的调用方合同（发布的 JSON Schema），客户端据此建表单。
+    contract: Value,
+}
+
+impl From<PublishedModel> for ModelCatalogEntry {
+    fn from(model: PublishedModel) -> Self {
+        Self {
+            name: model.gateway_model,
+            vendor: model.vendor_id,
+            revision: model.native_revision,
+            contract: model.capability_schema,
+        }
+    }
+}
+
+/// 对客目录：当前**真的能调**的模型，以及每个模型那份发布的合同。
+///
+/// 鉴权与生成入口是**同一把 API Key**：目录属于同一个面，不另立一套凭证。
+/// 取数与判据在仓库层（与受理期选路同一条），这里只做投射——目录里不出现渠道、供给、
+/// 驱动或任何执行记录；型号身份与合同就够客户端建表单了。
+async fn list_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<ModelCatalogResponse>, ApiError> {
+    // 目录不按账户分片（同一个平台型号对所有账户都一样），但 Key 仍然必须有效。
+    authenticate(&state, &headers).await?;
+    let data = state
+        .runtime
+        .published_models()
+        .await?
+        .into_iter()
+        .map(ModelCatalogEntry::from)
+        .collect();
+    Ok(Json(ModelCatalogResponse { data }))
 }
 
 /// 受理请求：**平铺**的模型参数 + 图片字段（`image` 与 `image_urls` 同义二选一，`mask` 是遮罩）。

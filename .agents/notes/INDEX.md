@@ -21,6 +21,7 @@
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-20 | [对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra](./implemented/platform/2026-09-20-flat-request-body-and-asset-roles.md) | platform | implemented |
 | 2026-09-20 | [图片按渠道原形进原形出：不落盘静态资产，也不提供异步形态](./implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md) | platform | implemented |
+| 2026-09-20 | [合同与承载面分层、映射声明化与对客目录（#10 落地）](./implemented/platform/2026-09-20-vendor-model-contract-and-offering-mapping.md) | platform | implemented |
 | 2026-09-19 | [独立图片生成服务端第一阶段交付](./implemented/platform/2026-09-19-initial-image-generation-vertical-slice.md) | platform | implemented |
 | 2026-09-19 | [第二阶段交付：多 Offering 路由与 APIMart Driver](./implemented/platform/2026-09-19-multi-offering-routing-and-apimart-driver.md) | platform | implemented |
 
@@ -51,6 +52,7 @@ PostgreSQL 持久化与迁移、请求与结果的传输形态、Adapter 边界�
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-20 | [对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra](./implemented/platform/2026-09-20-flat-request-body-and-asset-roles.md) | platform | implemented |
 | 2026-09-20 | [图片按渠道原形进原形出：不落盘静态资产，也不提供异步形态](./implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md) | platform | implemented |
+| 2026-09-20 | [合同与承载面分层、映射声明化与对客目录（#10 落地）](./implemented/platform/2026-09-20-vendor-model-contract-and-offering-mapping.md) | platform | implemented |
 | 2026-09-19 | [独立图片生成服务端第一阶段交付](./implemented/platform/2026-09-19-initial-image-generation-vertical-slice.md) | platform | implemented |
 | 2026-09-19 | [第二阶段交付：多 Offering 路由与 APIMart Driver](./implemented/platform/2026-09-19-multi-offering-routing-and-apimart-driver.md) | platform | implemented |
 

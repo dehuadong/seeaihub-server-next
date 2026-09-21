@@ -8,8 +8,8 @@ use seeai_application::{
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, CreateImageGeneration, GenerationJob, ImageBranch, JobId,
-    OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PublishedOffering,
-    PublishedRevision, RuntimeRevisionId, VendorModelId,
+    OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PublishedModel,
+    PublishedOffering, PublishedRevision, RuntimeRevisionId, VendorModelId,
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
@@ -368,6 +368,40 @@ impl HubRepository for PgHubRepository {
             }
         }
         Ok(candidates)
+    }
+
+    async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
+        // 判据与 `active_offering` **逐条对齐**（生效的发布条目 + 启用的供给 + 启用的渠道）：
+        // 目录里列出的型号必须真的受理得起来。少判一条，就会出现"目录里有、提交时取不到候选"
+        // 的型号——那种型号对调用方是 404，比不列更糟。
+        //
+        // 一个型号一条：正常情形下同一个型号的 active 条目来自同一次发布（发布即原子替换），
+        // 只有发布语义被绕过才会跨修订并存；即便如此也按确定的顺序取一条，不把同一个名字列两遍。
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT ON (re.gateway_model)
+                re.gateway_model, vm.vendor_id, vm.native_revision, vm.capability_schema
+            FROM publication.runtime_entries re
+            JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+            JOIN supply.offerings o ON o.id = re.offering_id AND o.enabled
+            JOIN supply.channels c ON c.id = o.channel_id AND c.enabled
+            WHERE re.active
+            ORDER BY re.gateway_model ASC, re.routing_priority ASC, vm.created_at DESC, vm.id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                Ok(PublishedModel {
+                    gateway_model: row.try_get("gateway_model").map_err(database_error)?,
+                    vendor_id: row.try_get("vendor_id").map_err(database_error)?,
+                    native_revision: row.try_get("native_revision").map_err(database_error)?,
+                    capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+                })
+            })
+            .collect()
     }
 
     async fn create_account(

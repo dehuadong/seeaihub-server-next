@@ -41,7 +41,7 @@
 
 发布期：
 
-- **R1** `carrier_schema` 的每个顶层字段必须**在合同里**（供给不能凭空多出参数）。
+- **R1** `carrier_schema` 的每个顶层字段必须**从合同可达**：合同直接声明它、被 `rename` 从某个合同字段接过来、或是尺寸换算的目标字段（供给不能凭空多出参数）。
 - **R2** `carrier_schema` 的每个字段必须能通过映射落到 Driver 的 `wire_parameters` 上（否则"声明了发不出去"）。
 - **R3** 分支与图片数上限仍对 Driver 的 `supported_branches` / `max_images`。
 

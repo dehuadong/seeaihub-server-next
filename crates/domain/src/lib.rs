@@ -322,6 +322,26 @@ pub struct PublishedRevision {
     pub candidates: Vec<OfferingCandidate>,
 }
 
+/// 对客目录里的一条：一个**当前真的能调**的对外模型，以及它那份模型级合同。
+///
+/// "真的能调"不由目录自己判：仓库按受理期**同一条**判据取数（该型号在生效的发布条目上至少
+/// 有一条启用的供给，且那条供给的渠道也启用）。列出却受理不了的型号比不列更糟——调用方会照它
+/// 建表单，然后在提交时落空。
+///
+/// 这里是**目录身份**，不是渠道：厂商是目录属性（同一个厂商模型可以由多条渠道供给），
+/// 供给、渠道、驱动与任何执行记录都不进来。
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct PublishedModel {
+    /// 对外的模型名：客户端提交 `model` 时用的那个名字。
+    pub gateway_model: String,
+    /// 厂商标识。
+    pub vendor_id: String,
+    /// 合同修订。
+    pub native_revision: String,
+    /// 该模型的调用方合同：**发布的那一份**，客户端据此建表单。
+    pub capability_schema: Value,
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationJob {
     pub id: JobId,

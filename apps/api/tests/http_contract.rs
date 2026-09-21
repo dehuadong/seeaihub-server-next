@@ -787,6 +787,8 @@ impl Harness {
 /// 对客响应里**不许**出现内部的执行记录，也不许指路任何查询接口。
 ///
 /// 内部它就是一个执行与审计记录：没有 job id、没有任务号、没有"去查任务"的指引。
+/// 这里同时钉住"渠道/供给侧的词汇不进对客响应"：供给、渠道、驱动与厂商原生型号都是平台内部
+/// 的组织方式，调用方拿到的只有型号身份与它公开的能力面（目录里的合同就是后者）。
 fn assert_public_only(what: &str, body: &Value) {
     let rendered = body.to_string();
     for needle in [
@@ -797,6 +799,13 @@ fn assert_public_only(what: &str, body: &Value) {
         "task-contract",
         "attempt",
         "assets",
+        "offering",
+        "Offering",
+        "channel",
+        "Channel",
+        "provider_kind",
+        "provider_model_id",
+        "adapter_key",
     ] {
         assert!(
             !rendered.contains(needle),
@@ -4819,4 +4828,174 @@ async fn verify_lease_recovery_contract(
     assert_eq!(repeated.returned_to_queue, 0);
     assert_eq!(repeated.sent_to_reconciliation, 0);
     pool.close().await;
+}
+
+/// 取一次对客目录（`GET /v1/models`）。
+async fn get_catalog(client: &Client, base_url: &str, api_key: &str) -> (StatusCode, Value) {
+    let response = client
+        .get(format!("{base_url}/v1/models"))
+        .bearer_auth(api_key)
+        .send()
+        .await
+        .expect("catalog request");
+    let status = response.status();
+    let raw = response.text().await.expect("catalog body");
+    (
+        status,
+        serde_json::from_str(&raw).unwrap_or(Value::String(raw)),
+    )
+}
+
+/// 对客目录：`GET /v1/models` 只列**当前真的能调**的型号，合同就是发布的那一份。
+///
+/// 判据与受理期选路**同一条**（生效的发布条目 + 启用的供给 + 启用的渠道）：目录里列出的型号
+/// 必须真的提交得起来。列着却提交不了比不列更糟——调用方会照它建表单，然后在提交时落空。
+/// 本用例只读发布物与目录，不起 Worker、不连上游：零外部调用。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_model_catalog_lists_only_callable_models_with_their_published_contract() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 同步入口在这个用例里只用来验"停用之后真的调不了"；那一步在受理前就失败，不会等超时。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // ── 没有 Key：401，且走现有的对客错误信封；乱给的 Key 同样是 401 ──
+    let unauthorized = client
+        .get(format!("{base_url}/v1/models"))
+        .send()
+        .await
+        .expect("catalog request");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    let envelope: Value = unauthorized.json().await.expect("error envelope");
+    assert_eq!(
+        envelope["error"]["code"].as_str(),
+        Some("authorization_required")
+    );
+    assert_public_only("无 Key 的目录请求", &envelope);
+    let rejected = client
+        .get(format!("{base_url}/v1/models"))
+        .bearer_auth("sk_seeai_not_a_real_key")
+        .send()
+        .await
+        .expect("catalog request with an unknown key");
+    assert_eq!(rejected.status(), StatusCode::UNAUTHORIZED);
+
+    // 两个型号、两份不同的合同：目录里每一条都必须带**它自己**那份，且逐字一致。
+    let model = "catalog-model-a";
+    let other = "catalog-model-b";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let other_contract = surface_schema(json!({
+        "model": {"const": other},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let published = [
+        (model, "catalog-a-1", &contract),
+        (other, "catalog-b-1", &other_contract),
+    ];
+    for (name, revision, schema) in published {
+        let status = publish_with_surfaces(
+            &client,
+            &base_url,
+            &admin_token,
+            name,
+            revision,
+            schema.clone(),
+            vec![("aihubmix-image-v1", schema.clone())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name} 必须发布成功");
+    }
+
+    // ── 带 Key：两个型号都在，形状是 `{name, vendor, revision, contract}` ──
+    let (status, catalog) = get_catalog(&client, &base_url, &api_key).await;
+    assert_eq!(status, StatusCode::OK, "got {catalog}");
+    assert_public_only("目录", &catalog);
+    assert_eq!(
+        catalog.as_object().map(serde_json::Map::len),
+        Some(1),
+        "目录顶层只有 data：{catalog}"
+    );
+    let entries = catalog["data"].as_array().expect("data is an array");
+    assert_eq!(entries.len(), 2, "两个在售型号都要在目录里：{catalog}");
+    for (name, revision, schema) in published {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("`{name}` 必须在目录里：{catalog}"));
+        assert_eq!(
+            entry.as_object().map(serde_json::Map::len),
+            Some(4),
+            "目录条目只有 name / vendor / revision / contract：{entry}"
+        );
+        assert_eq!(entry["vendor"].as_str(), Some("OpenAI"));
+        assert_eq!(entry["revision"].as_str(), Some(revision));
+        assert_eq!(
+            &entry["contract"], schema,
+            "目录里的合同必须与发布的那一份逐字一致"
+        );
+    }
+
+    // ── 停用供给：该型号从目录里消失，提交也确实取不到候选 ──
+    sqlx::query(
+        "UPDATE supply.offerings SET enabled = false
+         WHERE vendor_model_id = (SELECT id FROM catalog.vendor_models WHERE native_model_id = $1)",
+    )
+    .bind(model)
+    .execute(&pool)
+    .await
+    .expect("disable the offering");
+    let (_, catalog) = get_catalog(&client, &base_url, &api_key).await;
+    let names: Vec<&str> = catalog["data"]
+        .as_array()
+        .expect("data is an array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert_eq!(names, vec![other], "停用的型号必须从目录里消失：{catalog}");
+    let key = format!("catalog-disabled-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(model, "disabled model"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "目录不列的型号，受理期同样取不到候选：{body}"
+    );
+
+    // ── 渠道停用与供给停用是**同一条**判据：它同样让型号从目录里消失 ──
+    sqlx::query(
+        "UPDATE supply.channels SET enabled = false
+         WHERE id = (SELECT o.channel_id FROM supply.offerings o
+                     JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+                     WHERE vm.native_model_id = $1)",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .expect("disable the channel");
+    let (status, catalog) = get_catalog(&client, &base_url, &api_key).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog,
+        json!({"data": []}),
+        "一个可调型号都没有时，目录是空列表而不是错误：{catalog}"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
 }
