@@ -9,7 +9,7 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 
 # 对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
 
-> **失效范围（2026-09-20 同日）**：本条里"图片是平台资产 id""有 202 受理与 job_id 轮询"的部分**已作废**——平台不再托管静态素材，对客只有同步形态。取代记录见 [图片按渠道原形进原形出](./2026-09-20-images-pass-through-without-asset-storage.md)；决策见 `docs/adr/0019`。其余（扁平请求体、`Idempotency-Key`、服务端定预授权额、参数放行）仍有效。
+> **失效范围（2026-09-20 同日）**：本条里"图片是平台资产 id""有 202 受理与 job_id 轮询"的部分**已作废**——平台不再托管静态素材，对客只有同步形态。取代记录见 [图片按渠道原形进原形出](./2026-09-20-images-pass-through-without-asset-storage.md)；决策见 `docs/adr/0019`。本条里"按第一方文档把 `background`/`output_compression`/`user`/`moderation` 声明在顶层"以及"参数一律放行透传"两句也已作废：声明面改以**该模型对应端点的 `request.schema`** 为准（那四项属 `/ai/v1` 族、本平台不走），参数改按候选声明面**过滤**（没声明的丢掉）。见 [AIHubMix 声明面对齐端点 schema](./2026-09-20-aihubmix-declared-face-follows-endpoint-schema.md)。其余（扁平请求体、`Idempotency-Key`、服务端定预授权额）仍有效。
 
 ## 追加（同日，按用户的四条决定）
 

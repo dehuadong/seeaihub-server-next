@@ -107,7 +107,7 @@ HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能�
 
 ## 5. 原生能力 Schema 与发布
 
-以 AIHubMix 无需鉴权的机器 Schema 为上游证据。导入后形成平台自己的不可变 `NativeImageCapabilitySchema` 修订，至少保存：来源 URL、抓取时间、内容摘要、上游 schema 版本和人工审核记录；必填 `model`、`prompt`；`image` 与 `images` 的同义/归并关系（`images` 最多 16 张）；`mask` 必须与 `image` 或非空 `images` 同时存在；`n` 为 1–10、默认 1；`output_format` 为 `png`/`jpeg`、默认 `png`；`size` 的原生值与图生图分支的受限集合；`quality`/`background`/`output_compression`/`user` 四项可选参数及其透明背景、压缩格式的组合约束（**字段位置以该 Offering 实际调用的端点为定，见下**；其中后三项在本阶段采用的执行路径上属**已声明未验证**，见下）；`async`、`webhook_url`、`webhook_events_filter` 的原生条件；未声明字段失败关闭。
+以 AIHubMix 无需鉴权的机器 Schema 为上游证据。导入后形成平台自己的不可变 `NativeImageCapabilitySchema` 修订，至少保存：来源 URL、抓取时间、内容摘要、上游 schema 版本和人工审核记录；必填 `model`、`prompt`；`image` 与 `images` 的同义/归并关系（`images` 最多 16 张）；`mask` 必须与 `image` 或非空 `images` 同时存在；`n` 为 1–10、默认 1；`output_format` 为 `png`/`jpeg`、默认 `png`；`size` 的原生值与图生图分支的受限集合；`quality` 可选参数（枚举与默认值按该端点 schema）（**字段与取值一律以该 Offering 实际调用的端点的 `request.schema` 为定，见下**）；`async`、`webhook_url`、`webhook_events_filter` 的原生条件（属 `/ai/v1` 那族，本平台不采用）；未声明字段由平台丢弃。
 
 **未声明字段由平台在受理前处置**（2026-09-19 更正 + 2026-09-20 用户定处置）：本句原先依赖「上游 `additionalProperties: false`」这一对该上游的观察。第二个 Provider 的实测表明上游可能**静默接受未声明字段并降级为默认值**，因此这层处置必须由平台在受理前执行，不能外包给上游。**2026-09-20 定为丢弃**：按选中候选声明的参数面过滤，没声明的直接丢掉（不报错、也不发上游），见 `docs/adr/0018-open-parameters-by-first-party-docs.md` 的同日修订。
 
@@ -115,7 +115,7 @@ HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能�
 
 **形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而那份 Schema 覆盖的端点不止一个，各端点的参数位置与可用面并不相同。声明"原生能力 Schema"时，字段与位置一律取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；各端点的实际形态属渠道事实，见 `docs/facts/channel-facts.md` §2。
 
-- 上一段清单里的 `background`、`output_compression`、`user` **不在**本阶段采用的执行路径的参数集合内，因此属"已声明未验证"，不应视为已开放能力（[`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G2）；
+- 上一段清单里的 `background`、`output_compression`、`user`、`moderation` **不在**本平台采用的 `/v1` 端点族的参数集合内（它们属 `/ai/v1` 那族的 `extra`），因此素材**不声明**它们（2026-09-20 定；此前按文档声明过一轮，已按端点 `request.schema` 收回）；
 - 已知差距（当前素材把可选参数声明在本 Offering 未采用的那一族端点的形状下，Adapter 能力面又强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。
 
 已知文档冲突与发布规则：实时 Schema 与模型介绍/旧资料存在差异——实时 Schema 不含 `input_fidelity`、`moderation`、`response_format`，`quality` 不接受 `auto`，`output_format` 不接受 `webp`，`mask` 的类型声明自身也有矛盾。首版能力发布按实时 Schema 的保守交集处理：未声明字段丢弃、上述未证实参数不开启、`mask` 先只接受 string。每个冲突参数经真实 wire 验证后，再以新 Schema 修订发布，不能在原修订上静默放宽。「未声明字段丢弃」是**平台自己的**受理前处置：上游不保证拒绝未声明字段（2026-09-19 实测另一 Provider 静默接受并降级为默认值），因此不能依赖上游返回错误来兜底。决策依据见 `docs/adr/0002-native-capability-schema-not-canonical.md` 与 `docs/adr/0018-open-parameters-by-first-party-docs.md`。

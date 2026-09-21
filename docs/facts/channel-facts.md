@@ -157,7 +157,7 @@
 
 **位置差异属于渠道各端点族自己的形态。** 本平台对 AIHubMix 采用的执行路径是**同步**的 `/v1/images/generations` 与 `/v1/images/edits`（§2.6 实测结清），上表第 1 行那条异步面**不使用**——它的包装形态与本平台无关。
 
-**`background` / `output_compression` / `user` / `moderation` 的位置（2026-09-20 定）**：它们在第一方**文档**里是 OpenAI 兼容面的顶层参数（AIHubMix 2.5 的机器 Schema 则把它们放在 `/ai/v1` 那族的 `extra` 内，`gpt-image-2` 没有 `moderation`）。按 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)，**文档写明支持的参数直接声明**，不再以"没实测"为由拦截；平台按声明在受理前校验取值。本仓库的 AIHubMix 素材据此把四项声明在**顶层**。
+**`background` / `output_compression` / `user` / `moderation` 的位置（2026-09-20 定，同日修正）**：它们只存在于 `/ai/v1` 那族（在 `extra` 内；`gpt-image-2` 没有 `moderation`）。本平台走的是 `/v1` 族，那两个端点的 `request.schema` 里**没有这四项**（`additionalProperties: false`），所以素材**不声明**它们——一度按第一方文档把它们声明在顶层，已按端点 `request.schema` 收回。声明面的依据见 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md) 与 [`ADR-0002`](../adr/0002-native-capability-schema-not-canonical.md) 的 2026-09-20 修订。
 
 **仍存的一处不一致（如实登记，不在声明上回避）**：上表第 2、3 行（我们实际走的 `/v1/*`）的机器 Schema 只列 `model, n, output_format, prompt, quality, size`（edits 另有 `image, mask`），且 `additionalProperties: false`。也就是说文档的 OpenAI 兼容面比机器 Schema 宽——**某个参数真正需要用时再验证它在 `/v1/*` 上的行为**，那时才值得一次计费调用（零费用的做法：用一个明显非法的取值，若被拒则是"不认识该参数"或"取值非法"，两者都在受理前、不计费；若被接受则说明端点认这个参数）。
 
@@ -223,8 +223,8 @@
 | --- | --- | --- |
 | `model.const` 字面值 | `gpt-image-2` | **`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`**（各与 `native_model_id` 同名） |
 | `quality` 取值 | `low`/`medium`/`high` | **新增 `xhigh`、`max`**，共 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）；在本平台采用的同步 `/v1` 端点上是**顶层**参数 |
-| `moderation` | **无** | 上游 `/ai/v1` 机器 Schema 有（`auto`/`low`），但**本平台素材不声明**它（Adapter 未验证该参数，见 §2.9） |
-| `background` | 上游有 | 上游有；**本平台素材不声明**（未经验证，按 `docs/adr/0002` 不开放） |
+| `moderation` | **无** | 上游 `/ai/v1` 机器 Schema 有（`auto`/`low`）；**本平台素材不声明**（它属 `/ai/v1` 那族，我们走的 `/v1` 族没有这个字段） |
+| `background` | 上游有 | 上游 `/ai/v1` 有；**本平台素材不声明**（同上，属 `/ai/v1` 那族） |
 | `n` | `min 1, max 10` | `min 1, max 10`（**同**） |
 
 **Offering（④）参数**：
@@ -250,20 +250,19 @@
 
 与 `crates/domain/src/lib.rs:345-348` 的默认 `PriceRates` 逐项一致。**响应不返回金额**，结算按 `usage` 四分项 × 上述单价计算（已用真实响应验证：14 文本输入 + 196 图像输出 → $0.005950）。
 
-**本渠道就绪判定**：③④⑤ 所需事实**齐备**；② 沿用现有 Driver（2.5 实测同构）——**但存在一处发布阻塞，见 2.9**。
+**本渠道就绪判定**：③④⑤ 所需事实**齐备**；② 沿用现有 Driver（2.5 实测同构）。
 
-### 2.9 素材的参数面：文档支持的都声明在顶层
+### 2.9 素材的参数面：以该模型对应端点的 `request.schema` 为准
 
-**执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。本仓库的 AIHubMix 素材把参数**全部声明在顶层**：
+**执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。素材声明的就是这两个端点 `request.schema` 里的字段：
 
-`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality` / `background` / `output_compression` / `user`（2.5 两款另有 `moderation`）。
+`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image` 只在 edits 端、且必填；generations 端没有 `image`/`mask`）。
 
-**依据是文档，不是实测**（[`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md)）：渠道第一方文档写明支持的参数就声明；"没实测过"不再作为拦截理由，某个参数真正需要用时再验它在实际端点上的行为。
+**字段、枚举与取值范围都取自该模型对应端点的 `request.schema`**（快照见 `out-reference/aihubmix/schema-gpt-image-2*.endpoints.json`）：`n` 为 1–10、默认 1；`quality` 2.5 两款是 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）、`gpt-image-2` 只有 `low`/`medium`/`high`；`output_format` 只有类型与默认值 `png`、`size` 只有类型——**schema 没给枚举的，素材不发明枚举**。
+
 **当前阶段平台不校验取值**（枚举、区间、类型都不管），但**按选中候选声明的参数面过滤**：候选声明过的参数原样发给上游，没声明的直接丢掉（不报错、不发上游）。哪些参数需要把取值管起来，等一份明确的清单（用户 2026-09-20 说明后期统一整理）。
 
-**取值约束取自文档**：`background` 为 `auto`/`opaque`/`transparent`；`moderation` 为 `auto`/`low`；`output_compression` 为 0–100 的整数；`user` 为字符串。素材里还带一条文档写明的条件：`background = transparent` 时 `output_format` 必须是 `png`。
-
-**2026-09-20 的变化**：此前素材把 `quality` 等放在 `extra` 内、并因此与 Adapter 的声明面互相牵制（当时记为"发布阻塞"）。现在两边都去掉了 `extra`，阻塞不存在了；`quality` 顶层直传（上游在同步 `/v1` 上就是这样）。
+**2026-09-20 的两轮变化**：先把 `quality` 等从 `extra` 内提到顶层（那一轮还按第一方文档把 `background`/`output_compression`/`user`/`moderation` 声明在顶层）；同日又按端点 `request.schema` **收回那四项、去掉 `size`/`output_format` 自造的枚举、并修正 `gpt-image-2` 的 `quality`**（schema 里它没有 `auto`）。口径是：**声明面以端点 `request.schema` 为准，不以文档的宽面为准**（依据见 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md) 与 [`ADR-0002`](../adr/0002-native-capability-schema-not-canonical.md) 的 2026-09-20 修订）。
 
 ### 2.10 已生成的发布素材
 

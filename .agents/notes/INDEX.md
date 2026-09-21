@@ -16,6 +16,7 @@
 
 | 首次提出 | 记录 | 分类 | 生命周期 |
 | --- | --- | --- | --- |
+| 2026-09-20 | [AIHubMix 素材的声明面对齐端点 request.schema](./implemented/platform/2026-09-20-aihubmix-declared-face-follows-endpoint-schema.md) | platform | implemented |
 | 2026-09-20 | [APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"](./implemented/platform/2026-09-20-apimart-failure-narrowing.md) | platform | implemented |
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-20 | [对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra](./implemented/platform/2026-09-20-flat-request-body-and-asset-roles.md) | platform | implemented |
@@ -45,6 +46,7 @@ PostgreSQL 持久化与迁移、请求与结果的传输形态、Adapter 边界�
 
 | 首次提出 | 记录 | 分类 | 生命周期 |
 | --- | --- | --- | --- |
+| 2026-09-20 | [AIHubMix 素材的声明面对齐端点 request.schema](./implemented/platform/2026-09-20-aihubmix-declared-face-follows-endpoint-schema.md) | platform | implemented |
 | 2026-09-20 | [APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"](./implemented/platform/2026-09-20-apimart-failure-narrowing.md) | platform | implemented |
 | 2026-09-20 | [渠道失败对客改写与平台侧失败清单](./implemented/platform/2026-09-20-consumer-facing-provider-error-rewrite.md) | platform | implemented |
 | 2026-09-20 | [对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra](./implemented/platform/2026-09-20-flat-request-body-and-asset-roles.md) | platform | implemented |

@@ -108,13 +108,14 @@ fn validate_aihubmix_publication(schema: &Value, restrictions: &Value) -> Result
     if properties.contains_key("n") {
         require_type(properties, "n", "integer")?;
     }
-    for name in [
-        "size",
-        "output_format",
-        "quality",
-        "background",
-        "moderation",
-    ] {
+    for name in ["size", "output_format", "quality"] {
+        if properties.contains_key(name) {
+            // 端点 schema 对这几项只声明类型（`size` / `output_format` 连枚举都没有），
+            // 所以枚举可有可无：声明了就必须是字符串枚举，没声明就按普通字符串发出去。
+            require_string_with_optional_enum(properties, name)?;
+        }
+    }
+    for name in ["background", "moderation"] {
         if properties.contains_key(name) {
             require_string_enum(properties, name)?;
         }
@@ -225,6 +226,26 @@ fn require_string_enum(properties: &Map<String, Value>, name: &str) -> Result<()
         Err(format!("native parameter {name} enum must contain strings"))
     } else {
         Ok(())
+    }
+}
+
+/// 字符串类型的参数：枚举可有可无（端点 schema 对 `size` / `output_format` 没给枚举）。
+fn require_string_with_optional_enum(
+    properties: &Map<String, Value>,
+    name: &str,
+) -> Result<(), String> {
+    let Some(field) = properties.get(name) else {
+        return Ok(());
+    };
+    if field.get("type").and_then(Value::as_str) != Some("string") {
+        return Err(format!("native parameter {name} must have type string"));
+    }
+    match field.get("enum").and_then(Value::as_array) {
+        None => Ok(()),
+        Some(values) if values.is_empty() || values.iter().any(|value| !value.is_string()) => {
+            Err(format!("native parameter {name} enum must contain strings"))
+        }
+        Some(_) => Ok(()),
     }
 }
 

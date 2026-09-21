@@ -1,7 +1,7 @@
 {
-  "_comment": "AIHubMix 供给 gpt-image-2.5-sunburst 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。参数面与费率取自上游公开口径与实测。",
+  "_comment": "AIHubMix 供给 gpt-image-2.5-sunburst 的运行时发布素材（新形状：offerings + price_plan）。纯运行时数据，不涉及代码改动。参数面按该模型 /v1 族端点的 request.schema 声明，费率取自上游公开口径与实测。",
   "_status": "草案 · 未发布。需「执行实现」授权后方可用于生产。",
-  "_evidence": "2.5 两款在 AIHubMix 的同步执行路径上实测与 gpt-image-2 同构（四分项 usage）。",
+  "_evidence": "2.5 两款在 AIHubMix 的同步执行路径上实测与 gpt-image-2 同构（四分项 usage）；参数面取自 out-reference/aihubmix/schema-gpt-image-2.5-sunburst.endpoints.json 的 /v1/images/generations 与 /v1/images/edits。",
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-sunburst",
   "native_revision": "2026-09-19-validated-1.0",
@@ -24,24 +24,16 @@
         "required": ["model", "prompt"],
         "properties": {
           "model": { "const": "gpt-image-2.5-sunburst" },
-          "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
-          "image": { "type": "string", "minLength": 1 },
-          "mask": { "type": "string", "minLength": 1 },
+          "prompt": { "type": "string" },
+          "image": { "type": "string" },
+          "mask": { "type": "string" },
           "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
-          "size": { "enum": ["auto", "1024x1024", "1536x1024", "1024x1536"] },
-          "output_format": { "enum": ["png", "jpeg"], "default": "png" },
-          "quality": { "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" },
-          "background": { "enum": ["auto", "opaque", "transparent"], "default": "auto" },
-          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100 },
-          "moderation": { "enum": ["auto", "low"], "default": "auto" },
-          "user": { "type": "string" }
+          "size": { "type": "string" },
+          "output_format": { "type": "string", "default": "png" },
+          "quality": { "type": "string", "enum": ["low", "medium", "high", "xhigh", "max", "auto"], "default": "auto" }
         },
         "allOf": [
-          { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
-          {
-            "if": { "properties": { "background": { "const": "transparent" } }, "required": ["background"] },
-            "then": { "properties": { "output_format": { "const": "png" } } }
-          }
+          { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
         ]
       },
       "price_plan": {
