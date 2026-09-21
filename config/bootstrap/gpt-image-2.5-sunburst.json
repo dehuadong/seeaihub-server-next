@@ -12,15 +12,16 @@
     "contract.output_compression": "厂商一手：generate 页（0–100，默认 100，仅 jpeg/webp 生效）。",
     "contract.background": "厂商一手：generate 页与 edit 页都写明 2.5 两款支持 opaque 与 transparent，`auto` 为默认；透明需 png/webp。",
     "contract.moderation": "厂商一手：generate 页（low/auto，默认 auto）。",
-    "contract.image_mask": "厂商一手：edit 页——参考图最多 16 张、`mask` 可选；该页当前的字段形状是 `images[]` 与 `mask` 对象（URL 或 file_id），对客契约沿用平台自己的字段名 `image`/`mask`（受理侧按这三个名字取图，再由承载面把图落到渠道字段名上）。",
+    "contract.image_mask": "厂商一手：edit 页——参考图是 `file` 或 `file[]`（最多 16 张）、`mask` 可选；该页当前的字段形状是 `images[]` 与 `mask` 对象（URL 或 file_id），对客契约沿用平台自己的字段名 `image`/`mask`（受理侧按这三个名字取图，再由承载面把图落到渠道字段名上）。**契约按厂商契约把 `image` 声明成字符串数组（≤16）、`mask` 声明成字符串，都不写 `format: binary`**：那是 multipart 的传输痕迹，不是参数语义——值是公网 URL 还是 data URL、到渠道那一步要不要变成文件部件，都属传输侧的事，由 Driver 按渠道要的形态处理。",
     "contract.mask_requires_image": "平台判断：遮罩只划定编辑范围，脱离参考图没有意义——与平台按名字角色装载图片的既有约定一致，因此写成声明而不是留给上游报错。",
-    "offering.aihubmix.carrier_schema": "渠道面：该模型 /v1 端点的 request.schema（out-reference/aihubmix/schema-gpt-image-2.5-sunburst.endpoints.json 的 /v1/images/generations 与 /v1/images/edits）——字段名、枚举、取值范围与 `format: binary` 都照抄；**没有 background/output_compression/moderation**（那三项属 /ai/v1 族的 `extra`，同步 /v1 端点收不了），所以这条供给承载不了它们。",
+    "offering.aihubmix.carrier_schema": "渠道面：该模型 /v1 端点的 request.schema（out-reference/aihubmix/schema-gpt-image-2.5-sunburst.endpoints.json 的 /v1/images/generations 与 /v1/images/edits）——字段名、枚举与取值范围照抄；参考图按**厂商契约**的 edit 面声明成 `file[]`（≤16），不照抄 `format: binary`（理由见 contract.image_mask）。**没有 background/output_compression/moderation**：那几项不在 /v1 端点的机器 Schema 快照里。用户 2026-09-20 更正指出，渠道自己的请求参数表（out-reference/aihubmix/gpt-image-2.md）把 background/output_compression/moderation/user/input_fidelity 都写了——**属文档比机器 Schema 宽**；本版仍按机器 Schema 声明这条供给的承载面，是否按文档补进来留待后续决定。",
+    "offering.aihubmix.image_inputs": "厂商契约 + 实测：edit 端点的 `image` 支持 `file[]`（最多 16 张）——对客契约里的 `image` 是同一个角色，承载面因此按字符串数组声明（≤16）。**多张参考图已实测成立**：旧仓库（seeaihub）的探针脚本 tests/image-generation/aihubmix_gpt_image_2_edit_probe.py 用 `POST /v1/images/edits` 发两张参考图成功（依据是多图融合示例）；**线上字段名是重复的 `image[]`，重复单值 `image` 会 400**——渠道机器 Schema 里那个单值 `image: string` 只是 schema 的简化（JSON Schema 表达不了 multipart 的重复字段），不是上限。**编码由 Driver 按张数承担**（一张发 `image`、多张发 `image[]`），不写进合同与承载面。16 是厂商契约的上限，未逐一压测，不为此花钱。`restrictions.max_images` 必须与承载面形态一致（数组 `maxItems` 16），否则发布期会以「限制超出承载面承诺」拒掉。",
     "offering.aihubmix.size": "渠道面：端点 schema 的 `size` 就是 `auto` 或 `宽x高`（像素型），与合同同型——因此不需要换算，也不声明尺寸档案，`parameter_mapping` 为空。",
     "offering.apimart.carrier_schema": "渠道面：APIMart 的 2.5 生成文档快照（out-reference/apimart/gpt-image-2.5-generation.cn.md）——字段与取值范围按该文档声明，文档里没出现的字段一律不声明。",
     "offering.apimart.size": "渠道面：该文档明写 `size` 收精确像素（如 `1600x1200`），且给精确像素时 `resolution` 被忽略；承载面因此只声明与合同同型的 `auto`|`宽x高`。渠道另有 15 个比例名与 `1k/2k/4k` 档位：比例名合同产不出、`resolution` 无法从合同到达（承载面字段必须从合同可达，否则发布被拒），两者都不声明。",
     "offering.apimart.rename": "渠道面：参考图字段是 `image_urls`（字符串数组，≤16）、遮罩是 `mask_url`，合同字段叫 `image`/`mask`，因此用 `rename` 落到渠道字段名上（受控实测见 out-reference/apimart/controlled-probe-2026-09-19.json）。",
     "offering.apimart.moderation": "渠道面：文档写明未传 `moderation` 时 APIMart 自己用 `low`，与厂商默认 `auto` 不同；本版没有注入显式默认值，调用方没给时仍由渠道按自己的默认处理（差异已登记，是否由映射钉死待定）。",
-    "restrictions": "沿用同一型号旧素材的声明（可走的分支与收图上限），未改动。",
+    "restrictions": "可走的分支沿用同一型号旧素材的声明。收图上限按承载面形态定：参考图声明成数组（`maxItems` 16），所以 `max_images` 是 16；两者必须一致，见 offering.aihubmix.image_inputs。",
     "price_plan": "沿用同一型号旧素材的费率：两家都是四档 token 单价（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens），来源 URL 见各自的 price_plan。"
   },
   "vendor_id": "OpenAI",
@@ -51,8 +52,13 @@
       "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
       "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
       "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" },
-      "image": { "type": "string", "format": "binary" },
-      "mask": { "type": "string", "format": "binary" }
+      "image": {
+        "type": "array",
+        "items": { "type": "string" },
+        "minItems": 1,
+        "maxItems": 16
+      },
+      "mask": { "type": "string" }
     },
     "allOf": [
       { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
@@ -67,7 +73,7 @@
       "credential_env": "AIHUBMIX_API_KEY",
       "restrictions": {
         "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-        "max_images": 1
+        "max_images": 16
       },
       "carrier_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -77,8 +83,13 @@
         "properties": {
           "model": { "const": "gpt-image-2.5-sunburst" },
           "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
-          "image": { "type": "string", "format": "binary" },
-          "mask": { "type": "string", "format": "binary" },
+          "image": {
+            "type": "array",
+            "items": { "type": "string" },
+            "minItems": 1,
+            "maxItems": 16
+          },
+          "mask": { "type": "string" },
           "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
           "size": {
             "type": "string",

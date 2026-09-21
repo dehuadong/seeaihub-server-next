@@ -4238,10 +4238,11 @@ async fn chosen_provider_kind(pool: &PgPool, offering_id: Uuid) -> String {
 ///
 /// 三条请求各钉一件事：
 /// - 只带 `prompt`：首选的 AIHubMix 承载得了，请求就该落在它身上；
-/// - 带 `background`：AIHubMix 的同步 /v1 面收不了这个字段 → 该候选**不合格**（判定记录写明原因）、
-///   改道 APIMart，且这个字段要原样出现在发给 APIMart 的报文里；
+/// - 带 `background`：AIHubMix 的承载面没声明这个字段（它的字段面按 /v1 端点的机器 Schema 声明，
+///   而渠道文档比机器 Schema 宽）→ 该候选**不合格**（判定记录写明原因）、改道 APIMart，且这个字段
+///   要原样出现在发给 APIMart 的报文里；
 /// - 带参考图：合同字段叫 `image`，APIMart 线上叫 `image_urls`，靠改名落到渠道字段名上
-///   （报文里不许出现 `image`）。
+///   （报文里不许出现 `image`），内联图先经上传接口换成公网 URL。
 ///
 /// 两家渠道各起一个进程内假上游：线上形状不同（一家同步回图、一家任务式），所以"报文里到底是
 /// 哪个字段名"只能按真正收到请求的那一方来判。全程零外部调用。
@@ -4358,15 +4359,25 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             carriers[0], carriers[1],
             "两条供给各带自己的承载面，不是共用一份"
         );
-        // 这个用例的差集就在这里：AIHubMix 的同步 /v1 面收不了 `background`，APIMart 收得了。
+        // 这个用例的差集就在这里：AIHubMix 的承载面没声明 `background`（它的字段面按 /v1 端点的
+        // 机器 Schema 声明），APIMart 声明了。**承载面没声明不等于渠道收不了**：渠道文档的请求
+        // 参数表把 background 写上了，只是这一版没按文档把它补进承载面。
         assert!(
             carriers[0]["properties"].get("background").is_none(),
-            "AIHubMix 的 /v1 面没有 background"
+            "AIHubMix 的承载面没声明 background"
         );
         assert!(
             carriers[1]["properties"].get("background").is_some(),
-            "APIMart 收得了 background"
+            "APIMart 声明了 background"
         );
+        // 参考图两边都声明成数组：AIHubMix 按厂商契约的 edit 面（`file[]`，≤16），APIMart 按
+        // 自己的文档（`image_urls`，≤16）——收图上限与这个形态是同一件事，写歪了发布期就拒。
+        assert_eq!(
+            carriers[0]["properties"]["image"]["type"], "array",
+            "AIHubMix 的参考图是数组形态"
+        );
+        assert_eq!(carriers[0]["properties"]["image"]["maxItems"], 16);
+        assert_eq!(carriers[1]["properties"]["image_urls"]["maxItems"], 16);
         // 承载面的每个字段名都要能从合同到达：合同直接声明，或被改名接过去（供给不能凭空多出参数）。
         for (index, row) in rows.iter().enumerate() {
             let carrier: Value = row.try_get("carrier_schema").expect("carrier");
@@ -4495,9 +4506,9 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         &json!({
             "model": "gpt-image-2.5-sunburst",
             "prompt": "保留商品主体，把背景换成米白色摄影棚",
-            // `background` 在这里只是把请求逼到 APIMart：AIHubMix 收不了它。
+            // `background` 在这里只是把请求逼到 APIMart：AIHubMix 的承载面没声明它。
             "background": "opaque",
-            "image": png_data_url()
+            "image": [png_data_url()]
         }),
     )
     .await;

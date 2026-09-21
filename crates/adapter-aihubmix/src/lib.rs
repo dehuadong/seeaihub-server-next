@@ -51,7 +51,7 @@ impl AdapterFactory for AihubmixAdapterFactory {
                 ImageBranch::ImageConditioned,
                 ImageBranch::Masked,
             ],
-            max_images: 1,
+            max_images: 16,
         })
     }
 
@@ -107,10 +107,13 @@ fn validate_aihubmix_publication(
     }
     require_const_string(properties, "model")?;
     require_type(properties, "prompt", "string")?;
-    for name in ["image", "mask"] {
-        if properties.contains_key(name) {
-            require_type(properties, name, "string")?;
-        }
+    // 参考图两种收法都表示得出来：单值（一次一张）与字符串数组（同一个部件名重复出现，
+    // 就是 multipart 里的列表形态）。遮罩是一块编辑范围，没有数组形态。
+    if properties.contains_key("image") {
+        require_string_or_string_array(properties, "image")?;
+    }
+    if properties.contains_key("mask") {
+        require_type(properties, "mask", "string")?;
     }
     if properties.contains_key("n") {
         require_type(properties, "n", "integer")?;
@@ -154,7 +157,17 @@ fn validate_aihubmix_publication(
         });
     // 最小请求用的图片取值就是调用方能给的形态：内联 data URL 或公网 URL。
     // 平台不再有"资产引用"这种值，承载面也不该按它校验。
+    // 取值要跟着**这份承载面自己声明的形态**走：声明成数组就给只装一张的数组，否则最小请求本身
+    // 就被这份 schema 判成非法，拒它的理由（"连最小请求都过不了"）是假的。
     let image = "https://example.invalid/reference.png";
+    let reference = match properties
+        .get("image")
+        .and_then(|field| field.get("type"))
+        .and_then(Value::as_str)
+    {
+        Some("array") => serde_json::json!([image]),
+        _ => serde_json::json!(image),
+    };
     let mask = "data:image/png;base64,AAAA";
     let cases = [
         (
@@ -163,11 +176,11 @@ fn validate_aihubmix_publication(
         ),
         (
             "image_conditioned",
-            serde_json::json!({"model": model, "prompt": "x", "image": image}),
+            serde_json::json!({"model": model, "prompt": "x", "image": reference}),
         ),
         (
             "masked",
-            serde_json::json!({"model": model, "prompt": "x", "image": image, "mask": mask}),
+            serde_json::json!({"model": model, "prompt": "x", "image": reference, "mask": mask}),
         ),
     ];
     for (branch, instance) in cases {
@@ -220,6 +233,35 @@ fn require_const_string(properties: &Map<String, Value>, name: &str) -> Result<(
         Err(format!(
             "native parameter {name} must declare a string const"
         ))
+    }
+}
+
+/// 参考图参数：单值字符串、或字符串数组（同一个部件名重复出现，就是 multipart 里的列表形态）。
+///
+/// 两种都表示得出来，所以两种都算声明得成形状；声明成别的（数字、对象、数组里不是字符串）就是
+/// 这条供给说了本 Driver 发不出去的形态，发布期直接拒绝。
+fn require_string_or_string_array(
+    properties: &Map<String, Value>,
+    name: &str,
+) -> Result<(), String> {
+    let field = properties.get(name).expect("caller checked the field");
+    match field.get("type").and_then(Value::as_str) {
+        Some("string") => Ok(()),
+        Some("array") => {
+            let items = field
+                .get("items")
+                .ok_or_else(|| format!("native parameter {name} array must declare items"))?;
+            if items.get("type").and_then(Value::as_str) == Some("string") {
+                Ok(())
+            } else {
+                Err(format!(
+                    "native parameter {name} array items must be strings"
+                ))
+            }
+        }
+        _ => Err(format!(
+            "native parameter {name} must be a string or an array of strings"
+        )),
     }
 }
 
@@ -326,9 +368,8 @@ impl AihubmixImageAdapter {
         &self,
         request: &PreparedImageRequest,
     ) -> Result<multipart::Form, AdapterError> {
-        let inputs = single_image_inputs(request)?;
+        let inputs = reference_inputs(request)?;
         let reference_part = image_part_name(request, ImageParameterKind::Reference)?;
-        let image = self.image_bytes(&inputs.reference_images[0]).await?;
         let mut form = multipart::Form::new()
             .text("model", request.provider_model_id.clone())
             .text(
@@ -340,7 +381,19 @@ impl AihubmixImageAdapter {
             // 见 [`multipart_text`] 里为什么不做"序列化成 JSON 文本"这种替代形态。
             form = form.text(name.clone(), multipart_text(name, value)?);
         }
-        form = form.part(reference_part.to_owned(), image_part(image)?);
+        // 参考图逐张发，**部件名随张数变**：一张就是名单里那个名字（`image`），多张时用重复的
+        // `image[]`——multipart 的重复字段才是这条渠道认的列表形态（实测：重复 `image` 会 400）。
+        // 这是**传输细节**：合同与承载面只声明"这条供给能承载最多 16 张参考图"，怎么编码由这里
+        // 承担，也不进 descriptor 的能力名单。收几张由发布物与选路定，这里不另设自己的上限。
+        let reference_part = if inputs.reference_images.len() > 1 {
+            format!("{reference_part}[]")
+        } else {
+            reference_part.to_owned()
+        };
+        for value in &inputs.reference_images {
+            let image = self.image_bytes(value).await?;
+            form = form.part(reference_part.clone(), image_part(image)?);
+        }
         if let Some(mask) = &inputs.mask {
             let mask_part = image_part_name(request, ImageParameterKind::Mask)?;
             let mask = self.image_bytes(mask).await?;
@@ -415,18 +468,18 @@ fn decode_inline_image(value: &str) -> Result<DecodedImage, AdapterError> {
     Ok(decoded)
 }
 
-/// 这个 Driver 的编辑端点只吃一张参考图（外加一张遮罩）：多给的直接拒绝，不静默丢掉。
-fn single_image_inputs(request: &PreparedImageRequest) -> Result<ImageInputs, AdapterError> {
+/// 这个 Driver 的编辑端点要**至少**一张参考图（外加至多一张遮罩）：一张都不给就直接拒绝，不静默
+/// 发一个没有图的编辑请求。
+///
+/// 多张**不在这里拦**：这条面按"最多 16 张"发布（`restrictions.max_images`），收几张是发布物与
+/// 选路的事；这里再拦一道，等于让声明的能力与实现互相矛盾——而且被拦下的请求是平台侧故障，
+/// 调用方完全无从判断。
+fn reference_inputs(request: &PreparedImageRequest) -> Result<ImageInputs, AdapterError> {
     let inputs = image_inputs(&request.native_parameters, &request.platform_parameters)
         .map_err(AdapterError::UnsupportedInput)?;
     if inputs.reference_images.is_empty() {
         return Err(AdapterError::UnsupportedInput(
             "the edit endpoint needs one reference image".to_owned(),
-        ));
-    }
-    if inputs.reference_images.len() > 1 {
-        return Err(AdapterError::UnsupportedInput(
-            "the metered /v1 edit endpoint is published for one image only".to_owned(),
         ));
     }
     Ok(inputs)
@@ -908,6 +961,15 @@ mod tests {
             .expect("bootstrap contract should be executable");
     }
 
+    /// Driver 的收图上限与素材声明同源：16 张参考图（发布期用它卡素材，两边对不上就发不出去）。
+    #[test]
+    fn the_descriptor_allows_the_sixteen_reference_images_the_materials_declare() {
+        let descriptor = AihubmixAdapterFactory
+            .descriptor(ADAPTER_KEY)
+            .expect("the adapter describes itself");
+        assert_eq!(descriptor.max_images, 16);
+    }
+
     #[test]
     fn rejects_schema_with_wrong_prompt_type() {
         let mut config = published_config();
@@ -922,6 +984,39 @@ mod tests {
             )
             .expect_err("wrong prompt type must be rejected");
         assert!(error.contains("prompt"));
+    }
+
+    /// 参考图声明成**字符串数组**也算声明得成形状（同名部件重复出现就是 multipart 里的列表形态）；
+    /// 数组里不是字符串则拒绝——那种形态本 Driver 发不出去。
+    #[test]
+    fn a_reference_image_declared_as_a_string_array_is_executable() {
+        let mut config = published_config();
+        config["offerings"][0]["capability_schema"]["properties"]["image"] = serde_json::json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 16
+        });
+        let offering = published_offering(&config).clone();
+        AihubmixAdapterFactory
+            .validate_publication(
+                ADAPTER_KEY,
+                &offering["capability_schema"],
+                &offering["restrictions"],
+            )
+            .expect("a string array reference image is executable");
+
+        config["offerings"][0]["capability_schema"]["properties"]["image"]["items"]["type"] =
+            Value::String("integer".to_owned());
+        let offering = published_offering(&config).clone();
+        let error = AihubmixAdapterFactory
+            .validate_publication(
+                ADAPTER_KEY,
+                &offering["capability_schema"],
+                &offering["restrictions"],
+            )
+            .expect_err("array items that are not strings must be rejected");
+        assert!(error.contains("image"), "{error}");
     }
 
     #[test]
@@ -1080,15 +1175,18 @@ mod tests {
         );
     }
 
+    /// 编辑端点收几张参考图由发布物与选路定，Driver 只保证"至少一张"：一张都不给就直接拒绝，
+    /// 多张照收——声明的能力与实现必须是同一件事。
     #[test]
-    fn rejects_multiple_images_on_metered_edit_contract() {
+    fn the_edit_endpoint_takes_every_reference_image_it_is_given() {
         let mut value = request(ImageBranch::ImageConditioned);
         value.native_parameters = serde_json::json!({
             "prompt": "test",
             "image": ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
         });
-        let error = single_image_inputs(&value).expect_err("multi-image edit must be rejected");
-        assert!(error.to_string().contains("one image only"));
+        let inputs =
+            reference_inputs(&value).expect("this surface is published for several images");
+        assert_eq!(inputs.reference_images.len(), 2);
         // 一张参考图可以被接受；遮罩一并带出来。
         let mut masked = request(ImageBranch::Masked);
         masked.native_parameters = serde_json::json!({
@@ -1096,11 +1194,46 @@ mod tests {
             "image": "data:image/png;base64,AAAA",
             "mask": "data:image/png;base64,BBBB"
         });
-        let inputs = single_image_inputs(&masked).expect("one reference image plus a mask");
+        let inputs = reference_inputs(&masked).expect("one reference image plus a mask");
         assert_eq!(inputs.reference_images.len(), 1);
         assert!(inputs.mask.is_some());
         // 没有参考图：编辑端点没有可编辑的图，直接拒绝。
-        assert!(single_image_inputs(&request(ImageBranch::ImageConditioned)).is_err());
+        assert!(reference_inputs(&request(ImageBranch::ImageConditioned)).is_err());
+    }
+
+    /// 多张参考图在线上是**重复的 `image[]` 部件**：不是只发第一张，也不是重复单值 `image`
+    /// （实测后者会 400）。一张时仍是单值 `image`。
+    #[tokio::test]
+    async fn several_reference_images_become_repeated_list_parts() {
+        let mut two = request(ImageBranch::ImageConditioned);
+        two.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
+        });
+        let rendered = multipart_body(&two)
+            .await
+            .expect("two reference images are expressible");
+        assert_eq!(
+            rendered.matches("name=\"image[]\"").count(),
+            2,
+            "两张参考图就是两个 `image[]` 部件：{rendered}"
+        );
+        assert!(
+            !rendered.contains("name=\"image\""),
+            "多张时不许退回单值 `image`（渠道会 400）：{rendered}"
+        );
+
+        // 一张时仍是单值 `image`：列表形态只属于多张。
+        let mut one = request(ImageBranch::ImageConditioned);
+        one.native_parameters = serde_json::json!({
+            "prompt": "test",
+            "image": ["data:image/png;base64,AAAA"]
+        });
+        let rendered = multipart_body(&one)
+            .await
+            .expect("one reference image is expressible");
+        assert!(rendered.contains("name=\"image\""), "{rendered}");
+        assert!(!rendered.contains("image[]"), "{rendered}");
     }
 
     #[test]

@@ -15,7 +15,7 @@
       "credential_env": "AIHUBMIX_API_KEY",
       "restrictions": {
         "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-        "max_images": 1
+        "max_images": 16
       },
       "capability_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -25,8 +25,8 @@
         "properties": {
           "model": { "const": "gpt-image-2.5-sunburst" },
           "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
-          "image": { "type": "string", "format": "binary" },
-          "mask": { "type": "string", "format": "binary" },
+          "image": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 16 },
+          "mask": { "type": "string" },
           "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
           "size": { "type": "string", "anyOf": [{ "const": "auto" }, { "pattern": "^[0-9]+x[0-9]+$" }] },
           "output_format": { "type": "string", "enum": ["png", "jpeg", "webp"], "default": "png" },
