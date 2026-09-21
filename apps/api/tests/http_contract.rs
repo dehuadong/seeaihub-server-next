@@ -365,6 +365,14 @@ fn body_contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
             .any(|window| window == needle)
 }
 
+/// 表单字节里某个**完整部件名**出现的次数。
+///
+/// 名字连引号一起比：`name="image"` 要求 `image` 后面紧跟着引号，所以列表形态的
+/// `name="image[]"` 不会被算成单值 `image`——这正是"多张时不许退回单值"要判的事。
+fn part_name_count(rendered: &str, name: &str) -> usize {
+    rendered.matches(&format!("name=\"{name}\"")).count()
+}
+
 /// 定位 `seeai-worker` 二进制，**并保证它是当前源码构建的**。
 ///
 /// 它是**独立包**，因此有两件事需要注意：
@@ -1180,6 +1188,95 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     assert_public_only("只有遮罩", &body);
 
     let _ = client;
+    harness.cleanup().await;
+}
+
+/// AIHubMix 的参考图按**张数**换线上部件名：多张是重复的 `image[]`，单张才是单值 `image`。
+///
+/// 为什么要有这条端到端：这条规则在 Driver 单测里已经钉住，但真正要保证的是**发布出去的那份
+/// 声明面**——参考图按厂商契约声明成字符串数组（≤16）——能一路走到线上：受理时两张都留得下、
+/// 选路时这条候选表达得了、装图时两张都落到它声明的名字上、最后按张数编码。上面任何一处只留下
+/// 第一张，对客响应照样是 200，只有看发给上游的报文才暴露出来。
+///
+/// 两张都用内联 data URL：图片字节就地解码，这条链路不必让假上游提供图片文件。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
+    let harness =
+        Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
+
+    // 1) 两张参考图：线上是两个 `image[]` 部件，不出现单值 `image`，也没有遮罩部件。
+    let key = format!("sync-two-refs-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "edit with two reference images");
+    request["image"] = json!([png_data_url(), png_data_url()]);
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request)
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("两张参考图", &body);
+    // 带图的请求走的是编辑端点：这条渠道的参考图只在 /v1/images/edits 上收。
+    assert_eq!(harness.count("POST", "/v1/images/edits"), 1);
+    assert_eq!(harness.count("POST", "/v1/images/generations"), 0);
+
+    let edits = harness.submit_bytes("/v1/images/edits");
+    let rendered = String::from_utf8_lossy(&edits);
+    assert_eq!(
+        part_name_count(&rendered, "image[]"),
+        2,
+        "两张参考图就是两个 `image[]` 部件：{rendered}"
+    );
+    assert_eq!(
+        part_name_count(&rendered, "image"),
+        0,
+        "多张时不许退回单值 `image`（渠道会 400）：{rendered}"
+    );
+    assert_eq!(
+        part_name_count(&rendered, "mask"),
+        0,
+        "这次请求没有遮罩，线上就不该有 `mask` 部件：{rendered}"
+    );
+    assert!(
+        body_contains_bytes(&edits, PNG_FIXTURE),
+        "参考图的字节必须原样进文件部件"
+    );
+
+    // 两张都留在了这次请求的参数面里，且都落在候选声明的名字上：不是只留下第一张。
+    let stored: Value = sqlx::query_scalar(
+        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("native parameters");
+    assert_eq!(
+        stored["image"].as_array().map(Vec::len),
+        Some(2),
+        "两张参考图都要留在内部参数里，got {stored}"
+    );
+
+    // 2) 一张参考图：同一份声明面下仍是单值 `image`——列表形态只属于多张。
+    let key = format!("sync-one-ref-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "edit with one reference image");
+    request["image"] = json!([png_data_url()]);
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request)
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("一张参考图", &body);
+    let edits = harness.submit_bytes("/v1/images/edits");
+    let rendered = String::from_utf8_lossy(&edits);
+    assert_eq!(
+        part_name_count(&rendered, "image"),
+        1,
+        "一张参考图就是单值 `image`：{rendered}"
+    );
+    assert_eq!(
+        part_name_count(&rendered, "image[]"),
+        0,
+        "单张不许用列表形态：{rendered}"
+    );
+
+    assert_job_succeeded(&harness, &key).await;
     harness.cleanup().await;
 }
 
