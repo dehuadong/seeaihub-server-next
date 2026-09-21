@@ -108,4 +108,35 @@
 | 结果 | 两次均 HTTP 200；结论见 §2.6/§2.7（**按用户要求未留样本文件**） |
 | 计费 | 2 次，自算各约 $0.00595，合计约 **$0.012** |
 
-**累计（截至 2026-09-20）**：AIHubMix 6 次 + APIMart 3 次 = **9 次计费提交**，可核对金额 ≈ **$0.0514**（另 1 次 AIHubMix 异步金额未知）。
+## 8. 多图 / 透明背景 / `mask_url` 实测（2026-09-20，经用户授权）
+
+### 8.1 AIHubMix：两张参考图 + `background=transparent`
+
+| 项 | 值 |
+| --- | --- |
+| 授权 | 用户 2026-09-20 指示「AIHubMix 授权你现在实测下 background 生成一张透明图，并保存本地我看下；同时使用 image 之前脚本提供的两张参考图」 |
+| 渠道 / 端点 | AIHubMix `POST https://api.inferera.com/v1/images/edits`（multipart） |
+| 计费调用次数 | **1 次** |
+| 请求参数 | `model=gpt-image-2.5-flare`、**两张参考图用重复的 `image[]` 部件**（旧仓库探针的两张 PNG）、`background=transparent`、`output_format=png`、`n=1`、`size=1024x1024`、`quality=low` |
+| 结果 | **HTTP 200**；响应顶层 `background: "transparent"`；返回 **RGBA PNG（color type 6）1,495,027 bytes** |
+| 计量 | `input_tokens=2589`（`image_tokens=2545`、`text_tokens=44`）、`output_tokens=196`、`total=2785` |
+| 计费 | 上游不返回金额，按四档费率自算 ≈ **$0.0265**（44×$5 + 2545×$8 + 196×$30 / 1M） |
+| 结清 | ① 该渠道**接受并落实 `background=transparent`**（响应回显 + RGBA 输出）；② **多张参考图经 `image[]` 可用**（重复单值 `image` 会 400） |
+| 未做 | 未逐像素核透明区域；16 张未压测（两张已够，不为上限花钱） |
+| 样本 | 本机 `.data/probe-2026-09-20/two-refs-transparent.png`（gitignore，**不入库**）；渠道事实见 §2.14 |
+
+### 8.2 APIMart：2.5 是否接受 `mask_url`（带/不带对照）
+
+| 项 | 值 |
+| --- | --- |
+| 授权 | 用户 2026-09-20 指出「`mask_url` 参数只有 `gpt-image-2` 模型有，`gpt-image-2.5-flare` 没有看到，所以你实测下看看」；对随后追加的对照调用回「可以」 |
+| 渠道 / 端点 | APIMart `POST /v1/uploads/images`（上传参考图与遮罩换公网 URL）+ `POST /v1/images/generations` + `GET /v1/tasks/{id}`（轮询，只读） |
+| 计费调用次数 | **2 次生成**（同一请求**带** / **不带** `mask_url`） |
+| 请求参数 | `model=gpt-image-2.5-flare`、`image_urls=[<上传后的 URL>]`（带遮罩那次另加 `mask_url=<上传后的 URL>`）、`n=1`、`size=1:1`、`resolution=1k`、`quality=low` |
+| 结果 | 两次都提交 **HTTP 200**（`status: submitted`）→ 轮询到 **`completed`** |
+| 计量与成本 | 两次**完全相同**：`input_tokens=1048`（`image_tokens=1024`、`text_tokens=24`）、`output_tokens=196`、`total=1244`；上游自报 **`cost = 0.011354 USD`**（两次同值）。交叉核对：按公开费率算 14192 microusd × 面板 `Group ratio 0.8` = **11354**，与上游 `cost` 逐位一致 |
+| 结清 | ① **2.5 接受 `mask_url`**（该字段不在 2.5 文档里，属"文档没写≠不支持"）；② **遮罩不额外计费**（两次 `usage` 与 `cost` 相同） |
+| **未证** | 遮罩是否**真的生效**只有弱信号：每 8 像素采样对比两张结果图，**遮罩椭圆内差异 21%、全图 79.9%**——方向与"透明区＝编辑区"的语义一致，但生成是随机的（无 seed），**不能据此断言遮罩生效** |
+| 样本 | 本机 `.data/probe-2026-09-20/apimart-25-mask-result.png`、`apimart-25-nomask-result.png`（gitignore，**不入库**）；渠道事实见 §3.11 |
+
+**累计（截至 2026-09-20）**：AIHubMix **7 次** + APIMart **5 次** = **12 次计费提交**，可核对金额 ≈ **$0.1006**（AIHubMix 5 次自算 + 1 次金额未知的异步调用；APIMart 5 次均有上游自报 `cost`）。本文 §8 两次 AIHubMix/APIMart 调用的样本都在本机 `.data/`（gitignore），未入库。
