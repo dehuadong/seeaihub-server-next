@@ -56,6 +56,8 @@
 | POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；每个候选可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
 | GET | `/api/v1/gateway-models` | `list_gateway_models` | 管理员（网关模型清单：对客名、运维开关、候选与承载面、**每个候选的定价**与修订级加价系数；**不回显渠道凭证**。对客名由管理员发布时自己填，平台不预设任何名字） |
 | PATCH | `/api/v1/gateway-models/{gateway_model}` | `set_gateway_model_enabled` | 管理员（**只改启用开关**；没发布过的名字是 404，定义只能由发布产生） |
+| GET | `/api/v1/route-policies` | `list_route_policies` | 管理员（路由策略清单：全局那条与各网关模型的覆盖；策略是**运行期配置**，不进不可变修订） |
+| PUT | `/api/v1/route-policies` | `upsert_route_policy` | 管理员（写入或覆盖一条策略：`gateway_model` 不传即全局；`strategy` 只接受**本层已实现**的取值（`priority_failover` / `weighted_random`），其余返回 400——落成默认会把"配置没生效"伪装成生效。每次写入换版本标识） |
 | PUT | `/api/v1/fx-rates` | `upsert_fx_rate` | 管理员（按币种录入**折算率**（渠道币种 → CNY，定点整数，分母 1e6）与生效时间，写审计；同一币种同一生效时刻只有一行，重录即改那一行。**汇率不进不可变修订**：同一时刻同一币种全平台必须是同一个数才对账得起来） |
 | GET | `/api/v1/reconciliation-cases` | `list_reconciliation_cases` | 管理员（含上游对账标识） |
 | POST | `/api/v1/reconciliation-cases/{job_id}/refund` | `refund_reconciliation` | 管理员（幂等退款） |
@@ -132,6 +134,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `pricing.price_plans` | ⑤ 渠道**成本费率**（四档 token 单价，币种按该渠道声明）：定价时的参考口径与毛利核算用，**不再是对客结算基数** | `RuntimeService::publish` |
 | `pricing.fx_rates` | ⑤ **折算率**（按币种的"渠道币种 → CNY"定点比值 + 生效时间）：受理时取"受理时刻生效的那一行"并快照。**外部事实，由管理员录入**，不进不可变修订 | `PricingService::upsert_fx_rate`（`PUT /api/v1/fx-rates`） |
 | `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给、优先级与**档内权重**（`routing_priority` 是档位，同档允许多条候选，档内按 `weight` 分摊）；修订上另记这次发布定义的是哪个**网关模型**（对客名）与它指向哪一行厂商模型合同，以及**定价**（修订级 `markup_bps` + **按候选键**的参考成本、成本币种、对客四档 CNY 费率向量、成本来源、档位价目表、保底表）；旧修订的定价列留 NULL ⇒ 受理与结算走旧口径 | `RuntimeService::publish` |
+| `routing.route_policies` | **路由策略**：在已发布的合格候选里"挑哪一条"的运行期配置（全局一条 + 按网关模型覆盖）。**运营配置，不进不可变修订**；改它即刻影响之后的受理，已受理 Job 不受影响 | `RoutePolicyService::upsert`（`PUT /api/v1/route-policies`）、受理时取生效那条 |
 | `publication.gateway_models` | 网关模型的**运维开关**：这个名字现在开着吗、谁在什么时候改的。**定义不在这里**（候选集、合同、定价只在不可变修订里） | `RuntimeService::publish`（首次发布落行）、`set_gateway_model_enabled` |
 | `generation.jobs` | 受理时的请求事实、所选供给、**冻结的定价快照**（对客费率向量、保底额与来源、命中的候选、折算率）、结果信封（渠道给的 `url` 或 `b64_json`）、对客错误码与平台侧失败类别；**对客不可见** | `GenerationService::create`、`complete_job`、`fail_job`、`recover_expired_leases` |
 | `generation.routing_decisions` | 受理时为什么选了它（候选、档位、**权重**、是否合格、本次**分流落点**） | 与 Job 同事务写入 |
@@ -157,7 +160,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
-| `migrations/0001_initial.sql`…`0010_routing_weight_and_decisions.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选） | 运行时的业务规则 |
+| `migrations/0001_initial.sql`…`0010_routing_weight_and_decisions.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选）、**路由策略表 `routing.route_policies`**（`0011`：作用域唯一，策略类型只放本层已实现的取值） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
 | `scripts/decisions/*.mjs` | Agent Notes 的目录、元数据与文件格式检查（不生成索引），自述与本地修补见该目录 `README.md` | 不影响服务运行 |
 | `docs/AGENTS.md`、`docs/agents/git.md` | 正文与代码注释的写作规则与 slop 清单；提交、推送与历史改写约定 | 工件位置与归属归 `docs/agents/artifacts.md`；Agent Note 的文件骨架归 `.agents/notes/README.md` |

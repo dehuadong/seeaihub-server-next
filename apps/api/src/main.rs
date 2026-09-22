@@ -15,11 +15,12 @@ use seeai_application::{
     CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationService,
     HubRepository, IdentityService, JobView, MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService,
     ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RuntimeService,
+    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RoutePolicyService,
+    RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
-    AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel,
+    AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel, RoutePolicy, RouteStrategy,
     contract_image_parameter_kind, replace_contract_model_identity,
 };
 use seeai_persistence::PgHubRepository;
@@ -41,6 +42,8 @@ struct AppState {
     pricing: PricingService,
     /// 账户面的管理员用例：建账户与充值——两件事都要在提交成功后把余额写进缓存。
     accounts: AccountsService,
+    /// 路由策略的管理员面：读清单与写入（运行期配置，不进不可变修订）。
+    route_policies: RoutePolicyService,
     generations: GenerationService,
     /// 同步入口等任务跑完的最长时间。
     sync_wait: Duration,
@@ -93,6 +96,7 @@ async fn main() -> Result<()> {
         pricing: PricingService::new(repository_port.clone()),
         accounts: AccountsService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
+        route_policies: RoutePolicyService::new(repository_port.clone()),
         sync_wait: generation_sync_wait()?,
         generations: GenerationService::new(
             repository_port,
@@ -118,6 +122,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/gateway-models/{gateway_model}",
             patch(set_gateway_model_enabled),
+        )
+        .route(
+            "/api/v1/route-policies",
+            get(list_route_policies).put(upsert_route_policy),
         )
         .route(
             "/api/v1/reconciliation-cases",
@@ -228,6 +236,56 @@ async fn read_account_balance(
         balance_microusd: change.balance_microusd,
         updated_at: change.updated_at,
     }))
+}
+
+fn route_policy_view(policy: &RoutePolicy) -> Value {
+    json!({
+        "gateway_model": policy.gateway_model,
+        "strategy": policy.strategy.as_str(),
+        "version": policy.version,
+    })
+}
+
+#[derive(Debug, Deserialize)]
+struct UpsertRoutePolicyBody {
+    /// 作用域：不传或给 `null` 就是全局那条。
+    #[serde(default)]
+    gateway_model: Option<String>,
+    strategy: String,
+}
+
+/// 管理员看策略清单：全局那条（若有）与各网关模型的覆盖。
+async fn list_route_policies(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let policies = state.route_policies.list().await?;
+    let views: Vec<Value> = policies.iter().map(route_policy_view).collect();
+    Ok(Json(json!({"route_policies": views})))
+}
+
+/// 写入（或覆盖）一条路由策略。
+///
+/// `strategy` 只接受本层**已经实现**的取值：写进一个实现不了的策略，会让"配置没生效"伪装成
+/// "配置生效了"，而选路正是靠它决定走哪家——所以这里直接拒绝，不悄悄落成默认。
+async fn upsert_route_policy(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpsertRoutePolicyBody>,
+) -> Result<Json<Value>, ApiError> {
+    require_admin(&state, &headers)?;
+    let strategy = RouteStrategy::parse(&body.strategy).ok_or_else(|| {
+        ApplicationError::InvalidParameter(format!(
+            "unknown route strategy {}; supported: priority_failover, weighted_random",
+            body.strategy
+        ))
+    })?;
+    let policy = state
+        .route_policies
+        .upsert(body.gateway_model.as_deref(), strategy, "admin-api")
+        .await?;
+    Ok(Json(json!({"route_policy": route_policy_view(&policy)})))
 }
 
 #[derive(Debug, Deserialize)]

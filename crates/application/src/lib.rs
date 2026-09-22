@@ -9,14 +9,14 @@ use seeai_domain::{
     AccountId, AttemptId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FloorTable, FxRate,
     GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, MeteringEvidence,
     OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, ProviderCostFact,
-    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RuntimeRevisionId,
-    apply_enum_maps, apply_parameter_defaults, apply_parameter_renames, apply_size_mapping,
-    carries_parameter, contract_image_parameter_kind, contract_model_identity, declared_defaults,
-    declared_enum_maps, declared_field_names, declared_parameter_names,
-    declared_reference_image_limit, declared_renames, declared_size_mapping,
-    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
-    is_used_parameter_value, literal_parameter_text, place_image_inputs, platform_image_parameters,
-    resolve_size_tier,
+    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
+    RouteStrategy, RuntimeRevisionId, apply_enum_maps, apply_parameter_defaults,
+    apply_parameter_renames, apply_size_mapping, carries_parameter, contract_image_parameter_kind,
+    contract_model_identity, declared_defaults, declared_enum_maps, declared_field_names,
+    declared_parameter_names, declared_reference_image_limit, declared_renames,
+    declared_size_mapping, declares_mask_parameter, declares_parameter,
+    declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
+    place_image_inputs, platform_image_parameters, resolve_size_tier,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -719,6 +719,20 @@ fn select_candidate(
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
 ) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
+    select_candidate_with_strategy(request, branch, candidates, RouteStrategy::PriorityFailover)
+}
+
+/// 同 [`select_candidate`]，但由调用方给出这次受理用哪条**路由策略**。
+///
+/// 策略只决定"在一批合格候选里挑哪一条"：候选合格与否仍由承载面与分支/张数判定，策略不改它们，
+/// 也不改选中之后的参数准备与冻结路径。取值空间只有合格候选——不合格的既不进权重之和，也不在
+/// 分摊区间里，**策略指定不了它们**。
+fn select_candidate_with_strategy(
+    request: &CreateImageGenerationRequest,
+    branch: ImageBranch,
+    candidates: &[OfferingCandidate],
+    strategy: RouteStrategy,
+) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
         // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误。
         return Err(ApplicationError::NotFound(format!(
@@ -764,7 +778,7 @@ fn select_candidate(
             (published, parameters, considered)
         })
         .collect();
-    let Some(chosen) = choose_by_priority_and_weight(&evaluated, request) else {
+    let Some(chosen) = choose_by_priority_and_weight(&evaluated, request, strategy) else {
         let reasons = evaluated
             .iter()
             .map(|(_, _, considered)| {
@@ -802,12 +816,16 @@ fn select_candidate(
     Ok((published, parameters, decision))
 }
 
-/// 档位与权重分摊：返回命中候选在 `evaluated` 里的下标，以及本次的分流落点。
+/// 在这批**合格候选**里选出命中那条：返回它在 `evaluated` 里的下标，以及本次的分流落点。
 ///
-/// 分两步，顺序不能换：
-/// 1. **定档位**——合格候选里最小的 `routing_priority`。档位是顺序，权重不参与这一步，
-///    因此"档 0 有合格候选"时权重再小的候选也不会被后面的档抢走；
-/// 2. **档内分摊**——该档的合格候选按 `weight` 分区间，落点落在谁的区间里就选谁。
+/// 取值空间先由**策略**定，两步顺序不能换：
+/// 1. **定候选集合**——`priority_failover` 先取合格候选里最小的 `routing_priority`（档位是顺序，
+///    权重不参与这一步，因此"档 0 有合格候选"时权重再小的候选也不会被后面的档抢走）；
+///    `weighted_random` 不看档位，直接用**全部**合格候选；
+/// 2. **在这个集合里按 `weight` 分摊**——落点落在谁的区间里就选谁。
+///
+/// 两种策略吃同一个哈希输入、同一套"按 `offering_id` 升序"的区间划分，因此都满足"同一请求重放
+/// 必落同一条"。不合格候选一律不在集合里：它们既不进权重之和，也不占区间。
 ///
 /// 区间划分的**顺序按 `offering_id` 升序**，不按数据库返回的行序：落点是哈希出来的一个数，
 /// 若区间划分依赖行序，同一请求换个取数顺序就会分到另一条候选，"可重放"就成了空话。
@@ -817,29 +835,37 @@ fn select_candidate(
 fn choose_by_priority_and_weight(
     evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
     request: &CreateImageGenerationRequest,
+    strategy: RouteStrategy,
 ) -> Option<(usize, u64)> {
-    let tier = evaluated
-        .iter()
-        .filter(|(_, _, considered)| considered.eligible)
-        .map(|(_, _, considered)| considered.routing_priority)
-        .min()?;
-    let mut tier_candidates: Vec<usize> = (0..evaluated.len())
-        .filter(|index| {
-            let considered = &evaluated[*index].2;
-            considered.eligible && considered.routing_priority == tier
-        })
-        .collect();
+    let mut pool: Vec<usize> = match strategy {
+        RouteStrategy::PriorityFailover => {
+            let tier = evaluated
+                .iter()
+                .filter(|(_, _, considered)| considered.eligible)
+                .map(|(_, _, considered)| considered.routing_priority)
+                .min()?;
+            (0..evaluated.len())
+                .filter(|index| {
+                    let considered = &evaluated[*index].2;
+                    considered.eligible && considered.routing_priority == tier
+                })
+                .collect()
+        }
+        RouteStrategy::WeightedRandom => (0..evaluated.len())
+            .filter(|index| evaluated[*index].2.eligible)
+            .collect(),
+    };
     // 定序键用 `offering_id` 里的 UUID 本身：`OfferingId` 是个新类型，没有比较语义，
     // 而这里要的只是"每次取数都排出同一个顺序"，不是任何业务顺序。
-    tier_candidates.sort_by_key(|index| evaluated[*index].2.offering_id.0);
-    let total: u64 = tier_candidates
+    pool.sort_by_key(|index| evaluated[*index].2.offering_id.0);
+    let total: u64 = pool
         .iter()
         .map(|index| u64::from(evaluated[*index].2.weight))
         .sum();
-    // 档内至少有一条合格候选 ⇒ 权重至少是 1 ⇒ 总和至少是 1，取模不会除以零。
+    // 集合里至少有一条合格候选 ⇒ 权重至少是 1 ⇒ 总和至少是 1，取模不会除以零。
     let draw = weight_split_draw(request.account_id, &request.idempotency_key) % total;
     let mut cursor = 0_u64;
-    for index in tier_candidates {
+    for index in pool {
         cursor += u64::from(evaluated[index].2.weight);
         if draw < cursor {
             return Some((index, draw));
@@ -1360,6 +1386,27 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 该网关模型生效的**路由策略**：按模型覆盖优先，其次全局那条；都没有就是 `None`
+    /// （调用方按默认 `priority_failover` 走）。
+    ///
+    /// 策略是运行期配置，**不进不可变修订**：改它即刻影响之后的受理；已受理的 Job 早已把候选
+    /// 固定在快照里，不受后续改策略影响。
+    async fn route_policy(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Option<RoutePolicy>, ApplicationError>;
+
+    /// 写入（或覆盖）一条策略：`gateway_model` 为 `None` 写全局那条。每次写入换新的版本标识，
+    /// 缓存拿它判断自己是不是旧的。
+    async fn upsert_route_policy(
+        &self,
+        policy: &RoutePolicy,
+        actor: &str,
+    ) -> Result<(), ApplicationError>;
+
+    /// 管理员看的策略清单：全局那条（若有）与各网关模型的覆盖。
+    async fn route_policies(&self) -> Result<Vec<RoutePolicy>, ApplicationError>;
+
     async fn create_api_key(
         &self,
         account_id: AccountId,
@@ -1711,6 +1758,46 @@ impl AccountsService {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError> {
         self.repository.read_account_balance(account_id).await
+    }
+}
+
+/// 路由策略的管理员面：读清单与写入。
+///
+/// 策略是**运行期配置**（不进不可变修订），所以这里没有"发布"这一步：写入成功即刻影响之后的
+/// 受理，已经受理的 Job 不受影响——它们的候选早已固定在快照里。
+#[derive(Clone)]
+pub struct RoutePolicyService {
+    repository: Arc<dyn HubRepository>,
+}
+
+impl RoutePolicyService {
+    #[must_use]
+    pub fn new(repository: Arc<dyn HubRepository>) -> Self {
+        Self { repository }
+    }
+
+    /// 管理员看的清单：全局那条（若有）与各网关模型的覆盖。
+    pub async fn list(&self) -> Result<Vec<RoutePolicy>, ApplicationError> {
+        self.repository.route_policies().await
+    }
+
+    /// 写入（或覆盖）一条策略：`gateway_model` 为 `None` 写全局那条。
+    ///
+    /// 版本标识在这里换新，不由调用方给：两次写入若用同一个版本，缓存就分辨不出"改过了"，
+    /// 会继续按旧策略选路。
+    pub async fn upsert(
+        &self,
+        gateway_model: Option<&str>,
+        strategy: RouteStrategy,
+        actor: &str,
+    ) -> Result<RoutePolicy, ApplicationError> {
+        let policy = RoutePolicy {
+            gateway_model: gateway_model.map(ToOwned::to_owned),
+            strategy,
+            version: Uuid::new_v4().to_string(),
+        };
+        self.repository.upsert_route_policy(&policy, actor).await?;
+        Ok(policy)
     }
 }
 
@@ -3050,8 +3137,16 @@ impl GenerationService {
             Some(probe) => self.acceleration.candidates(&request.model, probe).await?,
             None => self.repository.active_offering(&request.model).await?,
         };
-        let (mut offering, native_parameters, routing) =
-            select_candidate(&request, branch, &candidates)?;
+        // 这次受理用哪条策略：按模型覆盖优先、其次全局那条。**一条策略都没有时走原来的选路
+        // 函数**——零配置下的行为由构造保证与策略层引入之前逐位相同，而不是靠某个默认参数"应该
+        // 等价"。策略是运行期配置，改它不影响已经受理的 Job：那些 Job 的候选早已固定在快照里。
+        let policy = self.repository.route_policy(&request.model).await?;
+        let (mut offering, native_parameters, routing) = match policy {
+            Some(policy) => {
+                select_candidate_with_strategy(&request, branch, &candidates, policy.strategy)?
+            }
+            None => select_candidate(&request, branch, &candidates)?,
+        };
         // 受理时把定价随快照冻结，并算定这次的预授权额（保底额）。策略在受理时已经定下候选，
         // 所以售价**不必等上游回来**；冻结之后结算只读那份快照，受理之后改汇率、改加价系数、
         // 重发修订都不影响这一个 Job。
@@ -5653,6 +5748,63 @@ mod tests {
         unreachable!("落点必然落在某条候选的区间里")
     }
 
+    /// `weighted_random` 不看档位：在**全部合格候选**里按权重分摊，且同一请求重放落同一条。
+    ///
+    /// 与"档内分摊"的差别只在这一处：候选集合是全部合格候选，而不是最小档位那一档。落点仍由
+    /// `(账户, 幂等键)` 与权重决定，所以档 1 的候选也会分到请求——这正是它与 `priority_failover`
+    /// 的可观察差别。
+    #[test]
+    fn weighted_random_ignores_tiers_and_replays_to_the_same_candidate() {
+        let account_id = AccountId(Uuid::from_u128(0x5eea_0000_0000_0000_0000_0000_0000_0009));
+        let tier_zero = offering();
+        let mut tier_one = offering();
+        tier_one.offering_id = OfferingId::new();
+        let candidates = vec![
+            candidate_with_weight(&tier_zero, 0, 1),
+            candidate_with_weight(&tier_one, 1, 3),
+        ];
+
+        let mut tier_one_hits = 0;
+        for index in 0..64 {
+            let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+            request.account_id = account_id;
+            request.idempotency_key = format!("weighted-key-{index}");
+            let branch = request.branch().expect("prompt only");
+            let (chosen, _, decision) = select_candidate_with_strategy(
+                &request,
+                branch,
+                &candidates,
+                RouteStrategy::WeightedRandom,
+            )
+            .expect("a candidate must be chosen");
+            let hit = decision
+                .considered
+                .iter()
+                .find(|considered| considered.offering_id == chosen.offering_id)
+                .expect("命中项必须在判定记录里");
+            assert!(hit.eligible, "策略不得选中不合格候选：{hit:?}");
+            // 重放：同一请求再来一次，必须落同一条候选。
+            let (again, _, _) = select_candidate_with_strategy(
+                &request,
+                branch,
+                &candidates,
+                RouteStrategy::WeightedRandom,
+            )
+            .expect("a replay must be chosen");
+            assert_eq!(
+                again.offering_id, chosen.offering_id,
+                "同一 (账户, 幂等键) 必须落同一条候选"
+            );
+            if chosen.offering_id == tier_one.offering_id {
+                tier_one_hits += 1;
+            }
+        }
+        assert!(
+            tier_one_hits > 0,
+            "weighted_random 不看档位：档 1 的候选也应当分到请求"
+        );
+    }
+
     /// 同一档按权重分摊：逐条等于重算的期望，且判定记录自己就能重建结论。
     ///
     /// 三条性质一起验：① 分摊由 `(账户, 幂等键)` 与权重决定（不是随机数、也不看行序）；
@@ -6004,6 +6156,25 @@ mod tests {
             &self,
             _account_id: AccountId,
         ) -> Result<BalanceChange, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn route_policy(
+            &self,
+            _gateway_model: &str,
+        ) -> Result<Option<RoutePolicy>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn upsert_route_policy(
+            &self,
+            _policy: &RoutePolicy,
+            _actor: &str,
+        ) -> Result<(), ApplicationError> {
+            unused_repository()
+        }
+
+        async fn route_policies(&self) -> Result<Vec<RoutePolicy>, ApplicationError> {
             unused_repository()
         }
 

@@ -526,6 +526,55 @@ impl CostBasis {
     }
 }
 
+/// 路由策略类型：在一批**合格候选**里"选哪一条"由运营配置的策略决定。
+///
+/// 零配置时的默认值是 [`RouteStrategy::PriorityFailover`]——它按 `routing_priority` 数字小的
+/// 优先、该档不合格时依次降级、同档内按 `weight` 分摊，也就是策略层引入之前的行为。
+///
+/// 取值空间**只有合格候选**：承载面表达不了这次请求、分支或张数不被允许的候选先被排除，
+/// 任何策略都不得选中它们。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RouteStrategy {
+    /// 按档位顺序挑：合格候选里 `routing_priority` 最小的那一档，档内按 `weight` 分摊。
+    PriorityFailover,
+    /// 不看档位：在**全部**合格候选里按 `weight` 分摊。
+    WeightedRandom,
+}
+
+impl RouteStrategy {
+    /// 落库与进缓存用的稳定字符串。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::PriorityFailover => "priority_failover",
+            Self::WeightedRandom => "weighted_random",
+        }
+    }
+
+    /// 从落库值还原；解析不到说明存储被绕过或写进了本层还不支持的策略，按错误处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "priority_failover" => Some(Self::PriorityFailover),
+            "weighted_random" => Some(Self::WeightedRandom),
+            _ => None,
+        }
+    }
+}
+
+/// 一条生效的路由策略：作用域、类型与版本标识。
+///
+/// `gateway_model` 为 `None` 表示**全局那条**；非空表示覆盖该网关模型（按模型取"有覆盖用
+/// 覆盖、没有用全局"）。策略是**运行期配置**，不进不可变修订：改它即刻影响之后的受理，已经
+/// 受理的 Job 早已把候选固定在快照里。`version` 每次写入都变，缓存拿它判断自己是不是旧的。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RoutePolicy {
+    pub gateway_model: Option<String>,
+    pub strategy: RouteStrategy,
+    pub version: String,
+}
+
 /// 一条供给的**保底表**（CNY）：受理时算预授权额的唯一来源。
 ///
 /// 键是档位：`size` 本身，或 `size/quality`（**`quality` 留空即按 `size` 档**）。另有该供给的

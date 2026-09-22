@@ -10,10 +10,10 @@ use seeai_application::{
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
     GenerationJob, HitCandidate, ImageBranch, JobId, OfferingCandidate, OfferingId, PricePlanId,
-    PriceRates, PriceSnapshot, PublishedModel, PublishedOffering, PublishedRevision,
-    RuntimeRevisionId, VendorModelId,
+    PriceRates, PriceSnapshot, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
+    RouteStrategy, RuntimeRevisionId, VendorModelId,
 };
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
 use std::time::Duration as StdDuration;
@@ -830,6 +830,82 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError> {
         self.account_balance(account_id).await
+    }
+
+    /// 生效的策略：按模型覆盖优先，其次全局那条。
+    ///
+    /// `ORDER BY gateway_model IS NULL` 把非空（覆盖）排在前面：策略的作用域是"有覆盖用覆盖、
+    /// 没有用全局"，一条 SQL 就能定下来，不必让调用方分两次查再自己判优先级。
+    async fn route_policy(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Option<RoutePolicy>, ApplicationError> {
+        let row = sqlx::query(
+            r#"
+            SELECT gateway_model, strategy, version
+            FROM routing.route_policies
+            WHERE gateway_model = $1 OR gateway_model IS NULL
+            ORDER BY gateway_model IS NULL
+            LIMIT 1
+            "#,
+        )
+        .bind(gateway_model)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.as_ref().map(route_policy_from_row).transpose()
+    }
+
+    async fn upsert_route_policy(
+        &self,
+        policy: &RoutePolicy,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO routing.route_policies (id, gateway_model, strategy, version, updated_by)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (coalesce(gateway_model, ''))
+            DO UPDATE SET strategy = EXCLUDED.strategy,
+                          version = EXCLUDED.version,
+                          updated_at = now(),
+                          updated_by = EXCLUDED.updated_by
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(policy.gateway_model.as_deref())
+        .bind(policy.strategy.as_str())
+        .bind(&policy.version)
+        .bind(actor)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            "route_policy.upsert",
+            "route_policy",
+            policy.gateway_model.as_deref().unwrap_or("global"),
+            &json!({"strategy": policy.strategy.as_str(), "version": policy.version}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn route_policies(&self) -> Result<Vec<RoutePolicy>, ApplicationError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT gateway_model, strategy, version
+            FROM routing.route_policies
+            ORDER BY gateway_model IS NULL DESC, gateway_model
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(route_policy_from_row).collect()
     }
 
     async fn create_account(
@@ -2080,6 +2156,22 @@ fn balance_change_with_account(
     row: &sqlx::postgres::PgRow,
 ) -> Result<BalanceChange, ApplicationError> {
     balance_change(row, AccountId(row.try_get("id").map_err(database_error)?))
+}
+
+/// 从一行策略还原。
+///
+/// 策略类型是受控取值：落库值解析不到说明存储被绕过（或写进了本层还不支持的策略），按错误处理
+/// 而不是悄悄退回默认——退回默认会把"配置没生效"伪装成"配置生效了"，而选路正是靠它决定走哪家。
+fn route_policy_from_row(row: &sqlx::postgres::PgRow) -> Result<RoutePolicy, ApplicationError> {
+    let strategy: String = row.try_get("strategy").map_err(database_error)?;
+    let strategy = RouteStrategy::parse(&strategy).ok_or_else(|| {
+        ApplicationError::InvalidParameter(format!("unknown route strategy {strategy}"))
+    })?;
+    Ok(RoutePolicy {
+        gateway_model: row.try_get("gateway_model").map_err(database_error)?,
+        strategy,
+        version: row.try_get("version").map_err(database_error)?,
+    })
 }
 
 async fn insert_audit(

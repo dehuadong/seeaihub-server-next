@@ -8408,6 +8408,128 @@ async fn an_fx_rate_without_an_effective_time_is_stamped_by_the_database_clock()
     harness.cleanup().await;
 }
 
+/// 路由策略是**运营配置**：管理员能读写、写入即刻生效，而且**不产生新修订**。
+///
+/// 策略真的改变选路结果由应用层用例钉住（同一个候选集合、两种策略给出可观察的差别：
+/// `weighted_random_ignores_tiers_and_replays_to_the_same_candidate`）；这里验的是管理面与
+/// "不进不可变修订"这条——它是"改策略不需要重发"的全部含义。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn route_policies_are_runtime_configuration_and_do_not_touch_revisions() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let client = Client::new();
+    publish_bootstrap(&client, &harness.base_url, &harness.admin_token).await;
+    let revisions_before: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM publication.runtime_revisions")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("revision count");
+
+    // 没配置策略时清单是空的：零配置就是"没有这一层"。
+    let response = client
+        .get(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("policy list");
+    assert_eq!(response.status(), StatusCode::OK);
+    let listed: Value = response.json().await.expect("policy JSON");
+    assert_eq!(
+        listed["route_policies"],
+        json!([]),
+        "零配置时不该有任何策略行"
+    );
+
+    // 写全局那条。
+    let response = client
+        .put(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"strategy": "weighted_random"}))
+        .send()
+        .await
+        .expect("global policy");
+    assert_eq!(response.status(), StatusCode::OK);
+    let written: Value = response.json().await.expect("policy JSON");
+    assert_eq!(written["route_policy"]["gateway_model"], Value::Null);
+    assert_eq!(
+        written["route_policy"]["strategy"],
+        json!("weighted_random")
+    );
+    let first_version = written["route_policy"]["version"].clone();
+
+    // 再写同一个作用域：版本必须换新——缓存靠它判断自己是不是旧的。
+    let response = client
+        .put(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"strategy": "weighted_random"}))
+        .send()
+        .await
+        .expect("global policy again");
+    assert_eq!(response.status(), StatusCode::OK);
+    let rewritten: Value = response.json().await.expect("policy JSON");
+    assert_ne!(
+        rewritten["route_policy"]["version"], first_version,
+        "每次写入都要换版本标识，否则缓存分辨不出改过了"
+    );
+
+    // 按模型覆盖：只影响那个网关模型。
+    let response = client
+        .put(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"gateway_model": harness.model, "strategy": "priority_failover"}))
+        .send()
+        .await
+        .expect("model policy");
+    assert_eq!(response.status(), StatusCode::OK);
+
+    let response = client
+        .get(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("policy list");
+    let listed: Value = response.json().await.expect("policy JSON");
+    assert_eq!(
+        listed["route_policies"]
+            .as_array()
+            .expect("route_policies")
+            .len(),
+        2,
+        "全局一条 + 该模型的覆盖一条：{listed}"
+    );
+
+    // 本层还没实现的策略：明确拒绝，不悄悄落成默认——落成默认会把"配置没生效"伪装成生效。
+    let response = client
+        .put(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"strategy": "least_cost"}))
+        .send()
+        .await
+        .expect("unsupported strategy");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+    // 无管理员凭证：401。
+    let response = client
+        .get(format!("{}/api/v1/route-policies", harness.base_url))
+        .send()
+        .await
+        .expect("policy list without a token");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    // **改策略不发修订**。
+    let revisions_after: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM publication.runtime_revisions")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("revision count");
+    assert_eq!(
+        revisions_after, revisions_before,
+        "策略是运行期配置：写它不该产生新修订"
+    );
+
+    harness.cleanup().await;
+}
+
 /// **管理员读余额读的是数据库那一行，不是缓存**。
 ///
 /// 这条读服务于运营查看与对账：缓存里的值可能滞后、也可能来自对账覆盖，用它当答案会把
