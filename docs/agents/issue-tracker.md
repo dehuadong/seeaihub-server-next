@@ -6,8 +6,6 @@
 
 仓库：`dehuadong/seeaihub-server-next`。本地 remote `origin` 已配置，`gh` 在仓库内会自动推断目标仓库，通常不需要 `-R`。
 
-沙箱限制：本机沙箱内 SSH 传输不可用（`ssh.exe: couldn't create signal pipe`），因此 `git ls-remote`、`git fetch`、`git push` 在受限会话中会失败；`gh` 走 HTTPS + keyring，读写 Issue 不受影响。
-
 - **创建 issue**：`gh issue create --title "..." --body "..."`，多行正文用 heredoc。
 - **读取 issue**：`gh issue view <number> --comments`，用 `jq` 过滤评论，并同时取回标签。
 - **列出 issue**：`gh issue list --state open --json number,title,body,labels,comments --jq '[.[] | {number, title, body, labels: [.labels[].name], comments: [.comments[].body]}]'`，按需加 `--label` / `--state` 过滤。
@@ -30,8 +28,6 @@ Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/see
 | in-progress | `proposal:in-progress` |
 | complete | `proposal:complete` |
 | rejected | `proposal:rejected` |
-
-这些标签目前尚未在远端创建；需要时用 `gh label create "<标签>" -R dehuadong/seeaihub-server-next` 建立，或改用 issue 正文中的状态行。本配置的建立不构成发布工作或创建远端标签的授权。
 
 Plan Review 结论与批准证据写入该 issue 的决策/批准依据段，或链接的评审批次，并引用相关需求与设计。只有所需评审与批准齐备、且选定范围没有阻塞性决定或依赖时，才进入 `ready`；`in-progress` 仅在项目规则下取得执行授权后开始；交付并完成最终验证后进入 `complete`。就绪性丢失时，把受影响工作退回 `planning` 并记录阻塞原因；否决时记录决定。工作状态之外，批准与执行授权仍分别遵循项目指令（见仓库根 `AGENTS.md`）。
 

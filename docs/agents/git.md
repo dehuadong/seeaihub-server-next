@@ -4,24 +4,24 @@
 
 ## 按改动面选证据
 
-- 每处行为改动都要有能挡住它回归的**最小**证据：改哪个 crate 就跑那个 crate 的定向用例，改传输或协议就补一条对客端到端，改文档或记录就跑 `node scripts/decisions/check.mjs`。
-- **要提交或推送，不构成把已经通过的检查再跑一遍的理由。** 根 `AGENTS.md` 里那三条命令是交付门槛与 CI 的门槛，不是每次提交的仪式——刚跑过的 `cargo test` 不要为了提交再跑一次。
+- 每处改动选择能挡住回归的**最小**证据：Rust 改动运行相关 crate 的定向用例，传输或协议改动补对客端到端；Agent Note 与工件注册表运行 `node scripts/decisions/check.mjs`；其他代理文档检查本地链接、运行 `git diff --check` 并按写作规则审阅。
+- **要提交或推送，不构成把已经通过的检查再跑一遍的理由。** 根 `AGENTS.md` 里的三条命令是完整 Rust 门禁，按改动面需要时运行，不是每次提交的仪式。
 - **只报告实际跑过的命令**：没跑就写没跑，不用「应该没问题」代替证据。
-- **CI 拥有穷尽覆盖**（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)）：全量 `cargo test --workspace --all-features`、`--ignored` 端到端整跑与平台矩阵都在那里。本地跑全量只用于：用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
+- **Rust 全量门禁由 CI 承担**（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)）：CI 在 Ubuntu 上运行格式、Clippy、Workspace 测试与 ignored HTTP 合同测试。文档、Agent Note 与技能仍按上一条在本地验证。本地重复跑 Rust 全量只用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
 
 ## 提交
 
 - 一次提交只讲一件事：独立改动拆开，别把顺手整理与行为改动混在一起。
 - 发现前一次提交引入的问题，先修那次提交或明确说明，再往下传播。
-- 提交信息沿用 `git log` 里的既有写法：标题是 `<type>: <一句话>`，`type` 取 `feat` / `fix` / `docs` / `test` / `chore`；正文说清改了什么、为什么，与已批准的设计或决定有偏差时写明偏差；最后一段用 `验证：` 列出**实际跑过**的证据（命令、用例名、结果）。编号引用按 `docs/AGENTS.md` 的「引用要能点得回去」与 [`domain.md`](domain.md) 的「引用写法」。
+- 提交标题使用 `<type>: <一句话>`，`type` 取 `feat` / `fix` / `docs` / `test` / `chore`；正文说清改了什么、为什么，与已批准的设计或决定有偏差时写明偏差；最后一段用 `验证：` 列出**实际跑过**的证据（命令、用例名、结果）。引用遵循 [`docs/AGENTS.md`](../AGENTS.md) 的「合同与记录在仓库内闭环」与 [`domain.md`](domain.md) 的「引用写法」。
 - 文件尾只留一个换行；提交前用 `git diff --cached --check` 查空白错误。本机 `core.autocrlf` 会把仓库里的 LF 报成「LF will be replaced by CRLF」——那是本机配置的提示，不是文件有问题，不要把 LF 改成 CRLF 去消掉它。
 
 ## 推送与历史改写
 
-本仓库的改动直接落在 `main` 上（`git branch -a` 只有 `main` 与 `origin/main`，`git log` 也是这么走的），没走 PR；下面的要求与走不走 PR 无关。
+本仓库默认直接提交并推送 `main`，不要求通过 PR；操作前仍核对当前分支及其上游。下面的安全要求与是否经过 PR 无关。
 
-- 普通推送：跑一次与本改动面相关的证据 → `git push` → 核对远端 ref 与本地 `HEAD` 一致：`git rev-parse HEAD origin/main`。
-- **允许改写历史**（rebase），但只允许 `--force-with-lease=<branch>:<观察到的远端 OID>`：推送前先取远端并记下当时的 OID，远端一旦被别人推进，这次推送必须中止并重新看一遍。**禁止裸 `--force`**，也不要在 lease 不成立时换别的写法绕过去。
+- 普通推送：确认本改动面已有有效证据 → `git push` → 分别运行 `git rev-parse HEAD` 与 `git rev-parse '@{upstream}'`，核对两个 OID 一致。
+- 只有用户明确要求改写历史时才执行 rebase 或强制推送。强制推送只允许 `--force-with-lease=<branch>:<观察到的远端 OID>`：推送前先取远端并记下当时的 OID，远端一旦被别人推进，这次推送必须中止并重新看一遍。**禁止裸 `--force`**，也不要在 lease 不成立时换别的写法绕过去。
 - 改写之后，改写前那次推送的证据都不再是当前证据：重新取远端 head，重新核对检查结论；若这次改动走了 PR，还要重新核对评审线程、批准与可合并状态。
-- 受限会话里 SSH 传输不可用，`git push` / `git fetch` 可能直接失败（见 [`issue-tracker.md`](issue-tracker.md) 的沙箱说明）；失败就如实报告，不能说成推送成功。
+- 若当前环境限制 SSH 或网络访问，`git push` / `git fetch` 失败后如实报告，不绕过安全限制，也不把失败说成成功。
 - 本文件不要求安装 Git 钩子。真要装也只装窄的、能当场修的事（暂存区 lint 与空白、提交信息格式）；测试、构建与文档门禁留给本地按需运行与 CI。钩子一宽就会有人 `--no-verify` 绕过去，等于没有。

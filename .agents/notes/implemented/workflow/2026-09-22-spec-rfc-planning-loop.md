@@ -4,7 +4,7 @@ status: implemented
 created: 2026-09-22
 updated: 2026-09-22
 approval: 用户在本会话中确认“初步产品意图 ↔ 可行性探索 / RFC 草案 → Spec 定稿 → RFC 定稿”的设计，并输入“执行改进”授权实施
-verification: Planning 与 PRD 通过 quick_validate.py；Agent Note 检查、变更文档链接、结构与历史文档无差异断言、git diff --check 通过；Implementation Review 的 Standards 与 Spec 两轴 PASS
+verification: Planning 与 PRD 通过技能结构校验；Agent Note 检查、变更文档链接、结构与历史文档无差异断言、git diff --check 通过；Implementation Review 的 Standards 与 Spec 两轴 PASS
 ---
 
 # Agent Note：Spec 与 RFC 往返收敛，PRD 按需独立调用
@@ -41,7 +41,7 @@ Planning 原先把目标、范围与验收主要交给 Proposal 或工作项，S
 
 ## 验证
 
-- Planning 与 PRD 分别通过 `quick_validate.py`。
+- Planning 与 PRD 分别通过技能结构校验。
 - `node scripts/decisions/check.mjs` 通过，共检查 22 条记录。
 - 变更 Markdown 的本地链接、文件结构、PRD 显式调用策略和历史文档无差异断言通过。
 - `git diff --check` 通过；输出仅有 Git 的 LF/CRLF 工作区提示。
