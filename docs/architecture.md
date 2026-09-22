@@ -15,7 +15,7 @@
                   ▼
  应用层       crates/application
              用例（Service）+ 端口（trait：HubRepository /
-             AdapterFactory / CredentialProvider）；发布校验与归一；错误→处置映射
+             AdapterFactory / CredentialProvider / CacheStore）；发布校验与归一；错误→处置映射
                   │ 依赖
                   ▼
  领域层       crates/domain
@@ -24,6 +24,7 @@
                   ▲ 实现端口（反向依赖：基础设施依赖应用层，应用层不认识它们）
                   │
  基础设施     crates/persistence      PostgreSQL（SQL、事务、迁移）
+             crates/cache-redis      Redis（加速层的键值读写）
              crates/adapter-sdk      ② 的接口与共享类型
              crates/adapter-aihubmix ② AIHubMix 一族
              crates/adapter-apimart  ② APIMart 一族
@@ -80,6 +81,8 @@
 GenerationService::create                              crates/application
   ├─ 校验幂等键 / 预算
   ├─ 判定图片分支（文生图 / 图生图 / 带遮罩）           crates/domain  CreateImageGeneration::branch
+  ├─ 加速层开着时先做一次轻量读（生效修订标识 + 网关模型开关 + 数据库时钟），
+  │    候选集从 route 缓存取；修订标识不一致、开关已关或值读不出来即回源数据库   crates/application  AccelerationService
   ├─ 取该型号的候选供给，按档位选第一个有合格候选的档，      crates/application  select_candidate
   │    再在该档的合格候选里按 weight 确定性分摊
   │    （落点 = hash(账户 ‖ 幂等键)，不引入随机数；不合格的候选不进分摊；
@@ -87,9 +90,12 @@ GenerationService::create                              crates/application
   ├─ 受理时冻结定价：先把 size 归到档位、再查该供给    crates/application  freeze_pricing
   │    的保底表（像素型按档位像素表/最长边，auto 取 2K）；
   │    汇率按该候选的成本币种取"受理时刻生效的那一行"
-  └─ 写 Job + 路由判定 + 预授权（同一事务）              crates/persistence  create_job
+  ├─ 缓存里的余额**新鲜**（写穿来源 + 落在新鲜窗口内）且低于保底额 ⇒
+  │    提前 402 并写一条审计；不新鲜一律交给下面的数据库条件更新   crates/application  AccelerationService::precheck_balance
+  ├─ 写 Job + 路由判定 + 预授权（同一事务）              crates/persistence  create_job
        （Job 是内部执行/审计记录，对客不可见；预授权额 = 保底额，
          闸门是余额 ≥ 保底额，不足即 402）
+  └─ 提交后把**扣减后**的余额写进缓存（写穿）             crates/application  AccelerationService::write_balance
   ▼
 Worker（独立进程，循环领活）                            apps/worker/src/main.rs
   └─ WorkerService::run_once                           crates/application
@@ -100,6 +106,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
        ├─ 成功：结果信封写回 Job → complete_job          crates/application  complete_success
        │     写 Metering Evidence、记渠道成本事实（含折算后 CNY）、按实际扣费并结清预授权  crates/persistence  complete_job
        │     （**不封顶在保底额**：差额由余额透支吸收）
+       │     提交后把**实收之后**的余额写进缓存（失败收尾释放预授权时同样写）  crates/application  AccelerationService::write_balance
        └─ 失败：failure_from_adapter 决定处置            crates/application
              ├─ 对客码按责任方派生（渠道码与原文只留内部）  crates/application  public_error_code
              ├─ 可证明未受理 / 确定性拒绝 → failed + 释放预授权
@@ -112,6 +119,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
      GET /api/v1/provider-failures                       平台侧失败清单（欠费/凭证/平台 bug，管理员面）
      GET /api/v1/provider-cost-gaps                      成本缺口清单（成本未知的那些执行，管理员面）
      PUT /api/v1/fx-rates                                录入折算率（渠道币种 → CNY，管理员面）
+     定时缓存对账（API 进程内的独立任务）                  以数据库为准覆盖余额与候选集，发现不一致写审计  crates/application  AccelerationService::run_reconciler
 ```
 
 ## 5. 谁拥有哪张表
@@ -129,7 +137,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据**、**渠道成本事实**（来源 `computed`/`declared`/`unavailable` + 原币种金额 + 该渠道声明的币种 + **按冻结汇率折算后 CNY**）。成功与"结果交付失败进对账"两条路径都写成本事实 | `begin_attempt`、`complete_job`、`fail_job` |
 | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 余额、预授权、账目。**余额可为负**（透支发生在结算：实收超过保底额时差额把余额扣成负数），**保底额可为 0** | `create_job`（hold）、`complete_job`（capture）、`fail_job`（release） |
 | `identity.api_keys` | API Key 摘要 | `IdentityService` |
-| `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计 | `fail_job`、`ReconciliationService` |
+| `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载"凭缓存提前拒绝"与缓存对账发现的覆盖） | `fail_job`、`ReconciliationService`、`AccelerationService`（`insert_audit_event`） |
 
 `crates/persistence` 是这些表的唯一写入方；其他 crate 只能通过 `crates/application` 的 `HubRepository` 端口访问，不直接写 SQL。
 
@@ -137,24 +145,26 @@ Worker（独立进程，循环领活）                            apps/worker/s
 
 | 文件 | 负责什么 | 明确不负责 |
 | --- | --- | --- |
-| `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移 | 业务规则、SQL、上游调用 |
-| `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
-| `apps/api/tests/http_contract.rs` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**（零外部费用） | 单元测试（在各 crate 内） |
+| `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移、装配加速层并挂起缓存对账循环 | 业务规则、SQL、上游调用 |
+| `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现（含加速层）、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
+| `apps/api/tests/http_contract.rs` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**与**进程内假 Redis**（零外部费用） | 单元测试（在各 crate 内） |
 | `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PriceSnapshot`（对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
 | `crates/domain/src/image_parameters.rs` | 图片参数的**唯一**一份规则：调用方契约字段（`image`/`image_urls`/`mask`）、候选声明参数名的判定（名字以 `image` 开头＝参考图、含 `mask`＝遮罩）、`null`/空串＝这一处没有图、把调用方的图落到候选声明的参数名上 | IO；也不认识任何**具体渠道**（参数名本身按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G1） |
-| `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService`）、端口 trait、发布期校验（含"限制只能收窄"与定价"全有或全无"）、候选选择（**先按档位取第一个有合格候选的档，再在档内按权重确定性分摊**）、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生 | SQL、HTTP、上游协议 |
-| `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射 | 业务判定（只执行用例给出的结论） |
+| `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService` / `AccountsService`）、端口 trait（含 `CacheStore`）、发布期校验（含"限制只能收窄"与定价"全有或全无"）、候选选择（**先按档位取第一个有合格候选的档，再在档内按权重确定性分摊**）、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生、加速层语义（`AccelerationService`：键名与值形状、候选集的修订标识比对、写穿与来源标记、新鲜度判定与凭缓存拒绝的审计、缓存对账） | SQL、HTTP、上游协议、Redis 命令 |
+| `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射；余额变更一律用 `RETURNING` 把**提交后**的余额带回给用例（供写穿缓存） | 业务判定（只执行用例给出的结论） |
+| `crates/cache-redis/src/lib.rs` | 加速层的 Redis 实现：`GET` / `SET … PX` / `DEL` 三条命令、惰性连接与单次操作超时；连不上或命令报错一律返回错误，由用例层当"未命中"处理。`REDIS_URL` 为空时不构造（`from_env` 返回 `None`） | 键名、值形状、新鲜度与拒绝判定（都在 `crates/application`） |
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
 | `migrations/0001_initial.sql`…`0010_routing_weight_and_decisions.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
-| `scripts/decisions/*.mjs` | Agent Notes 的索引生成与一致性检查 | 不影响服务运行 |
+| `scripts/decisions/*.mjs` | Agent Notes 的目录、元数据与文件格式检查（不生成索引） | 不影响服务运行 |
+| `docs/AGENTS.md`、`docs/agents/git.md` | 正文与代码注释的写作规则与 slop 清单；提交、推送与历史改写约定 | 工件位置与归属归 `docs/agents/artifacts.md`；Agent Note 的文件骨架归 `.agents/notes/README.md` |
 | `docs/design/`、`docs/adr/` | 设计与决策的权威位置 | — |
 | `docs/facts/channel-facts.md` | 各渠道的**事实台账**（端点、参数、计量与成本口径、实测记录） | 不是接口合同，服务不读取 |
 | `docs/verification/` | 受控验证清单（步骤、停止条件、留档要求） | — |
 | `out-reference/` | 上游原始材料（文档、Schema 快照、实测响应） | 不属于平台合同，服务不读取 |
-| `.agents/notes/` | 工程变更与交付记录 | — |
+| `.agents/notes/` | 工程变更与交付记录；生命周期、文件骨架与写作规则见该目录的 `README.md` 与 `AGENTS.md` | — |
 
 ## 7. 扩展点
 

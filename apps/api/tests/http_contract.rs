@@ -21,6 +21,7 @@ use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
 use std::{
+    collections::BTreeMap,
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
@@ -492,12 +493,25 @@ async fn start_api(
     sync_wait_seconds: u64,
     max_concurrent_jobs: u64,
 ) -> (String, String, ApiProcess) {
+    start_api_with(database_url, sync_wait_seconds, max_concurrent_jobs, None).await
+}
+
+/// 同 [`start_api`]，但可以给这个进程配上**加速层**（缓存）。
+///
+/// 不配就是今天的路径：加速层根本不构造，受理不额外读库、不预检、不写缓存。
+async fn start_api_with(
+    database_url: &str,
+    sync_wait_seconds: u64,
+    max_concurrent_jobs: u64,
+    cache: Option<&CacheFixture>,
+) -> (String, String, ApiProcess) {
     let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
     let port = listener.local_addr().expect("test address").port();
     drop(listener);
     let base_url = format!("http://127.0.0.1:{port}");
     let admin_token = format!("contract-admin-{}", Uuid::new_v4());
-    let child = Command::new(env!("CARGO_BIN_EXE_seeai-api"))
+    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    command
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", &admin_token)
@@ -510,9 +524,9 @@ async fn start_api(
             sync_wait_seconds.to_string(),
         )
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("API process should start");
+        .stderr(Stdio::null());
+    apply_cache_env(&mut command, cache);
+    let child = command.spawn().expect("API process should start");
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     for (currency, rate_micros) in [("USD", 7_100_000_u64), ("CNY", 1_000_000_u64)] {
@@ -537,7 +551,14 @@ async fn start_api(
 /// 环境变量只有一份，两个调用点（[`Harness`] 与直接起进程的用例）共用：两家渠道的凭证都写在
 /// 测试进程的环境里，取值只在进程内假上游上用过，不写入配置、日志或响应。
 fn spawn_worker_process(database_url: &str) -> WorkerProcess {
-    let child = Command::new(worker_binary())
+    spawn_worker_process_with(database_url, None)
+}
+
+/// 同 [`spawn_worker_process`]，但可以给 Worker 也配上加速层：结算与失败收尾都改余额，
+/// 提交后要把新余额写穿缓存，所以两个进程必须看同一个缓存服务。
+fn spawn_worker_process_with(database_url: &str, cache: Option<&CacheFixture>) -> WorkerProcess {
+    let mut command = Command::new(worker_binary());
+    command
         .env("DATABASE_URL", database_url)
         .env("WORKER_ID", "driver-contract-worker")
         .env("WORKER_POLL_INTERVAL_MS", "200")
@@ -546,9 +567,9 @@ fn spawn_worker_process(database_url: &str) -> WorkerProcess {
         .env("APIMART_API_KEY", "contract-test-key")
         .env("AIHUBMIX_API_KEY", "contract-test-key")
         .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("worker process should start");
+        .stderr(Stdio::null());
+    apply_cache_env(&mut command, cache);
+    let child = command.spawn().expect("worker process should start");
     WorkerProcess { child }
 }
 
@@ -590,6 +611,8 @@ struct Harness {
     _api: ApiProcess,
     /// 保持假上游的监听任务存活。
     _upstream: FakeUpstream,
+    /// 这次用例给 API 与 Worker 配的加速层（假 Redis）；没配就是"没有缓存"的那条路径。
+    cache: Option<CacheFixture>,
 }
 
 impl Harness {
@@ -661,16 +684,55 @@ impl Harness {
     }
 
     async fn start_with_draft(
-        mut draft: Value,
+        draft: Value,
         contract: Option<Value>,
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
     ) -> Self {
+        Self::build(draft, contract, behaviour, max_concurrent_jobs, 30, None).await
+    }
+
+    /// 同 `start_with_draft`，但给 API 与 Worker 配上**加速层**（假 Redis）。
+    ///
+    /// `sync_wait_seconds` 也在这里给：验收里有的用例故意不跑 Worker，让同步入口在很短的窗口后
+    /// 超时——那时 Job 已经受理、预授权也扣了，正好用来观察写穿。
+    async fn start_with_cache(
+        draft: Value,
+        contract: Option<Value>,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+        cache: CacheFixture,
+    ) -> Self {
+        Self::build(
+            draft,
+            contract,
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
+            Some(cache),
+        )
+        .await
+    }
+
+    async fn build(
+        mut draft: Value,
+        contract: Option<Value>,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+        cache: Option<CacheFixture>,
+    ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
         let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
-        let (base_url, admin_token, process) =
-            start_api(&database_url, 30, max_concurrent_jobs).await;
+        let (base_url, admin_token, process) = start_api_with(
+            &database_url,
+            sync_wait_seconds,
+            max_concurrent_jobs,
+            cache.as_ref(),
+        )
+        .await;
         let client = Client::new();
         wait_until_ready(&client, &base_url).await;
         let account = create_account(&client, &base_url, &admin_token).await;
@@ -715,12 +777,23 @@ impl Harness {
             declared_surface,
             _api: process,
             _upstream: upstream,
+            cache,
         }
     }
 
     /// 起一个真实 Worker 进程（丢弃返回值即结束它）。
+    ///
+    /// Worker 与 API 共用同一个缓存服务：结算改余额之后要把新余额写穿，否则缓存会留着一个
+    /// 刚写过、但偏高的余额。
     fn spawn_worker(&self) -> WorkerProcess {
-        spawn_worker_process(&self.database_url)
+        spawn_worker_process_with(&self.database_url, self.cache.as_ref())
+    }
+
+    /// 这次用例的假 Redis；没配缓存的用例调用它会直接失败（那是用例写错了）。
+    fn cache(&self) -> &CacheFixture {
+        self.cache
+            .as_ref()
+            .expect("this test must run with the cache fixture")
     }
 
     /// 走同步入口发一次 JSON 请求，并起真实 Worker 把它跑到终态。
@@ -9170,4 +9243,1014 @@ async fn the_routing_weight_migration_keeps_existing_entries_and_allows_shared_t
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
+}
+
+// ───────────────────────────── 加速层（缓存）─────────────────────────────
+//
+// 这一组用例验的是"Redis 只是加速层"：扣减与余额事实只在数据库事务里发生，缓存写的是提交后的
+// 值，陈旧一律回源，凭缓存提前拒绝必须留审计，缓存停掉结果逐位不变。
+//
+// 缓存服务用**进程内假 Redis**（与假上游同一套做法）：验收要能直接改坏缓存里的值、能让写入失败
+// （模拟"失效没成功"），还要在没有 Redis 的机器上跑得起来。它只在 127.0.0.1 上监听、不出网。
+
+/// 缓存参数：写进 API / Worker 进程的环境变量。默认值就是设计里给的那一套。
+#[derive(Debug, Clone, Copy)]
+struct CacheSettings {
+    route_ttl_seconds: u64,
+    balance_ttl_seconds: u64,
+    freshness_window_ms: u64,
+    reconcile_interval_ms: u64,
+}
+
+impl Default for CacheSettings {
+    fn default() -> Self {
+        Self {
+            route_ttl_seconds: 60,
+            balance_ttl_seconds: 360,
+            freshness_window_ms: 5_000,
+            reconcile_interval_ms: 180_000,
+        }
+    }
+}
+
+impl CacheSettings {
+    /// 换掉新鲜窗口与对账周期。两者必须满足生产实现的那条校验（窗口至少小 4 倍），否则 API 进程
+    /// 会因为配置不合法直接退出。
+    fn with_windows(self, freshness_window_ms: u64, reconcile_interval_ms: u64) -> Self {
+        Self {
+            freshness_window_ms,
+            reconcile_interval_ms,
+            ..self
+        }
+    }
+}
+
+/// 假 Redis 里的一条：值 + 过期时刻（`None` 表示不过期）。
+struct CacheEntry {
+    value: String,
+    expires_at: Option<tokio::time::Instant>,
+}
+
+/// 进程内假 Redis：只实现加速层用到的那几条命令。
+///
+/// 它不是"另一个实现"，而是**测试用的可观测替身**：用例可以读它、改它、让它拒绝写入，从而构造
+/// "缓存被改错""失效没成功""缓存服务停掉"这三种现实里会发生、但没法靠真实 Redis 稳定复现的情形。
+struct CacheFixture {
+    url: String,
+    settings: CacheSettings,
+    state: Arc<Mutex<BTreeMap<String, CacheEntry>>>,
+    fail_writes: Arc<std::sync::atomic::AtomicBool>,
+    connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
+    listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
+}
+
+impl CacheFixture {
+    async fn start(settings: CacheSettings) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("fake redis binds");
+        let port = listener.local_addr().expect("addr").port();
+        let state: Arc<Mutex<BTreeMap<String, CacheEntry>>> = Arc::new(Mutex::new(BTreeMap::new()));
+        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
+            Arc::new(Mutex::new(Vec::new()));
+        let handle = {
+            let state = state.clone();
+            let fail_writes = fail_writes.clone();
+            let connections = connections.clone();
+            tokio::spawn(async move {
+                loop {
+                    let Ok((socket, _)) = listener.accept().await else {
+                        break;
+                    };
+                    let state = state.clone();
+                    let fail_writes = fail_writes.clone();
+                    let served = tokio::spawn(async move {
+                        let _ = serve_fake_redis(socket, state, fail_writes).await;
+                    });
+                    if let Ok(mut connections) = connections.lock() {
+                        connections.push(served);
+                    }
+                }
+            })
+        };
+        Self {
+            url: format!("redis://127.0.0.1:{port}"),
+            settings,
+            state,
+            fail_writes,
+            connections,
+            listener: Mutex::new(Some(handle)),
+        }
+    }
+
+    fn url(&self) -> &str {
+        &self.url
+    }
+
+    fn settings(&self) -> CacheSettings {
+        self.settings
+    }
+
+    /// 缓存里的原文（不看 TTL）。
+    fn raw(&self, key: &str) -> Option<String> {
+        self.state
+            .lock()
+            .expect("cache state lock")
+            .get(key)
+            .map(|entry| entry.value.clone())
+    }
+
+    fn json(&self, key: &str) -> Option<Value> {
+        self.raw(key)
+            .map(|raw| serde_json::from_str(&raw).expect("cache values are JSON"))
+    }
+
+    /// 直接写一条（绕过服务）：用例用它构造"缓存被人为改错"。
+    fn put(&self, key: &str, value: &Value) {
+        self.state.lock().expect("cache state lock").insert(
+            key.to_owned(),
+            CacheEntry {
+                value: value.to_string(),
+                expires_at: None,
+            },
+        );
+    }
+
+    /// 让后续的 `SET` / `DEL` 全部失败：模拟"发布之后的失效没成功"。
+    fn set_fail_writes(&self, fail: bool) {
+        self.fail_writes
+            .store(fail, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// 关掉这个缓存服务：监听与已建立的连接一起断，客户端会看到连接被重置。
+    fn stop(&self) {
+        if let Ok(mut listener) = self.listener.lock()
+            && let Some(handle) = listener.take()
+        {
+            handle.abort();
+        }
+        if let Ok(mut connections) = self.connections.lock() {
+            for handle in connections.drain(..) {
+                handle.abort();
+            }
+        }
+    }
+
+    fn balance(&self, account_id: &str) -> Option<Value> {
+        self.json(&format!("user_balance:{account_id}"))
+    }
+
+    fn route(&self, gateway_model: &str) -> Option<Value> {
+        self.json(&format!("route:{gateway_model}"))
+    }
+
+    /// 把缓存里的余额改成一个错值（写入时间与来源由用例指定）。
+    fn corrupt_balance(
+        &self,
+        account_id: &str,
+        balance_microusd: i64,
+        source: &str,
+        written_at: Value,
+    ) {
+        self.put(
+            &format!("user_balance:{account_id}"),
+            &json!({
+                "balance_microusd": balance_microusd,
+                "written_at": written_at,
+                "source": source,
+            }),
+        );
+    }
+
+    /// 等到缓存里的余额变成这个值（对账是定时的，只能等）。
+    async fn wait_for_balance(&self, account_id: &str, expected: i64) -> Option<Value> {
+        for _ in 0..200 {
+            if let Some(cached) = self.balance(account_id)
+                && cached["balance_microusd"] == json!(expected)
+            {
+                return Some(cached);
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+        None
+    }
+}
+
+/// 给子进程装上加速层的那几个环境变量。
+fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
+    let Some(cache) = cache else {
+        // 不设 `REDIS_URL` 就是"没有缓存"：加速层不构造，路径与没有这一层时逐位相同。
+        return;
+    };
+    let settings = cache.settings();
+    command
+        .env("REDIS_URL", cache.url())
+        .env(
+            "CACHE_ROUTE_TTL_SECONDS",
+            settings.route_ttl_seconds.to_string(),
+        )
+        .env(
+            "CACHE_BALANCE_TTL_SECONDS",
+            settings.balance_ttl_seconds.to_string(),
+        )
+        .env(
+            "CACHE_FRESHNESS_WINDOW_MS",
+            settings.freshness_window_ms.to_string(),
+        )
+        .env(
+            "CACHE_RECONCILE_INTERVAL_MS",
+            settings.reconcile_interval_ms.to_string(),
+        )
+        .env("CACHE_OPERATION_TIMEOUT_MS", "200");
+}
+
+/// 假 Redis 的服务循环：读一条 RESP 命令、回一条应答。
+async fn serve_fake_redis(
+    socket: tokio::net::TcpStream,
+    state: Arc<Mutex<BTreeMap<String, CacheEntry>>>,
+    fail_writes: Arc<std::sync::atomic::AtomicBool>,
+) -> std::io::Result<()> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
+
+    let (read_half, mut writer) = socket.into_split();
+    let mut reader = BufReader::new(read_half);
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).await? == 0 {
+            return Ok(());
+        }
+        let header = header.trim_end();
+        let Some(count) = header.strip_prefix('*') else {
+            // 客户端只用数组形式；真收到别的就当这条连接没法用了。
+            return Ok(());
+        };
+        let count: usize = count.parse().unwrap_or(0);
+        let mut args = Vec::with_capacity(count);
+        for _ in 0..count {
+            let mut bulk_header = String::new();
+            if reader.read_line(&mut bulk_header).await? == 0 {
+                return Ok(());
+            }
+            let length: usize = bulk_header
+                .trim_end()
+                .trim_start_matches('$')
+                .parse()
+                .unwrap_or(0);
+            let mut buffer = vec![0_u8; length + 2];
+            reader.read_exact(&mut buffer).await?;
+            args.push(String::from_utf8_lossy(&buffer[..length]).into_owned());
+        }
+        let reply = fake_redis_command(&args, &state, &fail_writes);
+        writer.write_all(reply.as_bytes()).await?;
+    }
+}
+
+/// 一条命令的应答。只认加速层真正会发的那几条：**认不出来的一律报错**——假服务宽容地回 `+OK`
+/// 会让"命令名写错了"这种错误在用例里悄悄通过，而真实 Redis 会直接拒绝它。
+///
+/// `CLIENT` 要放行：客户端建连接时会发两条 `CLIENT SETINFO`，它们的应答内容没人看。
+fn fake_redis_command(
+    args: &[String],
+    state: &Arc<Mutex<BTreeMap<String, CacheEntry>>>,
+    fail_writes: &Arc<std::sync::atomic::AtomicBool>,
+) -> String {
+    let name = args
+        .first()
+        .map(|value| value.to_ascii_uppercase())
+        .unwrap_or_default();
+    match name.as_str() {
+        "GET" => {
+            let Some(key) = args.get(1) else {
+                return "-ERR wrong number of arguments\r\n".to_owned();
+            };
+            let mut state = state.lock().expect("cache state lock");
+            let expired = state
+                .get(key)
+                .and_then(|entry| entry.expires_at)
+                .is_some_and(|deadline| deadline <= tokio::time::Instant::now());
+            if expired {
+                state.remove(key);
+            }
+            match state.get(key) {
+                Some(entry) => bulk_string(&entry.value),
+                None => "$-1\r\n".to_owned(),
+            }
+        }
+        "SET" => {
+            if fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return "-ERR writes are disabled in this test\r\n".to_owned();
+            }
+            let (Some(key), Some(value)) = (args.get(1), args.get(2)) else {
+                return "-ERR wrong number of arguments\r\n".to_owned();
+            };
+            let expires_at = match (
+                args.get(3).map(|option| option.to_ascii_uppercase()),
+                args.get(4).and_then(|amount| amount.parse::<u64>().ok()),
+            ) {
+                (Some(option), Some(amount)) if option == "PX" => {
+                    Some(tokio::time::Instant::now() + Duration::from_millis(amount))
+                }
+                (Some(option), Some(amount)) if option == "EX" => {
+                    Some(tokio::time::Instant::now() + Duration::from_secs(amount))
+                }
+                _ => None,
+            };
+            state.lock().expect("cache state lock").insert(
+                key.clone(),
+                CacheEntry {
+                    value: value.clone(),
+                    expires_at,
+                },
+            );
+            "+OK\r\n".to_owned()
+        }
+        "DEL" => {
+            if fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
+                return "-ERR writes are disabled in this test\r\n".to_owned();
+            }
+            let mut state = state.lock().expect("cache state lock");
+            let mut removed = 0_i64;
+            for key in args.iter().skip(1) {
+                if state.remove(key).is_some() {
+                    removed += 1;
+                }
+            }
+            format!(":{removed}\r\n")
+        }
+        "PING" => "+PONG\r\n".to_owned(),
+        "CLIENT" => "+OK\r\n".to_owned(),
+        other => format!("-ERR unknown command '{other}'\r\n"),
+    }
+}
+
+fn bulk_string(value: &str) -> String {
+    format!("${}\r\n{value}\r\n", value.len())
+}
+
+/// 这次用例发布的定价（与 P2b 的用例同一份口径），让"保底额"与"实收"都是确定的数。
+async fn publish_cache_priced(harness: &Harness, consumer_rates: Value) -> StatusCode {
+    let client = Client::new();
+    republish_priced(
+        harness,
+        &client,
+        openai_floor_amounts(),
+        consumer_rates,
+        2_000,
+    )
+    .await
+}
+
+/// 该账户在**数据库**里的余额（账本是权威）。
+async fn database_balance(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT balance_microusd FROM ledger.accounts WHERE id = $1")
+        .bind(Uuid::parse_str(account_id).expect("account id"))
+        .fetch_one(&harness.pool)
+        .await
+        .expect("balance")
+}
+
+/// 某一类审计事件的载荷（运营要能发现平台侧事件）。
+async fn audit_events(harness: &Harness, action: &str) -> Vec<Value> {
+    sqlx::query_scalar(
+        "SELECT payload FROM operations.audit_events WHERE action = $1 ORDER BY created_at ASC",
+    )
+    .bind(action)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("audit events")
+}
+
+/// 等内部执行记录跑到某个状态：起了 Worker 之后，Job 是被异步领走的，读一次不够。
+async fn wait_for_job_state(harness: &Harness, key: &str, expected: &str) {
+    for _ in 0..300 {
+        if harness.job(key).await.1 == expected {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+    assert_eq!(
+        harness.job(key).await.1,
+        expected,
+        "内部执行记录必须跑到这个状态"
+    );
+}
+
+/// 对客响应里**可比对**的那部分：图片项各有哪些字段、是不是本机假上游给的 `url`。
+///
+/// `created` 是时间戳，`url` 里带着假上游每次随机的端口——两者逐位比不了。比的是响应结构：
+/// 缓存开着与关掉，对客拿到的形状必须逐位相同。
+fn comparable_response(body: &Value) -> Vec<(Vec<String>, bool)> {
+    body["data"]
+        .as_array()
+        .map(|items| {
+            items
+                .iter()
+                .map(|item| {
+                    let mut keys: Vec<String> = item
+                        .as_object()
+                        .map(|object| object.keys().cloned().collect())
+                        .unwrap_or_default();
+                    keys.sort();
+                    let is_url = item["url"]
+                        .as_str()
+                        .is_some_and(|url| url.starts_with("http://127.0.0.1:"));
+                    (keys, is_url)
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// **写穿**：充值、受理预授权扣减、结算三条路径都在数据库提交之后把余额写进缓存。
+///
+/// 一次用例把三条路径都走一遍：充值后缓存立刻是充值后的值；不跑 Worker 发一次请求（同步入口
+/// 超时，但 Job 已经受理、预授权已经扣），缓存跟着变成"初始 − 保底额"；再起 Worker 把同一个 Job
+/// 跑完，缓存变成结算后的余额。每一步都与数据库逐位比对。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn cache_write_through_makes_the_balance_visible_after_every_write() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        1,
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+
+    // ① 充值：提交后立刻可见。
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let cached = harness
+        .cache()
+        .balance(&account_id)
+        .expect("充值之后缓存里必须立刻有余额");
+    assert_eq!(cached["balance_microusd"], json!(1_000_000));
+    assert_eq!(cached["source"], json!("db_commit"));
+    assert_eq!(
+        cached["balance_microusd"],
+        json!(database_balance(&harness, &account_id).await),
+        "缓存里的值与数据库逐位一致"
+    );
+
+    // ② 受理（预授权扣减）：不跑 Worker，同步入口 1 秒后超时；Job 已受理、保底额已扣。
+    let key = format!("cache-hold-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "cache contract");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "accepted");
+    let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
+    assert_eq!(
+        cached["balance_microusd"],
+        json!(1_000_000 - 250_000),
+        "缓存跟着变成扣掉保底额之后的值"
+    );
+    assert_eq!(
+        cached["balance_microusd"],
+        json!(database_balance(&harness, &account_id).await)
+    );
+
+    // route 缓存也建起来了，且带着**当前生效修订**的标识。
+    let cached_route = harness
+        .cache()
+        .route(harness.model)
+        .expect("受理之后 route 缓存必须建起来");
+    let effective: Uuid =
+        sqlx::query_scalar("SELECT runtime_revision_id FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job revision");
+    assert_eq!(
+        cached_route["runtime_revision_id"],
+        json!(effective.to_string()),
+        "route 缓存带的是写它那次发布的修订标识"
+    );
+
+    // ③ 结算：起 Worker 把同一个 Job 跑完，缓存变成实收之后的余额。
+    let _worker = harness.spawn_worker();
+    wait_for_job_state(&harness, &key, "succeeded").await;
+    let settled = database_balance(&harness, &account_id).await;
+    assert_eq!(settled, 1_000_000 - 43_680, "实收按对客费率向量算");
+    let cached = harness.cache().balance(&account_id).expect("结算之后缓存");
+    assert_eq!(cached["balance_microusd"], json!(settled));
+    assert_eq!(cached["source"], json!("db_commit"));
+
+    harness.cleanup().await;
+}
+
+/// **停掉缓存服务，结果逐位相同**：同一场景跑两遍（配了缓存但把服务关掉 / 完全不配缓存），
+/// 实收、最终余额、Job 终态与对客响应体都逐位相同——降级是"全部回源数据库"，不是"另一条路径"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
+    /// 跑一遍完整场景，回读可比对的四个数。
+    async fn run(cache: Option<CacheFixture>) -> (i64, i64, String, Vec<(Vec<String>, bool)>) {
+        let draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+        let harness = match cache {
+            Some(cache) => {
+                Harness::start_with_cache(
+                    draft,
+                    None,
+                    UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+                    64,
+                    30,
+                    cache,
+                )
+                .await
+            }
+            None => {
+                Harness::start_with_draft(
+                    draft,
+                    None,
+                    UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+                    64,
+                )
+                .await
+            }
+        };
+        let client = Client::new();
+        assert_eq!(
+            publish_cache_priced(&harness, priced_consumer_rates()).await,
+            StatusCode::OK
+        );
+        let (account_id, api_key) =
+            funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+        // 充值把缓存写起来之后再把缓存服务关掉：这时"缓存里有一条值、服务却不可用"。
+        if let Some(cache) = harness.cache.as_ref() {
+            assert!(cache.balance(&account_id).is_some());
+            cache.stop();
+        }
+        let _worker = harness.spawn_worker();
+        let key = format!("cache-down-{}", Uuid::new_v4());
+        let mut request = route_request(harness.model, "cache down contract");
+        request["size"] = json!("2K");
+        request["quality"] = json!("low");
+        let (status, body) = post_json(
+            &harness.base_url,
+            &api_key,
+            "/v1/images/generations",
+            &key,
+            &request,
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+        let (job_id, state, _) = harness.job(&key).await;
+        let captured = harness.captured_microusd(job_id).await;
+        let balance = database_balance(&harness, &account_id).await;
+        let shape = comparable_response(&body);
+        harness.cleanup().await;
+        (captured, balance, state, shape)
+    }
+
+    let with_cache = run(Some(CacheFixture::start(CacheSettings::default()).await)).await;
+    let without_cache = run(None).await;
+    assert_eq!(
+        with_cache, without_cache,
+        "缓存不可用与完全没有缓存必须逐位相同（实收、余额、终态、响应体）"
+    );
+    assert_eq!(with_cache.0, -43_680, "实收按对客费率向量算");
+    assert_eq!(with_cache.1, 1_000_000 - 43_680);
+}
+
+/// **route 缓存陈旧不可用**：发布新修订之后让失效失败（或手工把值里的修订标识改旧）→ 受理
+/// **回源数据库**读到新候选集，选路与定价都用新修订那一份。
+///
+/// 这条验的是"陈旧可检"：正确性不依赖"发布后的失效一定成功"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_stale_route_cache_falls_back_to_the_database() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+
+    // 先受理一次，把 route 缓存写起来（带着第一版修订的标识）。
+    let first_key = format!("cache-route-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "route cache contract");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let _worker = harness.spawn_worker();
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &first_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let stale = harness.cache().route(harness.model).expect("route 缓存");
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &first_key).await["consumer_rates_cny"],
+        priced_consumer_rates()
+    );
+
+    // 换一份对客费率重发修订，并让**失效失败**：缓存里留着的还是第一版那份候选集。
+    harness.cache().set_fail_writes(true);
+    let mut higher = priced_consumer_rates();
+    higher["image_output_micros_per_million"] = json!(440_000_000);
+    assert_eq!(
+        publish_cache_priced(&harness, higher.clone()).await,
+        StatusCode::OK
+    );
+    harness.cache().set_fail_writes(false);
+    assert_eq!(
+        harness.cache().route(harness.model).expect("旧值还在"),
+        stale,
+        "失效失败了，缓存里留着的还是旧值（这正是要检出的情形）"
+    );
+
+    // 再受理一次：修订标识对不上 ⇒ 回源数据库，用新修订的定价。
+    let second_key = format!("cache-route-next-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &second_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &second_key).await["consumer_rates_cny"],
+        higher,
+        "陈旧缓存必须回源，用新修订那一份定价"
+    );
+    assert_ne!(
+        harness.cache().route(harness.model).expect("重建后的缓存"),
+        stale,
+        "回源之后缓存被重建成新修订那一份"
+    );
+
+    // 第二种陈旧形态：手工把值里的修订标识改旧，结果同样回源。
+    let mut forged = harness.cache().route(harness.model).expect("缓存");
+    forged["runtime_revision_id"] = json!(Uuid::new_v4().to_string());
+    harness
+        .cache()
+        .put(&format!("route:{}", harness.model), &forged);
+    let third_key = format!("cache-route-forged-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &third_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &third_key).await["consumer_rates_cny"],
+        higher
+    );
+
+    harness.cleanup().await;
+}
+
+/// **陈旧缓存不得拒绝**：缓存里的余额偏低，但超出新鲜窗口（或来源是对账写回）→ 不提前拒绝，
+/// 判定交给数据库，请求照常成功。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_stale_balance_entry_never_rejects() {
+    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(settings).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
+    let written_at = fresh["written_at"].clone();
+
+    // ① 来源是对账写回：它只保证"与数据库一致"，不构成"刚有一笔钱变动过"的证据。
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 1, "reconciler", written_at);
+    let _worker = harness.spawn_worker();
+    let mut request = route_request(harness.model, "stale cache contract");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let first_key = format!("cache-stale-reconciler-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &first_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "对账写回的值不得用于拒绝：{body}");
+
+    // ② 来源是写穿路径，但写入时间在窗口之外（一小时前）。
+    let long_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 1, "db_commit", json!(long_ago));
+    let second_key = format!("cache-stale-old-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &second_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "陈旧缓存不得拒绝：{body}");
+
+    // 两次都真的扣了钱（判定交给了数据库），而且没有留下任何"凭缓存拒绝"的审计。
+    assert_eq!(
+        database_balance(&harness, &account_id).await,
+        1_000_000 - 2 * 43_680
+    );
+    assert!(
+        audit_events(&harness, "balance.precheck_rejected")
+            .await
+            .is_empty(),
+        "没有发生凭缓存的拒绝"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **误拒有审计**：缓存**新鲜**（来源写穿、写入时间在窗口内）且余额低于保底额 → 提前返回
+/// 402，不建 Job、不扣款，同时留下一条审计（缓存余额、写入时间、来源与本次保底额）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_fresh_cache_rejection_is_audited() {
+    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(settings).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
+    let written_at = fresh["written_at"].clone();
+    // 缓存说"不够"（比 2K 档的保底额 ¥0.25 还少），数据库说"够"——这正是要能解释清楚的那一次。
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 1, "db_commit", written_at.clone());
+
+    let key = format!("cache-reject-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "fresh cache rejection");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "got {body}");
+    assert_eq!(body["error"]["code"], json!("insufficient_balance"));
+
+    // 拒绝没有副作用：不建 Job、不扣款。
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job count");
+    assert_eq!(jobs, 0, "凭缓存拒绝不建 Job");
+    assert_eq!(database_balance(&harness, &account_id).await, 1_000_000);
+
+    // 但必须留下一条能解释"为什么拒了这个客户"的审计。
+    let events = audit_events(&harness, "balance.precheck_rejected").await;
+    assert_eq!(events.len(), 1, "凭缓存拒绝必须留审计");
+    assert_eq!(events[0]["cached_balance_microusd"], json!(1));
+    assert_eq!(events[0]["cached_source"], json!("db_commit"));
+    assert_eq!(events[0]["cached_written_at"], written_at);
+    assert_eq!(events[0]["hold_microusd"], json!(250_000));
+    assert_eq!(events[0]["gateway_model"], json!(harness.model));
+
+    harness.cleanup().await;
+}
+
+/// **重放不受余额预检管辖**：同一个幂等键重发会去重成原来那个 Job，不新建、不扣款，所以哪怕
+/// 缓存新鲜且余额已经低于保底额，也不能凭它回 402——否则"重发同一个键"就变成看余额脸色的行为。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
+    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        1,
+        CacheFixture::start(settings).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    // 余额刚好够扣一次保底额（¥0.30 ≥ ¥0.25）：受理之后余额就低于保底额了。
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 300_000).await;
+
+    let key = format!("cache-replay-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "replay contract");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
+    let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
+    assert_eq!(
+        cached["balance_microusd"],
+        json!(50_000),
+        "缓存新鲜，且已经低于 2K 档的保底额"
+    );
+
+    // 同一个键立刻重发：去重成原来那个 Job，不因为缓存说"不够"而被拒。
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "重放不得被预检拒：{body}"
+    );
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.jobs WHERE account_id = $1 AND idempotency_key = $2",
+    )
+    .bind(Uuid::parse_str(&account_id).expect("account id"))
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job count");
+    assert_eq!(jobs, 1, "重放去重成原来那个 Job");
+    assert_eq!(
+        database_balance(&harness, &account_id).await,
+        50_000,
+        "重放不扣款"
+    );
+    assert!(
+        audit_events(&harness, "balance.precheck_rejected")
+            .await
+            .is_empty(),
+        "重放没有发生凭缓存的拒绝"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **定时对账兜底**：把缓存里的余额与候选集改错 → 对账以数据库为准覆盖，并留下审计。
+///
+/// 覆盖之后的来源标记是 `reconciler`——它**不再**能用于提前拒绝（见上一条用例的口径）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
+    // 对账周期 1 秒、新鲜窗口 200 毫秒：用例等得起，而且满足"窗口显著小于周期"。
+    let settings = CacheSettings::default().with_windows(200, 1_000);
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(settings).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+
+    // 先受理一次把 route 缓存写起来，再把余额与候选集都改错。
+    let _worker = harness.spawn_worker();
+    let key = format!("cache-reconcile-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "reconcile contract");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let settled = database_balance(&harness, &account_id).await;
+    let fresh = harness.cache().balance(&account_id).expect("结算之后缓存");
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 1, "db_commit", fresh["written_at"].clone());
+    let mut forged_route = harness.cache().route(harness.model).expect("route 缓存");
+    forged_route["runtime_revision_id"] = json!(Uuid::new_v4().to_string());
+    harness
+        .cache()
+        .put(&format!("route:{}", harness.model), &forged_route);
+
+    let corrected = harness
+        .cache()
+        .wait_for_balance(&account_id, settled)
+        .await
+        .expect("定时对账必须把缓存余额覆盖回数据库的值");
+    assert_eq!(
+        corrected["source"],
+        json!("reconciler"),
+        "对账写回的值来源是 reconciler（因此不再能用于提前拒绝）"
+    );
+    assert_eq!(corrected["balance_microusd"], json!(settled));
+
+    // 候选集那条：对账校正它以当前生效修订为准（这里直接把它拿掉，下一次受理回源重建）。
+    for _ in 0..200 {
+        if harness.cache().route(harness.model).is_none() {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(
+        harness.cache().route(harness.model).is_none(),
+        "对账必须把陈旧候选集拿掉"
+    );
+
+    let balance_events = audit_events(&harness, "cache.balance_corrected").await;
+    assert!(
+        !balance_events.is_empty(),
+        "覆盖缓存必须留审计（运营要能发现缓存被动过）"
+    );
+    assert_eq!(balance_events[0]["cached_balance_microusd"], json!(1));
+    assert_eq!(
+        balance_events[0]["database_balance_microusd"],
+        json!(settled)
+    );
+    assert!(
+        !audit_events(&harness, "cache.route_invalidated")
+            .await
+            .is_empty(),
+        "候选集被校正也要留审计"
+    );
+
+    harness.cleanup().await;
 }

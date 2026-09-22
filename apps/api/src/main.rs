@@ -11,12 +11,13 @@ use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
-    AdapterRegistry, ApplicationError, CreateImageGenerationRequest, GatewayModelView,
-    GeneratedImage, GenerationService, HubRepository, IdentityService, JobView,
-    MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
-    RefundReconciliationCommand, RuntimeService,
+    AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
+    CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationService,
+    HubRepository, IdentityService, JobView, MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService,
+    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RuntimeService,
 };
+use seeai_cache_redis::RedisCache;
 use seeai_domain::{
     AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel,
     contract_image_parameter_kind, replace_contract_model_identity,
@@ -33,12 +34,13 @@ use uuid::Uuid;
 #[derive(Clone)]
 struct AppState {
     admin_token: Arc<str>,
-    repository: Arc<dyn HubRepository>,
     identity: IdentityService,
     runtime: RuntimeService,
     reconciliation: ReconciliationService,
     /// 定价侧的管理员面：折算率的录入与取值（汇率不进不可变修订）。
     pricing: PricingService,
+    /// 账户面的管理员用例：建账户与充值——两件事都要在提交成功后把余额写进缓存。
+    accounts: AccountsService,
     generations: GenerationService,
     /// 同步入口等任务跑完的最长时间。
     sync_wait: Duration,
@@ -63,19 +65,41 @@ async fn main() -> Result<()> {
             Arc::new(AihubmixAdapterFactory),
             Arc::new(ApimartAdapterFactory),
         ]));
+    // 加速层：`REDIS_URL` 没配就是没有缓存——那时这一层是空操作，受理路径连那次轻量读都不做，
+    // 行为与没有它时逐位相同。配了但连不上也只是"每次都未命中"，回源数据库。
+    let acceleration = match RedisCache::from_env()? {
+        Some(cache) => {
+            info!("cache acceleration layer enabled");
+            Arc::new(AccelerationService::new(
+                repository_port.clone(),
+                Arc::new(cache),
+                CachePolicy::from_env()?,
+            ))
+        }
+        None => Arc::new(AccelerationService::disabled(repository_port.clone())),
+    };
+    // 定时对账兜底：以数据库为准把缓存覆盖回去。它挂在这里而不是 Worker 上——对客请求由本进程
+    // 服务，本进程在，兜底就在。
+    if acceleration.is_enabled() {
+        tokio::spawn(acceleration.clone().run_reconciler());
+    }
     let state = AppState {
         admin_token,
-        repository: repository_port.clone(),
         identity: IdentityService::new(repository_port.clone()),
-        runtime: RuntimeService::new(repository_port.clone(), adapters),
-        reconciliation: ReconciliationService::new(repository_port.clone()),
+        runtime: RuntimeService::new(repository_port.clone(), adapters)
+            .with_acceleration(acceleration.clone()),
+        reconciliation: ReconciliationService::new(repository_port.clone())
+            .with_acceleration(acceleration.clone()),
         pricing: PricingService::new(repository_port.clone()),
+        accounts: AccountsService::new(repository_port.clone())
+            .with_acceleration(acceleration.clone()),
         sync_wait: generation_sync_wait()?,
         generations: GenerationService::new(
             repository_port,
             generation_max_cost_microusd()?,
             generation_max_concurrent_jobs()?,
-        ),
+        )
+        .with_acceleration(acceleration),
     };
     let app = Router::new()
         .route("/health", get(health))
@@ -151,7 +175,7 @@ async fn create_account(
     require_admin(&state, &headers)?;
     let account_id = AccountId::new();
     state
-        .repository
+        .accounts
         .create_account(account_id, body.initial_credit_microusd, "admin-api")
         .await?;
     Ok(Json(CreateAccountResponse { account_id }))
@@ -171,7 +195,7 @@ async fn credit_account(
 ) -> Result<StatusCode, ApiError> {
     require_admin(&state, &headers)?;
     state
-        .repository
+        .accounts
         .credit_account(
             AccountId(account_id),
             body.amount_microusd,

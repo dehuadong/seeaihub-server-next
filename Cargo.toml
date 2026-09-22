@@ -8,6 +8,7 @@ members = [
   "crates/adapter-aihubmix",
   "crates/adapter-apimart",
   "crates/persistence",
+  "crates/cache-redis",
 ]
 resolver = "3"
 

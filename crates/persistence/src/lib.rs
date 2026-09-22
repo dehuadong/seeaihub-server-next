@@ -1,11 +1,11 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
-    ApplicationError, AttemptFailure, ClaimedJob, CompleteJob, GatewayModelCandidateView,
-    GatewayModelView, HoldDisposition, HubRepository, JobView, LeaseRecovery, NewFxRate,
-    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
-    RoutingDecision,
+    AcceptanceProbe, ApplicationError, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
+    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
+    LeaseRecovery, NewFxRate, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
+    RefundReconciliationCommand, RoutingDecision,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -16,6 +16,7 @@ use seeai_domain::{
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
+use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
 /// **唯一的候选可用性判据**：这条候选现在真的能走吗——它自己启用，且它所在的渠道也启用。
@@ -61,6 +62,24 @@ impl PgHubRepository {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// 读一个账户**当前**的余额与写入时刻。
+    ///
+    /// 用在"这次没有改动余额、但调用方仍要刷新缓存"的路径上（幂等重放、保留预授权的失败收尾）：
+    /// 返回数据库的值总不会错，而"重放后缓存还留着旧数"会让下一次预检拿着过时的数去判。
+    async fn account_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<BalanceChange, ApplicationError> {
+        let row =
+            sqlx::query("SELECT balance_microusd, updated_at FROM ledger.accounts WHERE id = $1")
+                .bind(account_id.0)
+                .fetch_optional(&self.pool)
+                .await
+                .map_err(database_error)?
+                .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+        balance_change(&row, account_id)
     }
 
     async fn load_generation_job(&self, job_id: JobId) -> Result<GenerationJob, ApplicationError> {
@@ -807,14 +826,19 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
         initial_credit_microusd: u64,
         actor: &str,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<BalanceChange, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, $2)")
-            .bind(account_id.0)
-            .bind(to_i64(initial_credit_microusd)?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, $2)
+            RETURNING balance_microusd, updated_at
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(to_i64(initial_credit_microusd)?)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
         if initial_credit_microusd > 0 {
             sqlx::query(
                 r#"
@@ -840,7 +864,8 @@ impl HubRepository for PgHubRepository {
             &serde_json::json!({"initial_credit_microusd": initial_credit_microusd}),
         )
         .await?;
-        transaction.commit().await.map_err(database_error)
+        transaction.commit().await.map_err(database_error)?;
+        balance_change(&inserted, account_id)
     }
 
     async fn credit_account(
@@ -849,7 +874,7 @@ impl HubRepository for PgHubRepository {
         amount_microusd: u64,
         business_key: &str,
         actor: &str,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<BalanceChange, ApplicationError> {
         if amount_microusd == 0 {
             return Err(ApplicationError::Validation(
                 "credit amount must be positive".to_owned(),
@@ -871,22 +896,21 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if inserted.rows_affected() == 1 {
+        let change = if inserted.rows_affected() == 1 {
             let updated = sqlx::query(
                 r#"
                 UPDATE ledger.accounts
                 SET balance_microusd = balance_microusd + $2, updated_at = now()
                 WHERE id = $1
+                RETURNING balance_microusd, updated_at
                 "#,
             )
             .bind(account_id.0)
             .bind(to_i64(amount_microusd)?)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
-            .map_err(database_error)?;
-            if updated.rows_affected() != 1 {
-                return Err(ApplicationError::NotFound(format!("account {account_id}")));
-            }
+            .map_err(database_error)?
+            .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
             insert_audit(
                 &mut transaction,
                 actor,
@@ -896,6 +920,7 @@ impl HubRepository for PgHubRepository {
                 &serde_json::json!({"amount_microusd": amount_microusd, "business_key": business_key}),
             )
                 .await?;
+            balance_change(&updated, account_id)?
         } else {
             let existing = sqlx::query(
                 "SELECT account_id, kind, amount_microusd FROM ledger.entries WHERE business_key = $1",
@@ -917,7 +942,112 @@ impl HubRepository for PgHubRepository {
                     "credit business_key was already used with different input".to_owned(),
                 ));
             }
-        }
+            // 幂等重放：这次没有改动余额，但返回**当前**余额——把缓存刷成数据库的值不会有坏处，
+            // 而"重放后缓存还是旧的"会让下一次预检拿着一个过时的数去判。
+            let current = sqlx::query(
+                "SELECT balance_microusd, updated_at FROM ledger.accounts WHERE id = $1",
+            )
+            .bind(account_id.0)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+            balance_change(&current, account_id)?
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok(change)
+    }
+
+    async fn acceptance_probe(
+        &self,
+        gateway_model: &str,
+        account_id: AccountId,
+        idempotency_key: &str,
+    ) -> Result<AcceptanceProbe, ApplicationError> {
+        // 一条查询读完四件事，且**永远返回一行**：没有这个网关模型时开关为 false、修订为空，
+        // 受理侧对它的处置与"取不到任何候选"一样（对客是"模型不存在"）。
+        //
+        // 开关必须单独读：`PATCH enabled` 改的是可变表、不改变修订标识，只比对修订标识的话，
+        // 关掉的模型会在 route 缓存的有效期内继续被受理。时钟也一起取回来，"缓存值新不新鲜"
+        // 因此用的是数据库的时钟，不受进程与库之间漂移的影响。
+        //
+        // 重放这一项按 `(account_id, idempotency_key)` 的唯一索引判，是一次索引探测：它只决定
+        // 余额预检该不该拦这一次请求，不参与任何金额判定。
+        let row = sqlx::query(
+            r#"
+            SELECT
+                now() AS database_now,
+                COALESCE(
+                    (SELECT gm.enabled FROM publication.gateway_models gm
+                     WHERE gm.gateway_model = $1),
+                    false
+                ) AS enabled,
+                (SELECT re.runtime_revision_id FROM publication.runtime_entries re
+                 WHERE re.active AND re.gateway_model = $1
+                 ORDER BY re.routing_priority ASC, re.offering_id ASC
+                 LIMIT 1) AS runtime_revision_id,
+                EXISTS (
+                    SELECT 1 FROM generation.jobs j
+                    WHERE j.account_id = $2 AND j.idempotency_key = $3
+                ) AS replay
+            "#,
+        )
+        .bind(gateway_model)
+        .bind(account_id.0)
+        .bind(idempotency_key)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(AcceptanceProbe {
+            enabled: row.try_get("enabled").map_err(database_error)?,
+            effective_revision_id: row
+                .try_get::<Option<Uuid>, _>("runtime_revision_id")
+                .map_err(database_error)?
+                .map(RuntimeRevisionId),
+            database_now: row.try_get("database_now").map_err(database_error)?,
+            replay: row.try_get("replay").map_err(database_error)?,
+        })
+    }
+
+    async fn accounts_updated_within(
+        &self,
+        window: StdDuration,
+    ) -> Result<Vec<BalanceChange>, ApplicationError> {
+        // 窗口在**库侧**算：`now() - $1` 用的是数据库的时钟，与写穿缓存时盖章的 `updated_at`
+        // 同一个来源；换成进程时钟就会因为漂移漏掉刚变过的账户。
+        let rows = sqlx::query(
+            r#"
+            SELECT id, balance_microusd, updated_at FROM ledger.accounts
+            WHERE updated_at >= now() - make_interval(secs => $1)
+            ORDER BY updated_at ASC, id ASC
+            "#,
+        )
+        .bind(window.as_secs_f64())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(balance_change_with_account).collect()
+    }
+
+    async fn insert_audit_event(
+        &self,
+        actor: &str,
+        action: &str,
+        subject_type: &str,
+        subject_id: &str,
+        payload: Value,
+    ) -> Result<(), ApplicationError> {
+        // 单独一个事务：调用点都是"业务已经定局、现在要留痕"，不该被业务事务回滚带走。
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            action,
+            subject_type,
+            subject_id,
+            &payload,
+        )
+        .await?;
         transaction.commit().await.map_err(database_error)
     }
 
@@ -976,7 +1106,7 @@ impl HubRepository for PgHubRepository {
         offering: PublishedOffering,
         request_hash: String,
         routing: RoutingDecision,
-    ) -> Result<GenerationJob, ApplicationError> {
+    ) -> Result<(GenerationJob, BalanceChange), ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
             .bind(format!(
@@ -1003,24 +1133,29 @@ impl HubRepository for PgHubRepository {
                     "idempotency key was already used with different input".to_owned(),
                 ));
             }
-            return self.load_generation_job(JobId(existing_id)).await;
+            // 重放：这次没有扣减，但返回**当前**余额——缓存跟着刷成数据库的值不会有坏处，
+            // 而"重放后缓存还留着旧数"会让下一次预检拿着过时的数去判。
+            let job = self.load_generation_job(JobId(existing_id)).await?;
+            let balance = self.account_balance(command.account_id).await?;
+            return Ok((job, balance));
         }
         let max_cost = to_i64(command.max_cost_microusd)?;
+        // 预授权扣减：`RETURNING` 把**扣减之后**的余额带出来，调用方据此写穿缓存。
+        // 判据一字不动（`rows_affected != 1` ⇒ 余额不足），缓存从不参与这个判定。
         let reserved = sqlx::query(
             r#"
             UPDATE ledger.accounts
             SET balance_microusd = balance_microusd - $2, updated_at = now()
             WHERE id = $1 AND balance_microusd >= $2
+            RETURNING balance_microusd, updated_at
             "#,
         )
         .bind(command.account_id.0)
         .bind(max_cost)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?;
-        if reserved.rows_affected() != 1 {
-            return Err(ApplicationError::InsufficientBalance);
-        }
+        .map_err(database_error)?
+        .ok_or(ApplicationError::InsufficientBalance)?;
         let job_id = JobId::new();
         let hold_id = Uuid::new_v4();
         let price_snapshot = serde_json::to_value(&offering.price_snapshot)
@@ -1097,21 +1232,25 @@ impl HubRepository for PgHubRepository {
         .await
         .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
+        let balance = balance_change(&reserved, command.account_id)?;
         let now = Utc::now();
-        Ok(GenerationJob {
-            id: job_id,
-            account_id: command.account_id,
-            state: seeai_domain::JobState::Accepted,
-            branch,
-            gateway_model: command.gateway_model,
-            native_parameters: command.native_parameters,
-            offering,
-            idempotency_key: command.idempotency_key,
-            request_hash,
-            max_cost_microusd: command.max_cost_microusd,
-            created_at: now,
-            updated_at: now,
-        })
+        Ok((
+            GenerationJob {
+                id: job_id,
+                account_id: command.account_id,
+                state: seeai_domain::JobState::Accepted,
+                branch,
+                gateway_model: command.gateway_model,
+                native_parameters: command.native_parameters,
+                offering,
+                idempotency_key: command.idempotency_key,
+                request_hash,
+                max_cost_microusd: command.max_cost_microusd,
+                created_at: now,
+                updated_at: now,
+            },
+            balance,
+        ))
     }
 
     async fn get_job(
@@ -1353,7 +1492,10 @@ impl HubRepository for PgHubRepository {
         Ok(())
     }
 
-    async fn complete_job(&self, completion: CompleteJob) -> Result<(), ApplicationError> {
+    async fn complete_job(
+        &self,
+        completion: CompleteJob,
+    ) -> Result<BalanceChange, ApplicationError> {
         let CompleteJob {
             job_id,
             worker_id,
@@ -1447,14 +1589,21 @@ impl HubRepository for PgHubRepository {
         // 释放差额 = 预授权额 − 实收：估大了退回余额，**估小了这里就是负数**，余额被扣成负的
         // （透支在结算吸收）。库层的非负约束已放宽，所以这一步不再需要绕开。
         let refund = authorized - charge;
-        sqlx::query(
-            "UPDATE ledger.accounts SET balance_microusd = balance_microusd + $2, updated_at = now() WHERE id = $1",
+        // `RETURNING` 把结算之后的余额带出来：调用方据此写穿缓存（用户要求：扣减成功后立即同步）。
+        let settled = sqlx::query(
+            r#"
+            UPDATE ledger.accounts
+            SET balance_microusd = balance_microusd + $2, updated_at = now()
+            WHERE id = $1
+            RETURNING balance_microusd, updated_at
+            "#,
         )
         .bind(account_id.0)
         .bind(refund)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
         insert_ledger_entry(
             &mut transaction,
             account_id,
@@ -1473,7 +1622,8 @@ impl HubRepository for PgHubRepository {
             &format!("job:{job_id}:capture"),
         )
         .await?;
-        transaction.commit().await.map_err(database_error)
+        transaction.commit().await.map_err(database_error)?;
+        balance_change(&settled, account_id)
     }
 
     async fn fail_job(
@@ -1482,7 +1632,7 @@ impl HubRepository for PgHubRepository {
         worker_id: &str,
         attempt_id: Option<AttemptId>,
         failure: AttemptFailure,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<BalanceChange, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
             r#"
@@ -1564,6 +1714,9 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        // 释放预授权那条分支会改动余额，把变更后的值留到提交之后带回去；保留预授权的那条
+        // 不动余额，提交后读当前值。
+        let mut released_balance = None;
         if failure.hold_disposition == HoldDisposition::RetainForReconciliation {
             if failure.target_state != seeai_domain::JobState::ReconciliationRequired {
                 return Err(ApplicationError::Persistence(
@@ -1603,14 +1756,21 @@ impl HubRepository for PgHubRepository {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-            sqlx::query(
-                "UPDATE ledger.accounts SET balance_microusd = balance_microusd + $2, updated_at = now() WHERE id = $1",
+            // 释放预授权：余额变了，所以这里要把变更后的值带回去（调用方要写穿缓存）。
+            let released = sqlx::query(
+                r#"
+                UPDATE ledger.accounts
+                SET balance_microusd = balance_microusd + $2, updated_at = now()
+                WHERE id = $1
+                RETURNING balance_microusd, updated_at
+                "#,
             )
             .bind(account_id.0)
             .bind(held)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
-            .map_err(database_error)?;
+            .map_err(database_error)?
+            .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
             insert_ledger_entry(
                 &mut transaction,
                 account_id,
@@ -1620,8 +1780,14 @@ impl HubRepository for PgHubRepository {
                 &format!("job:{job_id}:failure-release"),
             )
             .await?;
+            released_balance = Some(balance_change(&released, account_id)?);
         }
-        transaction.commit().await.map_err(database_error)
+        transaction.commit().await.map_err(database_error)?;
+        // 保留预授权（进对账）的那条路径没有改动余额：返回**当前**余额，让缓存刷成数据库的值。
+        match released_balance {
+            Some(change) => Ok(change),
+            None => self.account_balance(account_id).await,
+        }
     }
 
     async fn count_in_flight_jobs(
@@ -1754,7 +1920,7 @@ impl HubRepository for PgHubRepository {
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<BalanceChange, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
             r#"
@@ -1776,12 +1942,14 @@ impl HubRepository for PgHubRepository {
             ApplicationError::NotFound(format!("reconciliation case for job {}", command.job_id))
         })?;
         let status: String = row.try_get("status").map_err(database_error)?;
+        let account_id = AccountId(row.try_get("account_id").map_err(database_error)?);
         if status == "resolved" {
             let existing_key: Option<String> =
                 row.try_get("refund_business_key").map_err(database_error)?;
             if existing_key.as_deref() == Some(command.business_key.as_str()) {
                 transaction.commit().await.map_err(database_error)?;
-                return Ok(());
+                // 重放：这次没有退款，但返回**当前**余额，让缓存刷成数据库的值。
+                return self.account_balance(account_id).await;
             }
             return Err(ApplicationError::Conflict(
                 "reconciliation case was already resolved differently".to_owned(),
@@ -1794,16 +1962,21 @@ impl HubRepository for PgHubRepository {
                 "reconciliation job or hold is not open".to_owned(),
             ));
         }
-        let account_id = AccountId(row.try_get("account_id").map_err(database_error)?);
         let held: i64 = row.try_get("held_microusd").map_err(database_error)?;
-        sqlx::query(
-            "UPDATE ledger.accounts SET balance_microusd = balance_microusd + $2, updated_at = now() WHERE id = $1",
+        let released = sqlx::query(
+            r#"
+            UPDATE ledger.accounts
+            SET balance_microusd = balance_microusd + $2, updated_at = now()
+            WHERE id = $1
+            RETURNING balance_microusd, updated_at
+            "#,
         )
         .bind(account_id.0)
         .bind(held)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?;
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
         sqlx::query(
             "UPDATE ledger.holds SET status = 'released', updated_at = now() WHERE job_id = $1 AND status = 'active'",
         )
@@ -1871,8 +2044,31 @@ impl HubRepository for PgHubRepository {
             }),
         )
         .await?;
-        transaction.commit().await.map_err(database_error)
+        transaction.commit().await.map_err(database_error)?;
+        balance_change(&released, account_id)
     }
+}
+
+/// 读一行的余额与写入时刻，配上调用方手上的账户。
+///
+/// `balance_microusd` 是 `bigint` 且**可以为负**（透支发生在结算）：这里不做非负校验，
+/// 负数必须原样读出来，否则"缓存里那个数"与账本就不一致了。
+fn balance_change(
+    row: &sqlx::postgres::PgRow,
+    account_id: AccountId,
+) -> Result<BalanceChange, ApplicationError> {
+    Ok(BalanceChange {
+        account_id,
+        balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+        updated_at: row.try_get("updated_at").map_err(database_error)?,
+    })
+}
+
+/// 读一行的账户、余额与写入时刻（对账取数用：查询里带 `id`）。
+fn balance_change_with_account(
+    row: &sqlx::postgres::PgRow,
+) -> Result<BalanceChange, ApplicationError> {
+    balance_change(row, AccountId(row.try_get("id").map_err(database_error)?))
 }
 
 async fn insert_audit(

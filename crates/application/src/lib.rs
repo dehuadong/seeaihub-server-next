@@ -19,7 +19,7 @@ use seeai_domain::{
     resolve_size_tier,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value};
+use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{collections::BTreeMap, sync::Arc, time::Duration};
 use thiserror::Error;
@@ -1292,20 +1292,64 @@ pub trait HubRepository: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ProviderCostGapView>, ApplicationError>;
 
+    /// 受理前的**轻量读**：网关模型开关、当前生效的修订标识与数据库时钟。
+    ///
+    /// 它只服务加速层：route 缓存里的值带着写它那次发布的修订标识，与这里读到的比对，不一致就
+    /// 回源；开关必须**单独**读，因为 `PATCH enabled` 不改变修订标识——交给缓存判定的话，关掉的
+    /// 模型会在缓存的有效期内继续被受理。时钟也一起取，好让"缓存值新不新鲜"用**同一个时钟**判。
+    ///
+    /// 账户与幂等键只用来判**这次是不是重放**（同一个键已经建过 Job）：重放不新建、不扣款，
+    /// 因此余额预检不该管它。这一项折在同一条查询里读，受理不会因此多一次往返。
+    ///
+    /// 没有这个网关模型时返回 `enabled = false` 与 `None`，不是错误：受理侧对它的处置与
+    /// "取不到任何候选"一样（对客是"模型不存在"）。
+    async fn acceptance_probe(
+        &self,
+        gateway_model: &str,
+        account_id: AccountId,
+        idempotency_key: &str,
+    ) -> Result<AcceptanceProbe, ApplicationError>;
+
+    /// 对账用的增量取数：`updated_at` 落在最近 `window` 内的账户与它们的余额。
+    ///
+    /// 窗口在**库侧**用 `now() - interval` 算：受理、对账、缓存里的写入时间取的都是数据库的
+    /// 时间，换成进程时钟就会因为漂移把刚变过的账户漏掉（或把没变过的算进来）。
+    async fn accounts_updated_within(
+        &self,
+        window: Duration,
+    ) -> Result<Vec<BalanceChange>, ApplicationError>;
+
+    /// 写一条审计事件（平台侧事件必须可发现）。
+    ///
+    /// 与业务写入**分开一个事务**：它的两个调用点都是"业务已经定局、现在要留痕"——凭缓存提前
+    /// 拒绝（根本没有业务写入）与对账覆盖（缓存不是账本）。塞进业务事务里会让留痕变成"能不能
+    /// 拒绝"的前置条件，那是反过来的依赖。
+    async fn insert_audit_event(
+        &self,
+        actor: &str,
+        action: &str,
+        subject_type: &str,
+        subject_id: &str,
+        payload: Value,
+    ) -> Result<(), ApplicationError>;
+
+    /// 建账户。返回的是**数据库里那个账户**变更后的余额与写入时刻：调用方要把它写进缓存
+    /// （写穿），而缓存里的写入时间要参与新鲜度判定与审计，只能用数据库盖章的那个时间。
     async fn create_account(
         &self,
         account_id: AccountId,
         initial_credit_microusd: u64,
         actor: &str,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 充值。返回提交后的余额与写入时刻（同一个幂等键重放时返回**当前**余额，让缓存跟着刷新）。
     async fn credit_account(
         &self,
         account_id: AccountId,
         amount_microusd: u64,
         business_key: &str,
         actor: &str,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<BalanceChange, ApplicationError>;
 
     async fn create_api_key(
         &self,
@@ -1318,6 +1362,9 @@ pub trait HubRepository: Send + Sync {
     async fn account_for_api_key(&self, key_hash: &str) -> Result<AccountId, ApplicationError>;
 
     /// 创建 Job，并与 Job **同事务**写入路由判定记录。
+    ///
+    /// 返回 Job 与**预授权扣减之后**的余额：受理的预授权扣减同样要写穿缓存，否则缓存会滞后
+    /// 一个预授权额。幂等重放（没有扣减）也返回当前余额——把缓存刷成数据库的值不会有坏处。
     async fn create_job(
         &self,
         command: CreateImageGeneration,
@@ -1325,7 +1372,7 @@ pub trait HubRepository: Send + Sync {
         offering: PublishedOffering,
         request_hash: String,
         routing: RoutingDecision,
-    ) -> Result<GenerationJob, ApplicationError>;
+    ) -> Result<(GenerationJob, BalanceChange), ApplicationError>;
 
     async fn get_job(
         &self,
@@ -1356,15 +1403,21 @@ pub trait HubRepository: Send + Sync {
         lease_duration: ChronoDuration,
     ) -> Result<(), ApplicationError>;
 
-    async fn complete_job(&self, completion: CompleteJob) -> Result<(), ApplicationError>;
+    /// 结算（`release` + `capture`）。返回结算**之后**的余额，供调用方写穿缓存。
+    async fn complete_job(
+        &self,
+        completion: CompleteJob,
+    ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 失败收尾。释放预授权的那些分支会改动余额，因此同样返回提交后的余额供写穿缓存——
+    /// 不写的话，缓存里会留着一个"刚写过、但偏高"的余额，那正是能被用来误拒的那类值。
     async fn fail_job(
         &self,
         job_id: JobId,
         worker_id: &str,
         attempt_id: Option<AttemptId>,
         failure: AttemptFailure,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<BalanceChange, ApplicationError>;
 
     /// 该账户当前**在跑**的 Job 数（`accepted`/`leased`/`submitting`）。
     ///
@@ -1386,10 +1439,11 @@ pub trait HubRepository: Send + Sync {
         query: ProviderFailureQuery,
     ) -> Result<Vec<ProviderFailureView>, ApplicationError>;
 
+    /// 对账退款（释放预授权）。返回**账户**与退款后的余额：调用方要按账户把余额写穿缓存。
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<BalanceChange, ApplicationError>;
 }
 
 /// 平台侧失败清单不传类别时的默认集合：只列**平台侧事件**。
@@ -1406,12 +1460,24 @@ fn default_failure_kinds() -> Vec<ProviderFailureKind> {
 #[derive(Clone)]
 pub struct ReconciliationService {
     repository: Arc<dyn HubRepository>,
+    acceleration: Arc<AccelerationService>,
 }
 
 impl ReconciliationService {
     #[must_use]
     pub fn new(repository: Arc<dyn HubRepository>) -> Self {
-        Self { repository }
+        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
+        Self {
+            repository,
+            acceleration,
+        }
+    }
+
+    /// 装上加速层：退款释放了预授权、余额变了，缓存要跟着刷新。
+    #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
+        self.acceleration = acceleration;
+        self
     }
 
     pub async fn list_open(&self) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
@@ -1449,7 +1515,11 @@ impl ReconciliationService {
                 "reconciliation note and business_key are required".to_owned(),
             ));
         }
-        self.repository.refund_reconciliation(command).await
+        let change = self.repository.refund_reconciliation(command).await?;
+        self.acceleration
+            .write_balance(&change, BalanceSource::DbCommit)
+            .await;
+        Ok(())
     }
 }
 
@@ -1563,6 +1633,667 @@ impl IdentityService {
     }
 }
 
+/// 账户面的管理员用例：建账户与充值。
+///
+/// 单独一个服务，是因为这两件事都要在**数据库提交成功之后**把余额写进缓存（写穿）：写在仓库里
+/// 会让持久化实现同时懂缓存，写在 HTTP 处理器里则会让"充值"这条路径有两处各写一次缓存。
+#[derive(Clone)]
+pub struct AccountsService {
+    repository: Arc<dyn HubRepository>,
+    acceleration: Arc<AccelerationService>,
+}
+
+impl AccountsService {
+    #[must_use]
+    pub fn new(repository: Arc<dyn HubRepository>) -> Self {
+        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
+        Self {
+            repository,
+            acceleration,
+        }
+    }
+
+    /// 装上加速层：充值后缓存要立即可见。
+    #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
+        self.acceleration = acceleration;
+        self
+    }
+
+    pub async fn create_account(
+        &self,
+        account_id: AccountId,
+        initial_credit_microusd: u64,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let change = self
+            .repository
+            .create_account(account_id, initial_credit_microusd, actor)
+            .await?;
+        self.acceleration
+            .write_balance(&change, BalanceSource::DbCommit)
+            .await;
+        Ok(())
+    }
+
+    pub async fn credit_account(
+        &self,
+        account_id: AccountId,
+        amount_microusd: u64,
+        business_key: &str,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let change = self
+            .repository
+            .credit_account(account_id, amount_microusd, business_key, actor)
+            .await?;
+        self.acceleration
+            .write_balance(&change, BalanceSource::DbCommit)
+            .await;
+        Ok(())
+    }
+}
+
+/// 加速层的最小能力面：按字符串键读写一个字符串值。
+///
+/// **语义只到这里为止**：键名、值长什么样、什么时候能拿缓存下结论，全在
+/// [`AccelerationService`] 里；实现只负责把这三条命令发给缓存服务。接口这么窄是故意的——
+/// 一旦让实现方也懂"余额"与"候选集"，两边的语义就会各自漂移，而漂移的表现是"缓存说的和
+/// 数据库说的不一样"。
+///
+/// 所有方法都可能失败。调用方一律把失败当"这次没命中"，回源数据库：缓存出问题不该让任何
+/// 请求失败，也不该改变任何结果。
+#[async_trait]
+pub trait CacheStore: Send + Sync {
+    async fn get(&self, key: &str) -> Result<Option<String>, ApplicationError>;
+
+    /// 写入并设置存活时间。写进去的值**永远是数据库提交之后的值**（见 [`AccelerationService`]）。
+    async fn set(&self, key: &str, value: &str, ttl: Duration) -> Result<(), ApplicationError>;
+
+    async fn delete(&self, key: &str) -> Result<(), ApplicationError>;
+}
+
+/// 加速层的运行参数。
+///
+/// 新鲜窗口必须**显著小于**对账周期：对账写回的条目来源标记是 `reconciler`、本来就**不用于**
+/// 提前拒绝，这条比例关系是第二道保险——它保证"能用来拒绝的值"实际都来自写穿路径。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct CachePolicy {
+    pub route_ttl: Duration,
+    pub balance_ttl: Duration,
+    pub freshness_window: Duration,
+    pub reconcile_interval: Duration,
+}
+
+impl CachePolicy {
+    /// 新鲜窗口至少要比对账周期小这么多倍。
+    pub const FRESHNESS_TO_RECONCILE_RATIO: u32 = 4;
+
+    pub fn new(
+        route_ttl: Duration,
+        balance_ttl: Duration,
+        freshness_window: Duration,
+        reconcile_interval: Duration,
+    ) -> Result<Self, ApplicationError> {
+        if route_ttl.is_zero()
+            || balance_ttl.is_zero()
+            || freshness_window.is_zero()
+            || reconcile_interval.is_zero()
+        {
+            return Err(ApplicationError::Configuration(
+                "cache durations must be positive".to_owned(),
+            ));
+        }
+        if freshness_window.saturating_mul(Self::FRESHNESS_TO_RECONCILE_RATIO) > reconcile_interval
+        {
+            return Err(ApplicationError::Configuration(format!(
+                "the cache freshness window ({freshness_window:?}) must be at least {} times \
+                 smaller than the reconcile interval ({reconcile_interval:?})",
+                Self::FRESHNESS_TO_RECONCILE_RATIO
+            )));
+        }
+        Ok(Self {
+            route_ttl,
+            balance_ttl,
+            freshness_window,
+            reconcile_interval,
+        })
+    }
+
+    /// 默认参数：设计里给的那一套（route 60 秒、余额 360 秒、新鲜窗口 5 秒、对账周期 3 分钟）。
+    ///
+    /// 未配置缓存时用不到它——那时这一层是空操作，参数只在"缓存启用后怎么写"上起作用。
+    #[must_use]
+    pub fn default_policy() -> Self {
+        Self {
+            route_ttl: Duration::from_secs(60),
+            balance_ttl: Duration::from_secs(360),
+            freshness_window: Duration::from_secs(5),
+            reconcile_interval: Duration::from_secs(180),
+        }
+    }
+
+    /// 从环境变量读参数；没给的项取默认值。
+    ///
+    /// **默认值不等于启用**：这一层启不启用只看有没有缓存服务（`REDIS_URL`），不看这些参数。
+    pub fn from_env() -> Result<Self, ApplicationError> {
+        Self::new(
+            cache_duration_env("CACHE_ROUTE_TTL_SECONDS", 60)?,
+            cache_duration_env("CACHE_BALANCE_TTL_SECONDS", 360)?,
+            cache_duration_env("CACHE_FRESHNESS_WINDOW_MS", 5_000)?,
+            cache_duration_env("CACHE_RECONCILE_INTERVAL_MS", 180_000)?,
+        )
+    }
+}
+
+/// 读一个时长参数。以 `_SECONDS` 结尾的按秒、以 `_MS` 结尾的按毫秒，统一成 [`Duration`]。
+fn cache_duration_env(name: &str, default: u64) -> Result<Duration, ApplicationError> {
+    let value = match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ApplicationError::Configuration(format!("{name} must be an integer")))?,
+        _ => default,
+    };
+    Ok(if name.ends_with("_SECONDS") {
+        Duration::from_secs(value)
+    } else {
+        Duration::from_millis(value)
+    })
+}
+
+/// 一次余额变更的结果：**哪个账户**、变更**之后**的余额、以及数据库记下的时刻。
+///
+/// 三个数都由**数据库**给出（`UPDATE … RETURNING balance_microusd, updated_at`，账户就是被改的
+/// 那一行）。缓存里的写入时间要参与"新鲜不新鲜"的判定与审计，换成 API 进程的时钟就会因为两个
+/// 时钟的漂移把刚写的值判成旧的（或反过来，把旧值当成刚写的）；账户也一律取库里那一行，
+/// 不取调用方手上的 id——写穿缓存必须写回**真正被改动**的那个账户。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BalanceChange {
+    pub account_id: AccountId,
+    pub balance_microusd: i64,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 受理前的一次轻量读：网关模型开关、当前生效的修订标识、**数据库时钟**，以及这次请求是不是
+/// 一次**重放**（该账户下已有同一个幂等键的 Job）。
+///
+/// 修订标识用来判断 route 缓存是不是陈旧的：缓存里带着写它那次发布的标识，与这里读到的比对，
+/// 不一致就当未命中。开关必须**单独**读一次——`PATCH enabled` 改的是可变表、**不改变修订
+/// 标识**，交给缓存判定的话，关掉的模型会在缓存有效期内继续被受理。
+///
+/// 时钟也在这里取：缓存里的写入时间由数据库盖章，拿它跟进程时钟比就会因为漂移判错新鲜度。
+///
+/// 重放这一项服务余额预检：重放会去重成原来那个 Job（不新建、不扣款），因此**不受预检管辖**
+/// ——预检要避免的正是"新建一个 Job 却扣不动钱"，而重放本来就不新建。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AcceptanceProbe {
+    pub enabled: bool,
+    pub effective_revision_id: Option<RuntimeRevisionId>,
+    pub database_now: DateTime<Utc>,
+    pub replay: bool,
+}
+
+/// 余额缓存条目的来源：写穿路径写下的值**可以**用于提前拒绝，对账写回的不行。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BalanceSource {
+    /// 数据库事务提交后由写穿路径写下（充值、受理预授权扣减、结算、失败释放、对账退款）。
+    DbCommit,
+    /// 定时对账写回的副本：它只保证"与数据库一致"，不是"刚有一笔钱变动过"的证据。
+    Reconciler,
+}
+
+/// route 缓存的值：候选集 + **写它那次发布**的修订标识。
+///
+/// 修订标识是这一层的可检性来源：受理时与当前生效的修订比对，不一致就当未命中——因此
+/// "发布后的失效没成功"只会让缓存里留着旧值，不会让旧候选被用上。
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedRoute {
+    runtime_revision_id: RuntimeRevisionId,
+    candidates: Vec<OfferingCandidate>,
+}
+
+/// 余额缓存的值：余额 + 写入时间（数据库盖章）+ 来源标记。
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedBalance {
+    balance_microusd: i64,
+    written_at: DateTime<Utc>,
+    source: BalanceSource,
+}
+
+impl CachedBalance {
+    /// 这条值能不能用来下结论（提前拒绝）。两条判据都要满足：
+    ///
+    /// 1. 来源是**写穿路径**——对账写回的只是"与数据库一致"的副本，不构成"刚有一笔钱变动过"；
+    /// 2. 写入时间落在新鲜窗口内，且**不晚于数据库当前时刻**。晚于它只可能是两个时钟不同步，
+    ///    那种值一律当不新鲜：宁可多打一次数据库，也不要凭一个来路不明的时间拒绝客户。
+    fn is_fresh(&self, database_now: DateTime<Utc>, window: Duration) -> bool {
+        if self.source != BalanceSource::DbCommit {
+            return false;
+        }
+        if self.written_at > database_now {
+            return false;
+        }
+        let window = ChronoDuration::from_std(window).unwrap_or_else(|_| ChronoDuration::zero());
+        database_now - self.written_at < window
+    }
+}
+
+/// 一轮对账的结果（供定时任务记日志；对客不可见）。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ReconcileReport {
+    pub accounts_checked: u64,
+    pub balances_corrected: u64,
+    pub routes_invalidated: u64,
+}
+
+/// 加速层：把"哪些东西可以缓、值长什么样、什么时候能拿它下结论"收在一处。
+///
+/// 三条不变量，改这个类型时必须一起守住：
+///
+/// 1. **任何一次缓存操作失败都只是"这次没命中"**——回源数据库，绝不让请求因为缓存出问题而失败；
+/// 2. **扣减与余额事实只在数据库事务里发生**：这里的写入一律发生在提交**之后**、写的是提交后的
+///    值，从不用 `DECRBY` 之类的增量命令（增量表达不了"以数据库为准"，重放还会漂移）；
+/// 3. **只有新鲜的值能用来拒绝**：来源必须是写穿路径且写入时间落在窗口内，其余一律交给数据库判。
+#[derive(Clone)]
+pub struct AccelerationService {
+    repository: Arc<dyn HubRepository>,
+    cache: Option<Arc<dyn CacheStore>>,
+    policy: CachePolicy,
+}
+
+impl AccelerationService {
+    /// 没有缓存服务时的加速层：所有方法都是空操作，受理路径**不额外查库**。
+    ///
+    /// 于是"未配置缓存"的行为与没有这一层时逐位相同——降级不是"多打几次数据库"，而是根本
+    /// 不走这条路。
+    #[must_use]
+    pub fn disabled(repository: Arc<dyn HubRepository>) -> Self {
+        Self {
+            repository,
+            cache: None,
+            policy: CachePolicy::default_policy(),
+        }
+    }
+
+    #[must_use]
+    pub fn new(
+        repository: Arc<dyn HubRepository>,
+        cache: Arc<dyn CacheStore>,
+        policy: CachePolicy,
+    ) -> Self {
+        Self {
+            repository,
+            cache: Some(cache),
+            policy,
+        }
+    }
+
+    /// 有没有缓存服务。受理路径用它决定走不走加速：没有缓存时连那次轻量读都不做。
+    #[must_use]
+    pub fn is_enabled(&self) -> bool {
+        self.cache.is_some()
+    }
+
+    #[must_use]
+    pub fn policy(&self) -> CachePolicy {
+        self.policy
+    }
+
+    fn route_key(gateway_model: &str) -> String {
+        format!("route:{gateway_model}")
+    }
+
+    fn balance_key(account_id: AccountId) -> String {
+        format!("user_balance:{account_id}")
+    }
+
+    /// 取该网关模型的候选集：缓存命中且**修订标识一致**才用缓存，否则回源数据库并重建缓存。
+    ///
+    /// 修订标识由受理前那次 [`AcceptanceProbe`] 读来，这里不再查库。不一致（或值里根本没有这个
+    /// 标识、值读不出来）⇒ 当未命中。因此 route 缓存的陈旧是**可检的**，不依赖"发布后的失效
+    /// 一定成功"。
+    ///
+    /// 关掉（或从未发布）的模型**不看缓存**：开关是可变表里的事、不改变修订标识，缓存里那份
+    /// 候选集在模型被关掉之后仍然"看起来是新的"。
+    pub async fn candidates(
+        &self,
+        gateway_model: &str,
+        probe: &AcceptanceProbe,
+    ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+        let Some(effective) = probe.effective_revision_id.filter(|_| probe.enabled) else {
+            return Ok(Vec::new());
+        };
+        if let Some(cached) = self.read_route(gateway_model).await
+            && cached.runtime_revision_id == effective
+        {
+            return Ok(cached.candidates);
+        }
+        let candidates = self.repository.active_offering(gateway_model).await?;
+        // **空候选集不入缓存**：它是"这个型号现在调不动"的瞬时状态，而回源它只发生在错误路径上。
+        // 缓存下来反而会让"供给被重新启用"（今天没有写入方，但将来会有）在一个 TTL 内看不见。
+        if !candidates.is_empty() {
+            self.write_route(gateway_model, effective, &candidates)
+                .await;
+        }
+        Ok(candidates)
+    }
+
+    /// 受理前的余额预检：**只有新鲜的值才允许提前拒绝**，返回 `true` 表示"凭缓存拒绝"。
+    ///
+    /// 三条判据缺一不可：条目来源是写穿路径、写入时间落在新鲜窗口内、**这次不是重放**。
+    /// 重放会去重成原来那个 Job，不新建也不扣款——预检要避免的是"新建一个 Job 却扣不动钱"，
+    /// 拿它拦一次重放只会让"重发同一个键"变成看余额脸色的行为。
+    ///
+    /// 拒绝本身没有副作用——不建 Job、不扣款、不写状态，所以事后必须解释得清"为什么拒了这个
+    /// 客户"，这就是那条审计。审计写不下去时**不拒绝**：宁可多打一次数据库，也不能留下一次
+    /// 没有记录的拒绝。
+    pub async fn precheck_balance(
+        &self,
+        account_id: AccountId,
+        hold_microusd: u64,
+        gateway_model: &str,
+        probe: &AcceptanceProbe,
+    ) -> Result<bool, ApplicationError> {
+        if probe.replay {
+            return Ok(false);
+        }
+        let Some(cached) = self.read_balance(account_id).await else {
+            return Ok(false);
+        };
+        if !cached.is_fresh(probe.database_now, self.policy.freshness_window) {
+            return Ok(false);
+        }
+        let Ok(hold) = i64::try_from(hold_microusd) else {
+            return Ok(false);
+        };
+        if cached.balance_microusd >= hold {
+            return Ok(false);
+        }
+        let payload = json!({
+            "reason": "the cached balance is below the hold while the entry is fresh",
+            "gateway_model": gateway_model,
+            "cached_balance_microusd": cached.balance_microusd,
+            "cached_written_at": cached.written_at,
+            "cached_source": cached.source,
+            "hold_microusd": hold_microusd,
+            "database_now": probe.database_now,
+        });
+        if let Err(error) = self
+            .repository
+            .insert_audit_event(
+                "acceleration-precheck",
+                "balance.precheck_rejected",
+                "account",
+                &account_id.to_string(),
+                payload,
+            )
+            .await
+        {
+            tracing::warn!(
+                account_id = %account_id,
+                error = %error,
+                "could not record the cache-based balance rejection; falling back to the database"
+            );
+            return Ok(false);
+        }
+        tracing::warn!(
+            account_id = %account_id,
+            cached_balance_microusd = cached.balance_microusd,
+            hold_microusd,
+            "rejected a request on a fresh cached balance below the hold"
+        );
+        Ok(true)
+    }
+
+    /// 把**数据库提交后**的余额写进缓存（写穿）。
+    ///
+    /// 写的是提交后的值而不是增量：`DECRBY` 表达不了"以数据库为准"，重放还会漂移。写入时间用
+    /// 数据库给出的 `updated_at`，于是"新鲜"判定与审计里的时间都是数据库的时间。
+    pub async fn write_balance(&self, change: &BalanceChange, source: BalanceSource) {
+        if !self.is_enabled() {
+            return;
+        }
+        let value = CachedBalance {
+            balance_microusd: change.balance_microusd,
+            written_at: change.updated_at,
+            source,
+        };
+        let Ok(serialized) = serde_json::to_string(&value) else {
+            // 这个结构体不可能序列化失败；真失败也只说明这次没写进缓存，不影响正确性。
+            return;
+        };
+        self.write(
+            &Self::balance_key(change.account_id),
+            &serialized,
+            self.policy.balance_ttl,
+        )
+        .await;
+    }
+
+    /// 发布成功（事务提交后）与启停开关改动后失效 route 缓存。
+    ///
+    /// 失效失败不影响正确性：旧值带着旧修订标识，受理时的比对必然不一致 ⇒ 回源数据库；
+    /// 开关那一项由受理时按主键读的那一行兜住。失败只记一条日志（运营要能发现）。
+    pub async fn invalidate_route(&self, gateway_model: &str) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        let key = Self::route_key(gateway_model);
+        if let Err(error) = cache.delete(&key).await {
+            tracing::warn!(
+                key,
+                error = %error,
+                "cache invalidation failed; a stale entry would be detected at acceptance time"
+            );
+        }
+    }
+
+    /// 定时对账兜底：以数据库为准把缓存覆盖回去，并把**真的不一致**记下来。
+    ///
+    /// 只覆盖不一致的条目：已经等于数据库值的条目不动——重写会把它的来源降级成 `reconciler`
+    /// （等于"这条值不能再用于提前拒绝"），没必要为一次没发生的不一致付这个代价。
+    pub async fn reconcile_once(&self) -> Result<ReconcileReport, ApplicationError> {
+        if !self.is_enabled() {
+            return Ok(ReconcileReport::default());
+        }
+        let mut report = ReconcileReport::default();
+        // 增量窗口取对账周期的三倍：够覆盖"上一轮之后变过、这一轮才轮到"的账户。
+        let window = self.policy.reconcile_interval.saturating_mul(3);
+        for change in self.repository.accounts_updated_within(window).await? {
+            report.accounts_checked += 1;
+            let cached = self.read_balance(change.account_id).await;
+            if cached
+                .as_ref()
+                .is_some_and(|cached| cached.balance_microusd == change.balance_microusd)
+            {
+                continue;
+            }
+            if let Some(cached) = &cached {
+                report.balances_corrected += 1;
+                tracing::warn!(
+                    account_id = %change.account_id,
+                    cached_balance_microusd = cached.balance_microusd,
+                    database_balance_microusd = change.balance_microusd,
+                    "the cached balance disagreed with the database; overwriting it"
+                );
+                self.record_reconcile_correction(
+                    "cache.balance_corrected",
+                    "account",
+                    &change.account_id.to_string(),
+                    json!({
+                        "cached_balance_microusd": cached.balance_microusd,
+                        "cached_written_at": cached.written_at,
+                        "cached_source": cached.source,
+                        "database_balance_microusd": change.balance_microusd,
+                        "database_updated_at": change.updated_at,
+                    }),
+                )
+                .await;
+            }
+            self.write_balance(&change, BalanceSource::Reconciler).await;
+        }
+        for view in self.repository.gateway_models().await? {
+            let Some(cached) = self.read_route(&view.gateway_model).await else {
+                continue;
+            };
+            // 当前生效修订取自同一次只读投影：它与受理前那次轻量读取的是同一批复发行。
+            if view.enabled && view.runtime_revision_id == cached.runtime_revision_id {
+                continue;
+            }
+            report.routes_invalidated += 1;
+            tracing::warn!(
+                gateway_model = %view.gateway_model,
+                "the cached candidate set is not the effective revision; invalidating it"
+            );
+            self.record_reconcile_correction(
+                "cache.route_invalidated",
+                "gateway_model",
+                &view.gateway_model,
+                json!({
+                    "cached_runtime_revision_id": cached.runtime_revision_id,
+                    "effective_runtime_revision_id": view.runtime_revision_id,
+                    "enabled": view.enabled,
+                }),
+            )
+            .await;
+            self.invalidate_route(&view.gateway_model).await;
+        }
+        Ok(report)
+    }
+
+    /// 定时对账循环：由进程在启动时挂起来，与请求路径无关。
+    ///
+    /// 第一轮立刻跑（`interval` 的第一次 tick 立即完成），之后每 `interval` 一轮。缓存没启用时
+    /// 直接返回，连循环都不进。
+    pub async fn run_reconciler(self: Arc<Self>) {
+        if !self.is_enabled() {
+            return;
+        }
+        let interval = self.policy.reconcile_interval;
+        let mut ticker = tokio::time::interval(interval);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            match self.reconcile_once().await {
+                Ok(report) if report.balances_corrected > 0 || report.routes_invalidated > 0 => {
+                    tracing::warn!(
+                        accounts_checked = report.accounts_checked,
+                        balances_corrected = report.balances_corrected,
+                        routes_invalidated = report.routes_invalidated,
+                        "cache reconciliation corrected entries against the database"
+                    );
+                }
+                Ok(_) => {}
+                Err(error) => tracing::error!(error = %error, "cache reconciliation failed"),
+            }
+        }
+    }
+
+    /// 记一条对账发现的审计。写不进去只记日志——**对账本身已经生效**，留痕失败不该让它回退。
+    async fn record_reconcile_correction(
+        &self,
+        action: &str,
+        subject_type: &str,
+        subject_id: &str,
+        payload: Value,
+    ) {
+        if let Err(error) = self
+            .repository
+            .insert_audit_event(
+                "acceleration-reconciler",
+                action,
+                subject_type,
+                subject_id,
+                payload,
+            )
+            .await
+        {
+            tracing::error!(action, subject_id, error = %error, "could not record a cache reconciliation audit event");
+        }
+    }
+
+    async fn write_route(
+        &self,
+        gateway_model: &str,
+        runtime_revision_id: RuntimeRevisionId,
+        candidates: &[OfferingCandidate],
+    ) {
+        let value = CachedRoute {
+            runtime_revision_id,
+            candidates: candidates.to_vec(),
+        };
+        let Ok(serialized) = serde_json::to_string(&value) else {
+            return;
+        };
+        self.write(
+            &Self::route_key(gateway_model),
+            &serialized,
+            self.policy.route_ttl,
+        )
+        .await;
+    }
+
+    async fn read_route(&self, gateway_model: &str) -> Option<CachedRoute> {
+        let raw = self.read(&Self::route_key(gateway_model)).await?;
+        match serde_json::from_str(&raw) {
+            Ok(cached) => Some(cached),
+            Err(error) => {
+                // 值读不出来（格式变了、被改坏了）：当未命中，回源重建。
+                tracing::warn!(
+                    gateway_model,
+                    error = %error,
+                    "the cached candidate set is unreadable; falling back to the database"
+                );
+                None
+            }
+        }
+    }
+
+    async fn read_balance(&self, account_id: AccountId) -> Option<CachedBalance> {
+        let raw = self.read(&Self::balance_key(account_id)).await?;
+        match serde_json::from_str(&raw) {
+            Ok(cached) => Some(cached),
+            Err(error) => {
+                tracing::warn!(
+                    account_id = %account_id,
+                    error = %error,
+                    "the cached balance is unreadable; falling back to the database"
+                );
+                None
+            }
+        }
+    }
+
+    /// 读一条缓存值。**任何失败都是"没读到"**：连不上、超时、命令报错、值不存在，一视同仁。
+    async fn read(&self, key: &str) -> Option<String> {
+        let cache = self.cache.as_ref()?;
+        match cache.get(key).await {
+            Ok(value) => value,
+            Err(error) => {
+                tracing::warn!(key, error = %error, "cache read failed; falling back to the database");
+                None
+            }
+        }
+    }
+
+    /// 写一条缓存值。失败只记一条日志：缓存里留着旧值时，受理时的比对必然不一致 ⇒ 回源数据库，
+    /// 所以**正确性不依赖这次写入成功**。
+    async fn write(&self, key: &str, value: &str, ttl: Duration) {
+        let Some(cache) = self.cache.as_ref() else {
+            return;
+        };
+        if let Err(error) = cache.set(key, value, ttl).await {
+            tracing::warn!(
+                key,
+                error = %error,
+                "cache write failed; the cached value stays stale until it expires"
+            );
+        }
+    }
+}
+
 pub trait AdapterFactory: Send + Sync {
     fn descriptor(&self, adapter_key: &str) -> Option<AdapterDescriptor>;
 
@@ -1651,15 +2382,25 @@ pub trait CredentialProvider: Send + Sync {
 pub struct RuntimeService {
     repository: Arc<dyn HubRepository>,
     adapters: Arc<dyn AdapterFactory>,
+    acceleration: Arc<AccelerationService>,
 }
 
 impl RuntimeService {
     #[must_use]
     pub fn new(repository: Arc<dyn HubRepository>, adapters: Arc<dyn AdapterFactory>) -> Self {
+        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
         Self {
             repository,
             adapters,
+            acceleration,
         }
+    }
+
+    /// 装上加速层：发布与启停都要失效该型号的 route 缓存。
+    #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
+        self.acceleration = acceleration;
+        self
     }
 
     /// 发布一个 Vendor Model 的供给（完整候选集合）。
@@ -1694,7 +2435,11 @@ impl RuntimeService {
         }
         let request = command.into_request(contract, normalized);
         validate_gateway_model_identity(&request)?;
+        let gateway_model = request.gateway_model.clone();
         let revision = self.repository.publish_runtime(request).await?;
+        // 发布已经提交：这时才失效缓存。失效失败不影响正确性——旧值带着旧修订标识，
+        // 受理时的比对必然不一致（见 `AccelerationService::candidates`）。
+        self.acceleration.invalidate_route(&gateway_model).await;
         Ok(revision)
     }
 
@@ -1712,6 +2457,10 @@ impl RuntimeService {
     }
 
     /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。
+    ///
+    /// 改完失效该型号的 route 缓存：开关**不改变修订标识**，缓存里那份候选集在关掉之后仍然
+    /// "看起来是新的"，只能靠失效把它拿掉。失效失败也不影响正确性——受理时那一次按主键读的
+    /// `enabled` 会兜住（见 `AccelerationService::candidates`）。
     pub async fn set_gateway_model_enabled(
         &self,
         gateway_model: &str,
@@ -1720,7 +2469,9 @@ impl RuntimeService {
     ) -> Result<(), ApplicationError> {
         self.repository
             .set_gateway_model_enabled(gateway_model, enabled, actor)
-            .await
+            .await?;
+        self.acceleration.invalidate_route(gateway_model).await;
+        Ok(())
     }
 
     /// 校验单个候选，并归一化它的 `base_url`。
@@ -2216,6 +2967,8 @@ pub struct GenerationService {
     /// 这是最初的并发设计：一个账户同时只跑一个，超出的直接拒（429），
     /// 免得一次提交一堆把上游额度与平台成本一起打满。
     max_concurrent_jobs: u64,
+    /// 加速层：候选集从缓存取、受理后把余额写穿、以及**只在新鲜时**的提前拒绝。
+    acceleration: Arc<AccelerationService>,
 }
 
 impl GenerationService {
@@ -2225,11 +2978,20 @@ impl GenerationService {
         max_cost_microusd: u64,
         max_concurrent_jobs: u64,
     ) -> Self {
+        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
         Self {
             repository,
             max_cost_microusd,
             max_concurrent_jobs,
+            acceleration,
         }
+    }
+
+    /// 装上加速层。
+    #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
+        self.acceleration = acceleration;
+        self
     }
 
     pub async fn create(
@@ -2253,17 +3015,42 @@ impl GenerationService {
         {
             return Err(ApplicationError::TooManyInFlight);
         }
-        let candidates = self.repository.active_offering(&request.model).await?;
+        // 加速层开着时先做一次轻量读（生效修订标识 + 开关 + 数据库时钟），候选集再从缓存取；
+        // 关着时这一步不做，取数路径与没有这一层时逐字相同。
+        let probe = if self.acceleration.is_enabled() {
+            Some(
+                self.repository
+                    .acceptance_probe(&request.model, request.account_id, &request.idempotency_key)
+                    .await?,
+            )
+        } else {
+            None
+        };
+        let candidates = match &probe {
+            Some(probe) => self.acceleration.candidates(&request.model, probe).await?,
+            None => self.repository.active_offering(&request.model).await?,
+        };
         let (mut offering, native_parameters, routing) =
             select_candidate(&request, branch, &candidates)?;
         // 受理时把定价随快照冻结，并算定这次的预授权额（保底额）。策略在受理时已经定下候选，
         // 所以售价**不必等上游回来**；冻结之后结算只读那份快照，受理之后改汇率、改加价系数、
         // 重发修订都不影响这一个 Job。
         let hold_microusd = self.freeze_pricing(&request, &mut offering).await?;
+        // 预检：缓存里的余额**新鲜**且明显不够时提前拒绝。它只读不写、不建 Job、不扣款，
+        // 因此必然留下一条审计（`precheck_balance` 里落）；不新鲜一律交给下面的数据库条件更新。
+        if let Some(probe) = &probe
+            && self
+                .acceleration
+                .precheck_balance(request.account_id, hold_microusd, &request.model, probe)
+                .await?
+        {
+            return Err(ApplicationError::InsufficientBalance);
+        }
         // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按承载面过滤的结果）：
         // 上游目录变了、或另一个候选的承载面更窄，都不该让同一个幂等键算出不同的哈希。
         let request_hash = request_hash(&request)?;
-        self.repository
+        let (job, balance) = self
+            .repository
             .create_job(
                 CreateImageGeneration {
                     account_id: request.account_id,
@@ -2277,7 +3064,12 @@ impl GenerationService {
                 request_hash,
                 routing,
             )
-            .await
+            .await?;
+        // 预授权扣减已经提交：把扣减后的余额写进缓存，否则缓存会滞后一个预授权额。
+        self.acceleration
+            .write_balance(&balance, BalanceSource::DbCommit)
+            .await;
+        Ok(job)
     }
 
     /// 受理时把定价随 Job 冻结，并算定这次的**预授权额**（保底额）。
@@ -2377,6 +3169,8 @@ pub struct WorkerService {
     worker_id: String,
     lease_duration: ChronoDuration,
     provider_timeout: Duration,
+    /// 加速层：结算与失败收尾都改余额，提交后要把新余额写穿缓存。
+    acceleration: Arc<AccelerationService>,
 }
 
 impl WorkerService {
@@ -2393,6 +3187,7 @@ impl WorkerService {
                 "worker_id must not be empty".to_owned(),
             ));
         }
+        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
         Ok(Self {
             repository,
             adapters,
@@ -2400,7 +3195,35 @@ impl WorkerService {
             worker_id,
             lease_duration,
             provider_timeout,
+            acceleration,
         })
+    }
+
+    /// 装上加速层：结算与失败收尾之后要把余额写穿缓存。
+    #[must_use]
+    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
+        self.acceleration = acceleration;
+        self
+    }
+
+    /// 失败收尾 + 写穿余额。
+    ///
+    /// 释放预授权的那些分支会改动余额，**不写穿的话缓存里会留着一个刚写过、但偏高的余额**——
+    /// 那正好是"看起来新鲜、其实已经不对"的那类值，下一次受理就可能凭它误拒。
+    async fn fail_and_refresh(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+        failure: AttemptFailure,
+    ) -> Result<(), ApplicationError> {
+        let change = self
+            .repository
+            .fail_job(job_id, &self.worker_id, Some(attempt_id), failure)
+            .await?;
+        self.acceleration
+            .write_balance(&change, BalanceSource::DbCommit)
+            .await;
+        Ok(())
     }
 
     pub async fn run_once(&self) -> Result<bool, ApplicationError> {
@@ -2452,23 +3275,21 @@ impl WorkerService {
         {
             Ok(credential) => credential,
             Err(error) => {
-                self.repository
-                    .fail_job(
-                        claimed.job.id,
-                        &self.worker_id,
-                        Some(attempt_id),
-                        AttemptFailure {
-                            provider_code: "credential_unavailable".to_owned(),
-                            public_code: PublicErrorCode::PlatformUnavailable,
-                            message: error.to_string(),
-                            trace_id: None,
-                            kind: ProviderFailureKind::PlatformInternal,
-                            target_state: JobState::Failed,
-                            hold_disposition: HoldDisposition::Release,
-                            provider_cost: None,
-                        },
-                    )
-                    .await?;
+                self.fail_and_refresh(
+                    claimed.job.id,
+                    attempt_id,
+                    AttemptFailure {
+                        provider_code: "credential_unavailable".to_owned(),
+                        public_code: PublicErrorCode::PlatformUnavailable,
+                        message: error.to_string(),
+                        trace_id: None,
+                        kind: ProviderFailureKind::PlatformInternal,
+                        target_state: JobState::Failed,
+                        hold_disposition: HoldDisposition::Release,
+                        provider_cost: None,
+                    },
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -2479,23 +3300,21 @@ impl WorkerService {
         ) {
             Ok(adapter) => adapter,
             Err(error) => {
-                self.repository
-                    .fail_job(
-                        claimed.job.id,
-                        &self.worker_id,
-                        Some(attempt_id),
-                        AttemptFailure {
-                            provider_code: "adapter_configuration_failed".to_owned(),
-                            public_code: PublicErrorCode::PlatformUnavailable,
-                            message: error.to_string(),
-                            trace_id: None,
-                            kind: ProviderFailureKind::PlatformInternal,
-                            target_state: JobState::Failed,
-                            hold_disposition: HoldDisposition::Release,
-                            provider_cost: None,
-                        },
-                    )
-                    .await?;
+                self.fail_and_refresh(
+                    claimed.job.id,
+                    attempt_id,
+                    AttemptFailure {
+                        provider_code: "adapter_configuration_failed".to_owned(),
+                        public_code: PublicErrorCode::PlatformUnavailable,
+                        message: error.to_string(),
+                        trace_id: None,
+                        kind: ProviderFailureKind::PlatformInternal,
+                        target_state: JobState::Failed,
+                        hold_disposition: HoldDisposition::Release,
+                        provider_cost: None,
+                    },
+                )
+                .await?;
                 return Ok(());
             }
         };
@@ -2512,29 +3331,26 @@ impl WorkerService {
                     .complete_success(&claimed.job, attempt_id, &success, provider_cost.clone())
                     .await
                 {
-                    self.repository
-                        .fail_job(
-                            claimed.job.id,
-                            &self.worker_id,
-                            Some(attempt_id),
-                            AttemptFailure {
-                                provider_code: "result_delivery_failed".to_owned(),
-                                public_code: PublicErrorCode::OutcomeUnknown,
-                                message: error.to_string(),
-                                trace_id: None,
-                                kind: ProviderFailureKind::PlatformInternal,
-                                target_state: JobState::ReconciliationRequired,
-                                hold_disposition: HoldDisposition::RetainForReconciliation,
-                                provider_cost: Some(provider_cost),
-                            },
-                        )
-                        .await?;
+                    self.fail_and_refresh(
+                        claimed.job.id,
+                        attempt_id,
+                        AttemptFailure {
+                            provider_code: "result_delivery_failed".to_owned(),
+                            public_code: PublicErrorCode::OutcomeUnknown,
+                            message: error.to_string(),
+                            trace_id: None,
+                            kind: ProviderFailureKind::PlatformInternal,
+                            target_state: JobState::ReconciliationRequired,
+                            hold_disposition: HoldDisposition::RetainForReconciliation,
+                            provider_cost: Some(provider_cost),
+                        },
+                    )
+                    .await?;
                 }
             }
             Err(error) => {
                 let failure = failure_from_adapter(error);
-                self.repository
-                    .fail_job(claimed.job.id, &self.worker_id, Some(attempt_id), failure)
+                self.fail_and_refresh(claimed.job.id, attempt_id, failure)
                     .await?;
             }
         }
@@ -2605,7 +3421,8 @@ impl WorkerService {
                 "provider returned no image".to_owned(),
             ));
         }
-        self.repository
+        let change = self
+            .repository
             .complete_job(CompleteJob {
                 job_id: job.id,
                 worker_id: self.worker_id.clone(),
@@ -2620,7 +3437,12 @@ impl WorkerService {
                 provider_trace_id: success.provider_trace_id.clone(),
                 provider_cost,
             })
-            .await
+            .await?;
+        // 结算已经提交：把实收之后的余额写进缓存（用户要求：扣减成功后立即同步）。
+        self.acceleration
+            .write_balance(&change, BalanceSource::DbCommit)
+            .await;
+        Ok(())
     }
 }
 
@@ -5144,7 +5966,7 @@ mod tests {
             _account_id: AccountId,
             _initial_credit_microusd: u64,
             _actor: &str,
-        ) -> Result<(), ApplicationError> {
+        ) -> Result<BalanceChange, ApplicationError> {
             unused_repository()
         }
 
@@ -5154,6 +5976,33 @@ mod tests {
             _amount_microusd: u64,
             _business_key: &str,
             _actor: &str,
+        ) -> Result<BalanceChange, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn acceptance_probe(
+            &self,
+            _gateway_model: &str,
+            _account_id: AccountId,
+            _idempotency_key: &str,
+        ) -> Result<AcceptanceProbe, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn accounts_updated_within(
+            &self,
+            _window: Duration,
+        ) -> Result<Vec<BalanceChange>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn insert_audit_event(
+            &self,
+            _actor: &str,
+            _action: &str,
+            _subject_type: &str,
+            _subject_id: &str,
+            _payload: Value,
         ) -> Result<(), ApplicationError> {
             unused_repository()
         }
@@ -5182,7 +6031,7 @@ mod tests {
             _offering: PublishedOffering,
             _request_hash: String,
             _routing: RoutingDecision,
-        ) -> Result<GenerationJob, ApplicationError> {
+        ) -> Result<(GenerationJob, BalanceChange), ApplicationError> {
             unused_repository()
         }
 
@@ -5234,7 +6083,10 @@ mod tests {
             Ok(())
         }
 
-        async fn complete_job(&self, completion: CompleteJob) -> Result<(), ApplicationError> {
+        async fn complete_job(
+            &self,
+            completion: CompleteJob,
+        ) -> Result<BalanceChange, ApplicationError> {
             self.events
                 .lock()
                 .map_err(|error| ApplicationError::Persistence(error.to_string()))?
@@ -5244,7 +6096,7 @@ mod tests {
                 .lock()
                 .map_err(|error| ApplicationError::Persistence(error.to_string()))? =
                 Some(completion);
-            Ok(())
+            Ok(worker_balance_change())
         }
 
         async fn fail_job(
@@ -5253,12 +6105,12 @@ mod tests {
             _worker_id: &str,
             _attempt_id: Option<AttemptId>,
             failure: AttemptFailure,
-        ) -> Result<(), ApplicationError> {
+        ) -> Result<BalanceChange, ApplicationError> {
             *self
                 .failure
                 .lock()
                 .map_err(|error| ApplicationError::Persistence(error.to_string()))? = Some(failure);
-            Ok(())
+            Ok(worker_balance_change())
         }
 
         async fn provider_failures(
@@ -5285,8 +6137,17 @@ mod tests {
         async fn refund_reconciliation(
             &self,
             _command: RefundReconciliationCommand,
-        ) -> Result<(), ApplicationError> {
+        ) -> Result<BalanceChange, ApplicationError> {
             unused_repository()
+        }
+    }
+
+    /// 假仓库给出的余额变更：这组用例只验 Worker 的编排，加速层是关着的，数值没有意义。
+    fn worker_balance_change() -> BalanceChange {
+        BalanceChange {
+            account_id: AccountId::new(),
+            balance_microusd: 0,
+            updated_at: Utc::now(),
         }
     }
 

@@ -4,8 +4,10 @@ use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_adapter_sdk::ProviderCredential;
 use seeai_application::{
-    AdapterRegistry, ApplicationError, CredentialProvider, HubRepository, WorkerService,
+    AccelerationService, AdapterRegistry, ApplicationError, CachePolicy, CredentialProvider,
+    HubRepository, WorkerService,
 };
+use seeai_cache_redis::RedisCache;
 use seeai_persistence::PgHubRepository;
 use std::{env, sync::Arc, time::Duration};
 use tracing::{error, info};
@@ -50,6 +52,16 @@ async fn main() -> Result<()> {
             Arc::new(AihubmixAdapterFactory),
             Arc::new(ApimartAdapterFactory),
         ]));
+    // 加速层：Worker 只用到它的一半——结算与失败收尾都改余额，提交后要把新余额写穿缓存。
+    // `REDIS_URL` 没配时它是空操作，结算路径与没有它时逐位相同。
+    let acceleration = match RedisCache::from_env()? {
+        Some(cache) => Arc::new(AccelerationService::new(
+            repository_port.clone(),
+            Arc::new(cache),
+            CachePolicy::from_env()?,
+        )),
+        None => Arc::new(AccelerationService::disabled(repository_port.clone())),
+    };
     let worker = WorkerService::new(
         repository_port,
         adapters,
@@ -57,7 +69,8 @@ async fn main() -> Result<()> {
         worker_id.clone(),
         ChronoDuration::seconds(lease_seconds),
         provider_timeout,
-    )?;
+    )?
+    .with_acceleration(acceleration);
     info!(%worker_id, "worker started");
     loop {
         tokio::select! {
