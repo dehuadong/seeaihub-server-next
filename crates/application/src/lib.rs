@@ -6,15 +6,17 @@ use seeai_adapter_sdk::{
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, ImageParameterKind,
-    JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
-    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
-    RuntimeRevisionId, apply_enum_maps, apply_parameter_defaults, apply_parameter_renames,
-    apply_size_mapping, carries_parameter, contract_image_parameter_kind, contract_model_identity,
-    declared_defaults, declared_enum_maps, declared_field_names, declared_parameter_names,
+    AccountId, AttemptId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FloorTable, FxRate,
+    GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, MeteringEvidence,
+    OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, ProviderCostFact,
+    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RuntimeRevisionId,
+    apply_enum_maps, apply_parameter_defaults, apply_parameter_renames, apply_size_mapping,
+    carries_parameter, contract_image_parameter_kind, contract_model_identity, declared_defaults,
+    declared_enum_maps, declared_field_names, declared_parameter_names,
     declared_reference_image_limit, declared_renames, declared_size_mapping,
     declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
-    is_used_parameter_value, place_image_inputs, platform_image_parameters,
+    is_used_parameter_value, literal_parameter_text, place_image_inputs, platform_image_parameters,
+    resolve_size_tier,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -77,6 +79,15 @@ pub struct PublishRuntimeCommand {
     /// 扁平形式的计价。数组形式下必须为 `None`。
     #[serde(default)]
     pub price_plan: Option<PricePlanDraft>,
+    /// **加价系数**（基点，避免浮点）：**每个网关模型一个**，随修订发布、随 Job 快照冻结。
+    ///
+    /// 它不放在可变的开关表里：定价是修订的内容——放进可变表就等于"改价不用发布"，而
+    /// 已受理的 Job 必须固定受理时那一版。**具体数值由后台录入，不属设计决策**。
+    ///
+    /// 它**参与设定**对客费率向量（管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"推导），
+    /// 但**不参与结算**：结算只读受理时冻结的那份向量。
+    #[serde(default)]
+    pub markup_bps: Option<i32>,
     pub actor: String,
 }
 
@@ -97,6 +108,8 @@ pub struct PublishRuntimeRequest {
     pub actor: String,
     /// 该模型的调用方合同（模型级唯一一份，落库后不再改）。
     pub capability_schema: Value,
+    /// 加价系数（基点）：随修订发布、随 Job 快照冻结；没有候选带定价时为 `None`。
+    pub markup_bps: Option<i32>,
     /// 有序候选集：下标即 `routing_priority`。
     pub offerings: Vec<NormalizedOffering>,
 }
@@ -121,6 +134,48 @@ pub struct OfferingDraft {
     pub capability_schema: Option<Value>,
     #[serde(default)]
     pub price_plan: Option<PricePlanDraft>,
+    /// 该候选的渠道成本（**原币种**微单位）：**只作定价参考，不是售价的被乘数**。
+    ///
+    /// 发布者给每个候选取一个可核的值：`computed` 按该渠道四档费率 × 参考用量、`declared`
+    /// 取上游声明过的金额。
+    #[serde(default)]
+    pub reference_cost_microusd: Option<u64>,
+    /// 该候选的成本币种；缺省取该候选计价声明的币种（给了就必须与它一致）。
+    #[serde(default)]
+    pub cost_currency: Option<String>,
+    /// 该候选的**对客四档 CNY 费率向量**：售价依据（实收按它算）。
+    #[serde(default)]
+    pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 该候选的成本来源口径：`computed` 或 `declared`。
+    #[serde(default)]
+    pub cost_basis: Option<String>,
+    /// 档位价目表（CNY）：**只作定价参考与展示**，不参与预授权、也不参与结算。
+    #[serde(default)]
+    pub tier_prices: Option<Value>,
+    /// 该供给的**保底表**（CNY）：受理时算预授权额的唯一来源。
+    #[serde(default)]
+    pub floor_amounts: Option<Value>,
+}
+
+/// 一条候选**已校验**的定价（随修订发布、受理时随 Job 快照冻结）。
+///
+/// 为什么打包成一个整体、而不是散成几个可空字段：定价按候选**全有或全无**——只给对客费率
+/// 而没给参考成本与保底表，发布出来的候选就是"有售价、说不清成本、也算不出预授权"的半成品。
+/// 打包之后"这条候选不带定价"与"定价不完整"在类型上就分得开：前者是 `None`，后者发布期就拒。
+#[derive(Debug, Clone, PartialEq)]
+pub struct CandidatePricing {
+    /// 该候选的渠道成本（**原币种**微单位）：只作定价参考，不是售价的被乘数。
+    pub reference_cost_microusd: u64,
+    /// 该候选的成本币种（与它的计价声明同值）。
+    pub cost_currency: String,
+    /// 该候选的对客四档 CNY 费率向量。
+    pub consumer_rates_cny: ConsumerRatesCny,
+    /// 该候选的成本来源口径（两态）。
+    pub cost_basis: CostBasis,
+    /// 档位价目表（CNY，展示用）。
+    pub tier_prices: Value,
+    /// 该供给的保底表（CNY）。
+    pub floor_amounts: Value,
 }
 
 /// 计价合同草案。
@@ -167,6 +222,8 @@ pub struct NormalizedOffering {
     pub rates: PriceRates,
     pub price_source_url: String,
     pub routing_priority: i32,
+    /// 这条候选的定价；`None` = 它不带定价（旧形状的素材、或只发布了成本费率）。
+    pub pricing: Option<CandidatePricing>,
 }
 
 /// 归一后的整份发布：**一份模型级合同** + 有序候选集。
@@ -198,6 +255,7 @@ impl PublishRuntimeCommand {
             native_revision: self.native_revision,
             actor: self.actor,
             capability_schema,
+            markup_bps: self.markup_bps,
             offerings,
         }
     }
@@ -211,10 +269,31 @@ impl PublishRuntimeCommand {
             Some(drafts) => self.normalize_array(drafts)?,
             None => self.normalize_flat()?,
         };
+        self.validate_markup(&offerings)?;
         Ok(NormalizedPublication {
             contract: self.resolve_contract()?,
             offerings,
         })
+    }
+
+    /// 加价系数**可以缺省**，但不可为负，且不能是一条没人读的记录。
+    ///
+    /// 它只是**定价时的参考口径**：管理员按"成本费率 ×(1 + 加价系数)× 汇率"推导对客费率向量，
+    /// 也可以直接录入那份向量——直接录入时加价系数一次都不参与计算，所以"带定价就必须给加价
+    /// 系数"会把一条正当的录入挡在门外。要拒的是两件明显自相矛盾的事：负加价等于平台倒贴，
+    /// 不是定价（库层也有同一条约束，这里先拒是为了给出说得清的错误）；给了加价系数却没有任何
+    /// 候选带定价，那它没有任何东西可以解释。
+    fn validate_markup(&self, offerings: &[NormalizedOffering]) -> Result<(), ApplicationError> {
+        let priced = offerings.iter().any(|offering| offering.pricing.is_some());
+        match self.markup_bps {
+            Some(bps) if bps < 0 => Err(ApplicationError::Validation(
+                "markup_bps must not be negative".to_owned(),
+            )),
+            Some(_) if !priced => Err(ApplicationError::Validation(
+                "markup_bps is given but no offering carries pricing".to_owned(),
+            )),
+            _ => Ok(()),
+        }
     }
 
     /// 解析本次发布的**唯一一份合同**。
@@ -306,6 +385,9 @@ impl PublishRuntimeCommand {
                         "offerings[{index}].price_plan: {message}"
                     ))
                 })?;
+                let price_source_url = price_plan.source_url.clone();
+                let rates = price_plan.into_rates();
+                let pricing = normalize_candidate_pricing(index, draft, &rates.currency)?;
                 Ok(NormalizedOffering {
                     carrier_schema,
                     parameter_mapping: draft.parameter_mapping.clone(),
@@ -315,11 +397,12 @@ impl PublishRuntimeCommand {
                     provider_model_id: draft.provider_model_id.clone(),
                     base_url: draft.base_url.clone(),
                     credential_env: draft.credential_env.clone(),
-                    price_source_url: price_plan.source_url.clone(),
-                    rates: price_plan.into_rates(),
+                    price_source_url,
+                    rates,
                     routing_priority: i32::try_from(index).map_err(|_| {
                         ApplicationError::Validation("too many offerings".to_owned())
                     })?,
+                    pricing,
                 })
             })
             .collect()
@@ -373,6 +456,10 @@ impl PublishRuntimeCommand {
             price_source_url: price_plan.source_url.clone(),
             rates: price_plan.into_rates(),
             routing_priority: 0,
+            // 扁平形式是**过渡期的老形状**（老素材、老测试），不带定价：定价按候选给，只有
+            // 数组形式能表达"同一个网关模型的不同候选价格不同"这件事。它的发布仍走旧口径
+            // （对客扣费按已发布费率、预授权回落平台兜底数），与今天逐位相同。
+            pricing: None,
         }])
     }
 
@@ -462,6 +549,85 @@ fn validate_price_formula(price_plan: &PricePlanDraft) -> Result<(), String> {
 
 fn empty_object() -> Value {
     Value::Object(Map::new())
+}
+
+/// 归一一条候选的定价：**全有或全无**，形状与取值都在这里拒掉。
+///
+/// 判据是"这条候选有没有带定价"，不是"字段齐不齐"：只给对客费率而没给参考成本与保底表，
+/// 发布出来的候选就是"有售价、说不清成本、也算不出预授权"的半成品——那种候选一旦生效，
+/// 问题要等到结算才暴露。因此带了一半就明确拒绝，并指出缺哪一个。
+///
+/// 成本币种缺省取该候选计价声明的币种；给了就必须与它一致——币种权威只有一个，两个字段
+/// 各说各的会让"这笔成本是什么钱"没有唯一答案。
+fn normalize_candidate_pricing(
+    index: usize,
+    draft: &OfferingDraft,
+    declared_currency: &str,
+) -> Result<Option<CandidatePricing>, ApplicationError> {
+    let carries_pricing = draft.reference_cost_microusd.is_some()
+        || draft.cost_currency.is_some()
+        || draft.consumer_rates_cny.is_some()
+        || draft.cost_basis.is_some()
+        || draft.tier_prices.is_some()
+        || draft.floor_amounts.is_some();
+    if !carries_pricing {
+        return Ok(None);
+    }
+    let missing = |name: &str| {
+        ApplicationError::Validation(format!(
+            "offerings[{index}].{name} is required when the candidate carries pricing"
+        ))
+    };
+    let consumer_rates_cny = draft
+        .consumer_rates_cny
+        .clone()
+        .ok_or_else(|| missing("consumer_rates_cny"))?;
+    let reference_cost_microusd = draft
+        .reference_cost_microusd
+        .ok_or_else(|| missing("reference_cost_microusd"))?;
+    let cost_basis = draft
+        .cost_basis
+        .as_deref()
+        .ok_or_else(|| missing("cost_basis"))
+        .and_then(|value| {
+            CostBasis::parse(value).ok_or_else(|| {
+                ApplicationError::Validation(format!(
+                    "offerings[{index}].cost_basis must be computed or declared, got {value}"
+                ))
+            })
+        })?;
+    let floor_amounts = draft
+        .floor_amounts
+        .clone()
+        .ok_or_else(|| missing("floor_amounts"))?;
+    // 保底表的形状在这里就拒掉：表要在受理时查，等到受理才发现写错，受影响的是一批请求。
+    FloorTable::from_json(&floor_amounts).map_err(|message| {
+        ApplicationError::Validation(format!("offerings[{index}].floor_amounts: {message}"))
+    })?;
+    let tier_prices = draft.tier_prices.clone().unwrap_or_else(empty_object);
+    if !tier_prices.is_object() {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].tier_prices must be an object of (size, quality) → CNY amount"
+        )));
+    }
+    let cost_currency = draft
+        .cost_currency
+        .clone()
+        .unwrap_or_else(|| declared_currency.to_owned());
+    if cost_currency != declared_currency {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].cost_currency ({cost_currency}) must match the candidate's \
+             declared price currency ({declared_currency})"
+        )));
+    }
+    Ok(Some(CandidatePricing {
+        reference_cost_microusd,
+        cost_currency,
+        consumer_rates_cny,
+        cost_basis,
+        tier_prices,
+        floor_amounts,
+    }))
 }
 
 /// 按 `routing_priority` 升序取**第一个合格候选**。
@@ -700,6 +866,12 @@ pub struct AttemptFailure {
     pub kind: ProviderFailureKind,
     pub target_state: JobState,
     pub hold_disposition: HoldDisposition,
+    /// 这次执行**已经看到**的成本事实（成本平面）。
+    ///
+    /// 结果交付失败、进对账那条路径上执行已经发生、上游成本也拿得到，成本事实必须有去处——
+    /// 只有成功路径才落成本，等于把"这笔到底花了多少钱"丢在一条已经付过钱的路径上。
+    /// 拿不到（连用量都算不出）时为 `None`：那才是"这次没有成本事实可落"。
+    pub provider_cost: Option<ProviderCostFact>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -736,6 +908,19 @@ pub struct RefundReconciliationCommand {
     pub note: String,
     pub business_key: String,
     pub actor: String,
+}
+
+/// 待录入的一行折算率：`effective_at` 为 `None` 表示"立即生效"，**由数据库盖章**。
+///
+/// 它与 [`FxRate`] 回答的不是同一个问题：[`FxRate`] 是"库里那一行已生效的折算率"（读出来带着
+/// 库给的时刻），这里还没定时刻——不给就是让库用它的 `now()` 定。生效时刻之所以不能由进程
+/// 时钟给：发布期校验与受理取值用的都是库的 `now()`，两个时钟一旦漂移，"录完立刻发布"就会被
+/// 误判成"该币种还没有生效的折算率"。
+#[derive(Debug, Clone)]
+pub struct NewFxRate {
+    pub currency: String,
+    pub rate_micros: u64,
+    pub effective_at: Option<DateTime<Utc>>,
 }
 
 /// 一个待人工处置的对账案例。
@@ -807,6 +992,18 @@ pub struct GatewayModelCandidateView {
     pub carrier_schema: Value,
     /// 这条供给自己的合同值 → 渠道包装声明。
     pub parameter_mapping: Value,
+    /// 该候选的**对客四档 CNY 费率向量**（随修订发布）；这条候选不带定价时为 `null`。
+    pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 该候选的渠道成本（**原币种**微单位）：**只作定价参考，不是售价的被乘数**。
+    pub reference_cost_microusd: Option<u64>,
+    /// 该候选的成本币种（不假定 USD）。
+    pub cost_currency: Option<String>,
+    /// 该候选的成本来源口径（两态）。
+    pub cost_basis: Option<CostBasis>,
+    /// 档位价目表（CNY）：只作定价参考与展示，不参与预授权。
+    pub tier_prices: Option<Value>,
+    /// 该供给的**保底表**（CNY）：受理时算预授权额的查表依据。
+    pub floor_amounts: Option<Value>,
 }
 
 /// 管理员视图里的一个网关模型：一条只读投影。
@@ -827,8 +1024,31 @@ pub struct GatewayModelView {
     /// 当前生效的那一次发布。
     pub runtime_revision_id: RuntimeRevisionId,
     pub published_at: DateTime<Utc>,
+    /// **加价系数**（基点）：每个网关模型一个，随修订发布；没有带定价的候选时为 `null`。
+    pub markup_bps: Option<i32>,
     /// 候选清单，按 `routing_priority` 升序。
     pub candidates: Vec<GatewayModelCandidateView>,
+}
+
+/// 一条**成本缺口**：执行发生了、成本本该有金额，却拿不到（`unavailable`）。
+///
+/// 它**不进对账态、也不开对账案例**：对账态是"受理/执行状态不明"，会把消费者的钱扣在对账里；
+/// 成本缺口是**平台侧的账务缺口**——对客结算照常按费率快照完成，消费者的钱该扣的照扣。所以
+/// 缺口由这张运营清单承载，毛利侧标"成本未知"（金额与折算值留空，不写 0、不用费率顶替）。
+///
+/// `provider_trace_id` 是人工去上游核账单的依据——没有它，核账的人不知道该查哪个任务。
+/// 人工核对后补录金额归账实核对那条线；补录完成后这一笔不再出现在清单里。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ProviderCostGapView {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub account_id: AccountId,
+    /// 平台型号名。
+    pub gateway_model: String,
+    /// 渠道类别（例如 AIHubMix / APIMart）；没有渠道信息时为 `None`。
+    pub provider_kind: Option<String>,
+    pub provider_trace_id: Option<String>,
+    pub completed_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Error)]
@@ -903,6 +1123,31 @@ pub trait HubRepository: Send + Sync {
         enabled: bool,
         actor: &str,
     ) -> Result<(), ApplicationError>;
+
+    /// 管理员写：录入一行折算率（渠道币种 → CNY），写一条审计事件。
+    ///
+    /// 汇率是**外部事实**，按币种维护、带生效时间；它不是修订的内容——同一时刻同一币种全平台
+    /// 必须是同一个数才对账得起来，放进每份发布里改一次汇率就要重发所有型号。
+    ///
+    /// 请求没给生效时刻时，端口**不替它取一个时钟**：由实现交给数据库的 `now()` 盖章。发布期
+    /// 校验与受理取值都用库的 `now()`，盖章的时钟必须是同一个。
+    async fn upsert_fx_rate(&self, rate: NewFxRate, actor: &str) -> Result<(), ApplicationError>;
+
+    /// 取该币种**受理时刻生效的那一行**折算率（受理时刻之前已生效、其中最新的一行）。
+    ///
+    /// 没有可用行时返回 `None`：发布期已经拒绝过"没有折算率的币种"，所以这里取不到只可能是
+    /// 汇率表被改过，由调用方按平台侧配置问题处置。
+    async fn effective_fx_rate(&self, currency: &str) -> Result<Option<FxRate>, ApplicationError>;
+
+    /// 成本缺口清单（运营只读）：执行发生了、成本本该有金额却拿不到的那些执行尝试。
+    ///
+    /// 按完成时间倒序，`limit` 为条数上限——由调用方按 [`MAX_OPERATIONAL_LIMIT`] 收窄一次，
+    /// 这里不再重复收窄（两处各收一次，两边一旦改成不同的数，响应里的 `truncated` 就会与
+    /// 实际返回的条数对不上）。它不进对账态——见 [`ProviderCostGapView`]。
+    async fn provider_cost_gaps(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ProviderCostGapView>, ApplicationError>;
 
     async fn create_account(
         &self,
@@ -1062,6 +1307,74 @@ impl ReconciliationService {
             ));
         }
         self.repository.refund_reconciliation(command).await
+    }
+}
+
+/// 运营清单类接口一次最多返回多少条（不翻页，所以必须有个上限）。
+///
+/// 上限**只收在这一处**：HTTP 层解析查询参数时按它收窄一次，用例侧不再重复收窄。两处各收一次
+/// 的代价是两边会各自漂移，而漂移的表现是"清单被截断了吗"这个判断（响应里的 `truncated`）
+/// 与实际返回的条数对不上。
+pub const MAX_OPERATIONAL_LIMIT: u32 = 500;
+
+/// 定价侧的管理员用例：**折算率**的录入与取值，以及**成本缺口**的只读清单。
+///
+/// 它不碰修订内容——汇率不进不可变修订（改一次汇率要重发所有型号，而且同一时刻同一币种
+/// 全平台必须是同一个数才对账得起来）。售价向量仍随修订发布、随 Job 快照冻结。
+///
+/// 成本缺口清单也归这里：它问的是"哪几笔成本没记上"，属成本事实那一侧，**不是对账案例**
+/// ——把两件事挂在同一个服务上，会让那个服务因为两种不相干的理由被改。
+#[derive(Clone)]
+pub struct PricingService {
+    repository: Arc<dyn HubRepository>,
+}
+
+impl PricingService {
+    #[must_use]
+    pub fn new(repository: Arc<dyn HubRepository>) -> Self {
+        Self { repository }
+    }
+
+    /// 成本缺口清单（运营只读）：执行发生了、成本本该有金额却拿不到的那些执行尝试。
+    ///
+    /// 它**不是**对账案例：这些 Job 的对客结算已经按费率快照正常完成，消费者的钱该扣的照扣。
+    /// 缺口是平台侧的账务缺口——运营拿上游对账标识去核账单，补录归账实核对那条线。
+    pub async fn provider_cost_gaps(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ProviderCostGapView>, ApplicationError> {
+        self.repository.provider_cost_gaps(limit).await
+    }
+
+    /// 录入一行折算率（管理员，写审计）。同一币种同一生效时刻只能有一行——取值规则是
+    /// "受理时刻生效的那一行"，两行同时刻就没有唯一答案。
+    ///
+    /// 生效时刻**原样透传**（`None` 就是没给）：这里不补一个进程时钟，缺省由数据库盖章。
+    pub async fn upsert_fx_rate(
+        &self,
+        rate: NewFxRate,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let currency = rate.currency.trim();
+        if currency.is_empty() {
+            return Err(ApplicationError::Validation(
+                "fx rate currency must not be empty".to_owned(),
+            ));
+        }
+        if rate.rate_micros == 0 {
+            return Err(ApplicationError::Validation(
+                "fx rate must be positive".to_owned(),
+            ));
+        }
+        self.repository
+            .upsert_fx_rate(
+                NewFxRate {
+                    currency: currency.to_owned(),
+                    ..rate
+                },
+                actor,
+            )
+            .await
     }
 }
 
@@ -1798,8 +2111,12 @@ impl GenerationService {
             return Err(ApplicationError::TooManyInFlight);
         }
         let candidates = self.repository.active_offering(&request.model).await?;
-        let (offering, native_parameters, routing) =
+        let (mut offering, native_parameters, routing) =
             select_candidate(&request, branch, &candidates)?;
+        // 受理时把定价随快照冻结，并算定这次的预授权额（保底额）。策略在受理时已经定下候选，
+        // 所以售价**不必等上游回来**；冻结之后结算只读那份快照，受理之后改汇率、改加价系数、
+        // 重发修订都不影响这一个 Job。
+        let hold_microusd = self.freeze_pricing(&request, &mut offering).await?;
         // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按承载面过滤的结果）：
         // 上游目录变了、或另一个候选的承载面更窄，都不该让同一个幂等键算出不同的哈希。
         let request_hash = request_hash(&request)?;
@@ -1810,7 +2127,7 @@ impl GenerationService {
                     gateway_model: request.model,
                     native_parameters,
                     idempotency_key: request.idempotency_key,
-                    max_cost_microusd: self.max_cost_microusd,
+                    max_cost_microusd: hold_microusd,
                 },
                 branch,
                 offering,
@@ -1818,6 +2135,87 @@ impl GenerationService {
                 routing,
             )
             .await
+    }
+
+    /// 受理时把定价随 Job 冻结，并算定这次的**预授权额**（保底额）。
+    ///
+    /// 两件事都依赖这次请求，发布侧算不出来：
+    /// - **保底额**按请求的 `size` 先**归到档位**、再查该供给的保底表（回落链见
+    ///   [`resolve_size_tier`] 与 `FloorTable::lookup`）；连该供给的封顶保底值都没有时回落到
+    ///   平台兜底数。它**不由售价派生**——售价高不代表预授权高，两者是两件事；
+    /// - **汇率**按该候选的成本币种取"受理时刻生效的那一行"，原值快照进快照（受理之后不再换算）。
+    ///
+    /// **归位用的档位像素表就是这条供给已发布的尺寸档案**（`parameter_mapping` 里的档位 →
+    /// 比例 → 像素）：各供给的档位像素不同，只有它自己声明的那张表才是它的档位定义；这条供给
+    /// 没发布尺寸档案时按最长边阈值兜底。那份映射随 Job 一起冻结，所以事后重建"这次按哪一档
+    /// 冻的"用的是受理当时那一份，不是今天的发布物。
+    ///
+    /// 旧修订没有定价（快照里没有对客费率向量）：这一步什么都不做，返回平台兜底数，
+    /// 预授权与结算都走旧口径、与今天逐位相同。
+    async fn freeze_pricing(
+        &self,
+        request: &CreateImageGenerationRequest,
+        offering: &mut PublishedOffering,
+    ) -> Result<u64, ApplicationError> {
+        if offering.price_snapshot.consumer_rates_cny.is_none() {
+            return Ok(self.max_cost_microusd);
+        }
+        let cost_currency = offering
+            .price_snapshot
+            .cost_currency
+            .clone()
+            .ok_or_else(|| {
+                ApplicationError::Configuration(
+                    "a candidate that carries pricing must also carry its cost currency".to_owned(),
+                )
+            })?;
+        let table = offering
+            .price_snapshot
+            .floor_amounts
+            .as_ref()
+            .map(FloorTable::from_json)
+            .transpose()
+            .map_err(|message| {
+                ApplicationError::Configuration(format!(
+                    "the published floor table is malformed: {message}"
+                ))
+            })?
+            .unwrap_or_default();
+        // 尺寸档案在发布期已校验过形状，这里取不到只可能是"这条供给没发布尺寸档案"（合法）。
+        let profile = declared_size_mapping(&offering.parameter_mapping)
+            .map_err(|message| {
+                ApplicationError::Configuration(format!(
+                    "the published size mapping is malformed: {message}"
+                ))
+            })?
+            .map(|mapping| mapping.profile)
+            .unwrap_or_default();
+        let tier = resolve_size_tier(
+            literal_parameter_text(&request.native_parameters, "size"),
+            &profile,
+        );
+        let (hold_microusd, hold_source) = table
+            .lookup(
+                tier.as_ref(),
+                literal_parameter_text(&request.native_parameters, "quality"),
+            )
+            .unwrap_or((self.max_cost_microusd, HoldSource::PlatformDefault));
+        // 汇率在发布期已被校验过（该币种必须有一行已生效的折算率），所以取不到只可能是
+        // 汇率表被人删了行或只剩未来生效的行——那是平台自己的配置问题，不是这次请求的问题。
+        let fx_rate = self
+            .repository
+            .effective_fx_rate(&cost_currency)
+            .await?
+            .ok_or_else(|| {
+                ApplicationError::Configuration(format!(
+                    "no effective fx rate for {cost_currency}; publication rejects a currency \
+                     without one, so the rate table lost a row it promised"
+                ))
+            })?;
+        offering.price_snapshot.hold_microusd = Some(hold_microusd);
+        offering.price_snapshot.hold_source = Some(hold_source);
+        offering.price_snapshot.fx_rate = Some(fx_rate);
+        Ok(hold_microusd)
     }
 
     pub async fn get(
@@ -1924,6 +2322,7 @@ impl WorkerService {
                             kind: ProviderFailureKind::PlatformInternal,
                             target_state: JobState::Failed,
                             hold_disposition: HoldDisposition::Release,
+                            provider_cost: None,
                         },
                     )
                     .await?;
@@ -1950,6 +2349,7 @@ impl WorkerService {
                             kind: ProviderFailureKind::PlatformInternal,
                             target_state: JobState::Failed,
                             hold_disposition: HoldDisposition::Release,
+                            provider_cost: None,
                         },
                     )
                     .await?;
@@ -1961,8 +2361,12 @@ impl WorkerService {
             .await
         {
             Ok(success) => {
+                // 成本事实**先算出来**再结算：结算失败进对账那条路径也要落成本——执行已经发生、
+                // 上游成本也拿得到，把成本留在成功路径上等于"这一笔付过钱却没有成本事实"。
+                let provider_cost =
+                    provider_cost_fact(&claimed.job.offering.price_snapshot, &success);
                 if let Err(error) = self
-                    .complete_success(&claimed.job, attempt_id, success)
+                    .complete_success(&claimed.job, attempt_id, &success, provider_cost.clone())
                     .await
                 {
                     self.repository
@@ -1978,6 +2382,7 @@ impl WorkerService {
                                 kind: ProviderFailureKind::PlatformInternal,
                                 target_state: JobState::ReconciliationRequired,
                                 hold_disposition: HoldDisposition::RetainForReconciliation,
+                                provider_cost: Some(provider_cost),
                             },
                         )
                         .await?;
@@ -2038,69 +2443,45 @@ impl WorkerService {
         &self,
         job: &GenerationJob,
         attempt_id: AttemptId,
-        success: ProviderSuccess,
+        success: &ProviderSuccess,
+        provider_cost: ProviderCostFact,
     ) -> Result<(), ApplicationError> {
-        // 对客扣费（对客平面）：读受理时冻结的对客费率快照，只决定向消费者收多少。
+        // 对客扣费（对客平面）：读受理时冻结的**对客费率向量**，只决定向消费者收多少。
+        //
+        // **不封顶在预授权额**：预授权只是保底，实收按实际用量算，超出部分由余额透支吸收
+        // （透支发生在结算，不在受理）。所以这里没有"超过预授权就进对账"这一条——那是旧口径，
+        // 而旧口径会把一笔正常完成的生成扣在对账里。
         let charge = job
             .offering
             .price_snapshot
             .charge_microusd(&success.usage)
             .map_err(|error| ApplicationError::Reconciliation(error.to_string()))?;
-        if charge > job.max_cost_microusd {
-            return Err(ApplicationError::Reconciliation(format!(
-                "actual charge {charge} exceeds authorization {}",
-                job.max_cost_microusd
-            )));
-        }
         // 结果只是"当次信封"：渠道给 url 就留 url、给 base64 就留 base64，平台不看内容。
         if success.images.is_empty() {
             return Err(ApplicationError::Reconciliation(
                 "provider returned no image".to_owned(),
             ));
         }
-        // 自算成本（成本平面）：**另起一路**按该渠道的成本费率算，不复用上面那份对客扣费。
-        // 今天价格计划表暂时兼作渠道成本费率，两条路算出来的数相同；但对客费率一旦拆成自己的
-        // CNY 向量，复用就会让成本跟着售价漂移——上游成本与售价本来就是两个量。
-        let cost_rates = job.offering.price_snapshot.cost_rates();
-        let computed = ComputedCost {
-            currency: cost_rates.currency.clone(),
-            amount_microusd: cost_rates
-                .amount_microusd(&success.usage)
-                .map_err(|error| ApplicationError::Reconciliation(error.to_string()))?,
-        };
-        let provider_cost = provider_cost_fact(success.provider_cost, computed);
         self.repository
             .complete_job(CompleteJob {
                 job_id: job.id,
                 worker_id: self.worker_id.clone(),
                 attempt_id,
-                images: success.images,
+                images: success.images.clone(),
                 evidence: MeteringEvidence {
                     attempt_id,
-                    provider_response_digest: success.response_digest,
-                    usage: success.usage,
+                    provider_response_digest: success.response_digest.clone(),
+                    usage: success.usage.clone(),
                 },
                 charge_microusd: charge,
-                provider_trace_id: success.provider_trace_id,
+                provider_trace_id: success.provider_trace_id.clone(),
                 provider_cost,
             })
             .await
     }
 }
 
-/// 这次执行的**自算成本**（成本平面）：金额与币种。
-///
-/// 它是"本次实际分项 token × 该渠道成本费率"的结果，**只服务 `computed` 这一态**：
-/// `declared` 的金额与币种都取上游随金额报回的那一份声明，`unavailable` 两样都留空——
-/// 这两条来源都不认这份输入，所以它不是"传了但没用上"，而是"本就不属于它们"。
-struct ComputedCost {
-    /// 渠道声明的成本币种（受理时随请求冻结的那一份声明）。
-    currency: String,
-    /// 本次实际分项 token × 该渠道成本费率。
-    amount_microusd: u64,
-}
-
-/// 把 Driver 报出来的成本事实定成落库口径。
+/// 把 Driver 报出来的成本事实定成落库口径（成本平面：原币种原值 + 币种 + 折算后 CNY）。
 ///
 /// 判据是**成本从哪来**，不是"金额对不对"：
 /// - 上游直接给了金额 ⇒ `declared`，**直接取它**（含渠道侧折扣，比自算权威），币种也取它报的；
@@ -2110,22 +2491,42 @@ struct ComputedCost {
 /// 币种的权威**分来源**：`declared` 认上游报回来的那一份，`computed` 认渠道声明的成本币种
 /// （两处在实践中同源，但"以哪一份为准"必须只有一个答案）；所以没有"一个入参管三态"这回事。
 ///
-/// 折算后 CNY 这一项留给定价侧：折算要用受理时冻结的汇率，而汇率还没有落点，
-/// 这一片**不自己发明**一个分母，所以这里恒为 `None`（不是"折算成了 0"）。
-fn provider_cost_fact(report: ProviderCost, computed: ComputedCost) -> ProviderCostFact {
+/// **折算**用受理时冻结的汇率（该币种 → CNY），把原币种原值折成人民币——它只服务毛利核算，
+/// 不改对客金额。币种与那份汇率对不上时不折（留空）：拿另一个币种的汇率去乘就是编数，
+/// 而"编一个数"比"承认折算不出来"糟得多。
+///
+/// 自算失败（用量自相矛盾或溢出）时记成 `unavailable`：本该有金额却算不出来，也是缺口，
+/// 不用别的数顶替。
+fn provider_cost_fact(snapshot: &PriceSnapshot, success: &ProviderSuccess) -> ProviderCostFact {
     // 三态在 SDK 与领域各有一套写法，来源一律经那一处映射取，不在这里再判一次。
-    let source = ProviderCostSource::from(&report);
+    let mut source = ProviderCostSource::from(&success.provider_cost);
     // 形状只有一条规则：有金额的来源两样都在，`unavailable` 两样都不在。
-    let (amount_microusd, currency) = match report {
-        ProviderCost::Declared(cost) => (Some(cost.amount_microusd), Some(cost.currency)),
-        ProviderCost::Computed => (Some(computed.amount_microusd), Some(computed.currency)),
+    let (amount_microusd, currency) = match &success.provider_cost {
+        ProviderCost::Declared(cost) => (Some(cost.amount_microusd), Some(cost.currency.clone())),
+        ProviderCost::Computed => match snapshot.cost_rates().amount_microusd(&success.usage) {
+            Ok(amount) => (Some(amount), Some(snapshot.cost_rates().currency.clone())),
+            Err(_) => {
+                source = ProviderCostSource::Unavailable;
+                (None, None)
+            }
+        },
         ProviderCost::Unavailable => (None, None),
+    };
+    let cny_microusd = match (
+        amount_microusd,
+        currency.as_deref(),
+        snapshot.fx_rate.as_ref(),
+    ) {
+        (Some(amount), Some(currency), Some(rate)) if rate.currency == currency => {
+            rate.to_cny_microusd(amount).ok()
+        }
+        _ => None,
     };
     ProviderCostFact {
         source,
         amount_microusd,
         currency,
-        cny_microusd: None,
+        cny_microusd,
     }
 }
 
@@ -2424,6 +2825,8 @@ fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
             } else {
                 HoldDisposition::Release
             },
+            // 这条路径上没有执行结果，也就没有成本事实可落——不是"成本是 0"。
+            provider_cost: None,
         },
         AdapterError::Configuration(message) | AdapterError::UnsupportedInput(message) => {
             AttemptFailure {
@@ -2434,6 +2837,7 @@ fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
                 kind: ProviderFailureKind::PlatformInternal,
                 target_state: JobState::Failed,
                 hold_disposition: HoldDisposition::Release,
+                provider_cost: None,
             }
         }
     }
@@ -2488,6 +2892,18 @@ mod tests {
                     image_output_microusd_per_million: 30_000_000,
                 },
                 captured_at: Utc::now(),
+                // 夹具走**旧口径**（没有定价）：受理与结算的行为与今天逐位相同。
+                hit_candidate: None,
+                consumer_rates_cny: None,
+                tier_prices: None,
+                floor_amounts: None,
+                hold_microusd: None,
+                hold_source: None,
+                cost_basis: None,
+                reference_cost_microusd: None,
+                cost_currency: None,
+                markup_bps: None,
+                fx_rate: None,
             },
         }
     }
@@ -2559,6 +2975,7 @@ mod tests {
             parameter_mapping: serde_json::json!({}),
             offerings: None,
             price_plan: None,
+            markup_bps: None,
             actor: "tester".to_owned(),
         }
     }
@@ -2588,6 +3005,12 @@ mod tests {
             parameter_mapping: serde_json::json!({}),
             capability_schema: Some(schema("gpt-image-2.5-flare")),
             price_plan: Some(price_plan()),
+            reference_cost_microusd: None,
+            cost_currency: None,
+            consumer_rates_cny: None,
+            cost_basis: None,
+            tier_prices: None,
+            floor_amounts: None,
         }
     }
 
@@ -2815,6 +3238,7 @@ mod tests {
             },
             price_source_url: "https://example.invalid/price".to_owned(),
             routing_priority: 0,
+            pricing: None,
         }
     }
 
@@ -3355,6 +3779,148 @@ mod tests {
         };
         let error = command.normalize().expect_err("unknown formula must fail");
         assert!(error.to_string().contains("token_rates"), "{error}");
+    }
+
+    /// 一条**带定价**的候选：参考成本、对客费率向量、成本来源与保底表都给齐。
+    ///
+    /// 成本币种故意不给：它缺省取该候选计价声明的币种，这里顺带钉住"缺省也一致"。
+    fn priced_draft(provider_model_id: &str) -> OfferingDraft {
+        OfferingDraft {
+            reference_cost_microusd: Some(11_354),
+            cost_currency: None,
+            consumer_rates_cny: Some(ConsumerRatesCny {
+                text_input_micros_per_million: 7_000_000,
+                image_input_micros_per_million: 9_000_000,
+                text_output_micros_per_million: 11_000_000,
+                image_output_micros_per_million: 40_000_000,
+            }),
+            cost_basis: Some("declared".to_owned()),
+            tier_prices: Some(serde_json::json!({"2K": 250_000})),
+            floor_amounts: Some(serde_json::json!({
+                "amounts": {"1K": 160_000, "2K": 250_000, "4K": 300_000},
+                "cap_microusd": 300_000,
+            })),
+            ..draft(provider_model_id)
+        }
+    }
+
+    #[test]
+    fn a_priced_candidate_normalizes_with_its_declared_cost_currency() {
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(2_000),
+            offerings: Some(vec![priced_draft("pm-a")]),
+            ..base_command()
+        };
+        let normalized = command.normalize().expect("a priced candidate is valid");
+        let pricing = normalized.offerings[0]
+            .pricing
+            .as_ref()
+            .expect("the candidate must carry its pricing");
+        assert_eq!(
+            pricing.cost_currency, "USD",
+            "成本币种缺省取该候选计价声明的币种"
+        );
+        assert_eq!(pricing.reference_cost_microusd, 11_354);
+        assert_eq!(pricing.cost_basis, CostBasis::Declared);
+        assert_eq!(normalized.offerings[0].pricing.as_ref(), Some(pricing));
+    }
+
+    #[test]
+    fn a_candidate_that_carries_half_a_pricing_is_rejected() {
+        // 只给对客费率、不给参考成本与保底表：发布出来就是"有售价、说不清成本、也算不出预授权"
+        // 的半成品，问题要等到结算才暴露。
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(2_000),
+            offerings: Some(vec![OfferingDraft {
+                floor_amounts: None,
+                ..priced_draft("pm-a")
+            }]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("half a pricing must fail");
+        assert!(error.to_string().contains("floor_amounts"), "{error}");
+
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(2_000),
+            offerings: Some(vec![OfferingDraft {
+                reference_cost_microusd: None,
+                ..priced_draft("pm-a")
+            }]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("half a pricing must fail");
+        assert!(
+            error.to_string().contains("reference_cost_microusd"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn markup_may_be_omitted_but_never_negative_nor_orphaned() {
+        // 带定价却**没给**加价系数是合法的：管理员可以直接录入对客费率向量，那一步用不上它。
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![priced_draft("pm-a")]),
+            ..base_command()
+        };
+        let normalized = command
+            .normalize()
+            .expect("a directly entered consumer rate vector needs no markup");
+        assert!(
+            normalized.offerings[0].pricing.is_some(),
+            "定价照旧完整地归一出来"
+        );
+
+        // 给了加价系数却没有一条候选带定价：它只是一条没人读的记录。
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(2_000),
+            offerings: Some(vec![draft("pm-a")]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("markup without pricing");
+        assert!(
+            error.to_string().contains("no offering carries pricing"),
+            "{error}"
+        );
+
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(-1),
+            offerings: Some(vec![priced_draft("pm-a")]),
+            ..base_command()
+        };
+        let error = command.normalize().expect_err("negative markup");
+        assert!(error.to_string().contains("negative"), "{error}");
+    }
+
+    #[test]
+    fn a_candidate_cost_currency_must_match_its_declared_price_currency() {
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(2_000),
+            offerings: Some(vec![OfferingDraft {
+                cost_currency: Some("CNY".to_owned()),
+                ..priced_draft("pm-a")
+            }]),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("two currencies for one cost");
+        assert!(error.to_string().contains("cost_currency"), "{error}");
+    }
+
+    #[test]
+    fn a_malformed_floor_table_is_rejected_at_publication() {
+        let command = PublishRuntimeCommand {
+            markup_bps: Some(2_000),
+            offerings: Some(vec![OfferingDraft {
+                floor_amounts: Some(serde_json::json!({"amounts": {"2K": 250_000, "2k": 260_000}})),
+                ..priced_draft("pm-a")
+            }]),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("the same tier twice must be rejected before it can be looked up");
+        assert!(error.to_string().contains("2K"), "{error}");
     }
 
     /// 一条最小的对客请求（文生图）；参考图与遮罩由各用例自己加。
@@ -4125,6 +4691,28 @@ mod tests {
             unused_repository()
         }
 
+        async fn upsert_fx_rate(
+            &self,
+            _rate: NewFxRate,
+            _actor: &str,
+        ) -> Result<(), ApplicationError> {
+            unused_repository()
+        }
+
+        async fn effective_fx_rate(
+            &self,
+            _currency: &str,
+        ) -> Result<Option<FxRate>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn provider_cost_gaps(
+            &self,
+            _limit: u32,
+        ) -> Result<Vec<ProviderCostGapView>, ApplicationError> {
+            unused_repository()
+        }
+
         async fn create_account(
             &self,
             _account_id: AccountId,
@@ -4278,7 +4866,19 @@ mod tests {
 
     struct WorkerAdapter {
         succeeds: bool,
+        /// 上游确认生成、却**没交付任何图**：结果交付失败那条路径的夹具。
+        empty_result: bool,
         calls: AtomicUsize,
+    }
+
+    impl WorkerAdapter {
+        fn new(succeeds: bool, empty_result: bool) -> Self {
+            Self {
+                succeeds,
+                empty_result,
+                calls: AtomicUsize::new(0),
+            }
+        }
     }
 
     #[async_trait]
@@ -4304,7 +4904,11 @@ mod tests {
                 .into());
             }
             Ok(ProviderSuccess {
-                images: vec![GeneratedImage::from_base64("iVBORw0KGgo=".to_owned())],
+                images: if self.empty_result {
+                    Vec::new()
+                } else {
+                    vec![GeneratedImage::from_base64("iVBORw0KGgo=".to_owned())]
+                },
                 usage: TokenUsage {
                     input_tokens: 9,
                     input_text_tokens: 9,
@@ -4396,10 +5000,7 @@ mod tests {
         // 入口独立算一遍，而不是照抄实现里那个数——照抄的话，把对客金额接回来也照样过。
         let snapshot = job.offering.price_snapshot.clone();
         let repository = Arc::new(WorkerRepository::new(job, events.clone()));
-        let adapter = Arc::new(WorkerAdapter {
-            succeeds: true,
-            calls: AtomicUsize::new(0),
-        });
+        let adapter = Arc::new(WorkerAdapter::new(true, false));
 
         assert!(
             worker(repository.clone(), adapter.clone())
@@ -4444,19 +5045,36 @@ mod tests {
     }
 
     /// 成本来源的判定：上游给金额就**直接取**，渠道不报就按实际用量自算，拿不到就留空（不猜）。
+    ///
+    /// 同一个用量与同一份快照下走三态，钉住"判据是成本从哪来，不是金额对不对"。
     #[test]
     fn provider_cost_source_follows_where_the_cost_came_from() {
-        // 声明分支：金额与币种**都取上游随金额报回的那一份**。自算那份输入（这里故意填一个
-        // 不同的币种与金额）不参与这一态——不是"传了却忘了用"，是这条来源本就不认它。
+        let snapshot = offering().price_snapshot;
+        let usage = TokenUsage {
+            input_tokens: 9,
+            input_text_tokens: 9,
+            input_image_tokens: 0,
+            output_tokens: 196,
+            output_text_tokens: 0,
+            output_image_tokens: 196,
+            total_tokens: 205,
+        };
+        let success = |provider_cost| ProviderSuccess {
+            images: Vec::new(),
+            usage: usage.clone(),
+            response_digest: "digest".to_owned(),
+            provider_trace_id: None,
+            provider_cost,
+        };
+
+        // 声明分支：金额与币种**都取上游随金额报回的那一份**，自算那份费率不参与这一态
+        // ——不是"传了却忘了用"，是这条来源本就不认它。
         let declared = provider_cost_fact(
-            ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+            &snapshot,
+            &success(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
                 amount_microusd: 11_354,
                 currency: "CNY".to_owned(),
-            }),
-            ComputedCost {
-                currency: "USD".to_owned(),
-                amount_microusd: 999_999,
-            },
+            })),
         );
         assert_eq!(declared.source, ProviderCostSource::Declared);
         assert_eq!(
@@ -4470,56 +5088,85 @@ mod tests {
             "币种按上游报的那一份，不取渠道声明的成本币种、也不假定 USD"
         );
 
-        let computed = provider_cost_fact(
-            ProviderCost::Computed,
-            ComputedCost {
-                currency: "CNY".to_owned(),
-                amount_microusd: 5_925,
-            },
-        );
+        let computed = provider_cost_fact(&snapshot, &success(ProviderCost::Computed));
         assert_eq!(computed.source, ProviderCostSource::Computed);
+        // 9 文本输入 × 5 + 196 图像输出 × 30（每 1M）。
         assert_eq!(computed.amount_microusd, Some(5_925));
-        assert_eq!(computed.currency.as_deref(), Some("CNY"));
+        assert_eq!(computed.currency.as_deref(), Some("USD"));
 
-        let unavailable = provider_cost_fact(
-            ProviderCost::Unavailable,
-            ComputedCost {
-                currency: "USD".to_owned(),
-                amount_microusd: 5_925,
-            },
-        );
+        let unavailable = provider_cost_fact(&snapshot, &success(ProviderCost::Unavailable));
         assert_eq!(unavailable.source, ProviderCostSource::Unavailable);
         assert_eq!(
             unavailable.amount_microusd, None,
             "拿不到金额就留空，不许写 0"
         );
         assert_eq!(unavailable.currency, None);
-        // 折算值留给定价侧：这一片还没有汇率，所以是"没有折算值"，不是"折算成了 0"。
+        // 这份快照没有定价（没有冻结的汇率）：折算值留空，是"没有折算值"，不是"折算成了 0"。
         for fact in [&declared, &computed, &unavailable] {
             assert_eq!(fact.cny_microusd, None);
         }
     }
 
+    /// 折算只在**成本币种与冻结的汇率对得上**时才做，且按定点整数算。
+    #[test]
+    fn the_cost_is_converted_with_the_frozen_rate_of_its_own_currency() {
+        let mut snapshot = offering().price_snapshot;
+        snapshot.fx_rate = Some(FxRate {
+            currency: "USD".to_owned(),
+            rate_micros: 7_100_000,
+            effective_at: Utc::now(),
+        });
+        let usage = TokenUsage {
+            input_tokens: 0,
+            input_text_tokens: 0,
+            input_image_tokens: 0,
+            output_tokens: 0,
+            output_text_tokens: 0,
+            output_image_tokens: 0,
+            total_tokens: 0,
+        };
+        let success = |provider_cost| ProviderSuccess {
+            images: Vec::new(),
+            usage: usage.clone(),
+            response_digest: "digest".to_owned(),
+            provider_trace_id: None,
+            provider_cost,
+        };
+        let declared = provider_cost_fact(
+            &snapshot,
+            &success(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+                amount_microusd: 11_354,
+                currency: "USD".to_owned(),
+            })),
+        );
+        // 11354 微美元 × 7.1 = 80613.4 微元 ⇒ 向上取整。
+        assert_eq!(declared.cny_microusd, Some(80_614));
+
+        // 上游报的币种与冻结的汇率不是一回事：不折（留空），不拿另一个币种的汇率去乘。
+        let foreign = provider_cost_fact(
+            &snapshot,
+            &success(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+                amount_microusd: 11_354,
+                currency: "CNY".to_owned(),
+            })),
+        );
+        assert_eq!(foreign.amount_microusd, Some(11_354));
+        assert_eq!(foreign.cny_microusd, None);
+    }
+
     /// 记进成本列的是**按渠道成本费率自算的成本**，不是对客扣费。
     ///
-    /// 把两个口径**人为设成不同的值**：对客那一份模拟"将来由自己的 CNY 费率向量给出"的售价。
-    /// 这条断言防的是"又把对客金额接回来当成本"——那会让成本跟着售价漂移，而两者本来是两个量。
+    /// 把两个口径**人为设成不同的值**（成本读渠道成本费率、对客读自己的 CNY 向量）：这条断言
+    /// 防的是"又把对客金额接回来当成本"——那会让成本跟着售价漂移，而两者本来是两个量。
     #[test]
     fn the_recorded_computed_cost_is_not_the_consumer_charge() {
-        let cost_rates = PriceRates {
-            currency: "USD".to_owned(),
-            text_input_microusd_per_million: 5_000_000,
-            image_input_microusd_per_million: 8_000_000,
-            text_output_microusd_per_million: 10_000_000,
-            image_output_microusd_per_million: 30_000_000,
-        };
-        let consumer_rates = PriceRates {
-            currency: "CNY".to_owned(),
-            text_input_microusd_per_million: 7_000_000,
-            image_input_microusd_per_million: 9_000_000,
-            text_output_microusd_per_million: 11_000_000,
-            image_output_microusd_per_million: 40_000_000,
-        };
+        let mut snapshot = offering().price_snapshot;
+        snapshot.consumer_rates_cny = Some(ConsumerRatesCny {
+            text_input_micros_per_million: 7_000_000,
+            image_input_micros_per_million: 9_000_000,
+            text_output_micros_per_million: 11_000_000,
+            image_output_micros_per_million: 40_000_000,
+        });
         let usage = TokenUsage {
             input_tokens: 9,
             input_text_tokens: 9,
@@ -4529,19 +5176,23 @@ mod tests {
             output_image_tokens: 196,
             total_tokens: 205,
         };
-        let cost = cost_rates
+        let cost = snapshot
+            .cost_rates()
             .amount_microusd(&usage)
             .expect("cost rates price the usage");
-        let charge = consumer_rates
-            .amount_microusd(&usage)
+        let charge = snapshot
+            .charge_microusd(&usage)
             .expect("consumer rates price the usage");
         assert_ne!(cost, charge, "用例得先让两个口径真的不同");
 
         let fact = provider_cost_fact(
-            ProviderCost::Computed,
-            ComputedCost {
-                currency: cost_rates.currency.clone(),
-                amount_microusd: cost,
+            &snapshot,
+            &ProviderSuccess {
+                images: Vec::new(),
+                usage,
+                response_digest: "digest".to_owned(),
+                provider_trace_id: None,
+                provider_cost: ProviderCost::Computed,
             },
         );
         assert_eq!(
@@ -4556,10 +5207,7 @@ mod tests {
     async fn worker_sends_ambiguous_provider_response_to_reconciliation_once() {
         let events = Arc::new(Mutex::new(Vec::new()));
         let repository = Arc::new(WorkerRepository::new(worker_job(20_000), events.clone()));
-        let adapter = Arc::new(WorkerAdapter {
-            succeeds: false,
-            calls: AtomicUsize::new(0),
-        });
+        let adapter = Arc::new(WorkerAdapter::new(false, false));
 
         assert!(
             worker(repository.clone(), adapter.clone())
@@ -4588,20 +5236,23 @@ mod tests {
         );
     }
 
-    /// 第二种对账：**上游已确认生成、但平台无法结清**（实际费用超过受理时的预授权）。
+    /// 第二种对账：**上游已确认生成、但平台无法交付结果**（上游没给任何图）。
     ///
     /// 与第一种（创建阶段失联）的区别在这条路径上体现为**错误码不同**：
     /// 这里是 `result_delivery_failed`，而创建阶段失联用 adapter 报的错误码。
     /// 两者都进对账并保留预授权，但性质可分。
+    ///
+    /// 这条路径同时钉住一件事：**执行已经发生、成本也拿得到**，所以成本事实必须跟着落下来
+    /// ——只有成功路径才落成本，等于把"这一笔到底花了多少钱"丢在一条已经付过钱的路径上。
+    /// 结算按实际、可透支之后，"实际费用超过预授权"不再是进对账的理由（那是旧口径），
+    /// 所以这里用"上游没给图"来构造这条路径。
     #[tokio::test]
     async fn worker_sends_settlement_failure_to_reconciliation_with_its_own_code() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        // 预授权 1 microusd，而这次生成的费用是 5_925：生成已经发生，因此只能对账，不能当失败。
-        let repository = Arc::new(WorkerRepository::new(worker_job(1), events.clone()));
-        let adapter = Arc::new(WorkerAdapter {
-            succeeds: true,
-            calls: AtomicUsize::new(0),
-        });
+        let job = worker_job(1);
+        let snapshot = job.offering.price_snapshot.clone();
+        let repository = Arc::new(WorkerRepository::new(job, events.clone()));
+        let adapter = Arc::new(WorkerAdapter::new(true, true));
 
         assert!(
             worker(repository.clone(), adapter.clone())
@@ -4636,13 +5287,36 @@ mod tests {
             HoldDisposition::RetainForReconciliation,
             "a generated result must keep the hold for reconciliation"
         );
+        // 执行已经发生：成本事实跟着这条路径一起落，且按**成本那一侧**的费率独立算出来。
+        let expected = snapshot
+            .cost_rates()
+            .amount_microusd(&TokenUsage {
+                input_tokens: 9,
+                input_text_tokens: 9,
+                input_image_tokens: 0,
+                output_tokens: 196,
+                output_text_tokens: 0,
+                output_image_tokens: 196,
+                total_tokens: 205,
+            })
+            .expect("the channel cost rates price the usage");
+        assert_eq!(
+            failure.provider_cost,
+            Some(ProviderCostFact {
+                source: ProviderCostSource::Computed,
+                amount_microusd: Some(expected),
+                currency: Some(snapshot.cost_currency().to_owned()),
+                cny_microusd: None,
+            }),
+            "进对账这条路径上的成本事实必须有去处：执行已经发生、成本也拿得到"
+        );
         assert!(
             repository
                 .completion
                 .lock()
                 .expect("completion lock")
                 .is_none(),
-            "no settlement may happen when the actual charge exceeds the authorization"
+            "no settlement may happen when the provider delivered no result"
         );
     }
 

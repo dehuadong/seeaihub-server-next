@@ -4,7 +4,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, patch, post},
+    routing::{get, patch, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -13,8 +13,9 @@ use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
     AdapterRegistry, ApplicationError, CreateImageGenerationRequest, GatewayModelView,
     GeneratedImage, GenerationService, HubRepository, IdentityService, JobView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RuntimeService,
+    MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
+    RefundReconciliationCommand, RuntimeService,
 };
 use seeai_domain::{
     AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel,
@@ -36,6 +37,8 @@ struct AppState {
     identity: IdentityService,
     runtime: RuntimeService,
     reconciliation: ReconciliationService,
+    /// 定价侧的管理员面：折算率的录入与取值（汇率不进不可变修订）。
+    pricing: PricingService,
     generations: GenerationService,
     /// 同步入口等任务跑完的最长时间。
     sync_wait: Duration,
@@ -66,6 +69,7 @@ async fn main() -> Result<()> {
         identity: IdentityService::new(repository_port.clone()),
         runtime: RuntimeService::new(repository_port.clone(), adapters),
         reconciliation: ReconciliationService::new(repository_port.clone()),
+        pricing: PricingService::new(repository_port.clone()),
         sync_wait: generation_sync_wait()?,
         generations: GenerationService::new(
             repository_port,
@@ -99,6 +103,8 @@ async fn main() -> Result<()> {
             post(refund_reconciliation),
         )
         .route("/api/v1/provider-failures", get(list_provider_failures))
+        .route("/api/v1/fx-rates", put(upsert_fx_rate))
+        .route("/api/v1/provider-cost-gaps", get(list_provider_cost_gaps))
         .route("/v1/images/generations", post(generate_image))
         .route("/v1/images/edits", post(edit_image))
         .route("/v1/models", get(list_models))
@@ -228,7 +234,6 @@ struct ProviderFailuresQuery {
 }
 
 const DEFAULT_FAILURE_LIMIT: u32 = 100;
-const MAX_FAILURE_LIMIT: u32 = 500;
 
 /// 平台侧失败清单的响应：不翻页，因此必须让调用方看得出结果被截断了。
 #[derive(Debug, Serialize)]
@@ -267,7 +272,7 @@ async fn list_provider_failures(
     let limit = query
         .limit
         .unwrap_or(DEFAULT_FAILURE_LIMIT)
-        .clamp(1, MAX_FAILURE_LIMIT);
+        .clamp(1, MAX_OPERATIONAL_LIMIT);
     let failures = state
         .reconciliation
         .provider_failures(ProviderFailureQuery {
@@ -334,6 +339,84 @@ async fn refund_reconciliation(
         })
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 折算率的请求体：按币种给"1 单位该币种 = 多少人民币"的定点比值。
+///
+/// `rate_micros` 是定点整数（分母 1_000_000）：钱与汇率都不走浮点，差一个微单位就是对不上账。
+/// `effective_at` 不给就是"立即生效"；给了未来时刻就是调价预告——受理时取的仍是受理时刻
+/// 之前已生效的那一行。不给时这个时刻由**数据库**盖章：发布期校验与受理取值用的都是库的
+/// `now()`，换成 API 进程的时钟就会因两个时钟的漂移把"刚录完就发布"误判成"还没有生效"。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct UpsertFxRateBody {
+    currency: String,
+    rate_micros: u64,
+    effective_at: Option<DateTime<Utc>>,
+}
+
+/// 管理员写：录入一行折算率（渠道币种 → CNY）。
+///
+/// 汇率是**外部事实**，按币种维护，不属于任何一份发布：同一时刻同一币种全平台必须是同一个数
+/// 才对账得起来，放进每份发布里改一次汇率就要重发所有型号。没有折算率的币种在**发布期**被拒
+/// ——受理时取不到汇率就等于算不出成本，而那时拒的是消费者的请求。
+async fn upsert_fx_rate(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<UpsertFxRateBody>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    state
+        .pricing
+        .upsert_fx_rate(
+            // 生效时刻原样交给端口：`None` 表示"立即生效"，由数据库盖章，API 不替它读时钟。
+            NewFxRate {
+                currency: body.currency,
+                rate_micros: body.rate_micros,
+                effective_at: body.effective_at,
+            },
+            "admin-api",
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 成本缺口清单的查询参数：`limit` 为条数上限。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ProviderCostGapsQuery {
+    limit: Option<u32>,
+}
+
+/// 成本缺口清单的响应：与平台侧失败清单同形——不翻页，所以必须让调用方看得出结果被截断了。
+#[derive(Debug, Serialize)]
+struct ProviderCostGapsResponse {
+    gaps: Vec<ProviderCostGapView>,
+    count: usize,
+    truncated: bool,
+}
+
+/// 成本缺口清单（仅管理员）：执行发生了、成本本该有金额却拿不到（`unavailable`）的那些执行。
+///
+/// 运营从这里看到缺口：拿 `provider_trace_id` 去上游核账单，人工补录金额归账实核对那条线，
+/// 补录完成后这一笔不再出现在清单里。这些 Job **不进对账态**——对客结算已经按费率快照正常
+/// 完成，消费者的钱该扣的照扣；缺口是平台侧的账务缺口。
+async fn list_provider_cost_gaps(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<ProviderCostGapsQuery>,
+) -> Result<Json<ProviderCostGapsResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_FAILURE_LIMIT)
+        .clamp(1, MAX_OPERATIONAL_LIMIT);
+    let gaps = state.pricing.provider_cost_gaps(limit).await?;
+    Ok(Json(ProviderCostGapsResponse {
+        count: gaps.len(),
+        truncated: gaps.len() as u32 == limit,
+        gaps,
+    }))
 }
 
 /// 对客目录的响应：与生成入口一样用 `data` 承载列表。

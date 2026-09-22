@@ -1,17 +1,19 @@
 use async_trait::async_trait;
-use chrono::{Duration as ChronoDuration, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     ApplicationError, AttemptFailure, ClaimedJob, CompleteJob, GatewayModelCandidateView,
-    GatewayModelView, HoldDisposition, HubRepository, JobView, LeaseRecovery, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeRequest,
-    ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
+    GatewayModelView, HoldDisposition, HubRepository, JobView, LeaseRecovery, NewFxRate,
+    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
+    RoutingDecision,
 };
 use seeai_domain::{
-    AccountId, AttemptId, ChannelId, CreateImageGeneration, GenerationJob, ImageBranch, JobId,
-    OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PublishedModel,
-    PublishedOffering, PublishedRevision, RuntimeRevisionId, VendorModelId,
+    AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
+    GenerationJob, HitCandidate, ImageBranch, JobId, OfferingCandidate, OfferingId, PricePlanId,
+    PriceRates, PriceSnapshot, PublishedModel, PublishedOffering, PublishedRevision,
+    RuntimeRevisionId, VendorModelId,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
@@ -104,6 +106,7 @@ impl HubRepository for PgHubRepository {
             native_revision,
             actor,
             capability_schema,
+            markup_bps,
             offerings,
         } = request;
         if offerings.is_empty() {
@@ -112,6 +115,34 @@ impl HubRepository for PgHubRepository {
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 发布期校验：每个候选声明的成本币种必须有一行**已生效**的折算率，否则整份发布回滚。
+        // 受理时要按该币种取"受理时刻生效的那一行"并快照；发布期不拦，问题会在受理时才暴露
+        // ——那时拒的是消费者的请求，而错的是管理员的一次录入遗漏。
+        //
+        // 判据按**候选声明的币种**（不是"这条候选带不带定价"）：币种是这条供给的成本口径，
+        // 有没有定价不该让同一个币种在"能不能发布"这件事上前后不一致。
+        for offering in &offerings {
+            let effective: bool = sqlx::query_scalar(
+                r#"
+                SELECT EXISTS (
+                    SELECT 1 FROM pricing.fx_rates
+                    WHERE currency = $1 AND effective_at <= now()
+                )
+                "#,
+            )
+            .bind(&offering.rates.currency)
+            .fetch_one(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if !effective {
+                transaction.rollback().await.map_err(database_error)?;
+                return Err(ApplicationError::Validation(format!(
+                    "no effective fx rate for {}; record one before publishing a candidate \
+                     whose cost is kept in that currency",
+                    offering.rates.currency
+                )));
+            }
+        }
         // 合同行**不可变**：同一个 (vendor, model, revision) 只落一行，已有行一律复用，
         // 绝不就地改写。这样"Job 固定受理时版本"才成立——旧 Job 事后读到的合同与它受理时
         // 逐字相同。要改合同就发新修订（新修订是新行）。
@@ -165,6 +196,15 @@ impl HubRepository for PgHubRepository {
         };
         let mut candidates = Vec::with_capacity(offerings.len());
         let mut snapshot_entries = Vec::with_capacity(offerings.len());
+        // 定价列是**按候选键**的映射（同一个网关模型的不同候选价格不同），所以在循环里逐条
+        // 收集，最后整列写在修订上。全部为空时写 NULL：那是"这份修订没有定价"的明确信号，
+        // 与"定价表是空对象"分得开。
+        let mut reference_cost_microusd = Map::new();
+        let mut cost_currency = Map::new();
+        let mut consumer_rates_cny = Map::new();
+        let mut cost_basis = Map::new();
+        let mut tier_prices = Map::new();
+        let mut floor_amounts = Map::new();
         for offering in &offerings {
             let channel_id = ChannelId::new();
             sqlx::query(
@@ -244,9 +284,60 @@ impl HubRepository for PgHubRepository {
                     price_plan_id,
                     rates: offering.rates.clone(),
                     captured_at: now,
+                    // 命中的候选就是这条候选本身：快照是**按候选**带下来的，选中哪条就把哪条
+                    // 的快照固化进 Job，所以"这一笔的售价按谁算的"在快照里读得出来。
+                    hit_candidate: Some(HitCandidate {
+                        offering_id,
+                        channel_id,
+                        provider_kind: offering.provider_kind.clone(),
+                    }),
+                    // 随修订发布的定价。保底额与汇率依赖这次请求（`(size, quality)` 与受理时刻），
+                    // 发布侧算不出来，由受理用例算定后填。
+                    consumer_rates_cny: offering
+                        .pricing
+                        .as_ref()
+                        .map(|pricing| pricing.consumer_rates_cny.clone()),
+                    tier_prices: offering
+                        .pricing
+                        .as_ref()
+                        .map(|pricing| pricing.tier_prices.clone()),
+                    floor_amounts: offering
+                        .pricing
+                        .as_ref()
+                        .map(|pricing| pricing.floor_amounts.clone()),
+                    hold_microusd: None,
+                    hold_source: None,
+                    cost_basis: offering.pricing.as_ref().map(|pricing| pricing.cost_basis),
+                    reference_cost_microusd: offering
+                        .pricing
+                        .as_ref()
+                        .map(|pricing| pricing.reference_cost_microusd),
+                    cost_currency: offering
+                        .pricing
+                        .as_ref()
+                        .map(|pricing| pricing.cost_currency.clone()),
+                    markup_bps,
+                    fx_rate: None,
                 },
                 routing_priority: offering.routing_priority,
             });
+            if let Some(pricing) = &offering.pricing {
+                let key = offering_id.to_string();
+                reference_cost_microusd
+                    .insert(key.clone(), Value::from(pricing.reference_cost_microusd));
+                cost_currency.insert(key.clone(), Value::String(pricing.cost_currency.clone()));
+                consumer_rates_cny.insert(
+                    key.clone(),
+                    serde_json::to_value(&pricing.consumer_rates_cny)
+                        .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+                );
+                cost_basis.insert(
+                    key.clone(),
+                    Value::String(pricing.cost_basis.as_str().to_owned()),
+                );
+                tier_prices.insert(key.clone(), pricing.tier_prices.clone());
+                floor_amounts.insert(key, pricing.floor_amounts.clone());
+            }
             snapshot_entries.push(serde_json::json!({
                 "offering_id": offering_id,
                 "routing_priority": offering.routing_priority,
@@ -305,8 +396,10 @@ impl HubRepository for PgHubRepository {
         sqlx::query(
             r#"
             INSERT INTO publication.runtime_revisions
-                (id, snapshot, published_by, gateway_model, vendor_model_id)
-            VALUES ($1, $2, $3, $4, $5)
+                (id, snapshot, published_by, gateway_model, vendor_model_id,
+                 markup_bps, reference_cost_microusd, cost_currency, consumer_rates_cny,
+                 cost_basis, tier_prices, floor_amounts)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
             "#,
         )
         .bind(revision_id.0)
@@ -314,6 +407,13 @@ impl HubRepository for PgHubRepository {
         .bind(&actor)
         .bind(&gateway_model)
         .bind(vendor_model_id.0)
+        .bind(markup_bps)
+        .bind(optional_pricing_map(reference_cost_microusd))
+        .bind(optional_pricing_map(cost_currency))
+        .bind(optional_pricing_map(consumer_rates_cny))
+        .bind(optional_pricing_map(cost_basis))
+        .bind(optional_pricing_map(tier_prices))
+        .bind(optional_pricing_map(floor_amounts))
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -392,6 +492,13 @@ impl HubRepository for PgHubRepository {
                 p.text_output_microusd_per_million,
                 p.image_output_microusd_per_million,
                 rr.created_at AS captured_at,
+                rr.markup_bps,
+                rr.reference_cost_microusd,
+                rr.cost_currency,
+                rr.consumer_rates_cny,
+                rr.cost_basis,
+                rr.tier_prices,
+                rr.floor_amounts,
                 re.routing_priority
             FROM publication.runtime_entries re
             JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
@@ -487,6 +594,13 @@ impl HubRepository for PgHubRepository {
                 o.carrier_schema, o.parameter_mapping,
                 c.provider_kind,
                 ({CANDIDATE_AVAILABLE_SQL}) AS candidate_available,
+                rr.markup_bps,
+                rr.reference_cost_microusd,
+                rr.cost_currency,
+                rr.consumer_rates_cny,
+                rr.cost_basis,
+                rr.tier_prices,
+                rr.floor_amounts,
                 re.routing_priority
             FROM publication.runtime_entries re
             JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
@@ -554,6 +668,113 @@ impl HubRepository for PgHubRepository {
         )
         .await?;
         transaction.commit().await.map_err(database_error)
+    }
+
+    async fn upsert_fx_rate(&self, rate: NewFxRate, actor: &str) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 同一币种同一生效时刻只有一行：取值规则是"受理时刻生效的那一行"，两行同时刻就没有
+        // 唯一答案。重录同一时刻是**改**那一行（录错了要能改回来），不是再添一行。
+        //
+        // 生效时刻缺省时**由数据库盖章**（`coalesce($4, now())`），不让调用方替它读一个进程
+        // 时钟：发布期校验与受理取值都拿库的 `now()` 去比，盖章的时钟若不是同一个，"录完立刻
+        // 发布"就会在宿主与容器时钟漂移的不利方向上被判成"该币种还没有生效的折算率"。钱与
+        // 生效时刻只能认一个时钟。
+        //
+        // `RETURNING` 取回**库里最终那一行的时刻**：审计要记的是真正落库的时刻，而不是请求里
+        // 那个可能为空的入参。
+        let effective_at: DateTime<Utc> = sqlx::query_scalar(
+            r#"
+            INSERT INTO pricing.fx_rates (id, currency, rate_micros, effective_at, created_by)
+            VALUES ($1, $2, $3, coalesce($4, now()), $5)
+            ON CONFLICT (currency, effective_at)
+            DO UPDATE SET rate_micros = EXCLUDED.rate_micros, created_by = EXCLUDED.created_by
+            RETURNING effective_at
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(&rate.currency)
+        .bind(to_i64(rate.rate_micros)?)
+        .bind(rate.effective_at)
+        .bind(actor)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            "fx_rate.upsert",
+            "fx_rate",
+            &rate.currency,
+            &serde_json::json!({
+                "rate_micros": rate.rate_micros,
+                "effective_at": effective_at,
+            }),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)
+    }
+
+    async fn effective_fx_rate(&self, currency: &str) -> Result<Option<FxRate>, ApplicationError> {
+        // 取值规则：**受理时刻之前已生效、其中最新的一行**。不用"最新一行"是因为后录入的行可以
+        // 生效时间在未来（调价预告）——那样受理时该用的仍是旧那一行。
+        let row = sqlx::query(
+            r#"
+            SELECT currency, rate_micros, effective_at
+            FROM pricing.fx_rates
+            WHERE currency = $1 AND effective_at <= now()
+            ORDER BY effective_at DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(currency)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.map(|row| {
+            Ok(FxRate {
+                currency: row.try_get("currency").map_err(database_error)?,
+                rate_micros: to_u64(row.try_get("rate_micros").map_err(database_error)?)?,
+                effective_at: row.try_get("effective_at").map_err(database_error)?,
+            })
+        })
+        .transpose()
+    }
+
+    async fn provider_cost_gaps(
+        &self,
+        limit: u32,
+    ) -> Result<Vec<ProviderCostGapView>, ApplicationError> {
+        // 判据只有一条：**来源是 `unavailable`**（本该有金额却拿不到）。失败的执行四列全空、
+        // 来源也是空，那不是"缺口"而是"没有成本事实"——两者处置不同，不能混在一个清单里。
+        let rows = sqlx::query(
+            r#"
+            SELECT a.id AS attempt_id, a.job_id, j.account_id, j.gateway_model,
+                   c.provider_kind, a.provider_trace_id, a.completed_at
+            FROM generation.attempts a
+            JOIN generation.jobs j ON j.id = a.job_id
+            JOIN supply.channels c ON c.id = j.channel_id
+            WHERE a.provider_cost_source = 'unavailable'
+            ORDER BY a.completed_at DESC NULLS LAST, a.id ASC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                Ok(ProviderCostGapView {
+                    job_id: JobId(row.try_get("job_id").map_err(database_error)?),
+                    attempt_id: AttemptId(row.try_get("attempt_id").map_err(database_error)?),
+                    account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+                    gateway_model: row.try_get("gateway_model").map_err(database_error)?,
+                    provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+                    provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
+                    completed_at: row.try_get("completed_at").map_err(database_error)?,
+                })
+            })
+            .collect()
     }
 
     async fn create_account(
@@ -1136,11 +1357,9 @@ impl HubRepository for PgHubRepository {
         let account_id = AccountId(row.try_get("account_id").map_err(database_error)?);
         let authorized: i64 = row.try_get("max_cost_microusd").map_err(database_error)?;
         let charge = to_i64(charge_microusd)?;
-        if charge > authorized {
-            return Err(ApplicationError::Reconciliation(
-                "provider charge exceeded authorization".to_owned(),
-            ));
-        }
+        // **不封顶在预授权额**：预授权只是保底，实收按实际用量算。实收超过保底额时差额把余额
+        // 扣成负数（透支发生在结算，不在受理）——这是允许的结果，不是错误；下一次受理按当时的
+        // 余额判（可能已为负）⇒ 402。把这里改成"超过就进对账"会把一笔正常完成的生成扣在对账里。
         if evidence.attempt_id != attempt_id {
             return Err(ApplicationError::Persistence(
                 "metering evidence attempt does not match completion".to_owned(),
@@ -1150,8 +1369,8 @@ impl HubRepository for PgHubRepository {
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
         // 成本事实与计量证据**分开落**：计量事实是上游给的分项 token（在 `metering_evidence`
         // 里），成本是渠道报的钱或平台按实际用量自算的钱，只进毛利口径，不改对客金额。
-        // 折算后 CNY 这一项由定价侧填——汇率还没有落点，所以这一片是"没有折算值"（NULL），
-        // 不是 0，也不是用某个自己发明的分母算出来的数。
+        // 折算后 CNY 这一项由用例用**受理时冻结的汇率**算好——币种与那份汇率对不上时留 NULL
+        // （"没有折算值"，不是 0）。
         let provider_cost_amount = provider_cost.amount_microusd.map(to_i64).transpose()?;
         let provider_cost_cny = provider_cost.cny_microusd.map(to_i64).transpose()?;
         sqlx::query(
@@ -1200,6 +1419,8 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        // 释放差额 = 预授权额 − 实收：估大了退回余额，**估小了这里就是负数**，余额被扣成负的
+        // （透支在结算吸收）。库层的非负约束已放宽，所以这一步不再需要绕开。
         let refund = authorized - charge;
         sqlx::query(
             "UPDATE ledger.accounts SET balance_microusd = balance_microusd + $2, updated_at = now() WHERE id = $1",
@@ -1262,11 +1483,27 @@ impl HubRepository for PgHubRepository {
             }
         };
         if let Some(attempt_id) = attempt_id {
+            // 成本事实与失败事实**一起写**：进对账那条路径上执行已经发生、上游成本也拿得到，
+            // 只有成功路径才落成本，等于把"这一笔到底花了多少钱"丢在一条已经付过钱的路径上。
+            // 没有成本事实（连用量都算不出）时四列留 NULL——那是"这次没有成本事实可落"，
+            // 不是"成本是 0"。
+            let provider_cost = failure.provider_cost.clone();
+            let (cost_amount, cost_currency, cost_source, cost_cny) = match &provider_cost {
+                Some(cost) => (
+                    cost.amount_microusd.map(to_i64).transpose()?,
+                    cost.currency.clone(),
+                    Some(cost.source.as_str()),
+                    cost.cny_microusd.map(to_i64).transpose()?,
+                ),
+                None => (None, None, None, None),
+            };
             sqlx::query(
                 r#"
                 UPDATE generation.attempts
                 SET state = $3, provider_trace_id = $4, provider_error_code = $5,
-                    provider_error_message = $6, completed_at = now()
+                    provider_error_message = $6, provider_cost_microusd = $7,
+                    provider_cost_currency = $8, provider_cost_source = $9,
+                    provider_cost_cny_microusd = $10, completed_at = now()
                 WHERE id = $1 AND job_id = $2
                 "#,
             )
@@ -1276,6 +1513,10 @@ impl HubRepository for PgHubRepository {
             .bind(&failure.trace_id)
             .bind(&failure.provider_code)
             .bind(&failure.message)
+            .bind(cost_amount)
+            .bind(&cost_currency)
+            .bind(cost_source)
+            .bind(cost_cny)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -1664,13 +1905,17 @@ async fn insert_ledger_entry(
 }
 
 fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, ApplicationError> {
+    let offering_id = OfferingId(row.try_get("offering_id").map_err(database_error)?);
+    let channel_id = ChannelId(row.try_get("channel_id").map_err(database_error)?);
+    let provider_kind: String = row.try_get("provider_kind").map_err(database_error)?;
+    let pricing = row_candidate_pricing(row, offering_id.0)?;
     Ok(OfferingCandidate {
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,
         ),
         vendor_model_id: VendorModelId(row.try_get("vendor_model_id").map_err(database_error)?),
-        offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
-        channel_id: ChannelId(row.try_get("channel_id").map_err(database_error)?),
+        offering_id,
+        channel_id,
         gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,
         capability_schema: row.try_get("capability_schema").map_err(database_error)?,
@@ -1679,7 +1924,7 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
         restrictions: row.try_get("restrictions").map_err(database_error)?,
         adapter_key: row.try_get("adapter_key").map_err(database_error)?,
         provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
-        provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+        provider_kind: provider_kind.clone(),
         base_url: row.try_get("base_url").map_err(database_error)?,
         credential_env: row.try_get("credential_env").map_err(database_error)?,
         price_snapshot: PriceSnapshot {
@@ -1704,17 +1949,114 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
                 )?,
             },
             captured_at: row.try_get("captured_at").map_err(database_error)?,
+            // 命中候选就是这条候选：受理时选中哪条，就把它这份快照固化进 Job。
+            hit_candidate: Some(HitCandidate {
+                offering_id,
+                channel_id,
+                provider_kind,
+            }),
+            consumer_rates_cny: pricing.consumer_rates_cny,
+            tier_prices: pricing.tier_prices,
+            floor_amounts: pricing.floor_amounts,
+            // 保底额与汇率**依赖这次请求**，由受理用例算定后填（发布侧算不出来）。
+            hold_microusd: None,
+            hold_source: None,
+            cost_basis: pricing.cost_basis,
+            reference_cost_microusd: pricing.reference_cost_microusd,
+            cost_currency: pricing.cost_currency,
+            markup_bps: row.try_get("markup_bps").map_err(database_error)?,
+            fx_rate: None,
         },
         routing_priority: row.try_get("routing_priority").map_err(database_error)?,
     })
+}
+
+/// 一条候选在修订上的**定价**（按候选键的六个映射 + 修订级加价系数）。
+///
+/// 六个映射都缺席（`NULL`，或映射里没有这条候选）时全部为 `None`：这条候选不带定价，
+/// 受理与结算走旧口径。这是"迁移前的旧修订"与"发布了定价但表为空"分得开的关键。
+struct CandidatePricingRow {
+    consumer_rates_cny: Option<ConsumerRatesCny>,
+    tier_prices: Option<Value>,
+    floor_amounts: Option<Value>,
+    cost_basis: Option<CostBasis>,
+    reference_cost_microusd: Option<u64>,
+    cost_currency: Option<String>,
+}
+
+fn row_candidate_pricing(
+    row: &sqlx::postgres::PgRow,
+    offering_id: Uuid,
+) -> Result<CandidatePricingRow, ApplicationError> {
+    let entry = |column: &str| -> Result<Option<Value>, ApplicationError> {
+        let column: Option<Value> = row.try_get(column).map_err(database_error)?;
+        Ok(candidate_pricing_entry(column.as_ref(), offering_id).cloned())
+    };
+    let consumer_rates_cny = entry("consumer_rates_cny")?
+        .map(serde_json::from_value::<ConsumerRatesCny>)
+        .transpose()
+        .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+    let cost_basis = match entry("cost_basis")? {
+        Some(value) => Some(value.as_str().and_then(CostBasis::parse).ok_or_else(|| {
+            ApplicationError::Persistence(
+                "the published cost basis is not computed or declared".to_owned(),
+            )
+        })?),
+        None => None,
+    };
+    let reference_cost_microusd = entry("reference_cost_microusd")?
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                ApplicationError::Persistence(
+                    "the published reference cost is not an amount".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    let cost_currency = entry("cost_currency")?
+        .map(|value| {
+            value.as_str().map(str::to_owned).ok_or_else(|| {
+                ApplicationError::Persistence(
+                    "the published cost currency is not a currency name".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
+    Ok(CandidatePricingRow {
+        consumer_rates_cny,
+        tier_prices: entry("tier_prices")?,
+        floor_amounts: entry("floor_amounts")?,
+        cost_basis,
+        reference_cost_microusd,
+        cost_currency,
+    })
+}
+
+/// 从修订上**按候选键**的定价映射里取这条候选的那一份；没有这个键（或整列为空）时为 `None`。
+fn candidate_pricing_entry(column: Option<&Value>, offering_id: Uuid) -> Option<&Value> {
+    column?.as_object()?.get(&offering_id.to_string())
+}
+
+/// 按候选键的定价映射：一条候选都没带定价时写 `NULL`。
+///
+/// `NULL` 与空对象不是一回事：`NULL` 是"这份修订没有定价"（受理与结算走旧口径），空对象是
+/// "定价表是空的"。混起来之后，"迁移前的旧修订"与"发布了定价但表为空"就分不开了。
+fn optional_pricing_map(map: Map<String, Value>) -> Option<Value> {
+    if map.is_empty() {
+        None
+    } else {
+        Some(Value::Object(map))
+    }
 }
 
 /// 管理员视图里的一条候选：只读投影的一行。
 fn row_to_gateway_model_candidate(
     row: &sqlx::postgres::PgRow,
 ) -> Result<GatewayModelCandidateView, ApplicationError> {
+    let offering_id = OfferingId(row.try_get("offering_id").map_err(database_error)?);
+    let pricing = row_candidate_pricing(row, offering_id.0)?;
     Ok(GatewayModelCandidateView {
-        offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
+        offering_id,
         provider_kind: row.try_get("provider_kind").map_err(database_error)?,
         provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
         adapter_key: row.try_get("adapter_key").map_err(database_error)?,
@@ -1723,6 +2065,12 @@ fn row_to_gateway_model_candidate(
         enabled: row.try_get("candidate_available").map_err(database_error)?,
         carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
         parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
+        consumer_rates_cny: pricing.consumer_rates_cny,
+        reference_cost_microusd: pricing.reference_cost_microusd,
+        cost_currency: pricing.cost_currency,
+        cost_basis: pricing.cost_basis,
+        tier_prices: pricing.tier_prices,
+        floor_amounts: pricing.floor_amounts,
     })
 }
 
@@ -1741,6 +2089,8 @@ fn row_to_gateway_model(
             row.try_get("runtime_revision_id").map_err(database_error)?,
         ),
         published_at: row.try_get("published_at").map_err(database_error)?,
+        // 加价系数是**修订级**的（每个网关模型一个），所以从行上直接读，不按候选取。
+        markup_bps: row.try_get("markup_bps").map_err(database_error)?,
         candidates,
     })
 }

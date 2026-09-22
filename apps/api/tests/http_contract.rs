@@ -9,8 +9,13 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode};
-use seeai_application::HubRepository;
-use seeai_domain::{AccountId, replace_contract_model_identity};
+use seeai_application::{
+    AttemptFailure, HoldDisposition, HubRepository, ProviderFailureKind, PublicErrorCode,
+};
+use seeai_domain::{
+    AccountId, AttemptId, JobId, ProviderCostFact, ProviderCostSource,
+    replace_contract_model_identity,
+};
 use seeai_persistence::PgHubRepository;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -473,11 +478,15 @@ impl Drop for ApiProcess {
     }
 }
 
-/// 起一个平台 API 进程。
+/// 起一个平台 API 进程，并落下**测试夹具**要用的折算率。
 ///
-/// `sync_wait_seconds` 决定同步入口等多久：驱动测试给足（任务要跑完），
-/// 只验受理与路由的测试给小值（不必真等）。
-fn start_api(
+/// 汇率是**外部事实**、由管理员在后台录入：发布一个候选时，它声明的成本币种必须已有一行
+/// 生效的折算率，否则发布期就拒（这正是设计要的行为——受理时取不到汇率就算不出成本，而那时
+/// 拒的是消费者的请求）。所以每个用例在发布之前先有这两行。
+///
+/// 这两行是**夹具**，不是生产默认值：`USD` 的数值只在本用例里成立，`CNY` 那一行是 1:1
+/// （同币种折算按定义就是 1）。要验"没有折算率的币种发布被拒"的用例用一个**没被种下**的币种。
+async fn start_api(
     database_url: &str,
     sync_wait_seconds: u64,
     max_concurrent_jobs: u64,
@@ -503,6 +512,22 @@ fn start_api(
         .stderr(Stdio::null())
         .spawn()
         .expect("API process should start");
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    for (currency, rate_micros) in [("USD", 7_100_000_u64), ("CNY", 1_000_000_u64)] {
+        let response = client
+            .put(format!("{base_url}/api/v1/fx-rates"))
+            .bearer_auth(&admin_token)
+            .json(&json!({"currency": currency, "rate_micros": rate_micros}))
+            .send()
+            .await
+            .expect("fx rate fixture request");
+        assert_eq!(
+            response.status(),
+            StatusCode::NO_CONTENT,
+            "fixture fx rate for {currency} must be recorded"
+        );
+    }
     (base_url, admin_token, ApiProcess { child })
 }
 
@@ -643,7 +668,8 @@ impl Harness {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
         let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
-        let (base_url, admin_token, process) = start_api(&database_url, 30, max_concurrent_jobs);
+        let (base_url, admin_token, process) =
+            start_api(&database_url, 30, max_concurrent_jobs).await;
         let client = Client::new();
         wait_until_ready(&client, &base_url).await;
         let account = create_account(&client, &base_url, &admin_token).await;
@@ -960,7 +986,7 @@ async fn assert_job_succeeded(harness: &Harness, key: &str) -> Value {
 async fn public_surface_has_no_async_task_protocol() {
     let (database_url, database_name) = isolated_database_url().await;
     // 这个用例不起 Worker：同步入口必然等到超时，正好用来验"等不到时对客怎么说"。
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
 
@@ -2511,7 +2537,7 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
 async fn multiple_active_offerings_route_by_priority() {
     let (database_url, database_name) = isolated_database_url().await;
     // 同步入口会等到超时（没有 Worker）：给小值，别让用例白等。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -2729,7 +2755,7 @@ async fn multiple_active_offerings_route_by_priority() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let pool = PgPool::connect(&database_url)
@@ -2917,7 +2943,7 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn legacy_aihubmix_material_still_publishes() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let pool = PgPool::connect(&database_url)
@@ -2970,7 +2996,7 @@ async fn legacy_aihubmix_material_still_publishes() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn carrier_field_outside_the_contract_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
 
@@ -3032,7 +3058,7 @@ async fn carrier_field_outside_the_contract_is_rejected() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn carrier_field_the_driver_cannot_write_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
 
@@ -3081,7 +3107,7 @@ async fn carrier_field_the_driver_cannot_write_is_rejected() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idempotent() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let pool = PgPool::connect(&database_url)
@@ -3172,7 +3198,7 @@ async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idemp
 async fn carrier_surface_is_frozen_into_the_job() {
     let (database_url, database_name) = isolated_database_url().await;
     // 同步入口会等到超时（没有 Worker）：给小值，别让用例白等。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -3268,7 +3294,7 @@ async fn carrier_surface_is_frozen_into_the_job() {
 async fn a_field_a_carrier_cannot_carry_skips_it_and_fails_platform_side_when_none_can() {
     let (database_url, database_name) = isolated_database_url().await;
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -3639,7 +3665,7 @@ async fn the_size_conversion_reaches_the_upstream_request_body() {
 async fn a_size_combination_the_profile_lacks_makes_the_candidate_ineligible() {
     let (database_url, database_name) = isolated_database_url().await;
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -3816,7 +3842,7 @@ async fn a_size_combination_the_profile_lacks_makes_the_candidate_ineligible() {
 async fn the_auto_size_is_passed_through_and_never_converted() {
     let (database_url, database_name) = isolated_database_url().await;
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -4114,7 +4140,7 @@ async fn a_renamed_field_reaches_the_upstream_under_the_wire_name() {
 async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_candidate() {
     let (database_url, database_name) = isolated_database_url().await;
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -4307,7 +4333,7 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn defaults_the_carrier_cannot_carry_are_rejected_at_publication() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
 
@@ -4387,7 +4413,7 @@ async fn defaults_the_carrier_cannot_carry_are_rejected_at_publication() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_parameter() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -4589,7 +4615,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
     .await;
     let apimart_upstream =
         start_fake_upstream_with(apimart_calls.clone(), UpstreamBehaviour::apimart()).await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
@@ -5532,11 +5558,78 @@ async fn publish_candidates(
     admin_token: &str,
     model: &str,
     contract: Option<Value>,
-    mut offerings: Vec<Value>,
+    offerings: Vec<Value>,
 ) -> StatusCode {
+    publish_candidates_with_markup(
+        client,
+        base_url,
+        admin_token,
+        model,
+        contract,
+        offerings,
+        None,
+    )
+    .await
+}
+
+/// 同 `publish_candidates`，但可以带上**修订级**的加价系数。
+///
+/// 加价系数是定价的**参考口径**，可以不给：管理员直接录入对客费率向量时它不参与计算。
+async fn publish_candidates_with_markup(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    model: &str,
+    contract: Option<Value>,
+    offerings: Vec<Value>,
+    markup_bps: Option<i32>,
+) -> StatusCode {
+    let body = publication_body(model, "route-test-1", contract, offerings, markup_bps);
+    client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("runtime publication")
+        .status()
+}
+
+/// 在**指定修订**上发布一组候选（用夹具那台 API 与它的管理员令牌）。
+///
+/// 合同行不可变：同一个 (厂商, 型号, 修订) 只落一行，内容不同就拒——所以要发一份**不同的合同**
+/// 必须换修订号；同一个修订号重发只允许内容逐字相同。
+async fn publish_on_revision(
+    harness: &Harness,
+    model: &str,
+    revision: &str,
+    contract: Value,
+    offerings: Vec<Value>,
+    markup_bps: Option<i32>,
+) -> StatusCode {
+    let body = publication_body(model, revision, Some(contract), offerings, markup_bps);
+    Client::new()
+        .post(format!("{}/api/v1/runtime-revisions", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("runtime publication")
+        .status()
+}
+
+/// 拼一份发布命令：线上名以**承载面**为准，`model.const` 与 `provider_model_id` 都跟着本次型号走。
+///
+/// 旧形状的素材没有承载面，那份 `capability_schema` 就是它，两者落在同一处；带模型级合同时，
+/// 合同里的 `model.const` 也必须等于 `native_model_id`（发布期的硬判据）。
+fn publication_body(
+    model: &str,
+    revision: &str,
+    contract: Option<Value>,
+    mut offerings: Vec<Value>,
+    markup_bps: Option<i32>,
+) -> Value {
     for offering in &mut offerings {
-        // 线上名以**承载面**为准；`model.const` 跟着本次发布的型号走。旧形状没有承载面，
-        // 那份 `capability_schema` 就是它，两者落在同一处。
         let surface = if offering
             .get("carrier_schema")
             .is_some_and(|value| !value.is_null())
@@ -5551,29 +5644,70 @@ async fn publish_candidates(
     let mut body = json!({
         "vendor_id": "OpenAI",
         "native_model_id": model,
-        "native_revision": "route-test-1",
+        "native_revision": revision,
         "actor": "contract-test",
         "offerings": offerings
     });
     if let Some(mut contract) = contract {
-        // 合同里的 `model.const` 必须等于 `native_model_id`（发布期的硬判据），所以它也跟着
-        // 本次发布的型号走——素材里写的是厂商型号名，测试用的是自己的网关型号名。
         contract["properties"]["model"]["const"] = Value::String(model.to_owned());
         body["capability_schema"] = contract;
     }
-    client
-        .post(format!("{base_url}/api/v1/runtime-revisions"))
-        .bearer_auth(admin_token)
-        .json(&body)
-        .send()
-        .await
-        .expect("runtime publication")
-        .status()
+    if let Some(markup_bps) = markup_bps {
+        body["markup_bps"] = json!(markup_bps);
+    }
+    body
 }
 
 /// 测试构造体：模型 + 提示词（幂等键另走请求头）。
 fn route_request(model: &str, prompt: &str) -> Value {
     json!({"model": model, "prompt": prompt})
+}
+
+/// 定价断言用的**对客四档 CNY 费率向量**（每 1M tokens）。
+///
+/// 取值故意都高于该渠道的成本费率折算成人民币之后的样子（USD 费率 5/8/10/30 折 7.1 之后约
+/// 35/57/71/213），这样毛利是正的——用例要验的是"售价 − 成本折算后可逐笔算出"，毛利为负也
+/// 能算，但正数更能看出方向。
+fn priced_consumer_rates() -> Value {
+    json!({
+        "text_input_micros_per_million": 40_000_000,
+        "image_input_micros_per_million": 64_000_000,
+        "text_output_micros_per_million": 80_000_000,
+        "image_output_micros_per_million": 220_000_000
+    })
+}
+
+/// OpenAI 系当前的保底表形态：只按 `size` 填，`quality` 维留空备用。
+fn openai_floor_amounts() -> Value {
+    json!({
+        "amounts": {"1K": 160_000, "2K": 250_000, "4K": 300_000},
+        "cap_microusd": 300_000
+    })
+}
+
+/// 一个**付得起**的账户与 Key。
+///
+/// 夹具自带的账户余额只有 ¥0.10，比定价候选的保底额（¥0.16 起）还小——那本身是对的
+/// （受理闸门就是"余额 ≥ 保底额"），但要验售价与结算，得先有一个余额充足的账户。
+async fn funded_account(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    credit_microusd: u64,
+) -> (String, String) {
+    let account_id =
+        create_account_with_credit(client, base_url, admin_token, credit_microusd).await;
+    let api_key = issue_key(client, base_url, admin_token, &account_id).await;
+    (account_id, api_key)
+}
+
+/// 这次受理冻结下来的**定价快照**（`generation.jobs.price_snapshot`）。
+async fn frozen_snapshot(pool: &PgPool, key: &str) -> Value {
+    sqlx::query_scalar("SELECT price_snapshot FROM generation.jobs WHERE idempotency_key = $1")
+        .bind(key)
+        .fetch_one(pool)
+        .await
+        .expect("the request must have created a job with a frozen snapshot")
 }
 
 /// 合同里的文生图请求体（bootstrap 素材的模型名）。
@@ -6079,7 +6213,7 @@ fn renamed_material(aihubmix_upstream: &str) -> Value {
 async fn the_model_catalog_lists_only_callable_models_with_their_published_contract() {
     let (database_url, database_name) = isolated_database_url().await;
     // 同步入口在这个用例里只用来验"停用之后真的调不了"；那一步在受理前就失败，不会等超时。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -6256,7 +6390,7 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
     )
     .await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
@@ -6572,7 +6706,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
     )
     .await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
     wait_until_ready(&client, &base_url).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
@@ -6813,7 +6947,7 @@ async fn gateway_model_naming_migration_backfills_existing_publications() {
     assert!(enabled, "既有生效名字回填成启用");
 
     // 5) 迁移后立刻可读、可停用：走管理端接口（不起 Worker，也不连上游）。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url).await;
     let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
@@ -6832,6 +6966,1442 @@ async fn gateway_model_naming_migration_backfills_existing_publications() {
     );
     let (_, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
     assert_eq!(admin["gateway_models"][0]["enabled"], false);
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}
+
+// ───────────────────────── 定价、保底与结算 ─────────────────────────
+
+/// 起一个夹具并把它那条候选**重新发布成带定价的**。
+///
+/// 上游地址取夹具里那个假上游：重新发布不能把地址写回素材里那个占位地址（那样 Worker 会去连
+/// 一个不存在的上游）。重新发布本身就是"发布即原子替换"——它顺带证明**已受理的 Job 不受
+/// 后来的修订影响**（旧 Job 固定的是受理时那一版）。
+async fn republish_priced(
+    harness: &Harness,
+    client: &Client,
+    floor_amounts: Value,
+    consumer_rates: Value,
+    markup_bps: i32,
+) -> StatusCode {
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    draft["reference_cost_microusd"] = json!(11_354);
+    draft["cost_basis"] = json!("computed");
+    draft["consumer_rates_cny"] = consumer_rates;
+    draft["tier_prices"] = json!({"1K": 160_000, "2K": 250_000, "4K": 300_000});
+    draft["floor_amounts"] = floor_amounts;
+    publish_candidates_with_markup(
+        client,
+        &harness.base_url,
+        &harness.admin_token,
+        Harness::MODEL,
+        None,
+        vec![draft],
+        Some(markup_bps),
+    )
+    .await
+}
+
+/// 发一次请求，回读这次受理冻结下来的 `(保底额, 保底额来源)`。
+async fn hold_for(harness: &Harness, api_key: &str, parameters: Value) -> (u64, String) {
+    let key = format!("hold-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "hold contract");
+    for (name, value) in parameters
+        .as_object()
+        .expect("parameters must be an object")
+    {
+        request[name] = value.clone();
+    }
+    let (status, body) = post_json(
+        &harness.base_url,
+        api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    (
+        snapshot["hold_microusd"].as_u64().expect("a frozen hold"),
+        snapshot["hold_source"]
+            .as_str()
+            .expect("a frozen hold source")
+            .to_owned(),
+    )
+}
+
+/// 该 Job 的账户当前余额（账本是权威）。
+async fn account_balance(harness: &Harness, job_id: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT a.balance_microusd FROM ledger.accounts a
+         JOIN generation.jobs j ON j.account_id = a.id WHERE j.id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("balance")
+}
+
+/// **定价随 Job 冻结，结算只读那份快照**。
+///
+/// 一次请求同时钉住四件事：售价按**命中候选**发布的那份对客 CNY 费率向量算（不是渠道成本
+/// 费率）、保底额按请求的 `(size, quality)` 查该供给的保底表（**不由售价派生**）、汇率按该候选
+/// 的成本币种取受理时刻生效的那一行并随快照冻结、成本记原币种原值并用冻结的汇率折出人民币。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+    let key = format!("pricing-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "pricing contract");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("定价与结算", &body);
+    // 对客面**只有人民币**：响应里不出现成本侧那个币种。
+    assert!(
+        !body.to_string().contains("USD"),
+        "对客响应不该出现外币：{body}"
+    );
+
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(
+        snapshot["consumer_rates_cny"],
+        priced_consumer_rates(),
+        "对客费率向量必须与后台设定逐位一致"
+    );
+    assert_eq!(snapshot["hold_microusd"], json!(250_000), "2K 档的保底额");
+    assert_eq!(snapshot["hold_source"], json!("tier"));
+    assert_eq!(snapshot["cost_currency"], json!("USD"));
+    assert_eq!(snapshot["reference_cost_microusd"], json!(11_354));
+    assert_eq!(snapshot["cost_basis"], json!("computed"));
+    assert_eq!(snapshot["markup_bps"], json!(2_000));
+    assert_eq!(snapshot["fx_rate"]["currency"], json!("USD"));
+    assert_eq!(snapshot["fx_rate"]["rate_micros"], json!(7_100_000));
+
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    let offering_id: Uuid =
+        sqlx::query_scalar("SELECT offering_id FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("offering");
+    assert_eq!(
+        snapshot["hit_candidate"]["offering_id"],
+        json!(offering_id.to_string()),
+        "快照记的命中候选就是这次真正选中的那一条"
+    );
+    // 预授权额 = 保底额（不由售价派生）：Job 上的数与账本里的 hold 都是它。
+    let authorized: i64 =
+        sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("authorization");
+    assert_eq!(authorized, 250_000);
+    let held: i64 =
+        sqlx::query_scalar("SELECT amount_microusd FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("hold");
+    assert_eq!(held, 250_000);
+    // 实收 = 对客费率向量 × 实际用量：14 文本输入 × 40 + 196 图像输出 × 220（每 1M）。
+    assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    // 成本 = 原币种原值 + 折算后 CNY：5950 微美元 × 7.1 = 42245 微元。
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(amount, Some(5_950));
+    assert_eq!(currency.as_deref(), Some("USD"));
+    assert_eq!(source.as_deref(), Some("computed"));
+    assert_eq!(cny, Some(42_245));
+    // 毛利 = 售价（CNY）− 成本折算后 CNY，两条线分开留痕、可逐笔算出。
+    assert_eq!(43_680 - 42_245, 1_435);
+    // 余额 = 初始 − 实收（受理时先按保底额冻，结算按实际结清）。
+    let balance_after_first = account_balance(&harness, job_id).await;
+    assert_eq!(balance_after_first, 1_000_000 - 43_680);
+
+    // ── 重发修订（换对客费率向量与加价系数）**不影响已受理的 Job** ──
+    let mut higher = priced_consumer_rates();
+    higher["image_output_micros_per_million"] = json!(440_000_000);
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            higher.clone(),
+            3_000
+        )
+        .await,
+        StatusCode::OK
+    );
+    let next_key = format!("pricing-next-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &next_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
+    assert_eq!(
+        next_snapshot["consumer_rates_cny"], higher,
+        "新受理的 Job 用新价"
+    );
+    assert_eq!(next_snapshot["markup_bps"], json!(3_000));
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &key).await,
+        snapshot,
+        "已受理 Job 的快照逐位不动"
+    );
+    assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    // 第二笔按新价结算：14 文本输入 × 40 + 196 图像输出 × 440（每 1M） = 86800 微元。
+    assert_eq!(
+        account_balance(&harness, job_id).await,
+        balance_after_first - 86_800,
+        "旧 Job 的金额不动，新 Job 按新价扣"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **售价按命中的那条候选算**：同一个网关模型的两个候选各带一份对客费率向量，实收按**命中**的
+/// 那一份算，而且只随它变。
+///
+/// 两份向量故意差得很远（便宜那份算出来是 210 微元、正常那份是 43680 微元），拿错一份立刻露出来；
+/// 用**承载面差异**把请求逼到优先级 1 的那条（优先级 0 的候选承载不了 `quality`）。随后只改
+/// `reference_cost_microusd` 重发：参考成本只是定价参考，对客实收逐位不变。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    let model = Harness::MODEL;
+    // 合同声明 `quality`（调用方能提交它），而**优先级 0** 的候选承载面里没有它——请求带上
+    // `quality` 就一定落到优先级 1 的那条（选路规则：按优先级取第一个合格者）。
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let narrow = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let wide = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    // 便宜得离谱的那份：这次的用量按它算只有 14 × 1 + 196 × 1 = 210 微元。
+    let cheap = json!({
+        "text_input_micros_per_million": 1_000_000,
+        "image_input_micros_per_million": 1_000_000,
+        "text_output_micros_per_million": 1_000_000,
+        "image_output_micros_per_million": 1_000_000
+    });
+
+    let mut first = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    // 承载面走新名字：这一份发布带**模型级合同**，候选自带的旧 `capability_schema` 不该再充当
+    // 合同（两份不同的旧字段会让归一期拒掉整份发布）。
+    first["carrier_schema"] = narrow;
+    first
+        .as_object_mut()
+        .expect("a draft object")
+        .remove("capability_schema");
+    first["base_url"] = Value::String(harness.upstream_base_url.clone());
+    first["reference_cost_microusd"] = json!(11_354);
+    first["cost_basis"] = json!("computed");
+    first["consumer_rates_cny"] = cheap;
+    first["tier_prices"] = json!({});
+    first["floor_amounts"] = openai_floor_amounts();
+
+    let mut second = first.clone();
+    second["carrier_schema"] = wide;
+    second["reference_cost_microusd"] = json!(999_999);
+    second["consumer_rates_cny"] = priced_consumer_rates();
+
+    // 加价系数**不给**：对客费率向量是直接录入的，那一步用不上它（发布期不再强制）。
+    assert_eq!(
+        publish_on_revision(
+            &harness,
+            model,
+            "two-candidates-1",
+            contract.clone(),
+            vec![first.clone(), second.clone()],
+            None,
+        )
+        .await,
+        StatusCode::OK,
+        "直接录入对客费率向量、不填加价系数也必须发得出去"
+    );
+
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+    let mut request = route_request(harness.model, "hit candidate");
+    request["quality"] = json!("low");
+    let key = format!("hit-candidate-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(
+        snapshot["consumer_rates_cny"],
+        priced_consumer_rates(),
+        "快照冻的是**命中候选**那一份向量"
+    );
+    let hit: Uuid = snapshot["hit_candidate"]["offering_id"]
+        .as_str()
+        .expect("the frozen snapshot names the hit candidate")
+        .parse()
+        .expect("an offering id");
+    let chosen: Uuid = sqlx::query_scalar(
+        "SELECT re.offering_id FROM publication.runtime_entries re
+         WHERE re.active AND re.gateway_model = $1 AND re.routing_priority = 1",
+    )
+    .bind(model)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the priority 1 offering");
+    assert_eq!(
+        hit, chosen,
+        "承载不了 `quality` 的那条落选，这次请求落到下一条"
+    );
+    // 实收按**命中候选**的向量算：14 文本输入 × 40 + 196 图像输出 × 220（每 1M）。
+    assert_eq!(
+        harness.captured_microusd(job_id).await,
+        -43_680,
+        "拿优先级 0 那份便宜向量算就是 -210，两者差得很远"
+    );
+
+    // ── 只改参考成本重发：对客实收只随对客费率向量变 ──
+    let mut repriced = second.clone();
+    repriced["reference_cost_microusd"] = json!(7_777_777);
+    assert_eq!(
+        publish_on_revision(
+            &harness,
+            model,
+            "two-candidates-2",
+            contract,
+            vec![first, repriced],
+            None,
+        )
+        .await,
+        StatusCode::OK
+    );
+    let next_key = format!("hit-candidate-next-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &next_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (next_job, state, _) = harness.job(&next_key).await;
+    assert_eq!(state, "succeeded");
+    let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
+    assert_eq!(
+        next_snapshot["reference_cost_microusd"],
+        json!(7_777_777),
+        "重发确实换掉了参考成本（否则下面那条断言就是空的）"
+    );
+    assert_eq!(
+        harness.captured_microusd(next_job).await,
+        -43_680,
+        "参考成本只是定价参考：对客实收只随 `consumer_rates_cny` 变"
+    );
+    assert_eq!(
+        harness.captured_microusd(job_id).await,
+        -43_680,
+        "已受理 Job 的金额不动"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **保底按供给维度查表**：先把这次请求的 `size` 归到档位，再查表；查不到走该供给封顶保底值。
+///
+/// 归位规则（设计 §6）：像素型 `size` 先按该供给发布的档位像素表反向查、缺失时按**最长边**
+/// 阈值兜底；`auto`（与没给 `size` 同义）取**默认档 2K**；比例型归不出档位。
+/// `quality` 维留空即按 `size` 档：表里没为某个质量单列时，带任意质量都查到同一个档位。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_hold_resolves_the_tier_then_walks_the_supply_floor_chain() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+
+    // 档位查表：2K = ¥0.25。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "2K"})).await,
+        (250_000, "tier".to_owned())
+    );
+    // 档位写法的大小写不影响查表：调用方的 `2k` 与管理员的 `2K` 是同一个档。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "2k"})).await,
+        (250_000, "tier".to_owned())
+    );
+    // `quality` 维留空即按 `size` 档：带任意质量都查到同一个档位。
+    for quality in ["low", "high", "xhigh", "auto"] {
+        assert_eq!(
+            hold_for(
+                &harness,
+                &api_key,
+                json!({"size": "2K", "quality": quality})
+            )
+            .await,
+            (250_000, "tier".to_owned()),
+            "quality={quality}"
+        );
+    }
+    // **像素型 `size` 先归到档位**（用户口径：按分辨率保底、通过 `size` 判断 1K/2K/4K）：
+    // 这条供给没发布尺寸档案，所以按**最长边**阈值兜底。
+    for (size, amount) in [
+        ("1024x1024", 160_000), // 最长边 1024 ⇒ 1K = ¥0.16
+        ("2048x2048", 250_000), // 最长边 2048 ⇒ 2K = ¥0.25
+        ("3840x2160", 300_000), // 最长边 3840 ⇒ 4K = ¥0.3
+    ] {
+        assert_eq!(
+            hold_for(&harness, &api_key, json!({"size": size})).await,
+            (amount, "tier".to_owned()),
+            "size={size} 必须按它归出来的档位查保底"
+        );
+    }
+    // `size = auto`（与没给 `size` 同义）⇒ 默认档 2K（中间档）。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "auto"})).await,
+        (250_000, "auto_tier".to_owned())
+    );
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({})).await,
+        (250_000, "auto_tier".to_owned())
+    );
+    // **空串不是"没给"**：`size` 的字面量就是调用方说的那个尺寸，归不出档位就回落封顶保底值
+    // ——只有字段缺失或字面 `auto` 才走默认档 2K。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": ""})).await,
+        (300_000, "supply_cap".to_owned()),
+        "空串与'没给这个字段'必须落到不同的保底额上"
+    );
+    // 比例型只说了形状、没说分辨率 ⇒ 归不出档位 ⇒ 回落该供给的封顶保底值。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "16:9"})).await,
+        (300_000, "supply_cap".to_owned())
+    );
+
+    harness.cleanup().await;
+}
+
+/// **没有定价的旧修订与空保底表都回落到平台兜底数**（`GENERATION_MAX_COST_MICROUSD`）。
+///
+/// 前者的预授权与结算都走旧口径、与今天逐位相同；后者有定价（售价按对客费率向量），只是连该
+/// 供给的封顶保底值都没有——来源记的是平台兜底，事后分得清。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_unpriced_revision_and_an_empty_floor_table_fall_back_to_the_platform_default() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+
+    // 1) 没有定价的修订：快照里没有对客费率向量，预授权回落平台兜底数，结算按已发布费率。
+    let key = format!("unpriced-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "unpriced revision"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert!(
+        snapshot["consumer_rates_cny"].is_null(),
+        "旧口径的快照不带对客费率向量：{snapshot}"
+    );
+    assert!(snapshot["hold_microusd"].is_null());
+    let authorized: i64 =
+        sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("authorization");
+    assert_eq!(
+        authorized, 20_000,
+        "没有定价时预授权回落平台兜底数（今天的行为）"
+    );
+    assert_eq!(
+        harness.captured_microusd(job_id).await,
+        -5_950,
+        "结算也走旧口径：已发布费率 × 实际用量"
+    );
+
+    // 2) 有定价、但保底表里什么都没有：连封顶保底值也没有 ⇒ 平台兜底。
+    assert_eq!(
+        republish_priced(&harness, &client, json!({}), priced_consumer_rates(), 2_000).await,
+        StatusCode::OK
+    );
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "2K"})).await,
+        (20_000, "platform_default".to_owned())
+    );
+
+    harness.cleanup().await;
+}
+
+/// **透支**：实收超过保底额时余额被扣成负数，随后同一账户再发请求按当时余额判 402。
+///
+/// 受理闸门是"余额 ≥ 保底额"——保底额估小了由**结算**吸收，估大了结算释放差额；透支不是错误，
+/// 也不进对账（对账态是"受理/执行状态不明"，会把消费者的钱扣在对账里）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_refused() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    // 保底额 ¥0.001（1000 微元），而这次生成实际要 ¥0.043680：估小了。
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            json!({"amounts": {"1K": 1_000}, "cap_microusd": 1_000}),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000).await;
+    let _worker = harness.spawn_worker();
+
+    let key = format!("overdraft-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "overdraft");
+    request["size"] = json!("1K");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "受理闸门是'余额 ≥ 保底额'：1000 ≥ 1000，照常受理。got {body}"
+    );
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    let balance = account_balance(&harness, job_id).await;
+    assert_eq!(balance, 1_000 - 43_680, "结算按实际扣：差额把余额扣成负数");
+    assert!(balance < 0);
+    let cases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("cases");
+    assert_eq!(cases, 0, "透支不是'状态不明'，不该把消费者的钱扣在对账里");
+
+    // 随后同一个账户再发一次：按当时（负）余额判 ⇒ 402，不产生 Job、不扣款。
+    let refused_key = format!("overdraft-refused-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &refused_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "got {body}");
+    assert_eq!(body["error"]["code"], json!("insufficient_balance"));
+    let created: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&refused_key)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("refused jobs");
+    assert_eq!(created, 0, "被拒的受理不产生 Job");
+    assert_eq!(
+        account_balance(&harness, job_id).await,
+        balance,
+        "被拒的受理不扣款"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **汇率按受理时刻生效的那一行取值**，且**没有折算率的币种在发布期被拒**。
+///
+/// 未来生效的一行是调价预告：受理时该用的仍是受理时刻之前已生效的那一行。受理之后再录一行
+/// 也不动已受理 Job 的折算——快照已经把它冻住了。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_rate_effective_at_acceptance_is_frozen_and_a_missing_rate_blocks_publication() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+
+    // 调价预告：未来生效的一行不参与受理时的取值。
+    let future = chrono::Utc::now() + chrono::Duration::days(1);
+    let response = client
+        .put(format!("{}/api/v1/fx-rates", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "currency": "USD",
+            "rate_micros": 9_000_000u64,
+            "effective_at": future.to_rfc3339(),
+        }))
+        .send()
+        .await
+        .expect("future fx rate");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // 没有折算率的币种：发布期拒绝，整份发布不落任何行。
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    draft["price_plan"]["currency"] = json!("EUR");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            "eur-model",
+            None,
+            vec![draft]
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "该币种没有折算率就必须在发布期被拒"
+    );
+    let revisions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM publication.runtime_revisions WHERE gateway_model = 'eur-model'",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("revisions");
+    assert_eq!(revisions, 0, "被拒的发布不落任何行");
+
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+    let key = format!("fx-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "fx rate"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(
+        snapshot["fx_rate"]["rate_micros"],
+        json!(7_100_000),
+        "取的是受理时刻生效的那一行，不是未来那一行"
+    );
+    let (job_id, _, _) = harness.job(&key).await;
+    assert_eq!(harness.attempt_cost(job_id).await.3, Some(42_245));
+
+    // 受理之后再录一行（立即生效）：已受理 Job 的折算用的是冻结的那个数。
+    let response = client
+        .put(format!("{}/api/v1/fx-rates", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"currency": "USD", "rate_micros": 5_000_000u64}))
+        .send()
+        .await
+        .expect("later fx rate");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &key).await["fx_rate"]["rate_micros"],
+        json!(7_100_000),
+        "快照已经冻住了受理当时那一行"
+    );
+    assert_eq!(
+        harness.attempt_cost(job_id).await.3,
+        Some(42_245),
+        "已受理 Job 的成本折算不变"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **未指定 `effective_at` 时，落库的生效时刻由数据库决定**，不由 API 进程的时钟盖章。
+///
+/// 判据是"同一事务里两个库侧时刻必须逐位相同"：折算率那一行的 `effective_at` 由库的 `now()`
+/// 盖章，同一事务里那条审计事件的 `created_at` 也是库的 `now()`。若改回由进程时钟盖章，两者
+/// 会差出宿主与容器的时钟漂移——那正是"录完折算率立刻发布"被判成"该币种还没有生效的折算率"
+/// 的成因（发布期校验与受理取值比的都是库的 `now()`）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_fx_rate_without_an_effective_time_is_stamped_by_the_database_clock() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let client = Client::new();
+
+    let response = client
+        .put(format!("{}/api/v1/fx-rates", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"currency": "GBP", "rate_micros": 8_800_000u64}))
+        .send()
+        .await
+        .expect("fx rate without effective_at");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let same_clock: bool = sqlx::query_scalar(
+        r#"
+        SELECT f.effective_at = a.created_at
+        FROM pricing.fx_rates f
+        JOIN operations.audit_events a
+          ON a.action = 'fx_rate.upsert' AND a.subject_id = f.currency
+        WHERE f.currency = 'GBP'
+        "#,
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("stamped fx rate row and its audit event");
+    assert!(
+        same_clock,
+        "未指定生效时刻的折算率必须由库盖章：它的生效时刻要与同一事务里那条审计事件的库侧时间戳相同"
+    );
+
+    // 同一事实的另一面：库里不该出现一行"还没生效"的折算率——发布期校验看到的就是这些行。
+    let pending: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM pricing.fx_rates WHERE effective_at > now()")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("pending fx rates");
+    assert_eq!(pending, 0, "库盖章的行落库即生效，不会落在库的 now() 之后");
+
+    harness.cleanup().await;
+}
+
+/// **上游声明的金额直接取，并用冻结的汇率折出人民币**（`declared` 那一态）。
+///
+/// 上游声明的是 11354 微美元，而按该渠道成本费率自算是 5950——两个数不同，正好钉住"声明就
+/// 直接取、不自己算"。对客金额只由受理时冻结的对客费率向量决定，实际成本只进毛利口径。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
+    let harness = Harness::start(UpstreamBehaviour::apimart()).await;
+    let client = Client::new();
+    // 承载面与首次发布那一份**逐字一致**：合同是模型级唯一一份且不可变，换了面会被发布期拒。
+    let mut draft = candidate(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only", "image_conditioned", "masked"],
+    );
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    draft["reference_cost_microusd"] = json!(11_354);
+    draft["cost_basis"] = json!("declared");
+    draft["consumer_rates_cny"] = priced_consumer_rates();
+    draft["tier_prices"] = json!({});
+    draft["floor_amounts"] = openai_floor_amounts();
+    assert_eq!(
+        publish_candidates_with_markup(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            Harness::MODEL,
+            None,
+            vec![draft],
+            Some(2_000),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+    let key = format!("declared-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "declared cost"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(amount, Some(11_354), "上游给了金额就直接取它，不自己算");
+    assert_eq!(currency.as_deref(), Some("USD"));
+    assert_eq!(source.as_deref(), Some("declared"));
+    assert_eq!(cny, Some(80_614), "11354 微美元 × 7.1 = 80613.4 ⇒ 向上取整");
+    assert_eq!(
+        harness.captured_microusd(job_id).await,
+        -43_680,
+        "实际成本不改对客金额：对客金额只由冻结的对客费率向量决定"
+    );
+    // 毛利 = 售价（CNY）− 成本折算后 CNY：这一笔是负的（参考成本只是发布时的定价参考，
+    // 上游实际声明的金额比它高），照样能逐笔算出——不猜、不掩盖。
+    assert_eq!(43_680 - 80_614, -36_934);
+
+    harness.cleanup().await;
+}
+
+/// 管理员读：`GET /api/v1/gateway-models` 列出每个候选的定价与修订级加价系数，不用直查库。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_admin_view_lists_the_published_pricing() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let (status, admin) =
+        get_gateway_models(&client, &harness.base_url, Some(&harness.admin_token)).await;
+    assert_eq!(status, StatusCode::OK, "{admin}");
+    let view = &admin["gateway_models"][0];
+    assert_eq!(view["markup_bps"], json!(2_000), "加价系数是修订级的");
+    let candidate = &view["candidates"][0];
+    assert_eq!(candidate["consumer_rates_cny"], priced_consumer_rates());
+    assert_eq!(candidate["reference_cost_microusd"], json!(11_354));
+    assert_eq!(candidate["cost_currency"], json!("USD"));
+    assert_eq!(candidate["cost_basis"], json!("computed"));
+    assert_eq!(candidate["tier_prices"]["2K"], json!(250_000));
+    assert_eq!(candidate["floor_amounts"]["amounts"]["2K"], json!(250_000));
+    assert_eq!(candidate["floor_amounts"]["cap_microusd"], json!(300_000));
+
+    harness.cleanup().await;
+}
+
+/// **成本缺口**的处置：不进对账态、对客结算照常完成，运营从缺口清单里看得到它。
+///
+/// 补录金额归账实核对那条线（另一张工单）；补录完成后这一笔不再出现在清单里，所以清单就是
+/// "当前还有哪些缺口"的答案。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconciliation() {
+    let mut behaviour = UpstreamBehaviour::apimart();
+    // 渠道声明了金额却拿不到（终态没有 `cost` 字段）⇒ 成本缺口。
+    behaviour.declared_cost = None;
+    let harness = Harness::start(behaviour).await;
+    let key = format!("gap-list-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "cost gap for operations"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "成本缺口不是执行失败");
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(source.as_deref(), Some("unavailable"));
+    assert_eq!(
+        (amount, currency, cny),
+        (None, None, None),
+        "缺口不猜：三样都留空"
+    );
+
+    // 不进对账态、也不开对账案例：消费者的钱该扣的照扣。
+    let cases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("cases");
+    assert_eq!(cases, 0);
+    assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+
+    // 运营从缺口清单里看到它，带着去上游核账单要用的对账标识。
+    let client = Client::new();
+    let gaps: Value = client
+        .get(format!("{}/api/v1/provider-cost-gaps", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("cost gap list")
+        .json()
+        .await
+        .expect("cost gap list JSON");
+    assert_eq!(gaps["count"], json!(1), "{gaps}");
+    assert_eq!(gaps["truncated"], json!(false));
+    assert_eq!(gaps["gaps"][0]["job_id"], json!(job_id.to_string()));
+    assert_eq!(gaps["gaps"][0]["gateway_model"], json!(harness.model));
+    assert!(
+        gaps["gaps"][0]["provider_trace_id"].as_str().is_some(),
+        "缺口清单必须带上游对账标识，否则核账单的人不知道该查哪个任务：{gaps}"
+    );
+    // 该接口只对管理员开放。
+    let unauthorized = client
+        .get(format!("{}/api/v1/provider-cost-gaps", harness.base_url))
+        .send()
+        .await
+        .expect("unauthorized cost gap list");
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+
+    harness.cleanup().await;
+}
+
+/// **进对账那条路径也落成本事实**：执行已经发生、上游成本也拿得到，成本必须有去处。
+///
+/// 直接调仓库端口的 `fail_job`：结果交付失败在端到端里很难构造（假上游总会给图），而这条路径
+/// 的写入本来就是库层的事。同时验"没有成本事实时四列留空"——那是"这次没有成本事实可落"，
+/// 与"成本是 0"不是一回事。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("repository");
+    repository.migrate().await.expect("migrations");
+    let pool = repository.pool().clone();
+
+    let account = Uuid::new_v4();
+    let vendor_model = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let offering = Uuid::new_v4();
+    let price_plan = Uuid::new_v4();
+    let revision = Uuid::new_v4();
+    let contract = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": {"const": "cost-path"},
+            "prompt": {"type": "string"}
+        }
+    });
+    sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 100000)")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .expect("account fixture");
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1,'OpenAI','cost-path','rev-1',$2)",
+    )
+    .bind(vendor_model)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("contract fixture");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')",
+    )
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("channel fixture");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
+              carrier_schema, parameter_mapping)
+         VALUES ($1,$2,$3,'aihubmix-image-v1','cost-path','{}'::jsonb,$4,'{}'::jsonb)",
+    )
+    .bind(offering)
+    .bind(vendor_model)
+    .bind(channel)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("offering fixture");
+    sqlx::query(
+        "INSERT INTO pricing.price_plans
+             (id, offering_id, currency, text_input_microusd_per_million, image_input_microusd_per_million,
+              text_output_microusd_per_million, image_output_microusd_per_million, source_url, approved_by)
+         VALUES ($1,$2,'USD',5,8,10,30,'https://example.invalid/price','cost-path-test')",
+    )
+    .bind(price_plan)
+    .bind(offering)
+    .execute(&pool)
+    .await
+    .expect("price plan fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_revisions
+             (id, snapshot, published_by, gateway_model, vendor_model_id)
+         VALUES ($1,'{}'::jsonb,'cost-path-test','cost-path',$2)",
+    )
+    .bind(revision)
+    .bind(vendor_model)
+    .execute(&pool)
+    .await
+    .expect("runtime revision fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_entries
+             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active)
+         VALUES ($1,$2,$3,$4,'cost-path',true)",
+    )
+    .bind(revision)
+    .bind(vendor_model)
+    .bind(offering)
+    .bind(price_plan)
+    .execute(&pool)
+    .await
+    .expect("runtime entry fixture");
+
+    // 两条停在"正在调上游"、持有租约的 Job：一条带成本事实进对账，一条不带。
+    let mut jobs = Vec::new();
+    for key in ["with-cost", "without-cost"] {
+        let job_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO generation.jobs
+                 (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
+                  native_parameters, carrier_schema, parameter_mapping, runtime_revision_id,
+                  vendor_model_id, offering_id, channel_id, price_snapshot, max_cost_microusd,
+                  lease_owner, lease_expires_at)
+             VALUES ($1,$2,$3,'hash','submitting','prompt_only','cost-path',
+                     '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$4,$5,$6,$7,'{}'::jsonb,20000,
+                     'worker-x', now() + interval '1 hour')",
+        )
+        .bind(job_id)
+        .bind(account)
+        .bind(key)
+        .bind(revision)
+        .bind(vendor_model)
+        .bind(offering)
+        .bind(channel)
+        .execute(&pool)
+        .await
+        .expect("job fixture");
+        let attempt_id = Uuid::new_v4();
+        sqlx::query(
+            "INSERT INTO generation.attempts (id, job_id, state, request_digest)
+             VALUES ($1,$2,'submitting','digest')",
+        )
+        .bind(attempt_id)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("attempt fixture");
+        jobs.push((JobId(job_id), AttemptId(attempt_id)));
+    }
+
+    let failure = |provider_cost| AttemptFailure {
+        provider_code: "result_delivery_failed".to_owned(),
+        public_code: PublicErrorCode::OutcomeUnknown,
+        message: "provider returned no image".to_owned(),
+        trace_id: Some("task-1".to_owned()),
+        kind: ProviderFailureKind::PlatformInternal,
+        target_state: seeai_domain::JobState::ReconciliationRequired,
+        hold_disposition: HoldDisposition::RetainForReconciliation,
+        provider_cost,
+    };
+    let (with_cost, with_cost_attempt) = jobs[0];
+    repository
+        .fail_job(
+            with_cost,
+            "worker-x",
+            Some(with_cost_attempt),
+            failure(Some(ProviderCostFact {
+                source: ProviderCostSource::Computed,
+                amount_microusd: Some(5_950),
+                currency: Some("USD".to_owned()),
+                cny_microusd: Some(42_245),
+            })),
+        )
+        .await
+        .expect("the reconciliation path must record the cost it already has");
+
+    let row = sqlx::query(
+        "SELECT provider_cost_microusd, provider_cost_currency, provider_cost_source,
+                provider_cost_cny_microusd, provider_trace_id
+         FROM generation.attempts WHERE id = $1",
+    )
+    .bind(with_cost_attempt.0)
+    .fetch_one(&pool)
+    .await
+    .expect("attempt after failure");
+    assert_eq!(
+        row.get::<Option<i64>, _>("provider_cost_microusd"),
+        Some(5_950)
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("provider_cost_currency")
+            .as_deref(),
+        Some("USD")
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("provider_cost_source")
+            .as_deref(),
+        Some("computed")
+    );
+    assert_eq!(
+        row.get::<Option<i64>, _>("provider_cost_cny_microusd"),
+        Some(42_245)
+    );
+    assert_eq!(
+        row.get::<Option<String>, _>("provider_trace_id").as_deref(),
+        Some("task-1")
+    );
+    let cases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
+    )
+    .bind(with_cost.0)
+    .fetch_one(&pool)
+    .await
+    .expect("cases");
+    assert_eq!(cases, 1, "结果交付失败仍然进对账（与成本缺口不同）");
+
+    // 没有成本事实（连用量都算不出）：四列留空，不写成 0。
+    let (without_cost, without_cost_attempt) = jobs[1];
+    repository
+        .fail_job(
+            without_cost,
+            "worker-x",
+            Some(without_cost_attempt),
+            failure(None),
+        )
+        .await
+        .expect("a failure without a cost fact is still recorded");
+    let row = sqlx::query(
+        "SELECT provider_cost_microusd, provider_cost_currency, provider_cost_source,
+                provider_cost_cny_microusd
+         FROM generation.attempts WHERE id = $1",
+    )
+    .bind(without_cost_attempt.0)
+    .fetch_one(&pool)
+    .await
+    .expect("attempt after failure");
+    assert!(
+        row.get::<Option<i64>, _>("provider_cost_microusd")
+            .is_none()
+    );
+    assert!(
+        row.get::<Option<String>, _>("provider_cost_currency")
+            .is_none()
+    );
+    assert!(
+        row.get::<Option<String>, _>("provider_cost_source")
+            .is_none()
+    );
+    assert!(
+        row.get::<Option<i64>, _>("provider_cost_cny_microusd")
+            .is_none()
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// **迁移 0009 的增量路径**：旧库（只应用 0009 之前的迁移）上的数据在迁移后逐字不变，
+/// 定价列留 NULL（旧修订没有定价），三处约束被放宽，汇率表落成空的。
+///
+/// 三处放宽不是顺手做的：不透支与"保底额可为 0"在库层面直接报错，而它们是这套口径的前提。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_pricing_migration_relaxes_the_balance_checks_on_an_existing_database() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用这次改动之前的迁移。
+    let staged = std::env::temp_dir().join(format!("seeai-pricing-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < "0009" {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy early migration");
+        }
+    }
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+
+    // 2) 旧数据：一个已经发布过、**没有定价**的型号，外加一个余额为 0 的账户。
+    let vendor_model = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let offering = Uuid::new_v4();
+    let price_plan = Uuid::new_v4();
+    let revision = Uuid::new_v4();
+    let account = Uuid::new_v4();
+    let contract = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": {"const": "priced-legacy"},
+            "prompt": {"type": "string"}
+        }
+    });
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1,'OpenAI','priced-legacy','legacy-revision',$2)",
+    )
+    .bind(vendor_model)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("legacy contract row");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')",
+    )
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("channel fixture");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
+              carrier_schema, parameter_mapping)
+         VALUES ($1,$2,$3,'aihubmix-image-v1','priced-legacy','{}'::jsonb,$4,'{}'::jsonb)",
+    )
+    .bind(offering)
+    .bind(vendor_model)
+    .bind(channel)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("offering fixture");
+    sqlx::query(
+        "INSERT INTO pricing.price_plans
+             (id, offering_id, currency, text_input_microusd_per_million, image_input_microusd_per_million,
+              text_output_microusd_per_million, image_output_microusd_per_million, source_url, approved_by)
+         VALUES ($1,$2,'USD',5,8,10,30,'https://example.invalid/price','migration-test')",
+    )
+    .bind(price_plan)
+    .bind(offering)
+    .execute(&pool)
+    .await
+    .expect("price plan fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_revisions
+             (id, snapshot, published_by, gateway_model, vendor_model_id)
+         VALUES ($1,'{}'::jsonb,'migration-test','priced-legacy',$2)",
+    )
+    .bind(revision)
+    .bind(vendor_model)
+    .execute(&pool)
+    .await
+    .expect("runtime revision fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_entries
+             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active)
+         VALUES ($1,$2,$3,$4,'priced-legacy',true)",
+    )
+    .bind(revision)
+    .bind(vendor_model)
+    .bind(offering)
+    .bind(price_plan)
+    .execute(&pool)
+    .await
+    .expect("runtime entry fixture");
+    sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 0)")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .expect("account fixture");
+
+    // 3) 补上整批迁移：定价列、汇率表与三处放宽都必须自己跑通。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the pricing migration must apply on an already-built database");
+
+    // 4) 旧修订的定价列全部为 NULL：它没有定价，受理与结算走旧口径。
+    let row = sqlx::query(
+        "SELECT markup_bps, reference_cost_microusd, cost_currency, consumer_rates_cny,
+                cost_basis, tier_prices, floor_amounts
+         FROM publication.runtime_revisions WHERE id = $1",
+    )
+    .bind(revision)
+    .fetch_one(&pool)
+    .await
+    .expect("runtime revision after migration");
+    for column in [
+        "markup_bps",
+        "reference_cost_microusd",
+        "cost_currency",
+        "consumer_rates_cny",
+        "cost_basis",
+        "tier_prices",
+        "floor_amounts",
+    ] {
+        assert!(
+            row.try_get::<Option<Value>, _>(column)
+                .expect("column probe")
+                .is_none(),
+            "{column} 在旧修订上必须留 NULL（不回填）"
+        );
+    }
+
+    // 5) 汇率表落成空的：数值是外部事实，由管理员录入，迁移不预置任何一行。
+    let rates: i64 = sqlx::query_scalar("SELECT count(*) FROM pricing.fx_rates")
+        .fetch_one(&pool)
+        .await
+        .expect("fx rates");
+    assert_eq!(rates, 0);
+
+    // 6) 三处约束已放宽：余额可为负、保底额与预授权额可为 0。
+    sqlx::query("UPDATE ledger.accounts SET balance_microusd = -1 WHERE id = $1")
+        .bind(account)
+        .execute(&pool)
+        .await
+        .expect("透支要能把余额扣成负数");
+    sqlx::query(
+        "INSERT INTO generation.jobs
+             (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
+              native_parameters, carrier_schema, parameter_mapping, runtime_revision_id,
+              vendor_model_id, offering_id, channel_id, price_snapshot, max_cost_microusd)
+         VALUES ($1,$2,'zero-hold','hash','accepted','prompt_only','priced-legacy',
+                 '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$3,$4,$5,$6,'{}'::jsonb,0)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account)
+    .bind(revision)
+    .bind(vendor_model)
+    .bind(offering)
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("保底额可为 0");
+    let job_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = 'zero-hold'")
+            .fetch_one(&pool)
+            .await
+            .expect("job");
+    sqlx::query(
+        "INSERT INTO ledger.holds (id, account_id, job_id, amount_microusd, status)
+         VALUES ($1,$2,$3,0,'active')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account)
+    .bind(job_id)
+    .execute(&pool)
+    .await
+    .expect("零保底额要能落下来");
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);
