@@ -1,6 +1,6 @@
 主题: 平台网关模型、对客定价与运营后台（含路由权重与 Redis 加速层）
 当前修订: v1
-状态: 待评审（Plan Review 两轮发现已收口；用户更正与批准已并入；计价口径更正与路由策略层已并入；路由策略层决策已立为 `docs/adr/0020`；**原两条未决已由用户答复定案——未决清单已清空**；**对客价随命中渠道浮动、成本币种按渠道声明**两条口径已并入，见 §3.4/§3.8/§10）
+状态: 待评审（Plan Review 两轮发现已收口；用户更正与批准已并入；计价口径更正与路由策略层已并入；路由策略层决策已立为 `docs/adr/0020`；**原两条未决已由用户答复定案——未决清单已清空**；**对客价随命中渠道浮动、成本币种按渠道声明**两条口径已并入，见 §3.4/§3.8/§10；**Plan Review 终轮 7 条已并入**——透支撞库约束、币种校验残留、成本折算列归属、售价被乘数维度、`cost_basis` 按候选、ADR 修订清单两条、P1/P2b 验收与 `route_policies`/`fx_rates` 三条，见 §3.2/§3.6/§5.1/§9/§10）
 来源: 依据工作项「运营后台：平台网关模型、对客定价与路由权重」（提案正文 `.data/proposal-admin-console.md`）、`docs/adr/0003`/`0006`/`0009`/`0015`/`0017`/`0019`/`0020`、`docs/design/0005` 与仓库现状归纳；不引入未标注的新决策
 
 # 平台网关模型、对客定价与运营后台
@@ -50,14 +50,14 @@
 
 | 改动 | 内容 | 理由 |
 | --- | --- | --- |
-| `publication.runtime_revisions` 增列 | `gateway_model text NOT NULL`、`vendor_model_id uuid NOT NULL`（**P1 落**）、`markup_bps integer`、`reference_cost_microusd jsonb`（**按候选键**：该候选的渠道成本，**原币种**微单位，列名里的 `usd` 是历史命名）、`cost_currency jsonb`（**按候选键**：该候选的成本币种，§3.8）、`cost_basis text`、`tier_prices jsonb`（**CNY**，展示用）、`floor_amounts jsonb`（**CNY**，保底表）（**P2b 落**；后六列**可空**：只有新发布的修订带定价，见下） | 让"这次发布定义的是哪个网关模型、指向哪个 Vendor Model、**每个候选的渠道成本是多少（什么币种）**、**成本按哪个来源算**、**预授权保底额从哪查**"在修订上可读，不必从条目反推 |
+| `publication.runtime_revisions` 增列 | `gateway_model text NOT NULL`、`vendor_model_id uuid NOT NULL`（**P1 落**）、`markup_bps integer`、`reference_cost_microusd jsonb`（**按候选键**：该候选的渠道成本，**原币种**微单位，列名里的 `usd` 是历史命名；**只作定价参考**）、`cost_currency jsonb`（**按候选键**：该候选的成本币种，§3.8）、`consumer_rates_cny jsonb`（**按候选键**：该候选的**对客四档 CNY 费率向量**，管理员设定/推导，§3.2/§3.4）、`cost_basis jsonb`（**按候选键**：该候选的成本来源两态，与 `cost_currency` 同处，§3.7）、`tier_prices jsonb`（**CNY**，展示用）、`floor_amounts jsonb`（**CNY**，保底表）（**P2b 落**；后七列**可空**：只有新发布的修订带定价，见下） | 让"这次发布定义的是哪个网关模型、指向哪个 Vendor Model、**每个候选的渠道成本是多少（什么币种）**、**每个候选的对客费率是多少**、**成本按哪个来源算**、**预授权保底额从哪查**"在修订上可读，不必从条目反推 |
 | `publication.runtime_entries` | 已有 `gateway_model`（迁移 0004 改名而来），不改 | 路由索引已经按它建好 |
 | 新表 `publication.gateway_models` | `gateway_model text PRIMARY KEY`、`enabled boolean NOT NULL DEFAULT true`、`created_at`、`updated_at`、`updated_by` | **只放运维开关**，不放定义（定义只在不可变修订里） |
 | 唯一性 | 沿用"同一名字同时只有一个生效修订"，由发布原子替换保证 | `ADR-0009` |
 
 `publication.gateway_models` 刻意**不存** `vendor_model_id` / 候选 / 定价：那些是修订的内容，存第二份就等于造第二个权威（`ADR-0003`）。它只回答"这个名字现在开着吗、谁在什么时候改的"。
 
-**`markup_bps`、按候选的渠道成本 `reference_cost_microusd`（连同它的 `cost_currency`）与 `cost_basis` 随修订发布、随 Job 的 Price Snapshot 冻结**（§3.2/§3.3），**不放** `publication.gateway_models`：那张表是**运行状态**（开关），定价是**修订内容**——放进可变表就等于"改价不用发布"，而 `ADR-0003` 要求已受理 Job 固定受理时版本，定价必须能随修订被 Job 固化。其中 `cost_basis` 存的是**这次的成本来源口径**（**两态**：`Computed` = 我们按**实际 `usage`** 的分项 token × 四档费率自算；`Declared` = 上游**直接给 `cost`**，更权威、含折扣；**两态都在成本平面、币种按该候选的 `cost_currency`**，§3.8），取值面与 §3.7 的 `provider_cost_source` 同源但**不是同一个量**：它是**随修订发布**的定价侧口径（这次发布按哪种来源记成本），随快照冻结后使"这笔的成本是按哪种来源取的"事后可辨——**"成本来源可辨"是毛利核算的要求**（§3.5/§3.7）。
+**`markup_bps`、按候选的渠道成本 `reference_cost_microusd`（连同它的 `cost_currency`）、按候选的对客费率向量 `consumer_rates_cny` 与按候选的 `cost_basis` 随修订发布、随 Job 的 Price Snapshot 冻结**（§3.2/§3.3），**不放** `publication.gateway_models`：那张表是**运行状态**（开关），定价是**修订内容**——放进可变表就等于"改价不用发布"，而 `ADR-0003` 要求已受理 Job 固定受理时版本，定价必须能随修订被 Job 固化。其中 `cost_basis` **按候选维度存**（与 `cost_currency` 同处）、存的是**该候选的成本来源口径**（**两态**：`Computed` = 我们按**实际 `usage`** 的分项 token × 四档费率自算；`Declared` = 上游**直接给 `cost`**，更权威、含折扣；**两态都在成本平面、币种按该候选的 `cost_currency`**，§3.8），取值面与 §3.7 的 `provider_cost_source` 同源但**不是同一个量**：它是**随修订发布**的定价侧口径（该候选按哪种来源记成本），随快照冻结后使"这笔的成本是按哪种来源取的"事后可辨——**"成本来源可辨"是毛利核算的要求**（§3.5/§3.7）。
 
 **写入方**：该名字**首次发布成功时**由发布事务插入一行（`enabled` 默认 `true`），此后只由 `PATCH` 改 `enabled`。没有发布过就 PATCH 不存在的名字 → 404。
 
@@ -66,12 +66,12 @@
 - **`tier_prices`（档位价目表）降级为参考**：`(size, quality)` → 每张价（**CNY**），**只用于定价参考与展示**（管理员核价、对客价目说明），**不参与预授权**（§3.6）。档位的主要影响因素是 **`size` 与 `quality`**；`resolution` 是 **APIMart 的包装参数**（调用方合同里没有"档位"形态，承载面也不声明它），因此**不作价目表 / 保底表的键**；
 - **`floor_amounts`（保底表）是预授权的唯一来源**：**按供给（vendor + offering）维度**挂——不同 vendor / offering 计价不同，所以保底额必须**分别设定**，不能按网关模型或全平台一个数；每条供给下按 **`(size, quality)` 两维**给保底额，并另有一个**该供给的封顶保底值**（档位查不到时用它）。**保底额是人民币（CNY）**（§3.8）。OpenAI 系当前**只按 `size` 填**（**1K = ¥0.16**、**2K = ¥0.25**、**4K = ¥0.3**，**币种＝CNY**），**`quality` 维留空备用**——**留空即按 `size` 档**（§3.6）。
 
-**为什么不编进代码**：档位结构、每张价、每档保底额都是**随模型与渠道变的数据**——换模型、换渠道、渠道调价都不该改代码、不该重新发版；它们与 `markup_bps` 同类，**随修订发布生效、随 Job 快照冻结**，已受理的 Job 不受后续改动影响（`ADR-0003`）。与现有两个量的关系：`reference_cost_microusd` 是**该候选的渠道成本**（**原币种**、可核，用来体现"售价 = 该候选的渠道成本 ×(1 + 加价系数)× 汇率"这条产品口径，§3.2/§3.4），`floor_amounts` 是**受理时算预授权的查表依据**（CNY）——同源不同用：前者回答"这个网关模型的价是怎么定的"，后者回答"这一次请求先冻多少"。**两个币种平面**（对客 CNY / 成本按渠道币种）见 §3.8。
+**为什么不编进代码**：档位结构、每张价、每档保底额都是**随模型与渠道变的数据**——换模型、换渠道、渠道调价都不该改代码、不该重新发版；它们与 `markup_bps` 同类，**随修订发布生效、随 Job 快照冻结**，已受理的 Job 不受后续改动影响（`ADR-0003`）。与现有两个量的关系：`reference_cost_microusd` 是**该候选的渠道成本**（**原币种**、可核），**只作定价参考**——管理员按"该候选的成本费率 ×(1 + 加价系数)× 汇率"**设定/推导**该候选的**对客费率向量**（`consumer_rates_cny`）时用它，**它本身不再是售价的被乘数**（单值推不出四档向量，§3.2/§3.4）；`floor_amounts` 是**受理时算预授权的查表依据**（CNY）——同源不同用：前者回答"这个网关模型的价是怎么定的"，后者回答"这一次请求先冻多少"。**两个币种平面**（对客 CNY / 成本按渠道币种）见 §3.8。
 
 **迁移的回填**（增量迁移，不改已应用的 `0001`–`0006`，沿用本仓库的迁移约定）：**迁移分两次，与切片对齐——P1 落命名两列，P2b 落定价列**（§9 的 P1/P2b 是同一套列，两处口径一致）：
 
 - **P1 落的命名两列**（`gateway_model` / `vendor_model_id`）：在既有行上先按"同一 revision 的 `runtime_entries.gateway_model` / `vendor_model_id`"回填（同一次发布写下的条目同值，可直接取），再设 `NOT NULL`；
-- **P2b 落的定价列**（`markup_bps` / `reference_cost_microusd` / `cost_currency` / `cost_basis` / `tier_prices` / `floor_amounts`）：在既有行上**留 NULL**——旧修订没有定价，因此那些修订受理出来的快照不带 `consumer_rates_cny` / `hold_microusd`，结算与预授权走旧口径、与今天逐位相同（§3.3/§3.6）；
+- **P2b 落的定价列**（`markup_bps` / `reference_cost_microusd` / `cost_currency` / `consumer_rates_cny` / `cost_basis` / `tier_prices` / `floor_amounts`）：在既有行上**留 NULL**——旧修订没有定价，因此那些修订受理出来的快照不带 `consumer_rates_cny` / `hold_microusd`，结算与预授权走旧口径、与今天逐位相同（§3.3/§3.6）；
 - `publication.gateway_models` 按既有生效名字回填出对应行（`enabled = true`），使现有已发布数据在迁移后立刻可读、可停用（随 P1 一起落）。
 
 ## 2. 对客目录与读写路径
@@ -117,9 +117,11 @@
       "published_at": "…",
       "candidates": [
         { "offering_id": "…", "provider_kind": "APIMart", "provider_model_id": "…",
-          "routing_priority": 0, "weight": 1, "reference_cost_microusd": "…", "cost_currency": "…" },
+          "routing_priority": 0, "weight": 1, "reference_cost_microusd": "…", "cost_currency": "…",
+          "consumer_rates_cny": { "…": "该候选的四档对客 CNY 费率" }, "cost_basis": "Declared" },
         { "offering_id": "…", "provider_kind": "AIHubMix", "provider_model_id": "…",
-          "routing_priority": 1, "weight": 1, "reference_cost_microusd": "…", "cost_currency": "…" }
+          "routing_priority": 1, "weight": 1, "reference_cost_microusd": "…", "cost_currency": "…",
+          "consumer_rates_cny": { "…": "该候选的四档对客 CNY 费率" }, "cost_basis": "Computed" }
       ],
       "pricing": { "markup_bps": "…" }
     }
@@ -127,7 +129,7 @@
 }
 ```
 
-它是**只读投影**：数据源是生效修订（`runtime_entries` + `runtime_revisions` + `catalog.vendor_models`）加运维开关（`publication.gateway_models`）。不新增"编辑态"，也不回显渠道凭证（`credential_env` 只记变量名，本来就不进响应）。示例里的 `pricing` 各项只占字段位，并标出**币种平面**（§3.8）：每个候选各带**该候选的渠道成本**（`reference_cost_microusd`，**原币种**微单位）与**它的成本币种**（`cost_currency`），`markup_bps` 是**加价系数**（**每网关模型一个**）；汇率是**全局按币种维护**的折算率（`pricing.fx_rates`，渠道币种 → CNY），不随修订发布、**受理时快照进 Price Snapshot**（§3.2）。**该候选的对客售价（CNY）＝该候选渠道成本 ×(1 + `markup_bps`)× 该币种 → CNY 的汇率，受理时选中候选后算出并冻结**（§3.2/§3.4），**因此同一网关模型的不同候选价格不同**；**加价系数由管理员创建网关模型时录入、汇率由管理员在后台维护，数值本身不属设计决策**（§3.2/§10）。
+它是**只读投影**：数据源是生效修订（`runtime_entries` + `runtime_revisions` + `catalog.vendor_models`）加运维开关（`publication.gateway_models`）。不新增"编辑态"，也不回显渠道凭证（`credential_env` 只记变量名，本来就不进响应）。示例里的 `pricing` 各项只占字段位，并标出**币种平面**（§3.8）：每个候选各带**该候选的渠道成本**（`reference_cost_microusd`，**原币种**微单位，**只作定价参考**）、**它的成本币种**（`cost_currency`）、**按候选的对客费率向量**（`consumer_rates_cny`，**四档 CNY**，管理员设定/推导）与**它的成本来源**（`cost_basis`），`markup_bps` 是**加价系数**（**每网关模型一个**）；汇率是**全局按币种维护**的折算率（`pricing.fx_rates`，渠道币种 → CNY），不随修订发布、**受理时按该候选的 `cost_currency` 取"受理时刻生效的那一行"并快照进 Price Snapshot**（§3.2）。**对客费率向量由管理员按"该候选的成本费率 ×(1 + `markup_bps`)× 该币种 → CNY 的汇率"设定/推导，随修订发布、随 Job 快照冻结**（§3.2/§3.4），**因此同一网关模型的不同候选价格不同**；`reference_cost_microusd` 只作定价参考、**不是售价的被乘数**；**加价系数由管理员创建网关模型时录入、汇率由管理员在后台维护，数值本身不属设计决策**（§3.2/§10）。
 
 ### 2.3 写路径：沿用整份发布，新增一个字段
 
@@ -165,23 +167,26 @@
 
 依据：`docs/facts/channel-facts.md` §2.4/§2.6、§3、§5。`ADR-0006` 同时定下"`cost` 只用于核成本，**不替代计量事实**"——所以采集 `cost` 不违反那条决定，也不是复活已被否决的"金额型计量证据"（`ADR-0012` 存根）。**"按张计费"这一形态不存在**：两家都是 token 计费，因此 §3 不再有"按张 / 按 token"的二分（§3.6 的预授权保底额是另一回事，见 §1.6）。
 
-### 3.2 定价公式与三个量的落点
+### 3.2 定价公式与各量的落点
 
 ```
-售价(CNY) = 该候选的渠道成本(原币种) × (1 + 加价系数) × 汇率(该币种 → CNY)
+对客费率向量(CNY, 四档) = 该候选的成本费率(原币种, 四档) × (1 + 加价系数) × 汇率(该币种 → CNY)   ← 后台设定/推导依据
 ```
 
-**售价按该次请求命中的候选算**（§3.4）：候选的渠道成本**按候选（offering）发布**（§1.6），加价系数与汇率由后台设，**同一网关模型不同候选价格不同**。**对客只有 CNY 一个币种**（§3.8）：公式右边是**该候选的原币种成本**与**该币种 → CNY 的折算率**，左边落在**人民币售价**上。**两家渠道都是 token 计费**（§3.1），所以这条公式按**四档 token 费率**逐档成立——对客四档 CNY 费率 = 该候选的四档原币种成本费率 × (1 + 加价系数) × 该币种 → CNY 的汇率；`Declared` 渠道的参考成本是发布者给的可核值，实际成本仍按 §3.7 在结算时取上游声明（两者是两个量）。
+**售价是一组"按候选的对客费率向量"，不是由一个单值乘出来的**（Plan Review 终轮定案）：随修订发布、随 Job 快照冻结的是 `runtime_revisions.consumer_rates_cny`（**按候选键**、**四档 CNY** 费率），由管理员按上式**设定/推导**（也可直接录入）；`reference_cost_microusd`（**单值、原币种**）**只作定价参考**，**不再是售价的被乘数**——单值推不出四档向量（§3.3/§3.4）。
 
-**受理时选中候选之后即可算出售价**：策略在受理时已经定下候选（`select_candidate` 在 `create_job` 之前，§4.2），所以售价**不必等上游回来**；售价在受理时算定并**随 Job 的 Price Snapshot 冻结**（§3.3），**结算只读那份快照**——受理之后改汇率、改加价系数都不影响已受理的 Job（`ADR-0003`）。公式里的"渠道成本"因此是**发布数据里的候选成本**，不是"命中候选在运行期报出来的实际成本"——后者只进 `attempts`，只用于毛利核算（§3.5）。**预授权**则另走保底表（§3.6），与这条公式无关（**不由售价派生**）。
+**对客费率向量按该次请求命中的候选取**（§3.4）：它**按候选（offering）发布**（§1.6），加价系数与汇率由后台设，**同一网关模型不同候选价格不同**。**对客只有 CNY 一个币种**（§3.8）：公式右边是**该候选的原币种成本费率**与**该币种 → CNY 的折算率**，左边落在**人民币售价**上。**两家渠道都是 token 计费**（§3.1），所以这条公式按**四档 token 费率**逐档成立；`Declared` 渠道的参考成本是发布者给的可核值，**上游实际 `cost` 只影响毛利**（实际成本 vs 对客售价），**不改对客金额**，实际成本仍按 §3.7 在结算时取上游声明（两者是两个量）。
+
+**受理时选中候选之后售价即已定**：策略在受理时已经定下候选（`select_candidate` 在 `create_job` 之前，§4.2），所以售价**不必等上游回来**；受理时把该候选的 `consumer_rates_cny` **随 Job 的 Price Snapshot 冻结**（§3.3），**结算只读那份快照**——受理之后改汇率、改加价系数、重发修订都不影响已受理的 Job（`ADR-0003`）。公式里的"成本费率"因此是**发布数据里的候选成本口径**，不是"命中候选在运行期报出来的实际成本"——后者只进 `attempts`，只用于毛利核算（§3.5）。**预授权**则另走保底表（§3.6），与这条公式无关（**不由售价派生**）。
 
 | 量 | 放哪 | 为什么 |
 | --- | --- | --- |
-| **候选的渠道成本** | 随修订发布的**发布数据** `runtime_revisions.reference_cost_microusd`（**按候选键**，**原币种**微单位，连同 `cost_currency`；发布者给每个候选取一个可核的值：`Computed` 按该渠道四档费率 × 参考用量、`Declared` 取上游声明过的 `cost`） | 实际金额要等上游回来才知道；而且**售价按候选算**，成本就必须**按候选**发布——一个网关模型一个成本数就表达不出"不同候选不同价" |
+| **对客费率向量** | 随修订发布的**发布数据** `runtime_revisions.consumer_rates_cny`（**按候选键**、**四档 CNY** 费率；管理员按"该候选的成本费率 ×(1 + `markup_bps`)× 该币种 → CNY 的汇率"**设定/推导**，也可直接录入），受理时随 Job 快照冻结 | 售价是**四档向量**，单值推不出向量（Plan Review 终轮定案）；而且**售价按候选算**，向量就必须**按候选**发布——一个网关模型一个价就表达不出"不同候选不同价" |
+| **候选的渠道成本** | 随修订发布的**发布数据** `runtime_revisions.reference_cost_microusd`（**按候选键**，**原币种**微单位，连同 `cost_currency`；发布者给每个候选取一个可核的值：`Computed` 按该渠道四档费率 × 参考用量、`Declared` 取上游声明过的 `cost`）——**只作定价参考**，**不是售价的被乘数** | 实际金额要等上游回来才知道；它是管理员设定对客费率向量时的依据，也是毛利核算的对照口径 |
 | **加价系数** | `markup_bps`（整数基点，避免浮点）：**每个网关模型一个**，**由管理员创建/发布该网关模型时录入**，**随修订发布**（`runtime_revisions.markup_bps`，§1.6），**随 Job 的 Price Snapshot 冻结**；不放 `publication.gateway_models`（那张表只存开关）。**具体数值由后台录入，不属设计决策** | 网关模型这一层就是"同一份供给包成不同价格档"的载体；全局系数会让这层失去意义。随快照冻结 ⇒ 已受理 Job 不受后续改价影响（`ADR-0003`） |
-| **汇率** | **按币种维护的一组折算率**（`pricing.fx_rates`：`currency` → **CNY** + 生效时间；**渠道币种 → 对客币种**，不是固定的 USD → CNY），**由管理员在后台维护**（入口 `PUT /api/v1/fx-rates`，写审计），**受理时按该候选的 `cost_currency` 取率并快照进 Price Snapshot**（`fx_rate`）。**受理时参与算出售价**（本节公式），**受理之后对客金额不再做任何实时换算**（结算只读冻结的售价）；同一份快照汇率也用于**把实际成本折算成人民币**（毛利核算，§3.5/§3.8）。**具体数值由后台录入，不属设计决策**。**这一处就地修订 `ADR-0006`**（它原文写的是"Price Plan 保留…发布时固定的汇率"，见 §10 的修订清单） | 汇率是**外部事实**，同一时刻同一币种全平台必须是同一个数才对账得起来；放进每个网关模型的发布里，改一次汇率要重发所有模型。不写配置文件（用户明确后台走 API） |
+| **汇率** | **按币种维护的一组折算率**（`pricing.fx_rates`：`currency` → **CNY** + **生效时间**；**渠道币种 → 对客币种**，不是固定的 USD → CNY），**由管理员在后台维护**（入口 `PUT /api/v1/fx-rates`，写审计），**取值规则＝按生效时间取"受理时刻生效的那一行"**（受理时刻之前已生效、其中最新的一行；没有可用行则发布期拒绝），把该行**原值快照**进 Price Snapshot（`fx_rate`，连同它自己的生效时间）。**管理员设定对客费率向量时按同一口径取率**（§3.2），同一份快照值也用于**把实际成本折算成人民币**（毛利核算，§3.5/§3.8）；**受理之后不再换算**。**具体数值由后台录入，不属设计决策**。**这一处就地修订 `ADR-0006`**（它原文写的是"Price Plan 保留…发布时固定的汇率"，见 §10 的修订清单） | 汇率是**外部事实**，同一时刻同一币种全平台必须是同一个数才对账得起来；放进每个网关模型的发布里，改一次汇率要重发所有模型。不写配置文件（用户明确后台走 API） |
 
-汇率**按币种由后台管理员录入**（**渠道币种 → CNY** 的一组率，含生效时间），设计只立字段与快照位**并规定录入入口、快照时机与它在售价公式里的位置**（见 §10）；**成本币种以渠道声明的 `currency` 为准**（不假定 USD——`docs/facts/channel-facts.md` 记的四档费率是 AIHubMix 的 USD 费率表），与 `ADR-0006` 的"以 USD 计价的计划原生价即 microUSD"口径不冲突（那是**该渠道**的币种口径）；**对客平面一律 CNY**（§3.8）。
+汇率**按币种由后台管理员录入**（**渠道币种 → CNY** 的一组率，含生效时间），设计只立字段与快照位**并规定录入入口、快照时机、取值规则（受理时刻生效的那一行）与它在对客费率向量推导里的位置**（见 §10）；**成本币种以渠道声明的 `currency` 为准**（不假定 USD——`docs/facts/channel-facts.md` 记的四档费率是 AIHubMix 的 USD 费率表），与 `ADR-0006` 的"以 USD 计价的计划原生价即 microUSD"口径不冲突（那是**该渠道**的币种口径）；**对客平面一律 CNY**（§3.8）。
 
 ### 3.3 售价与保底快照随 Job 冻结
 
@@ -192,22 +197,22 @@ PriceSnapshot {
     price_plan_id,
     // ---- 对客平面：全部 CNY（§3.8）----
     hit_candidate,                                             // 受理时选中并冻结：本次命中的候选（offering_id / channel）——**售价按它算**（§3.4）
-    consumer_rates_cny,                                        // 受理时算定并冻结：**该候选的对客四档 token 费率（CNY）＝该候选渠道成本 ×(1 + markup_bps)× 该币种 → CNY 汇率**（实收依据，§3.2/§3.4）
+    consumer_rates_cny,                                        // **随修订发布、受理时随快照冻结**：**该候选的对客四档 token 费率向量（CNY）**，由管理员按"该候选成本费率 ×(1 + markup_bps)× 该币种 → CNY 汇率"设定/推导（实收依据，§3.2/§3.4）
     tier_prices,                                               // 随修订发布：档位价目表（**CNY**）——**仅定价参考/展示，不参与预授权**（§1.6/§3.6）
     floor_amounts,                                             // 随修订发布：**保底表（CNY）**——按供给（vendor + offering）维度、(size, quality) → 保底额 + 该供给封顶保底值（§1.6/§3.6）
     hold_microusd,                                             // 受理时算定并冻结：本次请求的**保底额（CNY 微单位）**（§3.6；**不由售价派生**）
     hold_source,                                               // 保底额来源：供给档位查表 / size=auto 取最大档 / 该供给封顶保底值 / 平台兜底（§3.6，事后可辨"这次为什么冻这么多"）
     // ---- 成本平面：原币种（按渠道声明的 `currency`），以及定价与折算用的汇率（§3.8）----
-    cost_basis: Computed { rates } | Declared { currency },    // 成本来源两态（随修订发布：runtime_revisions.cost_basis，随快照冻结）；rates 是**该渠道币种**的四档渠道成本费率
-    reference_cost_microusd,                                   // 随修订发布：**该候选的**渠道成本（**原币种**微单位，按候选键；§3.2/§3.4）
+    cost_basis: Computed { rates } | Declared { currency },    // 成本来源两态（**按候选键**随修订发布：runtime_revisions.cost_basis，随快照冻结）；rates 是**该渠道币种**的四档渠道成本费率
+    reference_cost_microusd,                                   // 随修订发布：**该候选的**渠道成本（**原币种**微单位，按候选键；**只作定价参考，不是售价的被乘数**；§3.2/§3.4）
     cost_currency,                                             // 随修订发布：该候选的成本币种（按候选键；§3.8）
-    markup_bps,                                                // 随修订发布：加价系数，**受理时参与算出售价**（§3.2）
-    fx_rate,                                                   // 受理时按 `cost_currency` 从全局 `pricing.fx_rates` 快照：**该币种 → CNY**，定点整数（如 1e6 分母），不使用浮点；**受理时参与算出售价**，同一份值也用于**成本折算（毛利）**；受理之后不再换算
+    markup_bps,                                                // 随修订发布：加价系数，**参与设定该候选的对客费率向量**（§3.2）
+    fx_rate,                                                   // 受理时按 `cost_currency` 从全局 `pricing.fx_rates` 取**受理时刻生效的那一行**并快照：**该币种 → CNY**，定点整数（如 1e6 分母），不使用浮点；管理员设定对客费率向量时按同一口径取率，快照里这一份值也用于**成本折算（毛利）**；受理之后不再换算
     captured_at,
 }
 ```
 
-`charge_microusd(usage)` 从"Σ token × 费率"改为"**只读快照 + 本次实际用量**"：实收 = **快照里的对客四档 token 费率（`consumer_rates_cny`，CNY——**命中候选的售价**，§3.4）× 实际 `usage` 的分项 token（真值）**，**不封顶在保底额**——实际超过保底额时差额把余额扣成负数（**透支发生在结算**，§3.6）。**对客金额全程 CNY、不做实时汇率换算**（售价在受理时已算定并冻结，§3.8）。成本侧按 `cost_basis` 取数（**原币种**，币种记在 `cost_currency` / `provider_cost_currency`）：`Computed` = 实际分项 token × 该渠道四档成本费率自算；`Declared` = 直接取上游声明的 `cost`（更权威、含折扣）——**成本只进毛利口径，不改对客金额**（§3.5）。毛利核算时用快照里的 `fx_rate`（该币种 → CNY）把成本折算成 CNY（§3.5/§3.8）。
+`charge_microusd(usage)` 从"Σ token × 费率"改为"**只读快照 + 本次实际用量**"：实收 = **快照里的对客四档 token 费率（`consumer_rates_cny`，CNY——**命中候选的售价**，§3.4）× 实际 `usage` 的分项 token（真值）**，**不封顶在保底额**——实际超过保底额时差额把余额扣成负数（**透支发生在结算**，§3.6）。**对客金额全程 CNY、不做实时汇率换算**（售价随修订发布、受理时随快照冻结，§3.8）。成本侧按 `cost_basis` 取数（**原币种**，币种记在 `cost_currency` / `provider_cost_currency`）：`Computed` = 实际分项 token × 该渠道四档成本费率自算；`Declared` = 直接取上游声明的 `cost`（更权威、含折扣）——**成本只进毛利口径，不改对客金额**（§3.5）。毛利核算时用快照里的 `fx_rate`（该币种 → CNY）把成本折算成 CNY（§3.5/§3.8）。
 
 **"档位 → 每张价"不再是计价单位**：两家渠道都是 token 计费（§3.1），所以实收只有 token 一个口径；`tier_prices` 里的每张价**只用于定价参考与展示**，不参与受理时的预授权，也不参与结算。
 
@@ -217,17 +222,17 @@ PriceSnapshot {
 
 用户原话是"与命中渠道无关"，**本轮已由用户答复定案**（§10 第 2 条已改为已定）：**"无关"指的是扣费对象，不是金额——对客价随命中渠道浮动**。落地口径：
 
-- **售价按该次请求命中的候选算**：`售价 = 该候选的渠道成本 × (1 + 加价系数) × 汇率`（加价系数与汇率由后台设，§3.2）。**同一网关模型不同候选价格不同**——候选的渠道成本不同，售价就不同；这正是"平台网关模型"这一层要表达的东西（同一份供给包成不同名字、不同成本档，§1.3）。
-- **受理时选中候选之后即可算出售价**：策略在受理时已经定下候选（`select_candidate` 在 `create_job` 之前，§4.2），所以售价不必等上游回来；**售价在受理时算定并随 Job 快照冻结**（§3.3），结算只读那份快照——受理之后改汇率、改加价系数都不影响已受理的 Job（`ADR-0003`）。
+- **售价按该次请求命中的候选算**：随修订发布、随 Job 快照冻结的是**按候选的对客费率向量** `consumer_rates_cny`（管理员按"该候选的成本费率 ×(1 + 加价系数)× 汇率"设定/推导，§3.2）；**`reference_cost_microusd` 只作定价参考，不是售价的被乘数**。**同一网关模型不同候选价格不同**——候选的费率不同，售价就不同；这正是"平台网关模型"这一层要表达的东西（同一份供给包成不同名字、不同成本档，§1.3）。
+- **受理时选中候选之后售价即已定**：策略在受理时已经定下候选（`select_candidate` 在 `create_job` 之前，§4.2），所以售价不必等上游回来；**该候选的对客费率向量随 Job 快照冻结**（§3.3），结算只读那份快照——受理之后改汇率、改加价系数、重发修订都不影响已受理的 Job（`ADR-0003`）。
 - **快照记"命中候选 + 该候选的成本与售价"**（§3.3）：事后能回答"这一笔命中的是哪条候选、按它的哪个成本、算成了多少售价"。
 - **扣的仍然是同一个用户余额**（`ledger.accounts`），不按渠道分账——"与命中渠道无关"说的是这一半。
 - **预授权与售价是两件事**：预授权（保底额）按**供给维度**查 `floor_amounts`（§3.6），**不由售价派生、也不参与售价计算**；售价高不代表预授权高。
 
-现状（`pricing.price_plans` 按候选挂、费率就是结算基数，§3.1）售价**也**随命中候选变，但**没有加价系数、也没有汇率折算**——本设计保留"按命中候选"这一点，把对客价改成"**候选成本 ×(1 + 加价系数)× 汇率**"（§3.2）。
+现状（`pricing.price_plans` 按候选挂、费率就是结算基数，§3.1）售价**也**随命中候选变，但**没有加价系数、也没有汇率折算**——本设计保留"按命中候选"这一点，把对客价改成"**按候选发布的四档对客费率向量**"（管理员按"候选成本费率 ×(1 + 加价系数)× 汇率"设定，§3.2）。
 
 ### 3.5 毛利记录
 
-- **对客结算只读 Job 固化的费率快照**：实收 = `price_snapshot.consumer_rates_cny`（**命中候选的**对客四档 token 费率，**CNY**，§3.4）× **实际 `usage` 的分项 token（真值）**，**不封顶在保底额**（§3.3/§3.6：按实际扣费，超出部分在结算时透支）。`attempts` 里的渠道成本**只用于毛利核算**——它**不参与对客结算**，不改对客金额，也不改预授权额（§3.6）。
+- **对客结算只读 Job 固化的费率快照**：实收 = `price_snapshot.consumer_rates_cny`（**命中候选的**对客四档 token 费率，**CNY**，§3.4）× **实际 `usage` 的分项 token（真值）**，**不封顶在保底额**（§3.3/§3.6：按实际扣费，超出部分在结算时透支）。`attempts` 里的渠道成本**只用于毛利核算**——它**不参与对客结算**，不改对客金额，也不改预授权额（§3.6）。**`Declared` 的实际 `cost` 只影响毛利**（实际成本 vs 对客售价），**不改对客金额**——对客金额只由受理时冻结的 `consumer_rates_cny` 决定（§3.2）。
 - **售价**：`ledger.entries`（`kind = 'capture'`，金额为负）+ `ledger.holds`（授权额）——账本是权威（`ADR-0003`）；另在 `generation.jobs` 加 `charge_microusd` 列（结算时写入）作为**投影**，便于按 job 直接查，权威仍是账本。**这一列缓做**：账本已经查得到，它只是查询便利，不阻塞任何切片（§9 的 P2b）。
 - **成本**：`generation.attempts` 新增 `provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）、`provider_cost_currency`、`provider_cost_source`（**两态 + 异常态**：`computed` / `declared` / `unavailable`，判据见 §3.7；`computed` = 实际分项 token × 该渠道四档费率自算，`declared` = 直接取上游 `cost`）与 `provider_cost_cny_microusd`（**折算后 CNY**，用快照的 `fx_rate`——该币种 → CNY——折出，毛利用）。**异步写入**（结算时才拿得到）。
 - **毛利** = 售价（快照，**CNY**）− 成本**折算后 CNY**（`attempts.provider_cost_cny_microusd`，由**原币种**原值 × 快照的 `fx_rate` 折出），按 job 可查；**两条线分开留痕**（售价/扣费记 CNY、成本记**原币种**原值 + 币种 + 折算汇率 + 折算后 CNY，§3.8）；成本缺失（`unavailable`）时标"成本未知"，不猜（§3.7）。
@@ -257,7 +262,7 @@ PriceSnapshot {
 
 - **对客实收** = `consumer_rates_cny`（**命中候选的**对客四档 token 费率，**CNY**，§3.4）× **实际 `usage` 的分项 token（真值）**；**不再取 min(算出额, hold)**——保底额只是预授权，实际多少就扣多少；
 - **成本侧**按 `cost_basis` 取数（§3.7，**原币种**）：`Computed` = 实际分项 token × 该渠道四档成本费率自算；`Declared` = **直接取上游 `cost`**（更权威、含折扣）；
-- **余额可为负（透支发生在结算，不在受理）**：实际超过保底额时余额被扣成负数，这是**允许的结果**，不是错误；**下一次受理按当时的余额判**（可能已为负）⇒ 402。透支的追补属**运营 / 充值流程**（本设计不展开）。
+- **余额可为负（透支发生在结算，不在受理）**：实际超过保底额时余额被扣成负数，这是**允许的结果**，不是错误；**下一次受理按当时的余额判**（可能已为负）⇒ 402。透支的追补属**运营 / 充值流程**（本设计不展开）。**透支依赖该迁移**：`migrations/0001_initial.sql` 现有 `ledger.accounts.balance_microusd` 的 `CHECK (balance_microusd >= 0)`、`ledger.holds.amount_microusd` 的 `CHECK (amount_microusd > 0)` 与 `generation.jobs.max_cost_microusd` 的 `CHECK (max_cost_microusd > 0)` 三处都拦着负余额 / 零保底额——**P2b 的迁移必须同时放宽这三处**（`balance_microusd` 去掉 `>= 0`，另两处改 `>= 0`），否则透支与"保底额可为 0"在库层面直接报错（§9 P2b）。
 
 `GENERATION_MAX_COST_MICROUSD` **只作"连供给封顶保底值都没有时的兜底保底额"**，不再是任何形式的上限：
 
@@ -294,9 +299,9 @@ PriceSnapshot {
 | **对客平面** | **CNY**（单币种） | 充值、余额、售价（对客四档 token 费率 / 档位价目表）、**保底额（hold）**、扣费（实收） | `ledger.accounts.balance_microusd`、`ledger.entries`、`PriceSnapshot.consumer_rates_cny` / `tier_prices` / `hold_microusd`、`runtime_revisions.floor_amounts` |
 | **成本平面** | **渠道声明的 `currency`**（不假定 USD） | 候选的渠道成本（发布数据）与实际成本（`Computed` = `usage` 分项 × 该渠道四档费率；`Declared` = 上游 `cost`） | `generation.attempts.provider_cost_microusd` / `provider_cost_currency` / `provider_cost_cny_microusd`、`runtime_revisions.reference_cost_microusd` / `cost_currency`、`PriceSnapshot.reference_cost_microusd` / `cost_currency` / `fx_rate` |
 
-- **对客金额不做实时汇率换算**：售价在**受理时**算定（用当时的汇率，§3.2/§3.4）后随快照冻结，结算**只读 CNY 的快照**（`consumer_rates_cny` × 实际 `usage` 分项 token；保底额直接就是 CNY）——**受理之后全程不出现外币换算**；
-- **汇率是"渠道币种 → 对客币种（CNY）"的一组折算率**（**按币种维护**，后台设）：`pricing.fx_rates` 按 `currency` 给率，受理时按该候选的 `cost_currency` 取率并随快照冻结（`fx_rate`）。它**在受理时参与算出售价**（§3.2），同一份值也用于**把实际成本折算成人民币**（毛利核算），**受理之后不再换算**；
-- **售价 = 该候选的渠道成本 × (1 + 加价系数) × 汇率**，**按命中候选算、以 CNY 表达**（§3.2/§3.4）；
+- **对客金额不做实时汇率换算**：售价是**按候选发布的 CNY 对客费率向量**（`consumer_rates_cny`，随修订发布、受理时随快照冻结），结算**只读 CNY 的快照**（`consumer_rates_cny` × 实际 `usage` 分项 token；保底额直接就是 CNY）——**受理之后全程不出现外币换算**；
+- **汇率是"渠道币种 → 对客币种（CNY）"的一组折算率**（**按币种维护**，后台设）：`pricing.fx_rates` 按 `currency` 给率**并带生效时间**，**取值规则＝按生效时间取"受理时刻生效的那一行"**，把该行**原值快照**进 Price Snapshot（`fx_rate`）。它**在管理员设定对客费率向量时参与推导**（§3.2），同一份快照值也用于**把实际成本折算成人民币**（毛利核算），**受理之后不再换算**；
+- **售价 = 按候选发布的四档对客费率向量 `consumer_rates_cny`**（管理员按"该候选的成本费率 ×(1 + 加价系数)× 汇率"设定/推导，**以 CNY 表达**），**按命中候选取、随修订发布并随 Job 快照冻结**；`reference_cost_microusd` **只作定价参考，不是售价的被乘数**（§3.2/§3.4）；
 - **保底额是 CNY**：OpenAI 系 **1K = ¥0.16 / 2K = ¥0.25 / 4K = ¥0.3**（**币种＝CNY，已确认**，§1.6/§3.6）；
 - **快照写清两条线**：**售价 / 保底 / 扣费记 CNY**；**成本记原币种金额 + 币种 + 当时汇率 + 折算后 CNY**（毛利用）——两条线分开，便于核对；
 - **既有列名的币种语义**：`ledger.accounts.balance_microusd` 与 `GENERATION_MAX_COST_MICROUSD` 的**币种语义为 CNY**（列名里的 `usd` 是历史命名；实施时可按需改名，语义以本节为准）；`reference_cost_microusd` / `provider_cost_microusd` 的 `_microusd` 同样是**历史命名**，其币种是**该候选 / 该次执行的 `cost_currency`**（§3.5/§3.7），**不假定 USD**。
@@ -361,6 +366,17 @@ PriceSnapshot {
 - **作用域两档**：**全局一条** + **可按网关模型覆盖**（`route_policies.gateway_model` 为空即全局、非空即覆盖该名字；按模型取"有覆盖用覆盖、没有用全局"）；
 - **未配置时默认 `priority_failover`**——按 `routing_priority` 数字小的优先、该档没有合格候选时依次降级、**同一档内按 `weight` 分摊**，即 **§4.1/§4.2 今天的行为**。因此**零配置下行为与今天逐位相同**：策略层是"加了旋钮"，不是"换了引擎"，没有配置就没有新行为。
 
+**`route_policies` 的结构**（策略的字段面；它是**运行期配置**、**不进不可变修订**，随本层落 **P6**）：
+
+| 列 | 内容 |
+| --- | --- |
+| `id` / `created_at` / `updated_at` / `updated_by` | 行身份与审计（管理员 API 写入） |
+| `gateway_model text NULL` | **作用域**：`NULL` = 全局一条；非空 = 覆盖该网关模型（本节第一条） |
+| `strategy text NOT NULL` | **策略类型**：`priority_failover`（默认）/ `weighted_random` / `least_cost` / `user_tag`（§5.2） |
+| `discount_rates jsonb` | **折扣率表**：按**候选供给（vendor + offering）**配，只作 `least_cost` 的比较输入、**不进成本**（§5.4） |
+| `tag_channel_map jsonb` | **`user_tag` 的"标签 → 渠道"映射**：`账户标签 → 渠道（或候选）`；标签命中哪条**合格候选**就选哪条（§5.2/§5.4）。**它是策略结构里的字段**，不只在缓存值描述里出现 |
+| `version text NOT NULL` | **策略版本标识**：每次写策略即更新，受理时用于缓存比对（§5.5） |
+
 ### 5.2 策略类型（举例，机制上可扩展）
 
 | 策略 | 怎么选（取值空间**只有合格候选**） | 吃什么输入 |
@@ -391,7 +407,7 @@ PriceSnapshot {
 
 **折扣率只作 `least_cost` 的比较输入**：`least_cost` 比的是**折后成本估算**（在**该候选的**渠道成本之上乘折扣率这类**估算**），**是估算、不是事实**。**两者不一致时以实际扣费为准**——策略只吃估算，**不改写成本事实、不进账本、不改对客金额**：`attempts` 的成本列仍按 §3.7 记**实际扣费**，对客金额仍只读受理时冻结的费率快照（§3.3/§3.5）。折扣率按**候选供给（vendor + offering）**配（与保底表同维度），与策略同属运营配置（运行期可改、即时生效、**不进修订**）；**填多少由运营决定，不属设计决策**。
 
-**账户标签**：为支持 `user_tag`，**账户上加标签字段**（机制要做：账户对象 `ledger.accounts` 增列；**标签值由运营设**）；它属**管理员面配置**（管理员 API 写入、写审计），**不是发布内容**。标签是策略的输入，本身不改变任何受理结果——没有生效的 `user_tag` 策略时，标签不影响选路。
+**账户标签**：为支持 `user_tag`，**账户上加标签字段**（机制要做：账户对象 `ledger.accounts` 增列；**标签值由运营设**），**"标签 → 渠道"的映射落在策略结构里**（`route_policies.tag_channel_map`，§5.1）；它属**管理员面配置**（管理员 API 写入、写审计），**不是发布内容**。标签是策略的输入，本身不改变任何受理结果——没有生效的 `user_tag` 策略时，标签不影响选路。
 
 ### 5.5 缓存与生效（改策略不需要发修订）
 
@@ -453,7 +469,7 @@ PriceSnapshot {
 
 | 键 | 值 | 失效 |
 | --- | --- | --- |
-| `route:<gateway_model>` | 生效修订的候选集：合同、承载面、参数映射、限制、`routing_priority`、`weight`、定价输入（**按候选的** `reference_cost_microusd` / `cost_currency`、修订级 `markup_bps`），**加发布修订标识 `runtime_revision_id`** | 发布成功后主动失效；另设 TTL |
+| `route:<gateway_model>` | 生效修订的候选集：合同、承载面、参数映射、限制、`routing_priority`、`weight`、定价输入（**按候选的** `reference_cost_microusd` / `cost_currency` / `consumer_rates_cny` / `cost_basis`、修订级 `markup_bps`），**加发布修订标识 `runtime_revision_id`** | 发布成功后主动失效；另设 TTL |
 | `route_policy:<gateway_model\|global>` | 生效策略：策略类型、作用域、折扣率表与账户标签命中规则，**加策略版本标识** | 改策略成功后主动失效；另设 TTL |
 | `api_key:<sha256(key)>` | `account_id` | 吊销时主动删；另设 TTL |
 | `user_balance:<account_id>` | 余额（**CNY** 微单位，**可为负**——透支发生在结算，§3.6/§3.8）+ 写入时间 + **来源标记**（`db_commit` / `reconciler`，§7.4） | 充值/受理/结算后立即写；另设 TTL |
@@ -485,7 +501,7 @@ WHERE id = $1 AND balance_microusd >= $保底额
 ```
 `rows_affected != 1` ⇒ `insufficient_balance`（对客 **402 余额不足**）——**这条硬拒绝保留**（用户澄清）。`$保底额` = **按供给维度查保底表**（§3.6：键是 vendor + offering，档位 `(size, quality)`；`size=auto` 取该供给最大档；缺档回落该供给封顶保底值，再回落 `GENERATION_MAX_COST_MICROUSD`），不再是"永远一个固定数"。**余额是这里唯一的上限**——查得到保底额时 `GENERATION_MAX_COST_MICROUSD` 不参与判定（§3.6）。**下一次受理按当时的余额判**：结算透支后余额可能已为负，此时 `balance_microusd >= $保底额` 不成立 ⇒ 同样 402。
 
-**结算**（现状，`complete_job`，本设计只改实收口径）：同一事务里 `release` 剩余授权 + `capture` 实收。**实收 = 对客四档 token 费率（CNY）× 实际 `usage` 的分项 token**（§3.3/§3.5），**不封顶在保底额**——**实际 > 保底额时差额由余额吸收，`capture` 之后余额可为负（这才是"透支"：发生在结算，不在受理）**；实际 < 保底额时差额释放回余额。透支的追补属运营 / 充值流程（本设计不展开）。**对客金额全程 CNY**（§3.8）。
+**结算**（现状，`complete_job`，本设计只改实收口径）：同一事务里 `release` 剩余授权 + `capture` 实收。**实收 = 对客四档 token 费率（CNY）× 实际 `usage` 的分项 token**（§3.3/§3.5），**不封顶在保底额**——**实际 > 保底额时差额由余额吸收，`capture` 之后余额可为负（这才是"透支"：发生在结算，不在受理；该负值要求迁移放宽 `ledger.accounts.balance_microusd` 的 `>= 0` 约束，§3.6/§9 P2b）**；实际 < 保底额时差额释放回余额。透支的追补属运营 / 充值流程（本设计不展开）。**对客金额全程 CNY**（§3.8）。
 
 Redis 的位置：
 
@@ -542,45 +558,50 @@ Redis 的位置：
 
 ### P1 网关模型命名层与对客目录
 
-**改动**：发布命令加 `gateway_model`；`runtime_revisions` 增 `gateway_model` / `vendor_model_id` **两列（P1 落的命名两列）**；`publication.gateway_models`；`GET /v1/models` 投射（网关名 + `vendor_id` + 替换 `model.const`）；`GET /api/v1/gateway-models`；`PATCH .../enabled`；发布期 `model.const` 校验。**定价列（`markup_bps` / `reference_cost_microusd` / `cost_currency` / `cost_basis` / `tier_prices` / `floor_amounts`）在 P2b 落**（§1.6 同一套口径：迁移**分两次**，P1 一次、P2b 一次）。
+**改动**：发布命令加 `gateway_model`；`runtime_revisions` 增 `gateway_model` / `vendor_model_id` **两列（P1 落的命名两列）**；`publication.gateway_models`；`GET /v1/models` 投射（网关名 + `vendor_id` + 替换 `model.const`）；`GET /api/v1/gateway-models`；`PATCH .../enabled`；发布期 `model.const` 校验。**定价列（`markup_bps` / `reference_cost_microusd` / `cost_currency` / `consumer_rates_cny` / `cost_basis` / `tier_prices` / `floor_amounts`）在 P2b 落**（§1.6 同一套口径：迁移**分两次**，P1 一次、P2b 一次）。
 
 **验收（离线）**：
 - 发布一份 `gateway_model = gpt-image-2.5-plus`、`native_model_id = gpt-image-2.5-sunburst` 的素材 → `GET /v1/models` 的 `name` 是 `gpt-image-2.5-plus`、含 `vendor_id`、**响应全文不含 `gpt-image-2.5-sunburst`**（含合同正文）；
 - 用网关模型名能受理（假上游跑通）、用厂商原生名得到 404；
 - `PATCH enabled=false` 后目录消失且受理 404，重新启用恢复；
 - **旧素材**（两者同值，如现有 `config/bootstrap/gpt-image-2.5-flare.json`）发布后，`GET /v1/models` 与受理行为与今天逐位一致；
-- 管理员读接口能列出候选、顺序、权重与定价，不需要直查库。
+- 管理员读接口能列出候选、顺序、权重与承载面/映射，不需要直查库（**定价相关断言移到 P2b**——定价列在 P2b 才落，§1.6）。
 
 ### P2a 成本事实采集（**不依赖任何未决**）
 
-**改动**：`adapter-sdk` 的 `ProviderSuccess` 加可选 `declared_cost`（+ 币种）；`adapter-apimart` 从任务终态读出并回传；`generation.attempts` 增 `provider_cost_microusd` / `provider_cost_currency` / `provider_cost_source` 三列。**快照的成本口径列 `runtime_revisions.cost_basis` 不在这里**——它是**定价侧**的列（随修订发布、随快照冻结），归 **P2b**（§1.6/§3.3）；P2a 只落 `attempts` 这三列。
+**改动**：`adapter-sdk` 的 `ProviderSuccess` 加可选 `declared_cost`（+ 币种）；`adapter-apimart` 从任务终态读出并回传；`generation.attempts` 增 `provider_cost_microusd` / `provider_cost_currency` / `provider_cost_source` / `provider_cost_cny_microusd`（**折算后 CNY**，毛利用，折算用快照的 `fx_rate`，§3.5）**四列**。**币种校验的改动也归本片**：`crates/application/src/lib.rs` 现在硬拒 `currency != "USD"`（大意"price currency must be USD for microUSD rates"）——**去掉该硬校验**，改为**按渠道/供给声明的 `currency` 接受**（**币种权威＝供给声明的 `currency`（发布数据），落 `cost_currency`**；`pricing.price_plans.currency` 保留为**成本侧历史字段**、**以供给的 `cost_currency` 为准**），**并校验该币种在汇率表里有折算率，否则发布期拒绝**（汇率表 `pricing.fx_rates` 的落点在 P2b，这条校验随它生效）。**快照的成本口径列 `runtime_revisions.cost_basis` 不在这里**——它是**定价侧**的列（**按候选键**、随修订发布、随快照冻结），归 **P2b**（§1.6/§3.3）；P2a 只落 `attempts` 这四列。
 
-**为什么能先做**：它只落"上游说了什么"，不碰定价公式、汇率、Redis，也不依赖任何 ADR 修订，因此可以**单独实施、单独验收**（§3.7）。
+**为什么能先做**：它只落"上游说了什么"（外加**按声明币种接受**这条校验与 `provider_cost_cny_microusd` 折算列），不碰定价公式与 Redis，也不依赖任何 ADR 修订，因此可以**单独实施、单独验收**（§3.7）；其中"该币种在汇率表里有折算率"与折算断言**随 P2b 的汇率表生效**。
 
 **验收（离线）**：
 - `declared` 路径：假上游终态**直接返回 `cost`**（用实测样例 `cost = 0.011354`）→ `provider_cost_source = declared`，**直接取它、不自己算**，金额与币种逐位落库；
 - `computed` 路径：AIHubMix 不给金额字段 → `provider_cost_source = computed`，金额按**实际 `usage` 的分项 token × 该渠道四档费率**自算（币种按该渠道的 `currency`）；
 - `unavailable` 路径：声明了但**缺字段 / 负数 / 解析失败** → 金额列留 NULL、**不猜**（不写 0、不用费率顶替），该笔成本缺口可发现（§3.7）；
+- **币种按声明接受**：给一条 `currency` 非 USD（如 `CNY`）的供给 → **发布不再被硬拒**（币种权威＝供给声明的 `currency`，落 `cost_currency`；`pricing.price_plans.currency` 只作成本侧历史字段）；声明一个**汇率表里没有折算率**的币种 → **发布期拒绝**（§3.7；汇率表在 P2b 落，该断言随 P2b 生效）；
 - 采集 `cost` **不改变**对客结算金额与计量事实（同一个用例里断言 `charge` 与今天逐位相同）。
 
 ### P2b 定价、保底表与售价快照
 
-**改动**：`runtime_revisions` 增 `markup_bps` / `reference_cost_microusd`（**按候选键**，**原币种**）/ `cost_currency`（**按候选键**）/ `cost_basis` / `tier_prices`（CNY）/ `floor_amounts`（CNY）（**P2b 落的定价列**；`cost_basis` 两态 `Computed` / `Declared`；`tier_prices` 降级为定价参考、`floor_amounts` 是保底表，随快照冻结）；`pricing.fx_rates` + `PUT /api/v1/fx-rates`（**按币种**给 **渠道币种 → CNY** 的折算率，受理时按候选 `cost_currency` 取率）；`PriceSnapshot` 扩展（`hit_candidate` / `consumer_rates_cny`（**受理时算定**）/ `tier_prices` / `floor_amounts` / `hold_microusd` / `hold_source` / `cost_basis` / `reference_cost_microusd` / `cost_currency` / `markup_bps` / `fx_rate`）；`charge_microusd` 改为只读快照（**命中候选的对客四档 CNY token 费率 × 实际 `usage` 分项 token**，**不封顶在保底额**）；**预授权 = 按供给维度查保底表**（`floor_amounts`：键 vendor + offering，档位 `(size, quality)`，`size=auto` 取最大档、缺档回落该供给封顶保底值、再回落 `GENERATION_MAX_COST_MICROUSD`；§3.6），受理仍按 `balance >= 保底额` 判准入（不足 ⇒ 402）；`jobs.charge_microusd` 投影列**缓做**。
+**改动**：`runtime_revisions` 增 `markup_bps` / `reference_cost_microusd`（**按候选键**，**原币种**，**只作定价参考**）/ `cost_currency`（**按候选键**）/ `consumer_rates_cny`（**按候选键**，**四档 CNY**，管理员设定/推导）/ `cost_basis`（**按候选键**，两态 `Computed` / `Declared`）/ `tier_prices`（CNY）/ `floor_amounts`（CNY）（**P2b 落的定价列**；`tier_prices` 降级为定价参考、`floor_amounts` 是保底表，随快照冻结）；**迁移放宽三处约束**——`ledger.accounts.balance_microusd` **去掉 `CHECK (balance_microusd >= 0)`**（透支要能把余额扣成负数）、`ledger.holds.amount_microusd` 与 `generation.jobs.max_cost_microusd` 由 `CHECK (> 0)` 改 **`CHECK (>= 0)`**（保底额可为 0）；`pricing.fx_rates` + `PUT /api/v1/fx-rates`（**按币种**给 **渠道币种 → CNY** 的折算率 + **生效时间**，受理时按候选 `cost_currency` **取"受理时刻生效的那一行"**并快照）；`PriceSnapshot` 扩展（`hit_candidate` / `consumer_rates_cny`（**随修订发布、受理时随快照冻结**）/ `tier_prices` / `floor_amounts` / `hold_microusd` / `hold_source` / `cost_basis` / `reference_cost_microusd` / `cost_currency` / `markup_bps` / `fx_rate`）；`charge_microusd` 改为只读快照（**命中候选的对客四档 CNY token 费率 × 实际 `usage` 分项 token**，**不封顶在保底额**）；**预授权 = 按供给维度查保底表**（`floor_amounts`：键 vendor + offering，档位 `(size, quality)`，`size=auto` 取最大档、缺档回落该供给封顶保底值、再回落 `GENERATION_MAX_COST_MICROUSD`；§3.6），受理仍按 `balance >= 保底额` 判准入（不足 ⇒ 402）；`jobs.charge_microusd` 投影列**缓做**。
 
 **验收（离线）**：
 - **成本来源两态各一条**：① `computed`——AIHubMix 不给金额字段 → 成本 = **实际 `usage` 分项 token × 该渠道四档费率**自算，`provider_cost_source = computed`；② `declared`——假上游终态**直接返回 `cost`**（实测样例 `cost = 0.011354`）→ **直接取它、不自己算**，`provider_cost_source = declared`，金额与**渠道声明的币种**逐位落库（§3.1/§3.7）；
-- **两个币种平面分开**：断言对客侧（`consumer_rates_cny`、`hold_microusd`、`charge`、余额）**全是 CNY**、响应与账本里**不出现外币**；成本侧记**原币种**原值 + 币种（`provider_cost_currency`），并同时记下**当时汇率**与**折算后 CNY**（`provider_cost_cny_microusd`）；**改一次汇率不影响已受理 Job 的售价**（快照已冻结），但**影响之后新受理 Job 的售价**（售价受理时才算，§3.2/§3.4）（§3.8）；
+- **两个币种平面分开**：断言对客侧（`consumer_rates_cny`、`hold_microusd`、`charge`、余额）**全是 CNY**、响应与账本里**不出现外币**；成本侧记**原币种**原值 + 币种（`provider_cost_currency`），并同时记下**当时汇率**与**折算后 CNY**（`provider_cost_cny_microusd`）；**改一次汇率不影响已受理 Job 的售价**（快照已冻结）；对客费率向量是**发布数据**，汇率改动只在**下一次设定/重发修订**时才体现（§3.2/§3.8）；
 - **保底按供给维度查表**：给定发布在**某条供给**（vendor + offering）下的保底表与请求的 `(size, quality)` → 受理时 `hold_microusd` **逐位等于**该档保底额、`hold_source` 记的是**供给档位查表**；**`size = auto` → 取该供给表里的最大档**；**表里没有这个档位 → 回落该供给的封顶保底值**；连封顶值也没有 → 回落 `GENERATION_MAX_COST_MICROUSD`（§3.6）；
 - **`quality` 维留空即按 `size` 档**：保底表只填 `size` 维（OpenAI 系当前形态，`1K = ¥0.16` / `2K = ¥0.25` / `4K = ¥0.3`，**CNY**）→ 请求带任意 `quality` 都查到同一个 `size` 档保底额（§3.6）；
 - **透支**：构造"结算实收 > 保底额"→ 受理照常（当时 `balance >= 保底额`），结算 `capture` 后 `ledger.accounts.balance_microusd` **可为负**；**随后用同一个账户再发一次请求 → 按当时（负）余额判 `balance >= 保底额` 不成立 ⇒ 402 `insufficient_balance`**，不产生 Job、不扣款（§3.6/§7.4）；**受理时 `balance < 保底额` 仍然是硬拒绝**；
-- **售价按命中候选算**：给定发布的**两个候选各自的渠道成本**（原币种 + `cost_currency`）、修订级 `markup_bps` 与受理时的汇率 → 受理时快照里的 `consumer_rates_cny` **逐位等于** `该候选渠道成本 ×(1 + markup_bps)× 该币种 → CNY 的汇率`，`hit_candidate` 记的是**实际命中的那条候选**；命中不同候选 → 售价**不同**（§3.2/§3.4）；
-- **同一网关模型**命中两条成本不同的候选 → 对客售价**不同**（各按自己的候选成本算，§3.4），但扣的是**同一个账户**；毛利 = 各自售价 − 各自成本折算后 CNY（用 P2a 的成本列断言）；
+- **对客费率向量与后台设定逐位一致**：给定发布的**两个候选各自设定的对客费率向量**（`consumer_rates_cny`，四档 CNY）→ 受理时快照里的 `consumer_rates_cny` **逐位等于**该候选在修订里设定的那一份（**不再写"由单值推出"**——`reference_cost_microusd` 只作定价参考、不是被乘数）；`hit_candidate` 记的是**实际命中的那条候选**；命中不同候选 → 售价**不同**（§3.2/§3.4）；
+- **`Declared` 的实际 `cost` 不改对客金额**：构造上游实际 `cost` 与发布参考值不同 → **对客 `charge` 不变**（仍按冻结的 `consumer_rates_cny` × 实际 `usage`），差额只进**毛利**（§3.2/§3.5）；
+- **同一网关模型**命中两条成本不同的候选 → 对客售价**不同**（各按自己发布的对客费率向量算，§3.4），但扣的是**同一个账户**；毛利 = 各自售价 − 各自成本折算后 CNY（用 P2a 的成本列断言）；
 - **实收按实际、不封顶**：结算 `charge` = `consumer_rates_cny` × **实际 `usage` 分项 token（真值）**；**不取 min(算出额, hold)**——实收超过保底额时按实际扣，差额由余额透支吸收；实收低于保底额时差额释放回余额（§3.3/§3.6）；
 - **旧修订 + 新 Job → 走旧口径**：迁移后仍生效、但**没有定价**（缺 `hold_microusd` / `consumer_rates_cny`）的旧修订受理出的新 Job，预授权**回落到 `GENERATION_MAX_COST_MICROUSD`**（今天的行为），结算也走旧口径（§3.3/§3.6）；
 - **售价不受固定数限制**：构造 `保底额 > GENERATION_MAX_COST_MICROUSD` 的定价 → **照常受理**（不拒绝、不截断、不写审计）（§3.6）；
+- **管理员读接口列出定价**（**从 P1 验收移来**，§9 P1）：P2b 之后 `GET /api/v1/gateway-models` 能列出每个候选的 `consumer_rates_cny` / `reference_cost_microusd` / `cost_currency` / `cost_basis`，以及修订级 `markup_bps` 与 `tier_prices` / `floor_amounts`，不需要直查库（§2.2）；
+- **汇率按受理时刻生效的那一行取值**：`pricing.fx_rates` 里同一币种两行不同生效时间 → 受理时快照的 `fx_rate` **逐位等于受理时刻生效的那一行**，且该行**随快照冻结**；受理之后新增 / 改动汇率行**不影响已受理 Job**（对客金额与成本折算都用冻结的那个数）；**对客费率向量是发布数据**，汇率改动只在下一次设定 / 重发修订时才体现（§3.2/§3.8）；
 - 历史 `price_snapshot`（缺 `consumer_rates_cny`）的结算结果与今天**逐位相同**；
 - 毛利 = 售价（CNY）− 成本折算后 CNY（**原币种**原值 × 快照 `fx_rate`）可逐笔算出，`provider_cost_source` 区分 `declared` / `computed` / `unavailable`，各一个用例；
-- 汇率改一次**不影响已受理 Job**（快照生效），**只影响之后新受理 Job 的售价**；已受理 Job 的对客金额与成本折算都用冻结的那个数。
+- **透支撞库约束已放宽**：结算把余额扣成负数后 `ledger.accounts` 的条件更新与后续受理**都不报库层约束错**（`balance_microusd >= 0` 已去掉）；`ledger.holds.amount_microusd` 与 `generation.jobs.max_cost_microusd` 接受 `0`（§3.6/§9 P2b 改动行）；
+- **重发修订**（换对客费率向量 / `markup_bps`）**不影响已受理 Job**，只影响之后新受理的 Job；已受理 Job 的对客金额与成本折算都用冻结的那个数（`ADR-0003`）。
 
 ### P3 权重与路由日志
 
@@ -616,7 +637,7 @@ Redis 的位置：
 
 ### P6 路由策略层（运营配置，**不进不可变修订**）
 
-**改动**：`route_policies`（全局一条 + 按网关模型覆盖、策略类型、折扣率表、版本标识）；策略读取（带版本校验、不一致回源，§5.5）；`least_cost` 的折扣率输入（按候选供给配，**只作估算**）；账户标签字段（`ledger.accounts` 增列）与管理员面写入；`weighted_random` 按 `(account_id, idempotency_key)` 哈希（与 P3 同一套哈希与区间划分）；`routing_decisions` 记生效策略与选路依据。**不新增修订内容**——策略不进不可变修订。
+**改动**：`route_policies`（全局一条 + 按网关模型覆盖、策略类型、折扣率表、**`user_tag` 的"标签 → 渠道"映射**、版本标识；结构见 §5.1）；策略读取（带版本校验、不一致回源，§5.5）；`least_cost` 的折扣率输入（按候选供给配，**只作估算**）；账户标签字段（`ledger.accounts` 增列）与管理员面写入；`weighted_random` 按 `(account_id, idempotency_key)` 哈希（与 P3 同一套哈希与区间划分）；`routing_decisions` 记生效策略与选路依据。**不新增修订内容**——策略不进不可变修订。
 
 **验收（离线）**：
 - **未配置策略 ⇒ 与今天逐位一致**：一条策略都不配时（默认 `priority_failover`），同一批输入（账户 + 幂等键 + 请求参数）的选路结果与今天**逐位相同**（含同档按 `weight` 分流）；
@@ -631,16 +652,16 @@ Redis 的位置：
 **原两条未决已由用户答复定案，未决清单为空**：
 
 1. **权重语义（已定）**：**`priority`（数字小者优先）+ `weight`（加权随机）**，且**两者都是路由策略的输入**——`priority_failover` 用 `priority`、`weighted_random` 用 `weight`，分流按 **`(账户, 幂等键)`** 确定性哈希（§4.2/§5.2/§5.4）。决策已落 [`docs/adr/0020`](../adr/0020-routing-strategy-layer-configured-by-operations.md)（**`ADR-0020`**）。因此"权重只作次级排序依据"这一备选**不采纳**（同档允许多候选、档内按权重分流，唯一索引换成 `(gateway_model, offering_id) WHERE active`，§4.2）。
-2. **"与命中渠道无关"的确切含义（已定）**：**对客价随命中渠道浮动**——用户原话：**"对客价随命中渠道浮动（管理员创建平台网关模型，设置模型对客定价：基于渠道成本 + 加价系数（美元汇率设置））"**。因此**售价按该次请求命中的候选算**：`售价 = 该候选的渠道成本 × (1 + 加价系数) × 汇率`（加价系数与汇率由后台设），**同一网关模型不同候选价格不同**；受理时**选中候选之后**即可算出售价（策略在受理时已定候选），快照记**命中候选 + 该候选的成本与售价**（§3.3/§3.4）。**"与命中渠道无关"指的是扣费对象**——扣的仍是同一个用户余额，不按渠道分账。**预授权（保底额）与售价是两件事**：保底额仍按**供给维度**的 `floor_amounts` 查表（§3.6），**不由售价派生**。此前记的"金额也无关"这一默认读法**作废**（连同"后台直接设一个固定 CNY 售价"）。
+2. **"与命中渠道无关"的确切含义（已定）**：**对客价随命中渠道浮动**——用户原话：**"对客价随命中渠道浮动（管理员创建平台网关模型，设置模型对客定价：基于渠道成本 + 加价系数（美元汇率设置））"**。因此**售价按该次请求命中的候选算**：随修订发布、随 Job 快照冻结的是**按候选的对客费率向量** `consumer_rates_cny`（管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"设定/推导；加价系数与汇率由后台设），**同一网关模型不同候选价格不同**；受理时**选中候选之后**随 Job 快照冻结（策略在受理时已定候选），快照记**命中候选 + 该候选的对客费率向量与成本**（§3.3/§3.4）。**"与命中渠道无关"指的是扣费对象**——扣的仍是同一个用户余额，不按渠道分账。**预授权（保底额）与售价是两件事**：保底额仍按**供给维度**的 `floor_amounts` 查表（§3.6），**不由售价派生**。此前记的"金额也无关"这一默认读法**作废**（连同"后台直接设一个固定 CNY 售价"）。
 
-现状（`pricing.price_plans` 按候选挂、费率即结算基数）售价**也**随命中候选变，但**没有加价系数与汇率**——本设计保留"按命中候选"这一点，把对客价改成"候选成本 ×(1 + 加价系数)× 汇率"（§3.4）。
+现状（`pricing.price_plans` 按候选挂、费率即结算基数）售价**也**随命中候选变，但**没有加价系数与汇率**——本设计保留"按命中候选"这一点，把对客价改成"**按候选发布的四档对客费率向量**"（§3.4）。
 
-**加价系数与汇率的数值不属设计决策**（用户更正）：**加价系数由管理员创建网关模型时录入**（每个网关模型一个，用于**受理时算出售价**），**汇率由管理员在后台维护**（**按币种**的一组折算率：渠道币种 → CNY，受理时用于算出售价，同一份值也用于成本折算）；设计只规定字段位、录入入口与快照时机（§3.2/§3.8）。因此这两条**不再列入未决**。
+**加价系数与汇率的数值不属设计决策**（用户更正）：**加价系数由管理员创建网关模型时录入**（每个网关模型一个，用于**设定该候选的对客费率向量**），**汇率由管理员在后台维护**（**按币种**的一组折算率：渠道币种 → CNY，**取值＝受理时刻生效的那一行**，用于设定对客费率向量，同一份快照值也用于成本折算）；设计只规定字段位、录入入口与快照时机（§3.2/§3.8）。因此这两条**不再列入未决**。
 
 ### 已定案（本设计直接决定，不再待决）
 
-- **`markup_bps` 归属**：每个网关模型一个，**数值由管理员创建网关模型时录入**，随修订发布、随 Job 的 Price Snapshot 冻结（§1.6/§3.2）；**它在受理时参与算出售价**（售价 = 该候选的渠道成本 ×(1 + `markup_bps`)× 汇率），随快照冻结后受理之后不再变（§3.4）；
-- **汇率维护入口与字段**：**按币种一组** `pricing.fx_rates` + `PUT /api/v1/fx-rates`（管理员、写审计），**现在就立字段**，**折算率按币种维护（渠道币种 → CNY，不固定 USD）**、数值由后台管理员录入（不属设计决策）；**它在受理时参与算出售价**（§3.2/§3.4），同一份值也用于**把成本折算成人民币**（毛利核算），**受理之后不再换算**（§3.2/§3.8）；
+- **`markup_bps` 归属**：每个网关模型一个，**数值由管理员创建网关模型时录入**，随修订发布、随 Job 的 Price Snapshot 冻结（§1.6/§3.2）；**它参与设定该候选的对客费率向量**（管理员按"该候选成本费率 ×(1 + `markup_bps`)× 汇率"设定/推导），随快照冻结后受理之后不再变（§3.4）；
+- **汇率维护入口与字段**：**按币种一组** `pricing.fx_rates` + `PUT /api/v1/fx-rates`（管理员、写审计），**现在就立字段**，**折算率按币种维护（渠道币种 → CNY，不固定 USD）**、数值由后台管理员录入（不属设计决策）；**它在管理员设定对客费率向量时参与推导**（§3.2/§3.4），**取值规则＝按生效时间取"受理时刻生效的那一行"、随快照冻结**，同一份快照值也用于**把成本折算成人民币**（毛利核算），**受理之后不再换算**（§3.2/§3.8）；
 - **币种平面**：**对客只有 CNY 单币种**（充值、余额、售价、保底额、扣费一律人民币，不做实时汇率换算）；**成本平面按渠道声明的 `currency`**（渠道四档费率表与上游 `cost` 都按该币种记，**不假定 USD**）；快照里售价/保底/扣费记 CNY、成本记**原币种原值 + 币种 + 当时汇率 + 折算后 CNY**（毛利用），两条线分开核对（§3.8）；
 - **Redis**：**已批准引入**（用户批准；**纯加速层**——缓存不是事实源，见 §7；**预检拒绝不需要新 ADR**——`ADR-0003` 的"缓存不是事实源"已覆盖，见 §7.4）。因此"是否批准引入 Redis"**不再待决**；
 - **网关模型启停粒度**：**整个模型一个开关**（`publication.gateway_models.enabled`），不做候选级开关（§2.1/§2.4）；
@@ -648,7 +669,7 @@ Redis 的位置：
 - **预授权口径**：**保底 + 允许透支**——预授权**只是保底**，按**供给（vendor + offering）维度**查**随修订发布的保底表**（`floor_amounts`：供给内按 `(size, quality)` 两维，`quality` 维留空即按 `size` 档；OpenAI 系当前 `1K = ¥0.16` / `2K = ¥0.25` / `4K = ¥0.3`，**币种＝CNY**；`size=auto` 取该供给最大档；缺档回落该供给封顶保底值，再回落 `GENERATION_MAX_COST_MICROUSD`），**不编进代码**（§3.6）。保底额**两个身份**：① **准入闸门**——受理时 `balance >= 保底额` 才放行，不足 ⇒ 402 `insufficient_balance`（**硬拒绝保留**）；② **结算的参考下限**——估小了由结算透支吸收、估大了结算释放差额。结算**按实际**——**两家渠道都是 token 计费**，实收 = 对客四档 **CNY** token 费率 × 实际 `usage` 分项 token，**不封顶在保底额**，**实际超过保底额时余额可为负（透支发生在结算）**；透支后**下一次受理按当时余额判 ⇒ 402**；透支的追补属运营 / 充值流程。**运营要设成本护栏属 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)、不在本设计**（§3.6）——**预授权口径本身不再归 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)**；
 - **"不可用时回退"的含义**：§4.4 已按**阶段**写清——受理前的候选不合格回退落地（现状）；提交前的失败技术上能回退，但当前策略是"失败不重试"（`ADR-0011`），改"回退下一候选"属**策略变更**；提交后的不确定（超时、断连、`5xx`）**不得回退**（会重复出图与重复计费），进对账。**"运行期回退"是否要做属 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)，不在本设计范围**——因此这一条也不再待决。
 
-- **对客价口径**：**售价随命中候选浮动**——`售价 = 该候选的渠道成本 ×(1 + 加价系数)× 汇率`（加价系数与汇率由后台设），**同一网关模型不同候选价格不同**；受理时**选中候选之后**算定并随 Job 快照冻结（快照记**命中候选 + 该候选的成本与售价**）；**预授权（保底额）仍按供给维度查 `floor_amounts`、不由售价派生**（§3.2/§3.3/§3.4/§3.6）；
+- **对客价口径**：**售价随命中候选浮动**——随修订发布、随 Job 快照冻结的是**按候选的对客费率向量** `consumer_rates_cny`（管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"设定/推导；加价系数与汇率由后台设），**同一网关模型不同候选价格不同**；`reference_cost_microusd` **只作定价参考、不是售价的被乘数**；受理时**选中候选之后**随 Job 快照冻结（快照记**命中候选 + 该候选的对客费率向量与成本**）；**预授权（保底额）仍按供给维度查 `floor_amounts`、不由售价派生**（§3.2/§3.3/§3.4/§3.6）；
 - **权重语义**：**`priority`（数字小者优先）+ `weight`（加权随机）**，**两者都是路由策略的输入**（`priority_failover` 用 `priority`、`weighted_random` 用 `weight`），分流按 `(账户, 幂等键)` 确定性哈希；决策已落 `ADR-0020`（§4.2/§5.2/§5.4）；
 
 ### 范围边界（不待决，归其他工作项）
@@ -665,29 +686,31 @@ Redis 的位置：
 **新立**：
 
 - **成本事实的落点**（`attempts` 承载渠道成本）与它与 `ADR-0006` 的关系；
-- **对客售价的构成与"售价随命中候选浮动"这一产品口径**（`售价 = 该候选的渠道成本 ×(1 + 加价系数)× 汇率`，§3.4/§10 第 2 条），以及**对客单币种 CNY / 成本平面按渠道声明币种**这条币种口径（§3.8）；
+- **对客售价的构成与"售价随命中候选浮动"这一产品口径**（随修订发布、随 Job 快照冻结的是**按候选的对客费率向量** `consumer_rates_cny`，管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"设定/推导；`reference_cost_microusd` 只作定价参考、不是被乘数，§3.4/§10 第 2 条），以及**对客单币种 CNY / 成本平面按渠道声明币种**这条币种口径（§3.8）；
 - **路由策略层**（§5）：**策略是运营配置**（运行期可改、即时生效、**不进不可变修订**）、**候选合格性优先于策略**（任何策略都不得选中不合格候选）、**分流确定性可重放**（`weighted_random` 按 `(账户, 幂等键)` 哈希）——**已立**：`docs/adr/0020-routing-strategy-layer-configured-by-operations.md`（**`ADR-0020`**，详见 §5.6）。
 
 **与 `ADR-0009` 的关系**：`ADR-0009`（与 `ADR-0015`）现状写的是"**选中顺序是发布决定**、不由请求参数 / Adapter / 价格决定""**核心服务不内置价格、优先级或健康度择优**"，**与路由策略层冲突**（`least_cost` 就是按价格选）。处理方式是**已立一条新 ADR**（`docs/adr/0020-routing-strategy-layer-configured-by-operations.md`，**`ADR-0020`**，见上一条与 §5.6），**不改 `ADR-0009` / `ADR-0015` 的旧条原文**——`ADR-0009` 标为**部分被取代**（保留原文与结论段、仅末尾追加标注；它定的"哪些候选存在、按什么顺序"**继续成立**），`ADR-0015` 的"核心服务不内置择优"**仍成立**（策略是运营配置、非硬编码）。
 
 **就地修订既有 ADR**：
 
-- `ADR-0006`：汇率从"Price Plan 发布时固定"改成"**按币种的全局折算率表 + 受理时快照**"，并写清**它是一组渠道币种 → CNY 的折算率、在受理时参与算出售价并随快照冻结，同一份值也用于把成本折算成人民币（毛利核算）**（§3.2/§3.8）；
+- `ADR-0006`：汇率从"Price Plan 发布时固定"改成"**按币种的全局折算率表 + 受理时快照**"，并写清**它是一组渠道币种 → CNY 的折算率、取值＝受理时刻生效的那一行、在设定对客费率向量时参与推导并随快照冻结，同一份快照值也用于把成本折算成人民币（毛利核算）**（§3.2/§3.8）；
+- `ADR-0006` 的**币种段**：原文"账本与 Price Snapshot 以 microUSD 计价"要改成"**对客账本与 Price Snapshot 以 CNY 计价，成本按渠道声明的币种**"（§3.8；`ADR-0006` 原文的"以 USD 计价的计划原生价即 microUSD"只是**该渠道**的币种口径，不改）；
 - `ADR-0009` ①：权重的语义与"优先级是档位、档内分流"这一选路模型——"数字小者优先**且同一型号内唯一**"要改成"档位内可多候选、按权重分流"（§4.2）；
-- `ADR-0009` ②：预授权口径——"预授权金额与计价口径是两个量，不得互相推导…不由候选价格反算"要改成"**预授权只是保底**，按**供给（vendor + offering）维度的保底表**查得（随修订发布、随 Job 快照冻结、不编进代码），它**既是准入闸门**（`balance >= 保底额` 才受理，不足 ⇒ 402）**也是结算的参考下限**；结算**按实际用量 / 实际成本**、**实际超过保底额时余额可为负（透支发生在结算）**；`GENERATION_MAX_COST_MICROUSD` 只作**连供给封顶保底值都没有时的兜底保底额**"（§3.6）。
+- `ADR-0009` ②：预授权口径——"预授权金额与计价口径是两个量，不得互相推导…不由候选价格反算"要改成"**预授权只是保底**，按**供给（vendor + offering）维度的保底表**查得（随修订发布、随 Job 快照冻结、不编进代码），它**既是准入闸门**（`balance >= 保底额` 才受理，不足 ⇒ 402）**也是结算的参考下限**；结算**按实际用量 / 实际成本**、**实际超过保底额时余额可为负（透支发生在结算）**；`GENERATION_MAX_COST_MICROUSD` 只作**连供给封顶保底值都没有时的兜底保底额**"（§3.6）；
+- `ADR-0009` ② 里**同段**那句"被选中候选的最小可能费用已超上限时**在受理前拒绝**"：本设计**已删除该规则**（§3.6——`GENERATION_MAX_COST_MICROUSD` 只作兜底保底额，不是"超限即拒"的门槛；受理的唯一上限是**客户余额**），修订 ② 时**一并删掉这句**（§3.6/§9 P2b）。
 
-**现状**：`ADR-0009` 已追加"**部分被取代**"标注（由 `ADR-0020` 引起，**原文与结论段一字未改**）；上列两条**操作性条款**——① 的"数字小者优先**且同一型号内唯一**"与 ② 的"预授权金额与计价口径是两个量，不得互相推导…不由候选价格反算"——**尚未改，属待办**（按仓库约定须经用户确认后再改 ADR，本设计不自行改 ADR 文件）。
+**现状**：`ADR-0009` 已追加"**部分被取代**"标注（由 `ADR-0020` 引起，**原文与结论段一字未改**）；上列 **`ADR-0006` 两处**（汇率段 + **币种段**）与 **`ADR-0009` 两条操作性条款**——① 的"数字小者优先**且同一型号内唯一**"、② 的"预授权金额与计价口径是两个量，不得互相推导…不由候选价格反算"与**同段那句"被选中候选的最小可能费用已超上限时在受理前拒绝"**——**尚未改，属待办**（按仓库约定须经用户确认后再改 ADR，本设计不自行改 ADR 文件）。
 
 另外几处是**设计级修订**（改 `docs/design/`，不动 ADR）：`GET /v1/models` 的字段名 `vendor` → `vendor_id`（`docs/design/0005` §8.1 已定该形状，`docs/design/0005` §8 第 1 条已同步改毕）、合同 `model.const` 的对客投射替换规则（§1.4）、以及 `docs/design/0005` §8 第 2 条（原"路由策略层：暂不引入"）与 §4 的 R5 登记（**已随本修订落地**，见 §5.6）。
 
 ## 评审记录
 
-- 状态：**待评审**（Plan Review 两轮发现已收口；用户更正与批准已并入，见下节第 15–21 条；**原两条未决已定案、未决清单为空**）。本文尚不构成实施依据。
+- 状态：**待评审**（Plan Review 两轮发现已收口；用户更正与批准已并入，见下节第 15–21 条；**Plan Review 终轮 7 条已并入**，见下节第 22 条；**原两条未决已定案、未决清单为空**）。本文尚不构成实施依据。
 - 评审完成后在此记录结论与批准依据（按 `docs/agents/artifacts.md`：`docs/design/` 的状态头表示**设计评审状态**，批准不由文件推断）。
 
 ## Plan Review 处置
 
-两轮 Plan Review 的发现逐条落点——**第一轮 8 条**，另加**用户两处更正**（第 9、10 条），**第二轮（收敛轮）4 条**（第 11–14 条），**上一轮用户更正、批准与补写 4 条**（第 15–18 条），**再上一轮用户更正 1 条**（第 19 条），**上一轮新增 1 条**（第 20 条：路由策略层），**本轮答复 1 条**（第 21 条：两条未决定案 + 对客价与成本币种两条口径并入）（本节编号只为对照评审清单，不构成正文引用）：
+两轮 Plan Review 的发现逐条落点——**第一轮 8 条**，另加**用户两处更正**（第 9、10 条），**第二轮（收敛轮）4 条**（第 11–14 条），**上一轮用户更正、批准与补写 4 条**（第 15–18 条），**再上一轮用户更正 1 条**（第 19 条），**上一轮新增 1 条**（第 20 条：路由策略层），**本轮答复 1 条**（第 21 条：两条未决定案 + 对客价与成本币种两条口径并入），**Plan Review 终轮 7 条**（第 22 条）（本节编号只为对照评审清单，不构成正文引用）：
 
 | # | 发现 | 落在哪 |
 | --- | --- | --- |
@@ -712,7 +735,8 @@ Redis 的位置：
 | 19 | **本轮用户更正：计价与预授权口径改口径（两处）**——① 上一轮的"按张计费 vs 按 token 计费"二分**作废**，**两家渠道都是 token 计费**（四档：文本输入 $5 / 文本输出 $10 / 图像输入 $8 / 图像输出 $30，每 1M tokens）；APIMart **直接返回 `cost`**（实测 `cost = 0.011354`），**不需要我们自己算** ⇒ 成本来源改为**两态** `Computed`（按实际 `usage` × 四档费率自算）/ `Declared`（直接取上游 `cost`，更权威、含折扣）。② "档位 → 每张价"的表（`tier_prices`）**降级为定价参考/展示，不参与预授权**；`size`、`quality` 是主要影响因素，`resolution` 是 APIMart 的包装参数（合同里没有档位形态、承载面不声明它）。③ **预授权只是保底**：受理时按保底额查余额，**余额 < 保底额 ⇒ 402 `insufficient_balance`（硬拒绝保留）**；**结算按实际扣费**（实际 `usage` 分项 token × 对客费率；`Declared` 时成本直接取上游 `cost`），**实际 > 保底额时余额可为负——这才是"透支"（发生在结算，不在受理）**；**下一次受理按当时（可能已为负）的余额判 ⇒ 402**；**Redis 预检仍可拒绝**（余额不足是硬规则），保留"新鲜窗口 + 必留审计"（§7.4 口径不变）。④ **保底额按供给（vendor + offering）分别设定**：保底表挂供给维度、随修订发布、随 Job 快照冻结、**不编进代码**；OpenAI 系按 `size` 给保底（**1K = ¥0.16 / 2K = ¥0.25 / 4K = ¥0.3**），`size=auto` 取最大档，缺档回落该供给封顶保底值、再回落 `GENERATION_MAX_COST_MICROUSD`；保底表**支持 `(size, quality)` 两维**，OpenAI 系当前只按 `size` 填、`quality` 维留空备用（**留空即按 `size` 档**）。⑤ **两个币种平面**：**对客只有 CNY 单币种**（充值、余额、售价、保底额、扣费一律人民币，不做实时汇率换算）；**USD 只是平台与渠道之间的结算口径**（四档费率与上游 `cost`）；**汇率（USD → CNY）只用于把美元成本折成人民币、服务毛利核算，不参与对客金额**；**售价由后台按网关模型设定、以 CNY 表达**（"成本 × 加价系数"若用只是后台定价时的参考算法）；**保底额币种＝CNY**（确认，去掉上一轮的"币种待确认"）；快照里**售价/保底/扣费记 CNY、成本记 USD 并记折算汇率与折算后 CNY**，两条线分开 | ① §3.1 重写为"两家都是 token 计费 + 成本来源两态"（含实测 `cost = 0.011354`）；§3.7 判据表改口径；§3.5 成本列、§6「平台成本价」行、§9 P2a 验收同步。② §1.6 字段清单把 `tier_token_estimates` / `hold_cap_microusd` 换成 `floor_amounts`，`tier_prices` 注明**只作参考、不参与预授权**；§3.3 快照把 `consumer_price_microusd` 换成 `consumer_rates_cny`（对客四档 CNY token 费率）、`hold_microusd` 改称**保底额**、`hold_source` 改按供给查表来源；§9 P2b 改动与验收同步；§3.4 的"另一种读法"改写。③ §3.6 整节重写为"**预授权只是保底**：按供给查保底表冻结，结算按实际、可透支"（兜底链改为 供给档位 → `size=auto` 最大档 → 供给封顶保底值 → `GENERATION_MAX_COST_MICROUSD`），写明保底额的**两个身份**（准入闸门 + 结算参考下限），**保留** `balance >= 保底额` 与 402；§3.3/§3.5/§6 删掉"封顶在 hold / 超产出不加收"；§7.2 余额注明**币种 CNY 且可为负**、§7.4 的 `$预授权` 改为按供给查表的 `$保底额` 并写清"透支发生在结算、下一次受理按当时余额判 402"（**Redis 预检可拒绝的写法保留不变**）；§9 P2b 加"**透支**"验收；§10 已定案与 `ADR-0009` ② 修订措辞同步。④ §1.6 定义 `floor_amounts` 结构（供给维度 + `(size, quality)` 两维 + 该供给封顶保底值，OpenAI 系样例 `¥` 标注为 **CNY**）；§3.6 写死查表与兜底链；§9 P2b 加"**保底按供给维度查表**"与"`quality` 维留空即按 `size` 档"两条验收。⑤ 新增 **§3.8 两个币种平面**（对客 CNY / 成本 USD 的落点表 + 汇率只服务毛利 + 既有列名的币种语义）；§3.2 定价公式改为"CNY 售价 + 参考算法"、汇率行改为 USD → CNY 且不参与对客金额；§3.3 快照分**对客平面 / 成本平面**两组并加 `fx_rate_usd_cny`；§3.5 毛利改为"售价 CNY − 成本折算后 CNY"、`attempts` 加 `provider_cost_cny_microusd`；§6「扣费金额」行注明 CNY；§9 P2b 加"**两个币种平面分开**"验收；§10「已定案」加**币种平面**一条、汇率条与 `ADR-0006` 修订条同步；提案同步 |
 | 20 | **本轮新增：路由策略层**（用户确认「路由这层是**运营的事**」——设计只给**机制**：选哪种策略 / 填什么折扣 / 给谁打什么标签都由运营在后台配） | 新增 **§5 路由策略层**：① **策略是运营配置、不是发布内容**——`route_policies`（运行期可改、即时生效）、**不进不可变修订**、**已受理的 Job 不受后续改策略影响**；② **作用域**＝全局一条 + 可按网关模型覆盖，**未配置时默认 `priority_failover`（＝今天的行为）**；③ **策略类型**（举例、机制上可扩展）`priority_failover` / `weighted_random` / `least_cost` / `user_tag`；④ **三条硬约束**——**候选合格性优先于策略**（不合格候选先被排除，任何策略都不得选中）、**策略只决定"选哪条合格候选"**（不改写参数映射与承载面）、**分流确定性可重放**（`weighted_random` 按 `(账户, 幂等键)` 哈希）；⑤ `priority` / `weight` / `discount_rate` / 账户标签都是**策略的输入**，不是各自独立生效的行为；⑥ **折扣率不进成本**（成本永远记实际扣费——`Declared` 取上游 `cost`、`Computed` 按实际 `usage` × 费率；折扣率**只作 `least_cost` 的比较输入**＝折后成本**估算**，两者不一致时**以实际扣费为准**）；⑦ **账户标签**（`ledger.accounts` 增列，**管理员面配置**、值由运营设）；⑧ **缓存**与 route 缓存同构（带版本校验、不一致回源），**改策略不需要发修订**。同步：§4.2 加"`weight` 是策略的输入"、§7.2/§7.3 加 `route_policy` 缓存与失效、§9 新增 **P6** 切片与验收、§10「已定案」加一条（"是否引入路由策略层"不再是未决 / 范围边界）、§10「新立 ADR」加"路由策略层"并写明**与 `ADR-0009` 的关系＝新立一条 ADR、不改旧条**（**该 ADR 现已立为 `docs/adr/0020-routing-strategy-layer-configured-by-operations.md`**）、设计级修订登记 `docs/design/0005` 两处旧口径（**现已随本修订落地**）；提案加范围第 10 条、已定案一条、验收第 12/13 条 |
 | 21 | **本轮用户答复：两条未决定案 + 两条口径并入**（① 权重语义 ② "与命中渠道无关"的确切含义 ③ 对客价随命中渠道浮动 ④ 成本币种按渠道声明，不假定 USD） | ① 两条**均改为已定**，§10 未决清单**清空**（0 条）：**`priority`（数字小者优先）+ `weight`（加权随机），两者都是路由策略的输入**，分流按 `(账户, 幂等键)` 确定性哈希——决策已落 `ADR-0020`（§4.2/§5.2/§5.4）；② **对客价随命中渠道浮动**——`售价 = 该候选的渠道成本 ×(1 + 加价系数)× 汇率`（加价系数与汇率由后台设），**同一网关模型不同候选价格不同**，受理时**选中候选之后**算定并随快照冻结，快照记**命中候选 + 该候选的成本与售价**；**预授权仍按供给维度的 `floor_amounts` 查表、与售价是两件事**。§3.2/§3.3/§3.4 改写（原"同一网关模型一个固定 CNY 售价 / 后台直接设 CNY 售价"作废），§2.2/§3.5/§3.8/§7.2/§9 P1/P2b 与提案同步；③ **成本平面按渠道声明的 `currency`**（不假定 USD）：`reference_cost_microusd` / `cost_currency` 按候选发布，汇率改成**按币种维护的"渠道币种 → CNY"折算率**（`pricing.fx_rates`），快照记**成本原币种金额 + 币种 + 当时汇率 + 折算后 CNY**，`fx_rate_usd_cny` 改名 `fx_rate`；§3.1 的四档费率表注明**是 AIHubMix 的 USD 费率表、按渠道币种标注**，§3.8 整节改写；④ §10「就地修订既有 ADR」补 `ADR-0009` 的**现状**（已追加"部分被取代"标注，操作性条款尚未改、属待办）；`docs/design/0005` §8 第 1 条的 `vendor` 已同步改为 `vendor_id` |
+| 22 | **Plan Review 终轮 7 条**（① 透支撞库约束 ② 币种校验残留 ③ `provider_cost_cny_microusd` 归属 ④ 售价被乘数维度 ⑤ `cost_basis` 按候选 ⑥ §10 ADR 清单两条 ⑦ P1/P2b 验收 + `route_policies` 结构 + `fx_rates` 取值规则） | ① **§3.6** 加一句"**透支依赖该迁移**"：`migrations/0001_initial.sql` 的 `ledger.accounts.balance_microusd` 的 `CHECK (>= 0)`、`ledger.holds.amount_microusd` 与 `generation.jobs.max_cost_microusd` 的 `CHECK (> 0)` 三处都拦着负余额 / 零保底额；**§9 P2b 改动清单**明确列出**迁移放宽这三处**（`balance_microusd` 去掉 `>= 0`，另两处改 `>= 0`），§9 P2b 验收补一条"透支不报库层约束错"，§7.4 加指向。② **§9 P2a 改动清单**加"**去掉 `crates/application/src/lib.rs` 的 `currency != "USD"` 硬校验**，改为**按供给声明的 `currency` 接受**（**币种权威＝供给声明的 `currency`（发布数据），落 `cost_currency`**；`pricing.price_plans.currency` 保留为**成本侧历史字段**、以供给的 `cost_currency` 为准）**并校验该币种在汇率表里有折算率，否则发布期拒绝**"，P2a 验收补一条对应断言。③ **§9 P2a 列清单**加 `generation.attempts.provider_cost_cny_microusd`（**折算后 CNY**，成本事实采集含折算），"三列"改"四列"。④ **定案：售价不是由单值乘出来的**——`consumer_rates_cny` 是**按候选的对客费率向量**（管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"设定/推导，**随修订发布、随 Job 快照冻结**，落 `runtime_revisions.consumer_rates_cny`），`reference_cost_microusd` **只作定价参考、不再是售价的被乘数**；§3.2 公式改成"对客费率向量 = …"（标注**后台设定/推导依据**）、§3.2 落点表加"对客费率向量"一行、§3.3/§3.4/§3.8/§2.2/§10 与提案同步；**§9 P2b 验收改成"对客费率向量与后台设定逐位一致"**（删"由单值推出"），并补"`Declared` 的实际 `cost` **只影响毛利**、不改对客金额"。⑤ **定案：`cost_basis` 改按候选维度**（与 `cost_currency` 同处，随修订发布、随 Job 快照冻结），**修订级不再放该字段**——§1.6 列清单 / §1.6 说明段 / §3.3 快照 / §9 P2b 改动同步。⑥ **§10「就地修订既有 ADR」补两条**：`ADR-0006` 的**币种段**（"账本与 Price Snapshot 以 microUSD 计价"→ 对客 CNY、成本按渠道币种）与 `ADR-0009` ② **同段**那句"被选中候选的最小可能费用已超上限时在受理前拒绝"（§3.6 已删除该规则），§10「现状」段同步。⑦ ① **§9 P1 验收去掉"定价"**（改成"候选、顺序、权重与承载面/映射"），**定价断言移到 §9 P2b 验收**；② **§5.1 补 `route_policies` 的结构**（含 `user_tag` 的 `tag_channel_map`"标签 → 渠道"映射），§9 P6 改动同步；③ **`pricing.fx_rates` 写明取值规则**——按生效时间取"**受理时刻生效的那一行**"，把该行**原值快照**进 PriceSnapshot（受理后不再换算），§3.2 落点表 / §3.3 快照 / §3.8 / §9 P2b 验收同步 |
 
-**未决清单已清空（0 条）**：**权重语义**（`priority` 数字小者优先 + `weight` 同档加权随机，**两者都是路由策略的输入**，分流按 `(账户, 幂等键)` 确定性哈希——决策已落 `ADR-0020`）与**"与命中渠道无关"的确切含义**（**对客价随命中渠道浮动**：`售价 = 该候选的渠道成本 ×(1 + 加价系数)× 汇率`，受理时选中候选后算定并随快照冻结；"无关"指的是扣费对象）**均已定案**——**两轮发现、两处更正、上一轮 4 条、上一轮 1 条与本轮答复都未新增待决项**；**第 20 条（路由策略层）不新增待决项**，但它要求**新立一条 ADR**（承接 `ADR-0009`/`ADR-0015` 的"选路是发布决定、不内置择优"）并**改 `docs/design/0005` 两处旧口径**——**两者均已落地**（ADR 已立为 `docs/adr/0020-routing-strategy-layer-configured-by-operations.md`，`ADR-0009` 随之标为**部分被取代**、其操作性条款**待修订**、`ADR-0015` 的"不内置择优"仍成立；`docs/design/0005` 两处旧口径已改，见 §5.6）；加价系数与汇率的数值由后台录入，**不属设计决策**（§10）。
+**未决清单已清空（0 条）**：**权重语义**（`priority` 数字小者优先 + `weight` 同档加权随机，**两者都是路由策略的输入**，分流按 `(账户, 幂等键)` 确定性哈希——决策已落 `ADR-0020`）与**"与命中渠道无关"的确切含义**（**对客价随命中渠道浮动**：随修订发布、随 Job 快照冻结的是**按候选的对客费率向量** `consumer_rates_cny`，管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"设定/推导；"无关"指的是扣费对象）**均已定案**——**两轮发现、两处更正、上一轮 4 条、上一轮 1 条、本轮答复与 Plan Review 终轮 7 条都未新增待决项**；**第 20 条（路由策略层）不新增待决项**，但它要求**新立一条 ADR**（承接 `ADR-0009`/`ADR-0015` 的"选路是发布决定、不内置择优"）并**改 `docs/design/0005` 两处旧口径**——**两者均已落地**（ADR 已立为 `docs/adr/0020-routing-strategy-layer-configured-by-operations.md`，`ADR-0009` 随之标为**部分被取代**、其操作性条款**待修订**、`ADR-0015` 的"不内置择优"仍成立；`docs/design/0005` 两处旧口径已改，见 §5.6）；加价系数与汇率的数值由后台录入，**不属设计决策**（§10）。
 
-**本文相对上一修订新增的两处字段级说法**（评审时请一并看）：`runtime_revisions.reference_cost_microusd`（**按候选的**渠道成本，**原币种**，发布数据；连同 `cost_currency`）与 `PriceSnapshot.consumer_rates_cny`（**受理时算定的**对客四档 token 费率，**CNY**）——它们是"**售价按命中候选算**"这条定价口径的前提（"金额也无关"已由第 21 条作废），理由在 §3.2/§3.3/§3.4。**第 20 条另新增路由策略层的三个说法**：`route_policies`（**策略**，运行期配置、**不进不可变修订**）、`discount_rate`（**折扣率**，只作 `least_cost` 的比较输入、**不进成本**）与**账户标签**（**管理员面配置**，支持 `user_tag`）——理由在 §5。**第 18 条曾新增的 `tier_token_estimates` / `hold_cap_microusd` 已被第 19 条移除**（那套"按张 / 按 token"的 hold 口径作废）；第 19 条改为新增 `runtime_revisions.floor_amounts`（**保底表**，**CNY**，按供给维度挂、随修订发布、随 Job 快照冻结、**不编进代码**）与 `PriceSnapshot.fx_rate`（第 21 条由 `fx_rate_usd_cny` 改名：**该候选币种 → CNY 的折算率**，受理时参与算出售价、同一份值也用于成本折算）——前者是**预授权保底额的唯一来源**，后者是**两个币种平面**（§3.8）的落点，理由在 §1.6/§3.6/§3.8。
+**本文相对上一修订新增的两处字段级说法**（评审时请一并看）：`runtime_revisions.reference_cost_microusd`（**按候选的**渠道成本，**原币种**，发布数据；连同 `cost_currency`；**只作定价参考**）与 `PriceSnapshot.consumer_rates_cny`（**随修订发布、受理时随快照冻结的**对客四档 token 费率向量，**CNY**）——它们是"**售价按命中候选算**"这条定价口径的前提（"金额也无关"已由第 21 条作废），理由在 §3.2/§3.3/§3.4。**第 22 条（Plan Review 终轮）另更正三处字段级说法**：① `runtime_revisions.consumer_rates_cny`（**按候选键**，**对客费率向量**——售价的落点是**发布数据**，不再由 `reference_cost_microusd` 这个单值乘出来，§3.2/§3.4）；② `runtime_revisions.cost_basis` **按候选键**（与 `cost_currency` 同处，**修订级不再放该字段**，§1.6/§3.3）；③ `generation.attempts.provider_cost_cny_microusd`（**折算后 CNY**，归 **P2a** 的成本事实采集，§3.5/§9 P2a）。**第 20 条另新增路由策略层的三个说法**：`route_policies`（**策略**，运行期配置、**不进不可变修订**；结构含 `user_tag` 的"标签 → 渠道"映射，§5.1）、`discount_rate`（**折扣率**，只作 `least_cost` 的比较输入、**不进成本**）与**账户标签**（**管理员面配置**，支持 `user_tag`）——理由在 §5。**第 18 条曾新增的 `tier_token_estimates` / `hold_cap_microusd` 已被第 19 条移除**（那套"按张 / 按 token"的 hold 口径作废）；第 19 条改为新增 `runtime_revisions.floor_amounts`（**保底表**，**CNY**，按供给维度挂、随修订发布、随 Job 快照冻结、**不编进代码**）与 `PriceSnapshot.fx_rate`（第 21 条由 `fx_rate_usd_cny` 改名：**该候选币种 → CNY 的折算率**；第 22 条更正为**在设定对客费率向量时参与推导、随快照冻结，同一份快照值也用于成本折算**）——前者是**预授权保底额的唯一来源**，后者是**两个币种平面**（§3.8）的落点，理由在 §1.6/§3.6/§3.8。
