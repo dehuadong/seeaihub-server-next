@@ -5,6 +5,8 @@
 
 这个仓库是独立的新服务端，不引用或修改旧 SeeAI Hub 仓库的内部代码、数据库和缓存。
 
+文档遵循 [`docs/AGENTS.md`](docs/AGENTS.md)：文档分层、范围与写法；工件放哪见 [`docs/agents/artifacts.md`](docs/agents/artifacts.md)。
+
 ## 工程边界
 
 - `apps/api`：HTTP 控制面与图片生成入口。
@@ -101,7 +103,7 @@ Discuss 及阶段推进权限在此定义；Planning 之后的阶段编排、门
 | `docs/agents/issue-tracker.md` | Proposal 与工单：GitHub Issues 为准、工作状态标签、PR 分诊 |
 | `docs/agents/domain.md` | 领域文档：读哪些、术语纪律、冲突标注、ADR 准入与引用 |
 | `docs/agents/artifacts.md` | 工件：放哪、不放什么，历史位置与本地工具约定 |
-| `docs/AGENTS.md` | 写作标准：正文与代码注释怎么写、slop 清单 |
+| `docs/AGENTS.md` | 文档标准：文档分层与范围、正文与注释的写法、slop 清单 |
 | `docs/agents/git.md` | 提交与推送：提交粒度与信息、推送前跑哪些证据、历史改写 |
 | `.agents/notes/` | Agent Note：记录范围、生命周期、文件骨架与检查（`README.md` 与 `AGENTS.md`） |
 

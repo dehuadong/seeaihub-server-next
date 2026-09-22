@@ -31,6 +31,7 @@ verification: `node scripts/decisions/check.mjs` 通过；注册表检查用变�
 - **引用规则拆成两半、各归其家**：根 `AGENTS.md` 删掉「引用要带所有者」。`docs/AGENTS.md` 承接的是**「合同就地写，理由链接走」**：读者在用到的地方要能看到完整合同，**为什么这么定**只链接到拥有它的那一层（ADR、设计或 Agent Note），正文不重述理由。`docs/agents/domain.md` 的「引用写法」只保留一条**条件**规则——引用了编号就写清是谁的编号（ADR 编号与 Issue 编号撞号），不要求"每个编号都带所有者"。`docs/agents/git.md` 里指向根指令的那句改指向这两处。
 - **工具自述归工具自己**：新增 [`scripts/decisions/README.md`](../../../../scripts/decisions/README.md)（用法、三处本地修补、升级 setup bundle 的提醒），注册表删掉「决策记录工具」一节与登记行，指向它的四处引用同步改掉。
 - **注册表瘦身**（56 → 49 行）：删掉「范围」里与 `domain.md`、`.agents/notes/README.md` 重复的三件事（管理根目录解析、多上下文、Agent Notes 位置），指向别家的登记压成一行指针，合并「既有工作项」与「实施 Ticket」两行。它只回答"放哪、不放什么"。
+- **`docs/AGENTS.md` 的身份是文档标准，不是文风手册**：文档分层与范围放最前（一份文档写多细、哪一层写什么、写文档的顺序、规则/位置/历史各归各层），写法只是其中一节；根 `AGENTS.md` 开头加一行"文档遵循 `docs/AGENTS.md`"（对应上游的"follow docs/AGENTS.md for documentation"），「文档与约定」表里那一行从"写作标准"改成"文档标准"。
 
 ## 备选方案
 
@@ -45,6 +46,7 @@ verification: `node scripts/decisions/check.mjs` 通过；注册表检查用变�
 - **把引用规则写成"必须引用工作项"**：不采纳。工作项只拥有这次工作的**范围与验收**，引用它是"引用属主"；**理由**（为什么这么定）归 `docs/adr/`、`docs/design/` 与 Agent Notes。以工作项为例会把重点从"链接理由"挪到"引用 issue"，本轮一度就是这么写偏的。
 - **把位置表并进 `docs/AGENTS.md`、删掉注册表**（上游的形状：位置表就在写作标准里）：不采纳。位置表里有 9 行没有别处可问，而且它还登记非文档类的东西（GitHub Issues、`out-reference/`、脚本、技能）；并进写作标准会让标准从 64 行长到 100+ 行，还要动 `check.mjs` 读的文件与 setup 部署的项目副本。保留但瘦身。
 - **只删重复、不动工具段**：不采纳。工具被四个地方写到（`notes/AGENTS.md`、`notes/README.md`、`docs/AGENTS.md`，加注册表），前三处各讲自己那部分，只有注册表那处是重复；工具该自己讲自己。
+- **把 `docs/AGENTS.md` 留在"写作标准"的定位上**：不采纳。上游的根指令写的是"文档遵循 `docs/AGENTS.md`"——那份文档的责任是**文档体系**（分层、范围、结构、预算、写作规则与 slop），写法只是其中一节；定位成文风手册会让"这份文档该写多细、放哪一层"这类问题无处可问。
 
 ## 后果
 
