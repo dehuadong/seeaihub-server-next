@@ -7,9 +7,13 @@ approval: seeaihub-server-next#1 记录的用户执行授权；历史设计批�
 verification: 2026-09-19 fmt、clippy、workspace tests、空库 PostgreSQL HTTP contract 与 decisions check 全部通过
 ---
 
-# 独立图片生成服务端第一阶段交付
+# Agent Note：独立图片生成服务端第一阶段交付
 
-## 实际交付
+## 问题
+
+旧服务端的产品与架构已冻结为历史来源，本仓库要在不依赖旧服务端代码与数据的前提下独立承接第一阶段合同。这一阶段要把图片生成的整条链路跑通：动态 Runtime Revision 与 Vendor Model / Offering / Channel / Price Plan 发布、AIHubMix Adapter 的 generations/edits 分流、输入输出 Asset、强类型 Metering Evidence、Price Snapshot 结算，以及租约恢复、Reconciliation Case 与审计。约束是当前正式 `/v1` 路径没有可查询 task id，提交、响应解析或归档结果不确定时只能进入 Reconciliation Case、不得自动重提。
+
+## 决定
 
 [新仓库承接工作项](https://github.com/dehuadong/seeaihub-server-next/issues/1) 已完成第一阶段合同收口。本仓库可以独立构建、测试和运行，不依赖旧服务端代码或数据；API 与 Worker 共用领域和应用模块，图片生成通过持久 Generation Job 执行。
 
@@ -24,7 +28,7 @@ verification: 2026-09-19 fmt、clippy、workspace tests、空库 PostgreSQL HTTP
 
 以上边界分别引用 [无 Evidence 不结算](../../../../docs/adr/0006-no-settlement-without-metering-evidence.md)、[不确定提交进入对账](../../../../docs/adr/0007-reconciliation-instead-of-automatic-retry.md) 与 [自有 Asset 才是平台结果](../../../../docs/adr/0008-own-object-storage-is-the-platform-result.md)。
 
-## 验证证据
+## 验证
 
 - `cargo fmt --check`：PASS；
 - `cargo clippy --workspace --all-targets --all-features -- -D warnings`：PASS；
@@ -34,6 +38,8 @@ verification: 2026-09-19 fmt、clippy、workspace tests、空库 PostgreSQL HTTP
 - 真实 Provider 的历史受控验证（第一阶段 2026-09-18）见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) §2.3（渠道事实的单一出处）；**其原始调研存档 `docs/research/` 已于 2026-09-20 被移除（提交 `ed140c2`）**，本次收口没有再次执行付费调用；
 - `node scripts/decisions/check.mjs`：PASS，索引与本地链接有效。
 
-## 后续边界
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 第二个 Provider/Adapter 与多 Offering 路由不属于本记录范围，应在本仓库另建工作项后进入规划。本阶段不承诺客户端合同，也不迁移旧服务端用户、余额、任务或流量。

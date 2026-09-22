@@ -158,7 +158,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
 | `migrations/0001_initial.sql`…`0010_routing_weight_and_decisions.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
-| `scripts/decisions/*.mjs` | Agent Notes 的目录、元数据与文件格式检查（不生成索引） | 不影响服务运行 |
+| `scripts/decisions/*.mjs` | Agent Notes 的目录、元数据与文件格式检查（不生成索引），自述与本地修补见该目录 `README.md` | 不影响服务运行 |
 | `docs/AGENTS.md`、`docs/agents/git.md` | 正文与代码注释的写作规则与 slop 清单；提交、推送与历史改写约定 | 工件位置与归属归 `docs/agents/artifacts.md`；Agent Note 的文件骨架归 `.agents/notes/README.md` |
 | `docs/design/`、`docs/adr/` | 设计与决策的权威位置 | — |
 | `docs/facts/channel-facts.md` | 各渠道的**事实台账**（端点、参数、计量与成本口径、实测记录） | 不是接口合同，服务不读取 |

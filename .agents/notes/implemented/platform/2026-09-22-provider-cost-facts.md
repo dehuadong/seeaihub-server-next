@@ -7,9 +7,9 @@ approval: 用户在会话中授权实施 P2a（成本事实采集）；范围与
 verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-server-next/issues/15) 的逐条可勾选验收清单（依据 `docs/design/0007` §1/§7/§8/§9）。**手工端到端**（真实 API `127.0.0.1:8091` + 真实 Worker + 假上游 `127.0.0.1:9099`，全新库 `seeai_p2a_verify` 上迁移 0001–0008 全新应用；零真实计费调用）：`declared` 落 `11354` / `USD`（上游声明的 11354 与渠道费率自算的 5950 不同，证明是直接取而非自算）、非 USD 声明（`CNY`）落声明值、字符串形态 `"0.011354"` 同样读出 11354、`unavailable` 三种（终态缺字段 / `cost = -0.01` / `cost = "n/a"`）金额与币种与折算值**全为 NULL**、`computed` 落 `5950`（= 14 文本输入 × 5 + 196 图像输出 × 30，每 1M）且币种 `USD`、失败执行四列 NULL；同批断言对客实收恒为 `-5950`、计量证据 `total_tokens = 210`，即采集成本**不改对客金额与计量事实**。**库层"不猜"**：对 `generation.attempts` 直写 15 条（10 条违反 CHECK + 5 条合法对照）——首轮实测发现"来源 NULL 但金额非空"被库**接受**（`CHECK` 表达式求值为 NULL 时算通过，而来源为 NULL 时 `provider_cost_source IN (...)` 求值为 NULL），已就地修正 `0008` 的 `attempts_provider_cost_shape`（两支补显式 `provider_cost_source IS NOT NULL`）；修正后 10 条全部 REJECTED、5 条对照全部 ACCEPTED，另补"来源 NULL + 仅币种"与"来源 NULL + 仅折算值"两条半填同样 REJECTED。**迁移增量**：在只应用 0001–0007 的库上造一条旧 `attempts` 行，再应用 0008 → 旧行四列 NULL、其余字段逐字未变、四列无 DEFAULT（无回填）、三条 CHECK 与部分索引就位、旧行不计入 `unavailable` 缺口；增量库上新约束同样拒半填。**门禁**：`cargo fmt --all --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（22 / 32 / 2 / 3 / 56 / 46 各 crate 单测通过，43 条端到端用例按设计 ignore）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **43 passed / 0 failed**，含本次新增的三条成本用例与币种用例；`node scripts/decisions/check.mjs` 通过。另做一次反向探针：临时把来源判定改成一律记 `unavailable`，`declared` / `computed` / 币种三条单测立刻失败（`left: Unavailable`），确认它们钉得住来源判定而不是靠断言互相抵消过关；探针已完全撤除。
 ---
 
-# 渠道成本事实采集：成本来源三态与按渠道声明的币种
+# Agent Note：渠道成本事实采集：成本来源三态与按渠道声明的币种
 
-## 问题与目标
+## 问题
 
 上游成本此前**一家都没留痕**：APIMart 的任务终态直接给 `cost`（含账号侧的 `Group ratio 0.8` 折扣，实测 `0.011354`），却既不采纳也不留存；AIHubMix 不给任何金额字段，金额要平台按实际用量 × 该渠道成本费率自己算，也没存。后果是**毛利算不出来**，事后也答不出"这一笔的成本是按哪种来源取的"。
 
@@ -17,7 +17,7 @@ verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-
 
 本项只做**采集成本事实并落库**与**按渠道声明接受币种**——定价公式、保底表、售价快照、汇率表、结算与透支、Redis、路由策略都不在本次交付里。
 
-## 实际交付
+## 决定
 
 - **成本来源三态**（`ProviderCost` 报告 → 领域 `ProviderCostSource`）：`declared`（渠道终态**直接给了金额**，直接取它——含渠道侧折扣，比自算权威）、`computed`（渠道**不给金额字段**，平台按**本次实际用量**与该渠道的**成本费率**自算）、`unavailable`（本该有金额却拿不到——**不得猜测**）。
 - **为什么是三态而不是"可选金额"**：判据是**成本从哪来**，不是"金额对不对"。合成一个 `None`，会把"这条渠道本就不报金额"误记成成本缺口，也会让本该由上游声明、却没拿到的数被自算的费率悄悄顶替。
@@ -31,7 +31,7 @@ verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-
 - **币种按渠道声明接受**：去掉 `currency != "USD"` 的硬校验，只要求非空；「该币种在汇率表里有折算率」这条校验随汇率表落地时才生效。`pricing.price_plans.currency` 保留为**成本侧历史字段**，币种权威是供给声明的那个值。
 - **成本与计量分开**：成本只进毛利口径，不改对客金额、也不进 `metering_evidence`。端到端用例在同一个请求里同时断言"上游声明的 11354 落了库"与"对客实收仍是 5950"。
 
-## 真实替代方案与取舍
+## 备选方案
 
 - **可选金额 vs 三态**：见上；三态必须分开，否则 `unavailable` 落不下去、自算会顶替声明。
 - **Driver 报金额时带币种 vs 平台侧自己配对**：币种权威是供给声明，但金额本身不带币种。把受理时冻结的那份声明交给 Driver、由它随金额一起报回来，落库处就只有一个来源——不必在平台侧再配一次，也不会两处各判一遍。
@@ -55,7 +55,7 @@ verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-
 | 来源判定的三态映射与折算值留空 | `provider_cost_source_follows_where_the_cost_came_from`（`crates/application`）、`worker_settles_the_provider_image_envelope_with_the_evidence` |
 | 落库字符串与库层 CHECK 取值自洽 | `provider_cost_sources_round_trip_through_their_stored_form`（`crates/domain`） |
 
-## 代价与已知限制
+## 后果
 
 - **`provider_cost_cny_microusd` 恒为 NULL**：折算与「币种在汇率表里有折算率」这条发布期校验随定价切片生效。
 - **结算失败进对账那条路径上的成本事实没有落**：实际费用超过预授权时执行已经发生、成本也拿得到，但那条路径不进结算写入。本片只落**执行成功**时的成本事实；该路径的成本补录随成本进账本与账实核对（工单 [#11](https://github.com/dehuadong/seeaihub-server-next/issues/11)）。

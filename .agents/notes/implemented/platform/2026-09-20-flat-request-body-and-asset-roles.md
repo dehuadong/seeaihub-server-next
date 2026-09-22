@@ -7,9 +7,13 @@ approval: 用户 2026-09-20 指出"`native_parameters` 是多余的、其下应�
 verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **13/13 通过**（含参考图、遮罩、上传失败三条真实链路，两个 OpenAI 兼容入口的**同步**响应，以及并发上限）
 ---
 
-# 对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
+# Agent Note：对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
 
 > **失效范围（2026-09-20 同日）**：本条里"图片是平台资产 id""有 202 受理与 job_id 轮询"的部分**已作废**——平台不再托管静态素材，对客只有同步形态。取代记录见 [图片按渠道原形进原形出](./2026-09-20-images-pass-through-without-asset-storage.md)；决策见 `docs/adr/0019`。本条里"按第一方文档把 `background`/`output_compression`/`user`/`moderation` 声明在顶层"以及"参数一律放行透传"两句也已作废：声明面改以**该模型对应端点的 `request.schema`** 为准（那四项属 `/ai/v1` 族、本平台不走），参数改按候选声明面**过滤**（没声明的丢掉）。见 [AIHubMix 声明面对齐端点 schema](./2026-09-20-aihubmix-declared-face-follows-endpoint-schema.md)。其余（扁平请求体、`Idempotency-Key`、服务端定预授权额）仍有效。
+
+## 问题
+
+对客受理请求原先套着 `native_parameters` 外壳，图片参数用渠道的字段名与路径（`position`），AIHubMix 另有一层 `extra`，平台自己的控制字段（`native_model_id`、`idempotency_key`、`max_cost_microusd`）也留在请求体里。调用方因此得知道命中哪个候选才能写对字段名，渠道的长尾参数要逐个由平台声明，多写一个参数还会被整体拒掉。字段命名上同样混着平台型号名与厂商原生名，没有区分"平台型号名 / 厂商原生名 / 发给渠道的模型名"三个角色。要收口的方向是请求体扁平化、图片改用 OpenAI 契约的角色名（`image`/`mask`），装载位置由平台按选中候选声明的参数面决定，而不是看调用方恰好写了哪个渠道字段名。
 
 ## 追加（同日，按用户的四条决定）
 
@@ -38,7 +42,7 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 - **两个 Adapter 同步改成透传**：出网请求体只重写 `model`/`prompt` 与图片参数（图片由 assets
   回填），其余键原样发给上游。
 
-## 实际交付
+## 决定
 
 **对客受理请求换形**（`POST /v1/image-generations`）：
 
@@ -71,7 +75,7 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
   `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），成功回 `{created, data:[{b64_json}]}`，失败回
   OpenAI 错误信封（平台侧语义，渠道原文不外泄）。内部流水线一字未改，同步只是门面的等待。
 
-## 验证结果
+## 验证
 
 | 行为 | 证据 |
 | --- | --- |
@@ -89,7 +93,9 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 | 在飞任务到顶回 429、跑完释放、同键重发不被误拒 | `concurrent_generations_are_capped` |
 | 改名后受理与查询都不缺列 | 全部端到端用例（`active_offering` 读 `gateway_model`） |
 
-## 未做（需要你的决定）
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - **预授权额的精度**：现在是一个固定数；按 Price Snapshot 算最坏成本、以及低于最小可能成本就受理前拒绝（`docs/adr/0009`），仍未实现。
 - **其余字段的取值仍随候选不同**：同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 并多一个 `resolution`——调用方仍要看命中哪个候选。

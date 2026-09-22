@@ -34,11 +34,12 @@ cargo test --workspace --all-features
 
 真实 Provider 测试必须显式启用并限制调用次数；普通测试不得产生外部费用。
 
+按改动面选能挡住这次回归的**最小**证据；要提交或推送不构成把已经通过的检查再跑一遍的理由，CI 拥有穷尽覆盖。只报告实际跑过的命令。提交、推送与历史改写见 `docs/agents/git.md`。
+
 ## 通用约定
 - 未经批准不发起任何计费调用
 - 未经批准不自主选择渠道模型
 - 当需要记录持久的ADR架构设计决策时必须获得用户确认
-- 引用要带所有者：提到工作项、差距、决策或其他编号时必须给出归属，例如 `#6 差距 G5`、`ADR-0017`、`docs/facts/channel-facts.md` §2.13；不留只有编号本身的引用
 
 ## 工程工作流
 
@@ -90,23 +91,20 @@ Discuss 及阶段推进权限在此定义；Planning 之后的阶段编排、门
 端到端请求在满足相应工作流门禁后，持续推进至验证完成。
 限定阶段的请求，在该阶段及其要求的审查完成后结束。
 
-## Agent skills
+## 文档与约定
 
-### Issue tracker
+每个会话需要的规则从这里找；每份文档只写自己的职责，位置、生命周期与写法不在别处重复。
 
-Proposal 与工单以 GitHub Issues 为权威（`dehuadong/seeaihub-server-next`）。见 `docs/agents/issue-tracker.md`。
+| 文档 | 职责 |
+| --- | --- |
+| `docs/agents/engineering.md` | 工程流程的阶段编排、门禁与返回路径 |
+| `docs/agents/issue-tracker.md` | Proposal 与工单：GitHub Issues 为准、工作状态标签、PR 分诊 |
+| `docs/agents/domain.md` | 领域文档：读哪些、术语纪律、冲突标注、ADR 准入与引用 |
+| `docs/agents/artifacts.md` | 工件：放哪、不放什么，历史位置与本地工具约定 |
+| `docs/AGENTS.md` | 写作标准：正文与代码注释怎么写、slop 清单 |
+| `docs/agents/git.md` | 提交与推送：提交粒度与信息、推送前跑哪些证据、历史改写 |
+| `.agents/notes/` | Agent Note：记录范围、生命周期、文件骨架与检查（`README.md` 与 `AGENTS.md`） |
 
-### Domain docs
+本仓库是单上下文：仓库根 `CONTEXT.md` 是唯一词汇表，不存在 `CONTEXT-MAP.md`。
 
-单上下文：仓库根 `CONTEXT.md` 是唯一词汇表，`docs/design/` 承载独立技术设计 RFC，`docs/adr/` 是决策的权威位置。见 `docs/agents/domain.md`。
-
-### Agent Notes
-
-重大工程变更与重要提案遵循 `.agents/notes/README.md`。
-复用既有权威记录；改动时在同一变更中维护相关记录、重新生成索引，并运行文档化检查。
-
-### Artifact management
-
-工程工件的查找、创建、更新与生命周期遵循 `docs/agents/artifacts.md`。
-即使在子项目中工作，也从仓库管理根目录解析该注册表及其中登记的位置。
-**注册表只登记位置与规则**：变更、历史与状态不写进登记表——变更归提交历史与 Agent Notes，历史位置归「历史工件与新旧衔接」表。
+重大工程变更与重要提案遵循 `.agents/notes/README.md`：改动时在同一变更里维护相关记录，并运行文档化检查。

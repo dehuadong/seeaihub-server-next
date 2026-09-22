@@ -7,9 +7,13 @@ approval: 用户在会话中明确输入「执行实现」；GitHub 上没有对
 verification: 2026-09-20 本地执行：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features`、`node scripts/decisions/check.mjs` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **11 个用例全部通过**（含本次新增的 `channel_rejections_reach_consumers_as_platform_problems`）
 ---
 
-# 渠道失败对客改写与平台侧失败清单
+# Agent Note：渠道失败对客改写与平台侧失败清单
 
-## 实际交付
+## 问题
+
+渠道失败的对客可见面是这条记录要处理的问题：渠道报的失败不再原样出现在消费者面前，消费者在 Job 上只能看到一个平台错误码（`platform_unavailable`、`outcome_unknown`、`content_rejected`，第三个目前是预留档，两个渠道都还没有已核实的审核类错误码）。语义按责任方判定：渠道因平台的参数、凭证、权限、额度或限流而拒绝即平台侧故障、不返回 4xx，只有消费者内容被拒才是消费者的 4xx，渠道 5xx 同样不透传，拿不准按平台侧处理。约束是渠道原始码与原文只留在内部（`generation.attempts.provider_error_code` / `provider_error_message`），消费者侧看不到渠道码、渠道原文或上游 trace id，平台欠费也不触发任何自动动作。
+
+## 决定
 
 渠道报的失败不再原样出现在消费者面前。消费者在 Job 上只能看到一个平台错误码：`platform_unavailable`、`outcome_unknown`、`content_rejected`（第三个目前是预留档——两个渠道都还没有已核实的审核类错误码）。
 
@@ -21,7 +25,7 @@ verification: 2026-09-20 本地执行：`cargo fmt --check`、`cargo clippy --wo
 
 - **与计划的差异（结论收敛）**：计划的"平台内部码固定映射"把 `result_delivery_failed` 与 `reconciliation_refunded` 都写成 `platform_unavailable`，但同一份计划的规则②（受理状态不明 → `outcome_unknown`）与迁移按 `state` 归一的口径都指向 `outcome_unknown`。按后两者收敛：**停在 `reconciliation_required` 的用 `outcome_unknown`**（结果可能已生成、只是取不回来），**退款结清后转 `failed` 并用 `platform_unavailable`**（已经处理完，不该再让消费者"等对账结论"）。两种码都在白名单内，对客都不含渠道信息。
 
-## 验证结果
+## 验证
 
 | 行为 | 证据 |
 | --- | --- |
@@ -38,7 +42,9 @@ verification: 2026-09-20 本地执行：`cargo fmt --check`、`cargo clippy --wo
 | 租约过期这类平台内部事件出现在 `?kind=platform_internal` 清单里，对客码是 `outcome_unknown` | `image_generation_http_contract` 中的 `verify_lease_recovery_contract` |
 | 对账退款后对客码是 `platform_unavailable`（已结清，不再让消费者等对账）、类别是 `platform_internal`；对账清单语义没变 | `image_generation_http_contract` 中的 `verify_reconciliation_contract`、`post_acceptance_failure_keeps_the_task_id_for_reconciliation` |
 
-## 代价与已知限制
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - 运营今天**没有渠道启停接口**：`supply.channels.enabled` 没有写入路径，`publish_runtime` 每次新插渠道行都把 `enabled` 写死为 `true`。平台欠费时运营唯一可用的处置是重新发布该型号的候选集合、把对应 Offering 移出。"渠道启停"是一个待补的能力差距。
 - APIMart 的 `429`、`409` 前两者、`503 idempotency_unavailable` 有第一方"未受理"依据，可以收窄成确定性拒绝。本项不动成败判定，该收窄单独处理（[#8](https://github.com/dehuadong/seeaihub-server-next/issues/8)）。

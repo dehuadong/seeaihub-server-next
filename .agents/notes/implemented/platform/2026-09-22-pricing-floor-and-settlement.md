@@ -4,18 +4,18 @@ status: implemented
 created: 2026-09-22
 updated: 2026-09-22
 approval: 用户在会话中授权实施 P2b（定价、保底与结算）；范围与验收见提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 的 P2b 工单 [#16](https://github.com/dehuadong/seeaihub-server-next/issues/16)
-verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-server-next/issues/16) 的逐条可勾选验收清单（依据 `docs/design/0007` §2–§9）。**全部离线**（真实空库 + 真实 API/Worker 进程 + 本机假上游，零真实计费调用、零外网）。Verify 阶段另起**独立于实现用例**的端到端驱动（自建 Node 驱动直打对客 HTTP + 直查库，不复用仓库测试的断言）：56 项检查 **55 PASS**，唯一未过项是「上游终态给了金额但结果为空」那条**适配器**路径（不属于本条验收条目所指的「结算失败进对账」路径；已转工单 [#17](https://github.com/dehuadong/seeaihub-server-next/issues/17)，见「风险与未决事项」）；结算失败进对账那条路径另行预埋撞 `business_key` 的 `capture` 分录实测（Job 进对账、四列落库）；增量迁移在旧库（只应用 0001–0008 + 旧数据）上实测 8 项全过。门禁：`cargo fmt --all --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（22 / 32 / 2 / 3 / 62 / 59 各 crate 单测通过，55 条端到端按设计 ignore）；`node scripts/decisions/check.mjs` 通过。`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1`：Verify 阶段一次性整跑曾因容器时钟漂移不稳定（同一份代码分别跑出 34/54、17/54、24/54、11/54 通过，失败信息全是发布期"没有已生效的折算率"）；**收口时已修**（"立即生效"的折算率改由数据库盖章，见「风险与未决事项」），修后**连续三次整跑均 55 passed / 0 failed**（54 条原有 + 1 条新增的盖章钉桩用例）。逐条证据见正文「验证」一节。
+verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-server-next/issues/16) 的逐条可勾选验收清单（依据 `docs/design/0007` §2–§9）。**全部离线**（真实空库 + 真实 API/Worker 进程 + 本机假上游，零真实计费调用、零外网）。Verify 阶段另起**独立于实现用例**的端到端驱动（自建 Node 驱动直打对客 HTTP + 直查库，不复用仓库测试的断言）：56 项检查 **55 PASS**，唯一未过项是「上游终态给了金额但结果为空」那条**适配器**路径（不属于本条验收条目所指的「结算失败进对账」路径；已转工单 [#17](https://github.com/dehuadong/seeaihub-server-next/issues/17)，见「后果」）；结算失败进对账那条路径另行预埋撞 `business_key` 的 `capture` 分录实测（Job 进对账、四列落库）；增量迁移在旧库（只应用 0001–0008 + 旧数据）上实测 8 项全过。门禁：`cargo fmt --all --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（22 / 32 / 2 / 3 / 62 / 59 各 crate 单测通过，55 条端到端按设计 ignore）；`node scripts/decisions/check.mjs` 通过。`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1`：Verify 阶段一次性整跑曾因容器时钟漂移不稳定（同一份代码分别跑出 34/54、17/54、24/54、11/54 通过，失败信息全是发布期"没有已生效的折算率"）；**收口时已修**（"立即生效"的折算率改由数据库盖章，见「后果」），修后**连续三次整跑均 55 passed / 0 failed**（54 条原有 + 1 条新增的盖章钉桩用例）。逐条证据见正文「验证」一节。
 ---
 
-# 定价、保底与结算：对客费率向量、汇率表、保底表与透支
+# Agent Note：定价、保底与结算：对客费率向量、汇率表、保底表与透支
 
-## 问题与目标
+## 问题
 
 对客扣费此前**就是渠道结算基数**（按已发布费率 × 真实 token）：既没有平台自己的 CNY 售价，也没有加价与汇率折算，卖出去等于原价转手；预授权是服务端一个固定数（`GENERATION_MAX_COST_MICROUSD`，默认 $0.02），实际费用超过它就进对账——一笔正常完成的生成被扣在对账里；上游成本虽然上一片已经采集（[渠道成本事实采集](../../implemented/platform/2026-09-22-provider-cost-facts.md)），但折算列恒为 NULL，**毛利算不出来**。
 
 本片把这条线补齐：售价按**候选**发布并对客冻结、汇率按币种维护并在受理时快照、预授权按**供给维度**的保底表查得、结算**按实际扣且允许透支**、成本用冻结的汇率折成人民币供算毛利。范围与逐条验收见工单 [#16](https://github.com/dehuadong/seeaihub-server-next/issues/16)。
 
-## 实际交付
+## 决定
 
 - **对客只有 CNY 单币种**：售价是**按候选发布的对客四档 CNY 费率向量**（`runtime_revisions.consumer_rates_cny`，按候选键的 jsonb 映射），受理时随 Job 的 Price Snapshot 冻结，结算只读它。`reference_cost_microusd` **只作定价参考，不是售价的被乘数**——单值推不出四档向量，而且实际金额要等上游回来才知道。**同一网关模型的不同候选价格不同**。
 - **加价系数 `markup_bps` 是修订级**（每个网关模型一个），随修订发布、随快照冻结；它**参与**"这个网关模型的价是怎么定的"（管理员按"成本费率 ×(1 + 加价系数)× 汇率"推导对客费率向量），但**不参与结算**，而且**可以缺省**——管理员直接录入对客费率向量时它一次都不参与计算。发布期只拒绝两件自相矛盾的事：负加价，以及给了加价系数却没有任何候选带定价。数值由后台录入，不是设计决策。
@@ -38,7 +38,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 
 增量迁移 `migrations/0009_pricing_floor_and_settlement.sql`：新建 `pricing.fx_rates`（**不预置任何数值**；同币种同生效时刻唯一 + 取值索引）；`publication.runtime_revisions` 增七个可空定价列（`markup_bps` + 六个按候选键的 jsonb 映射，`markup_bps` 另加非负约束），**不回填**；**放宽三处 CHECK**——`ledger.accounts.balance_microusd` 去掉非负约束（透支要能把余额扣成负数），`ledger.holds.amount_microusd` 与 `generation.jobs.max_cost_microusd` 由 `> 0` 改 `>= 0`（保底额可为 0）。只放宽、不收紧。
 
-## 真实替代方案与取舍
+## 备选方案
 
 - **定价按候选 vs 一个单值乘出来**：按候选。售价是四档向量，单值推不出向量；而且售价按候选算，向量就必须按候选发布——一个网关模型一个价表达不出"不同候选不同价"。
 - **汇率放进每份发布 vs 按币种维护一张表**：按币种维护。汇率是外部事实，同一时刻同一币种全平台必须是同一个数才对账得起来；放进发布里改一次汇率要重发所有型号。
@@ -53,7 +53,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 - **定价在扁平形式里也给 vs 只给数组形式**：只给数组形式。扁平形式是过渡期的老形状（老素材、老测试），定价按候选给，只有数组形式能表达"同一网关模型的不同候选价格不同"；扁平形式的发布仍走旧口径。
 - **自算失败记 `unavailable` vs 让整个结算失败**：记 `unavailable`。用量自相矛盾或溢出时，本该有金额却算不出来——那也是缺口，用别的数顶替才是错的。
 
-## 风险与未决事项
+## 后果
 
 - **成本缺口只"看得见"，没有告警**：运营要主动查清单；缺口进账本与账实核对、补录结果回填归工单 [#11](https://github.com/dehuadong/seeaihub-server-next/issues/11)。
 - **上游声明的币种与快照的成本币种不一致时留空**：这是有意的取舍（见上），代价是那一笔毛利算不出来、会落在"成本未知"一侧。
@@ -91,8 +91,8 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 | 毛利可逐笔算出；来源三态可辨 | 上面两条成本用例（`computed` / `declared` 各自带 CNY 折算值）、`a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconciliation`（`unavailable` 三样留空） |
 | 成本缺口处置：不进对账态、对客结算照常、运营看得见 | 同上（`reconciliation_cases` 为 0、`captured_microusd` 照扣、缺口清单带对账标识且仅管理员可读） |
 | 对账路径的成本落库 | `the_reconciliation_path_records_the_cost_fact_it_already_has`（直调仓库端口：带成本事实时四列落库、不带时四列留空）、`worker_sends_settlement_failure_to_reconciliation_with_its_own_code`（`crates/application`：失败事实里带着成本事实） |
-| 历史行为不变 | 既有 43 条端到端用例逐位通过（收口修正后**连续三次整跑 55/55 全过**；修前一次性整跑因容器时钟漂移不稳，见「风险与未决事项」的时钟条目） |
-| 门禁 | `cargo fmt --all --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿；`node scripts/decisions/check.mjs` 通过；`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **连续三次整跑 55/55 全过**（收口修正见「风险与未决事项」的时钟条目） |
+| 历史行为不变 | 既有 43 条端到端用例逐位通过（收口修正后**连续三次整跑 55/55 全过**；修前一次性整跑因容器时钟漂移不稳，见「后果」的时钟条目） |
+| 门禁 | `cargo fmt --all --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿；`node scripts/decisions/check.mjs` 通过；`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **连续三次整跑 55/55 全过**（收口修正见「后果」的时钟条目） |
 
 ### Verify 阶段的独立证据（2026-09-22）
 
@@ -105,9 +105,9 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 - **成本与毛利**：`computed` 5950/USD/42245、`declared` 11354/USD/80614（自算是 5950，取的是上游声明）、`unavailable` 三样留空且不进对账态、缺口清单列得出来（带 `provider_trace_id` 与 `completed_at`，无凭证 401）；对客响应与快照的对客平面不含外币。
 - **结算失败进对账那条路径**（本片承接的执行单元 ①）：在无 Worker 时受理、给该 Job 预埋一条撞 `business_key` 的 `capture` 分录，再起真 Worker → 结算事务失败、Job 进 `reconciliation_required`、`attempts` 四列照落（`5950 / USD / computed / 29750`）、对客回 502 `outcome_unknown`。
 - **迁移（增量）**：另建库只应用 `0001`–`0008` 并造旧数据（余额为 0 的账户、`amount=1000` 的 hold、`max_cost=20000` 的 Job、没有定价的旧修订），再由真迁移器补 `0009` → 迁移记录 `1..9`、旧行逐字不变、七个定价列留 NULL 无回填、`pricing.fx_rates` 落成空表、两处旧 CHECK 名消失且新的非负约束在位、余额可写成 -1、零额 hold 与零 `max_cost` 可写入。
-- **回归**：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features`（22 / 32 / 2 / 3 / 62 / 59 全绿，55 条端到端按设计 ignore）、`node scripts/decisions/check.mjs` 全过。`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` 修前**一次性整跑在本机不稳**：同一份代码分别跑出 34/54、17/54、24/54、11/54 通过，失败信息全是发布期"没有已生效的折算率"（根因见「风险与未决事项」的时钟条目：夹具"启动时落折算率、随后立刻发布"要求"刚录入＝已生效"，而应用时钟盖章、数据库时钟判生效）；**收口修正后连续三次整跑均 55 passed / 0 failed**（54 条原有 + 1 条盖章钉桩用例），不再受时钟漂移摆布。
+- **回归**：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features`（22 / 32 / 2 / 3 / 62 / 59 全绿，55 条端到端按设计 ignore）、`node scripts/decisions/check.mjs` 全过。`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` 修前**一次性整跑在本机不稳**：同一份代码分别跑出 34/54、17/54、24/54、11/54 通过，失败信息全是发布期"没有已生效的折算率"（根因见「后果」的时钟条目：夹具"启动时落折算率、随后立刻发布"要求"刚录入＝已生效"，而应用时钟盖章、数据库时钟判生效）；**收口修正后连续三次整跑均 55 passed / 0 failed**（54 条原有 + 1 条盖章钉桩用例），不再受时钟漂移摆布。
 
-56 项里唯一未过的是"上游终态给了金额、结果为空"那条**适配器**路径（成本四列留空）——已转工单 [#17](https://github.com/dehuadong/seeaihub-server-next/issues/17)，与残余风险一并记在「风险与未决事项」；它不是本表任一验收条目所指的路径。Verify 阶段发现的时钟盖章缺陷已在收口时修掉（见同节），修后门禁连续三次整跑全绿。
+56 项里唯一未过的是"上游终态给了金额、结果为空"那条**适配器**路径（成本四列留空）——已转工单 [#17](https://github.com/dehuadong/seeaihub-server-next/issues/17)，与残余风险一并记在「后果」；它不是本表任一验收条目所指的路径。Verify 阶段发现的时钟盖章缺陷已在收口时修掉（见同节），修后门禁连续三次整跑全绿。
 
 ## 依据与关联
 

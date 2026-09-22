@@ -7,13 +7,13 @@ approval: 用户在会话中授权实施 P1（平台网关模型命名层）；�
 verification: 2026-09-22 本地：`cargo fmt --all` 无差异；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（各 crate 单测 22 / 29 / 2 / 3 / 54 / 44 通过，40 条端到端用例按设计 ignore）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **40 passed / 0 failed**，含本次新增的命名层三条用例（零真实计费调用）。另做一次反向探针：临时去掉对客投射后 `gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface` 立刻失败（对客目录正文里出现了厂商原生名），确认用例钉得住这条规则、不是靠断言互相抵消过关。`node scripts/decisions/check.mjs` 通过。
 ---
 
-# 平台网关模型命名层：对客名与厂商原生名分离
+# Agent Note：平台网关模型命名层：对客名与厂商原生名分离
 
-## 问题与目标
+## 问题
 
 发布时平台型号名直接取厂商原生名（发布事务里 `gateway_model: native_model_id.clone()`），两个角色在库里是同一个值。后果有两层：厂商原生名因此出现在对客目录与合同正文里；平台也没法把同一份供给包成另一个对外名字（换名字等于换型号）。本项把这两个角色真正拆开，范围只到**命名层与对客面**——定价、保底、权重、路由策略、缓存都不在本次交付里。
 
-## 实际交付
+## 决定
 
 - **对客名与厂商原生名分开**：发布命令新增顶层 `gateway_model`（**平台对客名**）。**名字由管理员发布时自己填，平台不预设、也不固定任何名字**；缺省（不写或只写空白）时回退取 `native_model_id`，因此现有素材、现有已发布数据与现有用例的形状逐位不变。
 - **原子替换的对象是这个名字**：`publication.runtime_entries.gateway_model`、修订上新增的 `gateway_model` / `vendor_model_id` 两列都按对客名写。同一份供给因此可以包成两个网关模型，各自一份定义；重发一个名字只动它自己。
@@ -40,7 +40,9 @@ verification: 2026-09-22 本地：`cargo fmt --all` 无差异；`cargo clippy --
 | 两条候选共享一份合同、候选与顺序按对客名生效 | `the_2_5_materials_route_by_carrier_surface_and_wire_names`、`stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers` |
 | 对客名的回退与空白处理（不写、给值、只写空白三种） | `the_gateway_name_falls_back_to_the_vendor_name_when_absent`、`a_publish_must_declare_a_gateway_name` |
 
-## 代价与已知限制
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - **候选的 `weight` 不在本片**：权重属路由策略层，库里也没有这一列，因此管理端候选清单只给顺序（`routing_priority`），不给权重。
 - **定价、保底与售价快照不在本片**：修订上的定价列不落，管理端响应里也没有 `pricing`。

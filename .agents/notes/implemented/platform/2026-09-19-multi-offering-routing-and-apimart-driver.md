@@ -7,9 +7,13 @@ approval: seeaihub-server-next#2 记录的用户执行授权（用户明确输�
 verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单元测试、九个空库端到端合同测试与 decisions check 全部通过（**原记录如此，保留不改**）。**2026-09-20 核对到的差异**：HEAD 处 `apps/api/tests/http_contract.rs` 实际有 **10** 个 `#[ignore]` 用例——第 10 个（`post_acceptance_failure_keeps_the_task_id_for_reconciliation`）由 `3f2129e` 加入，即本记录最终修订的那次提交。**本记录未补跑十个用例，因此不声称"十个全部通过"**；该差异属记录过时，已写入下方更正节第 1 条。
 ---
 
-# 第二阶段交付：多 Offering 路由与 APIMart Driver
+# Agent Note：第二阶段交付：多 Offering 路由与 APIMart Driver
 
-## 实际交付
+## 问题
+
+第二阶段的实现要让同一 Vendor Model 可以由多个 Provider 同时供应，并按已发布的优先级选中第一个合格候选，同时补上任务式的 APIMart Driver（提交 → 轮询 → 取图）。而此前 `publication.runtime_entries` 的唯一索引是「每型号一个 active 条目」，且 `image`/`images`/`mask` 三个渠道字段名被硬编码在领域与用例层，字段名不同的厂商（APIMart 的 `image_urls`）因此无法绑定任何输入图。APIMart 只接受公网 URL 且不接受 base64，而本仓库没有上传链路，参考图与遮罩要在提交生成任务之前先换取 URL。按 `docs/adr/0002`，未证实的参数不开启、经真实 wire 验证后再发布新修订，因此这两条分支不能凭渠道文档直接开放。
+
+## 决定
 
 [第二工作项](https://github.com/dehuadong/seeaihub-server-next/issues/2) 的第二阶段实现已完成并验证：同一 Vendor Model 现在可以由**多个 Provider 同时供应**，平台按已发布的优先级选中第一个合格候选；新增 APIMart 的任务式 Driver。
 
@@ -24,7 +28,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 技术设计与边界由 [工作项 #2 的规划正文](https://github.com/dehuadong/seeaihub-server-next/issues/2) 与 [分层架构](../../../../docs/design/0004-layered-architecture.md) 拥有，持久决定由 [ADR 目录](../../../../docs/adr/) 拥有（本阶段新增 0009–0011；2026-09-20 收口新增 [`0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)；原 0012–0014 已于 2026-09-20 按 ADR 准入门槛退役，见下方更正节第 10 条）；本记录不复制其正文。
 
-## 验证结果
+## 验证
 
 规划验收条件 25 条：**22 条通过**，第 16–18 条标为**过期条件**（要求的能力在代码中不存在，且其前提已被实测结清）。
 
@@ -48,7 +52,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 1. **「限制只能收窄」的校验此前不存在**（最重要）。规划与 `ADR-0009` 都要求发布期校验「Offering 的 `restrictions` 不超出该候选 Profile 自己声明的范围」，而原实现只检查了 Adapter 的能力面。已补 `validate_restrictions_within_profile`，并加正反例测试。
 2. **`attempts.provider_trace_id` 在成功路径从不写入**：任务式上游的 `task_id` 被直接丢弃，人工对账失去线索。已打通「Adapter → `ProviderSuccess` → `CompleteJob` → UPDATE」。
 3. **未发布型号的返回码回归**：无 active 候选时曾返回 `Validation`（400），应为 `NotFound`（404）。
-4. **把做不到的能力声明成支持的**：APIMart 声明支持参考图/遮罩，但上游要求公网可访问 URL，而本仓库没有上传链路 —— 当时先收窄为仅文生图、运行时显式拒绝；**随后按用户指定补上了上传链路**。补完之后仍未立刻放开这两条分支：`docs/adr/0002` 要求"未证实的参数不开启、经真实 wire 验证后再发布新修订"，而 `image_urls` 的取值形态与上传接口的真实行为都还没经验证。**2026-09-19 经用户批准做了真实受控验证后，两条分支已开放**（见"实际交付"与 `docs/verification/paid-provider-calls.md` §6）。
+4. **把做不到的能力声明成支持的**：APIMart 声明支持参考图/遮罩，但上游要求公网可访问 URL，而本仓库没有上传链路 —— 当时先收窄为仅文生图、运行时显式拒绝；**随后按用户指定补上了上传链路**。补完之后仍未立刻放开这两条分支：`docs/adr/0002` 要求"未证实的参数不开启、经真实 wire 验证后再发布新修订"，而 `image_urls` 的取值形态与上传接口的真实行为都还没经验证。**2026-09-19 经用户批准做了真实受控验证后，两条分支已开放**（见"决定"与 `docs/verification/paid-provider-calls.md` §6）。
 5. **`PricePlanDraft.formula` 从不校验**：未知计价形态曾静默落库。
 6. **资产绑定路径写死了字段名**：`image`/`images`/`mask` 被硬编码在领域与用例层，导致"字段名不是 `image` 的厂商"（APIMart 的 `image_urls`）无法绑定任何输入图。已改为按路径取厂商原生参数名，并把"参考图/遮罩"的判定收敛成**一个**有测试的函数（运行期与发布期共用），认不出的参数名直接拒绝而不是静默忽略。
 7. **上传失败的分类不实**：`upload_failure` 曾把"生成任务可证明未受理"标成 `NotRetryable`（"确定性拒绝"）。三态里对应的是 `SafeBeforeAcceptance`（`docs/adr/0011`），已改正并补测试；`code`/`message` 仍按 `error.code` 保留。
@@ -85,9 +89,11 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 - 领域层改动**不是**为了适应 APIMart，恰恰相反：旧代码把 `image`/`images`/`mask` 三个**渠道字段名**写死在领域里，那才是渠道差异污染领域。现在领域只认识"路径的第一段是厂商参数名"这一件事，认不认得某个名字由一个**与具体渠道无关**的函数（`AssetParameterKind::classify`）回答；换一个字段名不同的 Provider，**不需要再改领域**。
 - 因此它更接近 §4 的 **E1（平台侧新能力）**：把"资产绑到哪个原生参数"从硬编码升级为平台自己的通用能力，而不是新增某渠道的分支。
-- 已知代价：渠道若用不以 `image` 开头、也不含 `mask` 的名字（例如 `reference_images`），平台会**拒绝**该绑定。这是**有意的**——用户 2026-09-19 决定平台内部只认渠道原生参数名，统一参数转换留给**后期对外消费侧**（见下面"未决项"第一条与 `docs/adr/0002` 的补充段）。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**——调用方所见参数名归 Vendor Model Contract，渠道包装差异归 Offering Parameter Mapping，"拒绝认不出的名字"只是本阶段的兼容规则。上句仅保留为当时的理由。
+- 已知代价：渠道若用不以 `image` 开头、也不含 `mask` 的名字（例如 `reference_images`），平台会**拒绝**该绑定。这是**有意的**——用户 2026-09-19 决定平台内部只认渠道原生参数名，统一参数转换留给**后期对外消费侧**（见下面"后果"第一条与 `docs/adr/0002` 的补充段）。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**——调用方所见参数名归 Vendor Model Contract，渠道包装差异归 Offering Parameter Mapping，"拒绝认不出的名字"只是本阶段的兼容规则。上句仅保留为当时的理由。
 
-## 已知限制与未决项（不在本次交付范围）
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - APIMart 的**图生图/遮罩分支已开放并已受控实测**（2026-09-19，见上）；仍未测的是 `sunburst` 的图生图（与 flare 同渠道族、同端点、同参数面）、`base64` 路径，以及 20MB / 16 张 / 256MB 这些**边界**——代码已按文档上限拒绝（单张 20MB + 单次总量 256MB），但没有逐个压测。
 - **"哪个原生参数装图片"目前靠名字约定** —— **已由用户决定（2026-09-19）**：平台内部只认渠道自己的参数名，**不做**统一参数转换；统一转换属**后期对外消费侧**的能力，现在做会牵动每个渠道的适配与验证，所以先把各条渠道跑通。决定记在 `docs/adr/0002` 的补充段（工作项 #4 据此关闭）；名字约定因此是明确的过渡方案，`reference_images` 这类名字由那一层解决。**⚠️ 2026-09-20 更正：该决定已被 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代**（0015 把名字约定定性为阶段性兼容规则）；`reference_images` 这类名字改由 Vendor Model Contract 显式声明解决，不再留给"那一层"。此条仅保留为当时的理由，**不再是现行规则**。

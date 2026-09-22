@@ -7,9 +7,9 @@ approval: 用户在会话中授权实施 P3（权重与路由日志）；范围�
 verification: 验收合同为工单 [#18](https://github.com/dehuadong/seeaihub-server-next/issues/18) 的逐条可勾选验收清单（依据 `docs/design/0008` §1–§5）。**全部离线**（真实空库 + 真实 API 进程 + 本机假上游，零真实计费调用、零外网）。门禁：`cargo fmt --all -- --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（22 / 32 / 2 / 3 / 67 / 59 各 crate 单测通过，58 条端到端按设计 ignore）；`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` 在**最终代码**上 **58 passed / 0 failed**（162.81s，含本片新增的 3 条）；`node scripts/decisions/check.mjs` 通过。分流期望值在用例里按设计规则（`sha256(账户 ‖ 幂等键)` 前 8 字节大端、对档内权重之和取模、按 `offering_id` 升序走区间）**独立重算**，不复用生产实现；并发发布那条另做**变异实测**（把发布事务里的按名字咨询锁换成 `SELECT 1` → 该用例实测失败：同一名字有 **4** 份修订的 active 条目并存；恢复后 1 份），证明该用例有检出能力。逐条证据见正文「验证」一节。
 ---
 
-# 权重与路由日志：档位内确定性分流与判定记录可重建
+# Agent Note：权重与路由日志：档位内确定性分流与判定记录可重建
 
-## 问题与目标
+## 问题
 
 同一型号的候选此前只有"顺序"一个旋钮：`routing_priority` 就是候选数组的下标，受理时按它升序取**第一个合格候选**，后面的候选只在前面不合格时才轮到。**同一档里按比例分流做不到**，而且库层的唯一索引 `(native_model_id, routing_priority) WHERE active` 直接把"同档多候选"挡在门外。
 
@@ -20,7 +20,7 @@ verification: 验收合同为工单 [#18](https://github.com/dehuadong/seeaihub-
 - **判定记录可重建**：`generation.routing_decisions.considered` 每条带上 `weight` 与本次的分流落点 `weight_draw`，事后能重建"考虑过谁、为什么跳过、为什么是它"；
 - **零配置下行为不变**：不带 `weight` 时默认 `1`，不带显式档位时仍等于数组下标。
 
-## 实际交付
+## 决定
 
 - **领域层**：`OfferingCandidate` 增 `weight: u32`（正整数、随候选发布、默认 1；反序列化缺省也是 1——早于这个字段落库的发布快照里没有它）。它是**发布数据**，与 `routing_priority` 同处；只在选路用，选中后固化进 Job 的 `PublishedOffering` 不带它（与 `routing_priority` 一样，只有发布侧需要）。
 - **应用层**：
@@ -45,7 +45,7 @@ verification: 验收合同为工单 [#18](https://github.com/dehuadong/seeaihub-
 
 因此发布事务开头加了一把按名字取的事务级咨询锁（`pg_advisory_xact_lock(hashtextextended($1, 0))`，与 `create_job` 里那把幂等锁同一种写法；随事务结束自动释放），让"替换"真的是一次替换；读时的跨修订防御**照旧留着**兜底。这条是评审阶段发现的，工单 [#18](https://github.com/dehuadong/seeaihub-server-next/issues/18) 的改动点清单与迁移说明已同步，并新增了一条端到端验收。
 
-## 真实替代方案与取舍
+## 备选方案
 
 - **哈希输入取 `(账户, 幂等键)` vs 取 JobId**：取前者。选路发生在 JobId 生成**之前**，拿一个当时还不存在的值当哈希输入是因果倒置；而这两个值受理前就已知。账户也进哈希：幂等键只在自己账户内唯一，不同账户用同一个键时不该相关。账户是定宽 UUID，直接拼在幂等键前面即可，不需要分隔符。
 - **档内区间按 `offering_id` 定序 vs 按数据库行序**：按 `offering_id`。落点是哈希出来的一个数，区间划分若依赖行序，"可重放"就成了空话。定序键必须是与请求无关的发布数据。
@@ -65,7 +65,7 @@ verification: 验收合同为工单 [#18](https://github.com/dehuadong/seeaihub-
 - `docs/design/0008` §1/§2 已在**同一变更**里记明这一处（§1 补"候选可以显式给出 `routing_priority`"、§2 补"档位怎么表达"与"档内定序"），`docs/design/0006` §1.5 同步了新索引名；
 - 工单 [#18](https://github.com/dehuadong/seeaihub-server-next/issues/18) 的「需裁决」一节保留了这一处的说明，供用户确认。**若另有打算（例如不允许多候选同档、只留 P6 的 `weighted_random` 用权重），改这一处即可，其余不受影响。**
 
-## 风险与未决事项
+## 后果
 
 - **同档多候选的发布形状是设计没写明的字段面**：见上「字段面的最小补齐」——按最小口径落地并已同步设计，**仍待用户确认**。
 - **`weight` 目前只在默认策略（`priority_failover`）下被消费**：`weighted_random` / `least_cost` / `user_tag` 与 `route_policies` 属 P6；本片只落"档位 + 档内分流"这一层，策略层接的就是这里算出来的合格集合。

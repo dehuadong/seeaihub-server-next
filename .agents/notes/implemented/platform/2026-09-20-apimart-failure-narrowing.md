@@ -7,9 +7,13 @@ approval: 用户在会话中同意执行本项（"#8 收窄判定可以执行"�
 verification: 2026-09-20 本地执行：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **11 个用例全部通过**（其中提交拒绝表新增 429 / 409 `idempotency_in_progress` / 409 `idempotency_result_indeterminate` 三行、并改判 503 `idempotency_unavailable` 一行，同时断言预授权"失败即释放、对账即保留"）
 ---
 
-# APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"
+# Agent Note：APIMart 失败判定收窄：有第一方依据的三类改为"可证明未受理"
 
-## 实际交付
+## 问题
+
+APIMart 有三类创建阶段的失败——`429` 限流、`409` 的两个幂等子类、`503 idempotency_unavailable`——第一方明文写明请求未执行、未受理，此前却被判为受理状态不确定、送进人工对账。把其实已受理的请求判成失败等于平台白付一次生成，因此收窄只取有第一方明文依据的组合，且只发生在任务尚未受理的创建阶段。AIHubMix 的 `429` / `503` 没有同样的未受理承诺，结论不能跨渠道套用。
+
+## 决定
 
 APIMart 有三类创建阶段的失败，第一方明文写明"请求未执行 / 未受理"，此前却被判为"受理状态不确定"送进人工对账。现在这三个**组合**按 `SafeBeforeAcceptance` 处理（Job `failed` + 释放预授权）：
 
@@ -27,7 +31,7 @@ APIMart 有三类创建阶段的失败，第一方明文写明"请求未执行 /
 
 AIHubMix 的 `429` / `503` 不在此列：它没有第一方"未受理"承诺，不能跨渠道套用结论（`docs/facts/channel-facts.md` §2.13、§4）。
 
-## 验证结果
+## 验证
 
 | 行为 | 证据 |
 | --- | --- |
@@ -40,7 +44,9 @@ AIHubMix 的 `429` / `503` 不在此列：它没有第一方"未受理"承诺，
 | **不对客可见的处置一致性**（默认测试套件内）：可证明未受理与确定性拒绝都落到 `failed` + 释放预授权 | `adapter_failures_keep_the_channel_code_internal` |
 | **端到端**：假上游按上述状态拒绝提交 ⇒ Job `failed`、对客码 `platform_unavailable`、预授权已释放；`409 result_indeterminate` 仍进对账且预授权保留；**同一个 `429` 在 AIHubMix 上仍进对账**（不跨渠道套用） | `channel_rejections_reach_consumers_as_platform_problems` |
 
-## 风险与未决
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - **判错的代价由平台承担**：把"其实已受理"判成失败＝白付一次生成。控制手段是"只改有第一方明文依据的三类 + 逐条反向用例 + 收窄只发生在创建阶段"。
 - **没有做付费实测**：`#8` 方案里提过"真实触发一次 429 或核对上游账单"，两者都需要计费调用、且 429 无法在不骚扰上游的前提下稳定触发，因此本项**只依据第一方文档**，未做计费验证。若将来要实证，最便宜的一次是"同一 idempotency key 提交两次"（一次生成的成本量级）。

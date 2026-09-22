@@ -7,13 +7,13 @@ approval: 用户 2026-09-20 明确"方向需求很明确，你自己判断，提
 verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **37 passed / 0 failed**（由收口者逐片重跑，零真实计费调用）。后续 AIHubMix 承载面补齐（`background`/`output_compression`/`moderation` 按厂商契约声明）与多图 `image[]`（参考图声明成数组 ≤16、Driver 按张数编码 `image`/`image[]`）已并入同一批素材与用例。
 ---
 
-# 合同与承载面分层、映射声明化与对客目录（#10 落地）
+# Agent Note：合同与承载面分层、映射声明化与对客目录（#10 落地）
 
 ## 问题
 
 `capability_schema` 一份数据兼了两个身份：客户端合同与"这条供给能承载的渠道面"。于是对客合同等于命中那条供给的**渠道包装面**（同一 `size` 在三家分别是像素/比例/档位），随选路变化，也与厂商原生参数不一致。设计见 [`docs/design/0005`](../../../../docs/design/0005-vendor-model-contract-and-offering-mapping.md)，决策属 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)。
 
-## 实际交付（四个切片）
+## 决定
 
 - **S1a 数据模型 + 发布期校验**：素材顶层 `capability_schema` = **模型级合同**，offering `carrier_schema` = **承载面**（过渡期合同来源唯一，旧素材照常可发布）；`catalog.vendor_models` 唯一键去掉 `schema_hash`（该列删除），改成 `(vendor_id, native_model_id, native_revision)`；**合同行不可变**（不再 `DO UPDATE`），"Job 固定受理时版本"这才成立；承载面与映射随 Job 冻结；发布期 R1（承载面字段从合同可达）/R2（落到 Driver 能写上线文的字段名）/R3。
 - **S1b 受理期规则**：R4 按**合同**过滤（合同外字段丢弃、缺必填 400）；R5 逐候选要求"请求实际用到的字段"都在其承载面里，不合格原因进 `routing_decisions`；**全部不合格 → 503 `platform_unavailable`**（平台侧供给问题，不再算消费者 400）；`parameter_mapping.defaults` 注入。
@@ -48,7 +48,9 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 - 仓库里那份 OpenAI 官方快照（`out-reference/openai/openai-images-api.md`）正文只覆盖到 `gpt-image-2`，**不含 2.5**，且**全仓没有任何文档引用它**——2.5 的其余特有项（例如 `size` 上限是否仍 `3840x2160`、16 的倍数与 1:3~3:1 约束是否照旧）仍按"沿用 gpt-image 家族面、未对 2.5 单独确认"标注，不冒充已确认。
 - 素材迁移（一个 Vendor Model 一份顶层合同 + AIHubMix / APIMart 两条 offering）与逐项出处清单见提交历史与素材自身的 `_evidence`。
 
-## 未做 / 边界
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - 尺寸声明里的"默认档位"没做成声明项（平台补的 `defaults` 会参与换算）。
 - `auto` 这类取值按"不是三型之一"处理：声明了尺寸换算的供给承载不了它。

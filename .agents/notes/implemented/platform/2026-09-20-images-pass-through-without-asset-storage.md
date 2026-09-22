@@ -7,9 +7,13 @@ approval: 用户 2026-09-20 明确指示：「无论是请求阶段还是返回�
 verification: 2026-09-20 本地最终工作树：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿（0 failed）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **18 passed / 0 failed**，全程本地假上游、**零真实计费调用**（由收口复核者亲自重跑）
 ---
 
-# 图片按渠道原形进原形出：不落盘静态资产，也不提供异步形态
+# Agent Note：图片按渠道原形进原形出：不落盘静态资产，也不提供异步形态
 
-## 决定与出处
+## 问题
+
+上一版把平台自己的对象存储当成结果归宿：对客有 asset id 与上传端点，图片要过资产角色、尺寸与摘要校验，结果由平台下载、解码、归档，对客另有 202 受理加 `job_id` 轮询的异步形态。这套形态要一直养着 `/v1/assets` 两条路由、`AssetService`/`AssetStore`、整个 `crates/object-storage`、`generation.assets` 表与 `ASSET_*`/`S3_*` 环境变量、compose 里的 minio。本记录要回答的是：渠道已经给出结果图（`url` 或 `b64_json`）的情况下，平台是否还要落盘静态资产、是否还要对客提供异步形态。
+
+## 决定
 
 决策正文在 [`docs/adr/0019`](../../../../docs/adr/0019-images-pass-through-without-asset-storage.md)，它取代 [`docs/adr/0008`](../../../../docs/adr/0008-own-object-storage-is-the-platform-result.md)（已按约定降级为一句话存根）。范围与验收在工单 [`#12`](https://github.com/dehuadong/seeaihub-server-next/issues/12)。
 
@@ -45,7 +49,9 @@ verification: 2026-09-20 本地最终工作树：`cargo fmt --all --check`、`ca
 | 内部记录仍在（同步调用后直接查库到终态） | 同上的查库断言 |
 | 已建过的库能升上来、旧资产表/列确实不在 | `images_pass_through_migration_applies_on_an_existing_database` |
 
-## 未做 / 边界
+<!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->
+
+## 后果
 
 - **`async` 参数不做**（对客没有异步形态）；**`cost` 不返回**（对外价是 [`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。
 - `content_rejected` 目前没有 Adapter 会产生它（改动前即如此），只有 application 单测覆盖。
