@@ -50,7 +50,7 @@
 
 | 改动 | 内容 | 理由 |
 | --- | --- | --- |
-| `publication.runtime_revisions` 增列 | `gateway_model text NOT NULL`、`vendor_model_id uuid NOT NULL`（**P1 落**）、`markup_bps integer`、`reference_cost_microusd bigint`、`cost_basis text`（**P2b 落**；后三列**可空**：只有新发布的修订带定价，见下） | 让"这次发布定义的是哪个网关模型、指向哪个 Vendor Model、按什么价卖、**成本按哪个口径算**"在修订上可读，不必从条目反推 |
+| `publication.runtime_revisions` 增列 | `gateway_model text NOT NULL`、`vendor_model_id uuid NOT NULL`（**P1 落**）、`markup_bps integer`、`reference_cost_microusd bigint`、`cost_basis text`、`tier_prices jsonb`、`tier_token_estimates jsonb`、`hold_cap_microusd bigint`（**P2b 落**；后六列**可空**：只有新发布的修订带定价，见下） | 让"这次发布定义的是哪个网关模型、指向哪个 Vendor Model、按什么价卖、**成本按哪个口径算**、**hold 的单价/上界从哪查**"在修订上可读，不必从条目反推 |
 | `publication.runtime_entries` | 已有 `gateway_model`（迁移 0004 改名而来），不改 | 路由索引已经按它建好 |
 | 新表 `publication.gateway_models` | `gateway_model text PRIMARY KEY`、`enabled boolean NOT NULL DEFAULT true`、`created_at`、`updated_at`、`updated_by` | **只放运维开关**，不放定义（定义只在不可变修订里） |
 | 唯一性 | 沿用"同一名字同时只有一个生效修订"，由发布原子替换保证 | `ADR-0009` |
@@ -61,10 +61,17 @@
 
 **写入方**：该名字**首次发布成功时**由发布事务插入一行（`enabled` 默认 `true`），此后只由 `PATCH` 改 `enabled`。没有发布过就 PATCH 不存在的名字 → 404。
 
-**迁移的回填**（增量迁移，不改已应用的 `0001`–`0006`，沿用本仓库的迁移约定）：**迁移分两次，与切片对齐——P1 落命名两列，P2b 落定价三列**（§8 的 P1/P2b 是同一套列，两处口径一致）：
+**`tier_prices`（档位价目表）与 `tier_token_estimates`（档位估算表）同样是随修订发布、随 Job 快照冻结的发布数据**——它们是 **hold 的单价/上界来源**（§3.6），与 `cost_basis` 一起表达**两种成本口径各自的表达形态**：
+
+- **每张价目表**（`tier_prices`：`(size, resolution, quality)` → 每张价）对应**按张计费**（`cost_basis = Declared`，APIMart 这类）；
+- **token 费率 + 档位估算表**（现有 `PriceRates` 的四档 token 费率 + `tier_token_estimates`：档位 → 分项最坏 token 数）对应**按 token 计费**（`cost_basis = Computed`，AIHubMix 这类）。
+
+**为什么不编进代码**：档位结构、每张价、各档位的最坏 token 数都是**随模型与渠道变的数据**——换模型、换渠道、渠道调价都不该改代码、不该重新发版；它们与 `markup_bps` 同类，**随修订发布生效、随 Job 快照冻结**，已受理的 Job 不受后续改动影响（`ADR-0003`）。与现有两个量的关系：`reference_cost_microusd` 是**定价时的参考成本**（单值、可核，用来体现"成本 + 加价系数"这条产品口径，§3.2），两张表是**受理时算 hold 的查表依据**——同源不同用：前者回答"这个网关模型的价是怎么定的"，后者回答"这一次请求该冻多少"。`hold_cap_microusd` 是**运营按网关模型录入的封顶值**，只在"连上界都给不出"时兜底（§3.6）。
+
+**迁移的回填**（增量迁移，不改已应用的 `0001`–`0006`，沿用本仓库的迁移约定）：**迁移分两次，与切片对齐——P1 落命名两列，P2b 落定价列**（§8 的 P1/P2b 是同一套列，两处口径一致）：
 
 - **P1 落的命名两列**（`gateway_model` / `vendor_model_id`）：在既有行上先按"同一 revision 的 `runtime_entries.gateway_model` / `vendor_model_id`"回填（同一次发布写下的条目同值，可直接取），再设 `NOT NULL`；
-- **P2b 落的定价三列**（`markup_bps` / `reference_cost_microusd` / `cost_basis`）：在既有行上**留 NULL**——旧修订没有定价，因此那些修订受理出来的快照不带 `consumer_price_microusd`，结算与 hold 走旧口径、与今天逐位相同（§3.3/§3.6）；
+- **P2b 落的定价列**（`markup_bps` / `reference_cost_microusd` / `cost_basis` / `tier_prices` / `tier_token_estimates` / `hold_cap_microusd`）：在既有行上**留 NULL**——旧修订没有定价，因此那些修订受理出来的快照不带 `consumer_price_microusd`，结算与 hold 走旧口径、与今天逐位相同（§3.3/§3.6）；
 - `publication.gateway_models` 按既有生效名字回填出对应行（`enabled = true`），使现有已发布数据在迁移后立刻可读、可停用（随 P1 一起落）。
 
 ## 2. 对客目录与读写路径
@@ -182,15 +189,20 @@ PriceSnapshot {
     cost_basis: Computed { rates } | Declared { currency },   // 定价时参考的成本口径（随修订发布：runtime_revisions.cost_basis，随快照冻结）
     reference_cost_microusd,                                   // 定价时参考的渠道成本（随修订发布）
     markup_bps,                                                // 随修订发布
+    tier_prices,                                               // 随修订发布：档位价目表（按张计费口径的单价来源，§1.6/§3.6）
+    tier_token_estimates,                                      // 随修订发布：档位估算表（按 token 计费口径的上界来源，§1.6/§3.6）
+    hold_cap_microusd,                                         // 随修订发布：运营按网关模型录入的封顶值（连上界都给不出时兜底，§3.6）
     fx_rate,                                                   // 受理时从全局表快照；定点整数（如 1e6 分母），不使用浮点
-    consumer_price_microusd,                                   // 受理时算定并冻结：对客单价（每计价单位；默认读法下同一网关模型一个固定价，不随命中候选变）
+    consumer_price_microusd,                                   // 受理时算定并冻结：对客单价——按张口径＝本次档位的每张价（精确）；按 token 口径＝本次档位估算出的每张价上界（§3.6）
+    hold_microusd,                                             // 受理时算定并冻结：本次请求的 hold（§3.6）
+    hold_source,                                               // hold 的来源：精确查表 / 档位估算上界 / 模型封顶值 / 平台兜底（§3.6，事后可辨"这次为什么冻这么多"）
     captured_at,
 }
 ```
 
-`charge_microusd(usage)` 从"Σ token × 费率"改为"**只读 `consumer_price_microusd`** × 计价单位数（**实际产出张数**，口径见 §5）"，并**封顶在 hold**（§3.6）——对客结算不再读实际成本（§3.5）。
+`charge_microusd(usage)` 从"Σ token × 费率"改为"**只读快照 + 本次实际用量**"，并**封顶在 hold**（§3.6）——对客结算不再读实际成本（§3.5）：**按张口径**（`Declared`）= `consumer_price_microusd` × 计价单位数（**实际产出张数**，口径见 §5）；**按 token 口径**（`Computed`）= 快照里的分项费率（`cost_basis: Computed { rates }`）经 `markup_bps` + `fx_rate` 换算出的**对客 token 费率** × **实际 `usage` 的分项 token（真值）**。
 
-**历史兼容**：`price_snapshot` 是 jsonb，**缺 `consumer_price_microusd`** ⇒ 按旧口径（`Σ token × 费率`）解释，结算结果与今天逐位相同。缺它有两种来源，都走这条路：① 已受理的历史 Job（快照本身就是旧的）；② 迁移后仍生效、但**没有定价**的旧修订受理出的新 Job（§1.6：定价三列留 NULL）。两种来源的 **hold 口径也一致**：缺 `consumer_price_microusd` 时 hold **回落到 `GENERATION_MAX_COST_MICROUSD`**，即**今天的行为**，不由售价派生（§3.6）。历史 Job 的查询与结算行为不变（验收第 9 条）。
+**历史兼容**：`price_snapshot` 是 jsonb，**缺 `consumer_price_microusd`** ⇒ 按旧口径（`Σ token × 费率`）解释，结算结果与今天逐位相同。缺它有两种来源，都走这条路：① 已受理的历史 Job（快照本身就是旧的）；② 迁移后仍生效、但**没有定价**的旧修订受理出的新 Job（§1.6：定价列留 NULL）。两种来源的 **hold 口径也一致**：缺 `consumer_price_microusd` 时 hold **回落到 `GENERATION_MAX_COST_MICROUSD`**，即**今天的行为**，不由售价派生（§3.6）。历史 Job 的查询与结算行为不变（验收第 9 条）。
 
 ### 3.4 扣费与命中渠道的关系（默认读法待用户确认）
 
@@ -203,27 +215,40 @@ PriceSnapshot {
 
 ### 3.5 毛利记录
 
-- **对客结算只读 Job 固化的售价快照**：结算金额 = `price_snapshot.consumer_price_microusd`（§3.3）。`attempts` 里的渠道成本**只用于毛利核算**——它**不参与对客结算**，不改对客金额，也不改授权额（§3.6）。
+- **对客结算只读 Job 固化的售价快照**：结算金额按快照的**成本口径**取真值（§3.3/§3.6）——按张口径 = `price_snapshot.consumer_price_microusd` × 实际产出张数；按 token 口径 = 快照里的对客 token 费率 × 实际 `usage` 的分项 token；两者都封顶在 hold。`attempts` 里的渠道成本**只用于毛利核算**——它**不参与对客结算**，不改对客金额，也不改授权额（§3.6）。
 - **售价**：`ledger.entries`（`kind = 'capture'`，金额为负）+ `ledger.holds`（授权额）——账本是权威（`ADR-0003`）；另在 `generation.jobs` 加 `charge_microusd` 列（结算时写入）作为**投影**，便于按 job 直接查，权威仍是账本。**这一列缓做**：账本已经查得到，它只是查询便利，不阻塞任何切片（§8 的 P2b）。
 - **成本**：`generation.attempts` 新增 `provider_cost_microusd`、`provider_cost_currency`、`provider_cost_source`（`declared` / `computed` / `unavailable`，判据见 §3.7）。**异步写入**（结算时才拿得到）。
 - **毛利** = 售价（快照）− 成本（`attempts`），按 job 可查；成本缺失（`unavailable`）时标"成本未知"，不猜（§3.7）。
 - **边界**：把成本**写进账本**（`ledger.entries` 的 `adjustment` 分录）与账实核对归工单 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)（成本进账本与账实核对那部分），**本设计不做**——同一件事不做两遍，也不在这里预先决定成本条目的会计语义。
 
-### 3.6 预授权由售价派生（`GENERATION_MAX_COST_MICROUSD` 退为"无售价可算时"的兜底 hold）
+### 3.6 预授权由售价派生（`GENERATION_MAX_COST_MICROUSD` 退为"估不出 hold 时"的兜底 hold）
 
 现状：`max_cost_microusd` 是服务端固定数（`GENERATION_MAX_COST_MICROUSD`，默认 $0.02，读在 `apps/api/src/main.rs`），受理时按它扣预授权；结算时 `charge > max_cost` ⇒ 进对账（`crates/application` 的 `complete_success`）。**加价后更容易触顶**，而 `ADR-0006` 定下对账**只能退款、收不回差额** ⇒ 实收一旦超过固定授权额，差额就收不回来。
 
 本设计把预授权改为**由 Price Snapshot 的售价派生**：受理时的 hold 就是**本次请求的售价快照**——**快照单价（§3.3，受理时已算定）× 请求张数 `n`**（受理时已知的请求事实）。**hold 与实收是两个口径**，各自写死，不再互相假设：
 
-- **hold = 本次请求的售价快照**：受理时只拿得到请求事实，因此授权额 = 快照单价 × 请求张数 `n`。快照单价在受理时已算定，所以 hold 当场算得出，不再有"加价撞固定预授权"的缺口。
-- **实收按实际产出张数，并封顶在 hold**：结算只读同一份快照、同一单价（§3.5），实收 = 快照单价 × **实际产出张数**（口径见 §5），且**取 min(算出额, hold)**。正常路径下渠道按合同给的上限产出、不多于请求张数，实收自然 ≤ hold。
+**"快照单价"从哪来（本轮补写）**：单价不是服务端写死的数，而是**按该修订的成本口径查随修订发布的表**（§1.6）——两张表是**两种成本口径各自的表达**，都由运营维护、随修订发布、随 Job 快照冻结，**不编进代码**：
+
+- **按张计费（`Declared`，APIMart 这类）**：单价来自**发布的档位价目表**（`tier_prices`：`(size, resolution, quality)` → 每张价）。受理时按 `(size, resolution, quality, n)` **查表精确算出** hold = 每张价 × 请求 `n`——**这是精确值，不是估算**。
+- **按 token 计费（`Computed`，AIHubMix 这类）**：受理时**无法精确知道 token 数**（输出 token 取决于实际生成，输入 token 随参考图编码/尺寸变），因此 hold 取**估算上界**：
+  - **输入侧**：prompt 长度 + 参考图**按尺寸估**；
+  - **输出侧**：按**档位**（`size` / `resolution` / `quality`）查**发布侧的档位估算表**（`tier_token_estimates`：档位 → 分项最坏 token 数，运营维护、**不编进代码**）取**最坏值**；
+  - **档位定不下来**（如 `size = auto`）⇒ 取**该模型档位表里的最大值**；
+  - **连上界都给不出**（表里没有可用档位、也没有可用费率）⇒ 用**运营录入的每网关模型封顶值**（`hold_cap_microusd`，随修订发布）兜底——**这正是 `GENERATION_MAX_COST_MICROUSD` 的正当用途：估不出时的 hold 值**（不是"超限即拒"，见下）；
+  - 上界 = Σ(分项估算 token × 对客 token 费率)，对客 token 费率由该修订的渠道成本费率（现有 `PriceRates`，§3.1）按 `markup_bps` + `fx_rate` 换算（§3.2）；再 × 请求 `n` 得 hold。
+- **这不改变 §3.4 的默认读法**：档位与实际用量是**请求事实与用量事实**，不是**候选事实**——同一个网关模型仍然不随命中候选变价。
+
+- **hold = 本次请求的售价快照**：受理时只拿得到请求事实，因此授权额 = 快照单价（按上表口径算定）× 请求张数 `n`。快照单价在受理时已算定，所以 hold 当场算得出，不再有"加价撞固定预授权"的缺口。
+- **实收按真值，并封顶在 hold**：结算只读同一份快照、同一口径（§3.5）——**按张口径**实收 = 快照单价 × **实际产出张数**（口径见 §5）；**按 token 口径**实收 = 对客 token 费率 × **实际 `usage` 的分项 token（真值）**；两者都**取 min(算出额, hold)**。正常路径下渠道按合同给的上限产出、不多于请求张数，实收自然 ≤ hold。
+- **hold 只冻结，差额在结算时释放**：hold **不是扣款**——受理时冻结，结算时沿用现状的"**捕获预授权 → 按实收扣 → 释放余额**"（`complete_job` 的 `capture` + `release`，§6.4）。按 token 口径的**估算上界高于真值**时，差额在结算时**释放回余额**。因此**估上界的代价只是多冻一点，不会多扣**。
 - **超产出（上游产出多于请求张数）不加收**：这是异常路径（渠道没守合同上限）。多出的张数**不对客计费**，实收**封顶在 hold**、**不向客户加收**；多出的部分只记**渠道成本**、形成**毛利缺口**并**留痕**（进 `attempts` 的成本列，§3.5/§5），供运营发现——对客的钱一分不多收，缺口记在平台侧。
 - **不再用"实收 ≤ 授权额由构造保证"这类依赖假设的话**：授权额与实收的关系由上面的**封顶规则**决定，不由"渠道一定不超产"这个假设决定；封顶之后也不会出现"实收超授权 ⇒ 进对账只能退款"的缺口。
 
-`GENERATION_MAX_COST_MICROUSD` **只作"没有售价可算时的兜底 hold"**，不再是任何形式的上限：
+`GENERATION_MAX_COST_MICROUSD` **只作"估不出 hold 时的兜底 hold"**，不再是任何形式的上限：
 
-- **有售价可算 ⇒ 它不参与判定**。此前写的"派生出的 hold 超过它就受理前拒绝"**这条已删除**：它的默认值只有 $0.02，当上限用会把正常请求全拒（用户指出）。**不截断、不拒绝、不写审计**——有售价时这个数一次都不读。
-- **没有售价可派生**：快照里**缺 `consumer_price_microusd`**（已受理的历史 Job，或迁移后仍生效但**没有定价**的旧修订受理出的新 Job，§3.3）⇒ 派生不出 hold，**回落到 `GENERATION_MAX_COST_MICROUSD`**，即**今天的行为**（受理时按这个固定数扣预授权），结算走旧口径、与今天逐位相同。
+- **算得出 hold ⇒ 它不参与判定**（按张口径查表算得出、按 token 口径估得出上界，都算"算得出"）。此前写的"派生出的 hold 超过它就受理前拒绝"**这条已删除**：它的默认值只有 $0.02，当上限用会把正常请求全拒（用户指出）。**不截断、不拒绝、不写审计**——算得出时这个数一次都不读。
+- **兜底分两层**：① 该修订**录入过每网关模型封顶值**（`hold_cap_microusd`，随修订发布、随快照冻结）⇒ 用它当 hold；② **连它也没有**（快照里**缺 `consumer_price_microusd`**——已受理的历史 Job，或迁移后仍生效但**没有定价**的旧修订受理出的新 Job，§3.3）⇒ 回落到**平台级默认 `GENERATION_MAX_COST_MICROUSD`**，即**今天的行为**（受理时按这个固定数扣预授权），结算走旧口径、与今天逐位相同。
+- **它的正当用途就是这一条**：**估不出上界时的 hold 值**——不是"超限即拒"的门槛（本节写死的"不截断、不拒绝、不写审计"就是边界）。
 
 **真正的上限是客户余额本身**：受理时的条件更新（§6.4）要求 `balance_microusd >= $hold`，不成立 ⇒ `insufficient_balance`，对客 **402 余额不足**，不产生 Job、不扣款。因此"售价高过某个服务端固定数"不是拒绝理由，"余额不够"才是。**运营要设成本护栏（服务端成本上限）属 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)，不在本设计**（§9 范围边界）。
 
@@ -298,7 +323,7 @@ PriceSnapshot {
 | 需要的信息 | 现在落在哪 | 缺什么 / 补什么 |
 | --- | --- | --- |
 | **模型** | `generation.jobs.gateway_model`（迁移 0004 已把列名收口为"平台型号名"） | 无需新列；语义随本设计变成"网关模型名" |
-| **张数** | 请求侧：`jobs.native_parameters->>'n'`；结果侧：`jobs.result_images` 的数组长度 | **两个口径都要写死**：**hold（授权额）按请求 `n`**（受理时已知的请求事实，× 快照单价）；**charge（实收）按实际产出张数**（结果信封长度，× 同一快照单价），**且封顶在 hold**。两者都在库里，不新增列。**上游产出多于请求张数（异常）时不向客户加收**：多出的张数不计费，只记**渠道成本与毛利缺口**并**留痕**（§3.6/§3.5），供运营发现 |
+| **张数** | 请求侧：`jobs.native_parameters->>'n'`；结果侧：`jobs.result_images` 的数组长度 | **两个口径都要写死**：**hold（授权额）按请求 `n`**（受理时已知的请求事实，× 快照单价）；**charge（实收）按实际产出张数**（结果信封长度，× 同一快照单价），**且封顶在 hold**（**按 token 计费的模型实收按实际 `usage` 的分项 token，不按张数**，§3.6）。两者都在库里，不新增列。**上游产出多于请求张数（异常）时不向客户加收**：多出的张数不计费，只记**渠道成本与毛利缺口**并**留痕**（§3.6/§3.5），供运营发现 |
 | **扣费金额** | `ledger.entries`（`kind='capture'`）+ `ledger.holds`（授权额）；**Job 上没有** charge 列 | 账本是权威（`ADR-0003`）；**补** `generation.jobs.charge_microusd`（结算时写入）作为投影，便于按 job 查——**缓做**（§3.5） |
 | **平台成本价** | **没有**：APIMart 的 `cost` 不采纳不留存；AIHubMix 的金额要自算也没存 | **补** `generation.attempts.provider_cost_microusd` / `provider_cost_currency` / `provider_cost_source`（§3.5） |
 | **请求时间戳** | `jobs.created_at`（受理）、`attempts.started_at` / `completed_at` | 够 |
@@ -358,7 +383,7 @@ PriceSnapshot {
 UPDATE ledger.accounts SET balance_microusd = balance_microusd - $预授权
 WHERE id = $1 AND balance_microusd >= $预授权
 ```
-`rows_affected != 1` ⇒ `insufficient_balance`（对客 402 余额不足）。`$预授权` = **本次请求的售价快照**（快照单价 × 请求 `n`，§3.6），不再是"永远一个固定数"；**缺售价快照单价时回落为 `GENERATION_MAX_COST_MICROUSD`**（§3.3/§3.6）。**余额是这里唯一的上限**——有售价可算时 `GENERATION_MAX_COST_MICROUSD` 不参与判定（§3.6）。
+`rows_affected != 1` ⇒ `insufficient_balance`（对客 402 余额不足）。`$预授权` = **本次请求的售价快照**（快照单价 × 请求 `n`，§3.6），不再是"永远一个固定数"；**估不出 hold 时按 §3.6 的兜底链回落**（先取该修订录入的每网关模型封顶值 `hold_cap_microusd`，**连它也没有、即缺售价快照单价时**回落为 `GENERATION_MAX_COST_MICROUSD`，§3.3/§3.6）。**余额是这里唯一的上限**——算得出 hold 时 `GENERATION_MAX_COST_MICROUSD` 不参与判定（§3.6）。
 
 **结算**（现状，`complete_job`，本设计不改）：同一事务里 `release` 剩余授权 + `capture` 实收。
 
@@ -417,7 +442,7 @@ Redis 的位置：
 
 ### P1 网关模型命名层与对客目录
 
-**改动**：发布命令加 `gateway_model`；`runtime_revisions` 增 `gateway_model` / `vendor_model_id` **两列（P1 落的命名两列）**；`publication.gateway_models`；`GET /v1/models` 投射（网关名 + `vendor_id` + 替换 `model.const`）；`GET /api/v1/gateway-models`；`PATCH .../enabled`；发布期 `model.const` 校验。**定价三列 `markup_bps` / `reference_cost_microusd` / `cost_basis` 在 P2b 落**（§1.6 同一套口径：迁移**分两次**，P1 一次、P2b 一次）。
+**改动**：发布命令加 `gateway_model`；`runtime_revisions` 增 `gateway_model` / `vendor_model_id` **两列（P1 落的命名两列）**；`publication.gateway_models`；`GET /v1/models` 投射（网关名 + `vendor_id` + 替换 `model.const`）；`GET /api/v1/gateway-models`；`PATCH .../enabled`；发布期 `model.const` 校验。**定价列（`markup_bps` / `reference_cost_microusd` / `cost_basis` / `tier_prices` / `tier_token_estimates` / `hold_cap_microusd`）在 P2b 落**（§1.6 同一套口径：迁移**分两次**，P1 一次、P2b 一次）。
 
 **验收（离线）**：
 - 发布一份 `gateway_model = gpt-image-2.5-plus`、`native_model_id = gpt-image-2.5-sunburst` 的素材 → `GET /v1/models` 的 `name` 是 `gpt-image-2.5-plus`、含 `vendor_id`、**响应全文不含 `gpt-image-2.5-sunburst`**（含合同正文）；
@@ -440,12 +465,14 @@ Redis 的位置：
 
 ### P2b 定价公式与售价快照
 
-**改动**：`runtime_revisions` 增 `markup_bps` / `reference_cost_microusd` / `cost_basis` **三列（P2b 落的定价三列，口径 `Computed` / `Declared`，随快照冻结）**；`pricing.fx_rates` + `PUT /api/v1/fx-rates`；`PriceSnapshot` 扩展（`cost_basis` / `reference_cost_microusd` / `markup_bps` / `fx_rate` / `consumer_price_microusd`）；`charge_microusd` 改为只读快照单价；**预授权由售价派生**（**hold = 本次请求的售价快照 = 快照单价 × 请求 `n`**）且 `GENERATION_MAX_COST_MICROUSD` 退为**"无售价可算时"的兜底 hold**（**缺 `consumer_price_microusd` 时 hold 回落到它**，不再是受理上限）；`jobs.charge_microusd` 投影列**缓做**。
+**改动**：`runtime_revisions` 增 `markup_bps` / `reference_cost_microusd` / `cost_basis` / `tier_prices` / `tier_token_estimates` / `hold_cap_microusd`（**P2b 落的定价列**，口径 `Computed` / `Declared`，随快照冻结）；`pricing.fx_rates` + `PUT /api/v1/fx-rates`；`PriceSnapshot` 扩展（`cost_basis` / `reference_cost_microusd` / `markup_bps` / `tier_prices` / `tier_token_estimates` / `hold_cap_microusd` / `fx_rate` / `consumer_price_microusd` / `hold_microusd` / `hold_source`）；`charge_microusd` 改为只读快照（按张口径读单价 × 实际产出张数、按 token 口径读对客费率 × 实际 `usage`）；**预授权由售价派生**（**hold = 本次请求的售价快照 = 快照单价 × 请求 `n`**，单价/上界来源见 §3.6）且 `GENERATION_MAX_COST_MICROUSD` 退为**"估不出 hold 时"的兜底 hold**（先取 `hold_cap_microusd`，**缺 `consumer_price_microusd` 时回落到它**，不再是受理上限）；`jobs.charge_microusd` 投影列**缓做**。
 
 **验收（离线）**：
 - 给定已知参考成本 / `markup_bps` / 汇率 → 受理时冻结的 `consumer_price_microusd` 等于"参考成本 ×(1 + markup)× fx"，**逐位断言**；
 - **同一网关模型**命中两条成本不同的候选 → 对客扣费**逐位相同**（默认读法，§3.4），差异只体现在毛利（用 P2a 的成本列断言）；扣的是**同一个账户**；
-- 预授权（hold）= 快照单价 × **请求 `n`**（即**本次请求的售价快照**）；结算 `charge` = 快照单价 × **实际产出张数**，**封顶在 hold**（不出现"实收超授权 ⇒ 进对账"）；
+- 预授权（hold）= 快照单价 × **请求 `n`**（即**本次请求的售价快照**）；结算 `charge` = 快照单价 × **实际产出张数**（按 token 口径的模型则按实际 `usage`，见下条），**封顶在 hold**（不出现"实收超授权 ⇒ 进对账"）；
+- **按张口径的 hold 可精确断言**：给定发布的**档位价目表**（`tier_prices`）与请求的 `(size, resolution, quality)` → 受理时 hold **逐位等于**"该档位每张价 × 请求 `n`"，且快照里 `hold_source` 记的是**精确查表**（§3.6）；
+- **按 token 口径的 hold 是"按档位估算上界"**：① 档位定不下来（`size = auto`）→ hold 取该模型档位估算表（`tier_token_estimates`）里的**最大值**；② 表里查不到可用档位、也没有可用费率 → hold 用**每网关模型封顶值** `hold_cap_microusd` 兜底（没有录入时回落到 `GENERATION_MAX_COST_MICROUSD`）；③ 并断言**结算按实际 `usage` 实收（token 真值）、冻结差额在结算时释放**（`capture` 实收 + `release` 剩余授权，§3.6）——估上界只多冻、不多扣；
 - **超产出不加收、留痕**：构造假上游**产出多于请求 `n`**（异常）→ 实收仍**封顶在 hold**、**不向客户加收**；多出的张数的渠道成本与毛利缺口能从 `attempts` 与快照算出来并**留痕**（§3.6/§5）；
 - **旧修订 + 新 Job → 走旧口径 hold**：迁移后仍生效、但**没有定价**（`consumer_price_microusd` 缺）的旧修订受理出的新 Job，hold **回落到 `GENERATION_MAX_COST_MICROUSD`**（今天的行为），结算也走旧口径（§3.3/§3.6）；
 - **售价不受固定数限制**：构造 `hold > GENERATION_MAX_COST_MICROUSD` 的定价 → **照常受理**（不拒绝、不截断、不写审计）；**受理的唯一上限是客户余额**——`hold > 余额` ⇒ 对客 **402 `insufficient_balance`**，不产生 Job、不扣款（§3.6/§6.4）；
@@ -500,7 +527,7 @@ Redis 的位置：
 - **汇率维护入口与字段**：**全局一条** `pricing.fx_rates` + `PUT /api/v1/fx-rates`（管理员、写审计），**现在就立字段**，**数值与币种由后台管理员录入**（不属设计决策）（§3.2）；
 - **Redis**：**已批准引入**（用户批准；**纯加速层**——缓存不是事实源，见 §6；**预检拒绝不需要新 ADR**——`ADR-0003` 的"缓存不是事实源"已覆盖，见 §6.4）。因此"是否批准引入 Redis"**不再待决**；
 - **网关模型启停粒度**：**整个模型一个开关**（`publication.gateway_models.enabled`），不做候选级开关（§2.1/§2.4）；
-- **预授权口径**：**由 Price Snapshot 的售价派生**——hold = **本次请求的售价快照**（快照单价 × **请求 `n`**）；实收按**实际产出张数**并封顶在 hold，超产出不加收、只留痕；`GENERATION_MAX_COST_MICROUSD` 只作**"没有售价可算时"的兜底 hold**（缺售价快照单价时回落到它），**不再是受理上限**——受理的唯一上限是**客户余额**（`hold > 余额` ⇒ 402 `insufficient_balance`），**运营要设成本护栏属 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)、不在本设计**（§3.6）——**预授权口径本身不再归 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)**；
+- **预授权口径**：**由 Price Snapshot 的售价派生**——hold = **本次请求的售价快照**（快照单价 × **请求 `n`**；单价/上界按该修订的成本口径查**随修订发布的档位价目表 / 档位估算表**，估不出上界时用**每网关模型封顶值**兜底，§3.6）；实收按**真值**（按张口径＝实际产出张数；按 token 口径＝实际 `usage` 的分项 token）并封顶在 hold，**冻结差额在结算时释放**（hold 只冻结，不是扣款），超产出不加收、只留痕；`GENERATION_MAX_COST_MICROUSD` 只作**"估不出 hold 时"的兜底 hold**（连每网关模型封顶值都没有时回落到它），**不再是受理上限**——受理的唯一上限是**客户余额**（`hold > 余额` ⇒ 402 `insufficient_balance`），**运营要设成本护栏属 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)、不在本设计**（§3.6）——**预授权口径本身不再归 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)**；
 - **"不可用时回退"的含义**：§4.4 已按**阶段**写清——受理前的候选不合格回退落地（现状）；提交前的失败技术上能回退，但当前策略是"失败不重试"（`ADR-0011`），改"回退下一候选"属**策略变更**；提交后的不确定（超时、断连、`5xx`）**不得回退**（会重复出图与重复计费），进对账。**"运行期回退"是否要做属 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)，不在本设计范围**——因此这一条也不再待决。
 
 ### 范围边界（不待决，归其他工作项）
@@ -523,18 +550,18 @@ Redis 的位置：
 
 - `ADR-0006`：汇率从"Price Plan 发布时固定"改成"**全局表 + 受理时快照**"（§3.2）；
 - `ADR-0009` ①：权重的语义与"优先级是档位、档内分流"这一选路模型——"数字小者优先**且同一型号内唯一**"要改成"档位内可多候选、按权重分流"（§4.2）；
-- `ADR-0009` ②：预授权口径——"预授权金额与计价口径是两个量，不得互相推导…不由候选价格反算"要改成"**预授权由 Job 固化的售价快照派生**（hold = 快照单价 × 请求张数 `n`），`GENERATION_MAX_COST_MICROUSD` 只作**没有售价可算时的兜底 hold**，不再是受理上限（上限是客户余额）"（§3.6）。
+- `ADR-0009` ②：预授权口径——"预授权金额与计价口径是两个量，不得互相推导…不由候选价格反算"要改成"**预授权由 Job 固化的售价快照派生**（hold = 快照单价 × 请求张数 `n`），`GENERATION_MAX_COST_MICROUSD` 只作**估不出 hold 时的兜底 hold**，不再是受理上限（上限是客户余额）"（§3.6）。
 
 另外两处是**设计级修订**（改 `docs/design/`，不动 ADR）：`GET /v1/models` 的字段名 `vendor` → `vendor_id`（`docs/design/0005` §8.1 已定该形状）、合同 `model.const` 的对客投射替换规则（§1.4）。
 
 ## 评审记录
 
-- 状态：**待评审**（Plan Review 两轮发现已收口；用户更正与批准已并入，见下节第 15–17 条）。本文尚不构成实施依据。
+- 状态：**待评审**（Plan Review 两轮发现已收口；用户更正与批准已并入，见下节第 15–18 条）。本文尚不构成实施依据。
 - 评审完成后在此记录结论与批准依据（按 `docs/agents/artifacts.md`：`docs/design/` 的状态头表示**设计评审状态**，批准不由文件推断）。
 
 ## Plan Review 处置
 
-两轮 Plan Review 的发现逐条落点——**第一轮 8 条**，另加**用户两处更正**（第 9、10 条），**第二轮（收敛轮）4 条**（第 11–14 条），**本轮用户更正与批准 3 条**（第 15–17 条）（本节编号只为对照评审清单，不构成正文引用）：
+两轮 Plan Review 的发现逐条落点——**第一轮 8 条**，另加**用户两处更正**（第 9、10 条），**第二轮（收敛轮）4 条**（第 11–14 条），**本轮用户更正、批准与补写 4 条**（第 15–18 条）（本节编号只为对照评审清单，不构成正文引用）：
 
 | # | 发现 | 落在哪 |
 | --- | --- | --- |
@@ -555,7 +582,8 @@ Redis 的位置：
 | 15 | **用户更正：加价系数与汇率不是"现在要定的数值"，而是后台管理员录入**（加价系数**创建网关模型时设置**、每网关模型一个；汇率**全局一条、由后台维护**） | ① 全文**不出现任何具体数值建议**：§2.2 的 `pricing` 示例改成占位并注明数值由后台录入；§3.2 两个量的落点行改为"**由管理员创建/发布时录入**""**由管理员在后台维护**，具体数值与币种不属设计决策"；§3.2 汇率段删掉"取恒等值"、改为"数值由后台录入，设计只立字段与快照位"；§9 范围边界把"具体取值"归 `#5`。② §9 未决**删去"加价系数数值""汇率数值/币种"两条**，改为一句话"**加价系数与汇率的数值不属设计决策：由后台录入**"；§9「已定案」两条同步。③ 提案「开放决策」由 5 条收敛为 2 条，并在「已定案」补录入方与入口 |
 | 16 | **用户批准：引入 Redis** | §9 未决**删去"是否批准引入 Redis"**，改记"**已批准引入（纯加速层，缓存不是事实源；预检拒绝不需要新 ADR）**"并移入 §9「已定案」；§6.7 由"是否引入需用户批准"改为"**用户已批准**"；§8 **P4** 标题由"待用户批准后"改为"**用户已批准**"；状态头与「评审记录」相应说明 |
 | 17 | **用户更正：预授权口径有坑**——hold 就是**本次请求的售价快照**（快照单价 × 请求张数 `n`）；`GENERATION_MAX_COST_MICROUSD` 默认值只有 $0.02，**当上限用会把正常请求全拒** | ① **删掉"超过 `GENERATION_MAX_COST_MICROUSD` 即受理前拒绝（503 + 审计）"**这条（§3.6 正文与 §8 P2b 验收同步删除）；② `GENERATION_MAX_COST_MICROUSD` **只作"没有售价可算时"的兜底 hold**（旧修订 / 历史 Job 缺 `consumer_price_microusd` 时回落到它，§3.3/§3.6）；③ **真正的上限是客户余额本身**——`hold > 余额` ⇒ 402 `insufficient_balance`，不产生 Job、不扣款（§3.6/§6.4）；④ **运营要设成本护栏属 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)、不在本设计**（§9 范围边界）；⑤ §3.6 标题、§3.6 的 `ADR-0009` 修订段、§6.4、§8 P2b 改动行与验收、§9「已定案」预授权口径同步改写 |
+| 18 | **本轮补写：hold 的单价/上界来源没写**（§3.6 只写"hold = 快照单价 × 请求 `n`"，**没说单价/上界从哪来**；尤其**按 token 计费的渠道**（AIHubMix 这类）受理时无法知道确切 token 数） | §3.6 补写 hold 的**单价/上界来源**——**按张计费**（`Declared`，APIMart 这类）按 `(size, resolution, quality, n)` 查**发布的档位价目表**（`tier_prices`）**精确算出**；**按 token 计费**（`Computed`，AIHubMix 这类）取**估算上界**（输入侧 prompt 长度 + 参考图按尺寸估、输出侧按档位查**发布的档位估算表** `tier_token_estimates` 取最坏值；`size=auto` 取该表**最大值**；**连上界都给不出**用**运营录入的每网关模型封顶值** `hold_cap_microusd` 兜底），并写明 `GENERATION_MAX_COST_MICROUSD` 的**正当用途就是"估不出时的 hold 值"**（不是"超限即拒"）；**hold 只冻结、结算按真值实收并释放差额**（估上界只多冻、不多扣）。§1.6 字段清单加 `tier_prices` / `tier_token_estimates` / `hold_cap_microusd`（**随修订发布、随 Job 快照冻结**；**不编进代码**——换模型/换渠道不该改代码），并写清与现有 `PriceRates` / `reference_cost_microusd` 的关系（**每张价目表**与 **token 费率 + 档位估算表**是**两种成本口径各自的表达**）；§3.3 快照加这几项与 `hold_microusd` / `hold_source`，结算口径按成本口径分支（§3.5 同步）；§8 P2b 验收补两条（**按张口径 hold 可精确断言**；**按 token 口径 hold 是按档位估算上界**、`auto` 取最大档、估不出用封顶值，且**结算按实际 `usage` 实收、冻结差额释放**）；§1.6/§8 的"定价三列"计数措辞同步改为"定价列"（P2b 落六列，§1.6 行注明"后六列可空"） |
 
-**留给用户的 2 条**：**权重语义**（档内确定性分流需就地修订 `ADR-0009`，还是只作次级排序）、**"与命中渠道无关"的确切含义**（默认读法＝同一网关模型一个固定售价，渠道成本只在定价时参考）——**两轮发现、两处更正与本轮 3 条都未新增待决项**；加价系数与汇率的数值由后台录入，**不属设计决策**（§9）。
+**留给用户的 2 条**：**权重语义**（档内确定性分流需就地修订 `ADR-0009`，还是只作次级排序）、**"与命中渠道无关"的确切含义**（默认读法＝同一网关模型一个固定售价，渠道成本只在定价时参考）——**两轮发现、两处更正与本轮 4 条都未新增待决项**；加价系数与汇率的数值由后台录入，**不属设计决策**（§9）。
 
-**本文相对上一修订新增的两处字段级说法**（评审时请一并看）：`runtime_revisions.reference_cost_microusd`（定价时参考的渠道成本，发布数据）与 `PriceSnapshot.consumer_price_microusd`（受理时算定的对客单价）——它们是"预授权由售价派生"与"金额也无关"这两条的前提，理由在 §3.2/§3.3。
+**本文相对上一修订新增的两处字段级说法**（评审时请一并看）：`runtime_revisions.reference_cost_microusd`（定价时参考的渠道成本，发布数据）与 `PriceSnapshot.consumer_price_microusd`（受理时算定的对客单价）——它们是"预授权由售价派生"与"金额也无关"这两条的前提，理由在 §3.2/§3.3。**第 18 条另新增三处字段级说法**：`runtime_revisions.tier_prices`（档位价目表）、`runtime_revisions.tier_token_estimates`（档位估算表）、`runtime_revisions.hold_cap_microusd`（每网关模型封顶值）——它们是 **hold 的单价/上界来源**，理由在 §1.6/§3.6。
