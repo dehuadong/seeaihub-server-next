@@ -177,6 +177,60 @@ pub struct MeteringEvidence {
     pub usage: TokenUsage,
 }
 
+/// 一次执行的**成本来源**：判据是"成本从哪来"，不是"金额对不对"。**三态**：
+/// `Computed` 是渠道不给金额字段、平台按**实际用量**与该渠道**成本费率**自算；
+/// `Declared` 是渠道终态**直接给了金额**（含渠道侧折扣，比自算权威）；`Unavailable` 是
+/// 本该有金额却拿不到——**不得猜测**：不记 0、不用自算顶替、也不用上一次的值。
+///
+/// 这三个取值同时是 SDK 报告与库层约束的取值面：SDK 那一侧怎么映射过来只写一处
+/// （`ProviderCost` 的 `From`），落库字符串只由 [`ProviderCostSource::as_str`] 给出，
+/// 三处不再各写一份判据。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderCostSource {
+    Computed,
+    Declared,
+    Unavailable,
+}
+
+impl ProviderCostSource {
+    /// 落库用的稳定字符串（库层 CHECK 也认这一组）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Computed => "computed",
+            Self::Declared => "declared",
+            Self::Unavailable => "unavailable",
+        }
+    }
+
+    /// 从落库值还原。库层有 CHECK 保证取值；解析不到说明存储被绕过，按错误处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "computed" => Some(Self::Computed),
+            "declared" => Some(Self::Declared),
+            "unavailable" => Some(Self::Unavailable),
+            _ => None,
+        }
+    }
+}
+
+/// 一次执行留下的**成本事实**（成本平面：原币种原值 + 币种 + 折算后 CNY）。
+///
+/// 与 [`MeteringEvidence`] 并列，但**不是同一件事**：计量事实仍是上游给的分项 token，
+/// 成本只进毛利口径——它**不改对客金额**，也不替代计量证据。币种按渠道声明，不假定 USD。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderCostFact {
+    pub source: ProviderCostSource,
+    /// 原币种微单位金额；`unavailable` 时为 `None`（不猜）。
+    pub amount_microusd: Option<u64>,
+    /// 该渠道声明的成本币种；`unavailable` 时为 `None`。
+    pub currency: Option<String>,
+    /// 折算后 CNY 微单位（毛利用）。折算要用受理时冻结的汇率，所以由定价侧填；
+    /// 汇率还没有落点时这一项是 `None`——不是"折算成了 0"。
+    pub cny_microusd: Option<u64>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceRates {
     pub currency: String,
@@ -193,25 +247,30 @@ pub struct PriceSnapshot {
     pub captured_at: DateTime<Utc>,
 }
 
-impl PriceSnapshot {
-    pub fn charge_microusd(&self, usage: &TokenUsage) -> Result<u64, DomainError> {
+impl PriceRates {
+    /// 本次**实际用量** × 这组四档费率，向上取整到微单位。
+    ///
+    /// 对客实收与渠道成本自算**用的是同一个算式**，但读的是**各自那份费率**：对客读对客费率，
+    /// 成本读该渠道的成本费率（今天价格计划表暂时兼作后者）。算式只有一份，免得两条路各写一遍、
+    /// 日后各自漂移；而"读哪份费率"由各自的入口决定，不在这里判。
+    pub fn amount_microusd(&self, usage: &TokenUsage) -> Result<u64, DomainError> {
         usage.validate()?;
         let terms = [
             (
                 usage.input_text_tokens,
-                self.rates.text_input_microusd_per_million,
+                self.text_input_microusd_per_million,
             ),
             (
                 usage.input_image_tokens,
-                self.rates.image_input_microusd_per_million,
+                self.image_input_microusd_per_million,
             ),
             (
                 usage.output_text_tokens,
-                self.rates.text_output_microusd_per_million,
+                self.text_output_microusd_per_million,
             ),
             (
                 usage.output_image_tokens,
-                self.rates.image_output_microusd_per_million,
+                self.image_output_microusd_per_million,
             ),
         ];
         let numerator = terms.into_iter().try_fold(0_u128, |sum, (tokens, rate)| {
@@ -222,6 +281,36 @@ impl PriceSnapshot {
         })?;
         let rounded_up = numerator.div_ceil(1_000_000);
         u64::try_from(rounded_up).map_err(|_| DomainError::ArithmeticOverflow)
+    }
+}
+
+impl PriceSnapshot {
+    /// 这条渠道的**成本费率**（四档，币种见 [`PriceRates::currency`]）。
+    ///
+    /// 它**不是对客定价口径**：对客售价走对客自己的 CNY 费率向量，两者是两套数据，只是今天
+    /// 价格计划表暂时兼作渠道成本费率。所以成本自算一律经这个访问点取费率，**不复用对客扣费
+    /// 算出来的那个金额**——那会让成本跟着售价漂移，而上游成本与售价本来就是两个量。
+    #[must_use]
+    pub fn cost_rates(&self) -> &PriceRates {
+        &self.rates
+    }
+
+    /// 这条渠道**声明的成本币种**。
+    ///
+    /// 成本平面记的是渠道自己的钱，所以币种按渠道声明取（不假定 USD）；对客平面只有 CNY，
+    /// 不走这个访问点。受理时冻结的这份声明是成本侧币种**唯一**的取值点：Driver 拿到的金额
+    /// 本身不带币种，它只能把这份声明带回来。
+    #[must_use]
+    pub fn cost_currency(&self) -> &str {
+        &self.rates.currency
+    }
+
+    /// 对客实收（对客平面，CNY）：读**对客**那份费率。
+    ///
+    /// 与成本自算（[`PriceSnapshot::cost_rates`]）分成两个入口：两条路各读自己的费率，今天
+    /// 价格计划表暂时兼作两份，对客费率拆成自己的 CNY 向量后只需改这个入口，成本侧不受影响。
+    pub fn charge_microusd(&self, usage: &TokenUsage) -> Result<u64, DomainError> {
+        self.rates.amount_microusd(usage)
     }
 }
 
@@ -411,18 +500,58 @@ mod tests {
 
     #[test]
     fn calculates_edit_charge_from_verified_usage() {
-        let snapshot = PriceSnapshot {
+        let snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+        assert_eq!(snapshot.charge_microusd(&usage()), Ok(14_207));
+    }
+
+    /// 成本自算与对客扣费是**两个口径**：算式同一个，读的费率各自一份。
+    ///
+    /// 今天价格计划表暂时兼作渠道成本费率，两份费率恰好是同一张表，所以两条路算出来的数
+    /// 相同；用例把两份费率**人为设成不同的值**，钉住"成本读成本费率、扣费读对客费率"——
+    /// 对客费率将来拆成自己的 CNY 向量时，成本不能跟着售价漂移。
+    #[test]
+    fn computed_cost_reads_the_channel_cost_rates_not_the_consumer_charge() {
+        let cost_snapshot =
+            snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+        let consumer_snapshot =
+            snapshot_with_rates("CNY", 7_000_000, 9_000_000, 11_000_000, 40_000_000);
+
+        let cost = cost_snapshot.cost_rates().amount_microusd(&usage());
+        let charge = consumer_snapshot.charge_microusd(&usage());
+        // 成本：27 文本输入 × 5 + 1024 图像输入 × 8 + 196 图像输出 × 30（每 1M）。
+        assert_eq!(cost, Ok(14_207));
+        // 对客：同一份用量，换成对客那份费率，金额就不一样了。
+        assert_eq!(charge, Ok(17_245));
+        assert_ne!(
+            cost, charge,
+            "两份费率不同时，成本与对客扣费必须各自算各自的，不能互相顶替"
+        );
+        assert_eq!(
+            cost_snapshot.cost_currency(),
+            "USD",
+            "成本币种取渠道声明的那一份，不假定 USD、也不跟着对客 CNY 走"
+        );
+    }
+
+    /// 造一份价格快照：四档费率按参数给，其余字段取与用例无关的定值。
+    fn snapshot_with_rates(
+        currency: &str,
+        text_input: u64,
+        image_input: u64,
+        text_output: u64,
+        image_output: u64,
+    ) -> PriceSnapshot {
+        PriceSnapshot {
             price_plan_id: PricePlanId::new(),
             rates: PriceRates {
-                currency: "USD".to_owned(),
-                text_input_microusd_per_million: 5_000_000,
-                image_input_microusd_per_million: 8_000_000,
-                text_output_microusd_per_million: 10_000_000,
-                image_output_microusd_per_million: 30_000_000,
+                currency: currency.to_owned(),
+                text_input_microusd_per_million: text_input,
+                image_input_microusd_per_million: image_input,
+                text_output_microusd_per_million: text_output,
+                image_output_microusd_per_million: image_output,
             },
             captured_at: Utc::now(),
-        };
-        assert_eq!(snapshot.charge_microusd(&usage()), Ok(14_207));
+        }
     }
 
     #[test]
@@ -430,6 +559,20 @@ mod tests {
         let mut invalid = usage();
         invalid.total_tokens = 1;
         assert_eq!(invalid.validate(), Err(DomainError::InconsistentUsage));
+    }
+
+    /// 成本来源的落库字符串是**库层 CHECK 的取值集合**，读写必须自洽：
+    /// 落下去的值读不回来，等于把事实写成了一次性写入。
+    #[test]
+    fn provider_cost_sources_round_trip_through_their_stored_form() {
+        for source in [
+            ProviderCostSource::Computed,
+            ProviderCostSource::Declared,
+            ProviderCostSource::Unavailable,
+        ] {
+            assert_eq!(ProviderCostSource::parse(source.as_str()), Some(source));
+        }
+        assert_eq!(ProviderCostSource::parse("guessed"), None);
     }
 
     #[test]

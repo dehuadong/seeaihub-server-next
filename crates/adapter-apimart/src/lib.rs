@@ -6,19 +6,19 @@
 //! 因此提交、轮询、取结果都在 `execute` 内完成。
 //!
 //! 计费相关：任务成功响应含**四分项 `usage`**（`input_tokens_details` 区分 text/image，
-//! 另有 `cached_tokens`），归一到领域 `TokenUsage`。平台按 token × 费率计价，与 AIHubMix
-//! 口径一致；响应里的 `cost`/`credits_cost` **本阶段既不采纳也不留存**（它们受账号折扣
-//! 影响）——若将来要按上游声明金额结算，那需要先
-//! 立一条新的持久决定并扩展领域证据形态，不是在 Driver 里顺手记下就算数。
+//! 另有 `cached_tokens`），归一到领域 `TokenUsage`。计量事实以这四分项 token 为准；
+//! 终态里的 `cost` 另外**采纳为成本事实**（成本平面，币种按渠道声明）——它含渠道侧的账号
+//! 折扣，比平台自算更权威，所以直接取它，不自己算。金额只进成本口径，**不替代计量事实**，
+//! 也不参与对客金额。`credits_cost` 仍不采纳：它只是 `cost` 的另一个刻度，不带来新事实。
 
 use async_trait::async_trait;
 use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, GeneratedImage, ImageAdapter, PreparedImageRequest,
-    ProviderCallError, ProviderCredential, ProviderFailureKind, ProviderSuccess, RetrySafety,
-    decode_data_url, is_http_url,
+    AdapterDescriptor, AdapterError, DeclaredCost, GeneratedImage, ImageAdapter,
+    PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind,
+    ProviderSuccess, RetrySafety, decode_data_url, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -511,7 +511,7 @@ impl ImageAdapter for ApimartImageAdapter {
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
         let task_id = self.submit(&request, &resolved, credential).await?;
         // 2) 提交之后的每一步，都把这个 task id 附在错误上：对账的人至少能拿它去上游查。
-        self.finish(&task_id, credential)
+        self.finish(&task_id, &request.cost_currency, credential)
             .await
             .map_err(|error| with_task_id(error, &task_id))
     }
@@ -525,6 +525,7 @@ impl ApimartImageAdapter {
     async fn finish(
         &self,
         task_id: &str,
+        cost_currency: &str,
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError> {
         // 轮询到终态。任务查询是幂等读，其瞬时失败在传输层已归类为
@@ -553,6 +554,7 @@ impl ApimartImageAdapter {
             // **不用于跨调用自动恢复**——拿它自动补齐结果需要另一套模型。
             provider_trace_id: Some(task_id.to_owned()),
             response_digest: digest,
+            provider_cost: task.provider_cost(cost_currency),
         })
     }
 }
@@ -672,6 +674,12 @@ struct TaskData {
     usage: Option<UsageBody>,
     #[serde(default)]
     error: Option<TaskError>,
+    /// 上游在终态直接声明的成本（十进制金额，币种由渠道声明）。
+    ///
+    /// 用 `Value` 而不是 `f64`：金额要走**精确**换算，浮点在这一步会悄悄差 1 微单位。
+    /// 缺字段、负数、非数字都按"这次没拿到金额"处理，绝不猜。
+    #[serde(default)]
+    cost: Option<Value>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -777,6 +785,90 @@ impl TaskData {
         );
         sha256_hex(material.as_bytes())
     }
+
+    /// 终态里的成本 → 成本事实。
+    ///
+    /// 币种不在这里判：金额本身不带币种，币种是**渠道声明**（受理时随请求冻结），所以这里
+    /// 只把金额精确换算成微单位，币种用传进来的那一份声明。缺字段、负数、非数字、超范围
+    /// 一律 `Unavailable`——**不得猜测**：不记 0、不用费率顶替、也不用上一次的值。
+    fn provider_cost(&self, cost_currency: &str) -> ProviderCost {
+        match self.cost.as_ref().and_then(declared_microusd) {
+            Some(amount_microusd) => ProviderCost::Declared(DeclaredCost {
+                amount_microusd,
+                currency: cost_currency.to_owned(),
+            }),
+            None => ProviderCost::Unavailable,
+        }
+    }
+}
+
+/// 上游报出来的金额 → 微单位整数。
+///
+/// **换算**这一步不经过浮点：钱乘 1e6 会在边界上悄悄差 1 微单位，而这种差正是"成本对不上账"
+/// 的来源。（JSON 数字本身由 `serde_json` 按双精度解出，那点误差要到十亿量级的金额才会碰到
+/// 微单位，远超这类金额的实际范围。）
+///
+/// 除数字外还接受**字符串形态与指数写法**：这只是**容忍上游的表示差异**——同一家的响应形状
+/// 会随版本变，把可读的金额读出来总好过凭空记一笔成本缺口。它**不是行为承诺**：上游没有承诺
+/// 过用哪种写法，平台也不因此就"支持"了这些形态，读不出来照样按"没拿到"处理。
+///
+/// 负数是上游在说"这笔倒找钱"，平台没有可记的对应事实，按"没拿到"处理。
+fn declared_microusd(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => parse_decimal_microusd(&number.to_string()),
+        Value::String(text) => parse_decimal_microusd(text),
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// 十进制字面量 → 微单位（小数超过 6 位时四舍五入到第 6 位）。
+///
+/// 判不出确切金额的一律返回 `None`：非数字、负数、指数越界、超出 `u64` 范围。
+/// 只有"上游明说这笔是 0"才得到 `0`——它和"没有金额"是两件事。
+fn parse_decimal_microusd(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.trim().parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    if mantissa.starts_with('-') {
+        return None;
+    }
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (mantissa, ""),
+    };
+    if integer.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    // 数字串去掉小数点，再按 10 的幂移到微单位：金额 × 1e6 = 数字 × 10^(指数 − 小数位数 + 6)。
+    let digits = format!("{integer}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let digits = digits.parse::<u128>().ok()?;
+    let shift = exponent - i32::try_from(fraction.len()).ok()? + 6;
+    let scaled = if shift >= 0 {
+        digits.checked_mul(10_u128.checked_pow(u32::try_from(shift).ok()?)?)?
+    } else {
+        let dropped = usize::try_from(-shift).ok()?;
+        let divisor = 10_u128.checked_pow(u32::try_from(dropped).ok()?)?;
+        let quotient = digits / divisor;
+        // 四舍五入：余数到半个除数就进位。够不到半微单位时结果就是 0，不是"猜了一个数"。
+        if (digits % divisor) * 2 >= divisor {
+            quotient + 1
+        } else {
+            quotient
+        }
+    };
+    u64::try_from(scaled).ok()
 }
 
 async fn read_body(response: reqwest::Response) -> Result<Bytes, AdapterError> {
@@ -1172,6 +1264,83 @@ mod tests {
         let parsed: TaskEnvelope = serde_json::from_value(body).expect("parses");
         let error = parsed.data.usage().expect_err("absent usage must fail");
         assert!(error.to_string().contains("no token usage"), "{error}");
+    }
+
+    /// 造一条带（或不带）`cost` 的终态任务：`None` 表示响应里**根本没有这个字段**。
+    fn task_with_cost(cost: Option<Value>) -> TaskData {
+        let mut body = serde_json::json!({
+            "data": {
+                "id": "task-x",
+                "status": "completed",
+                "usage": full_usage(),
+                "result": {"images": [{"url": ["https://example.invalid/a.png"]}]}
+            }
+        });
+        if let Some(cost) = cost {
+            body["data"]["cost"] = cost;
+        }
+        let parsed: TaskEnvelope = serde_json::from_value(body).expect("task envelope parses");
+        parsed.data
+    }
+
+    /// 终态声明的 `cost` **直接取用**：精确换成微单位，不按费率自算，也不经过浮点。
+    /// 币种跟着**渠道声明**走——金额本身不带币种，所以这里不假定任何币种。
+    #[test]
+    fn a_declared_cost_is_taken_verbatim_in_micro_units() {
+        let declared = |currency: &str| {
+            ProviderCost::Declared(DeclaredCost {
+                amount_microusd: 11_354,
+                currency: currency.to_owned(),
+            })
+        };
+        // 实测样例：cost = 0.011354（含账号折扣，比自算权威）。
+        let data = task_with_cost(Some(serde_json::json!(0.011354)));
+        assert_eq!(data.provider_cost("USD"), declared("USD"));
+        assert_eq!(data.provider_cost("CNY"), declared("CNY"));
+        // 字符串形态的金额同样读得出来（有些上游把金额写成字符串）。
+        let data = task_with_cost(Some(serde_json::json!("0.011354")));
+        assert_eq!(data.provider_cost("USD"), declared("USD"));
+    }
+
+    /// 拿不到金额就**不猜**：缺字段、显式 null、负数、非数字一律记 `unavailable`——
+    /// 不写 0、不用"token × 费率"顶替、也不用上一次的值。
+    #[test]
+    fn a_cost_it_cannot_read_is_never_guessed() {
+        for unreadable in [
+            None,
+            Some(Value::Null),
+            Some(serde_json::json!(-0.01)),
+            Some(serde_json::json!("n/a")),
+            Some(serde_json::json!([0.01])),
+        ] {
+            let data = task_with_cost(unreadable.clone());
+            assert_eq!(
+                data.provider_cost("USD"),
+                ProviderCost::Unavailable,
+                "{unreadable:?} 不是可读的金额，不许被猜成一个数"
+            );
+        }
+    }
+
+    /// 十进制换算：小数位、指数形式与四舍五入都要准——钱差 1 微单位就是对不上账。
+    #[test]
+    fn decimal_amounts_convert_to_micro_units_exactly() {
+        assert_eq!(parse_decimal_microusd("0.011354"), Some(11_354));
+        assert_eq!(parse_decimal_microusd("0.00476"), Some(4_760));
+        assert_eq!(parse_decimal_microusd("1"), Some(1_000_000));
+        assert_eq!(parse_decimal_microusd("12.5"), Some(12_500_000));
+        assert_eq!(parse_decimal_microusd("1e-6"), Some(1));
+        assert_eq!(parse_decimal_microusd("2.5e-7"), Some(0), "不足半微单位");
+        assert_eq!(parse_decimal_microusd("0.0000005"), Some(1), "半微单位进位");
+        assert_eq!(parse_decimal_microusd("0"), Some(0), "上游明说这笔是 0");
+        assert_eq!(parse_decimal_microusd("0.000"), Some(0));
+        for unreadable in ["", "-1", "+", "abc", "1.2.3", "1e", "0.1e-1000", "1e99999"] {
+            assert_eq!(
+                parse_decimal_microusd(unreadable),
+                None,
+                "`{unreadable}` 读不出确切金额"
+            );
+        }
     }
 
     #[test]
@@ -1621,6 +1790,7 @@ mod tests {
                 "image_urls": [format!("data:image/png;base64,{payload}")]
             }),
             platform_parameters: vec!["image_urls".to_owned()],
+            cost_currency: "USD".to_owned(),
         };
         assert!(
             ApimartImageAdapter::ensure_total_upload_within_limit(&inline("A".repeat(1024)))
@@ -1665,6 +1835,7 @@ mod tests {
             branch: ImageBranch::PromptOnly,
             native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
             platform_parameters: Vec::new(),
+            cost_currency: "USD".to_owned(),
         };
         let Value::Object(parameters) = &mut prepared.native_parameters else {
             panic!("fixture parameters must be an object");
@@ -1706,6 +1877,7 @@ mod tests {
                 "images": [inline]
             }),
             platform_parameters: Vec::new(),
+            cost_currency: "USD".to_owned(),
         };
         // `http://127.0.0.1:1` 上没有任何东西可以连：一旦它真去上传就会失败，
         // 因此这个用例通过本身就证明 data URL 没有被拿去上传。
@@ -1737,6 +1909,7 @@ mod tests {
                 "mask_url": "data:image/png;base64,BBBB"
             }),
             platform_parameters: vec!["image_urls".to_owned(), "mask_url".to_owned()],
+            cost_currency: "USD".to_owned(),
         };
         // 换算结果由 `resolve_images` 给出：这里只验装配（顺序与参数名逐字保持）。
         let mut resolved = Map::new();

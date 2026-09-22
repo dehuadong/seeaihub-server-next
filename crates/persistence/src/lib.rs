@@ -1116,6 +1116,7 @@ impl HubRepository for PgHubRepository {
             evidence,
             charge_microusd,
             provider_trace_id,
+            provider_cost,
         } = completion;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
@@ -1147,11 +1148,19 @@ impl HubRepository for PgHubRepository {
         }
         let evidence_json = serde_json::to_value(&evidence)
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+        // 成本事实与计量证据**分开落**：计量事实是上游给的分项 token（在 `metering_evidence`
+        // 里），成本是渠道报的钱或平台按实际用量自算的钱，只进毛利口径，不改对客金额。
+        // 折算后 CNY 这一项由定价侧填——汇率还没有落点，所以这一片是"没有折算值"（NULL），
+        // 不是 0，也不是用某个自己发明的分母算出来的数。
+        let provider_cost_amount = provider_cost.amount_microusd.map(to_i64).transpose()?;
+        let provider_cost_cny = provider_cost.cny_microusd.map(to_i64).transpose()?;
         sqlx::query(
             r#"
             UPDATE generation.attempts
             SET state = 'succeeded', response_digest = $3, metering_evidence = $4,
-                provider_trace_id = $5, completed_at = now()
+                provider_trace_id = $5, provider_cost_microusd = $6,
+                provider_cost_currency = $7, provider_cost_source = $8,
+                provider_cost_cny_microusd = $9, completed_at = now()
             WHERE id = $1 AND job_id = $2 AND state = 'submitting'
             "#,
         )
@@ -1160,6 +1169,10 @@ impl HubRepository for PgHubRepository {
         .bind(&evidence.provider_response_digest)
         .bind(&evidence_json)
         .bind(&provider_trace_id)
+        .bind(provider_cost_amount)
+        .bind(&provider_cost.currency)
+        .bind(provider_cost.source.as_str())
+        .bind(provider_cost_cny)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;

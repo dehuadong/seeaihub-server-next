@@ -1,20 +1,20 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, ImageAdapter, PreparedImageRequest, ProviderCredential,
-    ProviderSuccess, RetrySafety,
+    AdapterDescriptor, AdapterError, ImageAdapter, PreparedImageRequest, ProviderCost,
+    ProviderCredential, ProviderSuccess, RetrySafety,
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
     AccountId, AttemptId, CreateImageGeneration, GenerationJob, ImageBranch, ImageParameterKind,
     JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
-    PublishedModel, PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_enum_maps,
-    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
-    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
-    declared_field_names, declared_parameter_names, declared_reference_image_limit,
-    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
-    declares_reference_image_parameter, is_used_parameter_value, place_image_inputs,
-    platform_image_parameters,
+    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
+    RuntimeRevisionId, apply_enum_maps, apply_parameter_defaults, apply_parameter_renames,
+    apply_size_mapping, carries_parameter, contract_image_parameter_kind, contract_model_identity,
+    declared_defaults, declared_enum_maps, declared_field_names, declared_parameter_names,
+    declared_reference_image_limit, declared_renames, declared_size_mapping,
+    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
+    is_used_parameter_value, place_image_inputs, platform_image_parameters,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
@@ -725,6 +725,9 @@ pub struct CompleteJob {
     pub charge_microusd: u64,
     /// 上游逐请求标识，写入 `attempts.provider_trace_id` 供人工对账。
     pub provider_trace_id: Option<String>,
+    /// 这次执行看到的**成本事实**（成本平面，原币种）。与 `evidence` 并列但**不是同一件事**：
+    /// 计量事实是上游给的分项 token，成本只进毛利口径，不改对客金额。
+    pub provider_cost: ProviderCostFact,
 }
 
 #[derive(Debug, Clone)]
@@ -1316,9 +1319,12 @@ impl RuntimeService {
                 "provider_kind, adapter_key and provider_model_id must not be empty".to_owned(),
             ));
         }
-        if offering.rates.currency != "USD" {
+        // 成本币种**按渠道/供给自己声明的那个值接受**，不假定 USD：四档费率表本来就是按渠道
+        // 各自记、按该渠道币种标注的，硬写"必须是 USD"等于替渠道改币种。
+        // "这个币种在汇率表里有折算率"是定价侧的事，等汇率表落地时才在这里校验。
+        if offering.rates.currency.trim().is_empty() {
             return Err(ApplicationError::Validation(
-                "price currency must be USD for microUSD rates".to_owned(),
+                "price currency must not be empty".to_owned(),
             ));
         }
         let price_source = url::Url::parse(&offering.price_source_url)
@@ -1885,6 +1891,15 @@ impl WorkerService {
                 &claimed.job.offering.carrier_schema,
                 claimed.job.branch,
             ),
+            // 成本币种是**受理时冻结的那份渠道声明**（价格快照里就有）：上游报出来的金额不带
+            // 币种，Driver 拿不到"这个数是什么钱"，只能把这份声明原样带回来。取值只经这一个
+            // 访问点——受理、执行、落账三处各拼一遍链，改一处就会漏一处。
+            cost_currency: claimed
+                .job
+                .offering
+                .price_snapshot
+                .cost_currency()
+                .to_owned(),
         };
         let request_digest = request_digest(&prepared)?;
         self.repository
@@ -2025,6 +2040,7 @@ impl WorkerService {
         attempt_id: AttemptId,
         success: ProviderSuccess,
     ) -> Result<(), ApplicationError> {
+        // 对客扣费（对客平面）：读受理时冻结的对客费率快照，只决定向消费者收多少。
         let charge = job
             .offering
             .price_snapshot
@@ -2042,6 +2058,17 @@ impl WorkerService {
                 "provider returned no image".to_owned(),
             ));
         }
+        // 自算成本（成本平面）：**另起一路**按该渠道的成本费率算，不复用上面那份对客扣费。
+        // 今天价格计划表暂时兼作渠道成本费率，两条路算出来的数相同；但对客费率一旦拆成自己的
+        // CNY 向量，复用就会让成本跟着售价漂移——上游成本与售价本来就是两个量。
+        let cost_rates = job.offering.price_snapshot.cost_rates();
+        let computed = ComputedCost {
+            currency: cost_rates.currency.clone(),
+            amount_microusd: cost_rates
+                .amount_microusd(&success.usage)
+                .map_err(|error| ApplicationError::Reconciliation(error.to_string()))?,
+        };
+        let provider_cost = provider_cost_fact(success.provider_cost, computed);
         self.repository
             .complete_job(CompleteJob {
                 job_id: job.id,
@@ -2055,8 +2082,50 @@ impl WorkerService {
                 },
                 charge_microusd: charge,
                 provider_trace_id: success.provider_trace_id,
+                provider_cost,
             })
             .await
+    }
+}
+
+/// 这次执行的**自算成本**（成本平面）：金额与币种。
+///
+/// 它是"本次实际分项 token × 该渠道成本费率"的结果，**只服务 `computed` 这一态**：
+/// `declared` 的金额与币种都取上游随金额报回的那一份声明，`unavailable` 两样都留空——
+/// 这两条来源都不认这份输入，所以它不是"传了但没用上"，而是"本就不属于它们"。
+struct ComputedCost {
+    /// 渠道声明的成本币种（受理时随请求冻结的那一份声明）。
+    currency: String,
+    /// 本次实际分项 token × 该渠道成本费率。
+    amount_microusd: u64,
+}
+
+/// 把 Driver 报出来的成本事实定成落库口径。
+///
+/// 判据是**成本从哪来**，不是"金额对不对"：
+/// - 上游直接给了金额 ⇒ `declared`，**直接取它**（含渠道侧折扣，比自算权威），币种也取它报的；
+/// - 这条渠道不给金额字段 ⇒ `computed`，按**本次实际用量**与该渠道**成本费率**自算，币种按渠道声明；
+/// - 本该有金额却拿不到 ⇒ `unavailable`，金额与币种**留空**：不写 0、不用自算顶替。
+///
+/// 币种的权威**分来源**：`declared` 认上游报回来的那一份，`computed` 认渠道声明的成本币种
+/// （两处在实践中同源，但"以哪一份为准"必须只有一个答案）；所以没有"一个入参管三态"这回事。
+///
+/// 折算后 CNY 这一项留给定价侧：折算要用受理时冻结的汇率，而汇率还没有落点，
+/// 这一片**不自己发明**一个分母，所以这里恒为 `None`（不是"折算成了 0"）。
+fn provider_cost_fact(report: ProviderCost, computed: ComputedCost) -> ProviderCostFact {
+    // 三态在 SDK 与领域各有一套写法，来源一律经那一处映射取，不在这里再判一次。
+    let source = ProviderCostSource::from(&report);
+    // 形状只有一条规则：有金额的来源两样都在，`unavailable` 两样都不在。
+    let (amount_microusd, currency) = match report {
+        ProviderCost::Declared(cost) => (Some(cost.amount_microusd), Some(cost.currency)),
+        ProviderCost::Computed => (Some(computed.amount_microusd), Some(computed.currency)),
+        ProviderCost::Unavailable => (None, None),
+    };
+    ProviderCostFact {
+        source,
+        amount_microusd,
+        currency,
+        cny_microusd: None,
     }
 }
 
@@ -4247,6 +4316,8 @@ mod tests {
                 },
                 response_digest: "provider-response-digest".to_owned(),
                 provider_trace_id: Some("provider-request-1".to_owned()),
+                // 这条假 Driver 扮的是"不给金额字段"的渠道：成本由平台按实际用量自算。
+                provider_cost: ProviderCost::Computed,
             })
         }
     }
@@ -4320,7 +4391,11 @@ mod tests {
     #[tokio::test]
     async fn worker_settles_the_provider_image_envelope_with_the_evidence() {
         let events = Arc::new(Mutex::new(Vec::new()));
-        let repository = Arc::new(WorkerRepository::new(worker_job(20_000), events.clone()));
+        let job = worker_job(20_000);
+        // 成本侧要算的两个数（费率与币种）先从 Job 快照里取出来：断言得按**成本那一侧**的
+        // 入口独立算一遍，而不是照抄实现里那个数——照抄的话，把对客金额接回来也照样过。
+        let snapshot = job.offering.price_snapshot.clone();
+        let repository = Arc::new(WorkerRepository::new(job, events.clone()));
         let adapter = Arc::new(WorkerAdapter {
             succeeds: true,
             calls: AtomicUsize::new(0),
@@ -4341,6 +4416,24 @@ mod tests {
             .take()
             .expect("job must complete");
         assert_eq!(completion.evidence.usage.total_tokens, 205);
+        let expected_cost = snapshot
+            .cost_rates()
+            .amount_microusd(&completion.evidence.usage)
+            .expect("the channel cost rates must price the actual usage");
+        // 9 文本输入 × 5 + 196 图像输出 × 30（每 1M）。
+        assert_eq!(expected_cost, 5_925);
+        assert_eq!(
+            completion.provider_cost,
+            ProviderCostFact {
+                source: ProviderCostSource::Computed,
+                amount_microusd: Some(expected_cost),
+                currency: Some(snapshot.cost_currency().to_owned()),
+                cny_microusd: None,
+            },
+            "渠道不报金额时，成本按**本次实际用量 × 该渠道成本费率**自算，币种按渠道声明"
+        );
+        // 对客扣费走的是另一条入口（对客费率）。今天价格计划表暂时兼作成本费率，两个数恰好
+        // 相同；它们仍是两个量——对客费率拆出去之后，成本不能跟着售价走。
         assert_eq!(completion.charge_microusd, 5_925);
         assert_eq!(
             completion.images,
@@ -4348,6 +4441,115 @@ mod tests {
             "结果信封必须原样落到 Job：渠道给 base64 就留 base64"
         );
         assert!(repository.failure.lock().expect("failure lock").is_none());
+    }
+
+    /// 成本来源的判定：上游给金额就**直接取**，渠道不报就按实际用量自算，拿不到就留空（不猜）。
+    #[test]
+    fn provider_cost_source_follows_where_the_cost_came_from() {
+        // 声明分支：金额与币种**都取上游随金额报回的那一份**。自算那份输入（这里故意填一个
+        // 不同的币种与金额）不参与这一态——不是"传了却忘了用"，是这条来源本就不认它。
+        let declared = provider_cost_fact(
+            ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+                amount_microusd: 11_354,
+                currency: "CNY".to_owned(),
+            }),
+            ComputedCost {
+                currency: "USD".to_owned(),
+                amount_microusd: 999_999,
+            },
+        );
+        assert_eq!(declared.source, ProviderCostSource::Declared);
+        assert_eq!(
+            declared.amount_microusd,
+            Some(11_354),
+            "上游给了金额就直接取它，不许用自算值顶替"
+        );
+        assert_eq!(
+            declared.currency.as_deref(),
+            Some("CNY"),
+            "币种按上游报的那一份，不取渠道声明的成本币种、也不假定 USD"
+        );
+
+        let computed = provider_cost_fact(
+            ProviderCost::Computed,
+            ComputedCost {
+                currency: "CNY".to_owned(),
+                amount_microusd: 5_925,
+            },
+        );
+        assert_eq!(computed.source, ProviderCostSource::Computed);
+        assert_eq!(computed.amount_microusd, Some(5_925));
+        assert_eq!(computed.currency.as_deref(), Some("CNY"));
+
+        let unavailable = provider_cost_fact(
+            ProviderCost::Unavailable,
+            ComputedCost {
+                currency: "USD".to_owned(),
+                amount_microusd: 5_925,
+            },
+        );
+        assert_eq!(unavailable.source, ProviderCostSource::Unavailable);
+        assert_eq!(
+            unavailable.amount_microusd, None,
+            "拿不到金额就留空，不许写 0"
+        );
+        assert_eq!(unavailable.currency, None);
+        // 折算值留给定价侧：这一片还没有汇率，所以是"没有折算值"，不是"折算成了 0"。
+        for fact in [&declared, &computed, &unavailable] {
+            assert_eq!(fact.cny_microusd, None);
+        }
+    }
+
+    /// 记进成本列的是**按渠道成本费率自算的成本**，不是对客扣费。
+    ///
+    /// 把两个口径**人为设成不同的值**：对客那一份模拟"将来由自己的 CNY 费率向量给出"的售价。
+    /// 这条断言防的是"又把对客金额接回来当成本"——那会让成本跟着售价漂移，而两者本来是两个量。
+    #[test]
+    fn the_recorded_computed_cost_is_not_the_consumer_charge() {
+        let cost_rates = PriceRates {
+            currency: "USD".to_owned(),
+            text_input_microusd_per_million: 5_000_000,
+            image_input_microusd_per_million: 8_000_000,
+            text_output_microusd_per_million: 10_000_000,
+            image_output_microusd_per_million: 30_000_000,
+        };
+        let consumer_rates = PriceRates {
+            currency: "CNY".to_owned(),
+            text_input_microusd_per_million: 7_000_000,
+            image_input_microusd_per_million: 9_000_000,
+            text_output_microusd_per_million: 11_000_000,
+            image_output_microusd_per_million: 40_000_000,
+        };
+        let usage = TokenUsage {
+            input_tokens: 9,
+            input_text_tokens: 9,
+            input_image_tokens: 0,
+            output_tokens: 196,
+            output_text_tokens: 0,
+            output_image_tokens: 196,
+            total_tokens: 205,
+        };
+        let cost = cost_rates
+            .amount_microusd(&usage)
+            .expect("cost rates price the usage");
+        let charge = consumer_rates
+            .amount_microusd(&usage)
+            .expect("consumer rates price the usage");
+        assert_ne!(cost, charge, "用例得先让两个口径真的不同");
+
+        let fact = provider_cost_fact(
+            ProviderCost::Computed,
+            ComputedCost {
+                currency: cost_rates.currency.clone(),
+                amount_microusd: cost,
+            },
+        );
+        assert_eq!(
+            fact.amount_microusd,
+            Some(cost),
+            "成本列记的是渠道成本费率算出来的钱"
+        );
+        assert_ne!(fact.amount_microusd, Some(charge), "成本列不许记对客扣费");
     }
 
     #[tokio::test]

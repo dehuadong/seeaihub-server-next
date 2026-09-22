@@ -88,7 +88,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
        ├─ ImageAdapter::execute ─────────────────────►  crates/adapter-aihubmix / adapter-apimart
        │     ② 的内部：data URL 就地解码、公网 URL 取用或透传、提交、轮询、抽计量证据、分类错误
        ├─ 成功：结果信封写回 Job → complete_job          crates/application  complete_success
-       │     写 Metering Evidence、捕获预授权             crates/persistence  complete_job
+       │     写 Metering Evidence、记渠道成本事实、捕获预授权  crates/persistence  complete_job
        └─ 失败：failure_from_adapter 决定处置            crates/application
              ├─ 对客码按责任方派生（渠道码与原文只留内部）  crates/application  public_error_code
              ├─ 可证明未受理 / 确定性拒绝 → failed + 释放预授权
@@ -111,7 +111,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `publication.gateway_models` | 网关模型的**运维开关**：这个名字现在开着吗、谁在什么时候改的。**定义不在这里**（候选集、合同、定价只在不可变修订里） | `RuntimeService::publish`（首次发布落行）、`set_gateway_model_enabled` |
 | `generation.jobs` | 受理时的请求事实、所选供给、价格快照、结果信封（渠道给的 `url` 或 `b64_json`）、对客错误码与平台侧失败类别；**对客不可见** | `GenerationService::create`、`complete_job`、`fail_job`、`recover_expired_leases` |
 | `generation.routing_decisions` | 受理时为什么选了它（候选、优先级、是否合格） | 与 Job 同事务写入 |
-| `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据** | `begin_attempt`、`complete_job`、`fail_job` |
+| `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据**、**渠道成本事实**（来源 `computed`/`declared`/`unavailable` + 原币种金额 + 该渠道声明的币种 + 折算后 CNY） | `begin_attempt`、`complete_job`、`fail_job` |
 | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 余额、预授权、账目 | `create_job`（hold）、`complete_job`（capture）、`fail_job`（release） |
 | `identity.api_keys` | API Key 摘要 | `IdentityService` |
 | `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计 | `fail_job`、`ReconciliationService` |
@@ -129,10 +129,10 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/domain/src/image_parameters.rs` | 图片参数的**唯一**一份规则：调用方契约字段（`image`/`image_urls`/`mask`）、候选声明参数名的判定（名字以 `image` 开头＝参考图、含 `mask`＝遮罩）、`null`/空串＝这一处没有图、把调用方的图落到候选声明的参数名上 | IO；也不认识任何**具体渠道**（参数名本身按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G1） |
 | `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService`）、端口 trait、发布期校验（含"限制只能收窄"）、候选选择、错误→处置映射与对客错误码派生 | SQL、HTTP、上游协议 |
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射 | 业务判定（只执行用例给出的结论） |
-| `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、`ProviderCallError`、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
-| `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类 | 平台侧的生命周期与计费规则 |
-| `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance` | 同上；上游声明的 `cost`/`credits_cost` **不进平台证据**（计费事实由分项 token 推出，金额只在渠道事实台账里作为成本口径记录） |
-| `migrations/0001_initial.sql`…`0007_gateway_model_naming.sql` | 表结构与约束（含"每型号每个优先级一个活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`） | 运行时的业务规则 |
+| `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
+| `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
+| `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
+| `migrations/0001_initial.sql`…`0008_attempt_provider_cost.sql` | 表结构与约束（含"每型号每个优先级一个活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
 | `scripts/decisions/*.mjs` | Agent Notes 的索引生成与一致性检查 | 不影响服务运行 |
 | `docs/design/`、`docs/adr/` | 设计与决策的权威位置 | — |

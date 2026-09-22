@@ -4,7 +4,7 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
     AdapterDescriptor, AdapterError, DecodedImage, GeneratedImage, ImageAdapter,
-    PreparedImageRequest, ProviderCallError, ProviderCredential, ProviderFailureKind,
+    PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind,
     ProviderSuccess, RetrySafety, decode_data_url, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
@@ -729,6 +729,10 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
         usage,
         response_digest: digest,
         provider_trace_id,
+        // 这条渠道的响应里**没有任何金额字段**（计量只给四分项 token）：成本只能由平台按
+        // 实际用量与该渠道**成本费率**自算，所以这里明确报"这条渠道不给金额字段"，而不是
+        // 报一个空的金额——"本就不报"与"报了没拿到"是两件事，处置也不同。
+        provider_cost: ProviderCost::Computed,
     })
 }
 
@@ -911,6 +915,7 @@ mod tests {
                 "quality": "low"
             }),
             platform_parameters: platform_image_parameters(schema, branch),
+            cost_currency: "USD".to_owned(),
         }
     }
 

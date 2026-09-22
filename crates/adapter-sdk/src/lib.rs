@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
 use bytes::Bytes;
-use seeai_domain::{ImageBranch, TokenUsage};
+use seeai_domain::{ImageBranch, ProviderCostSource, TokenUsage};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use std::fmt::{Debug, Formatter};
@@ -50,6 +50,13 @@ pub struct PreparedImageRequest {
     /// 名单与 [`PreparedImageRequest::native_parameters`] 是同一份快照的两半：前者说"哪些名字
     /// 是平台的"，后者说"这些名字下的取值是什么"，两者都来自受理时固化的那一次请求。
     pub platform_parameters: Vec<String>,
+    /// 这条渠道**声明的成本币种**（受理时随请求冻结，与供给声明同源）。
+    ///
+    /// 上游报出来的金额本身不带币种，所以 Driver 拿不到"这个数是什么钱"——它只能把受理时
+    /// 冻结的那份声明带回来。这里**不假定任何币种**（USD 也只是某个渠道的声明值）。
+    ///
+    /// 它不参与请求摘要：币种不改变发往上游的任何字节，换一个币种不是另一次请求。
+    pub cost_currency: String,
 }
 
 /// 一次生成的一张图：**渠道给什么就是什么**——给 `url` 就留 `url`、给 base64 就留 `b64_json`。
@@ -139,6 +146,52 @@ pub struct ProviderSuccess {
     /// 平台把它落到已存在的 `attempts.provider_trace_id` 列。注意：本仓库**只用它做人工
     /// 对账**，不用它自动把结果取回来（那需要另一套模型与列）——创建响应失联一律进对账。
     pub provider_trace_id: Option<String>,
+    /// 这次执行看到的**成本事实**（成本平面，币种按渠道声明）。
+    ///
+    /// 它是**成本口径**，不是计量证据：计量事实仍然是 [`ProviderSuccess::usage`] 的四分项
+    /// token，成本不替代它，也不参与对客金额。
+    pub provider_cost: ProviderCost,
+}
+
+/// 上游终态直接给出的成本金额。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeclaredCost {
+    /// 上游给的金额，按**该渠道声明的币种**的微单位（1e-6）。
+    pub amount_microusd: u64,
+    /// 该渠道声明的成本币种（受理时随请求冻结的那一份声明）。
+    pub currency: String,
+}
+
+/// 一次执行看到的成本事实：判据是"成本从哪来"，不是"金额对不对"。
+///
+/// 做成三态而不是"可选金额"，是为了让两种"没有金额"分开：**这条渠道不报金额**（成本只能由
+/// 平台自算）与**本该报却这次没拿到**（不得猜测）的处置完全不同——合成一个 `None`，前者会被
+/// 误记成成本缺口，后者会被自算的费率悄悄顶替。
+///
+/// 三个成员名与领域侧 [`ProviderCostSource`] 的取值**逐字对齐**（`computed` / `declared` /
+/// `unavailable`）：同一件事在两层只换一个类型，不换名字，免得读的人以为它们是两套判据。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderCost {
+    /// 上游直接给了金额：**取它，不自己算**（含渠道侧折扣，比自算更权威）。
+    Declared(DeclaredCost),
+    /// 这条渠道**不给金额字段**：成本由平台按实际用量与该渠道**成本费率**自算。
+    Computed,
+    /// 本该有金额，这次却拿不到（缺字段 / 负数 / 解析失败）：**不得猜测**，留作成本缺口。
+    Unavailable,
+}
+
+/// SDK 的报告 → 领域的成本来源：**唯一的**一处映射。
+///
+/// 两层的取值面是同一件事的两种写法，所以转换只写在这里：调用方拿它取来源，不必再对
+/// [`ProviderCost`] 判一次三态——判两处就会各自漂移，而漂移的表现是同一笔成本被记成两种来源。
+impl From<&ProviderCost> for ProviderCostSource {
+    fn from(report: &ProviderCost) -> Self {
+        match report {
+            ProviderCost::Declared(_) => Self::Declared,
+            ProviderCost::Computed => Self::Computed,
+            ProviderCost::Unavailable => Self::Unavailable,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

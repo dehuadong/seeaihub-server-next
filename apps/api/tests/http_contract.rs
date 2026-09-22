@@ -84,6 +84,9 @@ struct UpstreamBehaviour {
     upload_failure_status: u16,
     submit: SubmitBehaviour,
     sync_image: SyncImageShape,
+    /// 任务终态里声明的成本：`None` 表示响应里**根本没有这个字段**（渠道没给），
+    /// 负数与非数字则覆盖"声明了却拿不到"的形态。取值是实测样例。
+    declared_cost: Option<Value>,
 }
 
 impl UpstreamBehaviour {
@@ -96,6 +99,7 @@ impl UpstreamBehaviour {
             upload_failure_status: 0,
             submit: SubmitBehaviour::Accepted,
             sync_image: SyncImageShape::Url,
+            declared_cost: Some(json!(0.011354)),
         }
     }
 
@@ -280,14 +284,12 @@ async fn serve_fake_upstream(
         } else {
             "completed"
         };
-        let payload = serde_json::to_vec(&json!({
+        let mut task = json!({
             "code": 200,
             "data": {
                 "id": "task-contract-1",
                 "status": status,
                 "progress": 100,
-                "cost": 0.00476,
-                "credits_cost": 0.0476,
                 "result": {"images": [{"url": [format!("http://127.0.0.1:{port}/result.png")], "expires_at": 4_000_000_000u64}]},
                 "usage": {
                     "input_tokens": 14,
@@ -297,8 +299,13 @@ async fn serve_fake_upstream(
                     "total_tokens": 210
                 }
             }
-        }))
-        .expect("task body");
+        });
+        // 成本字段按用例配置给：`None` 就是响应里**没有它**。
+        if let Some(cost) = &behaviour.declared_cost {
+            task["data"]["cost"] = cost.clone();
+            task["data"]["credits_cost"] = json!(0.0476);
+        }
+        let payload = serde_json::to_vec(&task).expect("task body");
         return write_response(socket, 200, "OK", "application/json", &payload).await;
     }
 
@@ -571,17 +578,20 @@ impl Harness {
             provider_kind,
             adapter_key,
             &["prompt_only", "image_conditioned", "masked"],
+            None,
             behaviour,
             64,
         )
         .await
     }
 
-    /// 同 `start`，但指定分支、命名与并发上限。
+    /// 同 `start`，但指定分支、命名与并发上限；`currency` 给 `Some` 时让这条供给**自己声明**
+    /// 一个成本币种（不再假定 USD），不给就用素材里的那份声明。
     async fn start_with(
         provider_kind: &str,
         adapter_key: &str,
         branches: &[&str],
+        currency: Option<&str>,
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
     ) -> Self {
@@ -591,6 +601,9 @@ impl Harness {
         };
         let mut draft = candidate(provider_kind, adapter_key, branches);
         draft["credential_env"] = Value::String(credential_env.to_owned());
+        if let Some(currency) = currency {
+            draft["price_plan"]["currency"] = Value::String(currency.to_owned());
+        }
         Self::start_with_draft(draft, None, behaviour, max_concurrent_jobs).await
     }
 
@@ -734,6 +747,40 @@ impl Harness {
     /// 假上游记录下来的请求。
     fn recorded(&self) -> Vec<UpstreamCall> {
         self.calls.lock().expect("calls lock").clone()
+    }
+
+    /// 这次执行留下的**成本事实**四列：原币种金额、币种、来源、折算后 CNY。
+    async fn attempt_cost(
+        &self,
+        job_id: Uuid,
+    ) -> (Option<i64>, Option<String>, Option<String>, Option<i64>) {
+        let row = sqlx::query(
+            "SELECT provider_cost_microusd, provider_cost_currency, provider_cost_source, \
+             provider_cost_cny_microusd FROM generation.attempts WHERE job_id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("the request must have created an attempt record");
+        (
+            row.try_get("provider_cost_microusd").expect("cost amount"),
+            row.try_get("provider_cost_currency")
+                .expect("cost currency"),
+            row.try_get("provider_cost_source").expect("cost source"),
+            row.try_get("provider_cost_cny_microusd")
+                .expect("cost in CNY"),
+        )
+    }
+
+    /// 这次结算**实际扣了对客多少钱**（账本是权威，取 capture 分录的金额）。
+    async fn captured_microusd(&self, job_id: Uuid) -> i64 {
+        sqlx::query_scalar(
+            "SELECT amount_microusd FROM ledger.entries WHERE job_id = $1 AND kind = 'capture'",
+        )
+        .bind(job_id)
+        .fetch_one(&self.pool)
+        .await
+        .expect("a settled job must have a capture entry")
     }
 
     /// 某个路径上**最近一次**记录到的生成请求体（JSON 形态）。
@@ -1371,6 +1418,22 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
         "the upstream task id must be persisted for manual reconciliation"
     );
 
+    // 成本事实：上游终态**直接声明了金额**，所以直接取它（含渠道侧折扣，比自算权威）；
+    // 币种是**该供给声明的**那个，不假定 USD。折算值这一片不写——汇率还没有落点。
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(source.as_deref(), Some("declared"));
+    assert_eq!(amount, Some(11_354), "实测样例 cost = 0.011354");
+    assert_eq!(currency.as_deref(), Some("USD"));
+    assert_eq!(cny, None, "折算要用受理时冻结的汇率，这一片还没有它");
+
+    // 采集成本**不改对客金额**：实收仍是该渠道费率 × 实际分项 token
+    // （14 文本输入 × 5 + 196 图像输出 × 30 = 5950 微单位），与上游声明的 11354 是两个量。
+    assert_eq!(
+        harness.captured_microusd(job_id).await,
+        -5_950,
+        "上游声明的金额只进成本口径，不许动对客实收"
+    );
+
     // Driver 的线上请求：只提交一次，且参数在顶层（无 extra 包装）。
     assert_eq!(
         harness.count("POST", "/v1/images/generations"),
@@ -1388,6 +1451,117 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     assert!(
         harness.count("GET", "/v1/tasks/") >= 1,
         "the driver must poll the task at least once"
+    );
+    harness.cleanup().await;
+}
+
+/// 渠道声明了会给金额，这次却**拿不到**（终态里没有这个字段）⇒ 不猜：
+/// 金额与币种留空、来源记 `unavailable`，缺口查得出来；对客结算照常完成。
+///
+/// 这是"成本缺口"与"执行失败"的分界：缺口是平台侧的账务问题，不该把消费者的钱扣在对账里。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_declared_cost_that_never_arrives_is_recorded_as_a_gap_not_guessed() {
+    let mut behaviour = UpstreamBehaviour::apimart();
+    behaviour.declared_cost = None;
+    let harness = Harness::start(behaviour).await;
+    let key = format!("cost-gap-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "cost never arrives"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("成本缺口", &body);
+
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "成本缺口不是执行失败：对客结算照常完成");
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(source.as_deref(), Some("unavailable"));
+    assert_eq!(amount, None, "拿不到金额就留空：不写 0、也不用费率顶替");
+    assert_eq!(currency, None);
+    assert_eq!(cny, None);
+    // 缺口可发现：按来源筛得出来，不用去翻上游账单才知道有这么一笔。
+    let gaps: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.attempts \
+         WHERE job_id = $1 AND provider_cost_source = 'unavailable'",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("gap query");
+    assert_eq!(gaps, 1);
+    // 对客实收不受成本缺口影响。
+    assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+    harness.cleanup().await;
+}
+
+/// 渠道**不给任何金额字段**（AIHubMix）⇒ 成本按本次实际用量与该渠道四档费率自算，
+/// 币种按该渠道声明。它只进成本口径：对客实收另有出处（账本），两者不是同一个量。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_cost_the_channel_never_reports_is_computed_from_the_actual_usage() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let key = format!("cost-computed-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "computed cost"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("自算成本", &body);
+
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(source.as_deref(), Some("computed"));
+    assert_eq!(currency.as_deref(), Some("USD"));
+    // 实际用量：14 文本输入 × 5 + 196 图像输出 × 30（每 1M） = 5950 微单位。
+    assert_eq!(amount, Some(5_950));
+    assert_eq!(cny, None);
+    assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+    harness.cleanup().await;
+}
+
+/// 币种**按渠道声明接受**：声明 `CNY` 的供给不再被发布期硬拒，落库的币种就是声明值。
+///
+/// 能发布出来本身就证明那条"必须是 USD"的硬校验已经不在了；而成本列里的币种证明它不是
+/// 被平台替换成某个默认币种，而是**照声明的原值**记下来的。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_channel_declared_currency_other_than_usd_is_accepted_and_recorded() {
+    let harness = Harness::start_with(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only"],
+        Some("CNY"),
+        UpstreamBehaviour::apimart(),
+        64,
+    )
+    .await;
+    let key = format!("cost-currency-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "declared currency"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("按声明币种", &body);
+
+    let (job_id, _, _) = harness.job(&key).await;
+    let (amount, currency, source, _) = harness.attempt_cost(job_id).await;
+    assert_eq!(source.as_deref(), Some("declared"));
+    assert_eq!(amount, Some(11_354));
+    assert_eq!(
+        currency.as_deref(),
+        Some("CNY"),
+        "币种权威是该供给声明的那个值，平台不替换成 USD"
     );
     harness.cleanup().await;
 }
@@ -1856,6 +2030,7 @@ async fn concurrent_generations_are_capped() {
         "APIMart",
         "apimart-image-v1",
         &["prompt_only"],
+        None,
         behaviour,
         1,
     )
@@ -2129,8 +2304,15 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
                 _ => UpstreamBehaviour::apimart(),
             }
         };
-        let harness =
-            Harness::start_with(provider_kind, adapter_key, &["prompt_only"], behaviour, 64).await;
+        let harness = Harness::start_with(
+            provider_kind,
+            adapter_key,
+            &["prompt_only"],
+            None,
+            behaviour,
+            64,
+        )
+        .await;
         let key = format!("rejected-{status}-{}", Uuid::new_v4());
         let (http, body) = harness
             .sync_json(
