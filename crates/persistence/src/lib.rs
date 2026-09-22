@@ -821,6 +821,17 @@ impl HubRepository for PgHubRepository {
             .collect()
     }
 
+    /// 读账户余额（权威在数据库那一行，**不读缓存**）。
+    ///
+    /// 这条读服务于运营查看与对账：缓存的值可能滞后、也可能来自对账覆盖，用它当答案会把
+    /// 账实不符读成账实相符。账户不存在返回 [`ApplicationError::NotFound`]。
+    async fn read_account_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<BalanceChange, ApplicationError> {
+        self.account_balance(account_id).await
+    }
+
     async fn create_account(
         &self,
         account_id: AccountId,

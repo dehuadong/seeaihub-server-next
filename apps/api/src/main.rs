@@ -104,6 +104,7 @@ async fn main() -> Result<()> {
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/accounts", post(create_account))
+        .route("/api/v1/accounts/{account_id}", get(read_account_balance))
         .route(
             "/api/v1/accounts/{account_id}/credits",
             post(credit_account),
@@ -204,6 +205,29 @@ async fn credit_account(
         )
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+struct AccountBalanceResponse {
+    balance_microusd: i64,
+    updated_at: DateTime<Utc>,
+}
+
+/// 读账户余额与写入时刻（管理员）。
+///
+/// 读的是 `ledger.accounts` 那一行，**不读缓存**：这条读用于运营对账与查看，缓存里的值可能
+/// 滞后、也可能来自对账覆盖，拿它当答案会把"账实不符"读成"账实相符"。账户不存在返回 404。
+async fn read_account_balance(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<Json<AccountBalanceResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    let change = state.accounts.read_balance(AccountId(account_id)).await?;
+    Ok(Json(AccountBalanceResponse {
+        balance_microusd: change.balance_microusd,
+        updated_at: change.updated_at,
+    }))
 }
 
 #[derive(Debug, Deserialize)]

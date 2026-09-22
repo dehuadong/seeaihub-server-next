@@ -1351,6 +1351,15 @@ pub trait HubRepository: Send + Sync {
         actor: &str,
     ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 读账户**当前**的余额与写入时刻。
+    ///
+    /// 权威是 `ledger.accounts` 那一行，**不读缓存**：这条读服务于运营查看与对账，缓存里的值
+    /// 可能滞后、也可能来自对账覆盖，用它当答案会把账实不符读成账实相符。
+    async fn read_account_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<BalanceChange, ApplicationError>;
+
     async fn create_api_key(
         &self,
         account_id: AccountId,
@@ -1691,6 +1700,17 @@ impl AccountsService {
             .write_balance(&change, BalanceSource::DbCommit)
             .await;
         Ok(())
+    }
+
+    /// 读账户余额与写入时刻（权威在数据库）。
+    ///
+    /// 刻意**不**走加速层：缓存的值可能滞后、也可能来自对账覆盖，而这条读的用途正是查看与
+    /// 对账——把缓存的数当答案，等于在"账实是否相符"这个问题上拿被怀疑的一方作证。
+    pub async fn read_balance(
+        &self,
+        account_id: AccountId,
+    ) -> Result<BalanceChange, ApplicationError> {
+        self.repository.read_account_balance(account_id).await
     }
 }
 
@@ -5976,6 +5996,13 @@ mod tests {
             _amount_microusd: u64,
             _business_key: &str,
             _actor: &str,
+        ) -> Result<BalanceChange, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn read_account_balance(
+            &self,
+            _account_id: AccountId,
         ) -> Result<BalanceChange, ApplicationError> {
             unused_repository()
         }

@@ -8408,6 +8408,82 @@ async fn an_fx_rate_without_an_effective_time_is_stamped_by_the_database_clock()
     harness.cleanup().await;
 }
 
+/// **管理员读余额读的是数据库那一行，不是缓存**。
+///
+/// 这条读服务于运营查看与对账：缓存里的值可能滞后、也可能来自对账覆盖，用它当答案会把
+/// "账实不符"读成"账实相符"。所以这里先把缓存改成一个错的数，读回来的仍必须是库里的值。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_admin_reads_a_balance_from_the_database_not_the_cache() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+    let client = Client::new();
+    let (account_id, _api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 375_000).await;
+
+    // 缓存里放一个错的数：读余额若走缓存，就会读到它而不是库里的 375000。
+    let fresh = harness
+        .cache()
+        .balance(&account_id)
+        .expect("建账户之后缓存里应有余额");
+    let written_at = fresh["written_at"].clone();
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 7, "db_commit", written_at);
+
+    let response = client
+        .get(format!("{}/api/v1/accounts/{account_id}", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("admin balance read");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body: Value = response.json().await.expect("balance JSON");
+    assert_eq!(
+        body["balance_microusd"],
+        json!(375_000),
+        "读的是数据库那一行，不是缓存里的 7：{body}"
+    );
+    assert!(
+        body["updated_at"].is_string(),
+        "要一起给出写入时刻，运营才看得出这个数是什么时候的：{body}"
+    );
+
+    let in_db: i64 =
+        sqlx::query_scalar("SELECT balance_microusd FROM ledger.accounts WHERE id = $1::uuid")
+            .bind(&account_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("account row");
+    assert_eq!(body["balance_microusd"].as_i64(), Some(in_db));
+
+    // 没有管理员凭证：401；账户不存在：404。
+    let response = client
+        .get(format!("{}/api/v1/accounts/{account_id}", harness.base_url))
+        .send()
+        .await
+        .expect("unauthenticated read");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let unknown = Uuid::new_v4();
+    let response = client
+        .get(format!("{}/api/v1/accounts/{unknown}", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("unknown account read");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    harness.cleanup().await;
+}
+
 /// **上游声明的金额直接取，并用冻结的汇率折出人民币**（`declared` 那一态）。
 ///
 /// 上游声明的是 11354 微美元，而按该渠道成本费率自算是 5950——两个数不同，正好钉住"声明就
