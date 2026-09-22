@@ -719,10 +719,17 @@ fn select_candidate(
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
 ) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
-    select_candidate_with_strategy(request, branch, candidates, RouteStrategy::PriorityFailover)
+    // 零配置路径：一条策略都没有时的选路，也就是策略层引入之前的行为。
+    let choice = RouteChoice {
+        strategy: RouteStrategy::PriorityFailover,
+        discount_rates: &BTreeMap::new(),
+        tag_channel_map: &BTreeMap::new(),
+        account_tag: None,
+    };
+    select_candidate_with_strategy(request, branch, candidates, &choice)
 }
 
-/// 同 [`select_candidate`]，但由调用方给出这次受理用哪条**路由策略**。
+/// 同 [`select_candidate`]，但由调用方给出这次受理用什么策略、以及该策略要吃的输入。
 ///
 /// 策略只决定"在一批合格候选里挑哪一条"：候选合格与否仍由承载面与分支/张数判定，策略不改它们，
 /// 也不改选中之后的参数准备与冻结路径。取值空间只有合格候选——不合格的既不进权重之和，也不在
@@ -731,7 +738,7 @@ fn select_candidate_with_strategy(
     request: &CreateImageGenerationRequest,
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
-    strategy: RouteStrategy,
+    choice: &RouteChoice<'_>,
 ) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
         // 该型号没有任何 active 供给 ⇒ 对调用方是"不存在"，不是参数错误。
@@ -778,7 +785,7 @@ fn select_candidate_with_strategy(
             (published, parameters, considered)
         })
         .collect();
-    let Some(chosen) = choose_by_priority_and_weight(&evaluated, request, strategy) else {
+    let Some(chosen) = choose_candidate(&evaluated, request, choice) else {
         let reasons = evaluated
             .iter()
             .map(|(_, _, considered)| {
@@ -816,53 +823,153 @@ fn select_candidate_with_strategy(
     Ok((published, parameters, decision))
 }
 
-/// 在这批**合格候选**里选出命中那条：返回它在 `evaluated` 里的下标，以及本次的分流落点。
+/// 选路要用的策略输入：策略本身，以及只有 `user_tag` 才消费的账户标签。
 ///
-/// 取值空间先由**策略**定，两步顺序不能换：
-/// 1. **定候选集合**——`priority_failover` 先取合格候选里最小的 `routing_priority`（档位是顺序，
-///    权重不参与这一步，因此"档 0 有合格候选"时权重再小的候选也不会被后面的档抢走）；
-///    `weighted_random` 不看档位，直接用**全部**合格候选；
-/// 2. **在这个集合里按 `weight` 分摊**——落点落在谁的区间里就选谁。
+/// 输入装在一个结构里而不是逐个当参数：四个策略各吃不同的输入，散成位置参数之后"哪个策略吃
+/// 哪个量"就只能靠读调用点才知道。
+struct RouteChoice<'a> {
+    strategy: RouteStrategy,
+    discount_rates: &'a BTreeMap<String, u32>,
+    tag_channel_map: &'a BTreeMap<String, String>,
+    /// 账户标签：只有 `user_tag` 消费它。别的策略下调用方不会为它多查一次库。
+    account_tag: Option<&'a str>,
+}
+
+/// 按策略在**合格候选**里选出命中那条：返回下标与本次的分流落点。
 ///
-/// 两种策略吃同一个哈希输入、同一套"按 `offering_id` 升序"的区间划分，因此都满足"同一请求重放
-/// 必落同一条"。不合格候选一律不在集合里：它们既不进权重之和，也不占区间。
+/// 四条策略共用两条底线：① **取值空间只有合格候选**——不合格的既不进权重之和，也不参与成本比较，
+/// 更不会被标签映射指定；② 落点只在按权重分摊的两种策略里有意义，其余策略记 `0`。
+///
+/// `least_cost` 与 `user_tag` 在"该策略给不出答案"时退回默认顺序（`priority_failover`）：
+/// 前者是没有任何候选带成本估算，后者是标签没配映射、或映射指向的候选这次承载不了。退回而不是
+/// 判失败——别的候选明明能承载这次请求，把它们一起判掉没有任何好处；退回的顺序是确定的，
+/// 仍然满足"同一请求重放落同一条"。
+fn choose_candidate(
+    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    request: &CreateImageGenerationRequest,
+    choice: &RouteChoice<'_>,
+) -> Option<(usize, u64)> {
+    match choice.strategy {
+        RouteStrategy::PriorityFailover => choose_by_priority_and_weight(evaluated, request),
+        RouteStrategy::WeightedRandom => choose_by_weight_across_all(evaluated, request),
+        RouteStrategy::LeastCost => choose_least_cost(evaluated, choice)
+            .or_else(|| choose_by_priority_and_weight(evaluated, request)),
+        RouteStrategy::UserTag => choose_by_tag(evaluated, choice)
+            .or_else(|| choose_by_priority_and_weight(evaluated, request)),
+    }
+}
+
+/// 档位顺序 + 档内按权重分摊：默认策略，也是策略层引入之前的行为。
+///
+/// 定档位时权重不参与：合格候选里最小的 `routing_priority` 先定下来，因此"档 0 有合格候选"时
+/// 权重再小的候选也不会被后面的档抢走。
+fn choose_by_priority_and_weight(
+    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    request: &CreateImageGenerationRequest,
+) -> Option<(usize, u64)> {
+    let tier = evaluated
+        .iter()
+        .filter(|(_, _, considered)| considered.eligible)
+        .map(|(_, _, considered)| considered.routing_priority)
+        .min()?;
+    let pool: Vec<usize> = (0..evaluated.len())
+        .filter(|index| {
+            let considered = &evaluated[*index].2;
+            considered.eligible && considered.routing_priority == tier
+        })
+        .collect();
+    split_by_weight(evaluated, request, pool)
+}
+
+/// 不看档位：**全部**合格候选按权重分摊。
+fn choose_by_weight_across_all(
+    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    request: &CreateImageGenerationRequest,
+) -> Option<(usize, u64)> {
+    let pool: Vec<usize> = (0..evaluated.len())
+        .filter(|index| evaluated[*index].2.eligible)
+        .collect();
+    split_by_weight(evaluated, request, pool)
+}
+
+/// 折后成本估算最小的一条。
+///
+/// 估算 = 该候选的**参考成本** × 它配的折扣率（没配就是不打折）。参考成本是发布者给的**定价
+/// 参考**，不是成本事实：这里只拿它排序，成本事实仍按实际扣费记（渠道声明多少就是多少）。
+/// 没有参考成本的候选排最后——拿不到估算就没法参与比较，但它仍是合格候选，只有在**谁都没有**
+/// 估算时才整体退回默认顺序。
+///
+/// 比较用 `u128`：参考成本是 `u64`，乘上万分比会溢出 `u64`。
+fn choose_least_cost(
+    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    choice: &RouteChoice<'_>,
+) -> Option<(usize, u64)> {
+    let mut best: Option<(usize, u128)> = None;
+    for (index, (published, _, considered)) in evaluated.iter().enumerate() {
+        if !considered.eligible {
+            continue;
+        }
+        let Some(cost) = published.price_snapshot.reference_cost_microusd else {
+            continue;
+        };
+        let rate = choice
+            .discount_rates
+            .get(&considered.offering_id.0.to_string())
+            .copied()
+            .unwrap_or(NO_DISCOUNT_RATE);
+        let discounted = u128::from(cost) * u128::from(rate);
+        let better = match best {
+            None => true,
+            // 同价时按 `offering_id` 升序定胜负：比较结果不能取决于取数顺序。
+            Some((best_index, current)) => {
+                (discounted, considered.offering_id.0)
+                    < (current, evaluated[best_index].2.offering_id.0)
+            }
+        };
+        if better {
+            best = Some((index, discounted));
+        }
+    }
+    best.map(|(index, _)| (index, 0))
+}
+
+/// 账户标签经映射指定的那条候选——它**必须合格**。
+///
+/// 标签没配映射、映射指向的候选这次承载不了这次请求，两者都不算数：返回 `None`，由调用方退回
+/// 默认顺序。映射**不是**绕过承载校验的入口。
+fn choose_by_tag(
+    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    choice: &RouteChoice<'_>,
+) -> Option<(usize, u64)> {
+    let mapped = choice.tag_channel_map.get(choice.account_tag?)?;
+    (0..evaluated.len())
+        .find(|index| {
+            let considered = &evaluated[*index].2;
+            considered.eligible && considered.offering_id.0.to_string() == *mapped
+        })
+        .map(|index| (index, 0))
+}
+
+/// 把候选集合按 `weight` 分成区间，返回落点所在的那一条与落点本身。
 ///
 /// 区间划分的**顺序按 `offering_id` 升序**，不按数据库返回的行序：落点是哈希出来的一个数，
 /// 若区间划分依赖行序，同一请求换个取数顺序就会分到另一条候选，"可重放"就成了空话。
 /// 定序键必须是与请求无关的发布数据，`offering_id` 满足这一点。
 ///
 /// 权重之和用 `u64` 累加：权重本身是 `u32`，多条候选相加可能溢出 `u32`。
-fn choose_by_priority_and_weight(
+fn split_by_weight(
     evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
     request: &CreateImageGenerationRequest,
-    strategy: RouteStrategy,
+    mut pool: Vec<usize>,
 ) -> Option<(usize, u64)> {
-    let mut pool: Vec<usize> = match strategy {
-        RouteStrategy::PriorityFailover => {
-            let tier = evaluated
-                .iter()
-                .filter(|(_, _, considered)| considered.eligible)
-                .map(|(_, _, considered)| considered.routing_priority)
-                .min()?;
-            (0..evaluated.len())
-                .filter(|index| {
-                    let considered = &evaluated[*index].2;
-                    considered.eligible && considered.routing_priority == tier
-                })
-                .collect()
-        }
-        RouteStrategy::WeightedRandom => (0..evaluated.len())
-            .filter(|index| evaluated[*index].2.eligible)
-            .collect(),
-    };
     // 定序键用 `offering_id` 里的 UUID 本身：`OfferingId` 是个新类型，没有比较语义，
     // 而这里要的只是"每次取数都排出同一个顺序"，不是任何业务顺序。
     pool.sort_by_key(|index| evaluated[*index].2.offering_id.0);
+    // 集合里至少有一条合格候选 ⇒ 权重至少是 1 ⇒ 总和至少是 1，取模不会除以零。
     let total: u64 = pool
         .iter()
         .map(|index| u64::from(evaluated[*index].2.weight))
         .sum();
-    // 集合里至少有一条合格候选 ⇒ 权重至少是 1 ⇒ 总和至少是 1，取模不会除以零。
     let draw = weight_split_draw(request.account_id, &request.idempotency_key) % total;
     let mut cursor = 0_u64;
     for index in pool {
@@ -874,6 +981,9 @@ fn choose_by_priority_and_weight(
     // 落点必然落在某条候选的区间里（总和就是全部区间），走不到这里。
     None
 }
+
+/// 不打折的折扣率：万分比。没给某条候选配折扣率时用它，免得把"没配"读成"零成本"。
+const NO_DISCOUNT_RATE: u32 = 10_000;
 
 /// 权重分摊的落点：`sha256(账户 ‖ 幂等键)` 取前 8 字节（大端）。
 ///
@@ -1386,6 +1496,17 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 账户标签（运营设）：只有生效的 `user_tag` 策略消费它，所以只有那种策略下才查它。
+    async fn account_tag(&self, account_id: AccountId) -> Result<Option<String>, ApplicationError>;
+
+    /// 设账户标签：`None` 表示清掉。写审计——它是管理员面的配置，改它会影响之后的受理。
+    async fn set_account_tag(
+        &self,
+        account_id: AccountId,
+        tag: Option<&str>,
+        actor: &str,
+    ) -> Result<(), ApplicationError>;
+
     /// 该网关模型生效的**路由策略**：按模型覆盖优先，其次全局那条；都没有就是 `None`
     /// （调用方按默认 `priority_failover` 走）。
     ///
@@ -1759,6 +1880,19 @@ impl AccountsService {
     ) -> Result<BalanceChange, ApplicationError> {
         self.repository.read_account_balance(account_id).await
     }
+
+    /// 设账户标签（管理员面）：只有生效的 `user_tag` 策略消费它，没有那种策略时它不改变任何
+    /// 选路结果。
+    pub async fn set_tag(
+        &self,
+        account_id: AccountId,
+        tag: Option<&str>,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        self.repository
+            .set_account_tag(account_id, tag, actor)
+            .await
+    }
 }
 
 /// 路由策略的管理员面：读清单与写入。
@@ -1785,15 +1919,22 @@ impl RoutePolicyService {
     ///
     /// 版本标识在这里换新，不由调用方给：两次写入若用同一个版本，缓存就分辨不出"改过了"，
     /// 会继续按旧策略选路。
+    ///
+    /// 两张输入表一起写：策略与它的输入是一次配置的两个部分，分开写会出现"策略换了、输入还是
+    /// 上一套"的中间状态，而受理正是按这两者共同决定的。
     pub async fn upsert(
         &self,
         gateway_model: Option<&str>,
         strategy: RouteStrategy,
+        discount_rates: BTreeMap<String, u32>,
+        tag_channel_map: BTreeMap<String, String>,
         actor: &str,
     ) -> Result<RoutePolicy, ApplicationError> {
         let policy = RoutePolicy {
             gateway_model: gateway_model.map(ToOwned::to_owned),
             strategy,
+            discount_rates,
+            tag_channel_map,
             version: Uuid::new_v4().to_string(),
         };
         self.repository.upsert_route_policy(&policy, actor).await?;
@@ -3143,7 +3284,19 @@ impl GenerationService {
         let policy = self.repository.route_policy(&request.model).await?;
         let (mut offering, native_parameters, routing) = match policy {
             Some(policy) => {
-                select_candidate_with_strategy(&request, branch, &candidates, policy.strategy)?
+                // 标签只有 `user_tag` 消费：别的策略下不为它多查一次库。
+                let account_tag = if policy.strategy == RouteStrategy::UserTag {
+                    self.repository.account_tag(request.account_id).await?
+                } else {
+                    None
+                };
+                let choice = RouteChoice {
+                    strategy: policy.strategy,
+                    discount_rates: &policy.discount_rates,
+                    tag_channel_map: &policy.tag_channel_map,
+                    account_tag: account_tag.as_deref(),
+                };
+                select_candidate_with_strategy(&request, branch, &candidates, &choice)?
             }
             None => select_candidate(&request, branch, &candidates)?,
         };
@@ -5748,6 +5901,87 @@ mod tests {
         unreachable!("落点必然落在某条候选的区间里")
     }
 
+    /// `least_cost` 取**折后成本估算**最小的一条：折扣把贵的那条变便宜时它就该赢。
+    ///
+    /// 估算 = 参考成本 × 该候选配的折扣率，缺省不打折。这里给贵的那条配一折，让它反过来更便宜，
+    /// 从而把"按折后估算比较"与"按原始成本比较"区分开。
+    #[test]
+    fn least_cost_compares_discounted_estimates() {
+        let plain = offering();
+        let mut discounted = offering();
+        discounted.offering_id = OfferingId::new();
+        let mut plain_candidate = candidate_with_weight(&plain, 0, 1);
+        plain_candidate.price_snapshot.reference_cost_microusd = Some(10_000);
+        let mut discounted_candidate = candidate_with_weight(&discounted, 0, 1);
+        discounted_candidate.price_snapshot.reference_cost_microusd = Some(20_000);
+        let mut discount_rates = BTreeMap::new();
+        discount_rates.insert(discounted.offering_id.0.to_string(), 1_000);
+        let tag_channel_map = BTreeMap::new();
+        let choice = RouteChoice {
+            strategy: RouteStrategy::LeastCost,
+            discount_rates: &discount_rates,
+            tag_channel_map: &tag_channel_map,
+            account_tag: None,
+        };
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let branch = request.branch().expect("prompt only");
+        let candidates = vec![plain_candidate, discounted_candidate];
+        let (chosen, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
+            .expect("a candidate must be chosen");
+        assert_eq!(
+            chosen.offering_id, discounted.offering_id,
+            "折扣之后估算更小的那条要赢，而不是原始成本更小的那条"
+        );
+    }
+
+    /// `user_tag`：标签经映射指定的候选要赢；映射指向的候选**不合格**时退回默认顺序。
+    ///
+    /// 退回而不是判失败：别的候选明明能承载这次请求，把它们一起判掉没有任何好处。这条断言同时
+    /// 钉住"映射不是绕过承载校验的入口"。
+    #[test]
+    fn user_tag_takes_the_mapped_candidate_and_falls_back_when_it_cannot_carry() {
+        let mapped = offering();
+        let other = offering();
+        let candidates = vec![
+            candidate_with_weight(&other, 0, 1),
+            candidate_with_weight(&mapped, 0, 1),
+        ];
+        let discount_rates = BTreeMap::new();
+        let mut tag_channel_map = BTreeMap::new();
+        tag_channel_map.insert("vip".to_owned(), mapped.offering_id.0.to_string());
+        let choice = RouteChoice {
+            strategy: RouteStrategy::UserTag,
+            discount_rates: &discount_rates,
+            tag_channel_map: &tag_channel_map,
+            account_tag: Some("vip"),
+        };
+        let request = image_request(serde_json::json!({"prompt": "hello"}));
+        let branch = request.branch().expect("prompt only");
+        let (chosen, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
+            .expect("a candidate must be chosen");
+        assert_eq!(
+            chosen.offering_id, mapped.offering_id,
+            "标签映射指向的候选要赢"
+        );
+
+        // 映射指向一个不存在于本次候选里的 id：退回默认顺序，仍然选出合格候选。
+        let mut unknown_map = BTreeMap::new();
+        unknown_map.insert("vip".to_owned(), OfferingId::new().0.to_string());
+        let choice = RouteChoice {
+            strategy: RouteStrategy::UserTag,
+            discount_rates: &discount_rates,
+            tag_channel_map: &unknown_map,
+            account_tag: Some("vip"),
+        };
+        let (chosen, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
+            .expect("退回默认顺序也必须有候选");
+        assert!(
+            candidates
+                .iter()
+                .any(|candidate| candidate.offering_id == chosen.offering_id)
+        );
+    }
+
     /// `weighted_random` 不看档位：在**全部合格候选**里按权重分摊，且同一请求重放落同一条。
     ///
     /// 与"档内分摊"的差别只在这一处：候选集合是全部合格候选，而不是最小档位那一档。落点仍由
@@ -5765,18 +5999,20 @@ mod tests {
         ];
 
         let mut tier_one_hits = 0;
+        let choice = RouteChoice {
+            strategy: RouteStrategy::WeightedRandom,
+            discount_rates: &BTreeMap::new(),
+            tag_channel_map: &BTreeMap::new(),
+            account_tag: None,
+        };
         for index in 0..64 {
             let mut request = image_request(serde_json::json!({"prompt": "hello"}));
             request.account_id = account_id;
             request.idempotency_key = format!("weighted-key-{index}");
             let branch = request.branch().expect("prompt only");
-            let (chosen, _, decision) = select_candidate_with_strategy(
-                &request,
-                branch,
-                &candidates,
-                RouteStrategy::WeightedRandom,
-            )
-            .expect("a candidate must be chosen");
+            let (chosen, _, decision) =
+                select_candidate_with_strategy(&request, branch, &candidates, &choice)
+                    .expect("a candidate must be chosen");
             let hit = decision
                 .considered
                 .iter()
@@ -5784,13 +6020,9 @@ mod tests {
                 .expect("命中项必须在判定记录里");
             assert!(hit.eligible, "策略不得选中不合格候选：{hit:?}");
             // 重放：同一请求再来一次，必须落同一条候选。
-            let (again, _, _) = select_candidate_with_strategy(
-                &request,
-                branch,
-                &candidates,
-                RouteStrategy::WeightedRandom,
-            )
-            .expect("a replay must be chosen");
+            let (again, _, _) =
+                select_candidate_with_strategy(&request, branch, &candidates, &choice)
+                    .expect("a replay must be chosen");
             assert_eq!(
                 again.offering_id, chosen.offering_id,
                 "同一 (账户, 幂等键) 必须落同一条候选"
@@ -6156,6 +6388,22 @@ mod tests {
             &self,
             _account_id: AccountId,
         ) -> Result<BalanceChange, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn account_tag(
+            &self,
+            _account_id: AccountId,
+        ) -> Result<Option<String>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn set_account_tag(
+            &self,
+            _account_id: AccountId,
+            _tag: Option<&str>,
+            _actor: &str,
+        ) -> Result<(), ApplicationError> {
             unused_repository()
         }
 

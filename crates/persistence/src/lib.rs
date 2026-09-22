@@ -842,7 +842,7 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Option<RoutePolicy>, ApplicationError> {
         let row = sqlx::query(
             r#"
-            SELECT gateway_model, strategy, version
+            SELECT gateway_model, strategy, discount_rates, tag_channel_map, version
             FROM routing.route_policies
             WHERE gateway_model = $1 OR gateway_model IS NULL
             ORDER BY gateway_model IS NULL
@@ -856,6 +856,50 @@ impl HubRepository for PgHubRepository {
         row.as_ref().map(route_policy_from_row).transpose()
     }
 
+    /// 账户标签：只有 `user_tag` 策略消费它，所以它是一条单独的读，不与受理探针绑在一起。
+    async fn account_tag(&self, account_id: AccountId) -> Result<Option<String>, ApplicationError> {
+        let row = sqlx::query("SELECT tag FROM ledger.accounts WHERE id = $1")
+            .bind(account_id.0)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)?
+            .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+        row.try_get("tag").map_err(database_error)
+    }
+
+    /// 设账户标签。
+    ///
+    /// **不动 `updated_at`**：那一列是"余额最后一次变动"的时刻，对账与缓存新鲜度都按它判断；
+    /// 改标签不是余额变动，动它会让对账以为这个账户刚有过一笔钱变动。
+    async fn set_account_tag(
+        &self,
+        account_id: AccountId,
+        tag: Option<&str>,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let updated = sqlx::query("UPDATE ledger.accounts SET tag = $2 WHERE id = $1")
+            .bind(account_id.0)
+            .bind(tag)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if updated.rows_affected() == 0 {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        insert_audit(
+            &mut transaction,
+            actor,
+            "account.tag_set",
+            "account",
+            &account_id.to_string(),
+            &json!({"tag": tag}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
     async fn upsert_route_policy(
         &self,
         policy: &RoutePolicy,
@@ -864,10 +908,13 @@ impl HubRepository for PgHubRepository {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query(
             r#"
-            INSERT INTO routing.route_policies (id, gateway_model, strategy, version, updated_by)
-            VALUES ($1, $2, $3, $4, $5)
+            INSERT INTO routing.route_policies
+                (id, gateway_model, strategy, discount_rates, tag_channel_map, version, updated_by)
+            VALUES ($1, $2, $3, $4, $5, $6, $7)
             ON CONFLICT (coalesce(gateway_model, ''))
             DO UPDATE SET strategy = EXCLUDED.strategy,
+                          discount_rates = EXCLUDED.discount_rates,
+                          tag_channel_map = EXCLUDED.tag_channel_map,
                           version = EXCLUDED.version,
                           updated_at = now(),
                           updated_by = EXCLUDED.updated_by
@@ -876,6 +923,8 @@ impl HubRepository for PgHubRepository {
         .bind(Uuid::new_v4())
         .bind(policy.gateway_model.as_deref())
         .bind(policy.strategy.as_str())
+        .bind(serde_json::to_value(&policy.discount_rates).map_err(json_error)?)
+        .bind(serde_json::to_value(&policy.tag_channel_map).map_err(json_error)?)
         .bind(&policy.version)
         .bind(actor)
         .execute(&mut *transaction)
@@ -887,7 +936,12 @@ impl HubRepository for PgHubRepository {
             "route_policy.upsert",
             "route_policy",
             policy.gateway_model.as_deref().unwrap_or("global"),
-            &json!({"strategy": policy.strategy.as_str(), "version": policy.version}),
+            &json!({
+                "strategy": policy.strategy.as_str(),
+                "version": policy.version,
+                "discount_rates": policy.discount_rates,
+                "tag_channel_map": policy.tag_channel_map,
+            }),
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
@@ -897,7 +951,7 @@ impl HubRepository for PgHubRepository {
     async fn route_policies(&self) -> Result<Vec<RoutePolicy>, ApplicationError> {
         let rows = sqlx::query(
             r#"
-            SELECT gateway_model, strategy, version
+            SELECT gateway_model, strategy, discount_rates, tag_channel_map, version
             FROM routing.route_policies
             ORDER BY gateway_model IS NULL DESC, gateway_model
             "#,
@@ -2170,8 +2224,25 @@ fn route_policy_from_row(row: &sqlx::postgres::PgRow) -> Result<RoutePolicy, App
     Ok(RoutePolicy {
         gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         strategy,
+        discount_rates: serde_json::from_value(
+            row.try_get("discount_rates").map_err(database_error)?,
+        )
+        .map_err(json_error)?,
+        tag_channel_map: serde_json::from_value(
+            row.try_get("tag_channel_map").map_err(database_error)?,
+        )
+        .map_err(json_error)?,
         version: row.try_get("version").map_err(database_error)?,
     })
+}
+
+/// 序列化/反序列化失败在语义上都是"这次的值不成形状"，按参数错误报出去。
+///
+/// jsonb 列的形状不对（不是对象、或值的类型不符）说明存储被绕过：按错误处理而不是当成空表——
+/// 空表意味着"这条策略没有输入"，而"读不出来"是另一回事，把它当空表会让 `least_cost` 悄悄退回
+/// 默认顺序，运营却以为折扣率生效了。
+fn json_error(error: serde_json::Error) -> ApplicationError {
+    ApplicationError::InvalidParameter(error.to_string())
 }
 
 async fn insert_audit(

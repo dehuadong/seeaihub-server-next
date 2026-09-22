@@ -26,7 +26,7 @@ use seeai_domain::{
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, net::SocketAddr, sync::Arc, time::Duration};
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -109,6 +109,7 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/api/v1/accounts", post(create_account))
         .route("/api/v1/accounts/{account_id}", get(read_account_balance))
+        .route("/api/v1/accounts/{account_id}/tag", put(set_account_tag))
         .route(
             "/api/v1/accounts/{account_id}/credits",
             post(credit_account),
@@ -242,6 +243,8 @@ fn route_policy_view(policy: &RoutePolicy) -> Value {
     json!({
         "gateway_model": policy.gateway_model,
         "strategy": policy.strategy.as_str(),
+        "discount_rates": policy.discount_rates,
+        "tag_channel_map": policy.tag_channel_map,
         "version": policy.version,
     })
 }
@@ -252,6 +255,12 @@ struct UpsertRoutePolicyBody {
     #[serde(default)]
     gateway_model: Option<String>,
     strategy: String,
+    /// 折扣率表（候选 → 万分比）：只作 `least_cost` 的比较输入，不进成本口径。
+    #[serde(default)]
+    discount_rates: Option<BTreeMap<String, u32>>,
+    /// 标签 → 候选的映射：供 `user_tag` 用。
+    #[serde(default)]
+    tag_channel_map: Option<BTreeMap<String, String>>,
 }
 
 /// 管理员看策略清单：全局那条（若有）与各网关模型的覆盖。
@@ -277,15 +286,45 @@ async fn upsert_route_policy(
     require_admin(&state, &headers)?;
     let strategy = RouteStrategy::parse(&body.strategy).ok_or_else(|| {
         ApplicationError::InvalidParameter(format!(
-            "unknown route strategy {}; supported: priority_failover, weighted_random",
+            "unknown route strategy {}; supported: priority_failover, weighted_random, least_cost, user_tag",
             body.strategy
         ))
     })?;
     let policy = state
         .route_policies
-        .upsert(body.gateway_model.as_deref(), strategy, "admin-api")
+        .upsert(
+            body.gateway_model.as_deref(),
+            strategy,
+            body.discount_rates.unwrap_or_default(),
+            body.tag_channel_map.unwrap_or_default(),
+            "admin-api",
+        )
         .await?;
     Ok(Json(json!({"route_policy": route_policy_view(&policy)})))
+}
+
+#[derive(Debug, Deserialize)]
+struct SetAccountTagBody {
+    /// 不传或给 `null` 就是清掉标签。
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+/// 设账户标签（管理员面）。
+///
+/// 标签只在**生效的 `user_tag` 策略**下影响选路：没有那条策略时，改它不改变任何受理结果。
+async fn set_account_tag(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<SetAccountTagBody>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    state
+        .accounts
+        .set_tag(AccountId(account_id), body.tag.as_deref(), "admin-api")
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]

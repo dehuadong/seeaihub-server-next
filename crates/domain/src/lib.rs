@@ -540,6 +540,10 @@ pub enum RouteStrategy {
     PriorityFailover,
     /// 不看档位：在**全部**合格候选里按 `weight` 分摊。
     WeightedRandom,
+    /// 不看档位与权重：在合格候选里取**折后成本估算**最小的一条。
+    LeastCost,
+    /// 不看档位与权重：由**账户标签**经映射指定候选；映射指向的候选不合格时不选它。
+    UserTag,
 }
 
 impl RouteStrategy {
@@ -549,29 +553,47 @@ impl RouteStrategy {
         match self {
             Self::PriorityFailover => "priority_failover",
             Self::WeightedRandom => "weighted_random",
+            Self::LeastCost => "least_cost",
+            Self::UserTag => "user_tag",
         }
     }
 
-    /// 从落库值还原；解析不到说明存储被绕过或写进了本层还不支持的策略，按错误处理。
+    /// 从落库值还原；解析不到说明存储被绕过，按错误处理。
     #[must_use]
     pub fn parse(value: &str) -> Option<Self> {
         match value {
             "priority_failover" => Some(Self::PriorityFailover),
             "weighted_random" => Some(Self::WeightedRandom),
+            "least_cost" => Some(Self::LeastCost),
+            "user_tag" => Some(Self::UserTag),
             _ => None,
         }
     }
 }
 
-/// 一条生效的路由策略：作用域、类型与版本标识。
+/// 一条生效的路由策略：作用域、类型、它自己的输入与版本标识。
 ///
 /// `gateway_model` 为 `None` 表示**全局那条**；非空表示覆盖该网关模型（按模型取"有覆盖用
 /// 覆盖、没有用全局"）。策略是**运行期配置**，不进不可变修订：改它即刻影响之后的受理，已经
 /// 受理的 Job 早已把候选固定在快照里。`version` 每次写入都变，缓存拿它判断自己是不是旧的。
+///
+/// 两张输入表都**只被对应的策略消费**：`discount_rates` 只有 [`RouteStrategy::LeastCost`] 读，
+/// `tag_channel_map` 只有 [`RouteStrategy::UserTag`] 读。没有生效的策略消费它们时，改这两张表
+/// 不改变任何选路结果。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RoutePolicy {
     pub gateway_model: Option<String>,
     pub strategy: RouteStrategy,
+    /// 折扣率表：**候选（`offering_id`）→ 万分比**，例如 `8000` 表示八折。
+    ///
+    /// 它只作 [`RouteStrategy::LeastCost`] 的比较输入：比的是**折后成本估算**，不是成本事实。
+    /// 成本永远按实际扣费记，两者不一致时以实际扣费为准。
+    pub discount_rates: BTreeMap<String, u32>,
+    /// **标签 → 候选（`offering_id`）**的映射，供 [`RouteStrategy::UserTag`] 用。
+    ///
+    /// 标签落在账户上（`ledger.accounts.tag`），映射落在策略里：同一个标签在不同网关模型上可以
+    /// 指向不同候选。映射指向的候选**仍要合格**——它承载不了这次请求时，策略也不能选它。
+    pub tag_channel_map: BTreeMap<String, String>,
     pub version: String,
 }
 

@@ -8408,6 +8408,122 @@ async fn an_fx_rate_without_an_effective_time_is_stamped_by_the_database_clock()
     harness.cleanup().await;
 }
 
+/// 路由策略的**输入面**：账户标签与两种策略要吃的表，都能经管理员 API 写入并读回。
+///
+/// 策略改变选路结果本身由应用层用例钉住（`least_cost_compares_discounted_estimates` /
+/// `user_tag_takes_the_mapped_candidate_and_falls_back_when_it_cannot_carry`）；这里验的是它们
+/// 的输入进得去、出得来，以及标签那条 401/404 的边界。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn route_policy_inputs_round_trip_through_the_admin_api() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let client = Client::new();
+    publish_bootstrap(&client, &harness.base_url, &harness.admin_token).await;
+    let account_id = create_account(&client, &harness.base_url, &harness.admin_token).await;
+
+    // 设账户标签：写库；无凭证 401；不存在的账户 404。
+    let response = client
+        .put(format!(
+            "{}/api/v1/accounts/{account_id}/tag",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"tag": "vip"}))
+        .send()
+        .await
+        .expect("set account tag");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT tag FROM ledger.accounts WHERE id = $1::uuid")
+            .bind(&account_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("account row");
+    assert_eq!(stored.as_deref(), Some("vip"), "标签要真的落到账户那一行");
+
+    let response = client
+        .put(format!(
+            "{}/api/v1/accounts/{account_id}/tag",
+            harness.base_url
+        ))
+        .json(&json!({"tag": "vip"}))
+        .send()
+        .await
+        .expect("set account tag without a token");
+    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+    let unknown = Uuid::new_v4();
+    let response = client
+        .put(format!(
+            "{}/api/v1/accounts/{unknown}/tag",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"tag": "vip"}))
+        .send()
+        .await
+        .expect("set tag on an unknown account");
+    assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+    // 写 `user_tag` 策略：带上"标签 → 候选"的映射，读回来要逐字一致。
+    let mapped_offering = Uuid::new_v4().to_string();
+    let response = client
+        .put(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "strategy": "user_tag",
+            "tag_channel_map": {"vip": mapped_offering},
+        }))
+        .send()
+        .await
+        .expect("user_tag policy");
+    assert_eq!(response.status(), StatusCode::OK);
+    let written: Value = response.json().await.expect("policy JSON");
+    assert_eq!(written["route_policy"]["strategy"], json!("user_tag"));
+    assert_eq!(
+        written["route_policy"]["tag_channel_map"]["vip"], mapped_offering,
+        "映射要原样存回来：{written}"
+    );
+
+    // 写 `least_cost` 策略：带上折扣率表。
+    let response = client
+        .put(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "gateway_model": harness.model,
+            "strategy": "least_cost",
+            "discount_rates": {mapped_offering.clone(): 8_000},
+        }))
+        .send()
+        .await
+        .expect("least_cost policy");
+    assert_eq!(response.status(), StatusCode::OK);
+    let written: Value = response.json().await.expect("policy JSON");
+    assert_eq!(
+        written["route_policy"]["discount_rates"][mapped_offering.as_str()],
+        json!(8_000),
+        "折扣率要原样存回来：{written}"
+    );
+
+    let response = client
+        .get(format!("{}/api/v1/route-policies", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("policy list");
+    let listed: Value = response.json().await.expect("policy JSON");
+    assert_eq!(
+        listed["route_policies"]
+            .as_array()
+            .expect("route_policies")
+            .len(),
+        2,
+        "全局一条 + 该模型一条：{listed}"
+    );
+
+    harness.cleanup().await;
+}
+
 /// 路由策略是**运营配置**：管理员能读写、写入即刻生效，而且**不产生新修订**。
 ///
 /// 策略真的改变选路结果由应用层用例钉住（同一个候选集合、两种策略给出可观察的差别：
@@ -8498,11 +8614,11 @@ async fn route_policies_are_runtime_configuration_and_do_not_touch_revisions() {
         "全局一条 + 该模型的覆盖一条：{listed}"
     );
 
-    // 本层还没实现的策略：明确拒绝，不悄悄落成默认——落成默认会把"配置没生效"伪装成生效。
+    // 本层没有的策略：明确拒绝，不悄悄落成默认——落成默认会把"配置没生效"伪装成生效。
     let response = client
         .put(format!("{}/api/v1/route-policies", harness.base_url))
         .bearer_auth(&harness.admin_token)
-        .json(&json!({"strategy": "least_cost"}))
+        .json(&json!({"strategy": "cheapest_by_latency"}))
         .send()
         .await
         .expect("unsupported strategy");
