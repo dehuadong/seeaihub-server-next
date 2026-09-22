@@ -1,49 +1,59 @@
-
 # Plan Review
 
-Identify the Proposal or existing work item being reviewed, its selected scope, and the requirements and design sections that apply. Review that planning set before implementation; record the result on that same work item.
+确定被评审的 Proposal 或既有工作项、选定范围，以及适用的产品合同与 RFC。小改动可以由工作项直接拥有产品合同；存在独立 RFC 时，产品合同由 Spec 拥有。评审整个规划集合，并把结果记录在同一工作项。
 
-Evaluate the planning set along three independent axes:
+## 三条评审线
 
-- **Standards** — fidelity to accepted ADRs, applicable RFCs, established domain language, and project constraints.
-- **Spec** — coverage of the authoritative product or work contract, such as the Proposal, PRD, approved Spec, or equivalent project artifact.
-- **Architecture** — coherence of boundaries, responsibilities, dependencies, interfaces, and system relationships.
+- **Standards**：是否符合 ADR、既有 RFC、领域语言和项目约束；
+- **Spec**：产品范围与验收是否明确，RFC 是否完整承接且没有遗漏、越界或暗中改写；
+- **Architecture**：职责、依赖、接口、数据流和系统关系是否一致。
 
-Report only material findings and trade-offs.
+只报告实质问题和真实取舍。
 
-## Decision
+## 产品合同检查
 
-Plan Review assesses the design within established decision authority. Record a pass, required revision or rejection; obtain any required external approval before treating a proposed decision as accepted.
+- 范围与非目标是否明确；
+- 正常、边界和失败行为是否足够清楚；
+- 验收条件是否可观察、可判定；
+- 产品决定是否仍需要实施者猜测；
+- 是否混入了应由 RFC 拥有的技术设计；
+- 技术探索是否还留有会改变范围的重要未知问题。
 
-Resolve findings in the artifact that owns them.
+## RFC 检查
 
-Existing contracts, accepted decisions, and established constraints may directly resolve questions already governed by them.
+- 是否引用明确的 Spec 修订与章节；
+- 是否覆盖适用的产品行为和约束；
+- 是否把产品假设当成技术决定；
+- 是否存在尚未解决的重要技术选择；
+- 是否具备足够清楚的验证切入点；
+- 多份 RFC 的边界是否完整且不互相矛盾。
 
-Material choices requiring an unresolved product, business, compatibility, cost, risk, architectural, or other value judgment belong to the user unless that authority has been explicitly delegated.
+## 决定与修正
 
-When authority is delegated, make the decision and preserve the material reasoning.
+评审结果为通过、需要修订或拒绝。需要外部批准的决定，在取得批准前不得视为已接受。
 
-For RFCs involved in the work:
+按属主修正：
 
-- accepted design with required approval evidence → mark it accepted or approved using the project's RFC convention
-- rejected design → mark it rejected using the project's convention
-- revision required → keep it non-authoritative until reviewed again
+- 产品范围、行为与验收问题回到 Spec 或直接承载它的工作项；
+- 技术设计问题回到 RFC；
+- 状态、评审与批准证据回到 Proposal 或工作项；
+- 持久领域或架构决定在需要时通过 `domain-modeling` 进入 ADR。
 
-When an accepted decision creates or changes a durable architectural constraint, preserve it through `domain-modeling` as an ADR when warranted.
+RFC 仍依赖临时产品假设时保持非权威。修订产品合同后，检查所有承接同一产品合同的 RFC，不只修改最先暴露问题的那一份。
 
-## Gate
+## 通过条件
 
-The planning set passes when:
+规划集合通过需要满足：
 
-- Standards, Spec, and Architecture have no unresolved material findings
-- required decisions are resolved
-- RFCs required for implementation are accepted or approved
-- accepted decisions are reflected in their authoritative artifacts
-- durable decisions are preserved when warranted
-- implementation can proceed without inventing material product behavior or architecture
+- Standards、Spec 与 Architecture 没有未解决的实质问题；
+- Spec 或等价产品合同已经稳定；
+- 每项适用验收条件都有设计承接，或明确说明无需技术设计；
+- 实施所需 RFC 已按项目约定接受或批准；
+- RFC 与适用产品合同之间没有遗漏、越界或冲突；
+- 所需决定已解决并写回权威工件；
+- 需要持久保存的决定已按约定记录；
+- 实施不需要发明重要产品行为或架构。
 
-Record the review outcome and supporting decision references on the identified Proposal or existing work item. When the review passes, required approvals are obtained and no blocker prevents the selected scope from starting, update that work item's readiness using the configured workflow. A review pass does not itself grant approval or execution authorization; referenced artifacts retain their own approval conventions.
+通过后，把结果和决定依据记录在工作项，并按配置更新就绪状态。评审通过不自动构成批准或执行授权。
 
-If it does not pass, keep the work in planning, revise the owning artifact, and review again.
-
-Routine implementation details may remain open.
+没有通过时，继续留在 Planning，修正拥有问题的工件并重新评审。普通实现细节可以保持开放。

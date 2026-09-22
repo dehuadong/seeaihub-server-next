@@ -1,64 +1,66 @@
 ---
 name: planning
-description: Use when creating or updating a Proposal, when the product contract needs further definition, or when material technical decisions must be resolved before implementation.
+description: 创建或更新 Proposal、Spec 与 RFC，在实施前收敛产品范围、验收条件和重要技术设计。
 ---
 
 # Planning
 
-Turn the current conversation and relevant project context into the minimum planning artifacts needed to establish implementation readiness.
+把当前对话与项目上下文整理成最少但足够的规划工件，使工作具备实施条件。Planning 可以让 Spec 与探索性 RFC 往返收敛，不要求机械地依次创建所有工件。
 
-Planning is synthesis and decision completion, not a mandatory step for every engineering task.
+## 1. 确定工作项
 
-## 1. Establish the work item and scope
+按项目工件注册表定位本次 Proposal 或既有工作项，以 Issue 编号、URL 或文件路径标识。它负责本次目标、选定的交付范围、决定状态和规划工件引用。
 
-Follow the artifact registry referenced by project instructions, or `docs/agents/artifacts.md` when present, for historical/current owners, destinations and lifecycle. Missing registration does not block planning; reuse established project conventions.
+复用合适的既有工作项；确实需要新的规划根节点时才创建 Proposal。创建或更新 Proposal 时读取 [proposal.md](./proposal.md)。
 
-Identify the Proposal or existing work item for this planning effort by its issue ID, URL, or file path. It owns the current goal, scope, acceptance conditions and decision status, directly or through explicit references to requirements and design. A product-wide Spec alone does not identify which change is being planned.
+小改动可以由工作项直接写清产品行为、范围、验收和技术决定，不为了凑流程另建本地工件。需要独立 RFC 时，先建立由它承接的 Spec，使仓库内产品合同与技术设计闭环。
 
-Reuse a suitable existing work item; create a Proposal when a new planning root is needed. Separate PRDs, Specs and RFCs are optional; a clearly identified work item and sufficient implementation requirements are not.
+## 2. 收敛产品合同与技术设计
 
-Read [proposal.md](./proposal.md) when creating or updating a Proposal.
+### Spec
 
-## 2. Complete necessary planning
+产品行为、范围或验收条件需要独立属主时，读取 [spec.md](./spec.md)，创建或更新 Spec。
 
-Use the following branches only where needed; they do not require a separate artifact for every heading.
+Spec 负责“做什么、哪些不做、什么结果算完成”。已有 PRD 可以作为背景输入，但不能代替本次工作的明确产品合同。
 
-### Product requirements
+### 探索性 RFC
 
-Read [prd.md](./prd.md) when the product contract needs further definition; refine its existing owner and create a separate PRD only when requested or independent ownership is needed.
+当可行性、成本、性能、兼容性、安全或上游限制会实质影响产品范围时，可以在产品合同稳定前读取 [rfc.md](./rfc.md)，创建非权威的 RFC 探索草案。
 
-### Technical design
+探索性 RFC 必须区分产品事实与临时假设，把影响产品范围的结论反馈给产品合同属主，不得作为实施依据。
 
-Read [rfc.md](./rfc.md) when meaningful technical decisions must be resolved before implementation.
+Spec 与探索性 RFC 可以往返修改，直到产品范围与验收条件不再依赖未解决的技术可行性问题。
 
-Use established domain language and architectural decisions as project context.
+### RFC 定稿
 
-Use `domain-modeling` when planning establishes or changes durable domain knowledge or architectural decisions.
+需要解决重要技术决定时，使用 [rfc.md](./rfc.md) 把已确定的产品合同转成技术设计。一份 Spec 可以由多份 RFC 分别承接。
 
-Do not create artifacts merely to complete a sequence.
+RFC 可以早于 Spec 开始，但只有在适用的 Spec 稳定后，才能完成评审并成为实施依据。RFC 不得暗中扩大、缩小或改写产品行为。
 
-### Decision authority
+使用项目既有领域语言、ADR 和架构约束。规划形成或改变持久领域知识或架构决定时，使用 `domain-modeling` 判断是否需要 ADR。
 
-Resolve ordinary technical choices autonomously when they remain within the agreed contract, established architecture, and project constraints.
+### 决定权限
 
-Escalate when a material choice requires an unresolved product, business, compatibility, cost, risk, architectural, or other value judgment.
+在已同意的产品合同、既有架构和项目约束内，自主解决普通技术选择。
 
-The user owns such unresolved decisions unless they have explicitly delegated that authority.
-
-When authority is delegated, make the decision and preserve the material reasoning where appropriate.
+涉及未解决的产品、业务、兼容性、成本、风险、架构方向或其他价值判断时，交由用户决定，除非用户已经明确委托决定权。
 
 ## 3. Plan Review
 
-After drafting the necessary planning content, use [review.md](./review.md) to perform Plan Review.
+必要规划内容形成后，读取 [review.md](./review.md) 执行 Plan Review。
 
-### Resolve findings and re-review
+把发现交回拥有它的工件：产品范围与验收问题回到 Spec 或直接承载它的工作项，技术设计问题回到 RFC，工作状态与批准证据回到 Proposal 或工作项。
 
-Return affected content to §2, resolve material findings in the artifact that owns them, and review again. Continue independent planning while a user-owned decision is pending; report unresolved blockers without claiming the planning set passed.
+解决实质问题后重新评审。等待用户决定时继续推进不受影响的规划，但不得宣称整体通过。
 
-## 4. Completion and handoff
+## 4. 完成与交接
 
-Planning completes when required decisions are resolved and the planning set passes Plan Review.
+Planning 完成需要同时满足：
 
-For a planning-only request, deliver the planning result and review evidence, then end the task. For end-to-end work, continue to the project's Implementation Gate when ready.
+- 产品范围和验收条件已经稳定；
+- 实施所需 RFC 已按项目约定接受或批准；
+- RFC 完整承接适用的 Spec；
+- 所需决定已解决；
+- Plan Review 通过。
 
-Check execution authorization separately under the project's Implementation Gate before entering implementation; reuse authorization already granted for this scope.
+若用户只要求规划，交付规划结果与评审证据后结束。端到端任务继续进入项目的 Implementation Gate，并单独核对执行授权。

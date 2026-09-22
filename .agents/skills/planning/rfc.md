@@ -1,107 +1,71 @@
 # RFC
 
-Use an RFC when meaningful technical decisions must be resolved before implementation.
+RFC 用于探索重要技术可行性，或把已经确定的产品合同转成足够明确的技术设计。
 
-Turn the established product or work contract into a sufficiently resolved technical design.
+RFC 可以早于产品合同定稿开始，但只有适用的 Spec 稳定后，才能被接受并成为实施依据。
 
-## Lifecycle
+## 位置与生命周期
 
-Use the project's artifact registry for RFC location and historical ownership. An independent RFC does not move with a linked change record's delivery lifecycle.
+遵循项目工件注册表和既有 RFC 生命周期。独立 RFC 不随关联工作项的交付状态移动，也不另造竞争状态。
 
-Use the project's existing RFC lifecycle when one exists.
+RFC 在获得项目要求的评审与批准前保持非权威；被替代时保留与替代设计的关系。
 
-Do not introduce a competing status vocabulary.
+## 输入与承接关系
 
-When no convention exists, local RFCs may use:
+RFC 应标明：
 
-    ---
-    status: Draft
-    date: YYYY-MM-DD
-    proposal: <proposal or work reference>
-    ---
+- 承接的 Spec 修订及适用章节；
+- 本 RFC 负责的技术范围以及与同一产品合同下其他 RFC 的边界。
 
-with these default states:
+一份 Spec 可以拆给多份 RFC。RFC 不复制 Spec 的范围与验收正文，只建立能追溯到具体要求的引用。
 
-- **Draft** — under design or awaiting review or decision; not an implementation basis.
-- **Accepted** — reviewed and approved; may be used as an implementation basis.
-- **Rejected** — considered and rejected; retained as historical context.
-- **Superseded** — previously accepted but replaced by a later authoritative design or decision.
+## 探索草案
 
-An RFC begins non-authoritative and becomes an implementation basis only when its project-defined lifecycle says it has been accepted or approved.
+以下技术事实会影响产品范围时，可以先写探索草案：
 
-When an accepted RFC is replaced, preserve the historical relationship to its replacement.
+- 上游能力和可用性；
+- 成本、性能或资源上限；
+- 兼容性与迁移可行性；
+- 安全、可靠性或运维硬约束；
+- 不同技术路线导致的产品体验差异。
 
-## Design
+探索草案必须区分已经确定的产品事实、临时假设和待决定问题。它输出可行性结论及其对产品范围的影响，把产品选择交回产品合同属主，不得自行定下产品行为。
 
-Focus on decisions that materially constrain implementation, such as:
+探索草案不能作为实施依据。
 
-- system boundaries and responsibilities
-- interfaces, protocols, schemas, or persistence
-- lifecycle and failure behavior
-- compatibility or migration
-- material security, reliability, performance, or resource constraints
-- meaningful verification seams
+## 技术设计
 
-Do not prescribe routine implementation details that can safely be decided while coding.
+按需要解决会实质约束实现的内容：
 
-## Design decisions
+- 系统边界与职责；
+- 接口、协议、Schema 与持久化；
+- 生命周期和失败行为；
+- 兼容与迁移；
+- 重要的安全、可靠性、性能或资源约束；
+- 有意义的验证切入点。
 
-Resolve ordinary technical choices directly when they remain within the agreed contract, established architecture, and project constraints.
+普通实现细节留给实现阶段，不为完整感规定目录、类型或步骤。
 
-When a material choice has meaningful alternatives, recommend the preferred approach and preserve enough reasoning for review.
+RFC 不得扩大、缩小或改写适用 Spec。设计中发现产品缺口时，暂停相关部分的接受，先修订 Spec，再检查同一产品合同下其他 RFC 是否受影响。
 
-Do not ask the user to choose between alternatives merely because multiple technically viable approaches exist.
+## 技术决定
 
-Escalate when the choice requires an unresolved:
+在已同意的产品合同、既有架构和项目约束内，自主解决普通技术选择。重要备选存在真实取舍时，给出推荐与足够的评审理由。
 
-- product behavior or scope decision
-- business preference
-- compatibility commitment
-- cost or operational trade-off
-- risk tolerance
-- durable architectural direction
-- other value judgment not already established
+需要产品、业务、兼容性、成本、风险、持久架构方向或其他价值判断时，交给相应决定权限，不把问题伪装成纯技术选择。
 
-The user owns these unresolved decisions unless they have explicitly delegated that authority.
+接受的决定形成或改变持久领域语言或架构约束时，使用 `domain-modeling` 判断是否需要 ADR。功能特有的设计留在 RFC，不把整份 RFC 复制到 ADR。
 
-When authority is delegated, make the decision and preserve the material reasoning.
+## 定稿与评审条件
 
-Document alternatives only when they materially explain the recommended design.
+RFC 可以进入 Plan Review，需要满足：
 
-## Decision record
+- 适用的 Spec 已经稳定；
+- 承接的修订与章节明确；
+- 方案足够解决重要技术决定；
+- 重要备选有推荐；
+- 需要外部权限的决定已明确；
+- 验证切入点足够清楚；
+- 实施不需要重新发现重要产品或技术决定。
 
-When review or external decision materially affects the RFC, preserve the decision trace concisely.
-
-For example:
-
-    ## Decision
-
-    - Review: Standards / Spec / Architecture — passed
-    - Authority: User | Delegated | Existing constraint
-    - Decision: <reference, when applicable>
-    - Accepted: YYYY-MM-DD
-    - ADR: <reference, when warranted>
-
-Reference authoritative discussion or decision artifacts rather than copying them into the RFC.
-
-## Durable decisions
-
-When an accepted decision establishes or changes durable domain language or an architectural constraint whose reasoning should outlive the RFC, use `domain-modeling` to preserve it as an ADR when warranted.
-
-Keep feature-specific design in the RFC.
-
-Do not duplicate the full RFC in an ADR.
-
-## Ready for review
-
-The RFC is ready for Plan Review when:
-
-- the proposed design is sufficiently resolved
-- material alternatives have a recommendation where needed
-- unresolved decisions requiring external authority are explicit
-- verification expectations are sufficiently clear
-- implementation would not need to rediscover a material technical decision
-
-Routine implementation details should remain open.
-
-Being ready for review does not itself make the RFC approved or authoritative.
+准备好评审不等于已经接受或批准。

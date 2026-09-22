@@ -1,0 +1,5 @@
+interface:
+  display_name: "prd"
+  short_description: "按用户要求编写产品需求文档，明确问题、目标、价值与边界"
+policy:
+  allow_implicit_invocation: false

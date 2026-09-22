@@ -1,36 +1,30 @@
 # Proposal
 
-A Proposal proposes a change and is the root work item for that planning effort when no suitable existing work item serves this purpose. It owns the goal, scope, acceptance and decision status, and references detailed requirements and design where they have separate owners.
+Proposal 在没有合适既有工作项时作为本次规划的根工作项。它负责为什么要改、这次选定哪部分、决定和就绪状态，并引用独立的产品合同与技术设计。
 
-## Configuration and storage
+## 配置与存放
 
-Before creating or updating a Proposal, read the project's issue-tracker configuration referenced by project instructions, normally `docs/agents/issue-tracker.md`. It must define where Proposals live and how their work status and review/approval evidence are maintained. Local Markdown is a supported tracker when explicitly configured.
+创建或更新 Proposal 前，读取项目指令指向的 Issue 配置，通常是 `docs/agents/issue-tracker.md`。配置必须说明 Proposal 放在哪里，以及工作状态、评审和批准证据如何维护。
 
-If this configuration is missing or does not resolve Proposal handling, ask the user to complete it. Continue discussion and drafting in the conversation; do not invent a storage location, publish the Proposal or set its workflow status before configuration is established.
+配置缺失或无法确定 Proposal 的处理方式时，在对话中继续讨论和起草，但不要自行选择存放位置、发布 Proposal 或改变远端状态。
 
-Reuse the existing Proposal and follow the artifact registry for historical ownership. A registration change does not migrate existing work. Create one Proposal in the configured location, not both a tracker issue and a duplicate local document.
+复用合适的既有 Proposal。一个工作只保留一个规划根节点，不同时创建远端 Issue 与重复的本地 Proposal。
 
-## Contents and format
+## 内容
 
-Follow the project's existing Proposal format and relevant maintained examples. When no project format exists, use [proposal-template.md](./proposal-template.md) as a body outline; status fields still come from tracker configuration.
+遵循项目既有格式。项目没有格式时使用 [proposal-template.md](./proposal-template.md)。内容与工作规模相称：
 
-Keep the content proportional to the work:
+- **目标与选定范围**：为什么做、本次交付哪一段以及重要排除项；
+- **产品合同**：引用适用的 Spec，或对小改动直接写清产品行为与验收；
+- **决定**：重要选择、未解决问题、Plan Review 与批准证据；
+- **引用**：相关 PRD、Spec、RFC、ADR 和实施工作项。
 
-- **Goal and scope** — the intended change, reason, included work and important exclusions.
-- **Acceptance** — observable completion conditions, or precise references to the applicable requirements.
-- **Decisions** — material proposed choices, unresolved questions and the resulting review and approval evidence.
-- **References** — existing PRD, Spec, RFC, ADR or other supporting artifacts.
+Proposal 不复制独立 Spec 或 RFC 的正文。存在独立 Spec 时，详细产品范围与验收由 Spec 拥有；Proposal 只说明本次选取其中哪一部分。
 
-A small Proposal may contain all necessary requirements and design. Create separate artifacts only when they need independent ownership. Reference their relevant sections instead of copying them or adding placeholder links.
+## 状态更新
 
-## Status and updates
+只使用配置好的工作状态与证据约定。Plan Review 结果记录在 Proposal 或既有工作项；只有规划内容通过、所需批准齐备且没有阻塞时，才更新为就绪。
 
-Use only the configured tracker's work states and evidence conventions. Record Plan Review results on this Proposal; transition it to ready only when readiness and required approvals are established. Execution authorization remains subject to project rules. A review result, approval and execution authorization are distinct facts.
+评审通过、批准和执行授权是三件不同的事。
 
-Update the Proposal when agreed scope, decisions, review results, workflow status or supporting references change. Detailed requirements, design reasoning and ticket progress stay with their respective owners.
-
-## Relationship to decision records
-
-A decision record may reference the Proposal to preserve a durable choice or delivery rationale without duplicating the proposal. Its `proposed / implemented / rejected` delivery lifecycle does not set the Proposal's work status.
-
-If an existing project uses one file for both purposes, follow its registered mapping of work status, approval evidence and record lifecycle. Do not add a competing `status` field or migrate historical Proposals automatically.
+详细产品合同、技术设计和实施进度分别留在自己的属主中。

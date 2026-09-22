@@ -1,19 +1,19 @@
-# <Proposal title>
+# <Proposal 标题>
 
-<!-- Fallback body outline. Prefer project examples. Use the configured tracker for the identifier, status and evidence representation; this template defines no parallel state field. Remove guidance and unused entries. -->
+<!-- 仅在项目没有既有格式时使用。标识、状态与证据按项目 Issue 配置维护；删除提示和不适用章节。 -->
 
-## Goal and scope
+## 目标与选定范围
 
-<What should change, why, the selected scope and important exclusions.>
+<为什么要改、本次交付哪一段，以及重要排除项。>
 
-## Acceptance
+## 产品合同
 
-- <Observable completion condition or reference to the applicable requirement section.>
+<引用适用的 Spec 章节；小改动没有独立 Spec 时，在这里写清可观察行为与验收条件。>
 
-## Decisions
+## 决定
 
-<Material proposed choices, reasoning and unresolved questions. Record actual Plan Review results and required approval evidence here, or reference their configured owner. Drafting this section grants neither approval nor execution authorization.>
+<重要选择、未解决问题、Plan Review 结论与批准证据。起草本节不代表已批准或已取得执行授权。>
 
-## References
+## 引用
 
-<Link existing supporting requirements and design sections. Omit absent artifacts.>
+<相关 PRD、Spec、RFC、ADR、Agent Note 与实施工作项。不存在的工件不要放占位链接。>
