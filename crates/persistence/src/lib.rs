@@ -1,10 +1,10 @@
 use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
-    ApplicationError, AttemptFailure, ClaimedJob, CompleteJob, HoldDisposition, HubRepository,
-    JobView, LeaseRecovery, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
-    RoutingDecision,
+    ApplicationError, AttemptFailure, ClaimedJob, CompleteJob, GatewayModelCandidateView,
+    GatewayModelView, HoldDisposition, HubRepository, JobView, LeaseRecovery, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeRequest,
+    ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, CreateImageGeneration, GenerationJob, ImageBranch, JobId,
@@ -13,8 +13,23 @@ use seeai_domain::{
 };
 use serde_json::Value;
 use sha2::{Digest, Sha256};
-use sqlx::{PgPool, Row, postgres::PgPoolOptions};
+use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
 use uuid::Uuid;
+
+/// **唯一的候选可用性判据**：这条候选现在真的能走吗——它自己启用，且它所在的渠道也启用。
+///
+/// 三处都判它：对客目录（列哪些模型）、受理（取哪些候选）、管理员视图（每个候选的 `enabled`
+/// 字段）。只写一遍是因为分散之后，将来加一条闸门（比如渠道维护窗口）必然漏掉其中一处，
+/// 而漏掉的那一处会让"目录里列着、提交时却取不到候选"重新出现——那种模型对调用方是 404，
+/// 比不列更糟。
+///
+/// 列名 `o`/`c` 是这三条查询里供给与渠道的固定别名。管理员视图不把它放进 `WHERE`（它要连
+/// **停用**的候选一起列出来，运营才看得出"为什么它调不动"），而是放进 `SELECT` 当一列读。
+///
+/// 用它拼查询要经过 `AssertSqlSafe`：`sqlx::query` 默认只收字面量，为的是逼动态 SQL 先被审
+/// 一遍。这里拼进去的只有这个编译期常量（列名与一个布尔与），不含任何外部输入或用户数据，
+/// 所以那个断言是"审过了"，不是把检查绕过去——别的动态 SQL 不要走这条路。
+const CANDIDATE_AVAILABLE_SQL: &str = "o.enabled AND c.enabled";
 
 #[derive(Debug, Clone)]
 pub struct PgHubRepository {
@@ -85,6 +100,7 @@ impl HubRepository for PgHubRepository {
         let PublishRuntimeRequest {
             vendor_id,
             native_model_id,
+            gateway_model,
             native_revision,
             actor,
             capability_schema,
@@ -213,7 +229,7 @@ impl HubRepository for PgHubRepository {
                 vendor_model_id,
                 offering_id,
                 channel_id,
-                gateway_model: native_model_id.clone(),
+                gateway_model: gateway_model.clone(),
                 native_revision: native_revision.clone(),
                 capability_schema: capability_schema.clone(),
                 carrier_schema: offering.carrier_schema.clone(),
@@ -251,28 +267,53 @@ impl HubRepository for PgHubRepository {
         }
         // 发布即原子替换该模型的全部 active 条目：候选集与顺序
         // 始终属于同一个 Revision，不存在跨 Revision 并存。
+        //
+        // 替换的对象是**平台对客名**，不是厂商原生名：同一份供给可以包成两个网关模型
+        // （各自一个名字、各自一份定义），重发一个名字只动它自己。
+        //
+        // 守卫：一次发布只定义一个网关模型，写下的候选必须同值。它守的是"同一次发布里的
+        // `gateway_model` 不得出现第二个值"这条验收要求——"发布即原子替换**这个名字**的
+        // 候选集"依赖它，两个名字的候选混在一次发布里会互相顶掉，"替换的到底是谁"就说不清了。
+        //
+        // 为什么现在走不到这里：每个候选的 `gateway_model` 都是从这个请求**唯一那个**名字字段
+        // 抄下来的（上面写快照时逐条用的就是它），因此类型上不可能出现第二个值。留着它是为了
+        // 让将来形状变化时（例如允许候选各自报名）先在这里被拦住，而不是先写进去再发现。
+        if candidates
+            .iter()
+            .any(|candidate| candidate.gateway_model != gateway_model)
+        {
+            transaction.rollback().await.map_err(database_error)?;
+            return Err(ApplicationError::Validation(
+                "a publication defines exactly one gateway model, but its candidates disagree \
+                 on the name"
+                    .to_owned(),
+            ));
+        }
         sqlx::query(
             "UPDATE publication.runtime_entries SET active = false WHERE active AND gateway_model = $1",
         )
-        .bind(&native_model_id)
+        .bind(&gateway_model)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
         let snapshot = serde_json::json!({
             "vendor_id": vendor_id,
-            "gateway_model": native_model_id,
+            "gateway_model": gateway_model,
             "native_revision": native_revision,
             "candidates": snapshot_entries,
         });
         sqlx::query(
             r#"
-            INSERT INTO publication.runtime_revisions (id, snapshot, published_by)
-            VALUES ($1, $2, $3)
+            INSERT INTO publication.runtime_revisions
+                (id, snapshot, published_by, gateway_model, vendor_model_id)
+            VALUES ($1, $2, $3, $4, $5)
             "#,
         )
         .bind(revision_id.0)
         .bind(&snapshot)
         .bind(&actor)
+        .bind(&gateway_model)
+        .bind(vendor_model_id.0)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -289,12 +330,26 @@ impl HubRepository for PgHubRepository {
             .bind(candidate.vendor_model_id.0)
             .bind(candidate.offering_id.0)
             .bind(candidate.price_snapshot.price_plan_id.0)
-            .bind(&native_model_id)
+            .bind(&gateway_model)
             .bind(candidate.routing_priority)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
         }
+        // 该名字**首次发布成功**时落一行运维开关（`enabled` 默认 true），此后只由 PATCH 改它。
+        // 定义（合同、候选集、定价）不进这张表：那些是修订的内容，存第二份就等于造第二个权威。
+        sqlx::query(
+            r#"
+            INSERT INTO publication.gateway_models (gateway_model, updated_by)
+            VALUES ($1, $2)
+            ON CONFLICT (gateway_model) DO NOTHING
+            "#,
+        )
+        .bind(&gateway_model)
+        .bind(&actor)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
         insert_audit(
             &mut transaction,
             &actor,
@@ -307,19 +362,23 @@ impl HubRepository for PgHubRepository {
         transaction.commit().await.map_err(database_error)?;
         Ok(PublishedRevision {
             runtime_revision_id: revision_id,
-            gateway_model: native_model_id,
+            gateway_model,
             candidates,
         })
     }
 
     async fn active_offering(
         &self,
-        native_model_id: &str,
+        gateway_model: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
         // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它所属的那一行
         // vendor_models 取**合同**（模型级唯一一份），并从它自己的 offering 行取**承载面**——
         // 同一型号的候选共享一份合同，各自带自己的承载面。
-        let rows = sqlx::query(
+        //
+        // 参数名是**平台对客名**（网关模型名），不是厂商原生名：调用方提交的 `model` 就是它。
+        // 判据与对客目录**逐条一致**，其中多一条"网关模型开着"——关掉的模型必须真的调不动，
+        // 否则"关闭"只影响目录、不影响受理，等于没关。
+        let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT
                 rr.id AS runtime_revision_id,
@@ -336,15 +395,16 @@ impl HubRepository for PgHubRepository {
                 re.routing_priority
             FROM publication.runtime_entries re
             JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+            JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
-            JOIN supply.offerings o ON o.id = re.offering_id AND o.enabled
-            JOIN supply.channels c ON c.id = o.channel_id AND c.enabled
+            JOIN supply.offerings o ON o.id = re.offering_id
+            JOIN supply.channels c ON c.id = o.channel_id
             JOIN pricing.price_plans p ON p.id = re.price_plan_id
-            WHERE re.active AND re.gateway_model = $1
+            WHERE re.active AND re.gateway_model = $1 AND {CANDIDATE_AVAILABLE_SQL}
             ORDER BY re.routing_priority ASC, rr.created_at DESC
-            "#,
-        )
-        .bind(native_model_id)
+            "#
+        )))
+        .bind(gateway_model)
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
@@ -363,7 +423,7 @@ impl HubRepository for PgHubRepository {
                 .any(|candidate| candidate.runtime_revision_id != first_revision)
             {
                 return Err(ApplicationError::Persistence(format!(
-                    "active candidates for model {native_model_id} span multiple runtime revisions"
+                    "active candidates for model {gateway_model} span multiple runtime revisions"
                 )));
             }
         }
@@ -371,24 +431,28 @@ impl HubRepository for PgHubRepository {
     }
 
     async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
-        // 判据与 `active_offering` **逐条对齐**（生效的发布条目 + 启用的供给 + 启用的渠道）：
-        // 目录里列出的型号必须真的受理得起来。少判一条，就会出现"目录里有、提交时取不到候选"
-        // 的型号——那种型号对调用方是 404，比不列更糟。
+        // 判据与 `active_offering` **逐条对齐**（生效的发布条目 + 网关模型开着 + 启用的供给 +
+        // 启用的渠道）：目录里列出的型号必须真的受理得起来。少判一条，就会出现"目录里有、
+        // 提交时取不到候选"的型号——那种型号对调用方是 404，比不列更糟。
         //
         // 一个型号一条：正常情形下同一个型号的 active 条目来自同一次发布（发布即原子替换），
         // 只有发布语义被绕过才会跨修订并存；即便如此也按确定的顺序取一条，不把同一个名字列两遍。
-        let rows = sqlx::query(
+        //
+        // 这里取的是**发布的合同原文**：合同行不可变，替换对客名是投射那一步的事
+        // （存的那份不动），否则旧 Job 事后读到的合同就与它受理时不一样了。
+        let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT DISTINCT ON (re.gateway_model)
                 re.gateway_model, vm.vendor_id, vm.native_revision, vm.capability_schema
             FROM publication.runtime_entries re
+            JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
-            JOIN supply.offerings o ON o.id = re.offering_id AND o.enabled
-            JOIN supply.channels c ON c.id = o.channel_id AND c.enabled
-            WHERE re.active
+            JOIN supply.offerings o ON o.id = re.offering_id
+            JOIN supply.channels c ON c.id = o.channel_id
+            WHERE re.active AND {CANDIDATE_AVAILABLE_SQL}
             ORDER BY re.gateway_model ASC, re.routing_priority ASC, vm.created_at DESC, vm.id ASC
-            "#,
-        )
+            "#
+        )))
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
@@ -402,6 +466,94 @@ impl HubRepository for PgHubRepository {
                 })
             })
             .collect()
+    }
+
+    async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError> {
+        // 只读投影：生效条目（含**已停用**的候选，运营要能看出"为什么它调不动"）+
+        // 修订（哪一次发布、什么时候发的）+ 厂商模型合同（厂商与原生名）+ 运维开关。
+        //
+        // 候选按 `routing_priority` 升序取；一条网关模型一项。开关行缺失的名字不会出现在这里
+        // （它同时也在受理与目录里取不到），因此"列得出来"就等于"能停用、能受理"。
+        //
+        // 候选能不能走由 `CANDIDATE_AVAILABLE_SQL` 判一次、当列读回来——不在这里用 Rust 重算
+        // 那几个开关的与：重算就是第三份判据，将来加一条闸门必然漏掉一处。
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            r#"
+            SELECT
+                re.gateway_model, gm.enabled,
+                vm.vendor_id, vm.native_model_id, vm.native_revision,
+                rr.id AS runtime_revision_id, rr.created_at AS published_at,
+                o.id AS offering_id, o.adapter_key, o.provider_model_id,
+                o.carrier_schema, o.parameter_mapping,
+                c.provider_kind,
+                ({CANDIDATE_AVAILABLE_SQL}) AS candidate_available,
+                re.routing_priority
+            FROM publication.runtime_entries re
+            JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+            JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model
+            JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+            JOIN supply.offerings o ON o.id = re.offering_id
+            JOIN supply.channels c ON c.id = o.channel_id
+            WHERE re.active
+            ORDER BY re.gateway_model ASC, re.routing_priority ASC, o.id ASC
+            "#
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let mut views: Vec<GatewayModelView> = Vec::new();
+        for row in &rows {
+            // 行按名字排好序，所以同一个名字的候选连续出现：遇到新名字就起一条，否则挂上去。
+            let name: String = row.try_get("gateway_model").map_err(database_error)?;
+            let candidate = row_to_gateway_model_candidate(row)?;
+            match views.last_mut() {
+                Some(view) if view.gateway_model == name => view.candidates.push(candidate),
+                _ => views.push(row_to_gateway_model(row, vec![candidate])?),
+            }
+        }
+        Ok(views)
+    }
+
+    async fn set_gateway_model_enabled(
+        &self,
+        gateway_model: &str,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 只改开关这一列。定义（合同、候选集）不在这里，改了它等于绕过发布——那会让
+        // "Job 固定受理时版本"失去依据。
+        let updated = sqlx::query(
+            r#"
+            UPDATE publication.gateway_models
+            SET enabled = $2, updated_at = now(), updated_by = $3
+            WHERE gateway_model = $1
+            "#,
+        )
+        .bind(gateway_model)
+        .bind(enabled)
+        .bind(actor)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 没发布过的名字不是"待创建的资源"：定义只能由发布产生，因此这里是"不存在"，
+        // 而不是先建一行再让人以为它已经在售。
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await.map_err(database_error)?;
+            return Err(ApplicationError::NotFound(format!(
+                "gateway model {gateway_model}"
+            )));
+        }
+        insert_audit(
+            &mut transaction,
+            actor,
+            "gateway_model.set_enabled",
+            "gateway_model",
+            gateway_model,
+            &serde_json::json!({"enabled": enabled}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)
     }
 
     async fn create_account(
@@ -1541,6 +1693,42 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
             captured_at: row.try_get("captured_at").map_err(database_error)?,
         },
         routing_priority: row.try_get("routing_priority").map_err(database_error)?,
+    })
+}
+
+/// 管理员视图里的一条候选：只读投影的一行。
+fn row_to_gateway_model_candidate(
+    row: &sqlx::postgres::PgRow,
+) -> Result<GatewayModelCandidateView, ApplicationError> {
+    Ok(GatewayModelCandidateView {
+        offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
+        provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+        provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
+        adapter_key: row.try_get("adapter_key").map_err(database_error)?,
+        routing_priority: row.try_get("routing_priority").map_err(database_error)?,
+        // 判据在 SQL 里判过了（`CANDIDATE_AVAILABLE_SQL`），这里只读结果，不重算。
+        enabled: row.try_get("candidate_available").map_err(database_error)?,
+        carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
+        parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
+    })
+}
+
+/// 管理员视图里的一个网关模型：只读投影的一行；候选按行序由调用方拼好后传进来。
+fn row_to_gateway_model(
+    row: &sqlx::postgres::PgRow,
+    candidates: Vec<GatewayModelCandidateView>,
+) -> Result<GatewayModelView, ApplicationError> {
+    Ok(GatewayModelView {
+        gateway_model: row.try_get("gateway_model").map_err(database_error)?,
+        enabled: row.try_get("enabled").map_err(database_error)?,
+        vendor_id: row.try_get("vendor_id").map_err(database_error)?,
+        native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+        native_revision: row.try_get("native_revision").map_err(database_error)?,
+        runtime_revision_id: RuntimeRevisionId(
+            row.try_get("runtime_revision_id").map_err(database_error)?,
+        ),
+        published_at: row.try_get("published_at").map_err(database_error)?,
+        candidates,
     })
 }
 

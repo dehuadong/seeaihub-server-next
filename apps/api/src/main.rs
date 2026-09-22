@@ -4,21 +4,21 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, post},
+    routing::{get, patch, post},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
-    AdapterRegistry, ApplicationError, CreateImageGenerationRequest, GeneratedImage,
-    GenerationService, HubRepository, IdentityService, JobView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
-    RefundReconciliationCommand, RuntimeService,
+    AdapterRegistry, ApplicationError, CreateImageGenerationRequest, GatewayModelView,
+    GeneratedImage, GenerationService, HubRepository, IdentityService, JobView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
+    ReconciliationService, RefundReconciliationCommand, RuntimeService,
 };
 use seeai_domain::{
     AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel,
-    contract_image_parameter_kind,
+    contract_image_parameter_kind, replace_contract_model_identity,
 };
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
@@ -85,6 +85,11 @@ async fn main() -> Result<()> {
             post(issue_api_key),
         )
         .route("/api/v1/runtime-revisions", post(publish_runtime))
+        .route("/api/v1/gateway-models", get(list_gateway_models))
+        .route(
+            "/api/v1/gateway-models/{gateway_model}",
+            patch(set_gateway_model_enabled),
+        )
         .route(
             "/api/v1/reconciliation-cases",
             get(list_reconciliation_cases),
@@ -342,10 +347,13 @@ struct ModelCatalogResponse {
 /// 字段名是对客协议的取值，与内部的 [`PublishedModel`] 分开：内部字段改名不该动对客协议。
 #[derive(Debug, Serialize)]
 struct ModelCatalogEntry {
-    /// 客户端提交 `model` 时用的名字。
+    /// 客户端提交 `model` 时用的名字——**平台对客名**（网关模型名）。
     name: String,
-    /// 厂商：目录属性，同一个厂商模型可以由多条渠道供给。
-    vendor: String,
+    /// 厂商标识：目录属性，同一个厂商模型可以由多条渠道供给。
+    ///
+    /// 叫 `vendor_id` 而不是 `vendor`：它是厂商的**标识**，与 `catalog.vendor_models.vendor_id`
+    /// 同义；对客协议里换名字比内部换名字代价大，因此这里一次说清。
+    vendor_id: String,
     /// 合同修订。
     revision: String,
     /// 该模型的调用方合同（发布的 JSON Schema），客户端据此建表单。
@@ -354,13 +362,33 @@ struct ModelCatalogEntry {
 
 impl From<PublishedModel> for ModelCatalogEntry {
     fn from(model: PublishedModel) -> Self {
+        let PublishedModel {
+            gateway_model,
+            vendor_id,
+            native_revision,
+            capability_schema,
+        } = model;
         Self {
-            name: model.gateway_model,
-            vendor: model.vendor_id,
-            revision: model.native_revision,
-            contract: model.capability_schema,
+            name: gateway_model.clone(),
+            vendor_id,
+            revision: native_revision,
+            contract: consumer_contract(capability_schema, &gateway_model),
         }
     }
+}
+
+/// 对客投射：把合同正文里的 `model.const` 换成**平台对客名**。
+///
+/// 存的那份合同**不动**（合同行不可变：旧 Job 事后读到的必须与它受理时逐字相同），只在交给
+/// 调用方时替换这一个字段。为什么可以替换：`model` 一直是**平台字段**——受理期平台本来就用
+/// 调用方给的 `model` 覆盖它（见 `contract_parameter_face`）；而合同里那个常量写的是**厂商
+/// 原生名**，原生名不进对客面。
+///
+/// 替换的位置、以及"合同没声明这个常量时不动它"，由 [`replace_contract_model_identity`] 一处
+/// 决定：发布期校验与这里必须指向合同里同一个字段，各写一遍迟早对不上。
+fn consumer_contract(mut contract: Value, gateway_model: &str) -> Value {
+    replace_contract_model_identity(&mut contract, gateway_model);
+    contract
 }
 
 /// 对客目录：当前**真的能调**的模型，以及每个模型那份发布的合同。
@@ -380,6 +408,58 @@ async fn list_models(
         .map(ModelCatalogEntry::from)
         .collect();
     Ok(Json(ModelCatalogResponse { data }))
+}
+
+/// 管理员读：网关模型清单的响应。
+///
+/// 用 `gateway_models` 包一层而不是直接回数组：这条视图将来只增字段（候选、定价），
+/// 有外层对象才不会每加一样就改一次响应的顶层形状。
+#[derive(Debug, Serialize)]
+struct GatewayModelsResponse {
+    gateway_models: Vec<GatewayModelView>,
+}
+
+/// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。
+///
+/// **需要管理员凭证**：它是运营视图，与对客目录不是一回事——对客目录只有型号身份与合同，
+/// 这里带厂商原生名、候选、承载面与映射。**不回显渠道凭证**（`credential_env` 只是变量名）。
+/// 全部数据来自数据库（生效修订 + 运维开关），不读缓存、不需要直查库。
+async fn list_gateway_models(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<GatewayModelsResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    Ok(Json(GatewayModelsResponse {
+        gateway_models: state.runtime.gateway_models().await?,
+    }))
+}
+
+/// 运维开关的请求体：**唯一可变位**就是它。
+///
+/// `deny_unknown_fields`：把"想顺手改候选/改合同"的请求直接拒掉，而不是静默忽略——
+/// 忽略会让调用方以为改成功了，而定义只能由发布产生。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct SetGatewayModelEnabledBody {
+    enabled: bool,
+}
+
+/// 管理员写：启停一个网关模型。
+///
+/// 关闭的语义：该名字从对客目录消失、受理得到"模型不存在"；**已受理的 Job 不受影响**
+/// （它们固定的是受理时那一版）。没有发布过的名字是 404——这里不创建任何东西。
+async fn set_gateway_model_enabled(
+    State(state): State<AppState>,
+    Path(gateway_model): Path<String>,
+    headers: HeaderMap,
+    Json(body): Json<SetGatewayModelEnabledBody>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    state
+        .runtime
+        .set_gateway_model_enabled(&gateway_model, body.enabled, "admin-api")
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 受理请求：**平铺**的模型参数 + 图片字段（`image` 与 `image_urls` 同义二选一，`mask` 是遮罩）。

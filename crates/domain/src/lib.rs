@@ -342,6 +342,31 @@ pub struct PublishedModel {
     pub capability_schema: Value,
 }
 
+/// 合同里声明**型号身份**的那个字段的位置（`properties.model.const`）。
+///
+/// 它有两处用途，且必须指向同一个字段：发布期用它拒绝「把 A 型号的合同挂到 B 型号上」，
+/// 对客投射时被替换的也**只有**这一个字段。位置写两遍就会各自漂移，而漂移的表现是
+/// "校验过了，交给调用方的合同里那个常量却是另一个名字"——两边都自认为对。
+const CONTRACT_MODEL_POINTER: &str = "/properties/model/const";
+
+/// 读出合同声明的型号身份；合同没声明这个字段时返回 `None`。
+#[must_use]
+pub fn contract_model_identity(contract: &Value) -> Option<&str> {
+    contract
+        .pointer(CONTRACT_MODEL_POINTER)
+        .and_then(Value::as_str)
+}
+
+/// 把合同声明的型号身份替换成 `model`。
+///
+/// **合同没声明这个字段时原样交回**，不凭空往里加键：加出来的键与库里那份合同对不上，
+/// 而调用方拿到的合同必须能逐字对应回库里那一份——只有这一处允许替换。
+pub fn replace_contract_model_identity(contract: &mut Value, model: &str) {
+    if let Some(slot) = contract.pointer_mut(CONTRACT_MODEL_POINTER) {
+        *slot = Value::String(model.to_owned());
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GenerationJob {
     pub id: JobId,

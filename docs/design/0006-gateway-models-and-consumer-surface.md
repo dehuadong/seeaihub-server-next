@@ -40,9 +40,9 @@
 
 ### 1.3 命名与唯一性
 
-- **`gateway_model`（平台命名）**：全局唯一，且**同一时刻只有一个生效修订**。沿用现有唯一索引 `one_active_entry_per_model_and_priority`（`(gateway_model, routing_priority) WHERE active`）所保证的"同一名字的生效条目来自同一修订"，本设计只调整该索引（[`0008`](./0008-routing-strategy-and-caching.md) §2）。
+- **`gateway_model`（平台命名）**：全局唯一，且**同一时刻只有一个生效修订**。沿用现有唯一索引 `one_active_entry_per_model_and_priority`（`(gateway_model, routing_priority) WHERE active`）所保证的"同一名字的生效条目来自同一修订"，本设计只调整该索引（[`0008`](./0008-routing-strategy-and-caching.md) §2）。**名字由管理员创建（发布）时自己填，平台不预设、也不固定任何名字**——本文出现的 `gpt-image-2.5-plus` 一类取值都是示例，不是默认名或规范名。
 - **`native_model_id`（厂商原生名）**：只属于 `catalog.vendor_models`，用于合同的身份与唯一键；**不进对客面**。
-- **允许多个网关模型指向同一个 Vendor Model Revision**：同一份供给包成不同名字/不同价格档（`gpt-image-2.5-plus` 与 `gpt-image-2.5-lite` 都指向 `gpt-image-2.5-sunburst`）。唯一性在**名字**上，不在 Vendor Model 上。这是引入命名层的动机之一，因此不做"一个 Vendor Model 只能有一个网关模型"的约束。
+- **允许多个网关模型指向同一个 Vendor Model Revision**：同一份供给包成不同名字/不同价格档（例如 `gpt-image-2.5-plus` 与 `gpt-image-2.5-lite` 都指向 `gpt-image-2.5-sunburst`，三者为示例值）。唯一性在**名字**上，不在 Vendor Model 上。这是引入命名层的动机之一，因此不做"一个 Vendor Model 只能有一个网关模型"的约束。
 - **发布命令新增 `gateway_model`**（`PublishRuntimeCommand`）：缺省时回退取 `native_model_id`，与现有形状**逐位兼容**——现有素材、现有已发布数据、现有测试都不用改。
 
 ### 1.4 对客名与 `native_model_id` 的边界
@@ -133,7 +133,7 @@
 }
 ```
 
-它是**只读投影**：数据源是生效修订（`runtime_entries` + `runtime_revisions` + `catalog.vendor_models`）加运维开关（`publication.gateway_models`）。不新增"编辑态"，也不回显渠道凭证（`credential_env` 只记变量名，本来就不进响应）。示例里的 `pricing` 各项只占字段位，并标出**币种平面**（[`0007`](./0007-pricing-floor-and-settlement.md) §8）：每个候选各带**该候选的渠道成本**（`reference_cost_microusd`，**原币种**微单位，**只作定价参考**）、**它的成本币种**（`cost_currency`）、**按候选的对客费率向量**（`consumer_rates_cny`，**四档 CNY**，管理员设定/推导）与**它的成本来源**（`cost_basis`），`markup_bps` 是**加价系数**（**每网关模型一个**）；汇率是**全局按币种维护**的折算率（`pricing.fx_rates`，渠道币种 → CNY），不随修订发布、**受理时按该候选的 `cost_currency` 取"受理时刻生效的那一行"并快照进 Price Snapshot**（[`0007`](./0007-pricing-floor-and-settlement.md) §2）。**对客费率向量由管理员按"该候选的成本费率 ×(1 + `markup_bps`)× 该币种 → CNY 的汇率"设定/推导，随修订发布、随 Job 快照冻结**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §4），**因此同一网关模型的不同候选价格不同**；`reference_cost_microusd` 只作定价参考、**不是售价的被乘数**；**加价系数由管理员创建网关模型时录入、汇率由管理员在后台维护，数值本身不属设计决策**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §10）。
+它是**只读投影**：数据源是生效修订（`runtime_entries` + `runtime_revisions` + `catalog.vendor_models`）加运维开关（`publication.gateway_models`）。不新增"编辑态"，也不回显渠道凭证（`credential_env` 只记变量名，本来就不进响应）。**示例里的 `weight` 归路由策略层，P3 落地后才出现**：本切片（P1）的管理端响应里没有它，示例保留该字段只为标出将来的位置。示例里的 `pricing` 各项只占字段位，并标出**币种平面**（[`0007`](./0007-pricing-floor-and-settlement.md) §8）：每个候选各带**该候选的渠道成本**（`reference_cost_microusd`，**原币种**微单位，**只作定价参考**）、**它的成本币种**（`cost_currency`）、**按候选的对客费率向量**（`consumer_rates_cny`，**四档 CNY**，管理员设定/推导）与**它的成本来源**（`cost_basis`），`markup_bps` 是**加价系数**（**每网关模型一个**）；汇率是**全局按币种维护**的折算率（`pricing.fx_rates`，渠道币种 → CNY），不随修订发布、**受理时按该候选的 `cost_currency` 取"受理时刻生效的那一行"并快照进 Price Snapshot**（[`0007`](./0007-pricing-floor-and-settlement.md) §2）。**对客费率向量由管理员按"该候选的成本费率 ×(1 + `markup_bps`)× 该币种 → CNY 的汇率"设定/推导，随修订发布、随 Job 快照冻结**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §4），**因此同一网关模型的不同候选价格不同**；`reference_cost_microusd` 只作定价参考、**不是售价的被乘数**；**加价系数由管理员创建网关模型时录入、汇率由管理员在后台维护，数值本身不属设计决策**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §10）。
 
 ### 2.3 写路径：沿用整份发布，新增一个字段
 

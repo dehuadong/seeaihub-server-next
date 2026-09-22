@@ -10,9 +10,9 @@ use seeai_domain::{
     JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
     PublishedModel, PublishedOffering, PublishedRevision, RuntimeRevisionId, apply_enum_maps,
     apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
-    contract_image_parameter_kind, declared_defaults, declared_enum_maps, declared_field_names,
-    declared_parameter_names, declared_reference_image_limit, declared_renames,
-    declared_size_mapping, declares_mask_parameter, declares_parameter,
+    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
+    declared_field_names, declared_parameter_names, declared_reference_image_limit,
+    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
     declares_reference_image_parameter, is_used_parameter_value, place_image_inputs,
     platform_image_parameters,
 };
@@ -39,6 +39,11 @@ use uuid::Uuid;
 pub struct PublishRuntimeCommand {
     pub vendor_id: String,
     pub native_model_id: String,
+    /// **平台对客名**（网关模型名）：调用方提交 `model` 时用的那个名字，也是这次发布
+    /// **原子替换**的对象。缺省时回退取 `native_model_id`——今天两者同值，老素材、老已发布
+    /// 数据与老测试因此逐位不变。
+    #[serde(default)]
+    pub gateway_model: Option<String>,
     pub native_revision: String,
     /// **Vendor Model Contract**：调用方合同的唯一一份，模型级。
     ///
@@ -84,7 +89,10 @@ pub struct PublishRuntimeCommand {
 #[derive(Debug, Clone)]
 pub struct PublishRuntimeRequest {
     pub vendor_id: String,
+    /// 厂商原生名：只属于厂商模型与合同的身份，**不进对客面**。
     pub native_model_id: String,
+    /// 平台对客名：这次发布定义并原子替换的那个网关模型。
+    pub gateway_model: String,
     pub native_revision: String,
     pub actor: String,
     /// 该模型的调用方合同（模型级唯一一份，落库后不再改）。
@@ -176,9 +184,17 @@ impl PublishRuntimeCommand {
         capability_schema: Value,
         offerings: Vec<NormalizedOffering>,
     ) -> PublishRuntimeRequest {
+        // 平台对客名缺省回退取厂商原生名：今天两者同值，老素材不带这个字段也照常可发布。
+        // 只写空白等于没写（名字是全空白的话，对客目录会列出一个调不动的名字）。
+        let gateway_model = self
+            .gateway_model
+            .map(|name| name.trim().to_owned())
+            .filter(|name| !name.is_empty())
+            .unwrap_or_else(|| self.native_model_id.clone());
         PublishRuntimeRequest {
             vendor_id: self.vendor_id,
             native_model_id: self.native_model_id,
+            gateway_model,
             native_revision: self.native_revision,
             actor: self.actor,
             capability_schema,
@@ -765,6 +781,53 @@ pub struct ProviderFailureQuery {
     pub limit: u32,
 }
 
+/// 管理员视图里的一条候选供给。
+///
+/// 它是**只读投影**：候选的定义（承载面、映射、顺序）来自生效修订，可走与否来自供给与渠道
+/// 自己的开关。**不回显渠道凭证**——`credential_env` 只是变量名，本来就不进响应。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayModelCandidateView {
+    pub offering_id: OfferingId,
+    /// 渠道类别（例如 AIHubMix / APIMart）。
+    pub provider_kind: String,
+    /// 这条供给在渠道侧用的模型名。
+    pub provider_model_id: String,
+    /// 用哪个 Driver 发出去。
+    pub adapter_key: String,
+    /// 选择顺序：数字小者优先（来自发布顺序，只有一个来源）。
+    pub routing_priority: i32,
+    /// 这条候选现在**真的能走**吗：供给与它所在渠道都启用。
+    ///
+    /// 与目录/受理的判据同一条——运营要能一眼看出"目录里为什么没有它"。
+    pub enabled: bool,
+    /// 这条供给**能承载**合同里的哪些字段。
+    pub carrier_schema: Value,
+    /// 这条供给自己的合同值 → 渠道包装声明。
+    pub parameter_mapping: Value,
+}
+
+/// 管理员视图里的一个网关模型：一条只读投影。
+///
+/// 数据源是生效修订（条目 + 修订 + 厂商模型合同）加运维开关。定义只能由发布产生，
+/// 这里**不新增编辑态**，也不回显渠道凭证。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct GatewayModelView {
+    /// 平台对客名：客户端提交 `model` 时用的那个名字。
+    pub gateway_model: String,
+    /// 运维开关：关掉之后它从对客目录消失、受理得到"模型不存在"；已受理的 Job 不受影响。
+    pub enabled: bool,
+    pub vendor_id: String,
+    /// 厂商原生名：**只在管理端出现**，对客面看不到它。
+    pub native_model_id: String,
+    /// 合同修订。
+    pub native_revision: String,
+    /// 当前生效的那一次发布。
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub published_at: DateTime<Utc>,
+    /// 候选清单，按 `routing_priority` 升序。
+    pub candidates: Vec<GatewayModelCandidateView>,
+}
+
 #[derive(Debug, Error)]
 pub enum ApplicationError {
     #[error("validation failed: {0}")]
@@ -820,6 +883,23 @@ pub trait HubRepository: Send + Sync {
     /// 目录里列出的型号必须真的受理得起来——取不到任何候选的型号，受理期对调用方是"不存在"，
     /// 因此也不该出现在目录里。一个可调型号都没有时返回空集合，不是错误。
     async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError>;
+
+    /// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。
+    ///
+    /// 一条都不可调（候选全被停用）的网关模型**照样列出来**——运营要能看见它、并据此决定
+    /// 是重新启用还是重发；把它藏起来等于"关掉之后再也找不到怎么打开"。
+    async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError>;
+
+    /// 管理员写：只改运维开关，写一条审计事件。
+    ///
+    /// 没发布过的名字返回 [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**
+    /// 任何东西（不做分步 CRUD）。
+    async fn set_gateway_model_enabled(
+        &self,
+        gateway_model: &str,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<(), ApplicationError>;
 
     async fn create_account(
         &self,
@@ -1154,6 +1234,7 @@ impl RuntimeService {
             normalized.push(self.validate_offering(&contract, offering)?);
         }
         let request = command.into_request(contract, normalized);
+        validate_gateway_model_identity(&request)?;
         let revision = self.repository.publish_runtime(request).await?;
         Ok(revision)
     }
@@ -1164,6 +1245,23 @@ impl RuntimeService {
     /// 否则客户端照目录建的表单会被另一套规则拒掉。
     pub async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
         self.repository.published_models().await
+    }
+
+    /// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。
+    pub async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError> {
+        self.repository.gateway_models().await
+    }
+
+    /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。
+    pub async fn set_gateway_model_enabled(
+        &self,
+        gateway_model: &str,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        self.repository
+            .set_gateway_model_enabled(gateway_model, enabled, actor)
+            .await
     }
 
     /// 校验单个候选，并归一化它的 `base_url`。
@@ -1357,12 +1455,10 @@ fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), Appl
     jsonschema::validator_for(contract)
         .map_err(|error| ApplicationError::Validation(error.to_string()))?;
     // 合同的身份必须与发布声明的型号一致：`model.const` 就是该 Provider 自己的模型名，
-    // 发布期据此拒绝「把 A 型号的合同挂到 B 型号上」。
-    if contract
-        .pointer("/properties/model/const")
-        .and_then(Value::as_str)
-        != Some(native_model_id)
-    {
+    // 发布期据此拒绝「把 A 型号的合同挂到 B 型号上」。这一条同时挡住"素材把**平台对客名**
+    // 写进合同正文"：对客名不是厂商模型的身份，写进合同就等于把两个角色又合成一个值。
+    // 读的位置与对客投射共用同一个助手——两边指向的必须是合同里同一个字段。
+    if contract_model_identity(contract) != Some(native_model_id) {
         return Err(ApplicationError::Validation(
             "capability_schema model.const must equal native_model_id".to_owned(),
         ));
@@ -1375,6 +1471,27 @@ fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), Appl
     {
         return Err(ApplicationError::Validation(
             "capability_schema must be a closed object schema".to_owned(),
+        ));
+    }
+    Ok(())
+}
+
+/// 校验这次发布声明的**平台对客名**：一次发布定义的就是这一个网关模型，名字不得为空白。
+///
+/// 守的是"同一次发布里的 `gateway_model` 不得出现第二个值"这条验收要求：名字是这次发布
+/// **原子替换**的对象，空白名字等于"替换一个不存在的名字"——对客目录会因此列出一个调不动的
+/// 名字。候选集是否都落在同一个名字上另由仓库在写入时守（见发布事务里的守卫）。
+///
+/// 为什么现在走不到这里：名字今天只有一个来源（命令顶层那一个字段），发布入口又已经校验过
+/// `native_model_id` 非空、`into_request` 把空白回退成它，因此到这里时名字必然非空。留着它是
+/// 为了让"发布即原子替换**这个名字**的候选集"在将来形状变化时（例如允许候选各自报名）先被
+/// 拦住，而不是先悄悄生效、事后才发现替换的到底是谁说不清。
+fn validate_gateway_model_identity(
+    request: &PublishRuntimeRequest,
+) -> Result<(), ApplicationError> {
+    if request.gateway_model.trim().is_empty() {
+        return Err(ApplicationError::Validation(
+            "gateway_model must not be empty".to_owned(),
         ));
     }
     Ok(())
@@ -2360,6 +2477,7 @@ mod tests {
         PublishRuntimeCommand {
             vendor_id: "OpenAI".to_owned(),
             native_model_id: "gpt-image-2.5-flare".to_owned(),
+            gateway_model: None,
             native_revision: "test-1".to_owned(),
             capability_schema: None,
             restrictions: serde_json::json!({}),
@@ -3080,6 +3198,42 @@ mod tests {
             validate_parameter_mapping(&contract, &offering).is_ok(),
             "改名接过来的字段照样承载得了这条默认值"
         );
+    }
+
+    /// 对客名缺省回退取厂商原生名：老素材、老已发布数据与老测试的形状因此逐位不变。
+    #[test]
+    fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
+        let request = base_command().into_request(schema("gpt-image-2.5-flare"), Vec::new());
+        assert_eq!(request.gateway_model, "gpt-image-2.5-flare");
+        assert_eq!(request.native_model_id, "gpt-image-2.5-flare");
+
+        // 给了就用给的：同一份供给可以包成另一个对客名，而合同挂的还是那个厂商模型。
+        let command = PublishRuntimeCommand {
+            gateway_model: Some("gpt-image-2.5-plus".to_owned()),
+            ..base_command()
+        };
+        let request = command.into_request(schema("gpt-image-2.5-flare"), Vec::new());
+        assert_eq!(request.gateway_model, "gpt-image-2.5-plus");
+        assert_eq!(request.native_model_id, "gpt-image-2.5-flare");
+
+        // 只写空白等于没写：对客目录不该列出一个空名字。
+        let command = PublishRuntimeCommand {
+            gateway_model: Some("   ".to_owned()),
+            ..base_command()
+        };
+        let request = command.into_request(schema("gpt-image-2.5-flare"), Vec::new());
+        assert_eq!(request.gateway_model, "gpt-image-2.5-flare");
+    }
+
+    /// 一次发布定义的就是一个网关模型：名字不能是空白。
+    #[test]
+    fn a_publish_must_declare_a_gateway_name() {
+        let mut request = base_command().into_request(schema("gpt-image-2.5-flare"), Vec::new());
+        assert!(validate_gateway_model_identity(&request).is_ok());
+        request.gateway_model = "  ".to_owned();
+        let error = validate_gateway_model_identity(&request)
+            .expect_err("a blank gateway name must be rejected");
+        assert!(error.to_string().contains("gateway_model"), "{error}");
     }
 
     /// 合同的身份就是发布的型号：`model.const` 不符即拒绝（换型号要发新的合同）。
@@ -3886,6 +4040,19 @@ mod tests {
         }
 
         async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError> {
+            unused_repository()
+        }
+
+        async fn set_gateway_model_enabled(
+            &self,
+            _gateway_model: &str,
+            _enabled: bool,
+            _actor: &str,
+        ) -> Result<(), ApplicationError> {
             unused_repository()
         }
 

@@ -51,11 +51,13 @@
 | POST | `/api/v1/accounts` | `create_account` | 管理员（`ADMIN_TOKEN`） |
 | POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
 | POST | `/api/v1/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
-| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price） |
+| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`） |
+| GET | `/api/v1/gateway-models` | `list_gateway_models` | 管理员（网关模型清单：对客名、运维开关、候选与承载面；**不回显渠道凭证**。对客名由管理员发布时自己填，平台不预设任何名字） |
+| PATCH | `/api/v1/gateway-models/{gateway_model}` | `set_gateway_model_enabled` | 管理员（**只改启用开关**；没发布过的名字是 404，定义只能由发布产生） |
 | GET | `/api/v1/reconciliation-cases` | `list_reconciliation_cases` | 管理员（含上游对账标识） |
 | POST | `/api/v1/reconciliation-cases/{job_id}/refund` | `refund_reconciliation` | 管理员（幂等退款） |
 | GET | `/api/v1/provider-failures` | `list_provider_failures` | 管理员（平台侧失败清单，含渠道原始码与原文） |
-| GET | `/v1/models` | `list_models` | 任何人（公开目录，无需鉴权；只列当前可调的型号与各自的调用方合同） |
+| GET | `/v1/models` | `list_models` | 任何人（公开目录，无需鉴权；只列当前可调的**网关模型**：`name` 是平台对客名、`vendor_id` 是厂商标识，另给合同修订 `revision` 与调用方合同 `contract`；厂商原生名不进对客面，`contract` 里的型号身份已换成对客名） |
 | POST | `/v1/images/generations` | `generate_image` | 持 Key 的账户（JSON；`model` + 平铺的模型参数 + 参考图/遮罩；幂等键走 `Idempotency-Key` 头） |
 | POST | `/v1/images/edits` | `edit_image` | 同上（`multipart/form-data`；`image`/`mask` 是文件部件，文本部件也认、值按 URL/data URL 读；与上一条**同一个能力**） |
 
@@ -105,7 +107,8 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `catalog.vendor_models` | ③ Profile（Capability Schema，随修订不可变） | `RuntimeService::publish` |
 | `supply.channels` / `supply.offerings` | ④ 渠道与供给 | `RuntimeService::publish` |
 | `pricing.price_plans` | ⑤ 计价配置 | `RuntimeService::publish` |
-| `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给与优先级 | `RuntimeService::publish` |
+| `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给与优先级；修订上另记这次发布定义的是哪个**网关模型**（对客名）与它指向哪一行厂商模型合同 | `RuntimeService::publish` |
+| `publication.gateway_models` | 网关模型的**运维开关**：这个名字现在开着吗、谁在什么时候改的。**定义不在这里**（候选集、合同、定价只在不可变修订里） | `RuntimeService::publish`（首次发布落行）、`set_gateway_model_enabled` |
 | `generation.jobs` | 受理时的请求事实、所选供给、价格快照、结果信封（渠道给的 `url` 或 `b64_json`）、对客错误码与平台侧失败类别；**对客不可见** | `GenerationService::create`、`complete_job`、`fail_job`、`recover_expired_leases` |
 | `generation.routing_decisions` | 受理时为什么选了它（候选、优先级、是否合格） | 与 Job 同事务写入 |
 | `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据** | `begin_attempt`、`complete_job`、`fail_job` |
@@ -129,7 +132,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、`ProviderCallError`、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类 | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance` | 同上；上游声明的 `cost`/`credits_cost` **不进平台证据**（计费事实由分项 token 推出，金额只在渠道事实台账里作为成本口径记录） |
-| `migrations/0001_initial.sql`…`0005_images_pass_through.sql` | 表结构与约束（含"每型号每个优先级一个活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及本次撤销资产表与列的增量迁移 | 运行时的业务规则 |
+| `migrations/0001_initial.sql`…`0007_gateway_model_naming.sql` | 表结构与约束（含"每型号每个优先级一个活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
 | `scripts/decisions/*.mjs` | Agent Notes 的索引生成与一致性检查 | 不影响服务运行 |
 | `docs/design/`、`docs/adr/` | 设计与决策的权威位置 | — |

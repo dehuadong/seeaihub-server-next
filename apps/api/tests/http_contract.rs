@@ -10,7 +10,7 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode};
 use seeai_application::HubRepository;
-use seeai_domain::AccountId;
+use seeai_domain::{AccountId, replace_contract_model_identity};
 use seeai_persistence::PgHubRepository;
 use serde_json::{Value, json};
 use sqlx::{PgPool, Row};
@@ -2562,6 +2562,12 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
         .as_str()
         .expect("native model id")
         .to_owned();
+    // 路由条目挂的是**平台对客名**：合同按厂商原生名落行，候选集按对客名生效。种子素材不写
+    // 这个字段，按发布期的回退规则取厂商原生名；平台自命名的例子见命名层那条用例。
+    let gateway = material["gateway_model"]
+        .as_str()
+        .unwrap_or(&model)
+        .to_owned();
     let revision = material["native_revision"]
         .as_str()
         .expect("native revision")
@@ -2632,7 +2638,7 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
          WHERE re.active AND re.gateway_model = $1
          ORDER BY re.routing_priority",
     )
-    .bind(&model)
+    .bind(&gateway)
     .fetch_all(&pool)
     .await
     .expect("candidate rows");
@@ -2696,7 +2702,7 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
          JOIN publication.runtime_entries re ON re.runtime_revision_id = rr.id
          WHERE re.active AND re.gateway_model = $1 LIMIT 1",
     )
-    .bind(&model)
+    .bind(&gateway)
     .fetch_one(&pool)
     .await
     .expect("runtime revision snapshot");
@@ -4437,7 +4443,13 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             .as_str()
             .expect("native model id")
             .to_owned();
-        assert_eq!(status, StatusCode::OK, "{model} 素材必须能发布：{body}");
+        // 对客名与厂商原生名是两个角色：目录与受理用前者，合同与合同行用后者。种子素材不写
+        // `gateway_model`，按发布期的回退规则取厂商原生名；自命名的例子见命名层那条用例。
+        let gateway = material["gateway_model"]
+            .as_str()
+            .unwrap_or(&model)
+            .to_owned();
+        assert_eq!(status, StatusCode::OK, "{gateway} 素材必须能发布：{body}");
 
         // 合同是**模型级唯一一份**：这个型号只落一行，两条候选都挂在它下面。
         let contracts: i64 = sqlx::query_scalar(
@@ -4459,7 +4471,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
              WHERE re.active AND re.gateway_model = $1
              ORDER BY re.routing_priority",
         )
-        .bind(&model)
+        .bind(&gateway)
         .fetch_all(&pool)
         .await
         .expect("candidate rows");
@@ -4562,22 +4574,27 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         assert_eq!(apimart_mapping["rename"]["image"], "image_urls");
         assert_eq!(apimart_mapping["rename"]["mask"], "mask_url");
 
-        // 对客目录：这个型号必须查得到，`contract` 逐字就是发布的那一份——
-        // "库里发布成了"与"调用方按目录建表单建得对"是两件事，这里把后一件也钉住。
-        // 目录公开，所以这里照调用方最常见的取法来：不带任何鉴权头。
+        // 对客目录：这个型号必须查得到，`contract` 逐字就是发布的那一份（只有 `model.const`
+        // 按对客名替换过）——"库里发布成了"与"调用方按目录建表单建得对"是两件事，这里把后一件
+        // 也钉住。目录公开，所以这里照调用方最常见的取法来：不带任何鉴权头。
         let (status, catalog) = get_catalog(&client, &base_url, None).await;
         assert_eq!(status, StatusCode::OK, "{catalog}");
         let entry = catalog["data"]
             .as_array()
             .expect("catalog data")
             .iter()
-            .find(|entry| entry["name"].as_str() == Some(model.as_str()))
-            .unwrap_or_else(|| panic!("{model} 必须在目录里：{catalog}"));
-        assert_eq!(entry["vendor"].as_str(), Some("OpenAI"));
+            .find(|entry| entry["name"].as_str() == Some(gateway.as_str()))
+            .unwrap_or_else(|| panic!("{gateway} 必须在目录里：{catalog}"));
+        assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
         assert_eq!(entry["revision"], material["native_revision"]);
         assert_eq!(
-            entry["contract"], material["capability_schema"],
-            "目录里的合同必须与发布的那一份逐字一致"
+            entry["contract"],
+            consumer_contract(material["capability_schema"].clone(), &gateway),
+            "目录里的合同必须是发布的那一份，只有 `model.const` 换成对客名"
+        );
+        assert!(
+            entry["contract"]["properties"]["model"]["const"] == gateway,
+            "对客合同里的 model.const 就是调用方要提交的名字：{entry}"
         );
     }
 
@@ -4676,6 +4693,11 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             .as_str()
             .expect("native model id")
             .to_owned();
+        // 种子素材不写对客名，按发布期的回退规则取厂商原生名（见命名层那条用例的自命名例子）。
+        let gateway = variant["gateway_model"]
+            .as_str()
+            .unwrap_or(&model)
+            .to_owned();
         let mut narrowed = false;
         for offering in variant["offerings"]
             .as_array_mut()
@@ -4703,23 +4725,24 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         assert_eq!(
             status,
             StatusCode::OK,
-            "{model} 的变体素材必须能发布：{body}"
+            "{gateway} 的变体素材必须能发布：{body}"
         );
         // 发布即原子替换该模型的 active 候选：现在生效的就是这份收窄过的声明。
+        // 替换的对象是**对客名**，所以这里按对客名查。
         let restrictions: Value = sqlx::query_scalar(
             "SELECT o.restrictions FROM publication.runtime_entries re
              JOIN supply.offerings o ON o.id = re.offering_id
              JOIN supply.channels c ON c.id = o.channel_id
              WHERE re.active AND re.gateway_model = $1 AND c.provider_kind = 'AIHubMix'",
         )
-        .bind(&model)
+        .bind(&gateway)
         .fetch_one(&pool)
         .await
         .expect("the narrowed AIHubMix entry must be active");
         assert_eq!(
             restrictions,
             json!({"allowed_branches": ["prompt_only"], "max_images": 0}),
-            "{model} 的变体发布后，AIHubMix 这条供给只允许文生图"
+            "{gateway} 的变体发布后，AIHubMix 这条供给只允许文生图"
         );
     }
 
@@ -5779,6 +5802,89 @@ async fn get_catalog(
     )
 }
 
+/// 对客目录里那条合同该长什么样：**发布的那一份**，只有型号身份那个常量换成对客名。
+///
+/// 存的那份合同不动（合同行不可变），因此目录与"库里那份"的差别**只有这一个字段**——
+/// 用例按这条判据比对，就不会把"合同被改过"漏过去。
+///
+/// 复用生产同一个助手，而不是自己按下标赋值：下标赋值在缺键时会**凭空造键**，于是
+/// "生产替换了"与"生产没替换"都能与期望值相等，用例就钉不住这条规则了。
+fn consumer_contract(mut contract: Value, gateway_model: &str) -> Value {
+    replace_contract_model_identity(&mut contract, gateway_model);
+    contract
+}
+
+/// 目录里列出的模型名，按目录顺序。
+fn catalog_names(catalog: &Value) -> Vec<String> {
+    catalog["data"]
+        .as_array()
+        .expect("catalog data is an array")
+        .iter()
+        .map(|entry| {
+            entry["name"]
+                .as_str()
+                .expect("every catalog entry has a name")
+                .to_owned()
+        })
+        .collect()
+}
+
+/// 取一次管理员网关模型清单（`GET /api/v1/gateway-models`）。
+///
+/// `admin_token` 给 `None` 就一个鉴权头都不带：这条视图是**运营视图**，与公开的对客目录不是
+/// 一回事，所以这里必须能看出它要凭证。
+async fn get_gateway_models(
+    client: &Client,
+    base_url: &str,
+    admin_token: Option<&str>,
+) -> (StatusCode, Value) {
+    let request = client.get(format!("{base_url}/api/v1/gateway-models"));
+    let request = match admin_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    let response = request.send().await.expect("gateway model request");
+    let status = response.status();
+    let raw = response.text().await.expect("gateway model body");
+    (
+        status,
+        serde_json::from_str(&raw).unwrap_or(Value::String(raw)),
+    )
+}
+
+/// 改一次运维开关（`PATCH /api/v1/gateway-models/{name}`）。
+async fn patch_gateway_model(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    gateway_model: &str,
+    enabled: bool,
+) -> StatusCode {
+    client
+        .patch(format!("{base_url}/api/v1/gateway-models/{gateway_model}"))
+        .bearer_auth(admin_token)
+        .json(&json!({"enabled": enabled}))
+        .send()
+        .await
+        .expect("gateway model patch")
+        .status()
+}
+
+/// 一份**对客名与厂商原生名不同**的素材：厂商原生名取 sunburst，对客名取 plus。
+///
+/// 只留 AIHubMix 那一条候选：这条用例只跑一家渠道，另一条留在这里会多一个用不到的假上游。
+fn renamed_material(aihubmix_upstream: &str) -> Value {
+    let mut material: Value = serde_json::from_str(include_str!(
+        "../../../config/bootstrap/gpt-image-2.5-sunburst.json"
+    ))
+    .expect("2.5 material parses");
+    material["gateway_model"] = Value::String("gpt-image-2.5-plus".to_owned());
+    let aihubmix = material["offerings"][0].clone();
+    material["offerings"] = json!([aihubmix]);
+    material["offerings"][0]["base_url"] = Value::String(aihubmix_upstream.to_owned());
+    material
+}
+
 /// 对客目录：`GET /v1/models` 只列**当前真的能调**的型号，合同就是发布的那一份。
 ///
 /// 目录**公开**：不带任何鉴权头就能取，乱给的 Key 也不会把它变成 401——调用方要先知道有哪些
@@ -5846,7 +5952,7 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
         assert_eq!(status, StatusCode::OK, "{name} 必须发布成功");
     }
 
-    // ── 两个型号都在，形状是 `{name, vendor, revision, contract}`；照旧不带鉴权头 ──
+    // ── 两个型号都在，形状是 `{name, vendor_id, revision, contract}`；照旧不带鉴权头 ──
     let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK, "got {catalog}");
     assert_public_only("目录", &catalog);
@@ -5862,16 +5968,29 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
             .iter()
             .find(|entry| entry["name"].as_str() == Some(name))
             .unwrap_or_else(|| panic!("`{name}` 必须在目录里：{catalog}"));
+        let mut keys: Vec<&str> = entry
+            .as_object()
+            .expect("entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
         assert_eq!(
-            entry.as_object().map(serde_json::Map::len),
-            Some(4),
-            "目录条目只有 name / vendor / revision / contract：{entry}"
+            keys,
+            vec!["contract", "name", "revision", "vendor_id"],
+            "目录条目只有 name / vendor_id / revision / contract 四个字段：{entry}"
         );
-        assert_eq!(entry["vendor"].as_str(), Some("OpenAI"));
+        assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
         assert_eq!(entry["revision"].as_str(), Some(revision));
+        // 厂商原生名不进对客面：这两个型号的对客名恰好等于原生名，因此这里只钉住"响应里
+        // 没有 native_model_id 这个**字段**"；名字不同时"正文不含原生名"由专门的用例钉。
+        assert!(
+            entry.get("native_model_id").is_none(),
+            "对客目录不许出现 native_model_id：{entry}"
+        );
         assert_eq!(
             &entry["contract"], schema,
-            "目录里的合同必须与发布的那一份逐字一致"
+            "目录里的合同必须与发布的那一份逐字一致（对客名与原生名同值时逐字相同）"
         );
     }
 
@@ -5927,5 +6046,612 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
     );
 
     pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 命名层：对客面只出现**平台网关模型名**，厂商原生名留在管理端。
+///
+/// 素材刻意让两个名字不同（厂商 `gpt-image-2.5-sunburst`、对客 `gpt-image-2.5-plus`），
+/// 一次把命名层的几条硬约束都钉住：
+/// - 素材把**对客名**写进合同正文会被发布期拒掉（合同正文那个常量是厂商模型的身份）；
+/// - 目录的 `name` 是对客名、带 `vendor_id`、**正文全文不含**厂商原生名（含合同正文）；
+/// - 用对客名能真的受理（假上游跑通），用厂商原生名是"模型不存在"；
+/// - 存的那份合同不动：库里 `model.const` 仍是厂商原生名，只有投射给调用方时替换；
+/// - 运维开关一关，目录与受理**同时**消失，管理端照样列得出来（否则关了就没法打开）。
+///
+/// 零外部调用：假上游在进程内，凭证只从环境变量读。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
+    const NATIVE: &str = "gpt-image-2.5-sunburst";
+    const GATEWAY: &str = "gpt-image-2.5-plus";
+
+    let (database_url, database_name) = isolated_database_url().await;
+    let client = Client::new();
+    let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = start_fake_upstream_with(
+        calls.clone(),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+    )
+    .await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64);
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let material = renamed_material(&upstream.base_url);
+
+    // ── 素材把**对客名**写进合同正文 → 发布期拒掉 ──
+    //
+    // 这条同时是"响应全文不含原生名"可判定的前提：合同正文里没有第二个模型名来源。
+    let mut misnamed = material.clone();
+    misnamed["capability_schema"]["properties"]["model"]["const"] =
+        Value::String(GATEWAY.to_owned());
+    let rejected = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&misnamed)
+        .send()
+        .await
+        .expect("misnamed publication");
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "合同正文写对客名必须被拒：{:?}",
+        rejected.text().await
+    );
+
+    // ── 正常发布：厂商原生名写进合同正文，对客名写在顶层 ──
+    let published = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&material)
+        .send()
+        .await
+        .expect("publication request");
+    let status = published.status();
+    let body = published.text().await.expect("publication body");
+    assert_eq!(status, StatusCode::OK, "素材必须能发布：{body}");
+
+    // ── 对客目录：name 是对客名，带 vendor_id，正文全文不含厂商原生名 ──
+    let raw = client
+        .get(format!("{base_url}/v1/models"))
+        .send()
+        .await
+        .expect("catalog request")
+        .text()
+        .await
+        .expect("catalog text");
+    assert!(
+        !raw.contains(NATIVE),
+        "对客目录正文不许出现厂商原生名（含合同正文）：{raw}"
+    );
+    let catalog: Value = serde_json::from_str(&raw).expect("catalog JSON");
+    assert_eq!(
+        catalog_names(&catalog),
+        vec![GATEWAY.to_owned()],
+        "{catalog}"
+    );
+    let entry = &catalog["data"][0];
+    assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
+    assert_eq!(entry["revision"], material["native_revision"]);
+    assert!(
+        entry.get("native_model_id").is_none(),
+        "对客目录不许出现 native_model_id：{entry}"
+    );
+    assert_eq!(
+        entry["contract"],
+        consumer_contract(material["capability_schema"].clone(), GATEWAY),
+        "目录里的合同是发布的那一份，只有 model.const 换成对客名"
+    );
+    assert_eq!(entry["contract"]["properties"]["model"]["const"], GATEWAY);
+
+    // ── 存的那份合同**不动**：库里那个常量仍是厂商原生名 ──
+    let stored_contract: Value = sqlx::query_scalar(
+        "SELECT capability_schema FROM catalog.vendor_models WHERE native_model_id = $1",
+    )
+    .bind(NATIVE)
+    .fetch_one(&pool)
+    .await
+    .expect("stored contract");
+    assert_eq!(
+        stored_contract["properties"]["model"]["const"], NATIVE,
+        "合同行不可变：替换只发生在投射那一步"
+    );
+    let vendor_model_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM catalog.vendor_models WHERE native_model_id = $1")
+            .bind(NATIVE)
+            .fetch_one(&pool)
+            .await
+            .expect("vendor model id");
+
+    // ── 管理员读：一条网关模型一项，带候选清单与运维开关 ──
+    let (unauthorized, _) = get_gateway_models(&client, &base_url, None).await;
+    assert_eq!(
+        unauthorized,
+        StatusCode::UNAUTHORIZED,
+        "运营视图要管理员凭证，与公开的对客目录不是一回事"
+    );
+    let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
+    assert_eq!(status, StatusCode::OK, "{admin}");
+    assert_eq!(
+        admin.as_object().map(serde_json::Map::len),
+        Some(1),
+        "管理端清单只有 gateway_models 一个顶层字段：{admin}"
+    );
+    let listed = admin["gateway_models"]
+        .as_array()
+        .expect("gateway_models is an array");
+    assert_eq!(listed.len(), 1, "{admin}");
+    let view = &listed[0];
+    assert_eq!(view["gateway_model"], GATEWAY);
+    assert_eq!(view["enabled"], true);
+    assert_eq!(view["vendor_id"], "OpenAI");
+    assert_eq!(view["native_model_id"], NATIVE, "厂商原生名只在管理端出现");
+    assert_eq!(view["native_revision"], material["native_revision"]);
+    assert!(
+        view["runtime_revision_id"].as_str().is_some(),
+        "要能看出这是哪一次发布：{view}"
+    );
+    assert!(
+        view["published_at"].as_str().is_some(),
+        "要能看出这次发布是什么时候发的：{view}"
+    );
+    let candidates = view["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1, "一条候选：{view}");
+    assert_eq!(candidates[0]["provider_kind"], "AIHubMix");
+    assert_eq!(candidates[0]["provider_model_id"], NATIVE);
+    assert_eq!(candidates[0]["adapter_key"], "aihubmix-image-v1");
+    assert_eq!(candidates[0]["routing_priority"], 0);
+    assert_eq!(candidates[0]["enabled"], true);
+    assert!(
+        candidates[0]["offering_id"].as_str().is_some(),
+        "候选要能被指认：{view}"
+    );
+    assert!(
+        candidates[0]["carrier_schema"].is_object()
+            && candidates[0]["parameter_mapping"].is_object(),
+        "候选自带承载面与映射，不必直查库：{view}"
+    );
+    assert!(
+        candidates[0].get("credential_env").is_none(),
+        "不回显渠道凭证：{view}"
+    );
+
+    // ── 用**对客名**受理：假上游真跑通；上行给渠道的仍是厂商原生名 ──
+    let _worker = spawn_worker_process(&database_url);
+    let key = format!("naming-gateway-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(GATEWAY, "命名层：按对客名受理"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "对客名必须真的能受理：{body}");
+    assert_sync_success("按对客名受理", &body);
+    assert_eq!(
+        count_calls(&calls, "POST", "/v1/images/generations"),
+        1,
+        "请求要真的发到假上游"
+    );
+    let submit = last_submit_body(&calls, "/v1/images/generations");
+    assert_eq!(
+        submit["model"], NATIVE,
+        "上行给渠道的是厂商原生名，不是对客名：{submit}"
+    );
+    let stored_model: String =
+        sqlx::query_scalar("SELECT gateway_model FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("job gateway model");
+    assert_eq!(stored_model, GATEWAY, "Job 固化的是对客名");
+    let (revision_gateway, revision_vendor_model): (String, Uuid) = {
+        let row = sqlx::query(
+            "SELECT gateway_model, vendor_model_id FROM publication.runtime_revisions
+             WHERE id = (SELECT runtime_revision_id FROM publication.runtime_entries
+                         WHERE active AND gateway_model = $1 LIMIT 1)",
+        )
+        .bind(GATEWAY)
+        .fetch_one(&pool)
+        .await
+        .expect("runtime revision naming columns");
+        (
+            row.try_get("gateway_model").expect("gateway model"),
+            row.try_get("vendor_model_id").expect("vendor model id"),
+        )
+    };
+    assert_eq!(revision_gateway, GATEWAY, "修订上记的是对客名");
+    assert_eq!(
+        revision_vendor_model, vendor_model_id,
+        "修订指向它挂的那行合同"
+    );
+
+    // ── 用**厂商原生名**受理：模型不存在 ──
+    let native_key = format!("naming-native-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &native_key,
+        &route_request(NATIVE, "命名层：按厂商原生名受理"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "厂商原生名不是对客身份，受理期取不到候选：{body}"
+    );
+    assert_eq!(
+        count_calls(&calls, "POST", "/v1/images/generations"),
+        1,
+        "被拒的请求不该发到上游"
+    );
+
+    // ── 运维开关：关掉之后目录与受理同时消失，管理端照样列得出来 ──
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, GATEWAY, false).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(
+        catalog,
+        json!({"data": []}),
+        "关掉的模型从目录里消失：{catalog}"
+    );
+    let off_key = format!("naming-off-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &off_key,
+        &route_request(GATEWAY, "命名层：关掉之后受理"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "关掉的模型受理得到'模型不存在'：{body}"
+    );
+    let (_, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
+    assert_eq!(
+        admin["gateway_models"][0]["gateway_model"], GATEWAY,
+        "关掉的模型照样列得出来，否则关了就没法打开：{admin}"
+    );
+    assert_eq!(admin["gateway_models"][0]["enabled"], false);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operations.audit_events
+         WHERE action = 'gateway_model.set_enabled' AND subject_id = $1",
+    )
+    .bind(GATEWAY)
+    .fetch_one(&pool)
+    .await
+    .expect("audit events");
+    assert_eq!(audits, 1, "PATCH 要写出一条审计事件");
+
+    // ── 重新启用：目录与受理都恢复 ──
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, GATEWAY, true).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(
+        catalog_names(&catalog),
+        vec![GATEWAY.to_owned()],
+        "重新启用后回到目录：{catalog}"
+    );
+    let on_key = format!("naming-on-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &on_key,
+        &route_request(GATEWAY, "命名层：重新启用之后受理"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重新启用后必须能受理：{body}");
+    assert_sync_success("重新启用后受理", &body);
+
+    // ── 没发布过的名字：404，而且不留下任何审计事件 ──
+    let unknown = format!("never-published-{}", Uuid::new_v4());
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, &unknown, false).await,
+        StatusCode::NOT_FOUND,
+        "没发布过的名字是'不存在'，不是'待创建'"
+    );
+    let unknown_audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM operations.audit_events WHERE subject_id = $1")
+            .bind(&unknown)
+            .fetch_one(&pool)
+            .await
+            .expect("audit events");
+    assert_eq!(unknown_audits, 0, "被拒的 PATCH 不该留下审计事件");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// **旧素材**（不带对客名）照常可发布：对客名回退取厂商原生名，行为与今天逐位一致。
+///
+/// 这是命名层"缺省回退"那条兼容承诺的证据：仓库里唯一不带 `gateway_model` 的素材发布之后，
+/// 目录的 `name` 就是厂商原生名，整条目录响应与今天逐字相同，受理也照旧跑得通。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let client = Client::new();
+    let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = start_fake_upstream_with(
+        calls.clone(),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+    )
+    .await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64);
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let material: Value = serde_json::from_str(include_str!(
+        "../../../config/bootstrap/aihubmix-gpt-image-2.json"
+    ))
+    .expect("legacy material parses");
+    assert!(
+        material.get("gateway_model").is_none(),
+        "这份夹具刻意不带对客名，缺省回退才有的可验"
+    );
+    let mut command = material.clone();
+    command["offerings"][0]["base_url"] = Value::String(upstream.base_url.clone());
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&command)
+        .send()
+        .await
+        .expect("publication request");
+    let status = response.status();
+    let body = response.text().await.expect("publication body");
+    assert_eq!(status, StatusCode::OK, "旧素材必须照常可发布：{body}");
+
+    // ── 目录逐位一致：name 是厂商原生名，形状就是新的四字段形状 ──
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert_eq!(
+        catalog,
+        json!({"data": [{
+            "name": "gpt-image-2",
+            "vendor_id": "OpenAI",
+            "revision": "2026-09-18-validated-1.3",
+            "contract": material["offerings"][0]["capability_schema"],
+        }]}),
+        "缺省回退之后目录与今天逐位一致：{catalog}"
+    );
+
+    // ── 受理行为同样照旧：按回退出来的名字跑通 ──
+    let _worker = spawn_worker_process(&database_url);
+    let key = format!("legacy-naming-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request("gpt-image-2", "旧素材：缺省回退"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "旧素材必须照常受理：{body}");
+    assert_sync_success("旧素材受理", &body);
+
+    // ── 落库事实：修订上的对客名就是回退出来的厂商原生名，开关行也在（默认启用）──
+    let revision_gateway: String = sqlx::query_scalar(
+        "SELECT rr.gateway_model FROM publication.runtime_revisions rr
+         JOIN publication.runtime_entries re ON re.runtime_revision_id = rr.id
+         WHERE re.active AND re.gateway_model = 'gpt-image-2' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("runtime revision naming column");
+    assert_eq!(revision_gateway, "gpt-image-2");
+    let enabled: bool = sqlx::query_scalar(
+        "SELECT enabled FROM publication.gateway_models WHERE gateway_model = $1",
+    )
+    .bind("gpt-image-2")
+    .fetch_one(&pool)
+    .await
+    .expect("gateway model switch");
+    assert!(enabled, "首次发布成功时落一行开关，默认开着");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 增量迁移：命名两列与运维开关表要在**已经建过库、已经有发布数据**的环境里落下来。
+///
+/// 先在只应用了早期迁移的库上造出"已经发布过一个型号"的数据（修订 + 一条生效条目），
+/// 再补上整批迁移，确认：
+/// - 修订上回填出对客名与它挂的那行合同，两列非空；
+/// - 运维开关按既有生效名字回填出一行（`enabled = true`）；
+/// - 迁移后**立刻可读、可停用**：管理端列得出来，也关得掉——不用重新发布一次。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn gateway_model_naming_migration_backfills_existing_publications() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用这次改动之前的迁移（`0007` 之前，含上一轮的合同/承载面拆分）。
+    let staged = std::env::temp_dir().join(format!("seeai-early-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < "0007" {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy early migration");
+        }
+    }
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+
+    // 2) 老数据：一个已经发布过的型号，按**这次改动之前**的形状落库
+    //    （合同 + 渠道 + 供给 + 计价 + 修订 + 一条生效条目）。
+    let vendor_model = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let offering = Uuid::new_v4();
+    let price_plan = Uuid::new_v4();
+    let revision = Uuid::new_v4();
+    let contract = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": {"const": "legacy-name"},
+            "prompt": {"type": "string"}
+        }
+    });
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1,'OpenAI','legacy-name','legacy-revision',$2)",
+    )
+    .bind(vendor_model)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("legacy contract row");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')",
+    )
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("channel fixture");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
+              carrier_schema, parameter_mapping)
+         VALUES ($1,$2,$3,'aihubmix-image-v1','legacy-name','{}'::jsonb,$4,'{}'::jsonb)",
+    )
+    .bind(offering)
+    .bind(vendor_model)
+    .bind(channel)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("offering fixture");
+    sqlx::query(
+        "INSERT INTO pricing.price_plans
+             (id, offering_id, currency, text_input_microusd_per_million, image_input_microusd_per_million,
+              text_output_microusd_per_million, image_output_microusd_per_million, source_url, approved_by)
+         VALUES ($1,$2,'USD',0,0,0,0,'https://example.invalid/price','migration-test')",
+    )
+    .bind(price_plan)
+    .bind(offering)
+    .execute(&pool)
+    .await
+    .expect("price plan fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_revisions (id, snapshot, published_by)
+         VALUES ($1,'{}'::jsonb,'migration-test')",
+    )
+    .bind(revision)
+    .execute(&pool)
+    .await
+    .expect("runtime revision fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_entries
+             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active)
+         VALUES ($1,$2,$3,$4,'legacy-name',true)",
+    )
+    .bind(revision)
+    .bind(vendor_model)
+    .bind(offering)
+    .bind(price_plan)
+    .execute(&pool)
+    .await
+    .expect("runtime entry fixture");
+
+    // 3) 补上整批迁移：命名两列与开关表必须自己跑通，不能因为已有数据就失败。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the naming migration must apply on an already-built database");
+
+    // 4) 回填结果：修订上的对客名与它挂的那行合同，两列都非空。
+    let row = sqlx::query(
+        "SELECT gateway_model, vendor_model_id FROM publication.runtime_revisions WHERE id = $1",
+    )
+    .bind(revision)
+    .fetch_one(&pool)
+    .await
+    .expect("runtime revision after migration");
+    let gateway_model: String = row.try_get("gateway_model").expect("gateway model");
+    let vendor_model_id: Uuid = row.try_get("vendor_model_id").expect("vendor model id");
+    assert_eq!(gateway_model, "legacy-name");
+    assert_eq!(vendor_model_id, vendor_model, "修订要指向它挂的那行合同");
+    for column in ["gateway_model", "vendor_model_id"] {
+        let nullable: String = sqlx::query_scalar(
+            "SELECT is_nullable FROM information_schema.columns
+             WHERE table_schema = 'publication' AND table_name = 'runtime_revisions'
+               AND column_name = $1",
+        )
+        .bind(column)
+        .fetch_one(&pool)
+        .await
+        .expect("column probe");
+        assert_eq!(nullable, "NO", "{column} 在既有行上必须非空");
+    }
+    let (switch, enabled): (String, bool) = {
+        let row = sqlx::query(
+            "SELECT gateway_model, enabled FROM publication.gateway_models
+             WHERE gateway_model = 'legacy-name'",
+        )
+        .fetch_one(&pool)
+        .await
+        .expect("backfilled switch row");
+        (
+            row.try_get("gateway_model").expect("gateway model"),
+            row.try_get("enabled").expect("enabled"),
+        )
+    };
+    assert_eq!(switch, "legacy-name");
+    assert!(enabled, "既有生效名字回填成启用");
+
+    // 5) 迁移后立刻可读、可停用：走管理端接口（不起 Worker，也不连上游）。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64);
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
+    assert_eq!(status, StatusCode::OK, "{admin}");
+    let view = &admin["gateway_models"][0];
+    assert_eq!(view["gateway_model"], "legacy-name");
+    assert_eq!(view["enabled"], true);
+    assert_eq!(view["vendor_id"], "OpenAI");
+    assert_eq!(view["native_model_id"], "legacy-name");
+    assert_eq!(view["candidates"][0]["provider_kind"], "AIHubMix");
+    assert_eq!(view["candidates"][0]["routing_priority"], 0);
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, "legacy-name", false).await,
+        StatusCode::NO_CONTENT,
+        "迁移回填出来的名字必须停得掉，不用重新发布一次"
+    );
+    let (_, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
+    assert_eq!(admin["gateway_models"][0]["enabled"], false);
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
 }
