@@ -54,7 +54,7 @@
 
 **图片字段是 R4 的例外**：`image`/`image_urls`/`mask` 不是"多带的旋钮"，而是请求的实质——合同没声明它们时**不能丢弃**（丢图等于悄悄生成一张没有参考图的图，还照样计费），一律 **400 `invalid_parameter`**，让调用方换模型或去掉参考图。
 
-**R5 的报码与选路**：全部候选都不合格是**平台侧供给问题**，不是消费者参数错——按 `ADR-0017` 的责任方原则，对客应表现为平台侧故障（`platform_unavailable`），不是 400 `validation_error`。选路方面，R5 默认继续试下一条候选，沿用 `ADR-0009` 的既有做法；交接文档要求"没有运营策略时不得自行换供给"，这条冲突**曾在此登记，现已随路由策略层落地收口**（[`docs/adr/0020`](../adr/0020-routing-strategy-layer-configured-by-operations.md)、[`docs/design/0006`](./0006-gateway-models-pricing-and-admin-console.md) 的**路由策略层**那节）：**R5 的语义不变**——**候选合格性优先于策略**，承载面表达不了这次请求、分支 / 张数不被该候选允许的候选**先被排除**（这正是 R5 本身）；变的只是"在合格候选里挑哪一条"由**运营策略**决定（未配置策略时默认 `priority_failover`，即 `ADR-0009` 的优先级顺序）。
+**R5 的报码与选路**：全部候选都不合格是**平台侧供给问题**，不是消费者参数错——按 `ADR-0017` 的责任方原则，对客应表现为平台侧故障（`platform_unavailable`），不是 400 `validation_error`。选路方面，R5 默认继续试下一条候选，沿用 `ADR-0009` 的既有做法；交接文档要求"没有运营策略时不得自行换供给"，这条冲突**曾在此登记，现已随路由策略层落地收口**（[`docs/adr/0020`](../adr/0020-routing-strategy-layer-configured-by-operations.md)、[`docs/design/0008`](./0008-routing-strategy-and-caching.md) 的**路由策略层**那节（§6））：**R5 的语义不变**——**候选合格性优先于策略**，承载面表达不了这次请求、分支 / 张数不被该候选允许的候选**先被排除**（这正是 R5 本身）；变的只是"在合格候选里挑哪一条"由**运营策略**决定（未配置策略时默认 `priority_failover`，即 `ADR-0009` 的优先级顺序）。
 
 ## 5. `size` 的语义（三义分型 + 换算）
 
@@ -86,7 +86,7 @@ S1a/S1b/S2 的验收全部**离线**（进程内假上游 + 直接查库），�
 ## 8. 已定的裁定（原未决项）
 
 1. **S4 对客目录**：**必做**，形状定为 `GET /v1/models`（**公开，无需鉴权**）→ `{data:[{name, vendor_id, revision, contract}]}`；`contract` 就是发布的那份 JSON Schema，客户端据此建表单。**为什么公开**：客户端得先知道有哪些模型、各自的参数面长什么样，才建得出表单——建表单之前先要凭证，等于逼调用方为了看一眼目录去开户；而目录里只有型号身份与合同，不含渠道、供给或任何内部信息。
-2. **路由策略层**：**已引入**（原口径"暂不引入"已作废）。决策归 [`docs/adr/0020`](../adr/0020-routing-strategy-layer-configured-by-operations.md)，落地机制见 [`docs/design/0006`](./0006-gateway-models-pricing-and-admin-console.md) 的**路由策略层**那节（§5）。`ADR-0009` 的"多条活动供给按优先级选路"仍是**未配置策略时的默认行为**（`priority_failover`，行为与今天逐位相同），只是不再排除"运营配置的策略"。
+2. **路由策略层**：**已引入**（原口径"暂不引入"已作废）。决策归 [`docs/adr/0020`](../adr/0020-routing-strategy-layer-configured-by-operations.md)，落地机制见 [`docs/design/0008`](./0008-routing-strategy-and-caching.md) 的**路由策略层**那节（§6）。`ADR-0009` 的"多条活动供给按优先级选路"仍是**未配置策略时的默认行为**（`priority_failover`，行为与今天逐位相同），只是不再排除"运营配置的策略"。
 3. **`defaults` 的发布期校验**：**加**（**R6**）：`parameter_mapping.defaults` 的每个键必须被该供给的承载面声明，否则发布被拒——声明了却不生效就是"声明了却发不出去"，与 R1–R3 同一条道理。随 S3 落地。
 4. **合同外的图片字段**：**400 `invalid_parameter`**，不丢弃（见 §4 的例外说明）。随 S3 把码定死并补测试。
 

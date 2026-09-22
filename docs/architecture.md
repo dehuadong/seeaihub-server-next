@@ -59,7 +59,7 @@
 | POST | `/v1/images/generations` | `generate_image` | 持 Key 的账户（JSON；`model` + 平铺的模型参数 + 参考图/遮罩；幂等键走 `Idempotency-Key` 头） |
 | POST | `/v1/images/edits` | `edit_image` | 同上（`multipart/form-data`；`image`/`mask` 是文件部件，文本部件也认、值按 URL/data URL 读；与上一条**同一个能力**） |
 
-对客的**生成面只有这两条路径**，都是**同步**：一个请求把图交回，没有 202 受理、没有 job_id 轮询。**分支由请求内容决定**（有没有参考图/遮罩），不按端点断言——带图的 generations、不带图的 edits 都合法。参考图与遮罩用**公网 URL 或 `data:image/…;base64,…`** 给出（`image` 与 `image_urls` 同义、二选一）；平台**不落盘**：不下载归档、不解码存储，渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，原样放进 `data[]`，由客户端判断。成功响应 `{created, data:[{url|b64_json}]}`；内部受理后等 Job 到终态（上限 `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），等不到就按失败回超时错误。预授权额由服务端定（`GENERATION_MAX_COST_MICROUSD`，默认 $0.02），不由调用方自报。
+对客的**生成面只有这两条路径**，都是**同步**：一个请求把图交回，没有 202 受理、没有 job_id 轮询。**分支由请求内容决定**（有没有参考图/遮罩），不按端点断言——带图的 generations、不带图的 edits 都合法。参考图与遮罩用**公网 URL 或 `data:image/…;base64,…`** 给出（`image` 与 `image_urls` 同义、二选一）；平台**不落盘**：不下载归档、不解码存储，渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，原样放进 `data[]`，由客户端判断。成功响应 `{created, data:[{url|b64_json}]}`；内部受理后等 Job 到终态（上限 `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），等不到就按失败回超时错误。预授权额**按供给（vendor + offering）维度的保底表**（`floor_amounts`，随修订发布、随 Job 快照冻结；设计口径见 `docs/design/0007` §6）查得，**不由调用方自报、也不由候选价格反算**；受理闸门是**余额 ≥ 保底额**（不成立即 402 `insufficient_balance`）。`GENERATION_MAX_COST_MICROUSD` 只作**连该供给的封顶保底值都查不到时**的兜底保底额，**不再是受理上限**。
 
 请求体上限 16MB（`DefaultBodyLimit`）。这里的 `job_id` 是**内部**执行/审计记录的标识，只在内部与管理员的运营接口出现。
 

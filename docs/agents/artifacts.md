@@ -38,6 +38,7 @@
 | 历史位置 / 适用工作 | 当前权威性 | 新工作位置 | 已有工作更新方式 | 迁移状态与依据 |
 | --- | --- | --- | --- | --- |
 | `docs/design/` 各文件的 `当前修订` / `状态` 头 | 仍有效 | 与 Agent Notes 的 `proposed / implemented / rejected` 并存，映射方式见下 | 原地更新 | 未迁移；不新增竞争状态字段 |
+| `docs/design/0006-gateway-models-pricing-and-admin-console.md` | 文件名已停用，内容已迁走；三份切片设计为权威位置 | 网关模型与对客面归 `docs/design/0006-gateway-models-and-consumer-surface.md`；定价、保底与结算归 `docs/design/0007-pricing-floor-and-settlement.md`；路由策略与缓存归 `docs/design/0008-routing-strategy-and-caching.md` | 新工作更新对应切片的那一份，不回到旧文件 | 2026-09-22 按用户授权按切片拆分；过程记录（评审记录与逐条处置）移出为 `.data/design-0006-review-log.md`，实施清单暂存 `.data/design-0006-slice-tickets.md` |
 
 一个文件兼任提案与记录时，沿用其登记归属与状态映射，分别识别工作进展、批准与交付生命周期。
 
