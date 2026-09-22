@@ -38,7 +38,7 @@
 | **① Model Protocol** | 对外路由、请求/响应外壳、对外生命周期 | `apps/api/src/main.rs`（路由与 handler）、`crates/application` 的 `CreateImageGeneration`、`crates/domain` 的 `JobState`（Job 视图只在内部与管理员面） |
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、证据提取、错误分类、轮询与取图（**渠道差异只此一处**） | `crates/adapter-sdk`（接口）、`crates/adapter-aihubmix`、`crates/adapter-apimart` |
 | **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份）与某 Offering 能**承载**的面（能力子集）：支持参数、值域、默认值、组合规则 | 运行时发布物 `catalog.vendor_models.capability_schema`；素材在 `config/bootstrap/*.json`。**当前实现仍是"每候选各带一份"——合同与能力子集尚未拆开，见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G5** |
-| **④ Offering** | 渠道、上游模型名、用哪个 Driver、渠道限制、路由优先级 | `supply.offerings` + `publication.runtime_entries`；发布逻辑在 `crates/application` 的 `RuntimeService` |
+| **④ Offering** | 渠道、上游模型名、用哪个 Driver、渠道限制、路由档位与**档内权重** | `supply.offerings` + `publication.runtime_entries`；发布逻辑在 `crates/application` 的 `RuntimeService` |
 | **⑤ Price** | 计价形态、费率、币种、汇率、保底与结算口径 | `pricing.price_plans`（渠道成本费率）+ `publication.runtime_revisions` 的定价列（**按候选**的对客费率向量、参考成本、成本来源、价目表、保底表）+ `pricing.fx_rates`（按币种的折算率）；公式在 `crates/domain` 的 `PriceSnapshot` |
 
 ## 3. 对外接口
@@ -80,8 +80,10 @@
 GenerationService::create                              crates/application
   ├─ 校验幂等键 / 预算
   ├─ 判定图片分支（文生图 / 图生图 / 带遮罩）           crates/domain  CreateImageGeneration::branch
-  ├─ 取该型号的候选供给，按优先级选第一个合格者          crates/application  select_candidate
-  │    （发布期"限制只能收窄"的校验已在此前完成；调用方的图落到候选声明的参数名上）
+  ├─ 取该型号的候选供给，按档位选第一个有合格候选的档，      crates/application  select_candidate
+  │    再在该档的合格候选里按 weight 确定性分摊
+  │    （落点 = hash(账户 ‖ 幂等键)，不引入随机数；不合格的候选不进分摊；
+  │      发布期"限制只能收窄"的校验已在此前完成；调用方的图落到候选声明的参数名上）
   ├─ 受理时冻结定价：先把 size 归到档位、再查该供给    crates/application  freeze_pricing
   │    的保底表（像素型按档位像素表/最长边，auto 取 2K）；
   │    汇率按该候选的成本币种取"受理时刻生效的那一行"
@@ -120,10 +122,10 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `supply.channels` / `supply.offerings` | ④ 渠道与供给 | `RuntimeService::publish` |
 | `pricing.price_plans` | ⑤ 渠道**成本费率**（四档 token 单价，币种按该渠道声明）：定价时的参考口径与毛利核算用，**不再是对客结算基数** | `RuntimeService::publish` |
 | `pricing.fx_rates` | ⑤ **折算率**（按币种的"渠道币种 → CNY"定点比值 + 生效时间）：受理时取"受理时刻生效的那一行"并快照。**外部事实，由管理员录入**，不进不可变修订 | `PricingService::upsert_fx_rate`（`PUT /api/v1/fx-rates`） |
-| `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给与优先级；修订上另记这次发布定义的是哪个**网关模型**（对客名）与它指向哪一行厂商模型合同，以及**定价**（修订级 `markup_bps` + **按候选键**的参考成本、成本币种、对客四档 CNY 费率向量、成本来源、档位价目表、保底表）；旧修订的定价列留 NULL ⇒ 受理与结算走旧口径 | `RuntimeService::publish` |
+| `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给、优先级与**档内权重**（`routing_priority` 是档位，同档允许多条候选，档内按 `weight` 分摊）；修订上另记这次发布定义的是哪个**网关模型**（对客名）与它指向哪一行厂商模型合同，以及**定价**（修订级 `markup_bps` + **按候选键**的参考成本、成本币种、对客四档 CNY 费率向量、成本来源、档位价目表、保底表）；旧修订的定价列留 NULL ⇒ 受理与结算走旧口径 | `RuntimeService::publish` |
 | `publication.gateway_models` | 网关模型的**运维开关**：这个名字现在开着吗、谁在什么时候改的。**定义不在这里**（候选集、合同、定价只在不可变修订里） | `RuntimeService::publish`（首次发布落行）、`set_gateway_model_enabled` |
 | `generation.jobs` | 受理时的请求事实、所选供给、**冻结的定价快照**（对客费率向量、保底额与来源、命中的候选、折算率）、结果信封（渠道给的 `url` 或 `b64_json`）、对客错误码与平台侧失败类别；**对客不可见** | `GenerationService::create`、`complete_job`、`fail_job`、`recover_expired_leases` |
-| `generation.routing_decisions` | 受理时为什么选了它（候选、优先级、是否合格） | 与 Job 同事务写入 |
+| `generation.routing_decisions` | 受理时为什么选了它（候选、档位、**权重**、是否合格、本次**分流落点**） | 与 Job 同事务写入 |
 | `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据**、**渠道成本事实**（来源 `computed`/`declared`/`unavailable` + 原币种金额 + 该渠道声明的币种 + **按冻结汇率折算后 CNY**）。成功与"结果交付失败进对账"两条路径都写成本事实 | `begin_attempt`、`complete_job`、`fail_job` |
 | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 余额、预授权、账目。**余额可为负**（透支发生在结算：实收超过保底额时差额把余额扣成负数），**保底额可为 0** | `create_job`（hold）、`complete_job`（capture）、`fail_job`（release） |
 | `identity.api_keys` | API Key 摘要 | `IdentityService` |
@@ -138,14 +140,14 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移 | 业务规则、SQL、上游调用 |
 | `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
 | `apps/api/tests/http_contract.rs` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**（零外部费用） | 单元测试（在各 crate 内） |
-| `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`PriceSnapshot`（对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
+| `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PriceSnapshot`（对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
 | `crates/domain/src/image_parameters.rs` | 图片参数的**唯一**一份规则：调用方契约字段（`image`/`image_urls`/`mask`）、候选声明参数名的判定（名字以 `image` 开头＝参考图、含 `mask`＝遮罩）、`null`/空串＝这一处没有图、把调用方的图落到候选声明的参数名上 | IO；也不认识任何**具体渠道**（参数名本身按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G1） |
-| `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService`）、端口 trait、发布期校验（含"限制只能收窄"与定价"全有或全无"）、候选选择、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生 | SQL、HTTP、上游协议 |
+| `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService`）、端口 trait、发布期校验（含"限制只能收窄"与定价"全有或全无"）、候选选择（**先按档位取第一个有合格候选的档，再在档内按权重确定性分摊**）、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生 | SQL、HTTP、上游协议 |
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射 | 业务判定（只执行用例给出的结论） |
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
-| `migrations/0001_initial.sql`…`0009_pricing_floor_and_settlement.sql` | 表结构与约束（含"每型号每个优先级一个活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0） | 运行时的业务规则 |
+| `migrations/0001_initial.sql`…`0010_routing_weight_and_decisions.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
 | `scripts/decisions/*.mjs` | Agent Notes 的索引生成与一致性检查 | 不影响服务运行 |
 | `docs/design/`、`docs/adr/` | 设计与决策的权威位置 | — |

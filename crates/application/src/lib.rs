@@ -28,7 +28,8 @@ use uuid::Uuid;
 /// 发布一个 Vendor Model 的供给。
 ///
 /// 一次发布携带该模型**完整、有序**的候选集合；
-/// 候选的 `routing_priority` **由数组下标决定**（`0..n-1`），不接受调用方赋号——只有一个来源。
+/// 候选的 `routing_priority` **缺省取数组下标**（`0..n-1`）——"顺序即优先级"的常规来源；
+/// 显式给值时可以让**多条候选落在同一档**，档内再按 `weight` 分摊。
 ///
 /// 合同是**模型级唯一一份**（[`Self::capability_schema`]）；每个候选各自声明它**能承载**的
 /// 字段面（[`OfferingDraft::carrier_schema`]）。
@@ -73,7 +74,7 @@ pub struct PublishRuntimeCommand {
     /// 扁平形式的合同值 → 渠道包装声明。数组形式下必须为 `None`。
     #[serde(default = "empty_object")]
     pub parameter_mapping: Value,
-    /// 数组形式的多个供给，顺序即 `routing_priority`。
+    /// 数组形式的多个供给；候选的档位缺省取它在数组里的下标，也可以自己声明。
     #[serde(default)]
     pub offerings: Option<Vec<OfferingDraft>>,
     /// 扁平形式的计价。数组形式下必须为 `None`。
@@ -110,7 +111,7 @@ pub struct PublishRuntimeRequest {
     pub capability_schema: Value,
     /// 加价系数（基点）：随修订发布、随 Job 快照冻结；没有候选带定价时为 `None`。
     pub markup_bps: Option<i32>,
-    /// 有序候选集：下标即 `routing_priority`。
+    /// 候选集：档位与档内权重都已在归一阶段定好（见 [`NormalizedOffering`]）。
     pub offerings: Vec<NormalizedOffering>,
 }
 
@@ -121,6 +122,18 @@ pub struct OfferingDraft {
     pub provider_model_id: String,
     pub base_url: String,
     pub credential_env: String,
+    /// **这条候选的档位**：数字小者优先。
+    ///
+    /// 缺省时取它在 `offerings` 数组里的**下标**——这是今天的口径，也是"顺序即优先级"的
+    /// 唯一来源。**显式给值**是为了让多条候选落在**同一档**：档内按 [`Self::weight`] 分摊，
+    /// 而"同档多候选"这件事没法用下标表达（下标天然互不相同）。
+    #[serde(default)]
+    pub routing_priority: Option<i32>,
+    /// **档位内的分流比**：正整数，缺省 `1`。
+    ///
+    /// 只在同一档内起作用；显式 `0` 会被拒——"不参与分流"不是权重的取值。
+    #[serde(default)]
+    pub weight: Option<u32>,
     #[serde(default = "empty_object")]
     pub restrictions: Value,
     /// 这条供给**能承载**合同里的哪些字段。
@@ -206,7 +219,7 @@ impl PricePlanDraft {
     }
 }
 
-/// 归一后的单个供给：形状判别与必填校验都已完成，`routing_priority` 已按下标定好。
+/// 归一后的单个供给：形状判别与必填校验都已完成，`routing_priority` 与 `weight` 已定好。
 #[derive(Debug, Clone)]
 pub struct NormalizedOffering {
     /// 这条供给**能承载**合同里的哪些字段。
@@ -221,7 +234,10 @@ pub struct NormalizedOffering {
     pub credential_env: String,
     pub rates: PriceRates,
     pub price_source_url: String,
+    /// 档位：显式给值就用它，没给就取数组下标。同一档可以有多条候选。
     pub routing_priority: i32,
+    /// 档位内的分流比，至少为 1。
+    pub weight: u32,
     /// 这条候选的定价；`None` = 它不带定价（旧形状的素材、或只发布了成本费率）。
     pub pricing: Option<CandidatePricing>,
 }
@@ -399,9 +415,8 @@ impl PublishRuntimeCommand {
                     credential_env: draft.credential_env.clone(),
                     price_source_url,
                     rates,
-                    routing_priority: i32::try_from(index).map_err(|_| {
-                        ApplicationError::Validation("too many offerings".to_owned())
-                    })?,
+                    routing_priority: normalize_routing_priority(index, draft)?,
+                    weight: normalize_weight(index, draft)?,
                     pricing,
                 })
             })
@@ -456,6 +471,8 @@ impl PublishRuntimeCommand {
             price_source_url: price_plan.source_url.clone(),
             rates: price_plan.into_rates(),
             routing_priority: 0,
+            // 扁平形式只有一个候选：档内分流对它没有意义，权重取默认值 1。
+            weight: 1,
             // 扁平形式是**过渡期的老形状**（老素材、老测试），不带定价：定价按候选给，只有
             // 数组形式能表达"同一个网关模型的不同候选价格不同"这件事。它的发布仍走旧口径
             // （对客扣费按已发布费率、预授权回落平台兜底数），与今天逐位相同。
@@ -515,6 +532,14 @@ pub struct ConsideredCandidate {
     pub offering_id: OfferingId,
     pub provider_kind: String,
     pub routing_priority: i32,
+    /// 这条候选的档位内分流比（它自己的发布值）。
+    pub weight: u32,
+    /// 本次判定的**分流落点**：`hash(账户 ‖ 幂等键)` 映射到命中档权重之和以内的那个位置。
+    ///
+    /// 同一次判定里逐项同值（它是"这次分摊落在哪"的一个数，不是每条候选各有一个）。记在判定
+    /// 记录里是为了让"为什么是它"**事后可重建**：账户与幂等键随 Job 落库，权重与落点在这里，
+    /// 按区间走一遍即可复现选中项——不必依赖任何随机数发生器或外部状态。
+    pub weight_draw: u64,
     pub eligible: bool,
     /// 不合格时的原因；合格时为 `None`。
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -530,6 +555,42 @@ pub struct RoutingDecision {
     pub runtime_revision_id: RuntimeRevisionId,
     pub chosen_offering_id: OfferingId,
     pub considered: Vec<ConsideredCandidate>,
+}
+
+/// 归一一条候选的**档位**：显式给了就用它，没给就取数组下标。
+///
+/// 下标是今天的口径（"顺序即优先级"），保留为缺省值之后，不带这个字段的老素材与老测试
+/// 行为逐位不变。显式给值只有一个用途：把**多条候选放进同一档**——下标天然互不相同，
+/// 档内按权重分流因此需要一条别的路来表达"这两条是同档"。
+///
+/// 负数直接拒：档位是顺序而不是偏移量，负号没有含义，放行只会让"最小的档位"变成一个
+/// 靠数据才看得出来的约定。
+fn normalize_routing_priority(
+    index: usize,
+    draft: &OfferingDraft,
+) -> Result<i32, ApplicationError> {
+    match draft.routing_priority {
+        Some(priority) if priority < 0 => Err(ApplicationError::Validation(format!(
+            "offerings[{index}].routing_priority must not be negative"
+        ))),
+        Some(priority) => Ok(priority),
+        None => i32::try_from(index)
+            .map_err(|_| ApplicationError::Validation("too many offerings".to_owned())),
+    }
+}
+
+/// 归一一条候选的**权重**：缺省 `1`；显式 `0` 拒绝。
+///
+/// 0 不是"不参与分流"的表达——想不参与就不发这条候选。放行 0 之后，这条候选会永远分不到，
+/// 而"为什么分不到"要读一遍分摊代码才知道，那是把配置错误伪装成运行结果。
+fn normalize_weight(index: usize, draft: &OfferingDraft) -> Result<u32, ApplicationError> {
+    match draft.weight {
+        Some(0) => Err(ApplicationError::Validation(format!(
+            "offerings[{index}].weight must be a positive integer"
+        ))),
+        Some(weight) => Ok(weight),
+        None => Ok(1),
+    }
 }
 
 /// 校验计价形态。
@@ -630,11 +691,19 @@ fn normalize_candidate_pricing(
     }))
 }
 
-/// 按 `routing_priority` 升序取**第一个合格候选**。
+/// 选出这次请求走的那条候选：**先定档位，再在档内按权重分摊**。
 ///
 /// 合格 = 该候选自己的 `restrictions` 允许本次分支与图片张数，**且**这条供给的承载面能承载
 /// 这次请求**实际用到**的每个字段（图片要能落到它声明的参数名上）。两个条件都必须用该候选
 /// 自己的声明判断——这正是「每条供给各自声明承载面、限制只收窄」的落地方式。
+///
+/// **合格性先于分流**：不合格的候选连分摊的资格都没有——它们不进权重之和、也不在区间里。
+/// 于是"权重写得再大"也换不来一次选中，这是"任何策略都不得选中不合格候选"这条硬约束在
+/// 本层的落点（策略层接的就是这里算出来的合格集合）。
+///
+/// 分摊规则：取**合格候选里最小的 `routing_priority`** 作为命中档（这就是"数字小者优先"），
+/// 在该档的合格候选里按 `weight` 分摊。落点用 `(账户, 幂等键)` 的哈希，**不用随机数发生器**：
+/// 同一请求重放必然落同一条候选，离线也能断言。
 ///
 /// 请求本身先按**合同**校验一次（缺必填、合同外的字段）：那是调用方的参数问题，与选路无关，
 /// 因此在这里直接失败，不进候选取舍。
@@ -643,7 +712,8 @@ fn normalize_candidate_pricing(
 /// 是平台的供给面承载不了它——对客必须表现为平台侧故障，不是参数错。同样在调用上游之前失败，
 /// 不回退到能力更宽但优先级更低的候选（候选已经全试过了）。
 ///
-/// 不做的事：不因价格重排候选（价格不参与选中）。
+/// 不做的事：不因价格重排候选（价格不参与选中），不改写参数映射与承载面——分摊只决定
+/// "选中谁"，选中之后的参数准备与冻结路径一字不动。
 fn select_candidate(
     request: &CreateImageGenerationRequest,
     branch: ImageBranch,
@@ -685,46 +755,116 @@ fn select_candidate(
                 offering_id: candidate.offering_id,
                 provider_kind: candidate.provider_kind.clone(),
                 routing_priority: candidate.routing_priority,
+                weight: candidate.weight,
+                // 落点先占位，定下命中档之后统一回填（它是本次判定一个数，不是每条候选各一个）。
+                weight_draw: 0,
                 eligible: skip_reason.is_none(),
                 skip_reason,
             };
             (published, parameters, considered)
         })
         .collect();
-    // 第一个合格候选胜出；不合格的留作诊断信息。
-    let chosen = evaluated
-        .iter()
-        .position(|(_, _, considered)| considered.eligible);
-    if let Some(chosen) = chosen {
-        let considered = evaluated
+    let Some(chosen) = choose_by_priority_and_weight(&evaluated, request) else {
+        let reasons = evaluated
             .iter()
-            .map(|(_, _, considered)| considered.clone())
-            .collect::<Vec<_>>();
-        let (published, parameters, _) =
-            evaluated.into_iter().nth(chosen).expect("index just found");
-        let decision = RoutingDecision {
-            runtime_revision_id: revision_id,
-            chosen_offering_id: published.offering_id,
-            considered,
-        };
-        return Ok((published, parameters, decision));
-    }
-    let reasons = evaluated
+            .map(|(_, _, considered)| {
+                format!(
+                    "{}#{}: {}",
+                    considered.provider_kind,
+                    considered.routing_priority,
+                    considered.skip_reason.as_deref().unwrap_or("unknown")
+                )
+            })
+            .collect::<Vec<_>>()
+            .join("; ");
+        return Err(ApplicationError::NoEligibleOffering(format!(
+            "no offering can carry this request for model {} (revision {revision_id}): {reasons}",
+            request.model
+        )));
+    };
+    let (chosen, weight_draw) = chosen;
+    let considered = evaluated
         .iter()
-        .map(|(_, _, considered)| {
-            format!(
-                "{}#{}: {}",
-                considered.provider_kind,
-                considered.routing_priority,
-                considered.skip_reason.as_deref().unwrap_or("unknown")
-            )
+        .map(|(_, _, considered)| ConsideredCandidate {
+            weight_draw,
+            ..considered.clone()
         })
-        .collect::<Vec<_>>()
-        .join("; ");
-    Err(ApplicationError::NoEligibleOffering(format!(
-        "no offering can carry this request for model {} (revision {revision_id}): {reasons}",
-        request.model
-    )))
+        .collect::<Vec<_>>();
+    let (published, parameters, _) = evaluated
+        .into_iter()
+        .nth(chosen)
+        .expect("index just computed");
+    let decision = RoutingDecision {
+        runtime_revision_id: revision_id,
+        chosen_offering_id: published.offering_id,
+        considered,
+    };
+    Ok((published, parameters, decision))
+}
+
+/// 档位与权重分摊：返回命中候选在 `evaluated` 里的下标，以及本次的分流落点。
+///
+/// 分两步，顺序不能换：
+/// 1. **定档位**——合格候选里最小的 `routing_priority`。档位是顺序，权重不参与这一步，
+///    因此"档 0 有合格候选"时权重再小的候选也不会被后面的档抢走；
+/// 2. **档内分摊**——该档的合格候选按 `weight` 分区间，落点落在谁的区间里就选谁。
+///
+/// 区间划分的**顺序按 `offering_id` 升序**，不按数据库返回的行序：落点是哈希出来的一个数，
+/// 若区间划分依赖行序，同一请求换个取数顺序就会分到另一条候选，"可重放"就成了空话。
+/// 定序键必须是与请求无关的发布数据，`offering_id` 满足这一点。
+///
+/// 权重之和用 `u64` 累加：权重本身是 `u32`，多条候选相加可能溢出 `u32`。
+fn choose_by_priority_and_weight(
+    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    request: &CreateImageGenerationRequest,
+) -> Option<(usize, u64)> {
+    let tier = evaluated
+        .iter()
+        .filter(|(_, _, considered)| considered.eligible)
+        .map(|(_, _, considered)| considered.routing_priority)
+        .min()?;
+    let mut tier_candidates: Vec<usize> = (0..evaluated.len())
+        .filter(|index| {
+            let considered = &evaluated[*index].2;
+            considered.eligible && considered.routing_priority == tier
+        })
+        .collect();
+    // 定序键用 `offering_id` 里的 UUID 本身：`OfferingId` 是个新类型，没有比较语义，
+    // 而这里要的只是"每次取数都排出同一个顺序"，不是任何业务顺序。
+    tier_candidates.sort_by_key(|index| evaluated[*index].2.offering_id.0);
+    let total: u64 = tier_candidates
+        .iter()
+        .map(|index| u64::from(evaluated[*index].2.weight))
+        .sum();
+    // 档内至少有一条合格候选 ⇒ 权重至少是 1 ⇒ 总和至少是 1，取模不会除以零。
+    let draw = weight_split_draw(request.account_id, &request.idempotency_key) % total;
+    let mut cursor = 0_u64;
+    for index in tier_candidates {
+        cursor += u64::from(evaluated[index].2.weight);
+        if draw < cursor {
+            return Some((index, draw));
+        }
+    }
+    // 落点必然落在某条候选的区间里（总和就是全部区间），走不到这里。
+    None
+}
+
+/// 权重分摊的落点：`sha256(账户 ‖ 幂等键)` 取前 8 字节（大端）。
+///
+/// 输入取 `(账户, 幂等键)` 而不是 JobId：选路发生在 JobId 生成**之前**，拿一个当时还不存在的
+/// 值当输入是因果倒置。这两个值在受理前就已知，而且**幂等键只在账户内唯一**——把账户也放进来，
+/// 不同账户用同一个键时才不会互相关联。
+///
+/// 账户是定宽 UUID，直接拼在幂等键前面即可：定宽前缀让"拼在哪里断开"没有歧义，不需要分隔符。
+/// 幂等键是调用方给的文本，因此这里用哈希而不是取模原始字节——哈希把它摊平到整个取值空间。
+fn weight_split_draw(account_id: AccountId, idempotency_key: &str) -> u64 {
+    let mut hasher = Sha256::new();
+    hasher.update(account_id.0.as_bytes());
+    hasher.update(idempotency_key.as_bytes());
+    let digest = hasher.finalize();
+    let mut bytes = [0_u8; 8];
+    bytes.copy_from_slice(&digest[..8]);
+    u64::from_be_bytes(bytes)
 }
 
 /// 对客受理请求：调用方按**合同**给字段，图片直接给公网 URL 或 data URL。
@@ -982,8 +1122,11 @@ pub struct GatewayModelCandidateView {
     pub provider_model_id: String,
     /// 用哪个 Driver 发出去。
     pub adapter_key: String,
-    /// 选择顺序：数字小者优先（来自发布顺序，只有一个来源）。
+    /// 选择顺序：数字小者优先。它**缺省等于候选在发布数组里的下标**，也可以由发布者显式给出
+    /// （显式给值是为了让多条候选落在同一档）。它是**档位**，同一档内再按权重分摊。
     pub routing_priority: i32,
+    /// 这条候选在**档位内**的分流比；同一档有多条合格候选时按它分摊。
+    pub weight: u32,
     /// 这条候选现在**真的能走**吗：供给与它所在渠道都启用。
     ///
     /// 与目录/受理的判据同一条——运营要能一眼看出"目录里为什么没有它"。
@@ -2923,8 +3066,17 @@ mod tests {
         })
     }
 
-    /// 把一个已发布供给变成"发布物里的候选"：字段完全一致，只多 `routing_priority`。
+    /// 把一个已发布供给变成"发布物里的候选"：字段完全一致，只多 `routing_priority` 与 `weight`。
     fn candidate_of(offering: &PublishedOffering, routing_priority: i32) -> OfferingCandidate {
+        candidate_with_weight(offering, routing_priority, 1)
+    }
+
+    /// 同 `candidate_of`，但能指定档内分流比。
+    fn candidate_with_weight(
+        offering: &PublishedOffering,
+        routing_priority: i32,
+        weight: u32,
+    ) -> OfferingCandidate {
         OfferingCandidate {
             runtime_revision_id: offering.runtime_revision_id,
             vendor_model_id: offering.vendor_model_id,
@@ -2943,6 +3095,7 @@ mod tests {
             credential_env: offering.credential_env.clone(),
             price_snapshot: offering.price_snapshot.clone(),
             routing_priority,
+            weight,
         }
     }
 
@@ -3000,6 +3153,8 @@ mod tests {
             provider_model_id: provider_model_id.to_owned(),
             base_url: "https://api.inferera.com".to_owned(),
             credential_env: "AIHUBMIX_API_KEY".to_owned(),
+            routing_priority: None,
+            weight: None,
             restrictions: serde_json::json!({}),
             carrier_schema: None,
             parameter_mapping: serde_json::json!({}),
@@ -3043,7 +3198,7 @@ mod tests {
         };
         let normalized = command.normalize().expect("array form is valid");
         assert_eq!(normalized.offerings.len(), 3);
-        // 优先级只有一个来源：数组下标。
+        // 缺省档位就是数组下标（没给 `routing_priority` 时唯一的来源）。
         assert_eq!(
             normalized
                 .offerings
@@ -3238,6 +3393,7 @@ mod tests {
             },
             price_source_url: "https://example.invalid/price".to_owned(),
             routing_priority: 0,
+            weight: 1,
             pricing: None,
         }
     }
@@ -4601,6 +4757,276 @@ mod tests {
         // 该型号一条 active 供给都没有：是"不存在"，不是"承载不了"。
         let error = select_candidate(&request, branch, &[]).expect_err("no active offering");
         assert!(matches!(error, ApplicationError::NotFound(_)), "{error}");
+    }
+
+    /// 按 `(账户, 幂等键)` 与权重**重算**期望落点。
+    ///
+    /// 故意在测试里独立写一遍，不调用生产实现的那个辅助函数：这条用例要证明的是"分摊确实由
+    /// 账户、幂等键与权重共同决定"，用被验对象自己算期望就什么也证明不了。
+    fn expected_weight_split(account_id: AccountId, key: &str, tier: &[(Uuid, u32)]) -> Uuid {
+        let mut hasher = Sha256::new();
+        hasher.update(account_id.0.as_bytes());
+        hasher.update(key.as_bytes());
+        let digest = hasher.finalize();
+        let mut bytes = [0_u8; 8];
+        bytes.copy_from_slice(&digest[..8]);
+        let total: u64 = tier.iter().map(|(_, weight)| u64::from(*weight)).sum();
+        let draw = u64::from_be_bytes(bytes) % total;
+        let mut ordered = tier.to_vec();
+        ordered.sort_by_key(|(offering_id, _)| *offering_id);
+        let mut cursor = 0_u64;
+        for (offering_id, weight) in ordered {
+            cursor += u64::from(weight);
+            if draw < cursor {
+                return offering_id;
+            }
+        }
+        unreachable!("落点必然落在某条候选的区间里")
+    }
+
+    /// 只用**判定记录**重建选中项：合格候选、档位、权重与落点都在里面，不需要别的事实。
+    fn rebuild_from_decision_record(decision: &RoutingDecision) -> Uuid {
+        let tier = decision
+            .considered
+            .iter()
+            .filter(|considered| considered.eligible)
+            .map(|considered| considered.routing_priority)
+            .min()
+            .expect("a decision always has an eligible candidate");
+        let mut ordered: Vec<(Uuid, u32)> = decision
+            .considered
+            .iter()
+            .filter(|considered| considered.eligible && considered.routing_priority == tier)
+            .map(|considered| (considered.offering_id.0, considered.weight))
+            .collect();
+        ordered.sort_by_key(|(offering_id, _)| *offering_id);
+        let draw = decision.considered[0].weight_draw;
+        let mut cursor = 0_u64;
+        for (offering_id, weight) in ordered {
+            cursor += u64::from(weight);
+            if draw < cursor {
+                return offering_id;
+            }
+        }
+        unreachable!("落点必然落在某条候选的区间里")
+    }
+
+    /// 同一档按权重分摊：逐条等于重算的期望，且判定记录自己就能重建结论。
+    ///
+    /// 三条性质一起验：① 分摊由 `(账户, 幂等键)` 与权重决定（不是随机数、也不看行序）；
+    /// ② 同一批输入重放结果逐条相同；③ 权重 1:3 下权重大的那条确实分到更多。
+    #[test]
+    fn weight_splits_within_one_tier_deterministically() {
+        let account_id = AccountId(Uuid::from_u128(0x5eea_0000_0000_0000_0000_0000_0000_0001));
+        let light = offering();
+        let mut heavy = offering();
+        heavy.offering_id = OfferingId::new();
+        let candidates = vec![
+            candidate_with_weight(&light, 0, 1),
+            candidate_with_weight(&heavy, 0, 3),
+        ];
+        let tier = vec![(light.offering_id.0, 1_u32), (heavy.offering_id.0, 3_u32)];
+
+        let mut first_pass = Vec::new();
+        let mut heavy_count = 0_u32;
+        for index in 0..64 {
+            let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+            request.account_id = account_id;
+            request.idempotency_key = format!("weight-key-{index}");
+            let branch = request.branch().expect("prompt only");
+            let (chosen, _, decision) = select_candidate(&request, branch, &candidates)
+                .expect("a candidate must be chosen");
+            assert_eq!(
+                chosen.offering_id.0,
+                expected_weight_split(account_id, &request.idempotency_key, &tier),
+                "落点必须由账户、幂等键与权重共同决定"
+            );
+            assert_eq!(
+                rebuild_from_decision_record(&decision),
+                chosen.offering_id.0,
+                "判定记录必须足以重建选中项"
+            );
+            let draw = decision.considered[0].weight_draw;
+            assert!(
+                decision
+                    .considered
+                    .iter()
+                    .all(|considered| considered.weight_draw == draw),
+                "分流落点是本次判定一个数，逐项同值：{:?}",
+                decision.considered
+            );
+            assert!(draw < 4, "落点必须落在该档权重之和以内：{draw}");
+            if chosen.offering_id == heavy.offering_id {
+                heavy_count += 1;
+            }
+            first_pass.push(chosen.offering_id);
+        }
+
+        // 同一批输入重放：逐条相同。
+        let mut second_pass = Vec::new();
+        for index in 0..64 {
+            let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+            request.account_id = account_id;
+            request.idempotency_key = format!("weight-key-{index}");
+            let branch = request.branch().expect("prompt only");
+            let (chosen, _, _) = select_candidate(&request, branch, &candidates)
+                .expect("a candidate must be chosen");
+            second_pass.push(chosen.offering_id);
+        }
+        assert_eq!(first_pass, second_pass, "同一批输入必须逐条可复现");
+
+        let distinct: std::collections::BTreeSet<Uuid> =
+            first_pass.iter().map(|offering_id| offering_id.0).collect();
+        assert_eq!(distinct.len(), 2, "权重 1:3 下两条候选都该被分到过");
+        assert!(
+            heavy_count > 32,
+            "权重大的那条应当分到更多：{heavy_count}/64"
+        );
+    }
+
+    /// 跨档：权重**不改变**档位顺序——档 0 有合格候选时，档 1 的权重再大也轮不到。
+    #[test]
+    fn weight_never_outranks_a_tier_that_has_an_eligible_candidate() {
+        let first = offering();
+        let mut second = offering();
+        second.offering_id = OfferingId::new();
+        let candidates = vec![
+            candidate_with_weight(&first, 0, 1),
+            candidate_with_weight(&second, 1, 1_000),
+        ];
+        for index in 0..16 {
+            let mut request = image_request(serde_json::json!({"prompt": "hello"}));
+            request.idempotency_key = format!("tier-key-{index}");
+            let branch = request.branch().expect("prompt only");
+            let (chosen, _, _) = select_candidate(&request, branch, &candidates)
+                .expect("a candidate must be chosen");
+            assert_eq!(
+                chosen.offering_id, first.offering_id,
+                "档 0 有合格候选时权重不该把它让给后面的档"
+            );
+        }
+    }
+
+    /// 不合格的候选**不进分摊**：权重写得再大也换不来一次选中。
+    ///
+    /// 这就是"候选合格性优先于策略"在本层的落点——合格集合先算出来，权重只在集合内部起作用。
+    #[test]
+    fn an_ineligible_candidate_never_wins_the_split() {
+        let contract = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "quality": {"enum": ["low", "high"]}
+        }));
+        // 同档两条：窄承载面（承载不了 `quality`）权重 1000，宽承载面权重 1。
+        let mut narrow = offering();
+        narrow.capability_schema = contract.clone();
+        narrow.carrier_schema = surface(serde_json::json!({
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"}
+        }));
+        let mut wide = offering();
+        wide.capability_schema = contract.clone();
+        wide.carrier_schema = contract;
+        wide.offering_id = OfferingId::new();
+        let candidates = vec![
+            candidate_with_weight(&narrow, 0, 1_000),
+            candidate_with_weight(&wide, 0, 1),
+        ];
+        for index in 0..16 {
+            let mut request =
+                image_request(serde_json::json!({"prompt": "hello", "quality": "high"}));
+            request.idempotency_key = format!("eligible-key-{index}");
+            let branch = request.branch().expect("prompt only");
+            let (chosen, _, decision) =
+                select_candidate(&request, branch, &candidates).expect("the wide candidate fits");
+            assert_eq!(
+                chosen.offering_id, wide.offering_id,
+                "不合格的候选不得因为权重大而被选中"
+            );
+            let skipped = decision
+                .considered
+                .iter()
+                .find(|considered| considered.offering_id == narrow.offering_id)
+                .expect("the narrow candidate must be considered");
+            assert!(!skipped.eligible);
+            assert!(
+                skipped
+                    .skip_reason
+                    .as_deref()
+                    .is_some_and(|reason| reason.contains("quality")),
+                "落选原因要写明承载不了哪个字段：{:?}",
+                skipped.skip_reason
+            );
+        }
+    }
+
+    /// 显式档位与权重按候选归一；**缺省仍是"下标即档位、权重 1"**（老素材行为逐位不变）。
+    #[test]
+    fn explicit_priority_and_weight_are_normalized_for_shared_tiers() {
+        let mut first = draft("m");
+        first.routing_priority = Some(0);
+        first.weight = Some(1);
+        let mut second = draft("m");
+        second.routing_priority = Some(0);
+        second.weight = Some(3);
+        let normalized = PublishRuntimeCommand {
+            offerings: Some(vec![first, second]),
+            ..base_command()
+        }
+        .normalize()
+        .expect("two candidates may share one tier");
+        assert_eq!(normalized.offerings[0].routing_priority, 0);
+        assert_eq!(normalized.offerings[1].routing_priority, 0);
+        assert_eq!(normalized.offerings[0].weight, 1);
+        assert_eq!(normalized.offerings[1].weight, 3);
+
+        let normalized = PublishRuntimeCommand {
+            offerings: Some(vec![draft("m"), draft("m")]),
+            ..base_command()
+        }
+        .normalize()
+        .expect("the legacy shape still publishes");
+        assert_eq!(normalized.offerings[0].routing_priority, 0);
+        assert_eq!(normalized.offerings[1].routing_priority, 1);
+        assert!(
+            normalized
+                .offerings
+                .iter()
+                .all(|offering| offering.weight == 1),
+            "没给权重时一律是 1"
+        );
+    }
+
+    /// 权重 0 与负档位在**发布期**就拒：它们是配置错误，不该等到分摊时表现为"分不到"。
+    #[test]
+    fn a_zero_weight_or_negative_priority_is_rejected() {
+        let mut zero_weight = draft("m");
+        zero_weight.weight = Some(0);
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![zero_weight]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("a zero weight must be rejected");
+        assert!(
+            error
+                .to_string()
+                .contains("weight must be a positive integer"),
+            "{error}"
+        );
+
+        let mut negative = draft("m");
+        negative.routing_priority = Some(-1);
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![negative]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("a negative priority must be rejected");
+        assert!(
+            error.to_string().contains("must not be negative"),
+            "{error}"
+        );
     }
 
     #[test]

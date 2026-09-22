@@ -40,7 +40,7 @@
 
 ### 1.3 命名与唯一性
 
-- **`gateway_model`（平台命名）**：全局唯一，且**同一时刻只有一个生效修订**。沿用现有唯一索引 `one_active_entry_per_model_and_priority`（`(gateway_model, routing_priority) WHERE active`）所保证的"同一名字的生效条目来自同一修订"，本设计只调整该索引（[`0008`](./0008-routing-strategy-and-caching.md) §2）。**名字由管理员创建（发布）时自己填，平台不预设、也不固定任何名字**——本文出现的 `gpt-image-2.5-plus` 一类取值都是示例，不是默认名或规范名。
+- **`gateway_model`（平台命名）**：全局唯一，且**同一时刻只有一个生效修订**。沿用现有唯一索引 `one_active_entry_per_model_and_priority`（`(gateway_model, routing_priority) WHERE active`）所保证的"同一名字的生效条目来自同一修订"，本设计只调整该索引（[`0008`](./0008-routing-strategy-and-caching.md) §2）——**该调整已落地**，现为 `one_active_entry_per_model_and_offering`（`(gateway_model, offering_id) WHERE active`），"生效条目来自同一修订"由发布事务的原子替换与仓库层的跨修订防御保证。**名字由管理员创建（发布）时自己填，平台不预设、也不固定任何名字**——本文出现的 `gpt-image-2.5-plus` 一类取值都是示例，不是默认名或规范名。
 - **`native_model_id`（厂商原生名）**：只属于 `catalog.vendor_models`，用于合同的身份与唯一键；**不进对客面**。
 - **允许多个网关模型指向同一个 Vendor Model Revision**：同一份供给包成不同名字/不同价格档（例如 `gpt-image-2.5-plus` 与 `gpt-image-2.5-lite` 都指向 `gpt-image-2.5-sunburst`，三者为示例值）。唯一性在**名字**上，不在 Vendor Model 上。这是引入命名层的动机之一，因此不做"一个 Vendor Model 只能有一个网关模型"的约束。
 - **发布命令新增 `gateway_model`**（`PublishRuntimeCommand`）：缺省时回退取 `native_model_id`，与现有形状**逐位兼容**——现有素材、现有已发布数据、现有测试都不用改。

@@ -115,6 +115,20 @@ impl HubRepository for PgHubRepository {
             ));
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 同一个网关模型名的发布**串行化**：本函数靠"先 `UPDATE ... SET active = false
+        // WHERE active AND gateway_model = $1`、再插入新条目"做原子替换，而这个替换只有在
+        // 同一名字的两次发布不交错时才成立。交错时两边都可能先看到"还没有自己的条目"，
+        // 于是两份修订的 active 条目同时存在——那是**读时**才会暴露的问题（仓库层对
+        // "active 候选跨修订并存"报错），表现为这个型号的所有请求一起失败，直到有人重新发布一次。
+        // 唯一索引挡不住这件事：每次发布都给候选新建一条供给行，索引上不会撞。
+        // 按名字取一把事务级咨询锁（随事务结束自动释放），让"替换"真的是一次替换。
+        // 锁键的写法与 `create_job` 里那把幂等锁一致（`hashtextextended`，bigint 键）。
+        // 不同的名字各有各的锁；哈希撞键只会让两个名字的发布多等一会儿，不影响正确性。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(&gateway_model)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
         // 发布期校验：每个候选声明的成本币种必须有一行**已生效**的折算率，否则整份发布回滚。
         // 受理时要按该币种取"受理时刻生效的那一行"并快照；发布期不拦，问题会在受理时才暴露
         // ——那时拒的是消费者的请求，而错的是管理员的一次录入遗漏。
@@ -320,6 +334,7 @@ impl HubRepository for PgHubRepository {
                     fx_rate: None,
                 },
                 routing_priority: offering.routing_priority,
+                weight: offering.weight,
             });
             if let Some(pricing) = &offering.pricing {
                 let key = offering_id.to_string();
@@ -341,6 +356,7 @@ impl HubRepository for PgHubRepository {
             snapshot_entries.push(serde_json::json!({
                 "offering_id": offering_id,
                 "routing_priority": offering.routing_priority,
+                "weight": offering.weight,
                 "provider_kind": offering.provider_kind,
                 "adapter_key": offering.adapter_key,
                 "provider_model_id": offering.provider_model_id,
@@ -422,8 +438,8 @@ impl HubRepository for PgHubRepository {
                 r#"
                 INSERT INTO publication.runtime_entries
                     (runtime_revision_id, vendor_model_id, offering_id, price_plan_id,
-                     gateway_model, active, routing_priority)
-                VALUES ($1, $2, $3, $4, $5, true, $6)
+                     gateway_model, active, routing_priority, weight)
+                VALUES ($1, $2, $3, $4, $5, true, $6, $7)
                 "#,
             )
             .bind(revision_id.0)
@@ -432,6 +448,9 @@ impl HubRepository for PgHubRepository {
             .bind(candidate.price_snapshot.price_plan_id.0)
             .bind(&gateway_model)
             .bind(candidate.routing_priority)
+            .bind(i32::try_from(candidate.weight).map_err(|_| {
+                ApplicationError::Validation("offering weight is out of range".to_owned())
+            })?)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -478,6 +497,10 @@ impl HubRepository for PgHubRepository {
         // 参数名是**平台对客名**（网关模型名），不是厂商原生名：调用方提交的 `model` 就是它。
         // 判据与对客目录**逐条一致**，其中多一条"网关模型开着"——关掉的模型必须真的调不动，
         // 否则"关闭"只影响目录、不影响受理，等于没关。
+        //
+        // 排序的第二项是 `o.id`（定序，不是业务顺序）：同一档允许多条候选，档内按权重分摊要
+        // 划分区间，而区间划分必须只有一个答案——行序不保证稳定，落点因此必须配一个稳定序。
+        // 分摊本身在用例层做（那里才知道账户与幂等键），这里只保证取回来的顺序是确定的。
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT
@@ -499,7 +522,8 @@ impl HubRepository for PgHubRepository {
                 rr.cost_basis,
                 rr.tier_prices,
                 rr.floor_amounts,
-                re.routing_priority
+                re.routing_priority,
+                re.weight
             FROM publication.runtime_entries re
             JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
             JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
@@ -508,7 +532,7 @@ impl HubRepository for PgHubRepository {
             JOIN supply.channels c ON c.id = o.channel_id
             JOIN pricing.price_plans p ON p.id = re.price_plan_id
             WHERE re.active AND re.gateway_model = $1 AND {CANDIDATE_AVAILABLE_SQL}
-            ORDER BY re.routing_priority ASC, rr.created_at DESC
+            ORDER BY re.routing_priority ASC, o.id ASC
             "#
         )))
         .bind(gateway_model)
@@ -601,7 +625,8 @@ impl HubRepository for PgHubRepository {
                 rr.cost_basis,
                 rr.tier_prices,
                 rr.floor_amounts,
-                re.routing_priority
+                re.routing_priority,
+                re.weight
             FROM publication.runtime_entries re
             JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
             JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model
@@ -1968,6 +1993,21 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
             fx_rate: None,
         },
         routing_priority: row.try_get("routing_priority").map_err(database_error)?,
+        weight: row_weight(row)?,
+    })
+}
+
+/// 读回一条候选的权重。
+///
+/// 库层有 `CHECK (weight > 0)`，所以读到的值正常都 ≥ 1；这里仍做一次防御性校验：库约束是
+/// 别人也能绕过的（直接写 SQL、手工改数据），而"权重为 0 的候选"会让分摊区间少一段，
+/// 表现为"某些请求分不到任何候选"——那种故障从结果上看不出来，只能在读回来时就拒。
+fn row_weight(row: &sqlx::postgres::PgRow) -> Result<u32, ApplicationError> {
+    let weight: i32 = row.try_get("weight").map_err(database_error)?;
+    u32::try_from(weight).map_err(|_| {
+        ApplicationError::Persistence(format!(
+            "offering weight {weight} is not a positive integer"
+        ))
     })
 }
 
@@ -2061,6 +2101,7 @@ fn row_to_gateway_model_candidate(
         provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
         adapter_key: row.try_get("adapter_key").map_err(database_error)?,
         routing_priority: row.try_get("routing_priority").map_err(database_error)?,
+        weight: row_weight(row)?,
         // 判据在 SQL 里判过了（`CANDIDATE_AVAILABLE_SQL`），这里只读结果，不重算。
         enabled: row.try_get("candidate_available").map_err(database_error)?,
         carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,

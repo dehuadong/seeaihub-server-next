@@ -32,4 +32,5 @@ workspace = true
 [dev-dependencies]
 base64.workspace = true
 reqwest.workspace = true
+sha2.workspace = true
 sqlx.workspace = true

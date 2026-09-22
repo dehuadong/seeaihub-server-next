@@ -16,10 +16,14 @@
 
 `routing_priority` = 发布时候选数组的下标（`crates/application` 的 `normalize_array`：`routing_priority = index`），数字小者优先。`ADR-0009`：选中顺序是**发布决定**，不由请求参数、Adapter 或价格决定。
 
+**候选可以显式给出 `routing_priority`**（缺省仍等于下标）：显式值只有一个用途——把**多条候选放进同一档**，供 §2 的档内分流使用。下标天然互不相同，没有这一条就没有任何方式表达"这两条是同档"。它不改变"顺序是发布决定"这条性质：档位仍由发布数据给出，只是可以给成同一个值。
+
 ## 2. 权重（新）：档位内分流，不是内置择优
 
 - `weight`：正整数，随候选发布，默认 `1`。
 - **语义**：**优先级是档位，权重只在同一档内分流**。受理时按 `routing_priority` 升序找到**第一个至少有一条合格候选的档**，在该档的合格候选里按 `weight` 分摊。
+- **档位怎么表达**：候选可以显式给出 `routing_priority`，**缺省等于数组下标**（§1 的现状）；**显式给值才能让两条候选同档**。下一条的索引调整以它为前提——没有它，"同档多候选"在发布形状里根本表达不出来，档内分流也就永远走不到。
+- **档内定序**：同一档里按 `weight` 分摊要划分区间，**区间划分按 `offering_id` 升序**，不按数据库返回的行序——落点是哈希出来的一个数，行序不稳定的话同一请求换个取数顺序就会分到另一条候选，"可重放"就成了空话。定序键必须是**与请求无关的发布数据**，`offering_id` 满足这一点。
 - **分摊用确定性哈希，输入是 `(account_id, idempotency_key)`**：`hash(account_id ‖ idempotency_key)` 映射到 `[0, Σweight)`，落在哪条候选的区间就选哪条。不用随机数发生器。理由：判定可复现、离线可断言分布、`routing_decisions` 事后能重建"为什么是它"（`ADR-0009` 要求判定记录可重建）。
 - **为什么不是 job id**：选路发生在生成 JobId **之前**——`GenerationService::create` 先 `select_candidate`、再 `create_job`，JobId 是在 `create_job` 里才 `JobId::new()` 出来的（`crates/persistence`）。拿一个当时还不存在的值当哈希输入是因果倒置；而 `(account_id, idempotency_key)` 在受理前就已知。
 - **重放语义**：同一个 `(account_id, idempotency_key)` 的**重放必然分到同一条候选**——哈希输入相同 ⇒ 分流结果相同；而 `create_job` 本来就把同键重发去重成原 Job（`UNIQUE (account_id, idempotency_key)`），所以重放既不改选路、也不新建 Job、不重复计费。**不同幂等键各自独立分摊**，哪怕在同一个账户下。`account_id` 也进哈希：幂等键只在自己账户内唯一，不同账户用同一个键时不该相关。

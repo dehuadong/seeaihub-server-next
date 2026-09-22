@@ -797,8 +797,9 @@ pub struct PublishedOffering {
 /// 合同是模型级的唯一一份），**各自带自己的 `carrier_schema`**——渠道包装不同，
 /// 这条供给能承载的字段面就不同。
 ///
-/// 与 [`PublishedOffering`] 的关系：字段完全一致，只多 `routing_priority`。
-/// `PublishedOffering` 表示**受理时被选中并固化进 Job 的那一份**；本类型表示**发布物中的候选**。
+/// 与 [`PublishedOffering`] 的关系：字段完全一致，只多 `routing_priority` 与 `weight` 两个
+/// **只在选路用**的发布字段。`PublishedOffering` 表示**受理时被选中并固化进 Job 的那一份**；
+/// 本类型表示**发布物中的候选**。
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct OfferingCandidate {
     pub runtime_revision_id: RuntimeRevisionId,
@@ -820,12 +821,31 @@ pub struct OfferingCandidate {
     pub base_url: String,
     pub credential_env: String,
     pub price_snapshot: PriceSnapshot,
-    /// 选择顺序：数字小者优先。发布时由候选数组下标决定，只有一个来源。
+    /// 选择顺序：数字小者优先。它**缺省等于候选在发布数组里的下标**（今天的老素材就是这个口径），
+    /// 也可以由发布者显式给出——显式给值是为了让多条候选落在同一档。
+    ///
+    /// 它是**档位**：受理时按它升序找到第一个至少有一条合格候选的档，选中就在这一档里发生。
     pub routing_priority: i32,
+    /// **档位内的分流比**：正整数，随候选发布，默认 `1`。
+    ///
+    /// 它只在**同一档内**起作用：同一档有多条合格候选时按权重分摊。它**不改变档位顺序**，
+    /// 也不看价格、健康度或延迟——它是发布者给出的分流比，与 `routing_priority` 同为发布数据，
+    /// 不是核心服务内置的择优规则。
+    ///
+    /// 反序列化缺省 `1`：这个字段是后加的，早于它落库的发布快照里没有这一项。快照今天只写不读，
+    /// 但缺省值让"将来真要读旧快照"时不会因为少一个字段就整份读不出来——那时该读出的语义正是
+    /// "权重 1"（今天唯一存在的取值）。
+    #[serde(default = "default_routing_weight")]
+    pub weight: u32,
+}
+
+/// 权重在**缺省**时的取值：`1`。`u32` 的 `Default` 是 0，而 0 不是合法的权重。
+fn default_routing_weight() -> u32 {
+    1
 }
 
 impl OfferingCandidate {
-    /// 选中后固化进 Job 的形态（丢掉仅发布侧需要的 `routing_priority`）。
+    /// 选中后固化进 Job 的形态（丢掉仅发布侧需要的 `routing_priority` 与 `weight`）。
     #[must_use]
     pub fn into_published(self) -> PublishedOffering {
         PublishedOffering {
