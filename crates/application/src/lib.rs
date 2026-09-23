@@ -1573,6 +1573,13 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 探一次**事实源**是否可达：只做一次 `SELECT 1`，不读任何业务表。
+    ///
+    /// 它是健康检查的唯一依赖判据。**缓存不可用不算不健康**：缓存是加速层，不可用时系统按"没有
+    /// 缓存"继续服务（直查数据库那条路径本来就在），把它算不健康会让编排系统重启一个本来能服务
+    /// 的实例。探活是只读幂等的，可以被很短间隔反复调用。
+    async fn probe(&self) -> Result<(), ApplicationError>;
+
     /// 账户标签（运营设）：只有生效的 `user_tag` 策略消费它，所以只有那种策略下才查它。
     async fn account_tag(&self, account_id: AccountId) -> Result<Option<String>, ApplicationError>;
 

@@ -1,5 +1,30 @@
 use super::*;
 
+/// 健康检查探的是**事实源**：数据库可达就 `200 {"status":"ok"}`。
+///
+/// 只有健康这一侧能自动化：装置是"起 API 进程 + 等 `/health` 就绪"，数据库不可达时进程根本起不来，
+/// 拿不到一个"正在服务、但库连不上"的实例。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn health_reports_ok_when_the_database_is_reachable() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    // 只判 body 逐字相等：多一个字段就意味着对客多暴露了一份内部状态。
+    let response = client
+        .get(format!("{base_url}/health"))
+        .send()
+        .await
+        .expect("health request");
+    assert_eq!(response.status(), StatusCode::OK);
+    let body = response.json::<Value>().await.expect("health body is JSON");
+    assert_eq!(body, json!({"status": "ok"}));
+
+    drop_isolated_database(&database_name).await;
+}
+
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn public_surface_has_no_async_task_protocol() {

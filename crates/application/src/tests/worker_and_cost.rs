@@ -123,6 +123,10 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn probe(&self) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
     async fn account_tag(
         &self,
         _account_id: AccountId,

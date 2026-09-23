@@ -1001,6 +1001,15 @@ impl HubRepository for PgHubRepository {
         self.account_balance(account_id).await
     }
 
+    /// 只探连接能不能用：`SELECT 1`，不碰任何业务表。
+    async fn probe(&self) -> Result<(), ApplicationError> {
+        sqlx::query("SELECT 1")
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
     /// 生效的策略：按模型覆盖优先，其次全局那条。
     ///
     /// `ORDER BY gateway_model IS NULL` 把非空（覆盖）排在前面：策略的作用域是"有覆盖用覆盖、

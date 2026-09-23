@@ -47,6 +47,8 @@ struct AppState {
     generations: GenerationService,
     /// 同步入口等任务跑完的最长时间。
     sync_wait: Duration,
+    /// 健康探测的依赖判据：探一次事实源是否可达（只 `SELECT 1`）。
+    repository: Arc<dyn HubRepository>,
 }
 
 #[tokio::main]
@@ -98,6 +100,7 @@ async fn main() -> Result<()> {
             .with_acceleration(acceleration.clone()),
         route_policies: RoutePolicyService::new(repository_port.clone()),
         sync_wait: generation_sync_wait()?,
+        repository: repository_port.clone(),
         generations: GenerationService::new(
             repository_port,
             generation_max_cost_microusd()?,
@@ -168,8 +171,43 @@ async fn shutdown_signal() {
     }
 }
 
-async fn health() -> Json<Value> {
-    Json(json!({"status": "ok"}))
+/// 健康检查：探一次**事实源**（数据库）是否可达，其余依赖一概不判。
+///
+/// 只算数据库：缓存是加速层，它不可用时系统按"没有缓存"继续服务，把它算不健康会让编排系统
+/// 重启一个本来能服务的实例；渠道是否可用是业务状态，不是进程健康状态。所以这里只做一次
+/// 只读幂等的 `SELECT 1`。
+///
+/// 探测带超时（`HEALTH_PROBE_TIMEOUT_MS`，默认 2000ms，是部署期配置项）：探活不能被一个卡住的
+/// 连接挂住——连接池排队、网络半开都可能让 `SELECT 1` 长时间不返回，那时进程已经不能在承诺的
+/// 时间内给出答案，按不可用处理比把编排系统也挂住更安全。
+async fn health(State(state): State<AppState>) -> Response {
+    let timeout = health_probe_timeout();
+    let reachable = matches!(
+        tokio::time::timeout(timeout, state.repository.probe()).await,
+        Ok(Ok(()))
+    );
+    if reachable {
+        (StatusCode::OK, Json(json!({"status": "ok"}))).into_response()
+    } else {
+        (
+            StatusCode::SERVICE_UNAVAILABLE,
+            Json(json!({"status": "unhealthy", "database": "unreachable"})),
+        )
+            .into_response()
+    }
+}
+
+/// 健康探测超时（毫秒）：部署期配置，缺省 2000ms。
+///
+/// 读不出来、或者读到 0 这种没意义的非正值时退回缺省：探活本身不该因为一个环境变量写错就把
+/// 整个进程判成不健康。
+fn health_probe_timeout() -> Duration {
+    let millis = env::var("HEALTH_PROBE_TIMEOUT_MS")
+        .ok()
+        .and_then(|raw| raw.parse::<u64>().ok())
+        .filter(|millis| *millis > 0)
+        .unwrap_or(2_000);
+    Duration::from_millis(millis)
 }
 
 #[derive(Debug, Deserialize)]

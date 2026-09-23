@@ -48,7 +48,7 @@
 
 | 方法 | 路径 | handler | 谁可以调 |
 | --- | --- | --- | --- |
-| GET | `/health` | `health` | 任何人 |
+| GET | `/health` | `health` | 任何人（探一次事实源是否可达：只做一次 `SELECT 1`，**缓存不可用只算降级、不算不健康**——缓存不可用时系统按"没有缓存"继续服务，把它算不健康会让编排系统重启一个本来能服务的实例。探测超时由 `HEALTH_PROBE_TIMEOUT_MS` 配，缺省 2000ms；超时按不可用处理。可达回 200，不可达回 503） |
 | POST | `/api/v1/accounts` | `create_account` | 管理员（`ADMIN_TOKEN`） |
 | GET | `/api/v1/accounts/{account_id}` | `read_account_balance` | 管理员（读余额与写入时刻；**读数据库那一行，不读缓存**：缓存可能滞后、也可能来自对账覆盖，用它当答案会把账实不符读成账实相符。账户不存在是 404） |
 | POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
