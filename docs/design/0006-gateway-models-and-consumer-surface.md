@@ -158,7 +158,6 @@
 
 ## 3. 不做
 
-- **渠道/供给启停接口**（提案第 1 条，用户撤回）；
 - **调用记录查询接口**（提案第 4 条后半，用户撤回）；
 - **跨厂商统一图片参数语义**（`ADR-0015`：属后期独立规划）；
 - **通用参数映射引擎**（沿用 `#10` 口径：只做"合同 → 该候选承载面"的校验与装载）；
@@ -174,7 +173,7 @@
 
 ### 已定案（本份直接决定）
 
-- **网关模型启停粒度**：**整个模型一个开关**（`publication.gateway_models.enabled`），不做候选级开关（§2.1/§2.4）；
+- **启停有两个粒度**：整个网关模型一个开关（`publication.gateway_models.enabled`），以及**供给级**（`supply.offerings.enabled` / `supply.channels.enabled`，`PATCH` 只改 `enabled`）。两者都是**运行状态、不进不可变修订**：写入即对之后的受理生效，已受理的 Job 不受影响；
 - **命名层与对客面的边界**：对客面只出现 `gateway_model`，`native_model_id` 不进对客面；合同 `model.const` 的对客投射替换（§1.3/§1.4）；
 - **历史不回填**：已发布的 `runtime_entries.gateway_model` 保持原值（§1.5）。
 
@@ -184,7 +183,7 @@
 - **成本护栏**（服务端成本上限一类的运营护栏）归 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)——本主题只把**客户余额**当受理上限（[`0007`](./0007-pricing-floor-and-settlement.md) §6）；
 - **成本进账本与账实核对**归 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)；
 - **运行期回退**（上游请求已发出之后改道另一条候选）归 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)（[`0008`](./0008-routing-strategy-and-caching.md) §4）；
-- **渠道/供给启停接口**与**调用记录查询接口**按用户口径不做（§3）。
+- **调用记录查询接口**按用户口径不做（§3）。
 
 ### 需要 ADR 的决定
 
