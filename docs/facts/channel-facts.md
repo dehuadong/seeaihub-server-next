@@ -421,7 +421,7 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 1. **任务成功响应含四分项 `usage`**，且 `input_tokens_details` **区分 `text_tokens` 与 `image_tokens`**（另有 `cached_tokens`）；
 2. ⇒ **无需扩展领域类型**：本渠道与 AIHubMix 的响应都能归一成既有 `TokenUsage`（`input_text` / `input_image` / `output_text` / `output_image`）；
 3. ⇒ **金额型计量证据本阶段不需要**（该候选决策经实测被否决并退役，理由见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）；
-4. **计价维度与 AIHubMix 相同**：单价 `$5 / $8 / $10 / $30` per 1M；本次 `cost = 0.00476 USD`，与按公开单价算出的 `0.00595` 差**正好 20%**——2026-09-19 由上游账单面板结清：那是面板自报的 `Group ratio 0.8`（**账号级固定倍率**），不是计量误差，也不作为平台结算依据（详见 §5）。
+4. **计价维度与 AIHubMix 相同**：单价 `$5 / $8 / $10 / $30` per 1M；本次 `cost = 0.00476 USD`：**平台的成本直接取它**，不用公开单价反算（详见 §5）。
 
 **此前记录的文档不一致**（生成页样例有 `usage`、`tasks/status.md` 样例无 `usage`）**已由实测结清**：实际响应**有**四分项 `usage`，粒度比两份文档样例都更细（文档只给聚合三项）。
 
@@ -455,7 +455,7 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 - ~~`usage` 实际是否存在~~ → **实测：存在**（§3.3）✅
 - ~~分项粒度~~ → **实测：四分项，含 `cached_tokens`**（§3.3）✅
-- ~~`cost` / `credits_cost` 与 `usage` 的关系~~ → **已结清**：`cost` 是按**折后**账号价的实际扣费，`credits = cost × 10`；折扣是面板自己写明的 `Group ratio 0.8`（§5）✅
+- ~~`cost` / `credits_cost` 与 `usage` 的关系~~ → **已结清**：`cost` 是这次的实际扣费，`credits = cost × 10`（§5）✅
 - ~~`Idempotency-Key` 是否定义~~ → **机器 Schema 明确声明**（§3.4）✅
 - **异步状态取值集合** —— 本次实测见到的终态为 `completed`；完整集合仍以两份文档的**并集**处理（未知取值继续轮询，不得当失败）。**未逐一实测**，属 ② 层实现时按并集容错即可，不阻塞；
 - **`image_urls` 图生图路径** —— **已受控实测结清**（见 §3.7、留档 §6）；
@@ -547,7 +547,7 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 **结论 2：遮罩是否真的"生效"只有弱信号，未严格证明。** 把两张产物与输入图按**每 8 像素采样**比对：遮罩椭圆**内**的差异像素占 **21%**，**全图**为 **79.9%**——方向对（遮罩内改动明显更少），但生成本身是随机的、请求里**没有 `seed`**，两次产物本来就不同，所以这只说明"遮罩区域改动更少"，**不能证明遮罩被严格遵从**。要严格证明得固定 `seed` 或多轮对照，本次没做。
 
-**与成本口径的一致性**：两次 `cost` 都是 `0.011354`。按公开费率手算 `24×$5 + 1024×$8 + 196×$30` per 1M = **14192 microusd**，乘面板自报的 `Group ratio 0.8` = **11354 microusd**，与上游 `cost` 逐位相同——§5.4 记的"整笔 −20%"在这一笔上再次成立。
+**与成本口径的一致性**：两次 `cost` 都是 `0.011354` —— 平台直接取它。
 
 **边界（未做）**：`sunburst` 的遮罩路径未单独实测（同渠道族、同端点、同参数面）；遮罩尺寸/通道的**边界**（与参考图不等比、非 512×512）未压测。
 
@@ -567,10 +567,10 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 | 渠道 | 成本价从哪来 | 依据 |
 | --- | --- | --- |
-| **APIMart** | **上游直接声明金额**：任务响应里的 `cost`（USD）。面板写明它 = `Base × Group ratio × Channel ratio × Discount ratio`，`credits_cost = cost × 10` | `out-reference/apimart/controlled-probe-2026-09-19.json`、留档 §3/§6、上游账单面板 |
+| **APIMart** | **上游直接声明金额**：任务响应里的 `cost`（USD）。`credits_cost = cost × 10` | `out-reference/apimart/controlled-probe-2026-09-19.json`、留档 §3/§6、上游账单面板 |
 | **AIHubMix** | **上游只给 token，金额要自己按费率算**：按 Tokens 计费，文本输入 **$5** / 文本输出 **$10** / 图像输入 **$8** / 图像输出 **$30**，每 1M tokens ⇒ 成本 = Σ(分项 token × 费率) | `docs/facts/channel-facts.md` §2.4/§2.6（同步 `/v1` 响应只有四分项 token，**没有金额字段**） |
 
-⇒ **不需要用 list 再算一遍 APIMart 的成本**：它自己给了数。`list × 倍率` 只是解释"为什么声明的金额低于公开费率"（本账号 Group ratio 0.8），**不是取数路径**；倍率也可能随账号变化，重算反而引入失真。
+⇒ **不要用公开费率反算 APIMart 的成本**：它自己给了数，直接取 `cost`。用费率反算只会引入失真。
 
 ### 5.2 实测成本（三笔，都是上游口径）
 
@@ -583,36 +583,25 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 **两个渠道的共同点**：都有**四分项 token**（`input_text` / `input_image` / `output_text` / `output_image`），所以平台侧的 `TokenUsage` 归一不变；差别只是"上游给不给金额"，留在各自 ② Driver 里（`0004` R1）。
 
-**`cost` 与公开费率的差额**（面板自报口径）：`Base cost` = Σ(分项 token × 费率)；`Actual cost` = `Base × Group ratio(0.8) × Channel ratio(1) × Discount ratio(1)`；`Credits = Actual × 10`。**平台结算基数**用的是 `price_plan` 里的费率 × 真实分项 token（两个 APIMart 素材现在填的是上游公开费率），**平台对外价未定**。逐笔差价见 §5.4。
-
+**结算基数与成本**：平台的**结算基数**是已发布 `price_plan` 的费率 × 真实分项 token；**APIMart 的成本直接取上游声明的 `cost`**，不用公开费率反算（决策见 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)）。**平台对外价未定**（工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。
 **缓存不参与**：本阶段按 Tokens 计费，**不区分缓存**——不建模缓存档、不为它加字段、也不把它当待办。
 
 ### 5.3 平台侧现在怎么用这些数（以及没有做什么）
 
 - 平台结算用的是**已发布 `price_plan` 的费率 × 真实分项 token**。两个 APIMart 素材的 `price_plan` 现在填的是上游公开费率——它现在的角色是**结算基数**，不是"平台对外定价决定"。
 - **`owned_by` 不携带厂商信息（2026-09-20 登记）**：APIMart 的目录接口响应对**所有**模型都返回 `"owned_by": "custom"`（含 `gemini-*` 等明确非 OpenAI 的模型），因此它**既不能证明也不能否证**某个 `gpt-image-*` 的 Vendor 归属。原始材料见 `out-reference/apimart/catalog-models.json`。⇒ 本仓库 `vendor_id: OpenAI` 是**运营方的显式配置决定**（发布命令里的 `vendor_id` + `native_model_id`，见 `config/bootstrap/*.json` 与工作项 `#2` 的规划范围），不是由渠道字段推导出来的事实。
-- **平台对外价尚未决定**：要不要在基数之上加价、要不要把账号折扣让给消费侧，都是**后期产品决定**（跟踪工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。本阶段**只固化成本价**。
-- 上游声明的 `cost`（APIMart）是**折后账号价**，随账号分组变化；它作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（这也是金额型证据被否决的原因之一，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。**成本口径按渠道取数的决策见 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)**（原 `0016` 已合并进该条）：APIMart 取 `cost`、AIHubMix 按费率自算。
+- **平台对外价尚未决定**：要不要在基数之上加价、要不要在基数之上加价（账号侧差异不进平台口径），都是**后期产品决定**（跟踪工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。本阶段**只固化成本价**。
+- 上游声明的 `cost`（APIMart）作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（这也是金额型证据被否决的原因之一，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。**成本口径按渠道取数的决策见 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)**（原 `0016` 已合并进该条）：APIMart 取 `cost`、AIHubMix 按费率自算。
 
-### 5.4 差价（面板账单 vs 我们的记录）
+### 5.4 逐笔调用与取数
 
-用户提供面板要核对的就是**差价**。逐笔如下（三笔都是同一倍率，**没有其它费用**）：
+三笔真实调用的用量、上游自报金额与平台侧结算基数逐笔留档在 `docs/verification/paid-provider-calls.md`。
 
-| 调用 | token 分项（文本in / 图片in / 图片out） | 面板 `Base cost`（= 平台侧 capture / 结算基数） | 上游实收（= **成本价**） | **差价** | 差价率 |
-| --- | --- | --- | --- | --- | --- |
-| 走我们自己的服务 | 29 / 1024 / 196 | $0.014217（capture 14217 microusd） | $0.011374 | **$0.002843** | 20% |
-| curl 直连 | 33 / 1024 / 196 | $0.014237 | $0.011390 | **$0.002847** | 20% |
-| curl 直连（纯文生图，留档 §3） | 14 / 0 / 196 | $0.005950 | $0.004760 | **$0.001190** | 20% |
+**取数口径**：APIMart 的成本取上游声明的 `cost`；AIHubMix 不给金额字段，成本按已发布费率 × 真实分项 token 自算。**平台侧结算基数**是已发布费率 × 真实分项 token，与上游实收是两个量。
 
-**差价的来源只有一个**：面板自报的 `Group ratio 0.8 × Channel ratio 1 × Discount ratio 1`，即**整笔 −20%**；分项逐项算也对得上（`Base = Σ(token × 费率)`，两次面板的每一行都与按公开费率手算的结果一致）。`credits = USD × 10`。
+**金额不替代计量**：金额随账号变化、不可复现，所以结算必须由分项 token 推出，上游声明的金额只用来核成本。
 
-**平台侧的位置**：capture `14217 microusd` 等于面板 `Base cost`（不是实收）——平台侧结算基数用的是公开费率，与上游实收之间就是这 20%。
-
-**AIHubMix 侧目前无法核对差价**：上游不返回任何金额字段，也无从知道它是否给账号折扣（§2.4）。要结清得看它的控制台/账单，不在这几次调用的实测范围内。
-
-**金额型计量证据因此被否决**：平台的**计量事实**是四分项 token；金额随账号倍率变化、不可复现，所以结算必须由分项 token 推出，上游声明的金额只用来核成本（本阶段要的正是它）。留档 §6 那次真实端到端是这条的实证。
-
-**来源**：用户 2026-09-19 在会话中提供的两张上游控制台"详情"面板截图（含 `task_id` 与 API 密钥标签，故**截图本身不入库**；本表只转录与结算有关的数字与倍率）。
+**来源**：用户 2026-09-19 在会话中提供的两张上游控制台详情面板截图（含 `task_id` 与密钥标签，故截图本身不入库）。
 
 ---
 

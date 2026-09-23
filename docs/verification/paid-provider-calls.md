@@ -39,7 +39,7 @@
 | 请求参数 | `model=gpt-image-2.5-flare`、`n=1`、`size=1:1`、`resolution=1k`、`quality=low` |
 | 结果 | 提交 HTTP 200（`status: submitted`）；10 秒后终态 `completed`，`actual_time=7` |
 | 计量 | **四分项 `usage`**：输入文本 14 / 输入图片 0 / 输出图片 196 / total 210（另含 `cached_tokens`） |
-| 计费 / 成本 | 上游自报 **`cost = 0.00476 USD`**（这就是本笔成本价）、`credits_cost = 0.0476`；公开费率算得 `0.00595`，差额是上游面板自报的 `Group ratio 0.8`（§5.4） |
+| 计费 / 成本 | 上游自报 **`cost = 0.00476 USD`**（这就是本笔成本价）、`credits_cost = 0.0476`；平台直接取它作为成本，不用公开费率反算（§5.4） |
 | 未做 | 未下载结果图（URL 已脱敏）；未测 `sunburst`；未测 `image_urls` 图生图 |
 | 原始记录 | `out-reference/apimart/controlled-probe-2026-09-19.json` |
 
@@ -89,9 +89,9 @@
 | **走我们自己服务的端到端** | 发布真实素材 → 平台接口上传两张图 → 受理 Job（`/image_urls/0` + `/mask_url`）→ 真实 Worker 执行 → **`succeeded`** |
 | 端到端计量 | Evidence 记 `input_text=29 / input_image=1024 / output_image=196`（与上游 `usage` 逐项一致） |
 | **成本价** | 上游自报 **`cost`**：直连那次 `$0.011390`、走自家服务那次 `$0.011374`（面板的 `Actual cost`，逐笔见 §5.4） |
-| 平台侧结算与成本的关系 | capture `14217 microusd` = 面板 `Base cost`（= 公开费率 × 分项 token）；成本价 = 它 × 账号倍率 0.8。差额来自账号倍率，**不是**计量误差（§5.4） |
+| 平台侧结算与成本的关系 | capture `14217 microusd` 是平台侧的结算基数；**成本价取上游自报的 `cost`**（§5.4） |
 | 端到端结果 | 结果图归档到自有对象存储：`image/png`、**1,486,934 bytes、1024×1024**；`provider_trace_id` 已落库（真实 task id） |
-| 面板核对（**已结清**） | 面板写明 `Base cost = Σ(token × 费率)`、`Actual = Base × Group ratio 0.8`，两次与 `cost` 逐位一致（§5.4） |
+| 面板核对（**已结清**） | 上游自报的 `cost` 两次逐位一致（§5.4） |
 | 敏感信息 | **未保存**真实图片 URL 与 task id；上表只记存在性、主机名与长度级信息。原始响应只留在本机临时目录，不入仓库。用户后来提供的上游账单面板含 task id 与密钥标签，**截图同样不入库**，只把结算数字转录进 §5.4 |
 | 未做 | 未下载上游结果图（结果图是我们自己服务完成取图后归档的）；未测 `sunburst`；未测 base64；未压测 20MB/16 张/256MB 边界 |
 
@@ -134,7 +134,7 @@
 | 计费调用次数 | **2 次生成**（同一请求**带** / **不带** `mask_url`） |
 | 请求参数 | `model=gpt-image-2.5-flare`、`image_urls=[<上传后的 URL>]`（带遮罩那次另加 `mask_url=<上传后的 URL>`）、`n=1`、`size=1:1`、`resolution=1k`、`quality=low` |
 | 结果 | 两次都提交 **HTTP 200**（`status: submitted`）→ 轮询到 **`completed`** |
-| 计量与成本 | 两次**完全相同**：`input_tokens=1048`（`image_tokens=1024`、`text_tokens=24`）、`output_tokens=196`、`total=1244`；上游自报 **`cost = 0.011354 USD`**（两次同值）。交叉核对：按公开费率算 14192 microusd × 面板 `Group ratio 0.8` = **11354**，与上游 `cost` 逐位一致 |
+| 计量与成本 | 两次**完全相同**：`input_tokens=1048`（`image_tokens=1024`、`text_tokens=24`）、`output_tokens=196`、`total=1244`；上游自报 **`cost = 0.011354 USD`**（两次同值）。上游自报 `cost = 11354 microusd`：**成本直接取它** |
 | 结清 | ① **2.5 接受 `mask_url`**（该字段不在 2.5 文档里，属"文档没写≠不支持"）；② **遮罩不额外计费**（两次 `usage` 与 `cost` 相同） |
 | **未证** | 遮罩是否**真的生效**只有弱信号：每 8 像素采样对比两张结果图，**遮罩椭圆内差异 21%、全图 79.9%**——方向与"透明区＝编辑区"的语义一致，但生成是随机的（无 seed），**不能据此断言遮罩生效** |
 | 样本 | 本机 `.data/probe-2026-09-20/apimart-25-mask-result.png`、`apimart-25-nomask-result.png`（gitignore，**不入库**）；渠道事实见 §3.11 |
