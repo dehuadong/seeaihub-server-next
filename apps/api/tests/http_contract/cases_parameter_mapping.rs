@@ -963,7 +963,6 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
         contract.clone(),
         vec![
             ("aihubmix-image-v1", carrier.clone(), mapped.clone()),
-            // 两条候选必须来自**两个渠道**：供给身份是"模型 + 渠道"唯一，同渠道两条会塌成一条。
             ("apimart-image-v1", carrier.clone(), json!({})),
         ],
     )
@@ -1216,7 +1215,6 @@ async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_paramete
 ///   字段的有无制造差异），于是它因**分支限制**不合格（判定记录写明原因）、改道 APIMart；合同
 ///   字段叫 `image`，APIMart 线上叫 `image_urls`，靠改名落到渠道字段名上（报文里不许出现
 ///   `image`），内联图先经上传接口换成公网 URL；
-/// - 带参考图 + 遮罩：同样因分支限制落到 APIMart，`image_urls` 与 `mask_url` 两个渠道名都得上线。
 ///
 /// 两家渠道各起一个进程内假上游：线上形状不同（一家同步回图、一家任务式），所以"报文里到底是
 /// 哪个字段名"只能按真正收到请求的那一方来判。全程零外部调用。
@@ -1632,7 +1630,6 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "内联参考图必须先上传换成公网 URL"
     );
 
-    // ── 用例 4：带参考图 + 遮罩 → 遮罩分支同样被收窄掉，两个渠道字段名都上线 ──
     let key = format!("contract-masked-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &base_url,

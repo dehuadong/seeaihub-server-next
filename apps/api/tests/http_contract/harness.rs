@@ -1547,6 +1547,8 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
     })
 }
 
+/// 一次发布里的两条候选必须来自**两个渠道**：供给身份是"模型 + 渠道"唯一，同一渠道发两条会
+/// 塌成一条（第二条要么被复用、要么被发布期拒）。要两条候选就换一个入口（地址或凭证身份不同）。
 /// 发布一组候选。`contract` 给 `Some` 时用它当**模型级合同**（新形状素材顶层那一份）；
 /// 给 `None` 时沿用旧形状：候选自己那份 `capability_schema` 既是承载面也是合同。
 async fn publish_candidates(

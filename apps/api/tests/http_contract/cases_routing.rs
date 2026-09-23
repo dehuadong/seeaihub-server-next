@@ -408,7 +408,6 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     );
     narrow_first["routing_priority"] = json!(0);
     narrow_first["restrictions"] = json!({"allowed_branches": ["prompt_only"], "max_images": 0});
-    // 两条候选必须来自**两个渠道**：供给身份是"模型 + 渠道"唯一，同一渠道发两条会塌成一条。
     // 第二条因此换渠道；它按新形状只补一份映射——承载面声明的仍是**渠道原生字段名**
     // （adapter 能在线上写出的名字），平台字段名到原生名的重命名交给 `parameter_mapping`。
     let mut narrow_second = candidate(
@@ -423,7 +422,6 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     narrow_second["restrictions"] = json!({"allowed_branches": ["prompt_only"], "max_images": 0});
     // 直接发布并把错误体带进断言：只比状态码会看不出被拒的真实原因。
     // 顶层合同用**平台对客字段名**那一份（AIHubMix 候选的 `capability_schema`）：合同一个
-    // vendor model 只有一份，各供给只带自己的承载面映射——两条候选分走两个渠道后正需要这样。
     let publication = publication_body(
         model,
         "route-test-1",
@@ -490,7 +488,6 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     // 与用例 4 的区别：这里只让**一条**候选不合格，另一条合格。若不合格的候选也参与分摊，
     // 权重 1000 会让它拿到几乎全部分流；断言"每次都落在合格那条"就是这条硬约束的证据。
     let model = "weight-model-d";
-    // 两条候选同样必须来自**两个渠道**（供给身份是"模型 + 渠道"唯一）。让**不合格**的那条
     // 换渠道：合格那条保持 AIHubMix，请求才会打到本用例已经起好的假上游。
     let mut heavy_but_ineligible = candidate(
         "APIMart",
