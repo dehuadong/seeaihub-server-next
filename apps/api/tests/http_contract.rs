@@ -94,6 +94,10 @@ struct UpstreamBehaviour {
     /// 任务终态里声明的成本：`None` 表示响应里**根本没有这个字段**（渠道没给），
     /// 负数与非数字则覆盖"声明了却拿不到"的形态。取值是实测样例。
     declared_cost: Option<Value>,
+    /// 终态里**没有结果图**（`result.images` 是空数组），但金额照给。
+    ///
+    /// 这是"上游明明给了金额、这次却没出图"的形态：用来观察那笔成本会不会丢。
+    terminal_without_images: bool,
 }
 
 impl UpstreamBehaviour {
@@ -107,6 +111,7 @@ impl UpstreamBehaviour {
             submit: SubmitBehaviour::Accepted,
             sync_image: SyncImageShape::Url,
             declared_cost: Some(json!(0.011354)),
+            terminal_without_images: false,
         }
     }
 
@@ -291,13 +296,21 @@ async fn serve_fake_upstream(
         } else {
             "completed"
         };
+        let images = if behaviour.terminal_without_images {
+            json!([])
+        } else {
+            json!([{
+                "url": [format!("http://127.0.0.1:{port}/result.png")],
+                "expires_at": 4_000_000_000u64
+            }])
+        };
         let mut task = json!({
             "code": 200,
             "data": {
                 "id": "task-contract-1",
                 "status": status,
                 "progress": 100,
-                "result": {"images": [{"url": [format!("http://127.0.0.1:{port}/result.png")], "expires_at": 4_000_000_000u64}]},
+                "result": {"images": images},
                 "usage": {
                     "input_tokens": 14,
                     "input_tokens_details": {"cached_tokens": 0, "image_tokens": 0, "text_tokens": 14},
@@ -1595,6 +1608,49 @@ async fn a_declared_cost_that_never_arrives_is_recorded_as_a_gap_not_guessed() {
     assert_eq!(gaps, 1);
     // 对客实收不受成本缺口影响。
     assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+    harness.cleanup().await;
+}
+
+/// 上游终态**给了金额、却没有任何结果图**：那笔成本今天既不在账上、也不在缺口清单里。
+///
+/// 这是"失败分支不采集成本"的形态：金额在终态里已经解析到手，但失败分支把它丢掉了，而来源留
+/// NULL（不是 `unavailable`）又不满足缺口清单的判据——两头都看不见。这条用例就是钉住它。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_terminal_without_images_loses_the_cost_it_already_declared() {
+    let mut behaviour = UpstreamBehaviour::apimart();
+    behaviour.terminal_without_images = true;
+    let harness = Harness::start(behaviour).await;
+    let key = format!("cost-empty-result-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "terminal without images"),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "没有结果图的那次执行是失败的：{body}");
+
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_ne!(state, "succeeded", "没有结果图不该算成功");
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(amount, None, "上游明明给了金额，却四项全空");
+    assert_eq!(currency, None);
+    assert_eq!(source, None);
+    assert_eq!(cny, None);
+    // 来源是 NULL 而不是 `unavailable`：连缺口清单都筛不出它。
+    let visible: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.attempts \
+         WHERE job_id = $1 AND provider_cost_source IS NOT NULL",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("gap query");
+    assert_eq!(
+        visible, 0,
+        "来源留 NULL ⇒ 这笔也不进成本缺口清单，账上与缺口两头都看不见"
+    );
     harness.cleanup().await;
 }
 
