@@ -8,15 +8,15 @@ pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
     AccountId, AttemptId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FloorTable, FxRate,
     GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, MeteringEvidence,
-    OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, ProviderCostFact,
-    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
-    RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps, apply_parameter_defaults,
-    apply_parameter_renames, apply_size_mapping, carries_parameter, contract_image_parameter_kind,
-    contract_model_identity, declared_defaults, declared_enum_maps, declared_field_names,
-    declared_parameter_names, declared_reference_image_limit, declared_renames,
-    declared_size_mapping, declares_mask_parameter, declares_parameter,
+    OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula,
+    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
+    RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps,
+    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
+    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
+    declared_field_names, declared_parameter_names, declared_reference_image_limit,
+    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
     declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
-    place_image_inputs, platform_image_parameters, resolve_size_tier,
+    place_image_inputs, platform_image_parameters, resolve_size_tier, unit_amount_microusd,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -27,17 +27,16 @@ use uuid::Uuid;
 
 /// 发布一个 Vendor Model 的供给。
 ///
-/// 一次发布携带该模型**完整、有序**的候选集合；
+/// 一次发布携带该模型**完整、有序**的候选集合（`offerings`，必填且非空）；
 /// 候选的 `routing_priority` **缺省取数组下标**（`0..n-1`）——"顺序即优先级"的常规来源；
 /// 显式给值时可以让**多条候选落在同一档**，档内再按 `weight` 分摊。
 ///
 /// 合同是**模型级唯一一份**（[`Self::capability_schema`]）；每个候选各自声明它**能承载**的
 /// 字段面（[`OfferingDraft::carrier_schema`]）。
 ///
-/// 形状判别（确定性三例，见 `normalize`）：
-/// - `offerings` 为 `Some(非空)` ⇒ **数组形式**；扁平字段必须全部为空；
-/// - `offerings` 为 `None` ⇒ **扁平形式**；扁平字段必须全部齐备，等价于一元素数组；
-/// - `offerings` 为 `Some(空)` ⇒ 拒绝。
+/// 发布命令只有"候选数组"这一种形状：每条供给自带渠道、承载面与计价，同一个网关模型的
+/// 不同候选因此能有不同的价。`offerings` 用 `Option` 收口，是为了让缺省与 `null` 落到同一条
+/// 校验错误上（空数组另有一条），不是允许省略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishRuntimeCommand {
     pub vendor_id: String,
@@ -50,36 +49,17 @@ pub struct PublishRuntimeCommand {
     pub native_revision: String,
     /// **Vendor Model Contract**：调用方合同的唯一一份，模型级。
     ///
-    /// 数组形式下可以省略：那时回退用候选自带的旧字段（过渡期里承载面与合同还是同一份），
+    /// 顶层可以省略：省略时回退用候选自带的旧字段（承载面与合同还是同一份），
     /// 但要求它们彼此完全一致——合同只有一份，同一个模型落成两份合同正是要收掉的分叉。
-    /// 扁平形式下必填。
     #[serde(default)]
     pub capability_schema: Option<Value>,
-    #[serde(default = "empty_object")]
-    pub restrictions: Value,
-    /// 扁平形式的单个供给。数组形式下必须为 `None`。
-    #[serde(default)]
-    pub provider_kind: Option<String>,
-    #[serde(default)]
-    pub adapter_key: Option<String>,
-    #[serde(default)]
-    pub provider_model_id: Option<String>,
-    #[serde(default)]
-    pub base_url: Option<String>,
-    #[serde(default)]
-    pub credential_env: Option<String>,
-    /// 扁平形式的单个供给**能承载**的字段面；缺省时与扁平形式的合同同值。
-    #[serde(default)]
-    pub carrier_schema: Option<Value>,
-    /// 扁平形式的合同值 → 渠道包装声明。数组形式下必须为 `None`。
-    #[serde(default = "empty_object")]
-    pub parameter_mapping: Value,
-    /// 数组形式的多个供给；候选的档位缺省取它在数组里的下标，也可以自己声明。
+    /// 本次发布的**完整、有序**候选集合：必填且非空。
+    ///
+    /// 每条候选自带渠道、承载面与计价；候选的档位缺省取它在数组里的下标，也可以自己声明
+    /// （同档多候选时按 `weight` 分摊）。缺省、`null` 与空数组都拒绝——发布的内容就是这份
+    /// 候选集合，没有它就没有可发布的东西。
     #[serde(default)]
     pub offerings: Option<Vec<OfferingDraft>>,
-    /// 扁平形式的计价。数组形式下必须为 `None`。
-    #[serde(default)]
-    pub price_plan: Option<PricePlanDraft>,
     /// **加价系数**（基点，避免浮点）：**每个网关模型一个**，随修订发布、随 Job 快照冻结。
     ///
     /// 它不放在可变的开关表里：定价是修订的内容——放进可变表就等于"改价不用发布"，而
@@ -95,8 +75,8 @@ pub struct PublishRuntimeCommand {
 /// 发布请求的**已校验**形态：由 [`PublishRuntimeCommand::into_request`] 产出
 /// （在逐候选校验之后），是仓库端口 `publish_runtime` 接收的唯一形态。
 ///
-/// 为什么与 [`PublishRuntimeCommand`] 分开：命令是"线上格式"，允许两种线格式与
-/// 各自的必填规则；请求是"已经检查过、可以落库的东西"。分开之后，数据库那层的入口
+/// 为什么与 [`PublishRuntimeCommand`] 分开：命令是"线上格式"，自带必填规则；
+/// 请求是"已经检查过、可以落库的东西"。分开之后，数据库那层的入口
 /// **在类型上**就只接受已核验的数据——绕开 `RuntimeService::publish` 直接调端口不再可能。
 #[derive(Debug, Clone)]
 pub struct PublishRuntimeRequest {
@@ -145,17 +125,36 @@ pub struct OfferingDraft {
     /// 承载面的**旧名字**（过渡期）：只在没有 `carrier_schema` 时顶替它。
     #[serde(default)]
     pub capability_schema: Option<Value>,
+    /// 这条供给的**计价形态**（渠道事实）：这个渠道的这个模型按什么计价，决定成本怎么算。
+    ///
+    /// 取值受控（`token_rates` / `per_image` / `per_call` / `upstream_declared`），必填：说不清
+    /// 一条供给按什么计价，它的成本就没有算法。**它不是平台的定价选择**——对客卖多少钱走
+    /// [`Self::consumer_rates_cny`]，与这里无关。
+    #[serde(default)]
+    pub formula: Option<String>,
+    /// **该渠道按 token 计量量计价时的那份四档费率**（`formula = token_rates` 的参数）。
+    ///
+    /// 渠道不按 token 计量量计价时**不必发它**——那时这条供给没有 Price Plan。
     #[serde(default)]
     pub price_plan: Option<PricePlanDraft>,
+    /// `per_image` / `per_call` 的**单价**（成本平面微单位，币种见 [`Self::cost_currency`]）。
+    ///
+    /// 按张 / 按次计价时它是成本自算唯一的参数；另外两种形态不给（给了会被拒：那个数永远不会
+    /// 被读，留着只会让人以为它在生效）。
+    #[serde(default)]
+    pub cost_unit_price_microusd: Option<u64>,
+    /// 这条供给**声明的成本币种**（渠道自己的钱是什么币）。
+    ///
+    /// 缺省取它的 Price Plan 币种；没有 Price Plan 时必须显式声明——成本要折算成人民币算毛利，
+    /// 单价与上游声明的金额也都要说清是哪个币种的钱。
+    #[serde(default)]
+    pub cost_currency: Option<String>,
     /// 该候选的渠道成本（**原币种**微单位）：**只作定价参考，不是售价的被乘数**。
     ///
     /// 发布者给每个候选取一个可核的值：`computed` 按该渠道四档费率 × 参考用量、`declared`
     /// 取上游声明过的金额。
     #[serde(default)]
     pub reference_cost_microusd: Option<u64>,
-    /// 该候选的成本币种；缺省取该候选计价声明的币种（给了就必须与它一致）。
-    #[serde(default)]
-    pub cost_currency: Option<String>,
     /// 该候选的**对客四档 CNY 费率向量**：售价依据（实收按它算）。
     #[serde(default)]
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
@@ -170,19 +169,19 @@ pub struct OfferingDraft {
     pub floor_amounts: Option<Value>,
 }
 
-/// 一条候选**已校验**的定价（随修订发布、受理时随 Job 快照冻结）。
+/// 一条候选**已校验**的定价参考与保底（随修订发布、受理时随 Job 快照冻结）。
 ///
-/// 为什么打包成一个整体、而不是散成几个可空字段：定价按候选**全有或全无**——只给对客费率
-/// 而没给参考成本与保底表，发布出来的候选就是"有售价、说不清成本、也算不出预授权"的半成品。
-/// 打包之后"这条候选不带定价"与"定价不完整"在类型上就分得开：前者是 `None`，后者发布期就拒。
+/// 为什么打包成一个整体、而不是散成几个可空字段：这几样按候选**全有或全无**——只给参考成本而
+/// 没给成本来源与保底表，发布出来的候选就是"说不清成本怎么记、也算不出预授权"的半成品。
+/// 打包之后"这条候选不带这些"与"带了一半"在类型上就分得开：前者是 `None`，后者发布期就拒。
+///
+/// **对客费率向量不在这一组里**：它是每条可被路由的供给都必须给出的**对客计费基准**
+/// （见 [`normalize_consumer_basis`]），与参考成本、保底表各有各的用途。成本币种也不在这里：
+/// 它是这条供给声明的渠道事实（[`OfferingDraft::cost_currency`]）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidatePricing {
     /// 该候选的渠道成本（**原币种**微单位）：只作定价参考，不是售价的被乘数。
     pub reference_cost_microusd: u64,
-    /// 该候选的成本币种（与它的计价声明同值）。
-    pub cost_currency: String,
-    /// 该候选的对客四档 CNY 费率向量。
-    pub consumer_rates_cny: ConsumerRatesCny,
     /// 该候选的成本来源口径（两态）。
     pub cost_basis: CostBasis,
     /// 档位价目表（CNY，展示用）。
@@ -191,13 +190,13 @@ pub struct CandidatePricing {
     pub floor_amounts: Value,
 }
 
-/// 计价合同草案。
+/// Price Plan 草案：**该渠道按 token 计量量计价时的那份四档费率**。
 ///
-/// `formula` 只在**发布期**用于判别与校验，**不落库**——`pricing.price_plans` 没有该列
-/// 本阶段唯一启用 `token_rates`。
+/// 它是 `token_rates` 这一种计价形态的参数，不是每条供给的必填——渠道按张 / 按次计价、或直接
+/// 由上游给实扣金额时，这条供给没有 Price Plan。四档费率的币种就是该渠道成本币种。
 #[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct PricePlanDraft {
-    pub formula: String,
     pub currency: String,
     pub text_input_microusd_per_million: u64,
     pub image_input_microusd_per_million: u64,
@@ -219,7 +218,7 @@ impl PricePlanDraft {
     }
 }
 
-/// 归一后的单个供给：形状判别与必填校验都已完成，`routing_priority` 与 `weight` 已定好。
+/// 归一后的单个供给：必填校验已完成，`routing_priority` 与 `weight` 已定好。
 #[derive(Debug, Clone)]
 pub struct NormalizedOffering {
     /// 这条供给**能承载**合同里的哪些字段。
@@ -232,14 +231,37 @@ pub struct NormalizedOffering {
     pub provider_model_id: String,
     pub base_url: String,
     pub credential_env: String,
-    pub rates: PriceRates,
-    pub price_source_url: String,
+    /// 这条供给的**计价形态**（渠道事实，决定成本怎么算）。
+    pub formula: PricingFormula,
+    /// Price Plan（`token_rates` 的费率参数）；渠道不按 token 计量量计价时为 `None`。
+    pub rates: Option<PriceRates>,
+    /// Price Plan 的来源 URL（渠道价目的出处）；没有 Price Plan 时为 `None`。
+    pub price_source_url: Option<String>,
+    /// `per_image` / `per_call` 的单价；另外两种形态为 `None`。
+    pub cost_unit_price_microusd: Option<u64>,
+    /// 这条供给声明的成本币种；`None` = 没显式声明（取 Price Plan 的币种，旧形状的素材）。
+    pub cost_currency: Option<String>,
+    /// 这条供给的**对客费率向量**（实收依据）；`None` = 没给（旧口径按 Price Plan 的费率收）。
+    pub consumer_rates_cny: Option<ConsumerRatesCny>,
     /// 档位：显式给值就用它，没给就取数组下标。同一档可以有多条候选。
     pub routing_priority: i32,
     /// 档位内的分流比，至少为 1。
     pub weight: u32,
     /// 这条候选的定价；`None` = 它不带定价（旧形状的素材、或只发布了成本费率）。
     pub pricing: Option<CandidatePricing>,
+}
+
+impl NormalizedOffering {
+    /// 这条供给的**成本币种**：显式声明优先，缺省取它的 Price Plan 币种。
+    ///
+    /// 两样都没有 = 这条供给没说清它的钱是什么币种（发布期已拒），所以读侧拿到的要么是一个
+    /// 答案、要么是旧形状的 `None`。
+    #[must_use]
+    pub fn cost_currency(&self) -> Option<&str> {
+        self.cost_currency
+            .as_deref()
+            .or_else(|| self.rates.as_ref().map(|rates| rates.currency.as_str()))
+    }
 }
 
 /// 归一后的整份发布：**一份模型级合同** + 有序候选集。
@@ -276,18 +298,21 @@ impl PublishRuntimeCommand {
         }
     }
 
-    /// 把两种形状归一到"一份合同 + 一个有序候选列表"。
+    /// 把命令归一成"一份合同 + 一个有序候选列表"。
     ///
-    /// 这是发布接口**唯一**的形状判别点：`apps/api` 的 `Json<PublishRuntimeCommand>` 反序列化
+    /// 这是发布接口唯一的入口校验点：`apps/api` 的 `Json<PublishRuntimeCommand>` 反序列化
     /// 之后，下游只处理 [`NormalizedPublication`]。
     pub fn normalize(&self) -> Result<NormalizedPublication, ApplicationError> {
-        let offerings = match &self.offerings {
-            Some(drafts) => self.normalize_array(drafts)?,
-            None => self.normalize_flat()?,
-        };
+        let drafts = self.offerings.as_deref().ok_or_else(|| {
+            ApplicationError::Validation(
+                "offerings is required: publish the model's complete, ordered offering list"
+                    .to_owned(),
+            )
+        })?;
+        let offerings = self.normalize_array(drafts)?;
         self.validate_markup(&offerings)?;
         Ok(NormalizedPublication {
-            contract: self.resolve_contract()?,
+            contract: self.resolve_contract(drafts)?,
             offerings,
         })
     }
@@ -295,12 +320,14 @@ impl PublishRuntimeCommand {
     /// 加价系数**可以缺省**，但不可为负，且不能是一条没人读的记录。
     ///
     /// 它只是**定价时的参考口径**：管理员按"成本费率 ×(1 + 加价系数)× 汇率"推导对客费率向量，
-    /// 也可以直接录入那份向量——直接录入时加价系数一次都不参与计算，所以"带定价就必须给加价
+    /// 也可以直接录入那份向量——直接录入时加价系数一次都不参与计算，所以"带对客费率就必须给加价
     /// 系数"会把一条正当的录入挡在门外。要拒的是两件明显自相矛盾的事：负加价等于平台倒贴，
     /// 不是定价（库层也有同一条约束，这里先拒是为了给出说得清的错误）；给了加价系数却没有任何
-    /// 候选带定价，那它没有任何东西可以解释。
+    /// 候选带**对客费率向量或定价参考**，那它没有任何东西可以解释。
     fn validate_markup(&self, offerings: &[NormalizedOffering]) -> Result<(), ApplicationError> {
-        let priced = offerings.iter().any(|offering| offering.pricing.is_some());
+        let priced = offerings
+            .iter()
+            .any(|offering| offering.consumer_rates_cny.is_some() || offering.pricing.is_some());
         match self.markup_bps {
             Some(bps) if bps < 0 => Err(ApplicationError::Validation(
                 "markup_bps must not be negative".to_owned(),
@@ -314,21 +341,15 @@ impl PublishRuntimeCommand {
 
     /// 解析本次发布的**唯一一份合同**。
     ///
-    /// 顶层给了就用顶层；顶层没给才回退到候选自带的旧字段——过渡期里老素材（承载面与合同
-    /// 还是同一份）因此照常可发布。回退时要求所有候选的旧字段**完全一致**：合同是模型级的
+    /// 顶层给了就用顶层；顶层没给才回退到候选自带的旧字段——承载面与合同还是同一份的候选
+    /// 因此照常可发布。回退时要求所有候选的旧字段**完全一致**：合同是模型级的
     /// 唯一一份，两份不同的内容不能同时成为同一个模型的合同，否则"客户端按合同提交"就没了依据。
-    fn resolve_contract(&self) -> Result<Value, ApplicationError> {
+    fn resolve_contract(&self, drafts: &[OfferingDraft]) -> Result<Value, ApplicationError> {
         if let Some(contract) = &self.capability_schema {
             return Ok(contract.clone());
         }
         let mut resolved: Option<Value> = None;
-        for (index, draft) in self
-            .offerings
-            .as_deref()
-            .unwrap_or_default()
-            .iter()
-            .enumerate()
-        {
+        for (index, draft) in drafts.iter().enumerate() {
             let Some(legacy) = &draft.capability_schema else {
                 return Err(ApplicationError::Validation(format!(
                     "capability_schema is required: declare the vendor model contract at the top level, \
@@ -351,6 +372,7 @@ impl PublishRuntimeCommand {
             .ok_or_else(|| ApplicationError::Validation("capability_schema is required".to_owned()))
     }
 
+    /// 逐候选归一：承载面、计价形态与参数、档位与档内权重。
     fn normalize_array(
         &self,
         drafts: &[OfferingDraft],
@@ -358,22 +380,6 @@ impl PublishRuntimeCommand {
         if drafts.is_empty() {
             return Err(ApplicationError::Validation(
                 "offerings must not be empty".to_owned(),
-            ));
-        }
-        if let Some(field) = self.first_present_flat_field() {
-            return Err(ApplicationError::Validation(format!(
-                "offerings is present, so the flat field {field} must be omitted"
-            )));
-        }
-        if self.flat_restrictions_present() {
-            return Err(ApplicationError::Validation(
-                "offerings is present, so the flat field restrictions must be omitted".to_owned(),
-            ));
-        }
-        if self.flat_parameter_mapping_present() {
-            return Err(ApplicationError::Validation(
-                "offerings is present, so the flat field parameter_mapping must be omitted"
-                    .to_owned(),
             ));
         }
         drafts
@@ -391,19 +397,8 @@ impl PublishRuntimeCommand {
                             "offerings[{index}].carrier_schema is required"
                         ))
                     })?;
-                let price_plan = draft.price_plan.clone().ok_or_else(|| {
-                    ApplicationError::Validation(format!(
-                        "offerings[{index}].price_plan is required"
-                    ))
-                })?;
-                validate_price_formula(&price_plan).map_err(|message| {
-                    ApplicationError::Validation(format!(
-                        "offerings[{index}].price_plan: {message}"
-                    ))
-                })?;
-                let price_source_url = price_plan.source_url.clone();
-                let rates = price_plan.into_rates();
-                let pricing = normalize_candidate_pricing(index, draft, &rates.currency)?;
+                let billing = normalize_billing(index, draft)?;
+                let pricing = normalize_candidate_pricing(index, draft)?;
                 Ok(NormalizedOffering {
                     carrier_schema,
                     parameter_mapping: draft.parameter_mapping.clone(),
@@ -413,116 +408,18 @@ impl PublishRuntimeCommand {
                     provider_model_id: draft.provider_model_id.clone(),
                     base_url: draft.base_url.clone(),
                     credential_env: draft.credential_env.clone(),
-                    price_source_url,
-                    rates,
+                    formula: billing.formula,
+                    rates: billing.rates,
+                    price_source_url: billing.price_source_url,
+                    cost_unit_price_microusd: billing.cost_unit_price_microusd,
+                    cost_currency: billing.cost_currency,
+                    consumer_rates_cny: billing.consumer_rates_cny,
                     routing_priority: normalize_routing_priority(index, draft)?,
                     weight: normalize_weight(index, draft)?,
                     pricing,
                 })
             })
             .collect()
-    }
-
-    fn normalize_flat(&self) -> Result<Vec<NormalizedOffering>, ApplicationError> {
-        let missing = |field: &str| {
-            ApplicationError::Validation(format!("{field} is required when offerings is absent"))
-        };
-        // 同一份字段清单驱动这里：任何一个缺失都拒绝（与数组形式的"必须全部为空"对称）。
-        for (field, value) in self.flat_fields() {
-            if value.is_none() {
-                return Err(missing(field));
-            }
-        }
-        let capability_schema = self
-            .capability_schema
-            .clone()
-            .ok_or_else(|| missing("capability_schema"))?;
-        let price_plan = self
-            .price_plan
-            .clone()
-            .ok_or_else(|| missing("price_plan"))?;
-        validate_price_formula(&price_plan)
-            .map_err(|message| ApplicationError::Validation(format!("price_plan: {message}")))?;
-        Ok(vec![NormalizedOffering {
-            // 扁平形式只有一个候选：承载面缺省时与合同同值，等价于"这份供给承载合同的全部字段"。
-            carrier_schema: self
-                .carrier_schema
-                .clone()
-                .unwrap_or_else(|| capability_schema.clone()),
-            parameter_mapping: self.parameter_mapping.clone(),
-            restrictions: self.restrictions.clone(),
-            provider_kind: self
-                .provider_kind
-                .clone()
-                .ok_or_else(|| missing("provider_kind"))?,
-            adapter_key: self
-                .adapter_key
-                .clone()
-                .ok_or_else(|| missing("adapter_key"))?,
-            provider_model_id: self
-                .provider_model_id
-                .clone()
-                .ok_or_else(|| missing("provider_model_id"))?,
-            base_url: self.base_url.clone().ok_or_else(|| missing("base_url"))?,
-            credential_env: self
-                .credential_env
-                .clone()
-                .ok_or_else(|| missing("credential_env"))?,
-            price_source_url: price_plan.source_url.clone(),
-            rates: price_plan.into_rates(),
-            routing_priority: 0,
-            // 扁平形式只有一个候选：档内分流对它没有意义，权重取默认值 1。
-            weight: 1,
-            // 扁平形式是**过渡期的老形状**（老素材、老测试），不带定价：定价按候选给，只有
-            // 数组形式能表达"同一个网关模型的不同候选价格不同"这件事。它的发布仍走旧口径
-            // （对客扣费按已发布费率、预授权回落平台兜底数），与今天逐位相同。
-            pricing: None,
-        }])
-    }
-
-    /// 扁平形式必填的字段清单——**唯一一份**。
-    ///
-    /// 它同时驱动两件事：数组形式下的"必须全部为空"检查，与扁平形式下的"必须齐备"检查。
-    /// 只留一处枚举的理由：分成两份时，漏改一处就会产生"检查了一半"——
-    /// 程序不报错，但校验已经不完整。
-    fn flat_fields(&self) -> [(&'static str, Option<&str>); 5] {
-        [
-            ("provider_kind", self.provider_kind.as_deref()),
-            ("adapter_key", self.adapter_key.as_deref()),
-            ("provider_model_id", self.provider_model_id.as_deref()),
-            ("base_url", self.base_url.as_deref()),
-            ("credential_env", self.credential_env.as_deref()),
-        ]
-    }
-
-    /// 数组形式下**必须全部为空**的扁平字段。
-    ///
-    /// 除上表外还含 `carrier_schema` 与 `price_plan`：它们是"单个供给"的东西，数组形式里
-    /// 每个候选自带。**顶层 `capability_schema` 不在此列**——它是模型级合同，数组形式下同样
-    /// 允许（也推荐）写在顶层。
-    /// `restrictions` 与 `parameter_mapping` 只在**非空**时才算"被给出"：它们带
-    /// `#[serde(default)]`，缺省即空对象，无法与显式写 `{}` 区分——而空值不携带信息，
-    /// 忽略它没有风险。
-    fn first_present_flat_field(&self) -> Option<&'static str> {
-        self.flat_fields()
-            .into_iter()
-            .find_map(|(name, value)| value.is_some().then_some(name))
-            .or_else(|| self.carrier_schema.is_some().then_some("carrier_schema"))
-            .or_else(|| self.price_plan.is_some().then_some("price_plan"))
-    }
-
-    /// `restrictions` 是否被显式给出（见 [`Self::first_present_flat_field`] 的说明）。
-    fn flat_restrictions_present(&self) -> bool {
-        self.restrictions
-            .as_object()
-            .is_some_and(|map| !map.is_empty())
-    }
-
-    /// `parameter_mapping` 是否被显式给出（判法同上：非空才算）。
-    fn flat_parameter_mapping_present(&self) -> bool {
-        self.parameter_mapping
-            .as_object()
-            .is_some_and(|map| !map.is_empty())
     }
 }
 
@@ -593,41 +490,136 @@ fn normalize_weight(index: usize, draft: &OfferingDraft) -> Result<u32, Applicat
     }
 }
 
-/// 校验计价形态。
+/// 一条候选归一后的**计价事实**：形态 + 它自己的参数 + 成本币种。
+struct Billing {
+    formula: PricingFormula,
+    rates: Option<PriceRates>,
+    price_source_url: Option<String>,
+    cost_unit_price_microusd: Option<u64>,
+    cost_currency: Option<String>,
+    consumer_rates_cny: Option<ConsumerRatesCny>,
+}
+
+/// 归一一条候选的**计价形态与它的参数**，判据是"这个渠道按什么计价"。
 ///
-/// 本阶段**唯一启用** `token_rates`。`formula` 不落库（`pricing.price_plans` 没有该列），
-/// 它只是发布期的判别符——因此必须在这里拒绝未知取值，否则"只启用一种形态"只是注释。
-/// 后续若引入新的计价形态，在此放行并同时落地对应列与结算路径。
-fn validate_price_formula(price_plan: &PricePlanDraft) -> Result<(), String> {
-    if price_plan.formula != "token_rates" {
-        return Err(format!(
-            "unsupported formula {}; this phase only enables token_rates",
-            price_plan.formula
-        ));
+/// 形态**必填且取值受控**：说不清一条供给按什么计价，它的成本就没有算法——受理时算不出成本
+/// 要么被别的数顶替（把成本算成售价或 0），要么要等到运营核账单才发现。形态与参数**配套**，
+/// 不配套就拒并指出缺哪一个：
+/// - `token_rates` 要那份四档费率（`price_plan`）；
+/// - `per_image` / `per_call` 要一个单价（并按张 / 按次的单位算成本）；
+/// - `upstream_declared` 什么参数都不要：金额由渠道在终态直接给出，平台没有可算的东西。
+///
+/// 反向也拒：给了这种形态用不到的参数（例如 `upstream_declared` 带单价、按张计价带一份四档费率）
+/// 说明发布者的意图与声明的形态对不上，而那个数永远不会被读——留着它只会让人以为它在生效。
+///
+/// 成本币种取**显式声明**，缺省取 Price Plan 的币种，两份都在就必须一致：成本平面记账、
+/// 折算与上游声明的金额都要以它为准，两个字段各说各的就没有唯一答案。没有 Price Plan 时必须
+/// 显式声明——那正是"这条供给的钱是什么币种"唯一还剩的来源。
+fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, ApplicationError> {
+    let declared = draft
+        .formula
+        .as_deref()
+        .ok_or_else(|| {
+            ApplicationError::Validation(format!(
+                "offerings[{index}].formula is required: state how this supply is priced \
+                 (token_rates / per_image / per_call / upstream_declared)"
+            ))
+        })
+        .and_then(|value| {
+            PricingFormula::parse(value).ok_or_else(|| {
+                ApplicationError::Validation(format!(
+                    "offerings[{index}].formula must be token_rates, per_image, per_call or \
+                     upstream_declared, got {value}"
+                ))
+            })
+        })?;
+    if declared == PricingFormula::TokenRates && draft.price_plan.is_none() {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].price_plan is required: a supply priced by token metering needs \
+             its four rates"
+        )));
     }
-    Ok(())
+    if declared != PricingFormula::TokenRates && draft.price_plan.is_some() {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].price_plan does not apply to formula {}: the four rates are the \
+             parameter of token_rates only",
+            declared.as_str()
+        )));
+    }
+    if declared.takes_unit_price() && draft.cost_unit_price_microusd.is_none() {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].cost_unit_price_microusd is required: formula {} is priced per \
+             unit",
+            declared.as_str()
+        )));
+    }
+    if !declared.takes_unit_price() && draft.cost_unit_price_microusd.is_some() {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].cost_unit_price_microusd does not apply to formula {}",
+            declared.as_str()
+        )));
+    }
+    let (rates, price_source_url, plan_currency) = match draft.price_plan.clone() {
+        Some(price_plan) => {
+            let currency = price_plan.currency.clone();
+            let source_url = price_plan.source_url.clone();
+            (
+                Some(price_plan.into_rates()),
+                Some(source_url),
+                Some(currency),
+            )
+        }
+        None => (None, None, None),
+    };
+    let cost_currency = match (&draft.cost_currency, &plan_currency) {
+        (Some(declared), Some(plan)) if declared != plan => {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].cost_currency ({declared}) must match the price plan currency \
+                 ({plan})"
+            )));
+        }
+        (Some(declared), _) => Some(declared.clone()),
+        (None, Some(plan)) => Some(plan.clone()),
+        (None, None) => {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].cost_currency is required when the supply has no price plan: \
+                 the declared amount and unit price must say which currency they are in"
+            )));
+        }
+    };
+    normalize_consumer_basis(index, draft, rates.as_ref())?;
+    Ok(Billing {
+        formula: declared,
+        rates,
+        price_source_url,
+        cost_unit_price_microusd: draft.cost_unit_price_microusd,
+        cost_currency,
+        consumer_rates_cny: draft.consumer_rates_cny.clone(),
+    })
 }
 
 fn empty_object() -> Value {
     Value::Object(Map::new())
 }
 
-/// 归一一条候选的定价：**全有或全无**，形状与取值都在这里拒掉。
+/// 归一一条候选的**定价参考与保底**：**全有或全无**，形状与取值都在这里拒掉。
 ///
-/// 判据是"这条候选有没有带定价"，不是"字段齐不齐"：只给对客费率而没给参考成本与保底表，
-/// 发布出来的候选就是"有售价、说不清成本、也算不出预授权"的半成品——那种候选一旦生效，
+/// 判据是"这条候选有没有带这几样"，不是"字段齐不齐"：只给参考成本而没给成本来源与保底表，
+/// 发布出来的候选就是"说不清成本怎么记、也算不出预授权"的半成品——那种候选一旦生效，
 /// 问题要等到结算才暴露。因此带了一半就明确拒绝，并指出缺哪一个。
 ///
-/// 成本币种缺省取该候选计价声明的币种；给了就必须与它一致——币种权威只有一个，两个字段
-/// 各说各的会让"这笔成本是什么钱"没有唯一答案。
+/// **对客费率向量不在这组里**：它是"可被路由的供给必须给出的对客计费基准"
+/// （[`normalize_consumer_basis`]），与参考成本、保底表各有各的用途（一个是售价，一个是定价
+/// 参考与预授权），可以只有前者——渠道按张 / 按次计价或直接由上游给金额时，参考成本与保底表
+/// 都没有着落，但这条供给照样要能卖。
+///
+/// 成本币种也不在这里：它是这条供给声明的渠道事实（见 [`normalize_billing`]），带不带定价都要有，
+/// 而且只有一个来源。
 fn normalize_candidate_pricing(
     index: usize,
     draft: &OfferingDraft,
-    declared_currency: &str,
 ) -> Result<Option<CandidatePricing>, ApplicationError> {
     let carries_pricing = draft.reference_cost_microusd.is_some()
-        || draft.cost_currency.is_some()
-        || draft.consumer_rates_cny.is_some()
         || draft.cost_basis.is_some()
         || draft.tier_prices.is_some()
         || draft.floor_amounts.is_some();
@@ -639,10 +631,6 @@ fn normalize_candidate_pricing(
             "offerings[{index}].{name} is required when the candidate carries pricing"
         ))
     };
-    let consumer_rates_cny = draft
-        .consumer_rates_cny
-        .clone()
-        .ok_or_else(|| missing("consumer_rates_cny"))?;
     let reference_cost_microusd = draft
         .reference_cost_microusd
         .ok_or_else(|| missing("reference_cost_microusd"))?;
@@ -671,24 +659,36 @@ fn normalize_candidate_pricing(
             "offerings[{index}].tier_prices must be an object of (size, quality) → CNY amount"
         )));
     }
-    let cost_currency = draft
-        .cost_currency
-        .clone()
-        .unwrap_or_else(|| declared_currency.to_owned());
-    if cost_currency != declared_currency {
-        return Err(ApplicationError::Validation(format!(
-            "offerings[{index}].cost_currency ({cost_currency}) must match the candidate's \
-             declared price currency ({declared_currency})"
-        )));
-    }
     Ok(Some(CandidatePricing {
         reference_cost_microusd,
-        cost_currency,
-        consumer_rates_cny,
         cost_basis,
         tier_prices,
         floor_amounts,
     }))
+}
+
+/// 归一一条候选的**对客计费基准**：这条供给卖多少钱从哪里读。
+///
+/// **可被路由的供给必须给出一个基准**：对客费率向量（今天的方式），或 Price Plan 的那份费率
+/// （旧口径——历史修订与"迁移后仍生效但没有定价的旧修订"结算时读的就是它）。两样都没有就
+/// 发布期拒掉：这条供给一旦生效，受理与结算都算不出该收多少钱，而**按 0 结算等于白送**——
+/// 那是账上一条"收过钱"的 0 元记录，不是"没有价"。
+///
+/// 它**不是** Price Plan 的必填：渠道按张 / 按次计价或直接由上游给金额时没有 Price Plan，
+/// 那时基准只能是对客费率向量（"不带价目表也能发布"说的是这个，不是"连对客价一起没有"）。
+fn normalize_consumer_basis(
+    index: usize,
+    draft: &OfferingDraft,
+    rates: Option<&PriceRates>,
+) -> Result<(), ApplicationError> {
+    if draft.consumer_rates_cny.is_some() || rates.is_some() {
+        return Ok(());
+    }
+    Err(ApplicationError::Validation(format!(
+        "offerings[{index}] has no consumer charge basis: a routable supply needs either its \
+         consumer rate vector (consumer_rates_cny) or the price plan rates the platform charges \
+         from"
+    )))
 }
 
 /// 选出这次请求走的那条候选：**先定档位，再在档内按权重分摊**。
@@ -2777,19 +2777,24 @@ impl RuntimeService {
             ));
         }
         // 成本币种**按渠道/供给自己声明的那个值接受**，不假定 USD：四档费率表本来就是按渠道
-        // 各自记、按该渠道币种标注的，硬写"必须是 USD"等于替渠道改币种。
-        // "这个币种在汇率表里有折算率"是定价侧的事，等汇率表落地时才在这里校验。
-        if offering.rates.currency.trim().is_empty() {
+        // 各自记、按该渠道币种标注的，硬写"必须是 USD"等于替渠道改币种。它是这条供给在成本
+        // 平面上的记账币种，所以每条供给都要有一个（没带定价的也要：上游声明的金额、按张 /
+        // 按次的单价都要说清是哪个币种的钱）。
+        let cost_currency = offering.cost_currency().unwrap_or_default();
+        if cost_currency.trim().is_empty() {
             return Err(ApplicationError::Validation(
-                "price currency must not be empty".to_owned(),
+                "cost currency must not be empty".to_owned(),
             ));
         }
-        let price_source = url::Url::parse(&offering.price_source_url)
-            .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-        if price_source.scheme() != "https" {
-            return Err(ApplicationError::Validation(
-                "price_source_url must use https".to_owned(),
-            ));
+        // 价目的出处只在带 Price Plan 时存在：没有 Price Plan 就没有渠道价目可引。
+        if let Some(price_source_url) = &offering.price_source_url {
+            let price_source = url::Url::parse(price_source_url)
+                .map_err(|error| ApplicationError::Validation(error.to_string()))?;
+            if price_source.scheme() != "https" {
+                return Err(ApplicationError::Validation(
+                    "price_source_url must use https".to_owned(),
+                ));
+            }
         }
         let descriptor = self
             .adapters
@@ -3362,18 +3367,27 @@ impl GenerationService {
         request: &CreateImageGenerationRequest,
         offering: &mut PublishedOffering,
     ) -> Result<u64, ApplicationError> {
+        // 汇率只要这条候选**声明了成本币种**就冻结：成本（上游声明的金额、或按计价形态自算
+        // 出来的金额）都要折成人民币才算得出毛利，而折算率只有受理时取得到。旧修订受理出的
+        // 历史 Job 快照里没有这个声明（那时没有这条事实），这一步因此什么都不做——那是旧口径。
+        if let Some(cost_currency) = offering.price_snapshot.cost_currency.clone() {
+            // 汇率在发布期已被校验过（该币种必须有一行已生效的折算率），所以取不到只可能是
+            // 汇率表被人删了行或只剩未来生效的行——那是平台自己的配置问题，不是这次请求的问题。
+            let fx_rate = self
+                .repository
+                .effective_fx_rate(&cost_currency)
+                .await?
+                .ok_or_else(|| {
+                    ApplicationError::Configuration(format!(
+                        "no effective fx rate for {cost_currency}; publication rejects a currency \
+                         without one, so the rate table lost a row it promised"
+                    ))
+                })?;
+            offering.price_snapshot.fx_rate = Some(fx_rate);
+        }
         if offering.price_snapshot.consumer_rates_cny.is_none() {
             return Ok(self.max_cost_microusd);
         }
-        let cost_currency = offering
-            .price_snapshot
-            .cost_currency
-            .clone()
-            .ok_or_else(|| {
-                ApplicationError::Configuration(
-                    "a candidate that carries pricing must also carry its cost currency".to_owned(),
-                )
-            })?;
         let table = offering
             .price_snapshot
             .floor_amounts
@@ -3405,21 +3419,8 @@ impl GenerationService {
                 literal_parameter_text(&request.native_parameters, "quality"),
             )
             .unwrap_or((self.max_cost_microusd, HoldSource::PlatformDefault));
-        // 汇率在发布期已被校验过（该币种必须有一行已生效的折算率），所以取不到只可能是
-        // 汇率表被人删了行或只剩未来生效的行——那是平台自己的配置问题，不是这次请求的问题。
-        let fx_rate = self
-            .repository
-            .effective_fx_rate(&cost_currency)
-            .await?
-            .ok_or_else(|| {
-                ApplicationError::Configuration(format!(
-                    "no effective fx rate for {cost_currency}; publication rejects a currency \
-                     without one, so the rate table lost a row it promised"
-                ))
-            })?;
         offering.price_snapshot.hold_microusd = Some(hold_microusd);
         offering.price_snapshot.hold_source = Some(hold_source);
-        offering.price_snapshot.fx_rate = Some(fx_rate);
         Ok(hold_microusd)
     }
 
@@ -3533,6 +3534,12 @@ impl WorkerService {
                 .offering
                 .price_snapshot
                 .cost_currency()
+                .ok_or_else(|| {
+                    ApplicationError::Configuration(
+                        "this job's snapshot carries no cost currency to hand the driver"
+                            .to_owned(),
+                    )
+                })?
                 .to_owned(),
         };
         let request_digest = request_digest(&prepared)?;
@@ -3600,7 +3607,10 @@ impl WorkerService {
                 let provider_cost = provider_cost_fact(
                     &claimed.job.offering.price_snapshot,
                     &success.provider_cost,
-                    Some(&success.usage),
+                    CostInputs::Succeeded {
+                        usage: &success.usage,
+                        images: success.images.len(),
+                    },
                 );
                 if let Err(error) = self
                     .complete_success(&claimed.job, attempt_id, &success, provider_cost.clone())
@@ -3727,7 +3737,7 @@ impl WorkerService {
 ///
 /// 判据是**成本从哪来**，不是"金额对不对"：
 /// - 上游直接给了金额 ⇒ `declared`，**直接取它**（含渠道侧折扣，比自算权威），币种也取它报的；
-/// - 这条渠道不给金额字段 ⇒ `computed`，按**本次实际用量**与该渠道**成本费率**自算，币种按渠道声明；
+/// - 渠道不给金额字段 ⇒ `computed`，按这条供给的**计价形态**自算（见 [`self_computed_cost`]）；
 /// - 本该有金额却拿不到 ⇒ `unavailable`，金额与币种**留空**：不写 0、不用自算顶替。
 ///
 /// 币种的权威**分来源**：`declared` 认上游报回来的那一份，`computed` 认渠道声明的成本币种
@@ -3738,26 +3748,25 @@ impl WorkerService {
 /// 而"编一个数"比"承认折算不出来"糟得多。
 ///
 /// 自算失败（用量自相矛盾或溢出）时记成 `unavailable`：本该有金额却算不出来，也是缺口，
-/// 不用别的数顶替。**用量不在手里**（失败件没有本次用量）与自算失败同处置：算不出来就是缺口。
+/// 不用别的数顶替。**这次的执行证据不在手里**（失败件没有结果张数与用量）与自算失败同处置：
+/// 算不出来就是缺口。
 fn provider_cost_fact(
     snapshot: &PriceSnapshot,
     provider_cost: &ProviderCost,
-    usage: Option<&TokenUsage>,
+    inputs: CostInputs<'_>,
 ) -> ProviderCostFact {
     // 三态在 SDK 与领域各有一套写法，来源一律经那一处映射取，不在这里再判一次。
     let mut source = ProviderCostSource::from(provider_cost);
     // 形状只有一条规则：有金额的来源两样都在，`unavailable` 两样都不在。
     let (amount_microusd, currency) = match provider_cost {
         ProviderCost::Declared(cost) => (Some(cost.amount_microusd), Some(cost.currency.clone())),
-        ProviderCost::Computed => {
-            match usage.map(|usage| snapshot.cost_rates().amount_microusd(usage)) {
-                Some(Ok(amount)) => (Some(amount), Some(snapshot.cost_rates().currency.clone())),
-                Some(Err(_)) | None => {
-                    source = ProviderCostSource::Unavailable;
-                    (None, None)
-                }
+        ProviderCost::Computed => match self_computed_cost(snapshot, inputs) {
+            Some(amount) => (Some(amount), snapshot.cost_currency().map(str::to_owned)),
+            None => {
+                source = ProviderCostSource::Unavailable;
+                (None, None)
             }
-        }
+        },
         ProviderCost::Unavailable => (None, None),
     };
     let cny_microusd = match (
@@ -3775,6 +3784,53 @@ fn provider_cost_fact(
         amount_microusd,
         currency,
         cny_microusd,
+    }
+}
+
+/// 这次执行手上有哪些证据——自算成本能拿到的输入因此是**类型上的事实**，不是"某个参数恰好为
+/// `None`"。
+///
+/// 成功件手里有本次实际用量与产出张数；失败件什么都没有（它只有 Driver 已经读到的金额，
+/// 那是 `declared` 那条路）。把这件事写进类型，是为了让"失败件一律算不出自算成本"这条口径
+/// 落在调用处看得见的地方，而不是靠一个 `None` 的含义。
+enum CostInputs<'a> {
+    /// 成功件：本次实际用量 + 产出的图片张数。
+    Succeeded {
+        usage: &'a TokenUsage,
+        images: usize,
+    },
+    /// 失败件：只有上游可能报回来的金额，自算一律算不出来。
+    Failed,
+}
+
+/// 按这条供给的**计价形态**自算成本（渠道不给金额字段时走这里）。
+///
+/// 形态决定算法，参数与用量都随修订发布、随 Job 冻结：
+/// - `token_rates`：实际用量的四个分项 × 该渠道四档费率（Price Plan 就是它的参数）；
+/// - `per_image`：**产出的张数** × 每张单价；
+/// - `per_call`：**1 次** × 每次单价；
+/// - `upstream_declared`：平台没有可算的东西——上游没给金额就是缺口，不编一个数。
+///
+/// 缺参数或缺用量（失败件、旧修订没有那份费率、快照里没有单价）⇒ `None`，由调用方落
+/// `unavailable`：来源可辨、进缺口清单。
+fn self_computed_cost(snapshot: &PriceSnapshot, inputs: CostInputs<'_>) -> Option<u64> {
+    let CostInputs::Succeeded { usage, images } = inputs else {
+        return None;
+    };
+    match snapshot.formula {
+        PricingFormula::TokenRates => snapshot
+            .cost_rates()
+            .and_then(|rates| rates.amount_microusd(usage).ok()),
+        PricingFormula::PerImage => {
+            let unit = snapshot.cost_unit_price_microusd?;
+            let count = u64::try_from(images).ok()?;
+            unit_amount_microusd(count, unit).ok()
+        }
+        PricingFormula::PerCall => {
+            let unit = snapshot.cost_unit_price_microusd?;
+            unit_amount_microusd(1, unit).ok()
+        }
+        PricingFormula::UpstreamDeclared => None,
     }
 }
 
@@ -4102,16 +4158,17 @@ fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> Attemp
 
 /// 失败件上的成本事实：Driver 报回来的那一份直接用，**没报就按 `unavailable` 落**。
 ///
-/// 与成功件共用 [`provider_cost_fact`] 这一处映射，只是失败件手里没有本次用量（自算那一态
-/// 因此算不出金额，落到缺口）。留 NULL 而不是 `unavailable` 的话，这笔成本在账上与缺口清单
+/// 与成功件共用 [`provider_cost_fact`] 这一处映射，只是失败件手里没有本次执行证据
+/// （[`CostInputs::Failed`]：没有用量、也没有产出张数），自算那几态因此一律算不出金额、
+/// 落到缺口。留 NULL 而不是 `unavailable` 的话，这笔成本在账上与缺口清单
 /// 两头都看不见——而"去核上游账单"正是缺口清单要承载的处置。
 fn failure_provider_cost(
     snapshot: &PriceSnapshot,
     provider_cost: Option<&ProviderCost>,
 ) -> ProviderCostFact {
     match provider_cost {
-        Some(provider_cost) => provider_cost_fact(snapshot, provider_cost, None),
-        None => provider_cost_fact(snapshot, &ProviderCost::Unavailable, None),
+        Some(provider_cost) => provider_cost_fact(snapshot, provider_cost, CostInputs::Failed),
+        None => provider_cost_fact(snapshot, &ProviderCost::Unavailable, CostInputs::Failed),
     }
 }
 
@@ -4155,14 +4212,16 @@ mod tests {
             base_url: "https://api.inferera.com".to_owned(),
             credential_env: "AIHUBMIX_API_KEY".to_owned(),
             price_snapshot: PriceSnapshot {
-                price_plan_id: PricePlanId::new(),
-                rates: PriceRates {
+                price_plan_id: Some(PricePlanId::new()),
+                rates: Some(PriceRates {
                     currency: "USD".to_owned(),
                     text_input_microusd_per_million: 5_000_000,
                     image_input_microusd_per_million: 8_000_000,
                     text_output_microusd_per_million: 10_000_000,
                     image_output_microusd_per_million: 30_000_000,
-                },
+                }),
+                formula: PricingFormula::TokenRates,
+                cost_unit_price_microusd: None,
                 captured_at: Utc::now(),
                 // 夹具走**旧口径**（没有定价）：受理与结算的行为与今天逐位相同。
                 hit_candidate: None,
@@ -4247,16 +4306,7 @@ mod tests {
             gateway_model: None,
             native_revision: "test-1".to_owned(),
             capability_schema: None,
-            restrictions: serde_json::json!({}),
-            provider_kind: None,
-            adapter_key: None,
-            provider_model_id: None,
-            base_url: None,
-            credential_env: None,
-            carrier_schema: None,
-            parameter_mapping: serde_json::json!({}),
             offerings: None,
-            price_plan: None,
             markup_bps: None,
             actor: "tester".to_owned(),
         }
@@ -4264,7 +4314,6 @@ mod tests {
 
     fn price_plan() -> PricePlanDraft {
         PricePlanDraft {
-            formula: "token_rates".to_owned(),
             currency: "USD".to_owned(),
             text_input_microusd_per_million: 5_000_000,
             image_input_microusd_per_million: 8_000_000,
@@ -4288,9 +4337,11 @@ mod tests {
             carrier_schema: None,
             parameter_mapping: serde_json::json!({}),
             capability_schema: Some(schema("gpt-image-2.5-flare")),
+            formula: Some("token_rates".to_owned()),
             price_plan: Some(price_plan()),
-            reference_cost_microusd: None,
+            cost_unit_price_microusd: None,
             cost_currency: None,
+            reference_cost_microusd: None,
             consumer_rates_cny: None,
             cost_basis: None,
             tier_prices: None,
@@ -4319,6 +4370,19 @@ mod tests {
         assert!(error.to_string().contains("must not be empty"), "{error}");
     }
 
+    /// 没有候选集合就没有可发布的东西：缺省与 `null` 都落到同一条校验错误上（发布期 400）。
+    #[test]
+    fn normalize_rejects_a_command_without_the_offering_array() {
+        let command = base_command();
+        let error = command
+            .normalize()
+            .expect_err("a command without offerings must be rejected");
+        assert!(
+            error.to_string().contains("offerings is required"),
+            "{error}"
+        );
+    }
+
     #[test]
     fn normalize_assigns_priority_from_array_index() {
         let command = PublishRuntimeCommand {
@@ -4337,48 +4401,6 @@ mod tests {
             vec![0, 1, 2]
         );
         assert_eq!(normalized.offerings[1].provider_model_id, "pm-b");
-    }
-
-    #[test]
-    fn normalize_flat_form_equals_a_single_zero_priority_offering() {
-        let command = PublishRuntimeCommand {
-            capability_schema: Some(schema("gpt-image-2.5-flare")),
-            provider_kind: Some("AIHubMix".to_owned()),
-            adapter_key: Some("aihubmix-image-v1".to_owned()),
-            provider_model_id: Some("gpt-image-2.5-flare".to_owned()),
-            base_url: Some("https://api.inferera.com".to_owned()),
-            credential_env: Some("AIHUBMIX_API_KEY".to_owned()),
-            price_plan: Some(price_plan()),
-            ..base_command()
-        };
-        let normalized = command.normalize().expect("flat form is valid");
-        assert_eq!(normalized.offerings.len(), 1);
-        assert_eq!(normalized.offerings[0].routing_priority, 0);
-        // 扁平形式没另给承载面：它承载合同声明的全部字段。
-        assert_eq!(normalized.offerings[0].carrier_schema, normalized.contract);
-    }
-
-    #[test]
-    fn normalize_rejects_mixing_array_and_flat_forms() {
-        let command = PublishRuntimeCommand {
-            capability_schema: Some(schema("gpt-image-2.5-flare")),
-            provider_kind: Some("AIHubMix".to_owned()),
-            offerings: Some(vec![draft("pm-a")]),
-            ..base_command()
-        };
-        let error = command
-            .normalize()
-            .expect_err("mixing both forms must be rejected");
-        assert!(error.to_string().contains("must be omitted"), "{error}");
-    }
-
-    #[test]
-    fn normalize_requires_every_flat_field_when_offerings_absent() {
-        let command = base_command();
-        let error = command
-            .normalize()
-            .expect_err("flat form without fields must be rejected");
-        assert!(error.to_string().contains("is required"), "{error}");
     }
 
     #[test]
@@ -4513,14 +4535,18 @@ mod tests {
             provider_model_id: "m".to_owned(),
             base_url: "https://api.inferera.com".to_owned(),
             credential_env: "AIHUBMIX_API_KEY".to_owned(),
-            rates: PriceRates {
+            rates: Some(PriceRates {
                 currency: "USD".to_owned(),
                 text_input_microusd_per_million: 5_000_000,
                 image_input_microusd_per_million: 8_000_000,
                 text_output_microusd_per_million: 10_000_000,
                 image_output_microusd_per_million: 30_000_000,
-            },
-            price_source_url: "https://example.invalid/price".to_owned(),
+            }),
+            formula: PricingFormula::TokenRates,
+            price_source_url: Some("https://example.invalid/price".to_owned()),
+            cost_unit_price_microusd: None,
+            cost_currency: Some("USD".to_owned()),
+            consumer_rates_cny: None,
             routing_priority: 0,
             weight: 1,
             pricing: None,
@@ -5031,16 +5057,24 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_unsupported_price_formula() {
-        // 本阶段只启用 token_rates；其余计价形态（例如按上游声明金额计价）必须显式拒绝，
-        // 而不是静默落库成一个它并不支持的计价形态。
-        let mut draft = draft("pm-a");
-        draft.price_plan = Some(PricePlanDraft {
-            formula: "upstream_charge".to_owned(),
-            ..price_plan()
-        });
+    fn normalize_rejects_a_missing_or_unknown_pricing_formula() {
+        // 一条供给说不清它按什么计价，它的成本就没有算法：缺形态与写错取值都要显式拒绝，
+        // 而不是静默落库成某个默认形态。
+        let mut without_formula = draft("pm-a");
+        without_formula.formula = None;
         let command = PublishRuntimeCommand {
-            offerings: Some(vec![draft]),
+            offerings: Some(vec![without_formula]),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("a supply without a pricing formula must fail");
+        assert!(error.to_string().contains("formula is required"), "{error}");
+
+        let mut unknown = draft("pm-a");
+        unknown.formula = Some("by_the_hour".to_owned());
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![unknown]),
             ..base_command()
         };
         let error = command.normalize().expect_err("unknown formula must fail");
@@ -5048,27 +5082,114 @@ mod tests {
     }
 
     #[test]
-    fn normalize_rejects_unsupported_formula_in_flat_form() {
-        let command = PublishRuntimeCommand {
-            capability_schema: Some(schema("gpt-image-2.5-flare")),
-            provider_kind: Some("AIHubMix".to_owned()),
-            adapter_key: Some("aihubmix-image-v1".to_owned()),
-            provider_model_id: Some("gpt-image-2.5-flare".to_owned()),
-            base_url: Some("https://api.inferera.com".to_owned()),
-            credential_env: Some("AIHUBMIX_API_KEY".to_owned()),
-            price_plan: Some(PricePlanDraft {
-                formula: "amount_only".to_owned(),
-                ..price_plan()
-            }),
+    fn normalize_rejects_parameters_that_do_not_match_the_formula() {
+        // 形态与参数配套：按 token 计量量要有那份四档费率；按张 / 按次要有一个单价；上游直接
+        // 给金额两种参数都不要。缺了要说清缺哪一个，给了用不到的也要拒。
+        let mut token_without_plan = draft("pm-a");
+        token_without_plan.price_plan = None;
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![token_without_plan]),
             ..base_command()
-        };
-        let error = command.normalize().expect_err("unknown formula must fail");
-        assert!(error.to_string().contains("token_rates"), "{error}");
+        }
+        .normalize()
+        .expect_err("token_rates without a price plan must fail");
+        assert!(
+            error.to_string().contains("price_plan is required"),
+            "{error}"
+        );
+
+        let mut per_image_without_unit_price = draft("pm-a");
+        per_image_without_unit_price.formula = Some("per_image".to_owned());
+        per_image_without_unit_price.price_plan = None;
+        per_image_without_unit_price.cost_currency = Some("USD".to_owned());
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![per_image_without_unit_price.clone()]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("per_image without a unit price must fail");
+        assert!(
+            error.to_string().contains("cost_unit_price_microusd"),
+            "{error}"
+        );
+
+        // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。对客计费基准
+        // 得由对客费率向量给出（没有价目表，就没有旧口径那份费率可用）。
+        per_image_without_unit_price.cost_unit_price_microusd = Some(11_354);
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![per_image_without_unit_price.clone()]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("a supply with neither a rate card nor a consumer vector must fail");
+        assert!(
+            error.to_string().contains("consumer charge basis"),
+            "{error}"
+        );
+        per_image_without_unit_price.consumer_rates_cny = Some(ConsumerRatesCny {
+            text_input_micros_per_million: 35_500_000,
+            image_input_micros_per_million: 56_800_000,
+            text_output_micros_per_million: 71_000_000,
+            image_output_micros_per_million: 213_000_000,
+        });
+        let normalized = PublishRuntimeCommand {
+            offerings: Some(vec![per_image_without_unit_price]),
+            ..base_command()
+        }
+        .normalize()
+        .expect("a supply priced per image needs no rate card");
+        assert_eq!(normalized.offerings[0].formula, PricingFormula::PerImage);
+        assert!(normalized.offerings[0].rates.is_none());
+        assert_eq!(normalized.offerings[0].cost_currency(), Some("USD"));
+        assert!(
+            normalized.offerings[0].consumer_rates_cny.is_some(),
+            "对客计费基准由对客费率向量给出"
+        );
+
+        // 反向：形态用不到的参数也要拒（它永远不会被读，留着只会让人以为它在生效）。
+        let mut token_rates_with_unit_price = draft("pm-a");
+        token_rates_with_unit_price.cost_unit_price_microusd = Some(11_354);
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![token_rates_with_unit_price]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("a unit price under token_rates must fail");
+        assert!(
+            error.to_string().contains("does not apply to formula"),
+            "{error}"
+        );
+
+        let mut declared_with_plan = draft("pm-a");
+        declared_with_plan.formula = Some("upstream_declared".to_owned());
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![declared_with_plan]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("a price plan under upstream_declared must fail");
+        assert!(
+            error.to_string().contains("does not apply to formula"),
+            "{error}"
+        );
+
+        // 没有 Price Plan 时成本币种必须显式声明：上游声明的金额与单价都要说清是哪个币种的钱。
+        let mut declared_without_currency = draft("pm-a");
+        declared_without_currency.formula = Some("upstream_declared".to_owned());
+        declared_without_currency.price_plan = None;
+        let error = PublishRuntimeCommand {
+            offerings: Some(vec![declared_without_currency]),
+            ..base_command()
+        }
+        .normalize()
+        .expect_err("a supply without a price plan must declare its cost currency");
+        assert!(error.to_string().contains("cost_currency"), "{error}");
     }
 
     /// 一条**带定价**的候选：参考成本、对客费率向量、成本来源与保底表都给齐。
     ///
-    /// 成本币种故意不给：它缺省取该候选计价声明的币种，这里顺带钉住"缺省也一致"。
+    /// 成本币种故意不给：它缺省取该供给 Price Plan 的币种（旧形状仍然这样），这里顺带钉住
+    /// "两条路取到的是同一个答案"。
     fn priced_draft(provider_model_id: &str) -> OfferingDraft {
         OfferingDraft {
             reference_cost_microusd: Some(11_354),
@@ -5102,12 +5223,27 @@ mod tests {
             .as_ref()
             .expect("the candidate must carry its pricing");
         assert_eq!(
-            pricing.cost_currency, "USD",
-            "成本币种缺省取该候选计价声明的币种"
+            normalized.offerings[0].cost_currency(),
+            Some("USD"),
+            "没显式声明成本币种时取该供给 Price Plan 的币种"
         );
         assert_eq!(pricing.reference_cost_microusd, 11_354);
         assert_eq!(pricing.cost_basis, CostBasis::Declared);
         assert_eq!(normalized.offerings[0].pricing.as_ref(), Some(pricing));
+    }
+
+    #[test]
+    fn a_candidate_cost_currency_must_match_its_price_plan_currency() {
+        let mut mismatched = draft("pm-a");
+        mismatched.cost_currency = Some("CNY".to_owned());
+        let command = PublishRuntimeCommand {
+            offerings: Some(vec![mismatched]),
+            ..base_command()
+        };
+        let error = command
+            .normalize()
+            .expect_err("two currencies for one supply must fail");
+        assert!(error.to_string().contains("cost_currency"), "{error}");
     }
 
     #[test]
@@ -5174,22 +5310,6 @@ mod tests {
         };
         let error = command.normalize().expect_err("negative markup");
         assert!(error.to_string().contains("negative"), "{error}");
-    }
-
-    #[test]
-    fn a_candidate_cost_currency_must_match_its_declared_price_currency() {
-        let command = PublishRuntimeCommand {
-            markup_bps: Some(2_000),
-            offerings: Some(vec![OfferingDraft {
-                cost_currency: Some("CNY".to_owned()),
-                ..priced_draft("pm-a")
-            }]),
-            ..base_command()
-        };
-        let error = command
-            .normalize()
-            .expect_err("two currencies for one cost");
-        assert!(error.to_string().contains("cost_currency"), "{error}");
     }
 
     #[test]
@@ -6801,6 +6921,7 @@ mod tests {
         assert_eq!(completion.evidence.usage.total_tokens, 205);
         let expected_cost = snapshot
             .cost_rates()
+            .expect("这条快照带 Price Plan")
             .amount_microusd(&completion.evidence.usage)
             .expect("the channel cost rates must price the actual usage");
         // 9 文本输入 × 5 + 196 图像输出 × 30（每 1M）。
@@ -6810,7 +6931,12 @@ mod tests {
             ProviderCostFact {
                 source: ProviderCostSource::Computed,
                 amount_microusd: Some(expected_cost),
-                currency: Some(snapshot.cost_currency().to_owned()),
+                currency: Some(
+                    snapshot
+                        .cost_currency()
+                        .expect("这条快照带成本币种")
+                        .to_owned(),
+                ),
                 cny_microusd: None,
             },
             "渠道不报金额时，成本按**本次实际用量 × 该渠道成本费率**自算，币种按渠道声明"
@@ -6849,7 +6975,10 @@ mod tests {
                 amount_microusd: 11_354,
                 currency: "CNY".to_owned(),
             }),
-            Some(&usage),
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 1,
+            },
         );
         assert_eq!(declared.source, ProviderCostSource::Declared);
         assert_eq!(
@@ -6863,13 +6992,27 @@ mod tests {
             "币种按上游报的那一份，不取渠道声明的成本币种、也不假定 USD"
         );
 
-        let computed = provider_cost_fact(&snapshot, &ProviderCost::Computed, Some(&usage));
+        let computed = provider_cost_fact(
+            &snapshot,
+            &ProviderCost::Computed,
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 1,
+            },
+        );
         assert_eq!(computed.source, ProviderCostSource::Computed);
         // 9 文本输入 × 5 + 196 图像输出 × 30（每 1M）。
         assert_eq!(computed.amount_microusd, Some(5_925));
         assert_eq!(computed.currency.as_deref(), Some("USD"));
 
-        let unavailable = provider_cost_fact(&snapshot, &ProviderCost::Unavailable, Some(&usage));
+        let unavailable = provider_cost_fact(
+            &snapshot,
+            &ProviderCost::Unavailable,
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 1,
+            },
+        );
         assert_eq!(unavailable.source, ProviderCostSource::Unavailable);
         assert_eq!(
             unavailable.amount_microusd, None,
@@ -6882,10 +7025,106 @@ mod tests {
         }
 
         // 用量不在手里（失败件没有本次用量）：自算那一态算不出金额，按缺口落，不猜。
-        let without_usage = provider_cost_fact(&snapshot, &ProviderCost::Computed, None);
+        let without_usage =
+            provider_cost_fact(&snapshot, &ProviderCost::Computed, CostInputs::Failed);
         assert_eq!(without_usage.source, ProviderCostSource::Unavailable);
         assert_eq!(without_usage.amount_microusd, None);
         assert_eq!(without_usage.currency, None);
+    }
+
+    /// 按张 / 按次计费的渠道：成本 = **数量 × 单价**，形态与它的参数随快照冻结。
+    ///
+    /// 逐位断言三种情形：按张看**产出的张数**、按次永远是**一次的钱**（不随张数变）、
+    /// 上游直接给金额的形态平台没有可算的东西（上游没给就是缺口）。这两种形态的快照里
+    /// **没有四档费率**——Price Plan 是 token 计量量那一种形态的参数，不是成本自算的前提。
+    #[test]
+    fn a_supply_priced_per_image_or_per_call_computes_from_its_unit_price() {
+        let usage = TokenUsage {
+            input_tokens: 9,
+            input_text_tokens: 9,
+            input_image_tokens: 0,
+            output_tokens: 196,
+            output_text_tokens: 0,
+            output_image_tokens: 196,
+            total_tokens: 205,
+        };
+        let mut snapshot = offering().price_snapshot;
+        snapshot.price_plan_id = None;
+        snapshot.rates = None;
+        snapshot.cost_currency = Some("USD".to_owned());
+        snapshot.fx_rate = Some(FxRate {
+            currency: "USD".to_owned(),
+            rate_micros: 7_100_000,
+            effective_at: Utc::now(),
+        });
+
+        // 按张：3 张 × 11_354 = 34_062（微单位），折算 34_062 × 7.1 = 241840.2 ⇒ 241841。
+        let mut per_image = snapshot.clone();
+        per_image.formula = PricingFormula::PerImage;
+        per_image.cost_unit_price_microusd = Some(11_354);
+        let fact = provider_cost_fact(
+            &per_image,
+            &ProviderCost::Computed,
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 3,
+            },
+        );
+        assert_eq!(fact.source, ProviderCostSource::Computed);
+        assert_eq!(fact.amount_microusd, Some(34_062), "按张 = 张数 × 单价");
+        assert_eq!(fact.currency.as_deref(), Some("USD"));
+        assert_eq!(
+            fact.cny_microusd,
+            Some(241_841),
+            "按冻结的汇率折成人民币算毛利"
+        );
+
+        // 按次：一次的钱，产出 7 张也一样。
+        let mut per_call = snapshot.clone();
+        per_call.formula = PricingFormula::PerCall;
+        per_call.cost_unit_price_microusd = Some(20_000);
+        let fact = provider_cost_fact(
+            &per_call,
+            &ProviderCost::Computed,
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 7,
+            },
+        );
+        assert_eq!(fact.amount_microusd, Some(20_000), "按次 = 1 × 单价");
+
+        // 上游直接给金额的形态：平台没有可算的东西，上游没给就是缺口（不编一个数）。
+        let mut declared_by_upstream = snapshot.clone();
+        declared_by_upstream.formula = PricingFormula::UpstreamDeclared;
+        let fact = provider_cost_fact(
+            &declared_by_upstream,
+            &ProviderCost::Computed,
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 3,
+            },
+        );
+        assert_eq!(fact.source, ProviderCostSource::Unavailable);
+        assert_eq!(fact.amount_microusd, None);
+        assert_eq!(fact.currency, None);
+
+        // 失败件手里没有产出张数：按张算不出来 ⇒ 缺口，不用别的数顶替。
+        let failed = provider_cost_fact(&per_image, &ProviderCost::Computed, CostInputs::Failed);
+        assert_eq!(failed.source, ProviderCostSource::Unavailable);
+        assert_eq!(failed.amount_microusd, None);
+
+        // 上游给了金额时形态不参与：直接取它，失败件也一样（那是执行事实，不是自算）。
+        let declared = provider_cost_fact(
+            &per_image,
+            &ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+                amount_microusd: 11_354,
+                currency: "USD".to_owned(),
+            }),
+            CostInputs::Failed,
+        );
+        assert_eq!(declared.source, ProviderCostSource::Declared);
+        assert_eq!(declared.amount_microusd, Some(11_354));
+        assert_eq!(declared.cny_microusd, Some(80_614));
     }
 
     /// 折算只在**成本币种与冻结的汇率对得上**时才做，且按定点整数算。
@@ -6912,7 +7151,10 @@ mod tests {
                 amount_microusd: 11_354,
                 currency: "USD".to_owned(),
             }),
-            Some(&usage),
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 1,
+            },
         );
         // 11354 微美元 × 7.1 = 80613.4 微元 ⇒ 向上取整。
         assert_eq!(declared.cny_microusd, Some(80_614));
@@ -6924,7 +7166,10 @@ mod tests {
                 amount_microusd: 11_354,
                 currency: "CNY".to_owned(),
             }),
-            Some(&usage),
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 1,
+            },
         );
         assert_eq!(foreign.amount_microusd, Some(11_354));
         assert_eq!(foreign.cny_microusd, None);
@@ -6954,6 +7199,7 @@ mod tests {
         };
         let cost = snapshot
             .cost_rates()
+            .expect("这条快照带 Price Plan")
             .amount_microusd(&usage)
             .expect("cost rates price the usage");
         let charge = snapshot
@@ -6961,7 +7207,14 @@ mod tests {
             .expect("consumer rates price the usage");
         assert_ne!(cost, charge, "用例得先让两个口径真的不同");
 
-        let fact = provider_cost_fact(&snapshot, &ProviderCost::Computed, Some(&usage));
+        let fact = provider_cost_fact(
+            &snapshot,
+            &ProviderCost::Computed,
+            CostInputs::Succeeded {
+                usage: &usage,
+                images: 1,
+            },
+        );
         assert_eq!(
             fact.amount_microusd,
             Some(cost),
@@ -7021,12 +7274,17 @@ mod tests {
         let events = Arc::new(Mutex::new(Vec::new()));
         let snapshot = offering().price_snapshot;
         let repository = Arc::new(WorkerRepository::new(worker_job(20_000), events.clone()));
-        let adapter = Arc::new(WorkerAdapter::new(false, false).reporting_failure_cost(
-            ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
-                amount_microusd: 11_354,
-                currency: snapshot.cost_currency().to_owned(),
-            }),
-        ));
+        let adapter = Arc::new(
+            WorkerAdapter::new(false, false).reporting_failure_cost(ProviderCost::Declared(
+                seeai_adapter_sdk::DeclaredCost {
+                    amount_microusd: 11_354,
+                    currency: snapshot
+                        .cost_currency()
+                        .expect("这条快照带成本币种")
+                        .to_owned(),
+                },
+            )),
+        );
 
         assert!(
             worker(repository.clone(), adapter.clone())
@@ -7045,7 +7303,12 @@ mod tests {
             Some(ProviderCostFact {
                 source: ProviderCostSource::Declared,
                 amount_microusd: Some(11_354),
-                currency: Some(snapshot.cost_currency().to_owned()),
+                currency: Some(
+                    snapshot
+                        .cost_currency()
+                        .expect("这条快照带成本币种")
+                        .to_owned(),
+                ),
                 cny_microusd: None,
             }),
             "失败件走与成功件同一套成本映射：来源、金额、币种都按适配器报的那一份"
@@ -7106,6 +7369,7 @@ mod tests {
         // 执行已经发生：成本事实跟着这条路径一起落，且按**成本那一侧**的费率独立算出来。
         let expected = snapshot
             .cost_rates()
+            .expect("这条快照带 Price Plan")
             .amount_microusd(&TokenUsage {
                 input_tokens: 9,
                 input_text_tokens: 9,
@@ -7121,7 +7385,12 @@ mod tests {
             Some(ProviderCostFact {
                 source: ProviderCostSource::Computed,
                 amount_microusd: Some(expected),
-                currency: Some(snapshot.cost_currency().to_owned()),
+                currency: Some(
+                    snapshot
+                        .cost_currency()
+                        .expect("这条快照带成本币种")
+                        .to_owned(),
+                ),
                 cny_microusd: None,
             }),
             "进对账这条路径上的成本事实必须有去处：执行已经发生、成本也拿得到"
@@ -7427,7 +7696,10 @@ mod tests {
                 kind: ProviderFailureKind::Unknown,
                 provider_cost: Some(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
                     amount_microusd: 11_354,
-                    currency: snapshot.cost_currency().to_owned(),
+                    currency: snapshot
+                        .cost_currency()
+                        .expect("这条快照带成本币种")
+                        .to_owned(),
                 })),
             }),
         );
@@ -7436,7 +7708,12 @@ mod tests {
             Some(ProviderCostFact {
                 source: ProviderCostSource::Declared,
                 amount_microusd: Some(11_354),
-                currency: Some(snapshot.cost_currency().to_owned()),
+                currency: Some(
+                    snapshot
+                        .cost_currency()
+                        .expect("这条快照带成本币种")
+                        .to_owned(),
+                ),
                 cny_microusd: None,
             }),
             "上游声明的金额直接取它：没有结果图不代表这笔钱没花"

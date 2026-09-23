@@ -2,9 +2,9 @@
 title: 平台网关模型命名层：对客名与厂商原生名分离
 status: implemented
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-09-23
 approval: 用户在会话中授权实施 P1（平台网关模型命名层）；范围与验收见提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 的 P1 工单 [#14](https://github.com/dehuadong/seeaihub-server-next/issues/14)
-verification: 2026-09-22 本地：`cargo fmt --all` 无差异；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（各 crate 单测 22 / 29 / 2 / 3 / 54 / 44 通过，40 条端到端用例按设计 ignore）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **40 passed / 0 failed**，含本次新增的命名层三条用例（零真实计费调用）。另做一次反向探针：临时去掉对客投射后 `gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface` 立刻失败（对客目录正文里出现了厂商原生名），确认用例钉得住这条规则、不是靠断言互相抵消过关。`node scripts/decisions/check.mjs` 通过。
+verification: 2026-09-22 本地：`cargo fmt --all` 无差异；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（各 crate 单测 22 / 29 / 2 / 3 / 54 / 44 通过，40 条端到端用例按设计 ignore）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **40 passed / 0 failed**，含本次新增的命名层三条用例（零真实计费调用）。另做一次反向探针：临时去掉对客投射后 `gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface` 立刻失败（对客目录正文里出现了厂商原生名），确认用例钉得住这条规则、不是靠断言互相抵消过关。`node scripts/decisions/check.mjs` 通过。2026-09-23：夹具退役后 `legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name` 的素材改为测试内构造，随空库端到端重跑 **72 passed / 0 failed**。
 ---
 
 # Agent Note：平台网关模型命名层：对客名与厂商原生名分离
@@ -34,7 +34,7 @@ verification: 2026-09-22 本地：`cargo fmt --all` 无差异；`cargo clippy --
 | 存的那份合同不动：库里 `model.const` 仍是原生名，只有投射给调用方时替换 | 同上 |
 | 运维开关一关，目录与受理同时消失，管理端照样列得出来；PATCH 未发布过的名字 404 | 同上 |
 | 素材把对客名写进合同正文被发布期拒掉 | 同上 |
-| 旧素材（不写对客名）发布后目录与受理与今天逐位一致 | `legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name` |
+| 不写对客名的命令发布后目录与受理与今天逐位一致 | `legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name` |
 | 迁移后既有已发布数据立刻可读、可停用；修订两列在既有行上非空 | `gateway_model_naming_migration_backfills_existing_publications` |
 | 目录形状只有 `name` / `vendor_id` / `revision` / `contract`，且不含内部词汇 | `the_model_catalog_lists_only_callable_models_with_their_published_contract` + `assert_public_only` |
 | 两条候选共享一份合同、候选与顺序按对客名生效 | `the_2_5_materials_route_by_carrier_surface_and_wire_names`、`stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers` |

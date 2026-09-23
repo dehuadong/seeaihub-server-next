@@ -35,7 +35,7 @@
 | `catalog.vendor_models` | Vendor Model 身份（`vendor_id` + `native_model_id` + `native_revision`）+ **调用方合同**（模型级唯一一份、行不可变，`ADR-0015`） | 网关模型**指向**其中一行；合同**不复制**，多个网关模型可共享同一行 |
 | `supply.offerings` | 一条候选供给：渠道、驱动、`provider_model_id`、承载面、参数映射、限制（`ADR-0015`） | 网关模型候选集的元素；候选自身的定义不改 |
 | `publication.runtime_revisions` / `runtime_entries` | 一次发布的不可变修订；生效条目、`routing_priority`、`active` | 网关模型的**身份与候选集只由发布产生**（`ADR-0009`：一次发布携带完整有序候选集合，原子替换） |
-| `pricing.price_plans` | 现状：四档 token 费率 + 来源 URL；现在它同时是对客结算基数 | 角色**收窄为渠道成本费率**：**费率表按渠道各自记、币种按该渠道的 `currency` 标注**（当前记的四档 `$5 / $10 / $8 / $30` 每 1M tokens 是 **AIHubMix** 的费率表、币种 **USD**；APIMart 的成本由上游 `cost` 直接给出，币种以渠道声明为准——**不是"全平台统一美元"**），定价时的参考与毛利核算用，不再是对客结算基数（[`0007`](./0007-pricing-floor-and-settlement.md)） |
+| `pricing.price_plans` | 现状：四档 token 费率 + 来源 URL；现在它同时是对客结算基数 | 角色**收窄为渠道成本费率**，而且**只是"按 token 计量量计价"这一种计价形态的参数**（供给上的 `formula` 说这个渠道按什么计价，按张 / 按次或由上游直接给金额的供给**没有** Price Plan）：**费率表按渠道各自记、币种按该渠道的 `currency` 标注**（当前记的四档 `$5 / $10 / $8 / $30` 每 1M tokens 是 **AIHubMix** 的费率表、币种 **USD**；APIMart 的成本由上游 `cost` 直接给出，币种以渠道声明为准——**不是"全平台统一美元"**），定价时的参考与毛利核算用，不再是对客结算基数（[`0007`](./0007-pricing-floor-and-settlement.md) §1） |
 | `generation.jobs` | 受理时的请求事实 + 被选中的 `PublishedOffering` + Price Snapshot | 受理时固化的 `gateway_model` 就是对外的那个名字 |
 
 ### 1.3 命名与唯一性

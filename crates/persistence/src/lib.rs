@@ -10,8 +10,8 @@ use seeai_application::{
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
     GenerationJob, HitCandidate, ImageBranch, JobId, OfferingCandidate, OfferingId, PricePlanId,
-    PriceRates, PriceSnapshot, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
-    RouteStrategy, RuntimeRevisionId, VendorModelId,
+    PriceRates, PriceSnapshot, PricingFormula, PublishedModel, PublishedOffering,
+    PublishedRevision, RoutePolicy, RouteStrategy, RuntimeRevisionId, VendorModelId,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -155,6 +155,13 @@ impl HubRepository for PgHubRepository {
         // 判据按**候选声明的币种**（不是"这条候选带不带定价"）：币种是这条供给的成本口径，
         // 有没有定价不该让同一个币种在"能不能发布"这件事上前后不一致。
         for offering in &offerings {
+            // 发布期校验的判据是**这条供给声明的成本币种**：受理时按它取折算率、Driver 按它给
+            // 上游金额标注币种。币种是成本口径，与"这条供给按什么计价、带不带价目表"无关。
+            let cost_currency = offering.cost_currency().ok_or_else(|| {
+                ApplicationError::Validation(
+                    "every offering must declare the currency its cost is kept in".to_owned(),
+                )
+            })?;
             let effective: bool = sqlx::query_scalar(
                 r#"
                 SELECT EXISTS (
@@ -163,16 +170,15 @@ impl HubRepository for PgHubRepository {
                 )
                 "#,
             )
-            .bind(&offering.rates.currency)
+            .bind(cost_currency)
             .fetch_one(&mut *transaction)
             .await
             .map_err(database_error)?;
             if !effective {
                 transaction.rollback().await.map_err(database_error)?;
                 return Err(ApplicationError::Validation(format!(
-                    "no effective fx rate for {}; record one before publishing a candidate \
-                     whose cost is kept in that currency",
-                    offering.rates.currency
+                    "no effective fx rate for {cost_currency}; record one before publishing a \
+                     candidate whose cost is kept in that currency"
                 )));
             }
         }
@@ -259,8 +265,9 @@ impl HubRepository for PgHubRepository {
                 r#"
                 INSERT INTO supply.offerings
                     (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
-                     restrictions, carrier_schema, parameter_mapping, enabled)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true)
+                     restrictions, carrier_schema, parameter_mapping, enabled,
+                     formula, cost_unit_price_microusd)
+                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
                 "#,
             )
             .bind(offering_id.0)
@@ -271,32 +278,40 @@ impl HubRepository for PgHubRepository {
             .bind(&offering.restrictions)
             .bind(&offering.carrier_schema)
             .bind(&offering.parameter_mapping)
+            .bind(offering.formula.as_str())
+            .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-            let price_plan_id = PricePlanId::new();
-            sqlx::query(
-                r#"
-                INSERT INTO pricing.price_plans (
-                    id, offering_id, currency,
-                    text_input_microusd_per_million, image_input_microusd_per_million,
-                    text_output_microusd_per_million, image_output_microusd_per_million,
-                    source_url, approved_by
-                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                "#,
-            )
-            .bind(price_plan_id.0)
-            .bind(offering_id.0)
-            .bind(&offering.rates.currency)
-            .bind(to_i64(offering.rates.text_input_microusd_per_million)?)
-            .bind(to_i64(offering.rates.image_input_microusd_per_million)?)
-            .bind(to_i64(offering.rates.text_output_microusd_per_million)?)
-            .bind(to_i64(offering.rates.image_output_microusd_per_million)?)
-            .bind(&offering.price_source_url)
-            .bind(&actor)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
+            let price_plan_id = match &offering.rates {
+                Some(rates) => {
+                    let price_plan_id = PricePlanId::new();
+                    sqlx::query(
+                        r#"
+                        INSERT INTO pricing.price_plans (
+                            id, offering_id, currency,
+                            text_input_microusd_per_million, image_input_microusd_per_million,
+                            text_output_microusd_per_million, image_output_microusd_per_million,
+                            source_url, approved_by
+                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                        "#,
+                    )
+                    .bind(price_plan_id.0)
+                    .bind(offering_id.0)
+                    .bind(&rates.currency)
+                    .bind(to_i64(rates.text_input_microusd_per_million)?)
+                    .bind(to_i64(rates.image_input_microusd_per_million)?)
+                    .bind(to_i64(rates.text_output_microusd_per_million)?)
+                    .bind(to_i64(rates.image_output_microusd_per_million)?)
+                    .bind(offering.price_source_url.as_deref().unwrap_or_default())
+                    .bind(&actor)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                    Some(price_plan_id)
+                }
+                None => None,
+            };
             candidates.push(OfferingCandidate {
                 runtime_revision_id: revision_id,
                 vendor_model_id,
@@ -316,6 +331,8 @@ impl HubRepository for PgHubRepository {
                 price_snapshot: PriceSnapshot {
                     price_plan_id,
                     rates: offering.rates.clone(),
+                    formula: offering.formula,
+                    cost_unit_price_microusd: offering.cost_unit_price_microusd,
                     captured_at: now,
                     // 命中的候选就是这条候选本身：快照是**按候选**带下来的，选中哪条就把哪条
                     // 的快照固化进 Job，所以"这一笔的售价按谁算的"在快照里读得出来。
@@ -326,10 +343,10 @@ impl HubRepository for PgHubRepository {
                     }),
                     // 随修订发布的定价。保底额与汇率依赖这次请求（`(size, quality)` 与受理时刻），
                     // 发布侧算不出来，由受理用例算定后填。
-                    consumer_rates_cny: offering
-                        .pricing
-                        .as_ref()
-                        .map(|pricing| pricing.consumer_rates_cny.clone()),
+                    // 对客费率向量是这条供给的**对客计费基准**（发布期已保证有它、或有旧口径那份
+                    // Price Plan 费率），与"参考成本 / 保底表"那组定价参考各归各：渠道按张 / 按次
+                    // 计价或直接由上游给金额时，参考成本与保底表都没有着落，但这条供给照样要能卖。
+                    consumer_rates_cny: offering.consumer_rates_cny.clone(),
                     tier_prices: offering
                         .pricing
                         .as_ref()
@@ -345,26 +362,32 @@ impl HubRepository for PgHubRepository {
                         .pricing
                         .as_ref()
                         .map(|pricing| pricing.reference_cost_microusd),
-                    cost_currency: offering
-                        .pricing
-                        .as_ref()
-                        .map(|pricing| pricing.cost_currency.clone()),
+                    // 成本币种是**这条供给声明的事实**（带不带定价都有）：没有 Price Plan 时
+                    // 它是唯一的来源，那份声明也必须随快照冻结（Driver 拿它给上游金额标注币种、
+                    // 受理时按它取折算率）。
+                    cost_currency: offering.cost_currency().map(str::to_owned),
                     markup_bps,
                     fx_rate: None,
                 },
                 routing_priority: offering.routing_priority,
                 weight: offering.weight,
             });
+            // 成本币种按候选键记进修订：它是成本平面的币种，与有没有定价无关。
+            if let Some(currency) = offering.cost_currency() {
+                cost_currency.insert(offering_id.to_string(), Value::String(currency.to_owned()));
+            }
+            // 对客费率向量按候选键记进修订：它是这条供给的售价依据，与定价参考那组无关。
+            if let Some(rates) = &offering.consumer_rates_cny {
+                consumer_rates_cny.insert(
+                    offering_id.to_string(),
+                    serde_json::to_value(rates)
+                        .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+                );
+            }
             if let Some(pricing) = &offering.pricing {
                 let key = offering_id.to_string();
                 reference_cost_microusd
                     .insert(key.clone(), Value::from(pricing.reference_cost_microusd));
-                cost_currency.insert(key.clone(), Value::String(pricing.cost_currency.clone()));
-                consumer_rates_cny.insert(
-                    key.clone(),
-                    serde_json::to_value(&pricing.consumer_rates_cny)
-                        .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
-                );
                 cost_basis.insert(
                     key.clone(),
                     Value::String(pricing.cost_basis.as_str().to_owned()),
@@ -383,11 +406,11 @@ impl HubRepository for PgHubRepository {
                 "credential_env": offering.credential_env,
                 "restrictions": offering.restrictions,
                 "contract_carrier_hash": contract_carrier_hash(&capability_schema, &offering.carrier_schema)?,
-                "currency": offering.rates.currency,
-                "text_input_microusd_per_million": offering.rates.text_input_microusd_per_million,
-                "image_input_microusd_per_million": offering.rates.image_input_microusd_per_million,
-                "text_output_microusd_per_million": offering.rates.text_output_microusd_per_million,
-                "image_output_microusd_per_million": offering.rates.image_output_microusd_per_million,
+                "formula": offering.formula.as_str(),
+                "cost_unit_price_microusd": offering.cost_unit_price_microusd,
+                "cost_currency": offering.cost_currency(),
+                // 四档费率与价目出处只在有 Price Plan 时才有：它们属于 token 计量量这一种形态。
+                "rates": offering.rates,
                 "price_source_url": offering.price_source_url,
             }));
         }
@@ -464,7 +487,8 @@ impl HubRepository for PgHubRepository {
             .bind(revision_id.0)
             .bind(candidate.vendor_model_id.0)
             .bind(candidate.offering_id.0)
-            .bind(candidate.price_snapshot.price_plan_id.0)
+            // 这条供给的 Price Plan；它按 token 计量量计价时才有。
+            .bind(candidate.price_snapshot.price_plan_id.map(|plan| plan.0))
             .bind(&gateway_model)
             .bind(candidate.routing_priority)
             .bind(i32::try_from(candidate.weight).map_err(|_| {
@@ -527,6 +551,7 @@ impl HubRepository for PgHubRepository {
                 vm.id AS vendor_model_id, re.gateway_model, vm.native_revision,
                 vm.capability_schema, o.carrier_schema, o.parameter_mapping,
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
+                o.formula, o.cost_unit_price_microusd,
                 c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
                 p.id AS price_plan_id, p.currency,
                 p.text_input_microusd_per_million,
@@ -549,7 +574,8 @@ impl HubRepository for PgHubRepository {
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
-            JOIN pricing.price_plans p ON p.id = re.price_plan_id
+            --  LEFT JOIN：渠道不按 token 计量量计价的供给没有 Price Plan。
+            LEFT JOIN pricing.price_plans p ON p.id = re.price_plan_id
             WHERE re.active AND re.gateway_model = $1 AND {CANDIDATE_AVAILABLE_SQL}
             ORDER BY re.routing_priority ASC, o.id ASC
             "#
@@ -2306,6 +2332,38 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
     let channel_id = ChannelId(row.try_get("channel_id").map_err(database_error)?);
     let provider_kind: String = row.try_get("provider_kind").map_err(database_error)?;
     let pricing = row_candidate_pricing(row, offering_id.0)?;
+    let formula: String = row.try_get("formula").map_err(database_error)?;
+    let formula = PricingFormula::parse(&formula).ok_or_else(|| {
+        ApplicationError::Persistence(format!(
+            "the published pricing formula {formula} is not one this build knows"
+        ))
+    })?;
+    // 四档费率与价目行一起有、一起没有（LEFT JOIN 的两侧）：Price Plan 是 token 计量量那一种
+    // 计价形态的参数，另外几种形态的供给没有它。
+    let currency: Option<String> = row.try_get("currency").map_err(database_error)?;
+    let rates = match currency {
+        Some(currency) => Some(PriceRates {
+            currency,
+            text_input_microusd_per_million: read_rate_amount(
+                row,
+                "text_input_microusd_per_million",
+            )?,
+            image_input_microusd_per_million: read_rate_amount(
+                row,
+                "image_input_microusd_per_million",
+            )?,
+            text_output_microusd_per_million: read_rate_amount(
+                row,
+                "text_output_microusd_per_million",
+            )?,
+            image_output_microusd_per_million: read_rate_amount(
+                row,
+                "image_output_microusd_per_million",
+            )?,
+        }),
+        None => None,
+    };
+    let cost_currency = pricing.cost_currency.clone();
     Ok(OfferingCandidate {
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,
@@ -2325,26 +2383,17 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
         base_url: row.try_get("base_url").map_err(database_error)?,
         credential_env: row.try_get("credential_env").map_err(database_error)?,
         price_snapshot: PriceSnapshot {
-            price_plan_id: PricePlanId(row.try_get("price_plan_id").map_err(database_error)?),
-            rates: PriceRates {
-                currency: row.try_get("currency").map_err(database_error)?,
-                text_input_microusd_per_million: to_u64(
-                    row.try_get("text_input_microusd_per_million")
-                        .map_err(database_error)?,
-                )?,
-                image_input_microusd_per_million: to_u64(
-                    row.try_get("image_input_microusd_per_million")
-                        .map_err(database_error)?,
-                )?,
-                text_output_microusd_per_million: to_u64(
-                    row.try_get("text_output_microusd_per_million")
-                        .map_err(database_error)?,
-                )?,
-                image_output_microusd_per_million: to_u64(
-                    row.try_get("image_output_microusd_per_million")
-                        .map_err(database_error)?,
-                )?,
-            },
+            price_plan_id: row
+                .try_get::<Option<Uuid>, _>("price_plan_id")
+                .map_err(database_error)?
+                .map(PricePlanId),
+            rates,
+            formula,
+            cost_unit_price_microusd: row
+                .try_get::<Option<i64>, _>("cost_unit_price_microusd")
+                .map_err(database_error)?
+                .map(to_u64)
+                .transpose()?,
             captured_at: row.try_get("captured_at").map_err(database_error)?,
             // 命中候选就是这条候选：受理时选中哪条，就把它这份快照固化进 Job。
             hit_candidate: Some(HitCandidate {
@@ -2360,13 +2409,25 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
             hold_source: None,
             cost_basis: pricing.cost_basis,
             reference_cost_microusd: pricing.reference_cost_microusd,
-            cost_currency: pricing.cost_currency,
+            cost_currency,
             markup_bps: row.try_get("markup_bps").map_err(database_error)?,
             fx_rate: None,
         },
         routing_priority: row.try_get("routing_priority").map_err(database_error)?,
         weight: row_weight(row)?,
     })
+}
+
+/// 读四档费率里的一个金额。价目行在场时四列都是 NOT NULL（库层约束），读到 NULL 说明存储被
+/// 绕过——按错误处理，不把缺的那一档当 0（0 费率会把成本算成免费）。
+fn read_rate_amount(row: &sqlx::postgres::PgRow, column: &str) -> Result<u64, ApplicationError> {
+    let value: Option<i64> = row.try_get(column).map_err(database_error)?;
+    match value {
+        Some(amount) => to_u64(amount),
+        None => Err(ApplicationError::Persistence(format!(
+            "the published price plan has no {column}"
+        ))),
+    }
 }
 
 /// 读回一条候选的权重。

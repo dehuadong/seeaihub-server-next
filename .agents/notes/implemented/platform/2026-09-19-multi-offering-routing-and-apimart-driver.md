@@ -20,7 +20,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 交付内容：
 
 - **多 Offering 路由**：`publication.runtime_entries` 增加 `routing_priority`，唯一索引由「每型号一个 active 条目」改为「每型号每个优先级一个」；`active_offering` 返回**候选集合**（每个候选自带它自己的 `capability_schema`）；新增 `generation.routing_decisions` 记录受理时的判定。
-- **发布接口形状**：`PublishRuntimeCommand` 支持 `offerings` 数组与 `price_plan`（三例确定性形状判别）；数据库端口只接受已核验的 `PublishRuntimeRequest`。
+- **发布接口形状**：`PublishRuntimeCommand` 只接受 `offerings` 候选数组（每条候选自带渠道、承载面与计价）；数据库端口只接受已核验的 `PublishRuntimeRequest`。
 - **APIMart Driver**：任务式（提交 → 轮询 → 取图 → 证据提取 → 错误分类）；错误分类只依据 `error.code`，未知状态继续轮询，查询阶段错误一律进对账。
 - **参考图/遮罩路径（上传）**：APIMart 只接受公网 URL 且不再接受 base64，因此 Driver 在**提交生成任务之前**先调 `POST /v1/uploads/images` 换取 URL，再把 URL 回填到原生参数；上传失败＝**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**。**2026-09-19 经用户批准做了真实受控验证**（1 次直连 + 1 次走我们自己的 API+Worker，两次生成合计不足 $0.03），据此两条分支已开放（`allowed_branches` 加上 `image_conditioned`/`masked`，`max_images: 16`）。证据见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 上传节与 `docs/verification/paid-provider-calls.md` 的图生图实测节。
 - **资产绑定路径不再写死字段名**：`AssetBinding.native_parameter_path` 现在真正是**厂商原生参数路径**（APIMart 的 `/image_urls/0`、`/mask_url`），不再硬编码 `image`/`images`/`mask`——这正是 `docs/adr/0002` 要求的"由厂商自己的 Schema 声明原生字段路径"。平台只在**一处**判定"这个参数装的是参考图还是遮罩"（名字以 `image` 开头 / 含 `mask`，其余一律拒绝），发布期校验与运行期用的是同一个函数；Driver 侧同样按路径回填，不自己决定键名。

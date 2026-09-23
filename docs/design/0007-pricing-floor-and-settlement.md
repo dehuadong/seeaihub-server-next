@@ -10,18 +10,40 @@
 
 本文节号是拆分后的连续编号，与拆分前单文件的对照见提案评论中的评审记录。
 
-## 1. 现状：两个渠道都是 token 计费，成本来源有两态
+## 1. 两层：渠道怎么计价（事实），平台卖多少钱（运营）
 
-**两家渠道都是 token 计费**；**费率表按渠道各自记，币种按该渠道声明的 `currency` 标注**（§8）——当前记的四档 `$5 / $10 / $8 / $30`（每 1M tokens：文本输入 / 文本输出 / 图像输入 / 图像输出）是 **AIHubMix** 的费率表、币种 **USD**，**不是"全平台统一美元"**。差别只在**成本从哪来**，所以成本来源只有两态（都在**成本平面、币种按渠道**，§8）：
+**计价形态是渠道事实**：这个渠道的这个模型**按什么计价**由渠道决定，平台如实登记（出处是渠道文档或实测），它决定**成本**怎么算——也就是平台与渠道之间怎么结算。**它不是运营的选项**：管理员最多是登记或更正这条事实（与登记其他渠道事实一样，写审计），平台也不做"选一种计价方式"的入口。
 
-| 渠道 | 成本来源 | 现状 |
+| 计价形态 | 参数 | 成本怎么算（渠道没给金额时） |
 | --- | --- | --- |
-| **AIHubMix** | **`Computed`**：上游只返回四分项 token、**没有任何金额字段** ⇒ 成本 = Σ(**实际** 分项 token × 该渠道的四档费率) | 费率在 `pricing.price_plans`（**按渠道挂**），现在**同时**当对客结算基数；本设计把它的角色**收窄为渠道成本费率**（定价时的参考口径 + 毛利核算），不再是对客结算基数（§2/§3） |
-| **APIMart** | **`Declared`**：上游任务终态**直接返回 `cost`**（**币种以渠道声明为准，不假定 USD**）⇒ **直接取它，不需要我们自己算**——它比自算 | **当前既不采纳也不留存**（`crates/adapter-apimart` 头注明确），要算毛利必须开始采集 |
+| `token_rates`：按四分项 token 计量量 | Price Plan（该渠道的四档费率 + 币种 + 价目出处） | 本次**实际用量**的四个分项 × 该渠道四档费率 |
+| `per_image`：按产出张数 | 每张单价 | **产出的张数** × 单价 |
+| `per_call`：按调用次数 | 每次单价 | **1 次** × 单价 |
+| `upstream_declared`：上游终态直接给实扣金额 | 无 | 取上游给的金额；上游没给就是**成本缺口**，不编一个数 |
+
+**上游给了金额就以金额为准**（§7）：渠道终态直接给 `cost` 时直接取它，比自算权威；**只有拿不到金额时，才按登记的计价形态自算**。
+
+**Price Plan 是 `token_rates` 这一种形态的参数**：该渠道按 token 计量量计价时的那份四档费率、币种与价目出处，**不是每条供给的必填**——渠道按张 / 按次计价、或直接由上游给金额时，这条供给没有 Price Plan（`migrations/0013_offering_pricing_formula.sql` 因此放开 `publication.runtime_entries.price_plan_id` 非空）。计价形态落在 `supply.offerings.formula` 上、按张/按次的单价落在 `supply.offerings.cost_unit_price_microusd` 上，两者随修订发布、随 Job 快照冻结。**放开的边界是"其它形态可以不发费率表"，不是"`token_rates` 也可以不发"**：形态必填且取值受控，`token_rates` 缺那份四档费率、`per_image` / `per_call` 缺单价，发布期一律 400 并说清缺什么。
+
+**成本币种是这条供给声明的事实**（`cost_currency`，缺省取 Price Plan 的币种）：上游报回来的金额不带币种，按张 / 按次的单价也要说清是哪个币种的钱，所以没有 Price Plan 时必须显式声明。折算率按该币种取"受理时刻生效的那一行"并**随快照冻结**（§2/§8）——成本（上游声明的或按形态自算的）要折成人民币才算得出毛利。
+
+**平台层是对客定价（运营）**：卖多少钱走**按候选发布的对客费率向量**（§2），与计价形态无关——**同一份渠道事实可以卖出不同的价**。两个载体各归各：Price Plan 与 `cost_unit_price_microusd` 是**渠道成本**侧的参数，Price Snapshot 里的 `consumer_rates_cny` 是**对客售价**的冻结快照（§2/§3）。
+
+**可被路由的供给必须能给出对客计费基准**：对客费率向量（今天的方式），或 Price Plan 的那份费率（旧口径——历史修订与"迁移后仍生效但没有定价的旧修订"结算时读的就是它）。两样都没有就**发布期拒**：这条供给一旦生效，受理与结算都算不出该收多少钱，而按 0 收等于白送。它**与计价形态无关**：`upstream_declared` / `per_image` / `per_call` 不必发 Price Plan，但仍要给对客费率向量——因此"不带价目表也能发布"成立，而"连对客价一起没有"不成立。
+
+费率表按渠道各自记、币种按该渠道声明的 `currency` 标注——当前记的四档 `$5 / $10 / $8 / $30`（每 1M tokens：文本输入 / 文本输出 / 图像输入 / 图像输出）是 **AIHubMix** 的表、币种 **USD**，**不是"全平台统一美元"**。
+
+**两家渠道各自的计价事实**（依据 [`docs/facts/channel-facts.md`](../facts/channel-facts.md)）：
+
+| 渠道 | 计价形态 | 成本来源 | 口径 |
+| --- | --- | --- | --- |
+| **AIHubMix** | `token_rates`：费率在 `pricing.price_plans`（**按供给挂**） | **`Computed`**：上游只返回四分项 token、**没有任何金额字段** ⇒ 成本 = Σ(**实际** 分项 token × 该渠道的四档费率) | 它的角色**收窄为渠道成本费率**（定价时的参考口径 + 毛利核算），**不再是对客结算基数**（§2/§3） |
+| **APIMart** | `upstream_declared`：**没有** Price Plan | **`Declared`**：上游任务终态**直接返回 `cost`**（**币种以渠道声明为准，不假定 USD**）⇒ **直接取它，不需要我们自己算**——它比自算 | 上游声明的金额只进毛利口径，**不改对客金额**；上游没给就是成本缺口（§7） |
 
 **实测事实**：APIMart 的 `cost` 我们实测过，返回 `cost = 0.011354`（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 计量节）。
 
-依据：[`docs/facts/channel-facts.md`](../facts/channel-facts.md)。`ADR-0006` 同时定下"`cost` 只用于核成本，**不替代计量事实**"——所以采集 `cost` 不违反那条决定，也不是复活已被否决的"金额型计量证据"（`ADR-0012` 存根）。**"按张计费"这一形态不存在**：两家都是 token 计费，因此本文 §1–§8 不再有"按张 / 按 token"的二分（§6 的预授权保底额是另一回事，见 [`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6）。
+`ADR-0006` 同时定下"`cost` 只用于核成本，**不替代计量事实**"，并且写明**成本按渠道各自的口径取数**——将来接入按次数或按张数计费的渠道，成本就按该渠道的计费单位取数。计价形态的取值面与成本算法按这条落地；"按张 / 按次"这两形态本仓库当前两家渠道都不用，取值面与算法仍然就位。§7 的 `provider_cost_source` 是**这一次的钱从哪来**（三态：`declared` / `computed` / `unavailable`），计价形态是**这个渠道按什么单位算钱**，两者层级不同、都不由对客定价决定（§8）。
+
 
 ## 2. 定价公式与各量的落点
 
@@ -31,7 +53,7 @@
 
 **售价是一组"按候选的对客费率向量"，不是由一个单值乘出来的**（Plan Review 终轮定案）：随修订发布、随 Job 快照冻结的是 `runtime_revisions.consumer_rates_cny`（**按候选键**、**四档 CNY** 费率），由管理员按上式**设定/推导**（也可直接录入）；`reference_cost_microusd`（**单值、原币种**）**只作定价参考**，**不再是售价的被乘数**——单值推不出四档向量（§3/§4）。
 
-**对客费率向量按该次请求命中的候选取**（§4）：它**按候选（offering）发布**（[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6），加价系数与汇率由后台设，**同一网关模型不同候选价格不同**。**对客只有 CNY 一个币种**（§8）：公式右边是**该候选的原币种成本费率**与**该币种 → CNY 的折算率**，左边落在**人民币售价**上。**两家渠道都是 token 计费**（§1），所以这条公式按**四档 token 费率**逐档成立；`Declared` 渠道的参考成本是发布者给的可核值，**上游实际 `cost` 只影响毛利**（实际成本 vs 对客售价），**不改对客金额**，实际成本仍按 §7 在结算时取上游声明（两者是两个量）。
+**对客费率向量按该次请求命中的候选取**（§4）：它**按候选（offering）发布**（[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6），加价系数与汇率由后台设，**同一网关模型不同候选价格不同**。**对客只有 CNY 一个币种**（§8）：公式右边是**该候选原币种的单位成本**与**该币种 → CNY 的折算率**（按 token 计量量计价的候选是四档 token 费率，所以这条公式按四档逐档成立；按张 / 按次计价的候选先把每张 / 每次单价折成人民币再定售价），左边落在**人民币售价**上。`Declared` 渠道的参考成本是发布者给的可核值，**上游实际 `cost` 只影响毛利**（实际成本 vs 对客售价），**不改对客金额**，实际成本仍按 §7 在结算时取上游声明（两者是两个量）。
 
 **受理时选中候选之后售价即已定**：策略在受理时已经定下候选（`select_candidate` 在 `create_job` 之前，[`0008`](./0008-routing-strategy-and-caching.md) §2），所以售价**不必等上游回来**；受理时把该候选的 `consumer_rates_cny` **随 Job 的 Price Snapshot 冻结**（§3），**结算只读那份快照**——受理之后改汇率、改加价系数、重发修订都不影响已受理的 Job（`ADR-0003`）。公式里的"成本费率"因此是**发布数据里的候选成本口径**，不是"命中候选在运行期报出来的实际成本"——后者只进 `attempts`，只用于毛利核算（§5）。**预授权**则另走保底表（§6），与这条公式无关（**不由售价派生**）。
 
@@ -57,11 +79,14 @@
 
 ## 3. 售价与保底快照随 Job 冻结
 
-`PriceSnapshot`（`crates/domain`，现在只有 `price_plan_id` + 四档 `rates` + `captured_at`）扩展为：
+`PriceSnapshot`（`crates/domain`）承载这些量：
 
 ```
 PriceSnapshot {
-    price_plan_id,
+    formula: token_rates | per_image | per_call | upstream_declared,   // 这条供给的**计价形态**（渠道事实，§1）：决定渠道没给金额时成本怎么算；历史快照缺这个键时按 token_rates 读（那一天只有这一种形态）
+    cost_unit_price_microusd,                                  // per_image / per_call 的**单价**（成本平面微单位，币种见 cost_currency）；另外两种形态为 None
+    price_plan_id,                                             // 这条供给的 Price Plan；只有 token_rates 有（其它形态为 None）
+    rates,                                                     // Price Plan 的四档费率（成本平面，币种见 `rates.currency`）；没有 Price Plan 时为 None
     // ---- 对客平面：全部 CNY（§8）----
     hit_candidate,                                             // 受理时选中并冻结：本次命中的候选（offering_id / channel）——**售价按它算**（§4）
     consumer_rates_cny,                                        // **随修订发布、受理时随快照冻结**：**该候选的对客四档 token 费率向量（CNY）**，由管理员按"该候选成本费率 ×(1 + markup_bps)× 该币种 → CNY 汇率"设定/推导（实收依据，§2/§4）
@@ -70,18 +95,20 @@ PriceSnapshot {
     hold_microusd,                                             // 受理时算定并冻结：本次请求的**保底额（CNY 微单位）**（§6；**不由售价派生**）
     hold_source,                                               // 保底额来源：供给档位查表（含像素型 size 归位到档位）/ size=auto 取默认档 2K / 该供给封顶保底值 / 平台兜底（§6，事后可辨"这次为什么冻这么多"）
     // ---- 成本平面：原币种（按渠道声明的 `currency`），以及定价与折算用的汇率（§8）----
-    cost_basis: Computed | Declared,                           // 成本来源的**标签**（**按候选键**随修订发布：runtime_revisions.cost_basis，随快照冻结）：它只说"这笔成本按哪种来源取"，**载荷不带在它身上**——`Computed` 要的那份四档渠道成本费率就在本快照的 `rates` 里、`Declared` 要的币种就在 `cost_currency` 里。载荷各归各位，是因为它们本来就有各自的出处与币种（`rates` 来自价格计划、`cost_currency` 来自该候选的声明），让标签再抄一份就等于同一件事有两个权威（§7）
+    cost_basis: Computed | Declared,                           // 成本来源的**标签**（**按候选键**随修订发布：runtime_revisions.cost_basis，随快照冻结）：它只说"这笔成本按哪种来源取"，**载荷不带在它身上**——`Computed` 要的计价形态与参数就在本快照的 `formula` / `rates` / `cost_unit_price_microusd` 里、`Declared` 要的币种就在 `cost_currency` 里。载荷各归各位，是因为它们本来就有各自的出处与币种（四档费率来自 Price Plan、单价与形态来自该供给的登记、`cost_currency` 来自该供给的声明），让标签再抄一份就等于同一件事有两个权威（§7）
     reference_cost_microusd,                                   // 随修订发布：**该候选的**渠道成本（**原币种**微单位，按候选键；**只作定价参考，不是售价的被乘数**；§2/§4）
-    cost_currency,                                             // 随修订发布：该候选的成本币种（按候选键；§8）
+    cost_currency,                                             // 随修订发布：这条供给声明的成本币种（按候选键；§1/§8）——声明了它，受理时就把该币种的折算率冻结下来（毛利要用）
     markup_bps,                                                // 随修订发布：加价系数，**参与设定该候选的对客费率向量**（§2）
     fx_rate,                                                   // 受理时按 `cost_currency` 从全局 `pricing.fx_rates` 取**受理时刻生效的那一行**并快照：**该币种 → CNY**，定点整数（如 1e6 分母），不使用浮点；管理员设定对客费率向量时按同一口径取率，快照里这一份值也用于**成本折算（毛利）**；受理之后不再换算
     captured_at,
 }
 ```
 
-`charge_microusd(usage)` 从"Σ token × 费率"改为"**只读快照 + 本次实际用量**"：实收 = **快照里的对客四档 token 费率（`consumer_rates_cny`，CNY——**命中候选的售价**，§4）× 实际 `usage` 的分项 token（真值）**，**不封顶在保底额**——实际超过保底额时差额把余额扣成负数（**透支发生在结算**，§6）。**对客金额全程 CNY、不做实时汇率换算**（售价随修订发布、受理时随快照冻结，§8）。成本侧按 `cost_basis` 取数（**原币种**，币种记在 `cost_currency` / `provider_cost_currency`）：`Computed` = 实际分项 token × 该渠道四档成本费率自算；`Declared` = 直接取上游声明的 `cost`——**成本只进毛利口径，不改对客金额**（§5）。毛利核算时用快照里的 `fx_rate`（该币种 → CNY）把成本折算成 CNY（§5/§8）。
+`charge_microusd(usage)` 从"Σ token × 费率"改为"**只读快照 + 本次实际用量**"：实收 = **快照里的对客四档 token 费率（`consumer_rates_cny`，CNY——**命中候选的售价**，§4）× 实际 `usage` 的分项 token（真值）**，**不封顶在保底额**——实际超过保底额时差额把余额扣成负数（**透支发生在结算**，§6）。**对客金额全程 CNY、不做实时汇率换算**（售价随修订发布、受理时随快照冻结，§8）。**实收的取值链只有两条**：命中候选的 `consumer_rates_cny`，以及没有它时的**旧口径**（Price Plan 的四档费率兼作对客费率，历史 Job 与"迁移后仍生效但没有定价的旧修订"都走这条）。**两条都没有 = 这条供给没有对客计费基准**：**发布期就拒**——可被路由的供给必须能给出对客计费基准（"不带价目表也能发布"说的是不必发那份四档费率，不是连对客价一起没有，§1）；真要遇到（只有历史修订才可能），**不按 0 结算**（0 元等于白送，还会在账上留下一条"收过钱"的 0 元记录），按**平台侧故障**处置（今天那条路是"结算失败进对账"）。
 
-**"档位 → 每张价"不再是计价单位**：两家渠道都是 token 计费（§1），所以实收只有 token 一个口径；`tier_prices` 里的每张价**只用于定价参考与展示**，不参与受理时的预授权，也不参与结算。
+成本侧按 [`Self::formula`] 取数（**原币种**，币种记在 `cost_currency` / `provider_cost_currency`），**上游给了金额就先取它**（§7）：`token_rates` = 实际分项 token × 该渠道四档成本费率自算；`per_image` = **产出的张数** × 单价；`per_call` = **1 次** × 单价；`upstream_declared` = 平台没有可算的参数，上游没给就是**成本缺口**。拿不到参数或用量（失败件没有用量与产出张数、形态是 `upstream_declared` 而上游没给）按 `unavailable` 落——**成本只进毛利口径，不改对客金额**（§5）。毛利核算时用快照里的 `fx_rate`（该币种 → CNY）把成本折算成 CNY（§5/§8）。
+
+**"档位 → 每张价"不是计价单位**：`tier_prices` 里的每张价（CNY）是**对客定价的参考与展示**，与渠道按什么计价无关；它不参与受理时的预授权，也不参与结算。渠道按张计价时，成本用的是**该供给登记的每张单价**（`cost_unit_price_microusd`，原币种），不是这张对客价目表。
 
 **历史兼容**：`price_snapshot` 是 jsonb，**缺 `consumer_rates_cny` / `hold_microusd`** ⇒ 按旧口径（`Σ token × 已发布费率`）结算，结果与今天逐位相同。缺它有两种来源，都走这条路：① 已受理的历史 Job（快照本身就是旧的）；② 迁移后仍生效、但**没有定价**的旧修订受理出的新 Job（[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6：定价列留 NULL）。两种来源的 **保底口径也一致**：缺 `hold_microusd` 时回落到 `GENERATION_MAX_COST_MICROUSD`，即**今天的行为**（§6）。历史 Job 的查询与结算行为不变（验收第 9 条）。
 
@@ -101,7 +128,7 @@ PriceSnapshot {
 
 - **对客结算只读 Job 固化的费率快照**：实收 = `price_snapshot.consumer_rates_cny`（**命中候选的**对客四档 token 费率，**CNY**，§4）× **实际 `usage` 的分项 token（真值）**，**不封顶在保底额**（§3/§6：按实际扣费，超出部分在结算时透支）。`attempts` 里的渠道成本**只用于毛利核算**——它**不参与对客结算**，不改对客金额，也不改预授权额（§6）。**`Declared` 的实际 `cost` 只影响毛利**（实际成本 vs 对客售价），**不改对客金额**——对客金额只由受理时冻结的 `consumer_rates_cny` 决定（§2）。
 - **售价**：`ledger.entries`（`kind = 'capture'`，金额为负）+ `ledger.holds`（授权额）——账本是权威（`ADR-0003`）；另在 `generation.jobs` 加 `charge_microusd` 列（结算时写入）作为**投影**，便于按 job 直接查，权威仍是账本。**这一列缓做**：账本已经查得到，它只是查询便利，不阻塞任何切片（P2b 工单）。
-- **成本**：`generation.attempts` 新增 `provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）、`provider_cost_currency`、`provider_cost_source`（**两态 + 异常态**：`computed` / `declared` / `unavailable`，判据见 §7；`computed` = 实际分项 token × 该渠道四档费率自算，`declared` = 直接取上游 `cost`）与 `provider_cost_cny_microusd`（**折算后 CNY**，用快照的 `fx_rate`——该币种 → CNY——折出，毛利用）。**异步写入**（结算时才拿得到）。
+- **成本**：`generation.attempts` 新增 `provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）、`provider_cost_currency`、`provider_cost_source`（**两态 + 异常态**：`computed` / `declared` / `unavailable`，判据见 §7；`declared` = 直接取上游 `cost`，`computed` = 按该供给登记的**计价形态**自算：分项 token × 四档费率 / 张数 × 单价 / 1 次 × 单价）与 `provider_cost_cny_microusd`（**折算后 CNY**，用快照的 `fx_rate`——该币种 → CNY——折出，毛利用）。**异步写入**（结算时才拿得到）。
 - **毛利** = 售价（快照，**CNY**）− 成本**折算后 CNY**（`attempts.provider_cost_cny_microusd`，由**原币种**原值 × 快照的 `fx_rate` 折出），按 job 可查；**两条线分开留痕**（售价/扣费记 CNY、成本记**原币种**原值 + 币种 + 折算汇率 + 折算后 CNY，§8）；成本缺失（`unavailable`）时标"成本未知"，不猜（§7）。
 - **边界**：把成本**写进账本**（`ledger.entries` 的 `adjustment` 分录）与账实核对归工单 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)（成本进账本与账实核对那部分），**本设计不做**——同一件事不做两遍，也不在这里预先决定成本条目的会计语义。
 
@@ -132,7 +159,7 @@ PriceSnapshot {
 **结算按实际，不封顶在保底额**（§3/§5）：
 
 - **对客实收** = `consumer_rates_cny`（**命中候选的**对客四档 token 费率，**CNY**，§4）× **实际 `usage` 的分项 token（真值）**；**不再取 min(算出额, hold)**——保底额只是预授权，实际多少就扣多少；
-- **成本侧**按 `cost_basis` 取数（§7，**原币种**）：`Computed` = 实际分项 token × 该渠道四档成本费率自算；`Declared` = **直接取上游 `cost`**；
+- **成本侧**按**登记的计价形态**取数（§1/§7，**原币种**），上游给了金额就先取它：`token_rates` = 实际分项 token × 该渠道四档成本费率自算；`per_image` = 产出的张数 × 单价；`per_call` = 1 次 × 单价；`upstream_declared` = **直接取上游 `cost`**；
 - **余额可为负（透支发生在结算，不在受理）**：实际超过保底额时余额被扣成负数，这是**允许的结果**，不是错误；**下一次受理按当时的余额判**（可能已为负）⇒ 402。透支的追补属**运营 / 充值流程**（本设计不展开）。**透支依赖该迁移**：`migrations/0001_initial.sql` 现有 `ledger.accounts.balance_microusd` 的 `CHECK (balance_microusd >= 0)`、`ledger.holds.amount_microusd` 的 `CHECK (amount_microusd > 0)` 与 `generation.jobs.max_cost_microusd` 的 `CHECK (max_cost_microusd > 0)` 三处都拦着负余额 / 零保底额——**P2b 的迁移必须同时放宽这三处**（`balance_microusd` 去掉 `>= 0`，另两处改 `>= 0`），否则透支与"保底额可为 0"在库层面直接报错（P2b 工单）。
 
 `GENERATION_MAX_COST_MICROUSD` **只作"连供给封顶保底值都没有时的兜底保底额"**，不再是任何形式的上限：
@@ -154,10 +181,10 @@ PriceSnapshot {
 | `provider_cost_source` | 判据 | 谁是这样 |
 | --- | --- | --- |
 | `declared` | 渠道在终态**直接给了 `cost`**，且解析成功（金额与币种都拿得到）——**直接取它，不需要我们自己算**（比自算更权威） | APIMart（实测 `cost = 0.011354`，`ADR-0006` 的渠道口径） |
-| `computed` | 渠道**不给金额字段**，平台按**实际 `usage` 的分项 token × 该渠道四档费率**自算（币种按该渠道的 `currency`） | AIHubMix |
-| `unavailable` | 声明了但**缺字段 / 负数 / 解析失败**，或该次执行根本没拿到终态金额 | 任一渠道的异常情形 |
+| `computed` | 渠道**不给金额字段**，平台按这条供给登记的**计价形态**自算（§1）：`token_rates` = 实际 `usage` 的分项 token × 该渠道四档费率；`per_image` = 产出的张数 × 单价；`per_call` = 1 次 × 单价（币种按该渠道声明的 `cost_currency`） | AIHubMix（`token_rates`）；按张 / 按次的渠道接进来时同样走这一态 |
+| `unavailable` | 声明了但**缺字段 / 负数 / 解析失败**，或该次执行根本没拿到终态金额；**也包括算不出来**：形态是 `upstream_declared` 而上游没给、按张计价却拿不到产出张数（失败件没有用量与张数）、快照里没有那份费率或单价 | 任一渠道的异常情形 |
 
-**`unavailable` 的处置（"APIMart 未声明 `cost` 或解析失败"）**：**不得猜测**——不记 0、不用"token × 费率"顶替、不用上一次的值（`ADR-0006`：证据缺字段、负数或解析失败时不得猜测费用，进对账）。具体是：`provider_cost_microusd` / `provider_cost_currency` 留 NULL、`provider_cost_source` 记 `unavailable`，该笔**成本缺口进对账**、毛利标"成本未知"，人工核对上游账单后再补录（补录与账实核对归 [#11 可靠性与钱的闭环](https://github.com/dehuadong/seeaihub-server-next/issues/11)）。
+**`unavailable` 的处置（"APIMart 未声明 `cost` 或解析失败"）**：**不得猜测**——不记 0、不用"token × 费率"顶替、不用上一次的值（`ADR-0006`：证据缺字段、负数或解析失败时不得猜测费用，进对账）。具体是：`provider_cost_microusd` / `provider_cost_currency` 留 NULL、`provider_cost_source` 记 `unavailable`，该笔**成本缺口进对账**、毛利标"成本未知"，人工核对上游账单后再补录（补录与账实核对归 [#11 可靠性与钱的闭环](https://github.com/dehuadong/seeaihub-server-next/issues/11)）。**失败件也走这一套**：它手里没有本次用量与产出张数，自算那几态因此一律算不出金额、落到缺口；只有"请求根本没交到渠道"的执行才四列留空（那是"根本没采"，见 [`docs/architecture.md`](../architecture.md)）。
 
 **"进对账"的确切落法是一张只读的「成本缺口清单」**（`GET /api/v1/provider-cost-gaps`，管理员面，带上游对账标识）：**不开对账案例、也不把 Job 推进 `reconciliation_required`**——对账案例的处置路径是退款，而成本缺口没有任何东西可退（对客结算已经按费率快照正常完成）；把两件事混成一个待办，只会让运营既不知道该退什么、也看不到缺口。运营拿清单里的对账标识去核上游账单，补录完成后该笔不再出现在清单里（清单的判据就是"来源是 `unavailable`"）。
 
@@ -165,15 +192,15 @@ PriceSnapshot {
 
 ## 8. 两个币种平面：对客 CNY，成本按渠道声明的币种
 
-**平台对客只有人民币（CNY）单币种**（用户澄清："用户充值难道还是多币种？"）——用户充值、余额、售价、保底额、扣费**一律人民币**；**成本平面则是"渠道各自的原币种"**：渠道 / 供给带 **`currency`**（发布数据 / 渠道配置的一部分），成本按**该币种**记原值——**可能是 USD、CNY 或别的，不假定 USD**（四档 token 费率表也是**按渠道各自记、按该渠道币种标注**：`$5/$10/$8/$30` 每 1M 是 **AIHubMix** 的 USD 费率表，不是"全平台统一美元"，§1）。两个平面**分开记、分开核**：
+**平台对客只有人民币（CNY）单币种**（用户澄清："用户充值难道还是多币种？"）——用户充值、余额、售价、保底额、扣费**一律人民币**；**成本平面则是"渠道各自的原币种"**：每条供给声明它自己的 **`cost_currency`**（发布数据的一部分，缺省取它 Price Plan 的币种），成本按**该币种**记原值——**可能是 USD、CNY 或别的，不假定 USD**（四档 token 费率表也是**按渠道各自记、按该渠道币种标注**：`$5/$10/$8/$30` 每 1M 是 **AIHubMix** 的 USD 费率表，不是"全平台统一美元"，§1）。两个平面**分开记、分开核**：
 
 | 平面 | 币种 | 包含 | 落在哪 |
 | --- | --- | --- | --- |
 | **对客平面** | **CNY**（单币种） | 充值、余额、售价（对客四档 token 费率 / 档位价目表）、**保底额（hold）**、扣费（实收） | `ledger.accounts.balance_microusd`、`ledger.entries`、`PriceSnapshot.consumer_rates_cny` / `tier_prices` / `hold_microusd`、`runtime_revisions.floor_amounts` |
-| **成本平面** | **渠道声明的 `currency`**（不假定 USD） | 候选的渠道成本（发布数据）与实际成本（`Computed` = `usage` 分项 × 该渠道四档费率；`Declared` = 上游 `cost`） | `generation.attempts.provider_cost_microusd` / `provider_cost_currency` / `provider_cost_cny_microusd`、`runtime_revisions.reference_cost_microusd` / `cost_currency`、`PriceSnapshot.reference_cost_microusd` / `cost_currency` / `fx_rate` |
+| **成本平面** | **该供给声明的 `cost_currency`**（不假定 USD） | 候选的渠道成本（发布数据）与实际成本（`Computed` = 按该供给的计价形态自算：分项 token × 四档费率 / 张数 × 单价 / 1 次 × 单价；`Declared` = 上游 `cost`） | `generation.attempts.provider_cost_microusd` / `provider_cost_currency` / `provider_cost_cny_microusd`、`runtime_revisions.reference_cost_microusd` / `cost_currency`、`supply.offerings.cost_unit_price_microusd`、`PriceSnapshot.reference_cost_microusd` / `cost_currency` / `cost_unit_price_microusd` / `fx_rate` |
 
 - **对客金额不做实时汇率换算**：售价是**按候选发布的 CNY 对客费率向量**（`consumer_rates_cny`，随修订发布、受理时随快照冻结），结算**只读 CNY 的快照**（`consumer_rates_cny` × 实际 `usage` 分项 token；保底额直接就是 CNY）——**受理之后全程不出现外币换算**；
-- **汇率是"渠道币种 → 对客币种（CNY）"的一组折算率**（**按币种维护**，后台设）：`pricing.fx_rates` 按 `currency` 给率**并带生效时间**，**取值规则＝按生效时间取"受理时刻生效的那一行"**，把该行**原值快照**进 Price Snapshot（`fx_rate`）。它**在管理员设定对客费率向量时参与推导**（§2），同一份快照值也用于**把实际成本折算成人民币**（毛利核算），**受理之后不再换算**；
+- **汇率是"渠道币种 → 对客币种（CNY）"的一组折算率**（**按币种维护**，后台设）：`pricing.fx_rates` 按 `currency` 给率**并带生效时间**，**取值规则＝按生效时间取"受理时刻生效的那一行"**，把该行**原值快照**进 Price Snapshot（`fx_rate`）。它**在管理员设定对客费率向量时参与推导**（§2），同一份快照值也用于**把实际成本折算成人民币**（毛利核算），**受理之后不再换算**。**冻结的条件是"这条供给声明了成本币种"**（每条新发布的供给都声明它，见 §1）——上游声明的金额与按形态自算出来的金额都要折成人民币才算得出毛利，所以受理时就把折算率冻下来；旧修订受理出的历史 Job 快照里没有这条声明，那时不冻结（毛利那一笔算不出来，标"成本未知"）；
 - **售价 = 按候选发布的四档对客费率向量 `consumer_rates_cny`**（管理员按"该候选的成本费率 ×(1 + 加价系数)× 汇率"设定/推导，**以 CNY 表达**），**按命中候选取、随修订发布并随 Job 快照冻结**；`reference_cost_microusd` **只作定价参考，不是售价的被乘数**（§2/§4）；
 - **保底额是 CNY**：OpenAI 系 **1K = ¥0.16 / 2K = ¥0.25 / 4K = ¥0.3**（**币种＝CNY，已确认**，[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6 与本文 §6）；
 - **快照写清两条线**：**售价 / 保底 / 扣费记 CNY**；**成本记原币种金额 + 币种 + 当时汇率 + 折算后 CNY**（毛利用）——两条线分开，便于核对；
@@ -186,9 +213,9 @@ PriceSnapshot {
 | 需要的信息 | 现在落在哪 | 缺什么 / 补什么 |
 | --- | --- | --- |
 | **模型** | `generation.jobs.gateway_model`（迁移 0004 已把列名收口为"平台型号名"） | 无需新列；语义随本设计变成"网关模型名" |
-| **张数** | 请求侧：`jobs.native_parameters->>'n'`；结果侧：`jobs.result_images` 的数组长度 | 两个口径都要写死：**预授权（保底额）按供给查保底表**（不按张数乘单价，§6）；**实收（charge）按实际 `usage` 的分项 token**（**两家渠道都是 token 计费**，不按张数，§3/§6），**不封顶在保底额**（超出部分在结算时透支）。张数两处都在库里，不新增列，作为记录与核对信息保留 |
+| **张数** | 请求侧：`jobs.native_parameters->>'n'`；结果侧：`jobs.result_images` 的数组长度 | 两个口径都要写死：**预授权（保底额）按供给查保底表**（不按张数乘单价，§6）；**实收（charge）按实际 `usage` 的分项 token**（对客费率向量是四档 token 费率，不按张数，§3/§6），**不封顶在保底额**（超出部分在结算时透支）。**张数另有用途**：渠道按张计价时它是**成本**自算的乘数（§1/§7）。两处都在库里，不新增列，作为记录与核对信息保留 |
 | **扣费金额** | `ledger.entries`（`kind='capture'`）+ `ledger.holds`（授权额）；**Job 上没有** charge 列。**币种 CNY**（对客平面，§8） | 账本是权威（`ADR-0003`）；**补** `generation.jobs.charge_microusd`（结算时写入）作为投影，便于按 job 查——**缓做**（§5） |
-| **平台成本价** | **没有**：APIMart 的 `cost` 不采纳不留存；AIHubMix 的金额要自算也没存 | **补** `generation.attempts.provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）/ `provider_cost_currency` / `provider_cost_source`（**两态 + 异常态**：`declared` 直接取上游 `cost`、`computed` 按实际 `usage` × 该渠道四档费率自算、`unavailable` 不猜，§5/§7）与 `provider_cost_cny_microusd`（**折算后 CNY**，毛利用，§8） |
+| **平台成本价** | **没有**：APIMart 的 `cost` 不采纳不留存；AIHubMix 的金额要自算也没存 | **补** `generation.attempts.provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）/ `provider_cost_currency` / `provider_cost_source`（**两态 + 异常态**：`declared` 直接取上游 `cost`、`computed` 按该供给的计价形态自算、`unavailable` 不猜，§5/§7）与 `provider_cost_cny_microusd`（**折算后 CNY**，毛利用，§8） |
 | **请求时间戳** | `jobs.created_at`（受理）、`attempts.started_at` / `completed_at` | 够 |
 | **上游 request_id** | `attempts.provider_trace_id`（AIHubMix 的 `x-request-id`；APIMart 的 task id） | 够 |
 
@@ -216,8 +243,8 @@ PriceSnapshot {
 - **对客价口径（原未决第 2 条，已定）**：**对客价随命中渠道浮动**。随修订发布、随 Job 快照冻结的是**按候选的对客费率向量** `consumer_rates_cny`（管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"设定/推导；加价系数与汇率由后台设），**同一网关模型不同候选价格不同**；`reference_cost_microusd` **只作定价参考、不是售价的被乘数**；受理时**选中候选之后**随 Job 快照冻结（快照记**命中候选 + 该候选的对客费率向量与成本**）。**"与命中渠道无关"指的是扣费对象**——扣的仍是同一个用户余额，不按渠道分账。**预授权（保底额）与售价是两件事**：保底额按**供给维度**查 `floor_amounts`（§6），**不由售价派生**。此前记的"金额也无关"这一默认读法**作废**（§2/§4/§5）。
 - **`markup_bps` 归属**：每个网关模型一个，数值由管理员创建网关模型时录入，随修订发布、随 Job 快照冻结；它**参与设定该候选的对客费率向量**，随快照冻结后受理之后不再变（§2）；
 - **汇率维护入口与取值规则**：**按币种一组** `pricing.fx_rates` + `PUT /api/v1/fx-rates`（管理员、写审计）；**折算率按币种维护（渠道币种 → CNY，不固定 USD）**、数值由后台管理员录入；**取值规则＝按生效时间取"受理时刻生效的那一行"、随快照冻结**；它在**管理员设定对客费率向量时参与推导**，同一份快照值也用于**把成本折算成人民币**（毛利核算），**受理之后不再换算**（§2/§8）；
-- **币种平面**：**对客只有 CNY 单币种**（充值、余额、售价、保底额、扣费一律人民币，不做实时汇率换算）；**成本平面按渠道声明的 `currency`**（渠道四档费率表与上游 `cost` 都按该币种记，**不假定 USD**）；快照里售价/保底/扣费记 CNY、成本记**原币种原值 + 币种 + 当时汇率 + 折算后 CNY**（毛利用），两条线分开核对（§8）；
-- **计价与成本来源**：**两家渠道都是 token 计费**（费率表按渠道各自记、按该渠道币种标注）；**成本来源两态**——`Computed`（按**实际 `usage`** × 该渠道四档费率自算）与 `Declared`（**直接取上游 `cost`**，币种以渠道声明为准），异常态 `unavailable` 不猜（§1/§7）；**"档位 → 每张价"的 `tier_prices` 只作定价参考/展示，不参与预授权**；`size`、`quality` 是主要影响因素，`resolution` 是 APIMart 的包装参数（§6）；
+- **币种平面**：**对客只有 CNY 单币种**（充值、余额、售价、保底额、扣费一律人民币，不做实时汇率换算）；**成本平面按该供给声明的 `cost_currency`**（四档费率表与上游 `cost` 都按该币种记，**不假定 USD**；没有 Price Plan 时必须显式声明）；快照里售价/保底/扣费记 CNY、成本记**原币种原值 + 币种 + 当时汇率 + 折算后 CNY**（毛利用），两条线分开核对（§1/§8）；
+- **计价与成本来源**：**计价形态是渠道事实**（这个渠道的这个模型按什么计价：按四分项 token 计量量 / 按产出张数 / 按调用次数 / 上游直接给实扣金额，由渠道决定、平台如实登记，**不归运营选**），形态与参数配套（`token_rates` 要那份四档费率即 Price Plan，`per_image` / `per_call` 要单价，`upstream_declared` 什么参数都不要），发布期必填且取值受控（§1）；**Price Plan 因此不是每条供给必填**（`runtime_entries.price_plan_id` 放开非空），但它仍**不是对客结算基数**（§2）。**成本来源两态**——`Computed`（按**登记的那种形态**自算：分项 token × 四档费率 / 张数 × 单价 / 1 次 × 单价）与 `Declared`（**直接取上游 `cost`**，币种以渠道声明为准），异常态 `unavailable` 不猜（含"形态没给金额""按张拿不到张数"）（§1/§7）；**"档位 → 每张价"的 `tier_prices` 只作定价参考/展示，不参与预授权，也不参与成本**；`size`、`quality` 是主要影响因素，`resolution` 是 APIMart 的包装参数（§6）；
 - **预授权口径**：**保底 + 允许透支**——预授权**只是保底**，按**供给（vendor + offering）维度**查随修订发布的保底表（`floor_amounts`）：供给内按 `(size, quality)` 两维，`quality` 维留空即按 `size` 档（OpenAI 系当前 `1K = ¥0.16` / `2K = ¥0.25` / `4K = ¥0.3`，**币种＝CNY**）；**像素型 `size` 按该供给的档位像素表归位、缺失时按最长边阈值（≤1024→1K、≤2048→2K、>2048→4K）**，`size = auto`（或没给 `size`）取 **`2K` 档**；归不出档位、或该档位在表里没有 ⇒ 回落该供给**封顶保底值**、再回落 `GENERATION_MAX_COST_MICROUSD`（§6）。保底额**两个身份**：① **准入闸门**——受理时 `余额 >= 保底额` 才放行，**不足 ⇒ 402 余额不足**（硬拒绝保留）；② **结算的参考下限**——估小了由结算透支吸收、估大了结算释放差额。结算**按实际**：实收 = **命中候选的**对客 CNY 费率 × 实际 `usage` 分项 token，**不封顶在保底额**，**实际超过保底额时余额可为负（透支发生在结算）**；透支后**下一次受理按当时余额判 ⇒ 402**；透支的追补属运营/充值流程（§6/§3）；
 - **Redis 预检**：余额不足是硬规则，**凭新鲜缓存提前拒绝**保留（新鲜窗口 + 必留审计）；该机制的设计归 [`0008`](./0008-routing-strategy-and-caching.md) §7.4，本份只认它不改对客金额口径（§6）。
 

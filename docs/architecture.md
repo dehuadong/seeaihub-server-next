@@ -40,7 +40,7 @@
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、证据提取、错误分类、轮询与取图（**渠道差异只此一处**） | `crates/adapter-sdk`（接口）、`crates/adapter-aihubmix`、`crates/adapter-apimart` |
 | **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份）与某 Offering 能**承载**的面（能力子集）：支持参数、值域、默认值、组合规则 | 运行时发布物 `catalog.vendor_models.capability_schema`；素材在 `config/bootstrap/*.json`。**当前实现仍是"每候选各带一份"——合同与能力子集尚未拆开，见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G5** |
 | **④ Offering** | 渠道、上游模型名、用哪个 Driver、渠道限制、路由档位与**档内权重** | `supply.offerings` + `publication.runtime_entries`；发布逻辑在 `crates/application` 的 `RuntimeService` |
-| **⑤ Price** | 计价形态、费率、币种、汇率、保底与结算口径 | `pricing.price_plans`（渠道成本费率）+ `publication.runtime_revisions` 的定价列（**按候选**的对客费率向量、参考成本、成本来源、价目表、保底表）+ `pricing.fx_rates`（按币种的折算率）；公式在 `crates/domain` 的 `PriceSnapshot` |
+| **⑤ Price** | 渠道**计价形态**（按 token 计量量 / 按产出张数 / 按调用次数 / 上游直接给金额）、费率与单价、币种、汇率、保底与结算口径 | `supply.offerings.formula` 与 `cost_unit_price_microusd`（渠道计价事实）+ `pricing.price_plans`（**按 token 计量量计价时**的渠道成本费率）+ `publication.runtime_revisions` 的定价列（**按候选**的对客费率向量、参考成本、成本来源、价目表、保底表）+ `pricing.fx_rates`（按币种的折算率）；公式在 `crates/domain` 的 `PriceSnapshot` |
 
 ## 3. 对外接口
 
@@ -53,7 +53,7 @@
 | GET | `/api/v1/accounts/{account_id}` | `read_account_balance` | 管理员（读余额与写入时刻；**读数据库那一行，不读缓存**：缓存可能滞后、也可能来自对账覆盖，用它当答案会把账实不符读成账实相符。账户不存在是 404） |
 | POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
 | POST | `/api/v1/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
-| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；每个候选可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
+| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；每个候选带**计价形态**（`formula`：`token_rates` / `per_image` / `per_call` / `upstream_declared`）与它的参数——按 token 计量量要那份四档费率（`price_plan`），按张 / 按次要单价（`cost_unit_price_microusd`），上游直接给金额两种参数都不要；另可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：形态必填且与参数配套、每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
 | GET | `/api/v1/gateway-models` | `list_gateway_models` | 管理员（网关模型清单：对客名、运维开关、候选与承载面、**每个候选的定价**与修订级加价系数；**不回显渠道凭证**。对客名由管理员发布时自己填，平台不预设任何名字） |
 | PATCH | `/api/v1/gateway-models/{gateway_model}` | `set_gateway_model_enabled` | 管理员（**只改启用开关**；没发布过的名字是 404，定义只能由发布产生） |
 | GET | `/api/v1/route-policies` | `list_route_policies` | 管理员（路由策略清单：全局那条与各网关模型的覆盖；策略是**运行期配置**，不进不可变修订） |
@@ -70,7 +70,7 @@
 
 对客的**生成面只有这两条路径**，都是**同步**：一个请求把图交回，没有 202 受理、没有 job_id 轮询。**分支由请求内容决定**（有没有参考图/遮罩），不按端点断言——带图的 generations、不带图的 edits 都合法。参考图与遮罩用**公网 URL 或 `data:image/…;base64,…`** 给出（`image` 与 `image_urls` 同义、二选一）；平台**不落盘**：不下载归档、不解码存储，渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，原样放进 `data[]`，由客户端判断。成功响应 `{created, data:[{url|b64_json}]}`；内部受理后等 Job 到终态（上限 `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），等不到就按失败回超时错误。
 
-**钱的两条线**（设计口径见 `docs/design/0007` §2–§8）：**对客只有 CNY 单币种**——售价是**按候选发布**的**对客四档 CNY 费率向量**（`consumer_rates_cny`，受理时随 Job 的 Price Snapshot 冻结，结算只读它），**预授权额**按**供给（vendor + offering）维度**的保底表（`floor_amounts`）查得——**像素型的 `size` 先归到档位**（优先用该供给发布的档位像素表、缺失时按最长边阈值兜底，`size = auto` 取默认档 2K），**不由售价派生**；受理闸门是**余额 ≥ 保底额**（不成立即 402 `insufficient_balance`），**结算按实际扣、不封顶在保底额**（实收超过保底额时余额被扣成负数——**透支发生在结算**，随后按当时余额判）。`GENERATION_MAX_COST_MICROUSD` 只作**连该供给的封顶保底值都查不到时**的兜底保底额，**不再是受理上限**。**成本平面按渠道声明的 `currency`** 记原币种原值，用受理时冻结的**折算率**（`pricing.fx_rates` 里"受理时刻生效的那一行"）折成 CNY 只用于毛利核算；`pricing.price_plans` 的费率收窄为**渠道成本费率**，不再是对客结算基数。
+**钱的两条线**（设计口径见 `docs/design/0007` §1–§8）：**对客只有 CNY 单币种**——售价是**按候选发布**的**对客四档 CNY 费率向量**（`consumer_rates_cny`，受理时随 Job 的 Price Snapshot 冻结，结算只读它），**预授权额**按**供给（vendor + offering）维度**的保底表（`floor_amounts`）查得——**像素型的 `size` 先归到档位**（优先用该供给发布的档位像素表、缺失时按最长边阈值兜底，`size = auto` 取默认档 2K），**不由售价派生**；受理闸门是**余额 ≥ 保底额**（不成立即 402 `insufficient_balance`），**结算按实际扣、不封顶在保底额**（实收超过保底额时余额被扣成负数——**透支发生在结算**，随后按当时余额判）。`GENERATION_MAX_COST_MICROUSD` 只作**连该供给的封顶保底值都查不到时**的兜底保底额，**不再是受理上限**。**成本平面按该供给声明的成本币种**记原币种原值，用受理时冻结的**折算率**（`pricing.fx_rates` 里"受理时刻生效的那一行"）折成 CNY 只用于毛利核算；成本怎么算由该供给的**计价形态**决定（上游给了金额就先取它，否则按形态自算），`pricing.price_plans` 的费率收窄为**渠道成本费率**、且只是"按 token 计量量计价"这一种形态的参数，不再是对客结算基数。
 
 请求体上限 16MB（`DefaultBodyLimit`）。这里的 `job_id` 是**内部**执行/审计记录的标识，只在内部与管理员的运营接口出现。
 
@@ -131,8 +131,8 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | Schema / 表 | 是什么事实 | 写入方 |
 | --- | --- | --- |
 | `catalog.vendor_models` | ③ Profile（Capability Schema，随修订不可变） | `RuntimeService::publish` |
-| `supply.channels` / `supply.offerings` | ④ 渠道与供给 | `RuntimeService::publish` |
-| `pricing.price_plans` | ⑤ 渠道**成本费率**（四档 token 单价，币种按该渠道声明）：定价时的参考口径与毛利核算用，**不再是对客结算基数** | `RuntimeService::publish` |
+| `supply.channels` / `supply.offerings` | ④ 渠道与供给；供给上另记**计价形态**（`formula`）与按张 / 按次的**单价**（`cost_unit_price_microusd`）——渠道事实，决定成本怎么算 | `RuntimeService::publish` |
+| `pricing.price_plans` | ⑤ 渠道**成本费率**（四档 token 单价，币种按该渠道声明）：**只有"按 token 计量量计价"的供给有**，定价时的参考口径与毛利核算用，**不再是对客结算基数** | `RuntimeService::publish` |
 | `pricing.fx_rates` | ⑤ **折算率**（按币种的"渠道币种 → CNY"定点比值 + 生效时间）：受理时取"受理时刻生效的那一行"并快照。**外部事实，由管理员录入**，不进不可变修订 | `PricingService::upsert_fx_rate`（`PUT /api/v1/fx-rates`） |
 | `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给、优先级与**档内权重**（`routing_priority` 是档位，同档允许多条候选，档内按 `weight` 分摊）；修订上另记这次发布定义的是哪个**网关模型**（对客名）与它指向哪一行厂商模型合同，以及**定价**（修订级 `markup_bps` + **按候选键**的参考成本、成本币种、对客四档 CNY 费率向量、成本来源、档位价目表、保底表）；旧修订的定价列留 NULL ⇒ 受理与结算走旧口径 | `RuntimeService::publish` |
 | `routing.route_policies` | **路由策略**：在已发布的合格候选里"挑哪一条"的运行期配置（全局一条 + 按网关模型覆盖），含**折扣率表**（只作 `least_cost` 的比较输入，不进成本）与**标签映射**（供 `user_tag`）。**运营配置，不进不可变修订**；改它即刻影响之后的受理，已受理 Job 不受影响 | `RoutePolicyService::upsert`（`PUT /api/v1/route-policies`）、受理时取生效那条 |
@@ -153,7 +153,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移、装配加速层并挂起缓存对账循环 | 业务规则、SQL、上游调用 |
 | `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现（含加速层）、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
 | `apps/api/tests/http_contract.rs` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**与**进程内假 Redis**（零外部费用） | 单元测试（在各 crate 内） |
-| `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PriceSnapshot`（对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
+| `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PricingFormula`（计价形态：按 token 计量量 / 按张 / 按次 / 上游直接给金额）、`PriceSnapshot`（计价形态与其单价 / 对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
 | `crates/domain/src/image_parameters.rs` | 图片参数的**唯一**一份规则：调用方契约字段（`image`/`image_urls`/`mask`）、候选声明参数名的判定（名字以 `image` 开头＝参考图、含 `mask`＝遮罩）、`null`/空串＝这一处没有图、把调用方的图落到候选声明的参数名上 | IO；也不认识任何**具体渠道**（参数名本身按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G1） |
 | `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService` / `AccountsService`）、端口 trait（含 `CacheStore`）、发布期校验（含"限制只能收窄"与定价"全有或全无"）、候选选择（**先按档位取第一个有合格候选的档，再在档内按权重确定性分摊**）、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生、加速层语义（`AccelerationService`：键名与值形状、候选集的修订标识比对、写穿与来源标记、新鲜度判定与凭缓存拒绝的审计、缓存对账） | SQL、HTTP、上游协议、Redis 命令 |
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射；余额变更一律用 `RETURNING` 把**提交后**的余额带回给用例（供写穿缓存） | 业务判定（只执行用例给出的结论） |
@@ -161,7 +161,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`（**失败件同样带成本事实报告**：终态之后判定失败时把已经读到的成本随错误交回平台）、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
-| `migrations/0001_initial.sql`…`0010_routing_weight_and_decisions.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选）、**路由策略表 `routing.route_policies`**（`0011`：作用域唯一，策略类型只放本层已实现的取值）、**策略的第二批输入**（`0012`：放宽策略取值面加入 `least_cost` 与 `user_tag`、策略上增折扣率表与标签映射、账户上增标签列） | 运行时的业务规则 |
+| `migrations/0001_initial.sql`…`0013_offering_pricing_formula.sql` | 表结构与约束（含"每型号每个网关模型下同一条供给只允许一条活动条目"、路由判定表、对客错误码白名单与失败类别取值），以及增量迁移：撤销资产表与列（`0005`）、合同与承载面拆分（`0006`）、网关模型命名两列与开关表（`0007`）、执行尝试上的成本四列与其同形约束（`0008`）、**汇率表 + 修订上的定价七列 + 放宽三处余额/预授权约束**（`0009`：余额可为负、保底额与预授权额可为 0）、**候选上的档内权重 + 唯一索引换成 `(gateway_model, offering_id) WHERE active`**（`0010`：同档允许多条候选）、**路由策略表 `routing.route_policies`**（`0011`：作用域唯一，策略类型只放本层已实现的取值）、**策略的第二批输入**（`0012`：放宽策略取值面加入 `least_cost` 与 `user_tag`、策略上增折扣率表与标签映射、账户上增标签列）、**供给上的计价形态与单价 + 放开 `runtime_entries.price_plan_id` 非空**（`0013`：渠道不按 token 计量量计价时没有 Price Plan） | 运行时的业务规则 |
 | `config/bootstrap/*.json` | 可直接发布的运行时素材（Profile + Offering + Price 三合一） | 不是运行时数据源：必须经发布接口写入 |
 | `scripts/decisions/*.mjs` | Agent Notes 的目录、元数据与文件格式检查（不生成索引），自述与本地修补见该目录 `README.md` | 不影响服务运行 |
 | `docs/AGENTS.md`、`docs/agents/git.md` | 正文与代码注释的写作规则与 slop 清单；提交、推送与历史改写约定 | 工件位置与归属归 `docs/agents/artifacts.md`；Agent Note 的文件骨架归 `.agents/notes/README.md` |

@@ -62,7 +62,7 @@
 
 - 按 Tokens 计费，四档单价（每 1M tokens）：文本输入 `$5` / 图像输入 `$8` / 文本输出 `$10` / 图像输出 `$30`（出处：`out-reference/aihubmix/gpt-image-2.md` 与模型页）。
 - 上游**只返回四分项 token、不返回任何金额字段**；`llms.txt` 写 `Pricing: per-generation`，与模型页的 token 单价表冲突——**以模型页的四档 token 单价为准**。
-- 四档与 `config/bootstrap/` 里各 AIHubMix 素材的 `price_plan` 逐项一致（含 `text_output_microusd_per_million = 10000000`）。
+- 四档与 `config/bootstrap/` 里各 AIHubMix 素材的 `price_plan` 逐项一致（含 `text_output_microusd_per_million = 10000000`）——素材里这条供给登记的**计价形态**是 `token_rates`（按四分项 token 计量量），那份价目表就是它的参数。
 - 本阶段按 Tokens 计费，**不考虑缓存档**；逐笔成本价与金额留档在 [`paid-provider-calls.md`](../verification/paid-provider-calls.md)。
 
 ## 3. APIMart
@@ -114,6 +114,7 @@
 - 任务终态：`status` 取 `pending` / `processing` / `completed` / `failed` / `cancelled`；成功时 `result.images[]` 每项为 `{url: [字符串], expires_at}`（**`url` 是数组**，`expires_at` 说明结果 URL 会过期、必须立刻下载转存）。
 - 终态同时返回四分项 `usage`（`input_tokens_details` 区分 `text_tokens` / `image_tokens`，另有 `cached_tokens`）与 `cost` / `credits_cost`（`credits_cost = cost × 10`）。
 - 实测结清：任务成功响应的 `usage` 粒度比生成页与 `/tasks/status` 两处文档样例都更细（文档只给聚合三项，`tasks-status.cn.md` 样例连 `usage` 都没有）；`cost` 是上游声明的实际扣费。参考图会真实计入 `image_tokens`（1024×1024 ⇒ 1024）；带参考图时四分项形状不变，② 的解码器不需要新分支。
+- **计价形态是"上游直接给实扣金额"**（`cost`，上面那条实测样例 `0.011354`）：素材里这条供给登记为 `upstream_declared` 并声明成本币种 USD，**没有** Price Plan——平台不按 token 单价反算它的成本。
 - **创建请求的失联处理**：响应丢失后无法按时间窗反查这次提交是否被受理（文档化的任务管理只有状态查询与 webhook，没有任务列表接口）⇒ 进人工对账，不自动重提。
 
 ### 3.5 幂等

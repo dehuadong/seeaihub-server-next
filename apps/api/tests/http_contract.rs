@@ -1537,7 +1537,11 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     assert_eq!(source.as_deref(), Some("declared"));
     assert_eq!(amount, Some(11_354), "实测样例 cost = 0.011354");
     assert_eq!(currency.as_deref(), Some("USD"));
-    assert_eq!(cny, None, "折算要用受理时冻结的汇率，这一片还没有它");
+    assert_eq!(
+        cny,
+        Some(80_614),
+        "受理时冻结的折算率（USD → CNY 7.1）把上游声明的金额折成人民币，毛利要用它"
+    );
 
     // 采集成本**不改对客金额**：实收仍是该渠道费率 × 实际分项 token
     // （14 文本输入 × 5 + 196 图像输出 × 30 = 5950 微单位），与上游声明的 11354 是两个量。
@@ -1647,7 +1651,11 @@ async fn a_terminal_without_images_still_records_the_cost_it_already_declared() 
     );
     assert_eq!(amount, Some(11_354), "金额是上游声明的 0.011354");
     assert_eq!(currency.as_deref(), Some("USD"), "币种按渠道声明");
-    assert_eq!(cny, None, "折算要用受理时冻结的汇率，这一片还没有它");
+    assert_eq!(
+        cny,
+        Some(80_614),
+        "终态给了金额就已经能折算了：受理时冻结的汇率把 11354 微美元折成人民币"
+    );
     harness.cleanup().await;
 }
 
@@ -1723,8 +1731,96 @@ async fn a_cost_the_channel_never_reports_is_computed_from_the_actual_usage() {
     assert_eq!(currency.as_deref(), Some("USD"));
     // 实际用量：14 文本输入 × 5 + 196 图像输出 × 30（每 1M） = 5950 微单位。
     assert_eq!(amount, Some(5_950));
-    assert_eq!(cny, None);
+    assert_eq!(
+        cny,
+        Some(42_245),
+        "受理时冻结的汇率把自算出来的成本折成人民币（5950 × 7.1 向上取整），毛利要用它"
+    );
     assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+    harness.cleanup().await;
+}
+
+/// 渠道**直接在上游终态给实扣金额**的供给不需要那份四档费率表：它能发布、能受理，成本取上游
+/// 声明的金额（平台没有可算的参数，也不自己编一个）。
+///
+/// 素材里那条 APIMart 供给就是这种事实（终态给 `cost`）：它**没有 Price Plan**，所以
+/// `runtime_entries.price_plan_id` 落 NULL——放开的正是这一条，而不是"`token_rates` 也可以
+/// 不发费率表"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_upstream_declared_supply_needs_no_rate_card_and_takes_the_upstream_amount() {
+    let harness = Harness::start_with_bootstrap(UpstreamBehaviour::apimart(), 64).await;
+    // 发布成功的判据在夹具里（`publication must succeed`）：这条供给没有价目表也发得出去。
+    let row = sqlx::query(
+        "SELECT o.formula, re.price_plan_id,
+                (SELECT count(*) FROM pricing.price_plans p WHERE p.offering_id = o.id) AS plans
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(Harness::MODEL)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the published candidate");
+    let formula: String = row.try_get("formula").expect("formula");
+    assert_eq!(
+        formula, "upstream_declared",
+        "素材里这条供给登记的计价形态就是它"
+    );
+    assert!(
+        row.try_get::<Option<Uuid>, _>("price_plan_id")
+            .expect("price plan id")
+            .is_none(),
+        "没有 Price Plan：价目表的非空约束已放开"
+    );
+    let plans: i64 = row.try_get("plans").expect("price plan rows");
+    assert_eq!(plans, 0);
+
+    let key = format!("upstream-declared-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "declared amount"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("上游直接给金额", &body);
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "受理与结算照常");
+
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(source.as_deref(), Some("declared"));
+    assert_eq!(amount, Some(11_354), "上游声明的 0.011354 直接取");
+    assert_eq!(currency.as_deref(), Some("USD"));
+    assert_eq!(
+        cny,
+        Some(80_614),
+        "受理时冻结的折算率把上游声明的金额折成人民币算毛利"
+    );
+
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(snapshot["formula"], json!("upstream_declared"));
+    assert!(snapshot["price_plan_id"].is_null());
+    assert!(
+        snapshot["rates"].is_null(),
+        "没有 Price Plan 就没有那份四档费率：{snapshot}"
+    );
+    assert_eq!(
+        snapshot["hold_source"],
+        json!("platform_default"),
+        "这条供给没有保底表 ⇒ 预授权回落到平台兜底数（§6 的兜底链）：{snapshot}"
+    );
+    let authorized: i64 =
+        sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("authorization");
+    assert_eq!(authorized, 20_000);
+    // 对客实收按**它发布的对客费率向量**算（14 文本输入 × 35.5 + 196 图像输出 × 213 = 42245
+    // 微元），与上游声明的成本（11354 微美元）是两个量：成本只进毛利口径。
+    assert_eq!(harness.captured_microusd(job_id).await, -42_245);
     harness.cleanup().await;
 }
 
@@ -3660,63 +3756,6 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
     drop_isolated_database(&database_name).await;
 }
 
-/// 仍留在 `config/bootstrap/` 的那一份**旧形状**素材（offering 级 `capability_schema`，没有顶层
-/// 合同、也没有 `carrier_schema`）照常能发布：过渡期里合同与承载面都回退到那一份声明面。
-///
-/// 这是**唯一**还按旧形状读的素材，留着就是为了这条语义——新形状的素材走的是上面那些用例，
-/// 旧形状的可发布性没有别的证据可依。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn legacy_aihubmix_material_still_publishes() {
-    let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
-    let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
-    let pool = PgPool::connect(&database_url)
-        .await
-        .expect("contract database");
-
-    // 只留这一份：它是仓库里唯一还带 offering 级 `capability_schema` 的素材，
-    // 也是这条"旧形状照常可发布"语义的唯一夹具。
-    let material = include_str!("../../../config/bootstrap/aihubmix-gpt-image-2.json");
-    let command: Value = serde_json::from_str(material).expect("material parses");
-    let model = command["native_model_id"]
-        .as_str()
-        .expect("native model id")
-        .to_owned();
-    let response = client
-        .post(format!("{base_url}/api/v1/runtime-revisions"))
-        .bearer_auth(&admin_token)
-        .json(&command)
-        .send()
-        .await
-        .expect("publication request");
-    assert_eq!(
-        response.status(),
-        StatusCode::OK,
-        "旧形状素材必须照常可发布：{model}"
-    );
-    // 回退的结果：合同就是那份声明面，承载面与它同值，同一个型号只落一行。
-    let rows = sqlx::query(
-        "SELECT vm.capability_schema, o.carrier_schema
-         FROM catalog.vendor_models vm
-         JOIN supply.offerings o ON o.vendor_model_id = vm.id
-         WHERE vm.native_model_id = $1",
-    )
-    .bind(&model)
-    .fetch_all(&pool)
-    .await
-    .expect("contract rows");
-    assert_eq!(rows.len(), 1, "{model} 只能落一行合同");
-    let contract: Value = rows[0].try_get("capability_schema").expect("contract");
-    let carrier: Value = rows[0].try_get("carrier_schema").expect("carrier");
-    assert_eq!(contract, command["offerings"][0]["capability_schema"]);
-    assert_eq!(carrier, contract);
-
-    pool.close().await;
-    drop_isolated_database(&database_name).await;
-}
-
 /// 承载面 ⊆ 合同（R1）：供给不能凭空多出调用方可提交的字段。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
@@ -5343,8 +5382,9 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         start_fake_upstream_with(apimart_calls.clone(), UpstreamBehaviour::apimart()).await;
     let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
     wait_until_ready(&client, &base_url).await;
-    let account = create_account(&client, &base_url, &admin_token).await;
-    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    // 这条用例连发四次请求，而素材现在带着**夹具对客费率**（按成本费率 × 折算率 7.1 推，比
+    // 旧口径"把 USD 费率当 CNY 收"高 7.1 倍）：受理闸门是"余额 ≥ 保底额"，所以要先把账户充上。
+    let (_, api_key) = funded_account(&client, &base_url, &admin_token, 1_000_000).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");
@@ -5847,8 +5887,8 @@ async fn publish_with_mappings(
                 "restrictions": {"allowed_branches": ["prompt_only"], "max_images": 0},
                 "carrier_schema": carrier,
                 "parameter_mapping": parameter_mapping,
+                "formula": "token_rates",
                 "price_plan": {
-                    "formula": "token_rates",
                     "currency": "USD",
                     "text_input_microusd_per_million": 5_000_000,
                     "image_input_microusd_per_million": 8_000_000,
@@ -6264,8 +6304,10 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
             "max_images": if declares_image { 1 } else { 0 }
         },
         "capability_schema": schema,
+        // 这份测试构造体按**四分项 token 计量量**计价（用例要的是可复现的费率），所以它带一份
+        // 价目表；真实素材里各渠道按自己的计价形态登记，见 `config/bootstrap/`。
+        "formula": "token_rates",
         "price_plan": {
-            "formula": "token_rates",
             "currency": "USD",
             "text_input_microusd_per_million": 5_000_000,
             "image_input_microusd_per_million": 8_000_000,
@@ -7417,10 +7459,11 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     drop_isolated_database(&database_name).await;
 }
 
-/// **旧素材**（不带对客名）照常可发布：对客名回退取厂商原生名，行为与今天逐位一致。
+/// **不带对客名**的发布命令照常可发布：对客名回退取厂商原生名，行为与今天逐位一致。
 ///
-/// 这是命名层"缺省回退"那条兼容承诺的证据：仓库里唯一不带 `gateway_model` 的素材发布之后，
-/// 目录的 `name` 就是厂商原生名，整条目录响应与今天逐字相同，受理也照旧跑得通。
+/// 这是命名层"缺省回退"那条兼容承诺的证据：命令不带 `gateway_model` 时，目录里的 `name`
+/// 就是厂商原生名，受理也照旧跑得通。素材在测试内构造（顶层一份合同 + 候选自带承载面），
+/// 刻意不带对客名。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() {
@@ -7440,16 +7483,60 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         .await
         .expect("contract database");
 
-    let material: Value = serde_json::from_str(include_str!(
-        "../../../config/bootstrap/aihubmix-gpt-image-2.json"
-    ))
-    .expect("legacy material parses");
+    let contract = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": { "const": "gpt-image-2" },
+            "prompt": { "type": "string", "minLength": 1 },
+            "image": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 16 },
+            "mask": { "type": "string" },
+            "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+            "size": { "type": "string", "anyOf": [{ "const": "auto" }, { "pattern": "^[0-9]+x[0-9]+$" }] },
+            "output_format": { "type": "string", "enum": ["png", "jpeg"], "default": "png" },
+            "quality": { "type": "string", "enum": ["low", "medium", "high"] },
+            "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
+            "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
+            "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" }
+        },
+        "allOf": [
+            { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
+        ]
+    });
+    let command = json!({
+        "vendor_id": "OpenAI",
+        "native_model_id": "gpt-image-2",
+        "native_revision": "2026-09-18-validated-1.3",
+        "actor": "bootstrap",
+        "capability_schema": contract.clone(),
+        "offerings": [{
+            "provider_kind": "AIHubMix",
+            "adapter_key": "aihubmix-image-v1",
+            "provider_model_id": "gpt-image-2",
+            "base_url": upstream.base_url.clone(),
+            "credential_env": "AIHUBMIX_API_KEY",
+            "restrictions": {
+                "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
+                "max_images": 16
+            },
+            "carrier_schema": contract.clone(),
+            "formula": "token_rates",
+            "price_plan": {
+                "currency": "USD",
+                "text_input_microusd_per_million": 5000000,
+                "image_input_microusd_per_million": 8000000,
+                "text_output_microusd_per_million": 10000000,
+                "image_output_microusd_per_million": 30000000,
+                "source_url": "https://aihubmix.com/model/gpt-image-2"
+            }
+        }]
+    });
     assert!(
-        material.get("gateway_model").is_none(),
-        "这份夹具刻意不带对客名，缺省回退才有的可验"
+        command.get("gateway_model").is_none(),
+        "这份构造刻意不带对客名，缺省回退才有的可验"
     );
-    let mut command = material.clone();
-    command["offerings"][0]["base_url"] = Value::String(upstream.base_url.clone());
     let response = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(&admin_token)
@@ -7459,7 +7546,11 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         .expect("publication request");
     let status = response.status();
     let body = response.text().await.expect("publication body");
-    assert_eq!(status, StatusCode::OK, "旧素材必须照常可发布：{body}");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "不带对客名的命令必须照常可发布：{body}"
+    );
 
     // ── 目录逐位一致：name 是厂商原生名，形状就是新的四字段形状 ──
     let (status, catalog) = get_catalog(&client, &base_url, None).await;
@@ -7470,24 +7561,28 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
             "name": "gpt-image-2",
             "vendor_id": "OpenAI",
             "revision": "2026-09-18-validated-1.3",
-            "contract": material["offerings"][0]["capability_schema"],
+            "contract": contract,
         }]}),
         "缺省回退之后目录与今天逐位一致：{catalog}"
     );
 
     // ── 受理行为同样照旧：按回退出来的名字跑通 ──
     let _worker = spawn_worker_process(&database_url);
-    let key = format!("legacy-naming-{}", Uuid::new_v4());
+    let key = format!("naming-fallback-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &base_url,
         &api_key,
         "/v1/images/generations",
         &key,
-        &route_request("gpt-image-2", "旧素材：缺省回退"),
+        &route_request("gpt-image-2", "不带对客名：缺省回退"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "旧素材必须照常受理：{body}");
-    assert_sync_success("旧素材受理", &body);
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "不带对客名的命令必须照常受理：{body}"
+    );
+    assert_sync_success("不带对客名的命令受理", &body);
 
     // ── 落库事实：修订上的对客名就是回退出来的厂商原生名，开关行也在（默认启用）──
     let revision_gateway: String = sqlx::query_scalar(
@@ -7507,6 +7602,53 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
     .await
     .expect("gateway model switch");
     assert!(enabled, "首次发布成功时落一行开关，默认开着");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 发布命令只有"候选数组"这一种形状：不带 `offerings` 的请求在发布期被拒（400），
+/// 不是"发布成功但没有候选"，也不落任何行。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn publication_without_the_offering_array_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "vendor_id": "OpenAI",
+            "native_model_id": "no-offerings-model",
+            "native_revision": "no-offerings-1",
+            "actor": "contract-test",
+            "capability_schema": {"type": "object"}
+        }))
+        .send()
+        .await
+        .expect("publication request");
+    let status = response.status();
+    let body = response.text().await.expect("publication body");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "没有候选集合必须在发布期被拒：{body}"
+    );
+    assert!(
+        body.contains("offerings is required"),
+        "错误要说清缺什么：{body}"
+    );
+    let revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM publication.runtime_revisions")
+        .fetch_one(&pool)
+        .await
+        .expect("runtime revisions");
+    assert_eq!(revisions, 0, "被拒的发布不落任何行");
 
     pool.close().await;
     drop_isolated_database(&database_name).await;
@@ -8458,6 +8600,210 @@ async fn the_rate_effective_at_acceptance_is_frozen_and_a_missing_rate_blocks_pu
     );
 
     harness.cleanup().await;
+}
+
+/// 发布期校验**计价形态**：形态必填、取值受控，而且**形态与参数配套**。
+///
+/// 不配套的三条都要拒并说清缺什么；反过来，"按张计价**不带**那份四档费率"是合法的——Price Plan
+/// 只是"按 token 计量量计价"这一种形态的参数，不是每条供给都有的东西。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let model = "formula-model";
+
+    async fn publish(
+        client: &Client,
+        base_url: &str,
+        admin_token: &str,
+        model: &str,
+        offerings: Vec<Value>,
+    ) -> (StatusCode, Value) {
+        let body = publication_body(model, "route-test-1", None, offerings, None);
+        let response = client
+            .post(format!("{base_url}/api/v1/runtime-revisions"))
+            .bearer_auth(admin_token)
+            .json(&body)
+            .send()
+            .await
+            .expect("runtime publication");
+        let status = response.status();
+        let body = response.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+    let message = |body: &Value| {
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    // 1) 缺形态：说不清一条供给按什么计价，它的成本就没有算法。
+    let mut without_formula = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    without_formula["formula"] = Value::Null;
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![without_formula],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("formula is required"), "{body}");
+
+    // 2) 取值受控：认不出的形态一样拒。
+    let mut unknown_formula = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    unknown_formula["formula"] = json!("by_the_hour");
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![unknown_formula],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("must be token_rates"), "{body}");
+
+    // 3) 按 token 计量量计价却没有那份四档费率。
+    let mut token_without_plan = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    token_without_plan["price_plan"] = Value::Null;
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![token_without_plan],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("price_plan is required"), "{body}");
+
+    // 4) 反向也要拒：形态用不到的参数永远不会被读，留着只会让人以为它在生效。
+    let mut declared_with_plan = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    declared_with_plan["formula"] = json!("upstream_declared");
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![declared_with_plan],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(
+        message(&body).contains("does not apply to formula"),
+        "{body}"
+    );
+
+    // 5) 按张计价**不带**费率表也能发布：参数是单价，不是那份四档费率。
+    let mut per_image = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    per_image["formula"] = json!("per_image");
+    per_image["price_plan"] = Value::Null;
+    per_image["cost_unit_price_microusd"] = json!(11_354);
+    per_image["cost_currency"] = json!("USD");
+    // 6) 没有对客计费基准（既无对客费率向量、又没有 Price Plan 的费率）：发布期就拒——
+    //    "不带价目表也能发布"不等于"连对客价一起没有"，那样结算只能按 0 收（等于白送）。
+    per_image["consumer_rates_cny"] = Value::Null;
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![per_image.clone()],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(
+        message(&body).contains("no consumer charge basis"),
+        "{body}"
+    );
+
+    // 7) 给它一份对客费率向量（没有价目表也可以）：发布成功，受理照常、快照冻结形态与单价。
+    per_image["consumer_rates_cny"] = json!({
+        "text_input_micros_per_million": 35_500_000u64,
+        "image_input_micros_per_million": 56_800_000u64,
+        "text_output_micros_per_million": 71_000_000u64,
+        "image_output_micros_per_million": 213_000_000u64
+    });
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![per_image.clone()],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "有对客计费基准、没有价目表照样发布：{body}"
+    );
+
+    // 落库：形态与单价在供给行上，价目行为 0、条目上的 Price Plan 为空。
+    let row = sqlx::query(
+        "SELECT o.formula, o.cost_unit_price_microusd, re.price_plan_id,
+                (SELECT count(*) FROM pricing.price_plans p WHERE p.offering_id = o.id) AS plans
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("the published candidate");
+    assert_eq!(
+        row.try_get::<String, _>("formula").expect("formula"),
+        "per_image"
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("cost_unit_price_microusd")
+            .expect("unit price"),
+        Some(11_354)
+    );
+    assert!(
+        row.try_get::<Option<Uuid>, _>("price_plan_id")
+            .expect("price plan id")
+            .is_none()
+    );
+    assert_eq!(row.try_get::<i64, _>("plans").expect("plans"), 0);
+
+    // 受理照常，且形态与单价随 Job 快照冻结。这里**不起 Worker**：受理本身就把快照冻好了，
+    // 等不到终态只是这次请求超时回错——要看的是快照。
+    let account_id = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account_id).await;
+    let key = format!("per-image-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(model, "priced per image"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker 时这次请求超时（受理已经发生）：{body}"
+    );
+    let snapshot = frozen_snapshot(&pool, &key).await;
+    assert_eq!(snapshot["formula"], json!("per_image"));
+    assert_eq!(snapshot["cost_unit_price_microusd"], json!(11_354));
+    assert_eq!(snapshot["cost_currency"], json!("USD"));
+    assert!(
+        snapshot["fx_rate"].is_object(),
+        "声明了成本币种就把折算率冻结下来（毛利要用它）：{snapshot}"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
 }
 
 /// **未指定 `effective_at` 时，落库的生效时刻由数据库决定**，不由 API 进程的时钟盖章。

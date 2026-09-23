@@ -2,9 +2,9 @@
 title: AIHubMix 素材的声明面对齐端点 request.schema
 status: implemented
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-23
 approval: 用户 2026-09-20 指出 AIHubMix `/v1` 那族的 `capability_schema.properties` 存在问题，指定以 `out-reference/aihubmix/schema-gpt-image-2.5-{flare,sunburst}.endpoints.json` 里 `kind: openai_compatible` 的 `/v1/images/edits`、`/v1/images/generations` 的 `request.schema` 为准核对字段、枚举与取值范围；并明确 Driver 能力面（`supported_top_level_parameters`）可以保留（那是能力上限，不是这次发布的声明面）
-verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿（0 failed）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **18 passed / 0 failed**（含用真实素材发布并断言声明面的用例）。零真实计费调用
+verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿（0 failed）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **18 passed / 0 failed**（含用真实素材发布并断言声明面的用例）。零真实计费调用。2026-09-23：该夹具退役，本记录只同步事实，未重跑本条门禁
 ---
 
 # Agent Note：AIHubMix 素材的声明面对齐端点 request.schema
@@ -13,7 +13,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 >
 > **仍然有效的部分**：Driver 能力面（`supported_top_level_parameters`）保留；`size` 照 schema 的表达方式用 `anyOf` 而不是改写成枚举；`prompt` 的 `minLength`/`maxLength` 不是自造约束；发布期校验那处放宽（类型必须是 string、`enum` 可有可无）保留。
 >
-> **素材位置已变**：本文提到的三份旧形状素材（`aihubmix-gpt-image-2.5-flare.json`、`-sunburst.json`）已退役，现为 `config/bootstrap/gpt-image-2.5-{flare,sunburst}.json`（顶层一份合同 + AIHubMix / APIMart 两条供给，声明面在各自的 `carrier_schema`）；`config/bootstrap/aihubmix-gpt-image-2.json` 作为旧形状夹具保留。
+> **素材位置已变**：本文提到的三份旧形状素材（`aihubmix-gpt-image-2.5-flare.json`、`-sunburst.json`、`aihubmix-gpt-image-2.json`）已退役，现为 `config/bootstrap/gpt-image-2.5-{flare,sunburst}.json`（顶层一份合同 + AIHubMix / APIMart 两条供给，声明面在各自的 `carrier_schema`）。
 
 ## 问题
 

@@ -26,6 +26,8 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 - **预授权只是保底**：hold = 查表得到的保底额（**不由售价派生**），受理闸门是**余额 ≥ 保底额**（不足即 402）；**结算按实际扣、不封顶在保底额**，实收超过保底额时余额被扣成负数——**透支发生在结算**，随后按当时余额判。`GENERATION_MAX_COST_MICROUSD` 退为"连该供给封顶保底值都没有时"的兜底保底额，不再是任何形式的上限（查得到保底额时它一次都不读）。
 - **毛利 = 售价（CNY）− 成本折算后 CNY**：折算用快照里的汇率，**币种对不上就不折**（留空，不拿另一个币种的汇率去乘）。两条线分开留痕：售价/保底/扣费记 CNY（账本是权威），成本记原币种原值 + 币种 + 当时汇率 + 折算后 CNY。
 - **旧修订走旧口径**：迁移后的旧修订定价列留 NULL，受理出的 Job 快照不带对客费率向量与保底额 ⇒ 对客扣费按已发布费率、预授权回落平台兜底数，与今天逐位相同；历史 `price_snapshot` 仍能解析（新字段都带 `#[serde(default)]`）。
+- **Price Plan 不是每条供给必填**：它只是"按 token 计量量计价"这一种**计价形态**的参数，形态落在供给上（`supply.offerings.formula` + 按张/按次的 `cost_unit_price_microusd`），因此 `publication.runtime_entries.price_plan_id` 可空（`migrations/0013_offering_pricing_formula.sql`）。形态必填且与参数配套（按 token 计量量缺那份四档费率、按张/按次缺单价，发布期 400），对客定价那一条维不变。
+- **实收的取值链只有两条**：命中候选的对客费率向量，或没有它时的旧口径（已发布费率兼作对客费率）。**两条都没有 = 这条供给没有对客计费基准**：**发布期拒**（可被路由的供给必须能给出对客计费基准——"不带价目表也能发布"说的是不必发那份四档费率，不是连对客价一起没有）；运行时真遇到（只有历史修订才可能）按**平台侧故障**处置，**不按 0 结算**（0 元等于白送，还会在账上留下一条"收过钱"的 0 元记录）。**折算率按"这条供给声明了成本币种"冻结**（每条新发布的供给都声明它，没有 Price Plan 时显式声明）：上游声明的金额与按形态自算的金额都要折成人民币才算得出毛利；旧修订受理出的历史 Job 快照里没有这条声明，那时不冻结。
 - **`charge_microusd` 投影列不做**：账本已经查得到，它只是查询便利，按设计缓做。
 - **本轮内部整理**（不改行为、不改响应形状）：`ConsumerRatesCny` 的四档字段名去掉 `usd`（这个载体只有 CNY，与 `FxRate::rate_micros` 同一条口径）；**成本缺口清单移到 `PricingService`**（它不是对账案例，挂在 `ReconciliationService` 上会让那个服务因为两种不相干的理由被改）；运营清单的条数上限收成 `MAX_OPERATIONAL_LIMIT` **一处**、只在 HTTP 层 clamp 一次（两处各 clamp 一次时，响应里的 `truncated` 会与实际返回条数对不上）；`size` / `quality` 的字面量读取复用领域那份判据（`literal_parameter_text`，与 `is_used_parameter_value` 的差别写在它的注释里），应用层不再自写一套空值约定；四档费率的算式改收一个费率结构体，不再按位置传四个 `u64`（按位置传时把两档写反了编译器不会吭声）。
 
@@ -50,7 +52,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 - **折算币种对不上时留空 vs 用快照汇率硬乘**：留空。拿另一个币种的汇率去乘就是编数，而"编一个数"比"承认折算不出来"糟得多。
 - **结算超过保底额进对账 vs 透支**：透支。预授权只是保底，实际多少就扣多少；把正常完成的生成扣在对账里，消费者要等一个本不该有的人工结论。
 - **成本缺口开对账案例 vs 单独的运营清单**：单独的清单。对账案例的处置路径是退款，而成本缺口没有任何东西可退（对客结算已经完成）；开案例会把两件不同的事混成一个待办。
-- **定价在扁平形式里也给 vs 只给数组形式**：只给数组形式。扁平形式是过渡期的老形状（老素材、老测试），定价按候选给，只有数组形式能表达"同一网关模型的不同候选价格不同"；扁平形式的发布仍走旧口径。
+- **定价随单条供给发布 vs 随候选数组发布**：随候选数组——一次只发一条供给的价时，"同一个网关模型的不同候选各有各的成本"这件事表达不出来。
 - **自算失败记 `unavailable` vs 让整个结算失败**：记 `unavailable`。用量自相矛盾或溢出时，本该有金额却算不出来——那也是缺口，用别的数顶替才是错的。
 
 ## 后果
@@ -88,6 +90,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 | 旧修订 + 新 Job 走旧口径；历史快照逐位不变 | `an_unpriced_revision_and_an_empty_floor_table_fall_back_to_the_platform_default`、`a_snapshot_without_the_pricing_keys_still_parses`（`crates/domain`） |
 | 售价不受固定数限制（保底额 > 平台兜底数照常受理） | `pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot`（保底额 250000 ≫ 平台兜底数 20000，照常受理） |
 | 管理员读列出每个候选的定价与修订级加价系数 | `the_admin_view_lists_the_published_pricing` |
+| 发布期校验计价形态：必填、取值受控、与参数配套（按张**不带**费率表也能发布，落库与快照都带形态与单价） | `publication_requires_a_pricing_formula_that_matches_its_parameters` |
 | 毛利可逐笔算出；来源三态可辨 | 上面两条成本用例（`computed` / `declared` 各自带 CNY 折算值）、`a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconciliation`（`unavailable` 三样留空） |
 | 成本缺口处置：不进对账态、对客结算照常、运营看得见 | 同上（`reconciliation_cases` 为 0、`captured_microusd` 照扣、缺口清单带对账标识且仅管理员可读） |
 | 对账路径的成本落库 | `the_reconciliation_path_records_the_cost_fact_it_already_has`（直调仓库端口：带成本事实时四列落库、不带时四列留空）、`worker_sends_settlement_failure_to_reconciliation_with_its_own_code`（`crates/application`：失败事实里带着成本事实） |

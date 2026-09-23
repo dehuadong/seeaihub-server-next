@@ -325,7 +325,7 @@ impl PriceRates {
     /// 本次**实际用量** × 这组四档费率，向上取整到微单位。
     ///
     /// 对客实收与渠道成本自算**用的是同一个算式**，但读的是**各自那份费率**：对客读对客费率，
-    /// 成本读该渠道的成本费率（今天价格计划表暂时兼作后者）。算式只有一份，免得两条路各写一遍、
+    /// 成本读该渠道的成本费率（今天 Price Plan 暂时兼作后者）。算式只有一份，免得两条路各写一遍、
     /// 日后各自漂移；而"读哪份费率"由各自的入口决定，不在这里判。
     pub fn amount_microusd(&self, usage: &TokenUsage) -> Result<u64, DomainError> {
         token_amount_microusd(usage, &TokenRates::from(self))
@@ -489,6 +489,76 @@ fn auto_tier() -> ResolvedTier {
         tier: DEFAULT_FLOOR_TIER.to_owned(),
         source: HoldSource::AutoTier,
     }
+}
+
+/// 一条供给的**计价形态**：这个渠道的这个模型**按什么计价**（渠道事实，不是平台的定价选择）。
+///
+/// 它说明**平台与渠道怎么结算**，因此决定成本怎么算；对客卖多少钱与它无关（对客售价走
+/// [`ConsumerRatesCny`]）。取值由渠道的计价方式决定，平台如实登记：按四分项 token 计量量、
+/// 按产出张数、按调用次数，或**由上游直接给实扣金额**——最后这种平台没有自己的计价参数，
+/// 金额由执行事实 [`ProviderCostSource::Declared`] 承接，不在这里编一个数。
+///
+/// 形态与它的参数一一配套（见发布期校验）：`token_rates` 要一份四档费率（原来挂在 Price Plan
+/// 上的那一份），`per_image` / `per_call` 要一个单价，`upstream_declared` 什么参数都不要
+/// ——"没有那份四档费率"因此是合法状态，`Price Plan` 也不再是每条供给的必填。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PricingFormula {
+    /// 按四分项 token 计量量计价：参数是该渠道的四档费率（`PriceRates`）。
+    TokenRates,
+    /// 按产出的图片张数计价：参数是每张单价。
+    PerImage,
+    /// 按调用次数计价：参数是每次单价。
+    PerCall,
+    /// 上游直接给出实扣金额：平台没有计价参数，金额由执行事实承接；上游没给就是缺口。
+    UpstreamDeclared,
+}
+
+impl PricingFormula {
+    /// 落库 / 进快照 / 线上用的稳定字符串。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TokenRates => "token_rates",
+            Self::PerImage => "per_image",
+            Self::PerCall => "per_call",
+            Self::UpstreamDeclared => "upstream_declared",
+        }
+    }
+
+    /// 从落库值还原；解析不到说明存储被绕过，按错误处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "token_rates" => Some(Self::TokenRates),
+            "per_image" => Some(Self::PerImage),
+            "per_call" => Some(Self::PerCall),
+            "upstream_declared" => Some(Self::UpstreamDeclared),
+            _ => None,
+        }
+    }
+
+    /// 这种形态要不要一个单价（`per_image` / `per_call` 要，另外两种不要）。
+    #[must_use]
+    pub fn takes_unit_price(self) -> bool {
+        matches!(self, Self::PerImage | Self::PerCall)
+    }
+}
+
+/// 缺这个键的历史快照按 `token_rates` 读：那一天只有这一种计价形态。
+fn legacy_pricing_formula() -> PricingFormula {
+    PricingFormula::TokenRates
+}
+
+/// 按张 / 按次计费的一笔金额：**数量 × 单价**（成本平面，币种见该供给声明的成本币种）。
+///
+/// 与四档费率那个算式一样，钱只走整数：单价与数量都是微单位整数，乘积就是微单位金额，
+/// 不引入浮点。溢出按错误处理，不截断。
+pub fn unit_amount_microusd(units: u64, unit_price_microusd: u64) -> Result<u64, DomainError> {
+    u128::from(units)
+        .checked_mul(u128::from(unit_price_microusd))
+        .and_then(|product| u64::try_from(product).ok())
+        .ok_or(DomainError::ArithmeticOverflow)
 }
 
 /// 该候选的**成本来源口径**（按候选发布、随快照冻结）。
@@ -757,13 +827,30 @@ pub struct HitCandidate {
 /// 由受理用例算定后填上。它们从不到库里"半填"——写 Job 的只有受理这一条路，写之前已经填好。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceSnapshot {
-    pub price_plan_id: PricePlanId,
-    /// 该渠道的**成本费率**（四档，币种见 [`PriceRates::currency`]）。
+    /// 这条供给的 Price Plan（**该渠道按 token 计量量计价时的那份四档费率**）。
+    ///
+    /// 渠道的计价形态不是 token 计量量时**没有这一项**：那份费率是 `token_rates` 这一形态的参数，
+    /// 不是所有供给都必须有的东西。历史快照缺这个键时读成 `None`。
+    #[serde(default)]
+    pub price_plan_id: Option<PricePlanId>,
+    /// 该渠道的**成本费率**（四档，币种见 [`PriceRates::currency`]）；没有 Price Plan 时为 `None`。
     ///
     /// 它**不是对客定价口径**：对客售价走 [`Self::consumer_rates_cny`]，两者是两套数据，
-    /// 只是今天价格计划表暂时兼作渠道成本费率。所以成本自算一律经 [`Self::cost_rates`]
+    /// 只是今天 Price Plan 暂时兼作渠道成本费率。所以成本自算一律经 [`Self::cost_rates`]
     /// 取费率，**不复用对客扣费算出来的那个金额**——那会让成本跟着售价漂移。
-    pub rates: PriceRates,
+    #[serde(default)]
+    pub rates: Option<PriceRates>,
+    /// 这条供给的**计价形态**（渠道事实，随修订发布、随 Job 冻结）。
+    ///
+    /// 它决定上游没给金额时成本怎么算（见 [`Self::cost_unit_price_microusd`]）。
+    /// 历史快照缺这个键时读成 `token_rates`：那一天只有这一种形态。
+    #[serde(default = "legacy_pricing_formula")]
+    pub formula: PricingFormula,
+    /// `per_image` / `per_call` 的**单价**（成本平面微单位，币种见 [`Self::cost_currency`]）。
+    ///
+    /// 渠道按张 / 按次计价时它是成本自算唯一的参数；另外两种形态为 `None`。
+    #[serde(default)]
+    pub cost_unit_price_microusd: Option<u64>,
     pub captured_at: DateTime<Utc>,
     /// 受理时命中并冻结的那条候选（售价按它算）。
     #[serde(default)]
@@ -804,32 +891,45 @@ impl PriceSnapshot {
     /// 这条渠道的**成本费率**（四档，币种见 [`PriceRates::currency`]）。
     ///
     /// 它**不是对客定价口径**：对客售价走对客自己的 CNY 费率向量，两者是两套数据，只是今天
-    /// 价格计划表暂时兼作渠道成本费率。所以成本自算一律经这个访问点取费率，**不复用对客扣费
+    /// Price Plan 暂时兼作渠道成本费率。所以成本自算一律经这个访问点取费率，**不复用对客扣费
     /// 算出来的那个金额**——那会让成本跟着售价漂移，而上游成本与售价本来就是两个量。
-    #[must_use]
-    pub fn cost_rates(&self) -> &PriceRates {
-        &self.rates
+    /// 没有 Price Plan（渠道不按 token 计量量计价）时为 `None`：那时成本的算法由
+    /// [`Self::formula`] 决定，不从这里取费率。    #[must_use]
+    pub fn cost_rates(&self) -> Option<&PriceRates> {
+        self.rates.as_ref()
     }
 
     /// 这条渠道**声明的成本币种**。
     ///
     /// 成本平面记的是渠道自己的钱，所以币种按渠道声明取（不假定 USD）；对客平面只有 CNY，
     /// 不走这个访问点。受理时冻结的这份声明是成本侧币种**唯一**的取值点：Driver 拿到的金额
-    /// 本身不带币种，它只能把这份声明带回来。
+    /// 本身不带币种，它只能把这份声明带回来。声明与 Price Plan 的币种在实践中同源；两份都在时
+    /// 发布期要求它们一致，所以这里取到的仍是一个答案。两样都没有 = 这条快照没带成本币种
+    /// （旧修订受理出的历史 Job），由调用方按"说不清是哪个币种"处理。
     #[must_use]
-    pub fn cost_currency(&self) -> &str {
-        &self.rates.currency
+    pub fn cost_currency(&self) -> Option<&str> {
+        self.cost_currency
+            .as_deref()
+            .or_else(|| self.rates.as_ref().map(|rates| rates.currency.as_str()))
     }
 
     /// 对客实收（对客平面，CNY）。
     ///
-    /// 有定价读**命中候选的对客费率向量**（售价按候选发布、随快照冻结）；没有定价读已发布
-    /// 费率——那是旧口径，与今天逐位相同（历史 Job 与"迁移后仍生效但没有定价的旧修订"都走
-    /// 这条路）。成本自算走 [`Self::cost_rates`]，与这里分成两个入口。
+    /// 取值链只有两条：命中候选的**对客费率向量**（售价按候选发布、随快照冻结），以及没有它时
+    /// 的**旧口径**（Price Plan 的那些费率兼作对客费率，历史 Job 与"迁移后仍生效但没有定价的
+    /// 旧修订"都走这条）。**两条都没有 ⇒ 这条供给没有对客计费基准**：算不出实收。
+    ///
+    /// 那时**不按 0 结算**（0 元等于白送，还会在账上留下一条"收过钱"的记录），也不拿别的数顶替
+    /// （成本只进毛利口径，把它当成对客金额就是把**成本当售价**卖出去）：返回错误，由调用方按
+    /// **平台侧故障**处置（今天那条路是"结算失败进对账"）。发布期已经拒掉没有对客计费基准的
+    /// 供给，所以这条路只剩历史修订受理出的 Job。
+    ///
+    /// 成本自算走 [`Self::cost_rates`] 与 [`Self::formula`]，与这里分成两个入口。
     pub fn charge_microusd(&self, usage: &TokenUsage) -> Result<u64, DomainError> {
-        match &self.consumer_rates_cny {
-            Some(rates) => rates.amount_microusd(usage),
-            None => self.rates.amount_microusd(usage),
+        match (&self.consumer_rates_cny, &self.rates) {
+            (Some(rates), _) => rates.amount_microusd(usage),
+            (None, Some(rates)) => rates.amount_microusd(usage),
+            (None, None) => Err(DomainError::MissingConsumerRate),
         }
     }
 }
@@ -1020,6 +1120,10 @@ pub enum DomainError {
     InconsistentUsage,
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
+    /// 这条供给没有对客计费基准（既无对客费率向量，也没有 Price Plan 的费率）：算不出实收。
+    /// **不按 0 结算**——0 元等于白送。
+    #[error("no consumer rate basis to charge this supply with")]
+    MissingConsumerRate,
 }
 
 #[cfg(test)]
@@ -1046,7 +1150,7 @@ mod tests {
 
     /// 成本自算与对客扣费是**两个口径**：算式同一个，读的费率各自一份。
     ///
-    /// 今天价格计划表暂时兼作渠道成本费率，两份费率恰好是同一张表，所以两条路算出来的数
+    /// 今天 Price Plan 暂时兼作渠道成本费率，两份费率恰好是同一张表，所以两条路算出来的数
     /// 相同；用例把两份费率**人为设成不同的值**，钉住"成本读成本费率、扣费读对客费率"——
     /// 对客费率将来拆成自己的 CNY 向量时，成本不能跟着售价漂移。
     #[test]
@@ -1056,7 +1160,10 @@ mod tests {
         let consumer_snapshot =
             snapshot_with_rates("CNY", 7_000_000, 9_000_000, 11_000_000, 40_000_000);
 
-        let cost = cost_snapshot.cost_rates().amount_microusd(&usage());
+        let cost = cost_snapshot
+            .cost_rates()
+            .expect("这条快照带 Price Plan")
+            .amount_microusd(&usage());
         let charge = consumer_snapshot.charge_microusd(&usage());
         // 成本：27 文本输入 × 5 + 1024 图像输入 × 8 + 196 图像输出 × 30（每 1M）。
         assert_eq!(cost, Ok(14_207));
@@ -1068,7 +1175,7 @@ mod tests {
         );
         assert_eq!(
             cost_snapshot.cost_currency(),
-            "USD",
+            Some("USD"),
             "成本币种取渠道声明的那一份，不假定 USD、也不跟着对客 CNY 走"
         );
     }
@@ -1084,14 +1191,16 @@ mod tests {
         image_output: u64,
     ) -> PriceSnapshot {
         PriceSnapshot {
-            price_plan_id: PricePlanId::new(),
-            rates: PriceRates {
+            price_plan_id: Some(PricePlanId::new()),
+            rates: Some(PriceRates {
                 currency: currency.to_owned(),
                 text_input_microusd_per_million: text_input,
                 image_input_microusd_per_million: image_input,
                 text_output_microusd_per_million: text_output,
                 image_output_microusd_per_million: image_output,
-            },
+            }),
+            formula: PricingFormula::TokenRates,
+            cost_unit_price_microusd: None,
             captured_at: Utc::now(),
             hit_candidate: None,
             consumer_rates_cny: None,
@@ -1448,7 +1557,13 @@ mod tests {
             "对客费率向量"
         );
         // 成本侧不受影响：它仍读该渠道的成本费率。
-        assert_eq!(snapshot.cost_rates().amount_microusd(&usage()), Ok(14_207));
+        assert_eq!(
+            snapshot
+                .cost_rates()
+                .expect("这条快照带 Price Plan")
+                .amount_microusd(&usage()),
+            Ok(14_207)
+        );
         assert_eq!(snapshot.hold_microusd, Some(250_000));
         assert_eq!(
             snapshot.fx_rate.as_ref().map(|rate| rate.rate_micros),
@@ -1479,7 +1594,66 @@ mod tests {
         assert_eq!(snapshot.hold_microusd, None);
         assert_eq!(snapshot.fx_rate, None);
         assert_eq!(snapshot.hit_candidate, None);
+        assert_eq!(
+            snapshot.formula,
+            PricingFormula::TokenRates,
+            "历史快照缺这个键时按当时唯一存在的计价形态读"
+        );
         assert_eq!(snapshot.charge_microusd(&usage()), Ok(14_207));
+    }
+
+    /// 对客实收的取值链只有两条：对客费率向量，或 Price Plan 的费率（旧口径）。
+    ///
+    /// 两条都没有 = 这条供给**没有对客计费基准**：算不出实收，返回错误由调用方按平台侧故障
+    /// 处置（发布期已拒；只有历史修订才可能走到这里）。**不按 0 结算**——0 元等于白送。
+    #[test]
+    fn a_supply_without_a_consumer_basis_cannot_be_charged() {
+        let mut snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+        snapshot.price_plan_id = None;
+        snapshot.rates = None;
+        snapshot.formula = PricingFormula::UpstreamDeclared;
+        snapshot.cost_currency = Some("USD".to_owned());
+        assert_eq!(
+            snapshot.charge_microusd(&usage()),
+            Err(DomainError::MissingConsumerRate)
+        );
+        assert_eq!(snapshot.cost_rates(), None);
+        assert_eq!(
+            snapshot.cost_currency(),
+            Some("USD"),
+            "声明还在：成本记账要用它，但对客金额与它无关"
+        );
+    }
+
+    /// 按张 / 按次的一笔金额逐位等于"数量 × 单价"，溢出按错误落。
+    #[test]
+    fn unit_prices_multiply_bit_exactly() {
+        // 3 张 × 11_354 微单位 = 34_062。
+        assert_eq!(unit_amount_microusd(3, 11_354), Ok(34_062));
+        // 1 次 × 11354 = 11354（按次就是一次的钱）。
+        assert_eq!(unit_amount_microusd(1, 11_354), Ok(11_354));
+        assert_eq!(unit_amount_microusd(0, 11_354), Ok(0));
+        assert_eq!(
+            unit_amount_microusd(u64::MAX, 2),
+            Err(DomainError::ArithmeticOverflow)
+        );
+    }
+
+    #[test]
+    fn pricing_formulas_round_trip_through_their_stored_form() {
+        for formula in [
+            PricingFormula::TokenRates,
+            PricingFormula::PerImage,
+            PricingFormula::PerCall,
+            PricingFormula::UpstreamDeclared,
+        ] {
+            assert_eq!(PricingFormula::parse(formula.as_str()), Some(formula));
+        }
+        assert_eq!(PricingFormula::parse("by_the_hour"), None);
+        assert!(PricingFormula::PerImage.takes_unit_price());
+        assert!(PricingFormula::PerCall.takes_unit_price());
+        assert!(!PricingFormula::TokenRates.takes_unit_price());
+        assert!(!PricingFormula::UpstreamDeclared.takes_unit_price());
     }
 
     #[test]
