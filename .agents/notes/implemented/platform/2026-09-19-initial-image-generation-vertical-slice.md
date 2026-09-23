@@ -35,7 +35,7 @@ verification: 2026-09-19 fmt、clippy、workspace tests、空库 PostgreSQL HTTP
 - `cargo test --workspace --all-features`：PASS，22 项 Rust 测试通过；
 - 空库执行 `cargo test -p seeai-api --test http_contract -- --ignored`：PASS，覆盖动态发布、API 隔离、对账只退款、无 capture、租约在提交前后分别恢复，以及提交后不会再次入队；
 - Implementation Review 第 2 轮：Standards PASS、Spec PASS，material findings 为 0；
-- 真实 Provider 的历史受控验证（第一阶段 2026-09-18）见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) §2.3（渠道事实的单一出处）；**其原始调研存档 `docs/research/` 已于 2026-09-20 被移除（提交 `ed140c2`）**，本次收口没有再次执行付费调用；
+- 真实 Provider 的历史受控验证（第一阶段 2026-09-18）见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 响应节（渠道事实的单一出处）；**其原始调研存档 `docs/research/` 已于 2026-09-20 被移除（提交 `ed140c2`）**，本次收口没有再次执行付费调用；
 - `node scripts/decisions/check.mjs`：PASS，索引与本地链接有效。
 
 <!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->

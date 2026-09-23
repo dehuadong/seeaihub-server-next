@@ -1,404 +1,153 @@
-# 第二阶段渠道事实台账（按渠道分节）
+# 渠道事实台账（按渠道分节）
 
-- **性质**：**本仓库自己的汇总登记**（渠道事实的单一出处），**不是平台接口合同**；运行中服务不读取本文。只记录**渠道事实与来源**，不记录密钥值、不保存真实图片 URL、task id、签名参数。
-- **位置说明（2026-09-19 从 `out-reference/` 迁入 `docs/facts/`）**：本文原先放在 `out-reference/`，那是错的——那里按定义只放「**来自本仓库之外的上游或第三方材料**」（原始证据：官方文档、Schema 快照、调用响应）。而本文是**汇总登记**：它把散在各 `out-reference/<provider>/` 里的原始证据归纳成「哪些事实已结清、依据是什么、本平台据此决定什么」，并含**平台侧的判断**（如「`quality` 位置差异属 ②」）。**原始证据仍在 `out-reference/`，本文只引用不复述全文。**
-- **来源**：用户（项目运营方）2026-09-19 直接给出的渠道信息，以及据此的本机只读抓取与经用户授权的实测调用（原始样本见 §2.2、§2.6 所引文件）。
-- **纪律（本文的写法）**：**渠道之间分开记录，不做跨渠道合并结论。** 依据 `docs/design/0004-layered-architecture.md` §2 **R1**：上游的同步/异步、Base64/URL、**token/金额**等差异**全部属于 ② Adapter Driver 的内部实现**，一个渠道一族、各自独立；不得把两家并成一张表去推导「平台级」结论。本文此前犯过这个错，已重写。
+本仓库自己的**渠道事实汇总登记**——把散在各 `out-reference/<provider>/` 的上游材料归纳成结论，逐条给出处。不是平台接口合同，运行中的服务不读取本文。
 
-## 1. 用户给出的渠道（原文口径）
+- **只放结论**，引用不复述：原始形状、逐字样本与错误码表在 `out-reference/<provider>/`，见 §1 的总账。
+- **不合并渠道**：一个渠道一族，各自独立；渠道差异属该渠道 ② Driver 的内部实现，不互相推导（依据 [`docs/design/0004`](../design/0004-layered-architecture.md) R1）。
+- **不记凭证值**，只记变量名：`AIHUBMIX_API_KEY`（AIHubMix）、`APIMART_API_KEY`（APIMart）；另有 `DOUBAO_API_KEY`（火山方舟），与本台账范围无关。三个变量在 **User 与 Machine 级都存在**，Agent 进程默认环境里读不到——用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取（2026-09-23 复核）。
+- **本文不记计费调用流水**：授权依据、次数、花费与样本位置统一留档在 [`docs/verification/paid-provider-calls.md`](../verification/paid-provider-calls.md)。
+- **不记平台口径**：平台怎么取成本、怎么结算、怎么对客呈现归 [`docs/design/0007`](../design/0007-pricing-floor-and-settlement.md)、[`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md) 与 [`docs/adr/0017`](../adr/0017-provider-errors-are-rewritten-for-consumers.md)；实施清单归相应工单。
 
-| 渠道 | 文档 | API Base URL |
-| --- | --- | --- |
-| AIHubMix | `https://api.inferera.com/model/gpt-image-2.5-sunburst/llms.txt`<br>`https://api.inferera.com/model/gpt-image-2.5-flare/llms.txt` | `https://api.inferera.com/v1` |
-| APIMart | `https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md` | **`https://api.apib.ai/v1`** |
+## 1. 渠道与原始材料总账
 
-**Base URL 以用户指定为准，不得再当成未决项。** 此前本文把「APIMart 两份文档正文里写 `api.apimart.ai`，而用户给的是 `api.apib.ai`」记成待确认并重复追问——**这是错的**。用户已两次明确指定，平台固化该值即可。
+| 渠道 | 文档（第一方） | API Base URL | 原始材料 |
+| --- | --- | --- | --- |
+| AIHubMix | `https://api.inferera.com/model/gpt-image-2.5-sunburst/llms.txt`、`…/gpt-image-2.5-flare/llms.txt`、`out-reference/aihubmix/error-code.md` | `https://api.inferera.com/v1`（用户指定） | `out-reference/aihubmix/`：`response-shapes.md`、`transcript-sync-and-async-2026-09.json`、`gpt_image_2_generations.json`、`schema-gpt-image-2*.endpoints.json`、`error-code.md`、`gpt-image-2.md` |
+| APIMart | `https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md`（另有 `/tasks/status.md`、`/uploads/images.md`） | `https://api.apib.ai/v1`（用户指定；文档正文写 `api.apimart.ai`，指向同一套服务） | `out-reference/apimart/`：`response-shapes.md`、`controlled-probe-2026-09-19.json`、`transcript-image-edit-2026-09-19.json`、`catalog-models.json`、`schema-gpt-image-2.5-flare.input.json`、`gpt-image-2.5-generation.cn.md`、`tasks-status.cn.md`、`uploads-images.cn.md`、`apimart-image-api-research.md` |
 
-### 1.1 凭证（只记变量名）
-
-| 变量名 | 本机实际情况（2026-09-19 复核） |
-| --- | --- |
-| `AIHUBMIX_API_KEY` | User 级与 Machine 级**均存在**，本会话**已成功取到并用于经授权的实测调用** |
-| `DOUBAO_API_KEY` | User 级与 Machine 级均存在；属火山方舟，与本阶段无关 |
-| `APIMART_API_KEY` | User 级与 Machine 级**均存在**（此处此前写成"不存在"，是错的——当时只看了进程环境） |
-
-**说明**：三个变量在 **User 与 Machine 级都存在**，但 Agent 进程默认环境里读不到；可用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取到——**「读不到」此前被写成部署障碍或"凭证不存在"，都是措辞错误**。
+厂商侧材料：`out-reference/openai/openai-images-generate-2026-09-20.md`（`size` 像素型与 `quality` 六档的厂商口径）。
 
 ## 2. AIHubMix
 
-> 适用层级：② Adapter Driver（代码）／③ Profile（Schema 数据）／④ Offering（供给）／⑤ Price（价格）。
+### 2.1 端点与鉴权
 
-### 2.1 端点（三个，来自 `llms.txt`）
-
-> **响应结构台账**：各端点实际返回什么形状、哪一次调用有逐字样本，见 [`out-reference/aihubmix/response-shapes.md`](../../out-reference/aihubmix/response-shapes.md)（外部参考资源，只作证据）。
-
-| 端点 | 形态 | 本仓库现状 |
+| 端点 | 形态 | 平台使用 |
 | --- | --- | --- |
-| `POST /v1/images/generations` | **同步**，OpenAI 兼容 | **第一阶段即用它**（bootstrap `adapter_key: aihubmix-image-v1`） |
-| `POST /v1/images/edits` | **同步**，OpenAI 兼容，multipart | 同上 |
-| `POST /ai/v1/images/generations` | **默认同步**；`async: true` 转任务式 | 已实测（见 2.3） |
+| `POST /v1/images/generations` | 同步，OpenAI 兼容 JSON | `prompt_only` 分支走它 |
+| `POST /v1/images/edits` | 同步，OpenAI 兼容 multipart | `image_conditioned` / `masked` 分支走它 |
+| `POST /ai/v1/images/generations` | 默认同步，`async: true` 转任务式（`GET /ai/v1/images/{id}` 轮询） | 不使用 |
 
-- 免鉴权机器 Schema：`https://aihubmix.com/call/schema/models/{model}/endpoints`。
-- 输出 URL **约 30 分钟**过期，下载需带同一 `Authorization: Bearer`。
+- 机器 Schema（免鉴权）：`https://api.inferera.com/call/schema/models/{model}/endpoints`；`aihubmix.com` 在本机不可达，同一 Schema 在 `api.inferera.com` 上取到（出处：`out-reference/aihubmix/schema-gpt-image-2*.endpoints.json`）。
+- 鉴权：`Authorization: Bearer` + `AIHUBMIX_API_KEY`；输出 URL 约 30 分钟过期，下载需带同一凭据（出处：`out-reference/aihubmix/gpt-image-2.md`）。
+- 同步两个端点的存在性已由真实调用结清（[`paid-provider-calls.md`](../verification/paid-provider-calls.md) §2、§8.1）。
 
-### 2.2 同步 `/v1` 的响应形状
+### 2.2 参数与取值
 
-原始响应样例在 `out-reference/aihubmix/`；要点：同步面回 `data[0].b64_json`、顶层有 `created/background/output_format/quality/size/usage`，**没有任务 id**。
-### 2.3 异步 `/ai/v1` 的响应形状
+- 本平台走 `/v1` 族，**没有 `extra` 这一层**：参数落顶层（出处：`out-reference/aihubmix/schema-gpt-image-2*.endpoints.json` 的 `request.schema`）。
+- 字段面：`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image`、`mask` 只在 edits 端，multipart 里是二进制部件、`format: binary`；generations 端没有这两个字段）。
+- `prompt` 必填、`minLength 1`；2.5 另有 `maxLength 32000`。
+- `n`：`1`–`10`，默认 `1`。
+- `quality`：2.5 两款 `low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）；`gpt-image-2` 只有 `low` / `medium` / `high`（机器 Schema 里没有 `auto`）。
+- `size`：`auto` 或 `宽x高`；Schema 用 `anyOf` 的 `const` + `pattern` 表达，不是枚举。`gpt-image-2` 的 edits 面另有 `auto` / `1024x1024` / `1536x1024` / `1024x1536` 的限制。
+- `output_format`：2.5 是 `png` / `jpeg` / `webp`（默认 `png`）；`gpt-image-2` 无 `webp`。
+- `quality` 的位置按**端点族**分辨：`/v1/*` 在顶层；`/ai/v1` 在 `extra` 内（`extra` 含 `background` / `moderation` / `output_compression` / `quality` / `user`），取值集合两处相同。
+- `background` / `output_compression` / `moderation` / `user` 只存在于 `/ai/v1` 族的 `extra` 内；`background` 的 `transparent` 要求 `output_format` 为 `png` 或 `webp`（`/ai/v1` 族的机器 Schema 约束）。
+- 本平台对这些字段的字段面与取值一律按**厂商契约**声明，不以渠道机器 Schema 的宽窄为准（依据 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)；`gpt-image-2` 的 `quality` 差异属型号面）。
+- 平台当前不校验取值，但按候选声明过的参数面过滤：没声明的直接丢弃，不报错、不发上游。
+- 参考图与遮罩按名字落位：以 `image` 开头＝参考图，含 `mask`＝遮罩（都像时以遮罩为准），其余拒绝；一张发 `image`、多张发重复的 `image[]` 部件——**重复单值 `image` 会 400**。
+- 上游 `403` 的 `insufficient_user_quota` 说的是**平台在该渠道的账户欠费**（`Platform Funding Failure`），与消费者余额无关。
 
-原始响应样例在 `out-reference/aihubmix/`；要点：异步面给出任务 id 与轮询状态，金额字段仍然没有。
-### 2.4 AIHubMix 的费率（四档）
+### 2.3 响应与失败
 
-按 **Tokens 计费**（上游口径）：
+- 同步响应要点：顶层 `created` / `background` / `output_format` / `quality` / `size` / `usage`，图像在 `data[0].b64_json`，**没有任务 id、没有金额字段**（出处：[`out-reference/aihubmix/response-shapes.md`](../../out-reference/aihubmix/response-shapes.md) §1）。
+- `usage` 是四分项：`input_tokens_details{text_tokens,image_tokens}` / `output_tokens_details{…}` + `total_tokens`；**没有 `cached_tokens`**。
+- 2.5 两款在同步 `/v1` 上与 `gpt-image-2` 同构（顶层字段集合相同），② 的同步解码器不需要按型号分支；编辑端点的 2.5 未单独实测（同端点、同字段面）。
+- 2.5 的 `/v1/*` 实测：`quality` 顶层传入即被接受（无需 `extra`）；接受并落实 `background=transparent`（响应回显 + 产物是带 alpha 的 RGBA PNG）；两张参考图经重复 `image[]` 部件一次提交成功。
+- 绑定失败与恢复：创建请求失联后没有取回手段（同步响应无 id，且同步调用不出现在 `/ai/v1/images` 任务列表里），只能人工对账（[`docs/adr/0007`](../adr/0007-reconciliation-instead-of-automatic-retry.md)）；**该渠道的逐请求标识是响应头 `X-Request-ID`**，② 采它作为对账标识（**未核实**：本仓库的样本从未记录过响应头，见 `out-reference/aihubmix/response-shapes.md` §4）。
+- 异步 `/ai/v1` 任务对象给出任务 id 与轮询状态，**不返回 `usage`、不返回金额**，因此不作为平台的计量与计费执行路径（出处：`out-reference/aihubmix/response-shapes.md` §3；[`paid-provider-calls.md`](../verification/paid-provider-calls.md) §1）。
+- 错误信封：`{"error":{"code","message","type"}}`（异步文档另带 `tid`）；实测顶层 `quality` 非法时 HTTP 400 + `code: schema_violation`，**未知参数是硬拒绝、不静默降级**（出处：`out-reference/aihubmix/response-shapes.md` §4）。
+- 错误码表：见 `out-reference/aihubmix/error-code.md`（第一方页面，更新于 2026-06-01）。可用信息的边界：**只有部分状态码带机器可读的错误标识符**（如 `insufficient_user_quota`、`prompt_missing`、`prompt_too_long`、`text_too_long`、`size_not_supported`、`n_not_within_range`），其余只能靠状态码 + 消息文本；该页自述大部分 400 是上游透传报错。`403` 的其余分支（账号禁用、IP 白名单、令牌不支持该模型、渠道被禁用）都是我们与渠道之间的配置/资质问题；该页没有「服务器错误」这一档，`503` 只有「没有可用渠道」与「被官方限速」两种含义。⇒ 分类以状态码兜底，并保留原始文本供人工核对。
 
-| 计费项 | 单价 |
-| --- | --- |
-| 文本输入 | `$5 / 1M tokens` |
-| 文本输出 | `$10 / 1M tokens` |
-| 图像输入 | `$8 / 1M tokens` |
-| 图像输出 | `$30 / 1M tokens` |
+### 2.4 计量与费率
 
-**这是本渠道的成本价来源**：上游**只返回四分项 token、不返回任何金额字段**（§2.6），所以成本价 = Σ(分项 token × 上表费率)；与 APIMart 不同（那边上游直接声明 `cost`，见 §5.1）。
-
-与 `crates/domain/src/lib.rs:345-348` 的默认 `PriceRates` **逐项一致**。
-
-**措辞提醒**：`llms.txt` 里写 `Pricing: per-generation`，而模型页给的是 token 单价表——**以模型页的四档 token 单价为准**。
-
-**缓存**：本阶段按 Tokens 计费，**不考虑缓存档**（§5.2）。
-
-### 2.5 `quality` 的位置按**端点族**分辨（权威 Schema 实测，2026-09-19）
-
-来源：`GET https://api.inferera.com/call/schema/models/gpt-image-2.5-flare/endpoints`（HTTP 200，9442 bytes，免鉴权）。注意 `aihubmix.com` 在本机不可达，同一 Schema 在 `api.inferera.com` 上取到。
-
-| 端点 | `additionalProperties` | 顶层参数 | `quality` 位置 |
-| --- | --- | --- | --- |
-| `/ai/v1/images/generations` | `false` | `async, extra, image, images, mask, model, n, output_format, prompt, size, webhook_events_filter, webhook_url` | **在 `extra` 内**（`extra` 含 `background, moderation, output_compression, quality, user`） |
-| `/v1/images/generations` | `false` | `model, n, output_format, prompt, quality, size` | **在顶层** |
-| `/v1/images/edits` | `false` | `image, mask, model, n, output_format, prompt, quality, size` | **在顶层** |
-
-`extra.quality` 与顶层 `quality` 的取值集合相同：`low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）。
-
-**位置差异属于渠道各端点族自己的形态。** 本平台对 AIHubMix 采用的执行路径是**同步**的 `/v1/images/generations` 与 `/v1/images/edits`（§2.6 实测结清），上表第 1 行那条异步面**不使用**——它的包装形态与本平台无关。
-
-**`background` / `output_compression` / `user` / `moderation` 的位置（2026-09-20 定，同日修正）**：它们只存在于 `/ai/v1` 那族（在 `extra` 内；`gpt-image-2` 没有 `moderation`）。本平台走的是 `/v1` 族，那两个端点的 `request.schema` 里**没有这四项**（`additionalProperties: false`），所以素材**不声明**它们——一度按第一方文档把它们声明在顶层，已按端点 `request.schema` 收回。声明面的依据见 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md) 与 [`ADR-0002`](../adr/0002-native-capability-schema-not-canonical.md) 的 2026-09-20 修订。
-
-**仍存的一处不一致（如实登记，不在声明上回避）**：上表第 2、3 行（我们实际走的 `/v1/*`）的机器 Schema 只列 `model, n, output_format, prompt, quality, size`（edits 另有 `image, mask`），且 `additionalProperties: false`。也就是说文档的 OpenAI 兼容面比机器 Schema 宽——**某个参数真正需要用时再验证它在 `/v1/*` 上的行为**，那时才值得一次计费调用（零费用的做法：用一个明显非法的取值，若被拒则是"不认识该参数"或"取值非法"，两者都在受理前、不计费；若被接受则说明端点认这个参数）。
-
-### 2.6 2.5 两款在同步 `/v1` 上的实测（2026-09-19，经用户授权）
-
-这是**第二阶段真正的增量**：第一阶段测的是 `gpt-image-2`（已退役），2.5 此前从未做过付费调用。
-
-`POST https://api.inferera.com/v1/images/generations`，两次 body 除 `model` 外完全相同（`prompt`、`n=1`、`size=1024x1024`、`quality=low`、`output_format=png`）：
-
-| 模型 | 结果 | 顶层字段 | `usage` |
-| --- | --- | --- | --- |
-| `gpt-image-2.5-sunburst` | HTTP 200，245,138 bytes，19.8 秒 | `created, background, data, output_format, quality, size, usage` | 见下 |
-| `gpt-image-2.5-flare` | HTTP 200，321,146 bytes，14.7 秒 | **同上（字段集合一致）** | 见下 |
-
-两次 `usage` **逐项相同**：
-
-```json
-{ "input_tokens": 14,
-  "input_tokens_details":  { "image_tokens": 0,   "text_tokens": 14 },
-  "output_tokens": 196,
-  "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
-  "total_tokens": 210 }
-```
-
-**结论**：**2.5 两款在同步 `/v1` 上与 `gpt-image-2` 完全同构**——顶层字段集合相同、`usage` 同为四分项 + `total_tokens`、`quality` 顶层传入即被接受（无需 `extra`）。⇒ **② 的同步解码器不需要为 2.5 新建分支**。
-
-**同步响应体里没有 `id`**（顶层 7 个字段、`data[]` 只有 `b64_json`），且同步调用**不出现在** `/ai/v1/images` 任务列表里 ⇒ 创建请求失联后**没有技术手段把结果取回**，只能进对账人工核对（`docs/adr/0007`）。**但响应头里有逐请求标识**：`X-Request-ID`，② 采的就是它。
-
-**转录已落盘**：`out-reference/aihubmix/transcript-sync-and-async-2026-09.json`（本次 2.5 两次 + 2026-09-18 的同步 generations/edits 与 `/ai/v1` 异步；**转录**，非逐字——逐字报文当时未落盘）。
-
-**计费**（两次相同）：`14×$5 + 0×$8 + 0×$10 + 196×$30` per 1M → **5950 microusd = $0.005950**。**响应里没有金额字段**，只有 token。
-
-### 2.9 素材的参数面：以该模型对应端点的 `request.schema` 为准
-
-**执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。素材声明的就是这两个端点 `request.schema` 里的字段：
-
-`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image` 只在 edits 端、且必填；generations 端没有 `image`/`mask`）。
-
-**字段、枚举与取值范围都取自该模型对应端点的 `request.schema`**（快照见 `out-reference/aihubmix/schema-gpt-image-2*.endpoints.json`）：`prompt` 有 `minLength 1`（2.5 另有 `maxLength 32000`）；`n` 为 1–10、默认 1；`quality` 2.5 两款是 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）、`gpt-image-2` 只有 `low`/`medium`/`high`；`size` 是 `auto` 或 `宽x高`（schema 用 `anyOf` 的 `const` + `pattern` 表达，不是枚举）；`output_format` 是 `png`/`jpeg`/`webp`（`gpt-image-2` 无 `webp`）、默认 `png`；`image`/`mask` 在编辑端是**二进制部件**（schema 标 `format: binary`）。**schema 怎么表达就怎么声明**（枚举、`anyOf`、`format` 都照抄），不自己发明也不省略。
-
-**当前阶段平台不校验取值**（枚举、区间、类型都不管），但**按选中候选声明的参数面过滤**：候选声明过的参数原样发给上游，没声明的直接丢掉（不报错、不发上游）。哪些参数需要把取值管起来，等一份明确的清单（用户 2026-09-20 说明后期统一整理）。
-
-**2026-09-20 的两轮变化**：先把 `quality` 等从 `extra` 内提到顶层（那一轮还按第一方文档把 `background`/`output_compression`/`user`/`moderation` 声明在顶层）；同日又按端点 `request.schema` **收回那四项、去掉 `size`/`output_format` 自造的枚举、并修正 `gpt-image-2` 的 `quality`**（schema 里它没有 `auto`）。口径是：**声明面以端点 `request.schema` 为准，不以文档的宽面为准**（依据见 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md) 与 [`ADR-0002`](../adr/0002-native-capability-schema-not-canonical.md) 的 2026-09-20 修订）。
-
-**（2026-09-20 晚更正：上一段的"以端点 Schema 为准"已被取代）** 声明面改为**按厂商契约**：聚合渠道转售的就是上游模型的能力，**渠道机器 Schema 写没写不构成渠道不能**；渠道若不接受某个已声明的取值，就表现为**渠道报错**，平台不静默降级、也不替渠道把字段吞掉。据此 `background` / `output_compression` / `moderation` 重新按厂商契约声明（枚举与默认值照厂商契约，不再以"这两个端点没有这四项"为由收回），参考图按厂商契约声明成字符串数组（≤16），`size` 按厂商的**像素型**声明。促成这次改口的是一条实测：`/v1/*` 的机器 Schema 里确实没有 `background`，但端点**接受并落实**了 `background=transparent`（§2.14）——窄 Schema 不等于端点不认。**唯一不变的是型号差异**：`gpt-image-2` 的 `quality` 仍按它自己的取值集合（不含 `auto`），那是型号面的事、不是渠道宽窄的事。
-
-### 2.11 费率
-
-四档单价见 §2.4（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens）；`config/bootstrap/aihubmix-*.json` 的 `price_plan` 按同一四档填写。
-
-**（2026-09-20 更正）** 本节此前记"在跑的配置把文本输出费率写成 0、平台少收费"。核对当前素材：`text_output_microusd_per_million` 已是 **10000000**（$10），该缺陷不存在于现文件。
-
-### 2.12 平台侧额度失败：`403`（用户 2026-09-20 告知）
-
-AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在这个渠道的账户**没额度了，与消费者余额无关。因此：
-
-- **不得原样返回给消费客户端**：对客应表现为平台侧故障，不能让消费者以为自己欠费；
-- 内部必须能发现它属**运营事件**（该渠道需要充值/换额度），而不是普通的用户请求失败；
-- 领域区分见 `CONTEXT.md` 的 `Platform Funding Failure` / `Consumer Insufficient Balance`。
-
-该码与 APIMart 的 `402` 是同一类（见 §3.8 第 3 条）；两者都被 Adapter 按"凭据/权限类 → 确定性拒绝"处理（重试同一配置无意义）。**对客怎么呈现已由 `docs/adr/0017` 定下**：一律说成平台侧故障（`platform_unavailable`），渠道码与原文只留内部；内部靠 `failure_kind = platform_funding` 让它成为可发现的运营事件。
-
-### 2.13 错误码（第一方文档快照，页面更新于 2026-06-01）
-
-来源：`out-reference/aihubmix/error-code.md`（第一方「HTTP 状态码」页）。**只有部分状态码带机器可读的「错误标识符」**，其余只能靠状态码 + 消息文本识别；该页自述「**大部分 400 错误是上游透传的报错**」——连消息文本也可能是第三方（Vendor）原文。
-
-| 状态码 | 错误标识符 | 消息（原文摘要） | 常见原因（第一方口径） |
-| --- | --- | --- | --- |
-| 503 | — | Incorrect model ID… / you do not have permission to use this model | 没有可用的渠道处理请求 |
-| 503 | — | Rate limited by provider – contact support… | 模型遇到官方限速 |
-| 429 | — | The xx model Too many requests; please try again later. | 请求频率超过限制 |
-| **403** | **`insufficient_user_quota`** | Your account balance is insufficient. Please recharge your account… | **用户余额不足，需要充值**——**这里的"用户"是我们**，即平台侧欠费 |
-| 403 | — | Account suspended. | 用户状态被禁用或在黑名单 |
-| 403 | — | Forbidden – insufficient permissions. | 用户角色权限不够 |
-| 403 | — | Forbidden – key(后六位) allowed only from approved IP ranges. | IP 不在令牌允许的网段内 |
-| 403 | — | Forbidden – key(后六位) not authorized to access the requested model. | 令牌不支持请求的模型 |
-| 403 | — | Key error；(后六位) | 非管理员用户尝试指定渠道 |
-| 403 | — | Forbidden – channel has been disabled. | 渠道状态为禁用 |
-| 401 | — | Unauthorized – no access token supplied | 未提供 Authorization 头 |
-| 401 | — | Unauthorized – access token is invalid or expired | access token 验证失败 |
-| 400 | — / `prompt_missing` / `prompt_too_long` / `text_too_long` / `size_not_supported` / `n_not_within_range` | Bad Request – invalid channel ID / prompt is required / … | 渠道 ID 错误、缺提示词、提示词或输入过长、尺寸不被支持、n 超范围 |
-
-**对平台的三条要点**：
-
-1. **"余额不足"说的是我们**：`insufficient_user_quota` 是**平台在渠道侧的账户欠费**（`CONTEXT.md` 的 `Platform Funding Failure`），**不得原样返回给消费客户端**；403 的其余分支（账号禁用、IP 白名单、令牌不支持该模型、渠道被禁用）也全是**我们与渠道之间的配置/资质问题**。
-2. **没有"服务器错误"这一档**：该页的 503 只有"没有可用渠道"与"被官方限速"两种含义，属渠道侧/上游侧问题，不是"我们调它时它崩了"。
-3. **分类不能只靠字符串匹配**：多数分支没有错误标识符，文本还可能是上游透传——所以要以**状态码兜底**，并保留原始文本供人工核对。
-
-### 2.14 编辑面实测：两张参考图 + `background=transparent`（2026-09-20，一次真实调用）
-
-`POST https://api.inferera.com/v1/images/edits`（`multipart/form-data`），`model=gpt-image-2.5-flare`：
-
-| 项 | 值 |
-| --- | --- |
-| 参考图 | **两张**，用**重复的 `image[]` 部件**提交（不是两次单值 `image`） |
-| 其余参数 | `background=transparent`、`output_format=png`、`n=1`、`size=1024x1024`、`quality=low` |
-| 结果 | **HTTP 200**；响应顶层 `background: "transparent"` |
-| 产物 | **RGBA PNG（PNG color type 6，带 alpha 通道）1,495,027 bytes** |
-| `usage` | `input_tokens 2589`（`input_tokens_details.image_tokens 2545`）/ `output_tokens 196` |
-
-**两条结论**：
-
-1. **该渠道接受并落实 `background=transparent`**：不但在响应里回显，产物的 PNG 头也确实是带 alpha 的 **RGBA**（不是 RGB）。这正是 §2.5 记的那处"文档面比机器 Schema 宽"的实测答案——**Schema 窄不等于端点不认**，所以素材按**厂商契约**声明这些字段（§2.9 的 2026-09-20 晚更正）。
-2. **多张参考图经 `image[]` 可用**：两张参考图一次提交成功；**重复单值 `image` 会 400**（家族面既有记录，见 §2.6 附近的实测与素材 `_evidence`）。⇒ 素材按张数决定编码（一张 `image`、多张 `image[]`）是对的。
-
-**与计费的关系**：图片输入 token 由 0 涨到 **2545**（两张参考图），四分项 `usage` 形状不变，② 的同步解码器仍不需要新分支。
-
-**边界（未做）**：**没有逐像素核对透明区域**（只核了 PNG 色彩类型与响应回显）；**16 张上限未压测**（不为此花钱）；`output_compression`、`moderation` 未在真实调用里用过。
-
-**样本位置**：这次调用的请求脚本与产物（`probe.ps1`、`two-refs-transparent.png`）在本机探测目录 `.data/probe-2026-09-20/`，**未入库**（该目录不入版本控制）；本节只转录与结论有关的事实。
+- 按 Tokens 计费，四档单价（每 1M tokens）：文本输入 `$5` / 图像输入 `$8` / 文本输出 `$10` / 图像输出 `$30`（出处：`out-reference/aihubmix/gpt-image-2.md` 与模型页）。
+- 上游**只返回四分项 token、不返回任何金额字段**；`llms.txt` 写 `Pricing: per-generation`，与模型页的 token 单价表冲突——**以模型页的四档 token 单价为准**。
+- 四档与 `config/bootstrap/` 里各 AIHubMix 素材的 `price_plan` 逐项一致（含 `text_output_microusd_per_million = 10000000`）。
+- 本阶段按 Tokens 计费，**不考虑缓存档**；逐笔成本价与金额留档在 [`paid-provider-calls.md`](../verification/paid-provider-calls.md)。
 
 ## 3. APIMart
 
-> 同样适用 ②③④⑤；与本文件的 AIHubMix 各节**互不推导**。
+### 3.1 端点与鉴权
 
-### 3.1 端点
-
-> **响应结构台账**：各端点实际返回什么形状、哪一次调用有逐字样本，见 [`out-reference/apimart/response-shapes.md`](../../out-reference/apimart/response-shapes.md)（外部参考资源，只作证据）。
-
-| 端点 | 形态 | 路由是否存在（2026-09-19 零费用探测） |
+| 端点 | 形态 | 平台使用 |
 | --- | --- | --- |
-| `POST /v1/images/generations` | **异步**，立即返回 `task_id` | **存在**（无凭证 401） |
-| `GET /v1/tasks/{task_id}` | 任务查询（可选 `?language=`，仅影响 `error.message`） | **存在**（无凭证 401） |
-| `POST /v1/uploads/images` | 上传本地图以取得可用 `url` | **存在**（无凭证 401；对照：`/v1/nonexistent-route` 返回 404） |
+| `POST /v1/images/generations` | 异步，立即返回 `task_id` | 提交生成任务 |
+| `GET /v1/tasks/{task_id}` | 任务查询（可选 `?language=`，只影响 `error.message`） | 轮询到终态并取计量与成本 |
+| `POST /v1/uploads/images` | 上传本地图换公网 `url`（`multipart/form-data`，字段名 `file`） | 调用方给 data URL 时先上传 |
 
-**探测方法**：对 `https://api.apib.ai` 发**不带任何凭证**的请求，只看 401/404（不触达任何账号、不产生任何费用）。三个真实端点在**我们实际配置的域名**上都存在，不只是文档里写着。
+- 鉴权：`Authorization: Bearer` + `APIMART_API_KEY`。
+- 三个端点在**我们实际配置的域名**上均存在：无凭证请求返回 401，对照的 `/v1/nonexistent-route` 返回 404（零费用探测，[`paid-provider-calls.md`](../verification/paid-provider-calls.md) §5）。
+- 目录里 `gpt-image-2.5-flare` / `-sunburst` 的 `supported_endpoint_types` 是 `["image-generation","openai"]`（出处：`out-reference/apimart/catalog-models.json`）。
+- 任务面是唯一的计量与成本来源：终态同时返回四分项 `usage` 与 `cost`；**非任务面拿不到 token、也没有 `cost` 字段**，因此平台只用任务面。
 
-**该渠道对同一模型声明两种端点类型，但只有任务面给得出计量与计费事实（2026-09-20 补记）**：目录里 `gpt-image-2.5-flare` / `-sunburst` 的 `supported_endpoint_types` 是 `["image-generation", "openai"]`（原始材料 `out-reference/apimart/catalog-models.json`）。**任务面**（`image-generation`）的终态同时返回四分项 `usage` 与 `cost`（§3.3 有逐字样本）；**非任务面拿不到 token，也没有 `cost` 字段**（用户 2026-09-20 实测）。⇒ 本平台**只用任务面**，该 Offering 的计量与成本事实的唯一来源是任务终态；成本口径的决策见 `docs/adr/0006`。
+### 3.2 请求参数与尺寸
 
-**提交响应**：`{"code":200,"data":[{"status":"submitted","task_id":"task_…"}]}` —— **`data` 是数组，读 `data[0].task_id`**。
+- 字段：`model`（`gpt-image-2.5-flare` / `-sunburst`）、`prompt`、`size`、`resolution`、`quality`、`n`（`1`–`4`）、`output_format`、`output_compression`、`background`、`moderation`、`image_urls`、`mask_url`。
+- `size`：默认 `auto`；另有 15 个比例（`1:1` `3:2` `2:3` `4:3` `3:4` `5:4` `4:5` `16:9` `9:16` `2:1` `1:2` `21:9` `9:21` `3:1` `1:3`）与精确像素（如 `1600x1200`）。文档明写图生图时**建议不传** `size`，由系统按输入图比例与 `resolution` 算。
+- `resolution`：默认 `1k`，取 `1k` / `2k` / `4k`；只与比例形式的 `size` 配合决定输出像素，`size` 用精确像素时**该字段被忽略**。
+- 精确像素的合法性：宽高均为 `16` 的倍数、任意单边 ≤ `3840`、长短边之比 ≤ `3:1`、总像素 `655,360`–`8,294,400`；高于 `2560x1440` 属实验性范围。
+- 比例 × 档位 → 像素的映射表存在（15 比例 × 3 档，整表见上游文档）；两个特征值：`4k` 的 `1:1` 是 `2880×2880`（不是 3840）；`4k` 下只有 `16:9` / `9:16` / `2:1` / `1:2` / `21:9` / `9:21` / `3:1` / `1:3` 八个比例能到 3840。
+- `quality`：`low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`，五档+auto；`xhigh`、`max` 仅 2.5 支持，传给 `gpt-image-2` 会同步返回 400、不自动降级）。
+- `moderation`：渠道默认 `low`（厂商契约默认是 `auto`）。
+- 来源：`out-reference/apimart/gpt-image-2.5-generation.cn.md`（2026-09-19 抓取）与上游文档 `https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md`，2026-09-20 逐句复核一致。
+- **`gpt-image-2` 的尺寸档案不适用于 2.5**：`4k` = 3840、「`auto` 回落 `1:1`」、「不传 `size` ⇒ 输出分辨率 = 输入图分辨率」都是 2.5 之前的旧口径；2.5 是「`auto` 由模型按提示词或参考图决定」、不传 `size` 时按输入图比例 + `resolution` 算。
+- 厂商侧对照（`out-reference/openai/openai-images-generate-2026-09-20.md`）：厂商原生 `size` 是**像素型**（任意 `宽x高`、宽高被 16 整除、比例 1:3–3:1、上限 `3840x2160`、`>2560x1440` 属实验性），**没有 `resolution` 字段**——那是 APIMart 的渠道包装；`gpt-image-2.5-flare` / `-sunburst` 是厂商侧真实模型（含 `2026-09-08` 快照枚举）；`quality` 的 `xhigh` / `max` 与厂商契约一致。
+- 提交请求参数、遮罩与幂等绑定见 §3.3、§3.5；平台的承载面只声明合同可达的字段（`auto` | `宽x高`），比例名与 `resolution` 无法从厂商合同到达，因此不声明。
 
-### 3.2 请求参数（`gpt-image-2.5`）
+### 3.3 参考图、遮罩与上传
 
-`model`（`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`）、`prompt`、`size`（`auto` + 15 比例 + 精确像素）、`resolution`（`1k/2k/4k`）、`quality`（`low/medium/high/xhigh/max/auto`，默认 `auto`）、`n`（`1~4`）、`output_format`、`output_compression`、`background`、`moderation`（默认 `low`）、`image_urls`（≤16，**仅公网可访问 URL**）。
+- 上传返回 `{url, filename, content_type, bytes, created_at}`；实测返回的 URL 主机是 `getapib.org`（不是文档示例里的 `upload.apimart.ai`），`https`、路径较长且随机；文档写 URL 有效期 72 小时。
+- 接受格式 JPEG / PNG / WebP / GIF，单张 ≤ `20MB`；上游文档示例的报错文案（`unsupported image type…`、`file size … exceeds maximum 20971520 bytes`）与上传页一致（出处：`out-reference/apimart/uploads-images.cn.md`）。
+- 生成请求里的参考图是 `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），只接受**公网可访问 URL**。上传页的 Python 示例把它写成 `[{"url": …}]`（对象数组）——实测用字符串数组提交成功并完成出图，平台取字符串数组。
+- 遮罩是 `mask_url`（字符串），与 `image_urls` 同用可行；实测用 512×512 带 alpha 的 PNG、尺寸与参考图一致，上游未报尺寸/通道错误。
+- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台取更严的一侧：一律先上传换 URL（**base64 是否仍被接受未实测**）。
+- 流程：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，[`docs/adr/0011`](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)）⇒ Job `failed` + 释放预授权，**不进对账**。调用方给公网 URL 时逐字透传、不上传；平台不托管素材，只有 data URL 才需要解码后上传。
+- 参数名不改写：生成请求用上游原生名 `image_urls` / `mask_url`，由 Offering Parameter Mapping 从合同字段 `image` / `mask` 落位（依据 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。
+- `mask_url` 不在 2.5 生成文档的字段表里，但**实测被接受**（提交 200 → `completed`），因此按厂商契约声明遮罩；渠道将来若拒绝它，表现会是渠道报错，不是平台静默丢字段。
+- 遮罩**不额外计费**：带/不带 `mask_url` 的两次调用 `usage` 与 `cost` 完全相同。
+- 遮罩是否真的生效只有**弱信号**：每 8 像素采样对比两张产物，遮罩椭圆内差异像素 21%、全图 79.9%——方向一致，但生成随机且请求无 `seed`，不能据此断言遮罩被严格遵从。
+- 未做：`sunburst` 的图生图与遮罩路径未单独实测（同渠道族、同端点、同参数面）；`base64` 路径未测；20MB / 16 张 / 256MB 边界未逐个压测；遮罩尺寸/通道的边界未压测。
 
-**`size` 与 `resolution` 的取值与默认值（2026-09-20 复核）**：
+### 3.4 任务流转与响应
 
-| 参数 | 默认 | 取值 | 说明 |
-| --- | --- | --- | --- |
-| `size` | **`auto`** | `auto` + 15 个比例（`1:1` `3:2` `2:3` `4:3` `3:4` `5:4` `4:5` `16:9` `9:16` `2:1` `1:2` `21:9` `9:21` `3:1` `1:3`）+ 精确像素（如 `1600x1200`） | 文档明写**图生图时建议不传** `size`，由系统按输入图比例与 `resolution` 算 |
-| `resolution` | **`1k`** | `1k` / `2k` / `4k` | **与"比例形式的 `size`"配合**决定实际输出像素；`size` 用精确像素时**该字段被忽略** |
+- 提交响应：`{"code":200,"data":[{"status":"submitted","task_id":"task_…"}]}`——**`data` 是数组，读 `data[0].task_id`**。
+- 任务终态：`status` 取 `pending` / `processing` / `completed` / `failed` / `cancelled`；成功时 `result.images[]` 每项为 `{url: [字符串], expires_at}`（**`url` 是数组**，`expires_at` 说明结果 URL 会过期、必须立刻下载转存）。
+- 终态同时返回四分项 `usage`（`input_tokens_details` 区分 `text_tokens` / `image_tokens`，另有 `cached_tokens`）与 `cost` / `credits_cost`（`credits_cost = cost × 10`）。
+- 实测结清：任务成功响应的 `usage` 粒度比生成页与 `/tasks/status` 两处文档样例都更细（文档只给聚合三项，`tasks-status.cn.md` 样例连 `usage` 都没有）；`cost` 是上游声明的实际扣费。参考图会真实计入 `image_tokens`（1024×1024 ⇒ 1024）；带参考图时四分项形状不变，② 的解码器不需要新分支。
+- **创建请求的失联处理**：响应丢失后无法按时间窗反查这次提交是否被受理（文档化的任务管理只有状态查询与 webhook，没有任务列表接口）⇒ 进人工对账，不自动重提。
 
-**精确像素的合法性**（渠道文档明写的四条）：宽高均为 `16` 的倍数、任意单边 ≤ `3840`、长边与短边之比 ≤ `3:1`、总像素 `655,360` ~ `8,294,400`；**高于 2560×1440 属实验性范围**（稳定性可能低于常用分辨率）。
+### 3.5 幂等
 
-**比例 × 档位 → 像素的映射表存在**（15 比例 × 3 档，本文不复述整表）。**两个特征值**：
+- `POST /v1/images/generations` 的机器 Schema 明确定义幂等键：头 `Idempotency-Key`、重放标识头 `Idempotency-Replayed`、`required: false`、`retention_seconds: 86400`、`scope: api_key_endpoint`（出处：`out-reference/apimart/schema-gpt-image-2.5-flare.input.json`）。
+- 结论：创建请求失联后**具备安全重试的机制基础**；平台的处置路径仍是「创建请求绝不重发」（[`docs/design/0002`](../design/0002-image-generation-tech-design.md) §7），是否启用幂等重试属后续工作项。
+- 同一 Schema 的另外两条事实：`model.const = "gpt-image-2.5-flare"`（与 `native_model_id` 同名，发布期校验可过）；`additionalProperties: true`，`quality` / `size` 只声明为 `type: string` 无取值约束，`required` 仅 `model`（另有 `anyOf: prompt | messages`）⇒ **未知字段不被此 Schema 拒绝**，与 AIHubMix 的 `additionalProperties: false` 相反。
 
-- `4k` 的 `1:1` 是 **`2880×2880`**，**不是** 3840；
-- `4k` 下**只有 8 个比例能到 3840**：`16:9` / `9:16` / `2:1` / `1:2` / `21:9` / `9:21` / `3:1` / `1:3`；其余 7 个比例的长边都到不了 3840。
+### 3.6 错误信封与错误码
 
-**来源**：`out-reference/apimart/gpt-image-2.5-generation.cn.md`（2026-09-19 抓取）＋ 2026-09-20 与上游文档 `https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md` **逐句复核一致**。
+- 信封统一为 `{"error":{"code","message","type"}}`（部分页面另有 `param`、`request_id`）。实测（无凭证 401）的 `error.code` 是**空字符串**、`type` 是 `apimart_error`，而文档示例里 `code` 是数字（401/402/…）⇒ 分类必须以 HTTP 状态码兜底，不能只依据 `error.code`。
+- 每请求标识在失败时也有：响应头 `X-Oneapi-Request-Id`，同时写进 `message` 的 `(request id: …)`；失败路径的 `provider_error_message` 原样落库，排查不必额外取头（成功路径的对账标识是 `task_id`）。
+- `402` 是**平台在该渠道的账户欠费/额度不足**（`Platform Funding Failure`），与消费者余额无关；对客呈现与内部归类见 [`docs/adr/0017`](../adr/0017-provider-errors-are-rewritten-for-consumers.md)。
 
-> ⚠️ **`gpt-image-2` 的尺寸档案不能沿用到 2.5。** `out-reference/apimart/apimart-image-api-research.md` 里的三条尺寸口径——`4k` = 3840、"`auto` 回落 `1:1`"、"不传 `size` ⇒ 输出分辨率 = 输入图分辨率"——**全是 `gpt-image-2` 口径**，与 2.5 的文档不一致：2.5 是"`auto` 由**模型**按提示词或参考图决定"、"不传 `size` 时按**输入图比例** + `resolution` 算"。2.5 的尺寸事实一律以本节为准，**不得**用旧材料反推。
-
-**已结清（2026-09-20）：`size` 的厂商原生语义。** 取到 OpenAI 官方文档并落成快照（`out-reference/openai/openai-images-generate-2026-09-20.md`，经本机代理 `127.0.0.1:7897` 抓取、HTTP 200）：
-
-- **厂商原生 `size` 是像素型**：对 `gpt-image-2`、`gpt-image-2-2026-04-21`、`gpt-image-2.5-sunburst`/`-flare`（含各自的 `2026-09-08` 快照）支持任意 `WIDTHxHEIGHT`（如 `1536x864`）；宽高均须被 16 整除、比例在 1:3~3:1；`>2560x1440` 属实验性、上限 `3840x2160`；标准值 `1024x1024`/`1536x1024`/`1024x1536`；`auto` 适用于允许自动定尺寸的模型。**不是比例、不是档位。**
-- **厂商侧没有 `resolution` 字段**——那只是 APIMart 的渠道包装（"与比例形式的 `size` 配合决定像素"）。
-- **`gpt-image-2.5-flare`/`-sunburst` 是厂商侧真实模型**（文档把它们与 `2026-09-08` 快照一并列入模型枚举）。
-- **`quality`**：默认 `auto`；`gpt-image-2.5-sunburst`/`-flare`（含 `2026-09-08` 快照）**额外支持 `xhigh` 与 `max`**——与用户 2026-09-20 告知的六档一致。
-
-⇒ 上面的取值与映射仍是**渠道口径**（比例 + 档位、`image_urls`/`mask_url`），但现在有对应的**厂商合同**可对照：合同按像素型 `size` 写，渠道差异由承载面 + `parameter_mapping` 吸收。
-
-### 3.3 任务成功响应（**2026-09-19 实测结清**）
-
-**实测原文**（`gpt-image-2.5-flare`、`n=1`、`size=1:1`、`resolution=1k`、`quality=low`；原始记录见 `out-reference/apimart/controlled-probe-2026-09-19.json`）：
-
-```json
-{ "code": 200, "data": {
-    "id": "task_…", "status": "completed", "progress": 100,
-    "cost": 0.00476, "credits_cost": 0.0476,
-    "created": 1789806894, "completed": 1789806901,
-    "actual_time": 7, "estimated_time": 60,
-    "result": { "images": [ { "url": ["<已脱敏>"], "expires_at": 1789893301 } ] },
-    "usage": {
-      "input_tokens": 14,
-      "input_tokens_details": { "cached_tokens": 0, "image_tokens": 0, "text_tokens": 14 },
-      "output_tokens": 196,
-      "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
-      "total_tokens": 210
-    }
-} }
-```
-
-**V1 的答案（Gate 前提，已结清）**：
-
-1. **任务成功响应含四分项 `usage`**，且 `input_tokens_details` **区分 `text_tokens` 与 `image_tokens`**（另有 `cached_tokens`）；
-2. ⇒ **无需扩展领域类型**：本渠道与 AIHubMix 的响应都能归一成既有 `TokenUsage`（`input_text` / `input_image` / `output_text` / `output_image`）；
-3. ⇒ **金额型计量证据本阶段不需要**（该候选决策经实测被否决并退役，理由见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）；
-4. **计价维度与 AIHubMix 相同**：单价 `$5 / $8 / $10 / $30` per 1M；本次 `cost = 0.00476 USD`：**平台的成本直接取它**，不用公开单价反算（详见 §5）。
-
-**此前记录的文档不一致**（生成页样例有 `usage`、`tasks/status.md` 样例无 `usage`）**已由实测结清**：实际响应**有**四分项 `usage`，粒度比两份文档样例都更细（文档只给聚合三项）。
-
-### 3.4 `Idempotency-Key`（机器 Schema 结清，V4 有答案）
-
-`GET /v1/models/gpt-image-2.5-flare/schema` 返回（原始快照 `out-reference/apimart/schema-gpt-image-2.5-flare.input.json`）：
-
-```json
-"idempotency": { "header": "Idempotency-Key", "replay_header": "Idempotency-Replayed",
-                 "required": false, "retention_seconds": 86400, "scope": "api_key_endpoint" }
-```
-
-⇒ **该端点的幂等键被平台明确定义**（保留 24 小时、作用域为 api_key+endpoint、可选的 `required:false`）。**结论**：创建请求失联后**具备安全重试的机制基础**；但本阶段仍按 `0002` §7 的「创建请求绝不重发」执行——是否启用幂等重试属**后续工作项**，不作为本阶段的处置路径。
-
-**同一 Schema 的另外两条事实**：
-
-- `model.const = "gpt-image-2.5-flare"`（与 `native_model_id` 同名，发布期校验可过）；
-- `additionalProperties: true`，且 `quality` / `size` 只声明为 `type: string`**无取值约束**（`required` 仅 `model`，另有 `anyOf: prompt | messages`）。⇒ **未知字段不被此 Schema 拒绝**，与 AIHubMix 的 `additionalProperties: false` 相反。
-
-### 3.5 机器可读证据（已入库）
-
-| 文件 | 内容 |
-| --- | --- |
-| `out-reference/apimart/catalog-models.json` | `GET /v1/models` 目录（8 条图像模型，含 `owned_by`、`category`、`supported_endpoint_types`） |
-| `out-reference/apimart/schema-gpt-image-2.5-flare.input.json` | `GET /v1/models/{model}/schema` 的输入合同 + 幂等声明 + 响应契约版本 |
-| `out-reference/apimart/controlled-probe-2026-09-19.json` | 本次受控实测的请求与终态响应（已脱敏） |
-
-⚠️ 注：`api.apib.ai` 与文档正文示例里的 `api.apimart.ai` 指向同一套服务；**平台固化使用用户指定的 `https://api.apib.ai/v1`**。
-
-### 3.7 参考图与遮罩：必须先上传（**2026-09-19 已受控实测结清**）
-
-原始材料：`out-reference/apimart/uploads-images.cn.md`（上传页，2026-09-19 抓取）；实测记录见留档 §6。
-
-| 事实 | 值 |
-| --- | --- |
-| 上传端点 | `POST /v1/uploads/images`，`multipart/form-data`，字段名 `file` |
-| 接受格式 / 上限 | JPEG、PNG、WebP、GIF；单张 ≤ **20MB** |
-| 返回（**实测**） | `{url, filename, content_type, bytes, created_at}`；字段与文档一致；`content_type` 由上游探测（我们传 PNG 得到 `image/png`） |
-| 返回的 URL 主机（**实测**） | `getapib.org`（**不是**文档示例里的 `upload.apimart.ai`）；`https`，路径较长且随机；有效期文档写 72 小时 |
-| 生成请求里的参考图（**实测**） | `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），只接受公网可访问 URL |
-| 遮罩（**实测**） | `mask_url`（字符串）与 `image_urls` **同用可行**；本次用 512×512 带 alpha 的 PNG，尺寸与参考图一致，上游未报任何尺寸/通道错误 |
-
-**两处文档冲突，实测后的结论**：
-
-1. 上传页的 Python 示例把 `image_urls` 写成 `[{"url": …}]`（对象数组）。**实测用字符串数组提交成功并完成出图** ⇒ 平台发**字符串数组**是对的（与机器 Schema、生成页字段说明及三个示例一致）。
-2. 上传页声明生成接口**不再接受 base64**，生成页仍写「支持 `base64 data URI`、可与 URL 混填」⇒ 平台取**更严的一侧**：一律先上传换 URL。**本次未实测 base64 是否仍被接受**（不需要，取严的一侧不受影响）。
-
-**带参考图时的计量（实测）**：`usage` 仍是四分项，且 `input_tokens_details.image_tokens` **真的会涨**（512×512 参考图 ⇒ **1024**，与文档口径一致），`text_tokens` 为提示词长度；平台按 `TokenUsage` 归一后结算，与上游自报金额只差固定折扣（见 §3.3、留档 §6）。
-
-**平台侧决定（全在 ② 层，不外泄）**：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**（与"提交后失联"是两条路径）。**2026-09-20 补**：平台不再托管素材，所以这条只对**调用方给 data URL** 的情况成立（那时才需要解码后上传换 URL）；调用方给公网 URL 时逐字透传，不上传。
-
-**发布素材状态：三条分支已开放。** `config/bootstrap/gpt-image-2.5-*.json` 里那条 APIMart 供给的 `allowed_branches` 已加上 `image_conditioned` / `masked`（`max_images: 16`）。（本节原先指的是两份 `config/bootstrap/apimart-gpt-image-2.5-*.json` 单供给素材；2026-09-20 晚并入"一份合同 + 多供给"的新素材后，那两份旧形状文件已退役。）**注意这是发布素材里的能力声明，不是产品上线**——素材 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确本阶段是阶段性任务、不存在上线批准。依据 `docs/adr/0002`「未证实的参数不开启，经真实 wire 验证后再发布新修订」——验证已完成：上传返回、`image_urls` 形态、`mask_url` 同用、以及 `usage.input_image_tokens` 四件事都在**一次真实调用**里结清；另外我们**自己的服务**（API + Worker，真实凭证）也对着真实上游跑通了同一条路径（留档 §6）。
-
-**参数名不改写**：生成请求用上游原生名 `image_urls` / `mask_url`（调用方给的是 `image`/`mask`，Adapter 落到这两个字段上）；平台**不**把它改名成 `images`。依据 `docs/adr/0002`（"若某厂商不使用 `image` 这个字段名，由该厂商自己的 Schema 声明原生字段路径"）。平台只在**一处**判定"这个**候选声明**的参数装的是参考图还是遮罩"：名字以 `image` 开头＝参考图、含 `mask`＝遮罩（两者都像时以遮罩为准）、其余一律拒绝（发布期与运行期共用同一个函数）；这套判定只管落位，不用来拦截调用方字段——调用方那些该候选**没声明**的参数在受理时就被丢掉了（不会到这一层，也不会发给上游）。**合同归属的更正（2026-09-20）**：原文此处还引用了 `0002` 的补充决定（"统一参数转换属后期对外消费侧"）。该补充决定已被 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代——调用方所见参数名归 **Vendor Model Contract**，"原生名"的落位由 **Offering Parameter Mapping** 承担；"平台内部不改渠道名"这一**当前实现事实**仍然成立，但它是映射层尚未落位的现状，不是既定归属（差距见工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)）。
-
-**未做**：`sunburst` 的图生图未单独实测（与 flare 同渠道族、同端点、同参数面）；`base64` 路径未测；20MB / 16 张 / 256MB 这些**边界**未逐个压测（只说单张 20MB 上限来自文档，代码里已按此拒绝并另有总量上限）。
-
-### 3.8 错误信封（2026-09-19 零费用探测，无凭证）
-
-无凭证请求真实端点，取到的 401 响应体：
-
-```json
-{"error":{"code":"","message":"invalid API key (request id: 20260919182056471923385yBRUUrTx)","param":"","type":"apimart_error"}}
-```
-
-三条对实现有影响的事实：
-
-1. **`error.code` 是空字符串**，可用的只有 `type: "apimart_error"` 与 `message`。因此"只依据 `error.code` 分类"在**凭据类失败**上会退化成"受理状态不确定"，把一个明确没进到生成的请求送进人工对账。平台的处置：分类**以 `error.code` 与消息前缀为主**，状态码只在它们给不出信息时兜底——凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝；**5xx 不按状态码定性**（`build_request_failed` 会以 500 承载参数错误，那正是这条规则要防的情况）。创建阶段另有按状态码收窄的三类，见 §3.10 的 `429` 与两个幂等子类。
-2. **每请求标识在失败时也有**：响应头 `X-Oneapi-Request-Id`，同时被写进 `message` 里的 `(request id: …)`。失败路径的 `provider_error_message` 会原样落库，排查时不需要额外取头（**只在失败路径**；成功路径的对账标识是任务式上游的 `task_id`）。
-3. **`402` 是平台侧欠费/额度不足**（用户 2026-09-20 告知）：它说的是**我们在这个渠道的账户**没额度了，与消费者余额无关。因此**不得原样返回给消费客户端**——对客表现为平台侧故障（`docs/adr/0017`：`platform_unavailable`），内部靠 `failure_kind = platform_funding` 让它成为可发现的运营事件。领域区分见 `CONTEXT.md` 的 `Platform Funding Failure` / `Consumer Insufficient Balance`。
-
-**未做（本节的探测范围）**：这次探测没有带凭证、也没有调用上传接口——那一步后来在用户批准下单独做过，见留档 §6。本节只记**路由与错误信封**的事实。
-
-### 3.9 成本口径
-
-成本口径（各渠道怎么取数、面板差价核对）**已独立成节**，见 §5。
-
-### 3.10 错误码与错误信封（第一方文档，2026-09-19）
-
-信封统一为 `{"error":{"code","message","type"}}`（部分页面另有 `param`、`request_id`）。**`code` 的类型与是否在场随端点而异**：真实 401 探测里 `error.code` 是**空字符串**（§3.8），而文档示例里 `code` 是**数字**（401/402/…）。因此分类必须以 HTTP 状态码兜底。
-
-| HTTP | 创建/查询接口（第一方文档） | 能否证明"未受理、未计费"（第一方口径） |
+| HTTP | 含义（第一方口径） | 能否证明「未受理、未计费」 |
 | --- | --- | --- |
-| `400` | `invalid_request_error`：size 不合法 / resolution 不支持 / 像素违规；查询侧＝"无效的任务 ID" | **能** |
-| `401` | `authentication_error`：身份验证失败 | **能** |
-| `402` | `payment_required`：**账户余额不足，请充值后再试** | **能**（未受理）——**这里的"账户"是我们**，即平台侧欠费 |
-| `403` | 权限不足（官方渠道页） | **能** |
-| `409` | 幂等子类：`idempotency_in_progress` / `idempotency_key_reused` / `idempotency_result_indeterminate` | 前两者**能**；`result_indeterminate` **不能**（第一方要求停止自动重试、不要换 Key） |
-| `429` | `rate_limit_error`：请求过于频繁 | **能**（未受理） |
+| `400` | `invalid_request_error`：size 不合法 / resolution 不支持 / 像素违规；查询侧＝无效的任务 ID | 能 |
+| `401` | `authentication_error`：身份验证失败 | 能 |
+| `402` | `payment_required`：账户余额不足（这里的「账户」是我们） | 能 |
+| `403` | 权限不足 | 能 |
+| `409` | 幂等子类：`idempotency_in_progress` / `idempotency_key_reused` / `idempotency_result_indeterminate` | 前两者能；`result_indeterminate` **不能**（第一方要求停止自动重试、不要换 Key） |
+| `429` | `rate_limit_error`：请求过于频繁 | 能 |
 | `500` | `server_error`：服务器错误 | **不能**——结果不明 |
 | `502` | 网关错误 | **不能** |
-| `503` | `service_unavailable`：上游暂时不可用 | 普通 503 **不能**；`503 idempotency_unavailable`（原文"当前请求未执行"）**能** |
+| `503` | `service_unavailable`：上游暂时不可用 | 普通 503 不能；`503 idempotency_unavailable`（原文「当前请求未执行」）**能** |
 | 超时 / 连接中断 | — | **不能**（第一方明示：客户端取消不代表服务端未生成、不代表不计费） |
 
-**两个必须处理的陷阱**：
+- 陷阱一：`500` 会被用来承载参数错误（示例 message 为 `build_request_failed: invalid size: 3:5, allowed: …`）；按「500 ⇒ 结果不明」处理会把可修正的请求错误升级成人工对账。
+- 陷阱二：失败任务会退款——`failed` 状态写明 reserved funds are refunded，`/v1/usage` 写明失败与失败后退款的调用不计入、部分成功的批次按实际交付张数计费。
+- 创建阶段另有按状态码收窄的三类（`429` 与两个幂等子类），凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝，`5xx` 不按状态码定性。
 
-1. **`500` 会被用来承载参数错误**：示例 message 为 `build_request_failed: invalid size: 3:5, allowed: …`。若按"500 ⇒ 结果不明 ⇒ 进对账"处理，会把一个纯粹可修正的请求错误升级成人工对账。
-2. **失败任务会退款**：`failed` 状态写明"reserved funds are refunded"，`/v1/usage` 也写明失败与失败后退款的调用不计入、部分成功的批次按实际交付张数计费。这影响"失败是否产生成本"的判断，但不改变平台的证据门槛。
+## 4. 本台账未结清的部分
 
-### 3.11 `mask_url` 在 2.5 上被接受（2026-09-20，两次真实调用：同一请求带/不带遮罩）
-
-流程与 §3.7 一致：先 `POST /v1/uploads/images` 把参考图与遮罩换成公网 URL，再 `POST /v1/images/generations` 提交（`model=gpt-image-2.5-flare`、`image_urls` + `mask_url`、`size=1:1`、`resolution=1k`、`quality=low`）。两次调用的差别**只有 `mask_url` 的有无**。
-
-| 项 | 带 `mask_url` | 不带 `mask_url` |
-| --- | --- | --- |
-| 提交 | HTTP 200，拿到 `task_id` | 同 |
-| 轮询 | 到 `completed` | 同 |
-| `usage` | `input_tokens 1048`（`image_tokens 1024`）/ `output_tokens 196` | **完全相同** |
-| `cost` | `0.011354` | **完全相同** |
-
-**结论 1：2.5 接受 `mask_url`。** 该字段**不在** `gpt-image-2.5` 的生成文档字段表里（§3.2 的参数清单没有它），但提交与出图都正常，没有"未知字段"类报错。⇒ 素材**按厂商契约**声明遮罩（§2.9 晚更正的同一条口径），而不是因为渠道文档没写就收回。**代价如实登记**：渠道将来若真拒绝它，表现会是渠道报错，不是平台静默丢字段。
-
-**结论 2：遮罩是否真的"生效"只有弱信号，未严格证明。** 把两张产物与输入图按**每 8 像素采样**比对：遮罩椭圆**内**的差异像素占 **21%**，**全图**为 **79.9%**——方向对（遮罩内改动明显更少），但生成本身是随机的、请求里**没有 `seed`**，两次产物本来就不同，所以这只说明"遮罩区域改动更少"，**不能证明遮罩被严格遵从**。要严格证明得固定 `seed` 或多轮对照，本次没做。
-
-**与成本口径的一致性**：两次 `cost` 都是 `0.011354` —— 平台直接取它。
-
-**边界（未做）**：`sunburst` 的遮罩路径未单独实测（同渠道族、同端点、同参数面）；遮罩尺寸/通道的**边界**（与参考图不等比、非 512×512）未压测。
-
-**样本位置**：这两次调用的脚本与产物（`apimart-mask-probe.ps1` 带遮罩、`apimart-mask-control.ps1` 不带、`apimart-25-{mask,nomask}-result.png`、`mask-ellipse.png`）在本机探测目录 `.data/probe-2026-09-20/`，**未入库**。
-
-## 4. 不跨渠道合并（原写法的更正）
-
-本文此前写过「两家响应形状对比表」「一个公式套不了两家」「证据形状不同所以要改领域」等跨渠道结论——**那些都是把渠道差异往上抬，违反 `0004` R1，已删除**。
-
-正确做法：**每个渠道各自的 ② Driver 负责把它自己的响应归一成领域形状**（`TokenUsage`），差异留在各自的 Driver 与其测试里，不进入 ①③④⑤，也不互相推导。
-
-## 5. 平台成本价
-
-平台侧怎么取成本、怎么结算归 [`docs/design/0007`](../design/0007-pricing-floor-and-settlement.md) 与 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)；本台账只记渠道侧事实，不重复平台口径。三笔真实调用的金额留档在 [`docs/verification/paid-provider-calls.md`](../verification/paid-provider-calls.md)。
----
-
-真实计费调用（授权依据、次数、花费、样本位置）留档在 `docs/verification/paid-provider-calls.md`。
+- AIHubMix 同步响应头到底有没有 `X-Request-ID`、长什么样：本仓库样本从未记录响应头，② 的写法是「有就采、没有就留空」（`out-reference/aihubmix/response-shapes.md` §4）。
+- APIMart 400 / 429 / 5xx 的**真实**报文未实测（400 与 413 形状来自上传页文档，`build_request_failed` 前缀来自生成页文档）。
+- AIHubMix 缓存输入、失败计费、促销/折扣的权威规则；`output_blocked` 明确不收生成费，`output_policy_violation` 可能仍按审核计费规则处理。
+- 逐字报文只有 AIHubMix 用户早期那一份，2.5 的实测只有转录（`out-reference/aihubmix/response-shapes.md` §0）。

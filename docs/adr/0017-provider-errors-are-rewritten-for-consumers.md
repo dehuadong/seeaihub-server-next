@@ -6,4 +6,4 @@ status: accepted
 
 渠道的状态码、错误码与原文**只留在内部**（Attempt 与管理端），对客只用平台错误码（`platform_unavailable` / `outcome_unknown` / `content_rejected`）。**责任方决定语义**：渠道因**平台的**参数、凭证、权限、额度或限流而拒绝（APIMart 的 `402`/`403`/`429`、以 `500` 承载的参数错误；AIHubMix 的 `401` 与 `403` 各分支）一律是平台侧故障，不返回 4xx；只有渠道明确因**消费者内容**拒绝才是消费者的 4xx；渠道 5xx 同样不透传。**拿不准时按平台侧处理**——渠道说的"账户余额不足"指的是**我们**（AIHubMix 的码就叫 `insufficient_user_quota`），原样返回会让消费者去充值。
 
-平台欠费与用户欠费是两个状态（见 `CONTEXT.md`）：用户欠费在受理前拒绝、对客可见；平台欠费只在调用渠道时暴露，属**运营事件，必须能被发现**，对客不得表现为"余额不足"。逐条码表见 `docs/facts/channel-facts.md` §2.13、§3.10。
+平台欠费与用户欠费是两个状态（见 `CONTEXT.md`）：用户欠费在受理前拒绝、对客可见；平台欠费只在调用渠道时暴露，属**运营事件，必须能被发现**，对客不得表现为"余额不足"。逐条码表见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 错误码节与 APIMart 错误码节。

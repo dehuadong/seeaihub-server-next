@@ -17,7 +17,7 @@
 
 2026-09-18 用真实付费调用结清：**AIHubMix 的正式执行路径采用它同步的两个端点**——`/v1/images/generations`（文生图）与 `/v1/images/edits`（图生图 / mask）。它们返回完整的分项 token，能形成可核验的 Metering Evidence。
 
-逐端点的形态、分支、计量事实与实测 token 数，以 `docs/facts/channel-facts.md` §2 为唯一出处，本文不复述。没有保存密钥、task ID 或短期 URL。
+逐端点的形态、分支、计量事实与实测 token 数，以 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节为唯一出处，本文不复述。没有保存密钥、task ID 或短期 URL。
 
 ## 2. 身份与供给登记
 
@@ -103,7 +103,7 @@ HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能�
 
 这正好落实「`image.generations.sync.v1` 与 task 协议不应成为领域拆分，生命周期差异由 Adapter 处理」的方向。决策依据见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
-**关于该渠道的异步任务面**：它**不使用**——任务对象没有可核验的计量事实，无法形成精确的最终 Evidence。若将来它能给出可核验的计量，按新的 Offering 修订发布即可，不需要改应用层或公开协议。各端点的实际形态见 `docs/facts/channel-facts.md` §2。
+**关于该渠道的异步任务面**：它**不使用**——任务对象没有可核验的计量事实，无法形成精确的最终 Evidence。若将来它能给出可核验的计量，按新的 Offering 修订发布即可，不需要改应用层或公开协议。各端点的实际形态见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节。
 
 ## 5. 原生能力 Schema 与发布
 
@@ -113,7 +113,7 @@ HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能�
 
 运行时请求不实时依赖 AIHubMix Schema 地址。更新流程是「抓取候选 → 差异检查 → 审核 → 发布新 Runtime Revision」，旧 Job 继续使用受理时固定的旧修订。
 
-**形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而那份 Schema 覆盖的端点不止一个，各端点的参数位置与可用面并不相同。声明"原生能力 Schema"时，字段与位置一律取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；各端点的实际形态属渠道事实，见 `docs/facts/channel-facts.md` §2。
+**形状必须绑定该 Offering 实际调用的端点（2026-09-20 收口更正）**：上一段的四项可选参数清单取自 AIHubMix 的**机器 Schema**，而那份 Schema 覆盖的端点不止一个，各端点的参数位置与可用面并不相同。声明"原生能力 Schema"时，字段与位置一律取自**该 Offering 实际调用的端点（含各分支）**——规则本身属 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，本节不复制；各端点的实际形态属渠道事实，见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节。
 
 - 上一段清单里的 `background`、`output_compression`、`user`、`moderation` **不在**本平台采用的 `/v1` 端点族的参数集合内（它们属 `/ai/v1` 那族的 `extra`），因此素材**不声明**它们（2026-09-20 定；此前按文档声明过一轮，已按端点 `request.schema` 收回）；
 - 已知差距（当前素材把可选参数声明在本 Offering 未采用的那一族端点的形状下，Adapter 能力面又强制该形状）登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G1。

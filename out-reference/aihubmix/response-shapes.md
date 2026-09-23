@@ -14,9 +14,9 @@
 | 端点 | 实测过？ | 有独立样本文件？ | 谁采集的 | 结构记在哪 |
 | --- | --- | --- | --- | --- |
 | `POST /v1/images/generations`（同步） | ✅ | ✅ **`gpt_image_2_generations.json`**（逐字，含 2 MB `b64_json`） | **用户早期采集**：响应 `created = 1785485861` ⇒ **2026-07-31 16:17:41 +08:00**；随仓库建立提交 `1fe462a` 入库 | §1 |
-| `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ✅（转录）**`transcript-sync-and-async-2026-09.json`** | 本仓库受控实测（`channel-facts` §5.2） | §1 |
+| `POST /v1/images/generations`（同步，2.5 两款） | ✅ 2026-09-19 | ✅（转录）**`transcript-sync-and-async-2026-09.json`** | 本仓库受控实测（`docs/verification/paid-provider-calls.md` §2） | §1 |
 | `POST /v1/images/edits`（同步，multipart，图片+mask） | ✅ 2026-09-18 | ✅（转录）同上文件 | 本仓库受控实测（`docs/research/…` §13.2） | §2 |
-| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ✅（转录）同上文件 | 本仓库受控实测（同上 §13.1 / `channel-facts` §2.3） | §3 |
+| `POST /ai/v1/images/generations`（异步任务对象） | ✅ 2026-09-18 + 2026-09-19 | ✅（转录）同上文件 | 本仓库受控实测（同上 §13.1 / `docs/verification/paid-provider-calls.md` §1） | §3 |
 | 错误信封 | ✅ 部分 | ✅（转录）同上文件 | 本仓库受控实测 + 上游文档 | §4 |
 
 **证据等级**：`gpt_image_2_generations.json` 是**逐字**报文；`transcript-sync-and-async-2026-09.json` 是**转录**（字段名与取值照当时的实测记录整理，`b64_json` 只记长度）——这批调用的逐字报文当时没有落盘。
@@ -63,7 +63,7 @@
 | `created` / `background` / `output_format` / `quality` / `size` | 顶层回显类字段，**不在** `data[]` 里 |
 | `data[]` | 数组；每项**只有** `b64_json`（本渠道这两条路径**不返回 URL**） |
 | `usage` | **四分项**（`input_tokens_details` / `output_tokens_details` 各含 `text_tokens`/`image_tokens`）+ `total_tokens`；**没有** `cached_tokens`、**没有**金额字段 |
-| 金额 | **响应里没有** ⇒ 成本价只能按四档 token 费率自算（见 `docs/facts/channel-facts.md` §2.4） |
+| 金额 | **响应里没有** ⇒ 成本价只能按四档 token 费率自算（见 [`docs/facts/channel-facts.md`](../../docs/facts/channel-facts.md) 的 AIHubMix 费率节） |
 
 **⇒ 后果（同步路径）**：同步调用**没有可查的上游任务**——响应里没有 id，且实测两次同步调用**未出现在** `/ai/v1/images` 任务列表里（`docs/research/gpt-image-2-inferera-research.md` §13.2）。所以创建请求一旦失联，**没有技术手段能把结果找回来**，只能进对账、人工按账号与时间窗核对（`docs/adr/0005`/`0007`）。异步 `/ai/v1` 才有 `id`（`t_…`），但那条路径不返回 `usage`，不作为计费执行路径。
 
@@ -117,7 +117,7 @@
 
 ## 5. 相关记录
 
-- 渠道事实（归纳后）：`docs/facts/channel-facts.md` §2.2/§2.3/§2.6/§2.6b；
+- 渠道事实（归纳后）：[`docs/facts/channel-facts.md`](../../docs/facts/channel-facts.md) 的 AIHubMix 参数、响应与费率节；
 - 调研过程与受控实测：`docs/research/gpt-image-2-inferera-research.md` §13；
 - 请求侧合同（机器 Schema 快照）：`schema-gpt-image-2*.endpoints.json`；
 - 另一个渠道的对应台账：`out-reference/apimart/response-shapes.md`。

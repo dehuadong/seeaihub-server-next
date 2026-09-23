@@ -43,7 +43,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
   - 厂商原生 `size` 是**像素型**（`WIDTHxHEIGHT`，宽高被 16 整除、比例 1:3~3:1、上限 `3840x2160`、`>2560x1440` 实验性，标准值 `1024x1024`/`1536x1024`/`1024x1536`，`auto` 适用）——**2.5 被写进这段**，此前"未对 2.5 单独确认"的说法作废；
   - 厂商侧**没有 `resolution`**，那只是 APIMart 的渠道包装；
   - `quality` 默认 `auto`，**2.5 两款额外支持 `xhigh`/`max`**，与用户告知的六档一致。
-  `docs/facts/channel-facts.md` 里那条"未结清"已据此改成**已结清**。
+  [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 里那条"未结清"已据此改成**已结清**。
 - OpenAI 最新上线提供 **`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`** 两种模型；**与旧模型的核心区别是支持 `low`/`medium`/`high`/`xhigh`/`max`/`auto` 六档质量设置**。⇒ 这两个模型名**是厂商侧真实模型**，`quality` 的六档与默认 `auto` 也据此归厂商侧，不再算渠道 schema 的推断。
 - 仓库里那份 OpenAI 官方快照（`out-reference/openai/openai-images-api.md`）正文只覆盖到 `gpt-image-2`，**不含 2.5**，且**全仓没有任何文档引用它**——2.5 的其余特有项（例如 `size` 上限是否仍 `3840x2160`、16 的倍数与 1:3~3:1 约束是否照旧）仍按"沿用 gpt-image 家族面、未对 2.5 单独确认"标注，不冒充已确认。
 - 素材迁移（一个 Vendor Model 一份顶层合同 + AIHubMix / APIMart 两条 offering）与逐项出处清单见提交历史与素材自身的 `_evidence`。

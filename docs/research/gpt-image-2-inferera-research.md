@@ -11,7 +11,7 @@
 
 | # | 原结论（错） | 更正后 | 依据 |
 | --- | --- | --- | --- |
-| 1 | §9.1 / §10：公开价**只有三项**（文本输入 / 图片输入 / 图片输出），仓库旧资料里的「文本输出 `$10 / 1M`」**不予采用** | **四档都要用**：文本输入 `$5`、**文本输出 `$10`**、图像输入 `$8`、图像输出 `$30`（每 1M tokens）。当初按"只有三项"发布，导致生效配置里**文本输出费率写成 0**，即少收费——该缺陷记录在 `docs/facts/channel-facts.md` §2.11 | 用户 2026-09-19 确认四档；`docs/facts/channel-facts.md` §2.4 |
+| 1 | §9.1 / §10：公开价**只有三项**（文本输入 / 图片输入 / 图片输出），仓库旧资料里的「文本输出 `$10 / 1M`」**不予采用** | **四档都要用**：文本输入 `$5`、**文本输出 `$10`**、图像输入 `$8`、图像输出 `$30`（每 1M tokens）。当初按"只有三项"发布，导致生效配置里**文本输出费率写成 0**，即少收费——该缺陷记录在 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节 | 用户 2026-09-19 确认四档；[`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节 |
 | 2 | §6.1（据文档）：**即使同步执行，AIHubMix 也会保存任务记录**，创建响应丢失时可通过 `GET /ai/v1/images` 查找 | **对本渠道的 `/v1` 同步分支不成立**：§13.2 实测两次同步调用**未出现在** `/ai/v1/images` 列表里。因此 `/v1` 的创建请求失联后**没有**可查询的上游任务 ⇒ 只能进对账（见 `docs/adr/0005`/`0007`） | 本文件 §13.2 实测 |
 | 3 | §7.1b 末：以「与火山方舟的行为相反」作对比 | 已删除。渠道差异不互相推导（`docs/design/0004` R1）；火山方舟的事实只在 `out-reference/doubao/doubao-ark-image-research.md` | `docs/design/0004` R1 |
 
@@ -247,11 +247,11 @@
 | 计费项 | 公开单价 | 性质与来源 |
 | --- | --- | --- |
 | 文本输入 | `$5 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
-| **文本输出** | **`$10 / 1M tokens`** | **事实**：用户 2026-09-19 确认；`docs/facts/channel-facts.md` §2.4 |
+| **文本输出** | **`$10 / 1M tokens`** | **事实**：用户 2026-09-19 确认；[`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节 |
 | 图像输入 | `$8 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
 | 图像输出 | `$30 / 1M tokens` | **事实**：[模型页](https://aihubmix.com/model/gpt-image-2) |
 
-> **⚠️ 更正（见文首第 1 条）**：本节此前只列三项，并把仓库旧资料里的「文本输出 `$10 / 1M`」判为不予采用。**那是错的**——按"只有三项"发布的生效配置把**文本输出费率写成 0**，会在 `output_text_tokens > 0` 时少收费（缺陷记录：`docs/facts/channel-facts.md` §2.11）。四档都要用。
+> **⚠️ 更正（见文首第 1 条）**：本节此前只列三项，并把仓库旧资料里的「文本输出 `$10 / 1M`」判为不予采用。**那是错的**——按"只有三项"发布的生效配置把**文本输出费率写成 0**，会在 `output_text_tokens > 0` 时少收费（缺陷记录：[`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节）。四档都要用。
 
 **事实**：模型说明摘要写成“per-generation，价格见模型页”，但实际模型页展示的是 token-based pricing；应以模型页具体价格表为准。[模型说明](https://api.inferera.com/model/gpt-image-2/llms.txt) · [模型页](https://aihubmix.com/model/gpt-image-2)
 
@@ -281,7 +281,7 @@
 
 - **事实**：公开的 `/ai/v1` Task 对象没有 `usage` 字段；OpenAI 兼容本地样本有 `usage`。[任务对象](https://docs.aihubmix.com/en/api/async-tasks.md#task-object) · [本地实测样本](../../out-reference/aihubmix/gpt_image_2_generations.json)
 - **待确认**：AIHubMix 是否通过任务详情、响应 Header、账单查询 API 或其他记录提供异步任务的文本/图片 token 分项和最终扣费。
-- **待确认**：缓存输入、舍入、最低扣费、失败计费、促销/折扣的权威规则（**缓存不由我们建模**：按 Tokens 计费不区分缓存，见 `docs/facts/channel-facts.md` §5.2）。`output_blocked` 明确称不收生成费，但 `output_policy_violation` 可能仍按既有审核计费规则处理。[任务错误](https://docs.aihubmix.com/en/api/async-tasks.md#task-errors)
+- **待确认**：缓存输入、舍入、最低扣费、失败计费、促销/折扣的权威规则（**缓存不由我们建模**：按 Tokens 计费不区分缓存，见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节）。`output_blocked` 明确称不收生成费，但 `output_policy_violation` 可能仍按既有审核计费规则处理。[任务错误](https://docs.aihubmix.com/en/api/async-tasks.md#task-errors)
 - **推论**：价格配置必须版本化并保留四种可能的 money rate；结算应优先使用 Provider 权威用量或账单记录，不应用图片尺寸自行反推 token。
 - **推论**：若 `/ai/v1` 最终无法提供可审计用量，需在以下方案中做明确选择后才能生产计费：使用可返回 usage 的 `/v1` 端点、接入 AIHubMix 账单记录、或采用经过验证的固定/预估计价并向用户明确其性质。
 

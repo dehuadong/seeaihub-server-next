@@ -22,9 +22,9 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 - **多 Offering 路由**：`publication.runtime_entries` 增加 `routing_priority`，唯一索引由「每型号一个 active 条目」改为「每型号每个优先级一个」；`active_offering` 返回**候选集合**（每个候选自带它自己的 `capability_schema`）；新增 `generation.routing_decisions` 记录受理时的判定。
 - **发布接口形状**：`PublishRuntimeCommand` 支持 `offerings` 数组与 `price_plan`（三例确定性形状判别）；数据库端口只接受已核验的 `PublishRuntimeRequest`。
 - **APIMart Driver**：任务式（提交 → 轮询 → 取图 → 证据提取 → 错误分类）；错误分类只依据 `error.code`，未知状态继续轮询，查询阶段错误一律进对账。
-- **参考图/遮罩路径（上传）**：APIMart 只接受公网 URL 且不再接受 base64，因此 Driver 在**提交生成任务之前**先调 `POST /v1/uploads/images` 换取 URL，再把 URL 回填到原生参数；上传失败＝**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**。**2026-09-19 经用户批准做了真实受控验证**（1 次直连 + 1 次走我们自己的 API+Worker，两次生成合计不足 $0.03），据此两条分支已开放（`allowed_branches` 加上 `image_conditioned`/`masked`，`max_images: 16`）。证据见 `docs/facts/channel-facts.md` §3.7 与 `docs/verification/paid-provider-calls.md` §6。
+- **参考图/遮罩路径（上传）**：APIMart 只接受公网 URL 且不再接受 base64，因此 Driver 在**提交生成任务之前**先调 `POST /v1/uploads/images` 换取 URL，再把 URL 回填到原生参数；上传失败＝**可证明未受理**（`SafeBeforeAcceptance`，`docs/adr/0011`）⇒ Job `failed` + 释放预授权，**不进对账**。**2026-09-19 经用户批准做了真实受控验证**（1 次直连 + 1 次走我们自己的 API+Worker，两次生成合计不足 $0.03），据此两条分支已开放（`allowed_branches` 加上 `image_conditioned`/`masked`，`max_images: 16`）。证据见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 上传节与 `docs/verification/paid-provider-calls.md` 的图生图实测节。
 - **资产绑定路径不再写死字段名**：`AssetBinding.native_parameter_path` 现在真正是**厂商原生参数路径**（APIMart 的 `/image_urls/0`、`/mask_url`），不再硬编码 `image`/`images`/`mask`——这正是 `docs/adr/0002` 要求的"由厂商自己的 Schema 声明原生字段路径"。平台只在**一处**判定"这个参数装的是参考图还是遮罩"（名字以 `image` 开头 / 含 `mask`，其余一律拒绝），发布期校验与运行期用的是同一个函数；Driver 侧同样按路径回填，不自己决定键名。
-- **渠道事实**：AIHubMix 2.5 两款与 APIMart 2.5 两款的发布素材；`docs/facts/channel-facts.md` 为渠道事实的单一出处。
+- **渠道事实**：AIHubMix 2.5 两款与 APIMart 2.5 两款的发布素材；[`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 为渠道事实的单一出处。
 
 技术设计与边界由 [工作项 #2 的规划正文](https://github.com/dehuadong/seeaihub-server-next/issues/2) 与 [分层架构](../../../../docs/design/0004-layered-architecture.md) 拥有，持久决定由 [ADR 目录](../../../../docs/adr/) 拥有（本阶段新增 0009–0011；2026-09-20 收口新增 [`0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)；原 0012–0014 已于 2026-09-20 按 ADR 准入门槛退役，见下方更正节第 10 条）；本记录不复制其正文。
 
@@ -81,7 +81,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 - **平台对外价没定，也不该在这阶段定**（加价、是否让利属后期产品决定，工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；两个素材 `price_plan` 里填的是上游公开费率，角色是**结算基数**，已在文件里用 `_note` 标注。
 - **按 Tokens 计费不考虑缓存**：不为缓存加字段、也不作为待办。
 
-逐笔核对表见 `docs/facts/channel-facts.md` §5。
+逐笔核对表见 `docs/verification/paid-provider-calls.md`。
 
 ## 本变更对领域模型的影响（`0004` §4 的例外说明）
 
@@ -108,7 +108,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 1. **端到端用例数的差异**：frontmatter 记的"九个"是**当时实际跑过的数目**，不改写；但 HEAD 处实际为 **10** 个 `#[ignore]` 用例，第 10 个由 `3f2129e` 加入（即本记录最后一次修订的那次提交，因此本记录自那时起就已过时）。本记录**未补跑**十个用例，故不声称十个全部通过。
 2. **"已开放"不等于"已上线"**：本记录写 APIMart 的图生图/遮罩"两条分支已开放"，指的是**发布素材里的 `allowed_branches`**，不是产品上线。素材的 `_status` 仍是"草案 · 未发布"；用户 2026-09-20 明确**本阶段是阶段性任务，不存在上线批准**。
-3. **调用方可见形状取自未被调用的端点族（最实质的一条）**：AIHubMix 素材把 `quality`/`background`/`output_compression`/`user` 声明在 `extra` 内——那是该渠道自有异步 API `/ai/v1/*` 的位置；本阶段实际调用的是 OpenAI 兼容的 `/v1/images/*`，该端点族 `quality` 在**顶层**且**不存在 `extra`**（`docs/facts/channel-facts.md` §2.5）。该形状由 `crates/adapter-aihubmix` 的能力面（把 `extra` 列为顶层参数名）与 `crates/application` 的发布校验强制，Adapter 再在出网时把 `extra.quality` 摊平回顶层，于是形成"发布校验认一套形状、上行发另一套"的翻译层。归属与目标形态见 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，修复登记为 #6 的差距 G1。
+3. **调用方可见形状取自未被调用的端点族（最实质的一条）**：AIHubMix 素材把 `quality`/`background`/`output_compression`/`user` 声明在 `extra` 内——那是该渠道自有异步 API `/ai/v1/*` 的位置；本阶段实际调用的是 OpenAI 兼容的 `/v1/images/*`，该端点族 `quality` 在**顶层**且**不存在 `extra`**（[`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 参数节）。该形状由 `crates/adapter-aihubmix` 的能力面（把 `extra` 列为顶层参数名）与 `crates/application` 的发布校验强制，Adapter 再在出网时把 `extra.quality` 摊平回顶层，于是形成"发布校验认一套形状、上行发另一套"的翻译层。归属与目标形态见 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，修复登记为 #6 的差距 G1。
 4. **同一模型的两个候选对调用方的字段形状不同**：AIHubMix 素材要求 `extra.quality`、APIMart 素材要求顶层 `quality`，两份 Schema 都是 `additionalProperties: false`。结果是**调用方把参数写在哪，直接决定哪个候选合格**，`routing_priority` 不起决定作用。这是复审"兼容性事实与路由选择必须分开"的实际形态。
 5. **逐个发布素材会静默替换候选**：发布语义是"该模型全部 active 条目原子替换"，`routing_priority` 由候选数组下标决定。现成素材是每渠道一个文件、各含一个候选；**按文件逐个发布会让该模型只剩最后一个候选**。要表达"同一模型两个 Provider"必须把候选合并成一次发布（`apps/api/tests/http_contract.rs` 的用例即合并写法）。登记为 #6 的差距 G4。
 6. **三个"已声明未验证"参数**：素材声明了 `background`、`output_compression`、`user`，但实测的 `/v1/images/generations` 顶层参数集不含这三项且 `additionalProperties: false`，与 `docs/adr/0002`"未证实的参数不开启"不符。登记为 #6 的差距 G2（验证要花钱，须单独批准）。
@@ -119,7 +119,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 本次收口**未改动实现代码、未发起任何真实渠道调用**。
 
 10. **ADR 集合按准入门槛整改（2026-09-20，用户指示）**：原 0012–0014 三篇**不是持久决定**，已移出 `docs/adr/`（编号不复用，历史全文见 git 历史）。判据与去向：
-    - **0012「Provider 声明的扣费金额能否作为计量证据」**——被实测回答掉的**候选问题**，不是决定 → 否决理由落成 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`，渠道侧事实留在 `docs/facts/channel-facts.md` §3.3/§5；
+    - **0012「Provider 声明的扣费金额能否作为计量证据」**——被实测回答掉的**候选问题**，不是决定 → 否决理由落成 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`，渠道侧事实留在 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 响应与计量节；
     - **0013「退役 `gpt-image-2`，改用两款 2.5」**——**目录运营状态**（改数据就能回退）→ 在售型号由 `config/bootstrap/*.json` 的发布声明表达；其中"`gpt-image-2-official` 与 `gpt-image-2` 视为同一 Vendor Model"是**运营方的显式配置判断**，其规则属 [`docs/adr/0004`](../../../../docs/adr/0004-vendor-and-provider-identities-stay-separate.md)（Vendor 与 Provider 身份不合并），不在 ADR 里记录具体型号；
     - **0014「第二阶段的 Provider 集合」**——**规划范围**（属 Proposal）→ 归工作项 `#2` 的规划正文。
     

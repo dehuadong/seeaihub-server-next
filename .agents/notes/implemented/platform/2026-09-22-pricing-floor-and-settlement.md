@@ -113,7 +113,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 
 - 设计：定价公式与各量落点、售价与保底快照随 Job 冻结、扣费与命中渠道、毛利记录、预授权只是保底、成本来源可辨、两个币种平面、记录与日志的落点见 [`docs/design/0007`](../../../../docs/design/0007-pricing-floor-and-settlement.md) §2–§9；定价列的位置见 [`docs/design/0006`](../../../../docs/design/0006-gateway-models-and-consumer-surface.md) §1.6/§2.2。
 - 决策：PostgreSQL 是业务事实权威、已受理 Job 固定受理时版本见 [`ADR-0003`](../../../../docs/adr/0003-postgresql-is-source-of-truth.md)；成本按渠道各自口径取数、金额不替代计量事实、缺字段不得猜测费用、**已就地修订的币种段与汇率段**见 [`ADR-0006`](../../../../docs/adr/0006-no-settlement-without-metering-evidence.md)；**已就地修订的预授权/上限条款**见 [`ADR-0009`](../../../../docs/adr/0009-multiple-active-offerings-and-routing.md)。
-- 事实台账：AIHubMix 四档费率与无金额字段见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) §2.4/§2.6；APIMart 终态 `cost` 与实测样例见同文件 §3、§5。
+- 事实台账：AIHubMix 四档费率与无金额字段见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 费率节；APIMart 终态 `cost` 与实测样例见同文件的 APIMart 计量节。
 - 迁移：[`0009_pricing_floor_and_settlement.sql`](../../../../migrations/0009_pricing_floor_and_settlement.sql)。
 - 索引同步：[`docs/architecture.md`](../../../../docs/architecture.md) §2（⑤ Price）、§3（路由）、§4（一次请求怎么走）、§5（表）、§6（文件与迁移）；词汇表 [`CONTEXT.md`](../../../../CONTEXT.md) 新增 `Consumer Rate Vector` / `Markup` / `FX Rate` / `Floor Amount` / `Gross Margin`，并改写 `Price Plan` / `Price Snapshot` / `Provider Cost`。
 - 相邻记录：[渠道成本事实采集](../../implemented/platform/2026-09-22-provider-cost-facts.md)（本片接它的折算列与发布期币种校验，并落它留下的两个执行单元）、[网关模型命名层](../../implemented/platform/2026-09-22-gateway-model-naming.md)（定价列按 P1 定下的位置落）。

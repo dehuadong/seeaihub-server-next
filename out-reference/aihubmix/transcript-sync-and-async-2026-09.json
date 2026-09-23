@@ -3,7 +3,7 @@
   "_provenance": {
     "who": "本仓库 Agent（前期会话的受控实测，经用户授权）",
     "when": "2026-09-18（同步 generations / 同步 edits / /ai/v1 异步）与 2026-09-19（2.5 两款同步）",
-    "evidence_level": "转录：字段名与取值来自当时的实测记录（docs/research/gpt-image-2-inferera-research.md §13、docs/facts/channel-facts.md §2.3/§2.6/§2.6b）；**逐字报文未落盘**，`b64_json` 只记长度不落全文",
+    "evidence_level": "转录：字段名与取值来自当时的实测记录（docs/research/gpt-image-2-inferera-research.md §13、docs/facts/channel-facts.md 的 AIHubMix 响应节）；**逐字报文未落盘**，`b64_json` 只记长度不落全文",
     "redaction": "task id、content_url、结果 URL 已脱敏",
     "why_not_verbatim": "这几次的原始报文没有保存成文件；下面每块都标了它来自哪条记录。"
   },
@@ -95,7 +95,7 @@
         }
       },
       "note": "顶层字段集合与 gpt-image-2 完全同构 ⇒ ② 的同步解码器不需要为 2.5 新建分支；`quality` 顶层传入即被接受（无需 extra）",
-      "source": "docs/facts/channel-facts.md §2.6/§2.6b（2026-09-19 受控实测）"
+      "source": "docs/facts/channel-facts.md 的 AIHubMix 响应节（2026-09-19 受控实测）"
     }
   ],
   "_user_early_capture（不是本仓库实测，另见 response-shapes.md §0）": {

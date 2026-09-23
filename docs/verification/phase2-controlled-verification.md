@@ -6,16 +6,16 @@
 
 > ### 状态更新（2026-09-19）：**AIHubMix 侧已结清，下列多数条目已不需要执行**
 >
-> 用户 2026-09-19 授权对 AIHubMix 做了受控实测（同步 2 款 + 异步 1 次），结果见 `docs/facts/channel-facts.md` §2.6 与 §5。
+> 用户 2026-09-19 授权对 AIHubMix 做了受控实测（同步 2 款 + 异步 1 次），结果见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节。
 >
 > | 原编号 | 原拟验证 | 现状 |
 > | --- | --- | --- |
-> | V1 | APIMart 任务响应是否有分项 `usage` | **已结清**：一次经授权的受控实测拿到四分项 `usage`（`docs/facts/channel-facts.md` §3.3 / §5.3） |
-> | V2 | APIMart `task_id` 路径与终态枚举 | **路径已结清**（`data[0].task_id`、`GET /v1/tasks/{id}`）；**终态取值集合未逐一实测**，按两份文档并集容忍未知值（§3.6） |
+> | V1 | APIMart 任务响应是否有分项 `usage` | **已结清**：一次经授权的受控实测拿到四分项 `usage`（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 节） |
+> | V2 | APIMart `task_id` 路径与终态枚举 | **路径已结清**（`data[0].task_id`、`GET /v1/tasks/{id}`）；**终态取值集合未逐一实测**，按两份文档并集容忍未知值 |
 > | V3 | AIHubMix 2.5 的计量形态 | **已结清**：两款同步 `/v1` 均返回四分项 `usage`，与 `gpt-image-2` 同构 |
 > | V4 | `Idempotency-Key` 是否生效 | **判定为不必测**：创建请求本就不重发，只影响优化项，不影响正确性 |
 > | V5 | `n` / `quality` 的实际行为 | **已删除**：属上游生成行为，非平台合同事实 |
-> | V6 | APIMart 机器 schema（只读） | **已结清**：`/v1/models/{model}/schema` 与 `/v1/models` 均已取到（§3.4/§3.5） |
+> | V6 | APIMart 机器 schema（只读） | **已结清**：`/v1/models/{model}/schema` 与 `/v1/models` 均已取到 |
 >
 > **本文当前没有待执行项。** 本阶段之后出现的待验证项——**APIMart 的参考图/遮罩路径**——已于 2026-09-19 **在用户批准下执行完毕**，结果见 `paid-provider-calls.md` §6：
 >

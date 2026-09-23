@@ -82,7 +82,7 @@
 | --- | --- |
 | `data.result.images[]` | 每项为 `{ "url": [<字符串>], "expires_at": <unix秒> }`——**`url` 是数组**（与生成页示例一致）；`expires_at` 说明结果 URL 会过期，必须立刻下载转存 |
 | `data.usage` | **四分项**：`input_tokens_details{cached_tokens,image_tokens,text_tokens}`、`output_tokens_details{image_tokens,text_tokens}` + `total_tokens`；**参考图会真实计入 `image_tokens`**（1024×1024 ⇒ 1024） |
-| `data.cost` / `data.credits_cost` | 上游**声明的**实际扣费（折后账号价）与 Credits（`= cost × 10`）。平台**不把它当计量事实**，只作**成本价**与对账核对（`docs/facts/channel-facts.md` §5） |
+| `data.cost` / `data.credits_cost` | 上游**声明的**实际扣费（折后账号价）与 Credits（`= cost × 10`）。平台**不把它当计量事实**，只作**成本价**与对账核对（[`docs/facts/channel-facts.md`](../../docs/facts/channel-facts.md) 的 APIMart 计量节） |
 | 其它 | `actual_time`（实际耗时秒）、`estimated_time`、`progress`、`created`/`completed` |
 
 ## 4. 错误信封
@@ -97,12 +97,12 @@
 | --- | --- |
 | 顶层 | `error.code`（**空字符串**）、`error.message`、`error.param`、`error.type`（`apimart_error`） |
 | 头 | `X-Oneapi-Request-Id`（逐请求标识，同时写在 `message` 的 `(request id: …)` 里） |
-| 影响 | 凭据类失败**没有可用的 `error.code`** ⇒ ② 的错误分类对 401/402/403 用状态码兜底（`docs/facts/channel-facts.md` §3.8） |
+| 影响 | 凭据类失败**没有可用的 `error.code`** ⇒ ② 的错误分类对 401/402/403 用状态码兜底（[`docs/facts/channel-facts.md`](../../docs/facts/channel-facts.md) 的 APIMart 错误节） |
 | 未实测 | 400/429/5xx 的**真实**报文（400 与 413 的形状来自上传页文档；`build_request_failed` 前缀来自生成页文档） |
 
 ## 5. 相关记录
 
-- 渠道事实（归纳后）：`docs/facts/channel-facts.md` §3.3（响应形状）、§3.7/§3.8（上传、错误）、§5（成本口径）；
+- 渠道事实（归纳后）：[`docs/facts/channel-facts.md`](../../docs/facts/channel-facts.md) 的 APIMart 各节（响应形状、上传与错误、计量与成本）；
 - 原始逐字样本：`controlled-probe-2026-09-19.json`；
 - 请求侧合同：`schema-gpt-image-2.5-flare.input.json`、`generation.md`、`gpt-image-2.5-generation.cn.md`、`tasks-status.cn.md`、`uploads-images.cn.md`；
 - 另一个渠道的对应台账：`out-reference/aihubmix/response-shapes.md`。

@@ -1,7 +1,7 @@
 # 来源: https://docs.apib.ai/cn/api-reference/uploads/images.md
 
 > 抓取时间 2026-09-19；HTTP 200。上游原始文档，**未改写**（仅转载正文与代码示例）。
-> 用途：APIMart 参考图/遮罩路径的**上传接口**一手合同（`docs/facts/channel-facts.md` §3.7）。
+> 用途：APIMart 参考图/遮罩路径的**上传接口**一手合同（归纳后的渠道事实见 [`docs/facts/channel-facts.md`](../../docs/facts/channel-facts.md) 的 APIMart 上传节）。
 
 ## 上传图片
 

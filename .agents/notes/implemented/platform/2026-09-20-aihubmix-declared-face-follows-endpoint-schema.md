@@ -9,7 +9,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 
 # Agent Note：AIHubMix 素材的声明面对齐端点 request.schema
 
-> **失效范围（2026-09-20 晚）**：本记录的**口径**——"声明面以该模型对应端点的 `request.schema` 为准"——已被**按厂商契约声明**取代：聚合渠道转售的就是上游模型的能力，**渠道机器 Schema 写没写不构成渠道不能**；渠道若不接受某个已声明的取值，就表现为渠道报错，平台不静默降级、也不替渠道吞掉字段。促成改口的实测是 `/v1` 族虽然机器 Schema 里没有 `background`，端点却**接受并落实**了 `background=transparent`（`docs/facts/channel-facts.md` §2.14）。取代记录见 [合同与承载面分层、映射声明化与对客目录](./2026-09-20-vendor-model-contract-and-offering-mapping.md)。
+> **失效范围（2026-09-20 晚）**：本记录的**口径**——"声明面以该模型对应端点的 `request.schema` 为准"——已被**按厂商契约声明**取代：聚合渠道转售的就是上游模型的能力，**渠道机器 Schema 写没写不构成渠道不能**；渠道若不接受某个已声明的取值，就表现为渠道报错，平台不静默降级、也不替渠道吞掉字段。促成改口的实测是 `/v1` 族虽然机器 Schema 里没有 `background`，端点却**接受并落实**了 `background=transparent`（[`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 响应节）。取代记录见 [合同与承载面分层、映射声明化与对客目录](./2026-09-20-vendor-model-contract-and-offering-mapping.md)。
 >
 > **仍然有效的部分**：Driver 能力面（`supported_top_level_parameters`）保留；`size` 照 schema 的表达方式用 `anyOf` 而不是改写成枚举；`prompt` 的 `minLength`/`maxLength` 不是自造约束；发布期校验那处放宽（类型必须是 string、`enum` 可有可无）保留。
 >

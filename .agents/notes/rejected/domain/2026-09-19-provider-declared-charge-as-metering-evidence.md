@@ -24,14 +24,14 @@ reason: 两家渠道的响应都返回四分项 token，且上游声明的金额
 
 ## 理由
 
-- 上游声明的 `cost` **不可复现**：同一份分项 token 下，它与按公开费率算出的金额不一致（实测差额见 `docs/facts/channel-facts.md` §5）；
+- 上游声明的 `cost` **不可复现**：同一份分项 token 下，它与按公开费率算出的金额不一致（实测差额见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 计量节）；
 - 平台可核验的计量事实是分项 token；金额只用于核**成本**，不能反过来替代计量事实（`docs/adr/0006` 的门槛、`docs/adr/0010` 的原则）；
 - 为一个尚未确认的形态预先建机制，会先污染领域类型。
 
 ## 影响与去向
 
 - **领域层零改动**：只有 token 一种计量形态（见 `CONTEXT.md` 的 `Token Usage` 词条）；
-- 渠道侧事实（两家都返回分项 token；上游声明金额与按公开费率算出的金额不一致）登记在 `docs/facts/channel-facts.md` §3.3、§5；
+- 渠道侧事实（两家都返回分项 token；上游声明金额与按公开费率算出的金额不一致）登记在 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 响应与计量节；
 - 本记录**取代**已退役的 `0012-provider-declared-charge-as-evidence`（2026-09-20 整改：那是一条被实测回答掉的**候选问题**，不是持久决定，因此移出 `docs/adr/`；历史全文见 git 历史）；
 - **不要重开这个问题**，除非将来出现一种只给金额、且金额可复现的上游来源。
 
@@ -42,4 +42,4 @@ reason: 两家渠道的响应都返回四分项 token，且上游声明的金额
 - APIMart 的 token 事实来自**异步任务终态**。该渠道对同一模型声明了 `image-generation` 与 `openai` 两种端点类型，而**非任务面拿不到 token、也没有 `cost` 字段**（用户 2026-09-20 实测），本平台因此只用任务面；
 - AIHubMix 的 token 事实来自它 OpenAI 兼容的 `/v1`（同步）。
 
-⇒ 若将来改用一个拿不到分项 token 的上游面，本条否决**不再自动成立**，需要重新决定证据形态。相关事实见 `docs/facts/channel-facts.md` §3.1/§3.3；成本口径的决策见 `docs/adr/0016`。
+⇒ 若将来改用一个拿不到分项 token 的上游面，本条否决**不再自动成立**，需要重新决定证据形态。相关事实见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 端点与响应节；成本口径的决策见 `docs/adr/0016`。

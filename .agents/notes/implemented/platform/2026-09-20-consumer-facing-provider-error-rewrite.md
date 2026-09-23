@@ -52,4 +52,4 @@ verification: 2026-09-20 本地执行：`cargo fmt --check`、`cargo clippy --wo
 
 ## 依据与关联
 
-决定正文由 [`ADR-0017`](../../../../docs/adr/0017-provider-errors-are-rewritten-for-consumers.md) 拥有；渠道错误码事实见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) §2.13 与 §3.10；接口与表结构索引同步在 [`docs/architecture.md`](../../../../docs/architecture.md)；工作项 [#7](https://github.com/dehuadong/seeaihub-server-next/issues/7)。
+决定正文由 [`ADR-0017`](../../../../docs/adr/0017-provider-errors-are-rewritten-for-consumers.md) 拥有；渠道错误码事实见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 错误码节与 APIMart 错误码节；接口与表结构索引同步在 [`docs/architecture.md`](../../../../docs/architecture.md)；工作项 [#7](https://github.com/dehuadong/seeaihub-server-next/issues/7)。

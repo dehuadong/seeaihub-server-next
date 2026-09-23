@@ -3,7 +3,7 @@
 - **用途**：记录本仓库**每一次真实渠道计费调用**——日期、授权依据、端点、次数、花费、样本位置与结清了什么。
 - **性质**：本仓库自己的证据记录，不是渠道事实，也不是平台合同。**渠道事实**（端点、参数、计量、错误码、成本口径）归纳在 [`docs/facts/channel-facts.md`](../facts/channel-facts.md)；原始样本在 `out-reference/<provider>/`。
 - **纪律**：凭证只从环境变量读取，不入库；不保存真实图片 URL 与 task id。
-- **引用约定**：本文写成 `§x.y` 的引用指 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的对应小节；本文内部引用写"本文 §x"。
+- **引用约定**：渠道事实一律用相对链接指到 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的对应节；本文内部引用写"本文 §x"。
 - **发新调用的入口**：`scripts/probe/response-shapes.ps1`（本仓库**唯一**会发真实计费调用的入口，默认只演练，必须显式加 `-ConfirmPaidCalls`）；未经批准不发起任何计费调用。
 
 ## 1. 异步实测（2026-09-19，经用户授权）
@@ -25,7 +25,7 @@
 | 授权 | 用户 2026-09-19 明确指示「可以同步实测下」 |
 | 调用次数 | **2 次**（`gpt-image-2.5-sunburst`、`gpt-image-2.5-flare`），除 `model` 外参数相同 |
 | 请求参数 | `n=1`、`size=1024x1024`、`quality=low`、`output_format=png` |
-| 结果 | 两次均 **HTTP 200**；sunburst 245,138 bytes / 19.8 秒，flare 321,146 bytes / 14.7 秒；四分项 `usage` 齐全且逐项相同（见 §2.6） |
+| 结果 | 两次均 **HTTP 200**；sunburst 245,138 bytes / 19.8 秒，flare 321,146 bytes / 14.7 秒；四分项 `usage` 齐全且逐项相同（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 响应节） |
 | 计费 | 每次按四档费率算得 **5950 microusd = $0.005950**（上游未返回金额，需自行计算） |
 | 未做 | 未把结果图写入仓库（`b64_json` 仅看长度与前缀）；未测带图编辑 |
 
@@ -39,7 +39,7 @@
 | 请求参数 | `model=gpt-image-2.5-flare`、`n=1`、`size=1:1`、`resolution=1k`、`quality=low` |
 | 结果 | 提交 HTTP 200（`status: submitted`）；10 秒后终态 `completed`，`actual_time=7` |
 | 计量 | **四分项 `usage`**：输入文本 14 / 输入图片 0 / 输出图片 196 / total 210（另含 `cached_tokens`） |
-| 计费 / 成本 | 上游自报 **`cost = 0.00476 USD`**（这就是本笔成本价）、`credits_cost = 0.0476`；平台直接取它作为成本，不用公开费率反算（§5.4） |
+| 计费 / 成本 | 上游自报 **`cost = 0.00476 USD`**（这就是本笔成本价）、`credits_cost = 0.0476`；平台直接取它作为成本，不用公开费率反算（见本文 §3） |
 | 未做 | 未下载结果图（URL 已脱敏）；未测 `sunburst`；未测 `image_urls` 图生图 |
 | 原始记录 | `out-reference/apimart/controlled-probe-2026-09-19.json` |
 
@@ -61,9 +61,9 @@
 
 第 **5–7 次（APIMart）**：上游三次都自报了实际扣费可对——**$0.004760**（纯文生图，本文 §3）+ **$0.011390**（直连图生图）+ **$0.011374**（走自家服务），合计 **$0.027524**。
 
-可核对总额 ≈ **$0.0394**（AIHubMix 2 次 + APIMart 3 次），另加 1 次金额未知的 AIHubMix 异步调用。全部使用 `n=1`、`quality=low` 的最小配置。**未发起任何火山方舟调用。** 另完成 3 次 APIMart **只读**探测（§3.5）与 4 次**无凭证**路由探测（本文 §5），零费用。
+可核对总额 ≈ **$0.0394**（AIHubMix 2 次 + APIMart 3 次），另加 1 次金额未知的 AIHubMix 异步调用。全部使用 `n=1`、`quality=low` 的最小配置。**未发起任何火山方舟调用。** 另完成 3 次 APIMart **只读**探测（本文 §3）与 4 次**无凭证**路由探测（本文 §5），零费用。
 
-**成本价来源（两渠道不同）**：**AIHubMix** 上游只给四分项 token，成本价按四档费率自算（§2.4）；**APIMart** 上游在响应里直接声明 `cost`，那就是成本价（§5.1）。**平台对外价未定**（后期，[#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。逐笔见 §5。
+**成本价来源（两渠道不同）**：**AIHubMix** 上游只给四分项 token，成本价按四档费率自算（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节）；**APIMart** 上游在响应里直接声明 `cost`，那就是成本价（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 计量节）。**平台对外价未定**（后期，[#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。逐笔见本文 §3 与 §6。
 
 ## 5. 零费用路由探测（2026-09-19，**无凭证**）
 
@@ -74,7 +74,7 @@
 | 次数 | **4 次**（`POST /v1/uploads/images`、`POST /v1/images/generations`、`GET /v1/tasks/nonexistent`、`GET /v1/nonexistent-route` 对照） |
 | 结果 | 三个真实端点均 **401**（存在但需鉴权）；对照的不存在路由 **404** ⇒ 路由判定有效 |
 | 计费 | **零**（无凭证、未生成、未上传任何文件） |
-| 附带事实 | 401 错误信封与失败路径的请求标识（见 §3.8） |
+| 附带事实 | 401 错误信封与失败路径的请求标识（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 错误节） |
 | 未做 | **没有带凭证调用上传接口**，也没有任何生成调用 |
 
 ## 6. 图生图 + 遮罩受控实测（2026-09-19，经用户批准）
@@ -88,11 +88,11 @@
 | 直接调用的计量 | `input_tokens=1057`（`image_tokens=1024`、`text_tokens=33`）、`output_tokens=196`（`image_tokens=196`）、`total=1253` |
 | **走我们自己服务的端到端** | 发布真实素材 → 平台接口上传两张图 → 受理 Job（`/image_urls/0` + `/mask_url`）→ 真实 Worker 执行 → **`succeeded`** |
 | 端到端计量 | Evidence 记 `input_text=29 / input_image=1024 / output_image=196`（与上游 `usage` 逐项一致） |
-| **成本价** | 上游自报 **`cost`**：直连那次 `$0.011390`、走自家服务那次 `$0.011374`（面板的 `Actual cost`，逐笔见 §5.4） |
-| 平台侧结算与成本的关系 | capture `14217 microusd` 是平台侧的结算基数；**成本价取上游自报的 `cost`**（§5.4） |
+| **成本价** | 上游自报 **`cost`**：直连那次 `$0.011390`、走自家服务那次 `$0.011374`（面板的 `Actual cost`，逐笔见本文 §6） |
+| 平台侧结算与成本的关系 | capture `14217 microusd` 是平台侧的结算基数；**成本价取上游自报的 `cost`**（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 计量节） |
 | 端到端结果 | 结果图归档到自有对象存储：`image/png`、**1,486,934 bytes、1024×1024**；`provider_trace_id` 已落库（真实 task id） |
-| 面板核对（**已结清**） | 上游自报的 `cost` 两次逐位一致（§5.4） |
-| 敏感信息 | **未保存**真实图片 URL 与 task id；上表只记存在性、主机名与长度级信息。原始响应只留在本机临时目录，不入仓库。用户后来提供的上游账单面板含 task id 与密钥标签，**截图同样不入库**，只把结算数字转录进 §5.4 |
+| 面板核对（**已结清**） | 上游自报的 `cost` 两次逐位一致（本文 §6） |
+| 敏感信息 | **未保存**真实图片 URL 与 task id；上表只记存在性、主机名与长度级信息。原始响应只留在本机临时目录，不入仓库。用户后来提供的上游账单面板含 task id 与密钥标签，**截图同样不入库**，只把结算数字转录进本文 §6 |
 | 未做 | 未下载上游结果图（结果图是我们自己服务完成取图后归档的）；未测 `sunburst`；未测 base64；未压测 20MB/16 张/256MB 边界 |
 
 **这一轮调用同时结清了 [`docs/verification/phase2-controlled-verification.md`](./phase2-controlled-verification.md) 里列的四条**（上传返回、`image_urls` 形态、图生图可用 + `usage` 变化、`mask_url` 可用），因此两个发布素材据此放开两条分支。
@@ -105,7 +105,7 @@
 | --- | --- |
 | 授权 | 用户 2026-09-20 指示「你现在实测下，看看结果如何」 |
 | 端点 / 次数 | AIHubMix `/ai/v1/images/generations`（不带 `async`）1 次 + `/v1/images/generations` 1 次；各 `gpt-image-2.5-flare`、`n=1`、`size=1024x1024`、`quality=low` |
-| 结果 | 两次均 HTTP 200；结论见 §2.6/§2.7（**按用户要求未留样本文件**） |
+| 结果 | 两次均 **HTTP 200**；结论见渠道路径复核（**按用户要求未留样本文件**） |
 | 计费 | 2 次，自算各约 $0.00595，合计约 **$0.012** |
 
 ## 8. 多图 / 透明背景 / `mask_url` 实测（2026-09-20，经用户授权）
@@ -123,7 +123,7 @@
 | 计费 | 上游不返回金额，按四档费率自算 ≈ **$0.0265**（44×$5 + 2545×$8 + 196×$30 / 1M） |
 | 结清 | ① 该渠道**接受并落实 `background=transparent`**（响应回显 + RGBA 输出）；② **多张参考图经 `image[]` 可用**（重复单值 `image` 会 400） |
 | 未做 | 未逐像素核透明区域；16 张未压测（两张已够，不为上限花钱） |
-| 样本 | 本机 `.data/probe-2026-09-20/two-refs-transparent.png`（gitignore，**不入库**）；渠道事实见 §2.14 |
+| 样本 | 本机 `.data/probe-2026-09-20/two-refs-transparent.png`（gitignore，**不入库**）；渠道事实见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 响应节 |
 
 ### 8.2 APIMart：2.5 是否接受 `mask_url`（带/不带对照）
 
@@ -137,6 +137,6 @@
 | 计量与成本 | 两次**完全相同**：`input_tokens=1048`（`image_tokens=1024`、`text_tokens=24`）、`output_tokens=196`、`total=1244`；上游自报 **`cost = 0.011354 USD`**（两次同值）。上游自报 `cost = 11354 microusd`：**成本直接取它** |
 | 结清 | ① **2.5 接受 `mask_url`**（该字段不在 2.5 文档里，属"文档没写≠不支持"）；② **遮罩不额外计费**（两次 `usage` 与 `cost` 相同） |
 | **未证** | 遮罩是否**真的生效**只有弱信号：每 8 像素采样对比两张结果图，**遮罩椭圆内差异 21%、全图 79.9%**——方向与"透明区＝编辑区"的语义一致，但生成是随机的（无 seed），**不能据此断言遮罩生效** |
-| 样本 | 本机 `.data/probe-2026-09-20/apimart-25-mask-result.png`、`apimart-25-nomask-result.png`（gitignore，**不入库**）；渠道事实见 §3.11 |
+| 样本 | 本机 `.data/probe-2026-09-20/apimart-25-mask-result.png`、`apimart-25-nomask-result.png`（gitignore，**不入库**）；渠道事实见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 掩码节 |
 
 **累计（截至 2026-09-20）**：AIHubMix **7 次** + APIMart **5 次** = **12 次计费提交**，可核对金额 ≈ **$0.1006**（AIHubMix 5 次自算 + 1 次金额未知的异步调用；APIMart 5 次均有上游自报 `cost`）。本文 §8 两次 AIHubMix/APIMart 调用的样本都在本机 `.data/`（gitignore），未入库。

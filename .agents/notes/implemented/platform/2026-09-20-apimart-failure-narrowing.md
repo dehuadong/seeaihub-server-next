@@ -29,7 +29,7 @@ APIMart 有三类创建阶段的失败，第一方明文写明"请求未执行 /
 
 顺带修正一处保真度问题：`error.code` 为**非空字符串**时（幂等子类就长这样）此前会被丢掉、退化成 `type` 或 `http_409`，现在原样保留，只对空串保留原有的降级规则。
 
-AIHubMix 的 `429` / `503` 不在此列：它没有第一方"未受理"承诺，不能跨渠道套用结论（`docs/facts/channel-facts.md` §2.13、§4）。
+AIHubMix 的 `429` / `503` 不在此列：它没有第一方"未受理"承诺，不能跨渠道套用结论（[`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 错误码节）。
 
 ## 验证
 
@@ -54,4 +54,4 @@ AIHubMix 的 `429` / `503` 不在此列：它没有第一方"未受理"承诺，
 
 ## 依据与关联
 
-`docs/adr/0011`（三态语义与当前映射）、`docs/adr/0007`（失败关闭与对账）、`docs/facts/channel-facts.md` §3.10（第一方口径）与 §4（不跨渠道合并结论）；工作项 [#8](https://github.com/dehuadong/seeaihub-server-next/issues/8)。
+`docs/adr/0011`（三态语义与当前映射）、`docs/adr/0007`（失败关闭与对账）、[`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 错误码节（第一方口径）；工作项 [#8](https://github.com/dehuadong/seeaihub-server-next/issues/8)。
