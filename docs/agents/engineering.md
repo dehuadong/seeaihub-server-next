@@ -18,11 +18,11 @@ Use the `planning` skill when the user requests planning, including planning-onl
 
 For end-to-end work, skip Planning when the work already satisfies the Implementation Gate's readiness conditions. An explicit planning request still receives its requested deliverable and applicable review, reusing existing artifacts and valid evidence.
 
-Identify the Proposal or existing work item for the current change by its ID, URL or path. It defines the selected delivery scope and planning status, and points to the applicable product contract and technical design. Reuse it; a separate Proposal, Spec or RFC is needed only when its content needs a new owner.
+Identify the Proposal or existing work item for the current change by its ID, URL or path. It defines the selected delivery scope and planning status, and points to the applicable product contract and technical design. Reuse it; a separate Proposal or RFC is needed only when its content needs a new owner.
 
-When product behavior, scope or acceptance conditions need an independent owner, use a Spec. A Spec owns what the product does, important non-goals and observable acceptance conditions. Small work without an independent RFC may keep that contract directly in the work item.
+Spec is the product contract content. When that contract or material technical design needs a repository owner, place the Spec and technical design in separate sections of the same RFC file. Small work without an RFC file may keep its Spec and technical decisions directly in the work item.
 
-An RFC may begin as a non-authoritative feasibility draft before its Spec is stable when technical constraints can materially change product scope. Feed those findings back into the Spec. Only after that Spec is stable may the RFC be accepted as an implementation basis. One Spec may be carried by multiple RFCs.
+An RFC may begin as a non-authoritative feasibility draft before its Spec is stable when technical constraints can materially change product scope. Feed findings back into the Spec section of the same file before accepting the design as an implementation basis. A complex capability may use an RFC set; its shared and slice ownership follows the planning skill's [RFC rules](../../.agents/skills/planning/rfc.md#rfc-集合).
 
 Planning owns its planning artifacts and Plan Review. After drafting, proactively complete Plan Review, resolve material findings in their owning artifacts, and review affected content again. Planning is complete only when required decisions are resolved and Plan Review passes; a finished draft alone does not complete the stage.
 
@@ -33,8 +33,8 @@ If a later stage exposes a material unresolved contract decision, return to `pla
 Enter implementation only when:
 
 * the identified Proposal or existing work item specifies the selected implementation scope
-* observable acceptance conditions are stated in the applicable Spec or directly in the work item
-* each required RFC identifies the Spec revision and sections it carries, without unresolved omissions, scope expansion or contradiction
+* observable acceptance conditions are stated in the Spec section of the applicable RFC file or directly in the work item
+* the required RFC or RFC set covers the selected Spec and technical design without unresolved omissions, duplicate ownership, scope expansion or contradiction
 * necessary design decisions, required planning review and approvals are evidenced, with no material unresolved decision affecting this scope
 * dependencies and blockers allow the selected scope to start
 * execution authorization under repository rules covers that scope

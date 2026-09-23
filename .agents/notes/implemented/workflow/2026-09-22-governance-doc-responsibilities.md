@@ -23,7 +23,7 @@ verification: `node scripts/decisions/check.mjs` 通过；注册表检查用变�
 ## 决定
 
 - **注册表只写位置与边界**：删掉注册模式与生效日期两行、删掉「生命周期与批准」整节、去掉开头那句与根 `AGENTS.md` 重复的治理流程说明；列名从「位置与规则」改成「位置与边界」。
-- **各家的规则归各家**：变更记录的生命周期与批准归 `.agents/notes/README.md`；Proposal 与 Ticket 的工作状态归 `docs/agents/issue-tracker.md`；ADR 的准入、退役与引用归 `docs/agents/domain.md`；批准与执行授权的区别归仓库根 `AGENTS.md`；正文与注释的写法归 `docs/AGENTS.md`。注册表只在表后留一句边界事实：独立 RFC、Spec 与 ADR 不随变更记录移动。
+- **各家的规则归各家**：变更记录的生命周期与批准归 `.agents/notes/README.md`；Proposal 与 Ticket 的工作状态归 `docs/agents/issue-tracker.md`；ADR 的准入、退役与引用归 `docs/agents/domain.md`；批准与执行授权的区别归仓库根 `AGENTS.md`；正文与注释的写法归 `docs/AGENTS.md`。注册表只在表后留一句边界事实：RFC 文件与 ADR 不随变更记录移动。
 - **索引只留一处**：根 `AGENTS.md` 新增「文档与约定」表，一个约定文档一行（职责 + 位置）；注册表删掉「工程约定文档」行；`docs/AGENTS.md` 只保留开头三条边界指针；`domain.md` 不再复述位置权威性。
 - **`domain.md` 回到自己的活**：读哪些领域文档、术语纪律、冲突标注、ADR 准入与引用。读什么保留路径，"某某是权威位置"改为指向注册表；目录树只留领域文档那几行（`apps/`、`crates/` 归 `docs/architecture.md`）；删掉 ADR 数量与存根计数。
 - **补登记**：注册表补「领域词汇表」（`CONTEXT.md`）与「Agent 技能」（`.agents/skills/`）两行；约定文档不再登记在注册表里，入口在根 `AGENTS.md` 的表。
