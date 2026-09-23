@@ -15,8 +15,9 @@
 | Agent Notes / 工程变更与交付记录 | `.agents/notes/{生命周期}/{分类}/`；路径、生命周期、文件骨架与检查见 [`.agents/notes/README.md`](../../.agents/notes/README.md) |
 | 领域词汇表 | 仓库根 `CONTEXT.md`：只放术语与定义；读取与命名约定见 [`domain.md`](domain.md) |
 | 持久决定 / ADR | **决策的权威位置**：`docs/adr/`，按 `0001-slug.md` 编号；准入、退役与引用写法见 [`domain.md`](domain.md) |
-| RFC 文件 / Spec 与技术设计 | `docs/design/`；Spec 与技术设计分节，复杂能力可拆为 RFC 集合；沿用 `NNNN-slug.md` 编号和既有 `主题` / `当前修订` / `状态` 头格式；**不混入评审记录** |
+| 独立技术设计 RFC | `docs/design/`；承接适用 Spec，沿用 `NNNN-slug.md` 编号和既有 `主题` / `当前修订` / `状态` 头格式；**不混入评审记录** |
 | 代码结构图 / 落点索引 | `docs/architecture.md`：**只做索引**——职责与规则归 `docs/design/0004-layered-architecture.md`，持久决定归 `docs/adr/`，冲突时以后两者为准；新增或移动文件、增删路由与表时在**同一变更**里同步 |
+| 独立产品合同 Spec | `docs/specs/`；负责产品范围、非目标、可观察行为与验收条件，明确需要时创建，优先更新同一产品能力已有 Spec |
 | 受控验证清单 | `docs/verification/`，按 `阶段-slug.md` 命名；**停止条件以来源规划为准**，清单只复述与执行；真实计费调用的留档固定在 `docs/verification/paid-provider-calls.md`（授权依据、次数、花费、样本位置），不写进渠道事实台账 |
 | 调查与探索存档 | `docs/research/`：结论 + 事实/推论/待确认分开 + 来源；已归纳定稿的渠道事实放 `docs/facts/`；结论被推翻时保留更正记录，不静默改写 |
 | 汇总事实登记 | `docs/facts/`：**只放结论**，引用而不复述；含凭证类内容时只记**变量名**；原始形状、逐字样本与调用流水分别归 `out-reference/<provider>/` 与 `docs/verification/paid-provider-calls.md` |
@@ -24,7 +25,7 @@
 | 外部参考资源 | `out-reference/`，**只作参考，不是工程工件**；入库范围见下 |
 | 受控采集脚本 | `scripts/probe/response-shapes.ps1`：**唯一**会发真实计费调用的入口（开关与凭证读法见脚本头部注释）；脱敏结果落 `out-reference/<provider>/`，登记补进该渠道的 `response-shapes.md` |
 
-文件有真实内容时才创建。Spec 是内容，不是单独工件；需要在仓库内长期保存时由 RFC 文件承载，小改动可以留在工作项。同一决定只保留一个权威属主：已写入 ADR 的决定，Agent Notes 只引用并链接，不另写一份决策正文。RFC 文件与 ADR 不随变更记录移动——它们的审阅、批准与替代约定写在各自文件里，记录只引用它们。
+文件有真实内容时才创建。同一决定只保留一个权威属主：已写入 ADR 的决定，Agent Notes 只引用并链接，不另写一份决策正文。独立 RFC、Spec 与 ADR 不随变更记录移动——它们的审阅、批准与替代约定写在各自文件里，记录只引用它们。
 
 ## 历史工件与新旧衔接
 

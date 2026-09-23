@@ -26,11 +26,12 @@ description: 按用户要求创建或更新 PRD，明确用户问题、产品目
 
 ## 与工程工件的关系
 
-PRD 可以作为 Proposal 与 Spec 的背景输入，但不能代替具体工程工作的 Spec。
+PRD 可以作为 Proposal 与 Spec 的背景输入，但不能代替某项工程工作的明确产品合同。
 
 进入工程 Planning 后：
 
 - Proposal 或既有工作项选择本次交付范围并维护状态；
-- Spec 在 RFC 文件中写清具体产品行为、范围、非目标和验收条件；同一文件承载技术设计。
+- Spec 就地写清具体产品行为、范围、非目标和验收条件；
+- RFC 承接 Spec，负责技术设计。
 
-不要为了形成完整链条而自动创建 Proposal 或 RFC。用户只要求 PRD 时，交付 PRD 后结束。
+不要为了形成完整链条而自动创建 Proposal、Spec 或 RFC。用户只要求 PRD 时，交付 PRD 后结束。
