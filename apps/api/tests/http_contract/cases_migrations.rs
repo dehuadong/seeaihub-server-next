@@ -754,15 +754,18 @@ async fn the_routing_weight_migration_keeps_existing_entries_and_allows_shared_t
     .execute(&pool)
     .await
     .expect("legacy contract row");
-    for _ in 0..2 {
+    for index in 0..2 {
         let channel = Uuid::new_v4();
         let offering = Uuid::new_v4();
         let price_plan = Uuid::new_v4();
+        // 两条候选各占一个**渠道身份**（地址不同）：一个入口只允许一条供给，两条候选要落在同一档
+        // 就得是两个入口——这也正是"同档两条候选"在真实发布里的样子。
         sqlx::query(
             "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
-             VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')",
+             VALUES ($1,'AIHubMix',$2,'AIHUBMIX_API_KEY')",
         )
         .bind(channel)
+        .bind(format!("https://api.inferera.com/channel-{index}"))
         .execute(&pool)
         .await
         .expect("channel fixture");
@@ -905,6 +908,170 @@ async fn the_routing_weight_migration_keeps_existing_entries_and_allows_shared_t
     assert!(
         duplicate.is_err(),
         "同一网关模型下同一条供给的 active 条目只能有一条"
+    );
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}
+
+/// **迁移 0014 的增量路径**：供给身份的两条唯一索引要在已建过的库上落下来；库里已经有同身份
+/// 重复行时**响亮失败**，不在迁移里静默归并。
+///
+/// 归并要改挂 `runtime_entries` / `jobs` / `routing_decisions` 的 `offering_id` 与 `channel_id`，
+/// 那是已发布修订与已受理 Job 的事实——迁移不改写它们。所以这里验三件事：有重复时迁移报错且
+/// 不留半截状态；人工清掉重复之后建得上；建上之后重复身份真的写不进去。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_supply_identity_migration_adds_unique_indexes_and_refuses_duplicates() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用这次改动之前的迁移。
+    let staged = std::env::temp_dir().join(format!("seeai-supply-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < "0014" {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy early migration");
+        }
+    }
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+
+    // 2) 老形状留下的同身份重复行：老发布每次都给候选新插一行渠道，所以同一个入口会有多行。
+    let identity = "https://api.inferera.com";
+    for _ in 0..2 {
+        sqlx::query(
+            "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+             VALUES ($1,'AIHubMix',$2,'AIHUBMIX_API_KEY')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(identity)
+        .execute(&pool)
+        .await
+        .expect("legacy channel row");
+    }
+
+    // 3) 有重复行时迁移**报错**，而且不留半截状态：失败的那次不记账、索引也不在。
+    let full = sqlx::migrate::Migrator::new(migrations.clone())
+        .await
+        .expect("migrator");
+    assert!(
+        full.run(&pool).await.is_err(),
+        "同身份重复行必须让迁移响亮失败，而不是被静默归并"
+    );
+    let applied: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE version = 14")
+            .fetch_one(&pool)
+            .await
+            .expect("migration ledger");
+    assert_eq!(applied, 0, "失败的那一次迁移不该留在账上");
+    let index: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM pg_indexes
+         WHERE schemaname = 'supply' AND indexname = 'channels_identity'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("index probe");
+    assert_eq!(index, 0, "失败的迁移不该留下半截索引");
+
+    // 4) 重复行由**人**显式清掉（开发库上这一步是重建库），迁移随即建得上。
+    sqlx::query("DELETE FROM supply.channels")
+        .execute(&pool)
+        .await
+        .expect("deduplicate by hand");
+    full.run(&pool)
+        .await
+        .expect("the supply identity migration must apply once duplicates are gone");
+    for name in ["channels_identity", "offerings_identity"] {
+        let count: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM pg_indexes WHERE schemaname = 'supply' AND indexname = $1",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .expect("index probe");
+        assert_eq!(count, 1, "{name} 必须建起来");
+    }
+
+    // 5) 身份真的唯一：重复的渠道与重复的供给都写不进去。
+    let channel = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1,'AIHubMix',$2,'AIHUBMIX_API_KEY')",
+    )
+    .bind(channel)
+    .bind(identity)
+    .execute(&pool)
+    .await
+    .expect("channel fixture");
+    let duplicate_channel = sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1,'AIHubMix',$2,'AIHUBMIX_API_KEY')",
+    )
+    .bind(Uuid::new_v4())
+    .bind(identity)
+    .execute(&pool)
+    .await;
+    assert!(duplicate_channel.is_err(), "同一个入口只允许一行");
+
+    let vendor_model = Uuid::new_v4();
+    let contract = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": {"const": "supply-identity"},
+            "prompt": {"type": "string"}
+        }
+    });
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1,'OpenAI','supply-identity','revision-1',$2)",
+    )
+    .bind(vendor_model)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("contract row");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
+              carrier_schema, parameter_mapping)
+         VALUES ($1,$2,$3,'aihubmix-image-v1','supply-identity','{}'::jsonb,$4,'{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(vendor_model)
+    .bind(channel)
+    .bind(&contract)
+    .execute(&pool)
+    .await
+    .expect("offering fixture");
+    let duplicate_offering = sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
+              carrier_schema, parameter_mapping)
+         VALUES ($1,$2,$3,'aihubmix-image-v1','supply-identity','{}'::jsonb,$4,'{}'::jsonb)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(vendor_model)
+    .bind(channel)
+    .bind(&contract)
+    .execute(&pool)
+    .await;
+    assert!(
+        duplicate_offering.is_err(),
+        "同一个模型经同一个入口只允许一条供给"
     );
 
     pool.close().await;

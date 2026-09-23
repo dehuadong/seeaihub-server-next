@@ -963,7 +963,8 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
         contract.clone(),
         vec![
             ("aihubmix-image-v1", carrier.clone(), mapped.clone()),
-            ("aihubmix-image-v1", carrier.clone(), json!({})),
+            // 两条候选必须来自**两个渠道**：供给身份是"模型 + 渠道"唯一，同渠道两条会塌成一条。
+            ("apimart-image-v1", carrier.clone(), json!({})),
         ],
     )
     .await;

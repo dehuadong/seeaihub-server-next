@@ -217,6 +217,12 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     second["reference_cost_microusd"] = json!(999_999);
     second["consumer_rates_cny"] = priced_consumer_rates();
 
+    // 两条候选必须来自**两个渠道**（供给身份是"模型 + 渠道"唯一，同渠道两条会塌成一条）。
+    // 在克隆**之后**把**不被命中**的那条换到另一个渠道：命中那条保持 AIHubMix，
+    // 请求才会打到本用例已经起好的假上游。
+    first["provider_kind"] = json!("APIMart");
+    first["adapter_key"] = json!("apimart-image-v1");
+
     // 加价系数**不给**：对客费率向量是直接录入的，那一步用不上它（发布期不再强制）。
     assert_eq!(
         publish_on_revision(

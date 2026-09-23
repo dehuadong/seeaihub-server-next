@@ -20,8 +20,8 @@ use seeai_application::{
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
-    AccountId, ImageInputs, ImageParameterKind, JobId, PublishedModel, RoutePolicy, RouteStrategy,
-    contract_image_parameter_kind, replace_contract_model_identity,
+    AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, OfferingId, PublishedModel,
+    RoutePolicy, RouteStrategy, contract_image_parameter_kind, replace_contract_model_identity,
 };
 use seeai_persistence::PgHubRepository;
 use serde::{Deserialize, Serialize};
@@ -124,6 +124,11 @@ async fn main() -> Result<()> {
             "/api/v1/gateway-models/{gateway_model}",
             patch(set_gateway_model_enabled),
         )
+        .route(
+            "/api/v1/offerings/{offering_id}",
+            patch(set_offering_enabled),
+        )
+        .route("/api/v1/channels/{channel_id}", patch(set_channel_enabled))
         .route(
             "/api/v1/route-policies",
             get(list_route_policies).put(upsert_route_policy),
@@ -690,8 +695,75 @@ async fn set_gateway_model_enabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 受理请求：**平铺**的模型参数 + 图片字段（`image` 与 `image_urls` 同义二选一，`mask` 是遮罩）。
+/// 供给级启停的请求体：**唯一可变位**就是 `enabled`。
 ///
+/// 不用 `deny_unknown_fields` + 结构体反序列化：那条路在 axum 里是 422，而"想顺手改承载面 /
+/// 改计价"是调用方把请求写错了，按 400 回更说得通（也让调用方分得清"请求不成立"与"内容不合法"）。
+/// 多一个字段就拒，不静默忽略——忽略会让调用方以为改成功了，而定义只能由发布产生。
+fn take_enabled_flag(body: Value) -> Result<bool, ApiError> {
+    let Value::Object(mut fields) = body else {
+        return Err(ApiError::bad_request(
+            "invalid_body",
+            "the request body must be a JSON object",
+        ));
+    };
+    let enabled = fields.remove("enabled");
+    if let Some(extra) = fields.keys().next() {
+        return Err(ApiError::bad_request(
+            "invalid_body",
+            format!("only `enabled` can be changed; unexpected field `{extra}`"),
+        ));
+    }
+    match enabled {
+        Some(Value::Bool(value)) => Ok(value),
+        _ => Err(ApiError::bad_request(
+            "invalid_body",
+            "`enabled` is required and must be a boolean",
+        )),
+    }
+}
+
+/// 管理员写：启停一条**供给**（Offering）。
+///
+/// 停用的语义：该供给从所有候选集里消失，之后的受理取不到它（取不到任何候选时对客是"模型不
+/// 存在"）；**已受理的 Job 不受影响**——它们的候选与定价早已随快照冻结在 Job 上。重发该模型的
+/// 其它变动也不会把它顶回启用：发布按身份复用供给行，不写 `enabled`。
+/// 供给 id 不存在是 404——这里只改已经发布出来的行，不创建任何东西。
+async fn set_offering_enabled(
+    State(state): State<AppState>,
+    Path(offering_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    state
+        .runtime
+        .set_offering_enabled(
+            OfferingId(offering_id),
+            take_enabled_flag(body)?,
+            "admin-api",
+        )
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 管理员写：启停一条**渠道**（Channel）。判据与 [`set_offering_enabled`] 同一条：渠道经它名下的
+/// 供给影响候选集，已受理的 Job 同样不受影响。渠道 id 不存在是 404。
+async fn set_channel_enabled(
+    State(state): State<AppState>,
+    Path(channel_id): Path<Uuid>,
+    headers: HeaderMap,
+    Json(body): Json<Value>,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    state
+        .runtime
+        .set_channel_enabled(ChannelId(channel_id), take_enabled_flag(body)?, "admin-api")
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 受理请求：**平铺**的模型参数 + 图片字段（`image` 与 `image_urls` 同义二选一，`mask` 是遮罩）。
 /// 图片直接是公网 URL 或 `data:image/…;base64,…`——平台不换 id、不上传、不落盘。
 #[derive(Debug, Deserialize)]
 struct CreateGenerationBody {

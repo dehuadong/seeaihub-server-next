@@ -245,44 +245,79 @@ impl HubRepository for PgHubRepository {
         let mut tier_prices = Map::new();
         let mut floor_amounts = Map::new();
         for offering in &offerings {
-            let channel_id = ChannelId::new();
-            sqlx::query(
+            // 渠道按**身份**复用：`provider_kind` + `base_url` + `credential_env` 决定"这是同一个
+            // 调用入口与凭证身份"。撞上既有行就回读它——渠道除了身份与 `enabled` 没有可变量，
+            // 而 `enabled` 是**运营设的停用状态**，发布不是它的写入方（写回 true 会把手工停用
+            // 无声顶掉）。因此这里不做 `DO UPDATE`：没有可更新的东西。
+            let channel_id = match sqlx::query_scalar::<_, Uuid>(
                 r#"
                 INSERT INTO supply.channels
                     (id, provider_kind, base_url, credential_env, enabled)
                 VALUES ($1, $2, $3, $4, true)
+                ON CONFLICT (provider_kind, base_url, credential_env) DO NOTHING
+                RETURNING id
                 "#,
             )
-            .bind(channel_id.0)
+            .bind(ChannelId::new().0)
             .bind(&offering.provider_kind)
             .bind(&offering.base_url)
             .bind(&offering.credential_env)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
-            .map_err(database_error)?;
-            let offering_id = OfferingId::new();
-            sqlx::query(
-                r#"
-                INSERT INTO supply.offerings
-                    (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
-                     restrictions, carrier_schema, parameter_mapping, enabled,
-                     formula, cost_unit_price_microusd)
-                VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
-                "#,
-            )
-            .bind(offering_id.0)
-            .bind(vendor_model_id.0)
-            .bind(channel_id.0)
-            .bind(&offering.adapter_key)
-            .bind(&offering.provider_model_id)
-            .bind(&offering.restrictions)
-            .bind(&offering.carrier_schema)
-            .bind(&offering.parameter_mapping)
-            .bind(offering.formula.as_str())
-            .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
+            .map_err(database_error)?
+            {
+                Some(id) => ChannelId(id),
+                None => ChannelId(
+                    sqlx::query_scalar(
+                        r#"
+                        SELECT id FROM supply.channels
+                        WHERE provider_kind = $1 AND base_url = $2 AND credential_env = $3
+                        "#,
+                    )
+                    .bind(&offering.provider_kind)
+                    .bind(&offering.base_url)
+                    .bind(&offering.credential_env)
+                    .fetch_one(&mut *transaction)
+                    .await
+                    .map_err(database_error)?,
+                ),
+            };
+            // 供给同理，按**它所属的 vendor model + channel** 复用。它的可变量（驱动、渠道侧模型名、
+            // 限制、承载面、映射、计价形态与单价）随这次发布更新，`enabled` **不在更新之列**：
+            // 那是运营设的停用状态，重发一次不该把它顶回启用。
+            let offering_id = OfferingId(
+                sqlx::query_scalar::<_, Uuid>(
+                    r#"
+                    INSERT INTO supply.offerings
+                        (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
+                         restrictions, carrier_schema, parameter_mapping, enabled,
+                         formula, cost_unit_price_microusd)
+                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
+                    ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
+                        adapter_key = EXCLUDED.adapter_key,
+                        provider_model_id = EXCLUDED.provider_model_id,
+                        restrictions = EXCLUDED.restrictions,
+                        carrier_schema = EXCLUDED.carrier_schema,
+                        parameter_mapping = EXCLUDED.parameter_mapping,
+                        formula = EXCLUDED.formula,
+                        cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd
+                    RETURNING id
+                    "#,
+                )
+                .bind(OfferingId::new().0)
+                .bind(vendor_model_id.0)
+                .bind(channel_id.0)
+                .bind(&offering.adapter_key)
+                .bind(&offering.provider_model_id)
+                .bind(&offering.restrictions)
+                .bind(&offering.carrier_schema)
+                .bind(&offering.parameter_mapping)
+                .bind(offering.formula.as_str())
+                .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(database_error)?,
+            );
             let price_plan_id = match &offering.rates {
                 Some(rates) => {
                     let price_plan_id = PricePlanId::new();
@@ -738,6 +773,77 @@ impl HubRepository for PgHubRepository {
         )
         .await?;
         transaction.commit().await.map_err(database_error)
+    }
+
+    async fn set_offering_enabled(
+        &self,
+        offering_id: OfferingId,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<Vec<String>, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 只改开关这一列：这条供给的定义（承载面、映射、计价）只在发布里，就地改它等于绕过发布。
+        let updated = sqlx::query("UPDATE supply.offerings SET enabled = $2 WHERE id = $1")
+            .bind(offering_id.0)
+            .bind(enabled)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        // 不存在的供给不是"待创建的资源"：定义只能由发布产生，这里只改已经发布出来的行。
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await.map_err(database_error)?;
+            return Err(ApplicationError::NotFound(format!(
+                "offering {offering_id}"
+            )));
+        }
+        // 这次改动影响哪些网关模型的候选集：调用方拿它失效 route 缓存。候选集的修订标识不因
+        // 启停而变，缓存里那份因此仍然"看起来是新的"，只能靠失效拿掉。
+        let gateway_models =
+            affected_gateway_models(&mut transaction, "re.offering_id = $1", offering_id.0).await?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            "offering.set_enabled",
+            "offering",
+            &offering_id.to_string(),
+            &serde_json::json!({"enabled": enabled}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(gateway_models)
+    }
+
+    async fn set_channel_enabled(
+        &self,
+        channel_id: ChannelId,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<Vec<String>, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let updated = sqlx::query("UPDATE supply.channels SET enabled = $2 WHERE id = $1")
+            .bind(channel_id.0)
+            .bind(enabled)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        if updated.rows_affected() == 0 {
+            transaction.rollback().await.map_err(database_error)?;
+            return Err(ApplicationError::NotFound(format!("channel {channel_id}")));
+        }
+        // 渠道经它名下的供给影响候选集，判据与 `set_offering_enabled` 同一条。
+        let gateway_models =
+            affected_gateway_models(&mut transaction, "o.channel_id = $1", channel_id.0).await?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            "channel.set_enabled",
+            "channel",
+            &channel_id.to_string(),
+            &serde_json::json!({"enabled": enabled}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(gateway_models)
     }
 
     async fn upsert_fx_rate(&self, rate: NewFxRate, actor: &str) -> Result<(), ApplicationError> {
@@ -2271,6 +2377,33 @@ fn route_policy_from_row(row: &sqlx::postgres::PgRow) -> Result<RoutePolicy, App
 /// 默认顺序，运营却以为折扣率生效了。
 fn json_error(error: serde_json::Error) -> ApplicationError {
     ApplicationError::InvalidParameter(error.to_string())
+}
+
+/// 某条供给 / 渠道的启停会影响哪些网关模型的候选集：它们的**生效**条目里含这条供给的那些名字。
+///
+/// 只取 active 条目：停用的历史条目不在任何受理路径上，失效它们的缓存没有意义。`predicate`
+/// 是调用点写死的片段（`re.offering_id = $1` 或 `o.channel_id = $1`），不是调用方给的输入。
+async fn affected_gateway_models(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    predicate: &str,
+    id: Uuid,
+) -> Result<Vec<String>, ApplicationError> {
+    let rows = sqlx::query(AssertSqlSafe(format!(
+        r#"
+        SELECT DISTINCT re.gateway_model
+        FROM publication.runtime_entries re
+        JOIN supply.offerings o ON o.id = re.offering_id
+        WHERE re.active AND {predicate}
+        ORDER BY re.gateway_model
+        "#
+    )))
+    .bind(id)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    rows.iter()
+        .map(|row| row.try_get("gateway_model").map_err(database_error))
+        .collect()
 }
 
 async fn insert_audit(

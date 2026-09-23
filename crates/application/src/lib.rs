@@ -6,23 +6,27 @@ use seeai_adapter_sdk::{
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AttemptId, ChargeFacts, ConsumerRatesCny, CostBasis, CreateImageGeneration,
-    FloorTable, FxRate, GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId,
-    JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
-    PriceSnapshot, PricingFormula, ProviderCostFact, ProviderCostSource, PublishedModel,
-    PublishedOffering, PublishedRevision, RoutePolicy, RouteStrategy, RuntimeRevisionId,
-    TokenUsage, apply_enum_maps, apply_parameter_defaults, apply_parameter_renames,
-    apply_size_mapping, carries_parameter, contract_image_parameter_kind, contract_model_identity,
-    declared_defaults, declared_enum_maps, declared_field_names, declared_parameter_names,
-    declared_reference_image_limit, declared_renames, declared_size_mapping,
-    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
-    is_used_parameter_value, literal_parameter_text, place_image_inputs, platform_image_parameters,
-    resolve_size_tier, unit_amount_microusd,
+    AccountId, AttemptId, ChannelId, ChargeFacts, ConsumerRatesCny, CostBasis,
+    CreateImageGeneration, FloorTable, FxRate, GenerationJob, HoldSource, ImageBranch,
+    ImageParameterKind, JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId,
+    ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
+    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
+    RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps, apply_parameter_defaults,
+    apply_parameter_renames, apply_size_mapping, carries_parameter, contract_image_parameter_kind,
+    contract_model_identity, declared_defaults, declared_enum_maps, declared_field_names,
+    declared_parameter_names, declared_reference_image_limit, declared_renames,
+    declared_size_mapping, declares_mask_parameter, declares_parameter,
+    declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
+    place_image_inputs, platform_image_parameters, resolve_size_tier, unit_amount_microusd,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
-use std::{collections::BTreeMap, sync::Arc, time::Duration};
+use std::{
+    collections::{BTreeMap, BTreeSet},
+    sync::Arc,
+    time::Duration,
+};
 use thiserror::Error;
 use uuid::Uuid;
 
@@ -1411,6 +1415,31 @@ pub trait HubRepository: Send + Sync {
         actor: &str,
     ) -> Result<(), ApplicationError>;
 
+    /// 管理员写：只改一条**供给**的启用开关，写一条审计事件。
+    ///
+    /// 返回这条供给现在出现在哪些网关模型的**生效**候选集里——调用方拿这些名字失效 route 缓存。
+    /// 启停不改变修订标识，缓存里那份候选集在停用之后仍然"看起来是新的"，只能靠失效拿掉。
+    ///
+    /// 没发布过的供给 id 返回 [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**
+    /// 任何东西。停用只影响之后的受理——已受理 Job 的候选与定价早已随快照冻结在 Job 上。
+    async fn set_offering_enabled(
+        &self,
+        offering_id: OfferingId,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<Vec<String>, ApplicationError>;
+
+    /// 管理员写：只改一条**渠道**的启用开关，写一条审计事件。
+    ///
+    /// 判据与 [`Self::set_offering_enabled`] 同一条：渠道经它名下的供给影响候选集，返回的也是
+    /// 受影响的网关模型名。
+    async fn set_channel_enabled(
+        &self,
+        channel_id: ChannelId,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<Vec<String>, ApplicationError>;
+
     /// 管理员写：录入一行折算率（渠道币种 → CNY），写一条审计事件。
     ///
     /// 汇率是**外部事实**，按币种维护、带生效时间；它不是修订的内容——同一时刻同一币种全平台
@@ -2689,6 +2718,7 @@ impl RuntimeService {
         for offering in offerings {
             normalized.push(self.validate_offering(&contract, offering)?);
         }
+        validate_supply_identities(&normalized)?;
         let request = command.into_request(contract, normalized);
         validate_gateway_model_identity(&request)?;
         let gateway_model = request.gateway_model.clone();
@@ -2727,6 +2757,45 @@ impl RuntimeService {
             .set_gateway_model_enabled(gateway_model, enabled, actor)
             .await?;
         self.acceleration.invalidate_route(gateway_model).await;
+        Ok(())
+    }
+
+    /// 管理员写：只改一条**供给**的启用开关，并失效受影响型号的 route 缓存。
+    ///
+    /// 停用即刻影响之后的受理：候选取数本来就同时读供给与渠道的开关，写入即生效，**不需要重发
+    /// 修订**——启停是运行状态，不是定义。已受理的 Job 不受影响（候选已冻结在它们的快照里）。
+    /// 缓存里那份候选集带着的修订标识没变，因此只能靠失效拿掉；失效失败也只是让这次停用晚一个
+    /// TTL 生效，不会让停用丢失（下一轮对账或 TTL 到期后回源）。
+    pub async fn set_offering_enabled(
+        &self,
+        offering_id: OfferingId,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let affected = self
+            .repository
+            .set_offering_enabled(offering_id, enabled, actor)
+            .await?;
+        for gateway_model in affected {
+            self.acceleration.invalidate_route(&gateway_model).await;
+        }
+        Ok(())
+    }
+
+    /// 管理员写：只改一条**渠道**的启用开关，并失效受影响型号的 route 缓存。
+    pub async fn set_channel_enabled(
+        &self,
+        channel_id: ChannelId,
+        enabled: bool,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let affected = self
+            .repository
+            .set_channel_enabled(channel_id, enabled, actor)
+            .await?;
+        for gateway_model in affected {
+            self.acceleration.invalidate_route(&gateway_model).await;
+        }
         Ok(())
     }
 
@@ -2960,6 +3029,33 @@ fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), Appl
 /// `native_model_id` 非空、`into_request` 把空白回退成它，因此到这里时名字必然非空。留着它是
 /// 为了让"发布即原子替换**这个名字**的候选集"在将来形状变化时（例如允许候选各自报名）先被
 /// 拦住，而不是先悄悄生效、事后才发现替换的到底是谁说不清。
+/// 一次发布里不能出现两条**同一条供给**的候选。
+///
+/// 供给的身份是"它所属的 vendor model + channel"，而渠道的身份是 `provider_kind` + `base_url` +
+/// `credential_env`；一次发布的所有候选都属于同一个 vendor model，所以"两条候选落在同一条供给上"
+/// 等价于"两条候选共用同一个渠道身份"。发布按身份复用供给行，两条候选于是会写到同一行上：候选集
+/// 里会出现两条指向同一条供给的条目（`runtime_entries` 的主键正是"修订 + 供给"），而"这条候选的
+/// 档位与权重"也就无处安放。要两条候选就换一个入口（地址或凭证身份不同）。
+///
+/// 判据用**归一之后**的 `base_url`：末尾斜杠的写法差异不构成两个入口。
+fn validate_supply_identities(offerings: &[NormalizedOffering]) -> Result<(), ApplicationError> {
+    let mut seen = BTreeSet::new();
+    for offering in offerings {
+        if !seen.insert((
+            offering.provider_kind.as_str(),
+            offering.base_url.as_str(),
+            offering.credential_env.as_str(),
+        )) {
+            return Err(ApplicationError::Validation(format!(
+                "two candidates share one channel identity ({} {} {}); one supply can appear \
+                 only once in a publication",
+                offering.provider_kind, offering.base_url, offering.credential_env
+            )));
+        }
+    }
+    Ok(())
+}
+
 fn validate_gateway_model_identity(
     request: &PublishRuntimeRequest,
 ) -> Result<(), ApplicationError> {

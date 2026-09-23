@@ -1570,3 +1570,283 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     pool.close().await;
     drop_isolated_database(&database_name).await;
 }
+
+/// 发布按**身份**复用渠道与供给行：手工停用的状态不会被下一次发布顶掉。
+///
+/// 老形状的发布每次都给候选新插一行渠道与一行供给、并写死 `enabled = true`——手工停用因此在
+/// 下一次发布时无声消失。这里按"停用 → 重发该模型的其它变动 → 仍然停用"两个方向各验一次
+/// （渠道停用、供给停用），顺带钉住"重发没有多插一行"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn republishing_a_model_keeps_the_disabled_supply_disabled() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let client = Client::new();
+    let (offering, channel) = active_supply(&harness).await;
+    let channels_before: i64 = sqlx::query_scalar("SELECT count(*) FROM supply.channels")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("channel count");
+
+    // 重发用的草案与夹具发布的那条逐字同身份，只改一处**可变量**（档位）——这正是
+    // "同一模型的其它变动"：渠道身份没变，因此必须复用同一行。
+    let republish = |priority: i32| {
+        let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+        draft["base_url"] = json!(harness.upstream_base_url);
+        draft["routing_priority"] = json!(priority);
+        draft
+    };
+    // 重发必须落在**同一个 vendor model** 上，所以合同要与入库那份**逐字相同**（合同不可变）。
+    // 这里直接**把库里存的那份读回来**当入参：如果这样仍被判"合同不同"，那就是入库时的归一化
+    // 与比较用的原始入参不对称——问题在代码的校验，而不是用例的构造。
+    let bootstrap_contract: Value = sqlx::query_scalar(
+        "SELECT capability_schema FROM catalog.vendor_models \
+         WHERE native_model_id = $1 AND native_revision = $2",
+    )
+    .bind("driver-model")
+    .bind("route-test-1")
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the bootstrapped vendor model contract");
+    let publish = async |draft: Value| {
+        let response = client
+            .post(format!("{}/api/v1/runtime-revisions", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&publication_body(
+                harness.model,
+                "route-test-1",
+                Some(bootstrap_contract.clone()),
+                vec![draft],
+                None,
+            ))
+            .send()
+            .await
+            .expect("runtime publication");
+        let status = response.status();
+        let raw = response.text().await.expect("publication body");
+        (status, raw)
+    };
+
+    // ── 停用渠道 → 重发 ──
+    assert_eq!(
+        patch_channel(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            channel,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = publish(republish(2)).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "重发同一模型的其它变动必须成功：{body}"
+    );
+
+    let channels_after: i64 = sqlx::query_scalar("SELECT count(*) FROM supply.channels")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("channel count");
+    assert_eq!(
+        channels_after, channels_before,
+        "同一个调用入口与凭证身份只该有一行：重发必须复用它，不是再插一行"
+    );
+    let channel_enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM supply.channels WHERE id = $1")
+            .bind(channel)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the reused channel row");
+    assert!(
+        !channel_enabled,
+        "重发不得把手工停用的渠道顶回启用——那正是这条切片要修掉的缺陷"
+    );
+    assert_eq!(
+        active_supply(&harness).await,
+        (offering, channel),
+        "生效条目仍指向同一行供给与渠道"
+    );
+    let off_key = format!("supply-channel-off-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &off_key,
+        &route_request(harness.model, "channel stays off"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "渠道停着，重发之后这个型号仍然取不到候选：{body}"
+    );
+
+    // ── 反过来：渠道重新启用、改停**供给** → 再重发 ──
+    assert_eq!(
+        patch_channel(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            channel,
+            true
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        patch_offering(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            offering,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let (status, body) = publish(republish(3)).await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    let offering_enabled: bool =
+        sqlx::query_scalar("SELECT enabled FROM supply.offerings WHERE id = $1")
+            .bind(offering)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the reused offering row");
+    assert!(!offering_enabled, "供给的停用状态同样不得被重发顶回启用");
+    assert_eq!(
+        active_supply(&harness).await,
+        (offering, channel),
+        "供给行也按身份复用：重发之后生效条目仍指向原来那一行"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 两条供给级启停接口的对外形状：管理员凭证、目标不存在、只允许改 `enabled`。
+///
+/// 形状本身就是合同的一部分：多给一个字段必须**被拒**而不是被静默忽略——忽略会让调用方以为
+/// 承载面 / 计价改成功了，而定义只能由发布产生。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_supply_switches_take_only_enabled_and_need_admin_credentials() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let client = Client::new();
+    let (offering, channel) = active_supply(&harness).await;
+    let offering_path = format!("/api/v1/offerings/{offering}");
+    let channel_path = format!("/api/v1/channels/{channel}");
+
+    // 无凭证：401。鉴权先于取数，所以不存在的 id 也一样。
+    for path in [&offering_path, &channel_path] {
+        let (status, body) = patch_supply(
+            &client,
+            &harness.base_url,
+            path,
+            None,
+            &json!({"enabled": false}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+    }
+
+    // 目标不存在：404，而且不留下审计——被拒的写入什么都没发生。
+    let unknown = Uuid::new_v4();
+    assert_eq!(
+        patch_offering(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            unknown,
+            false
+        )
+        .await,
+        StatusCode::NOT_FOUND,
+        "没发布过的供给 id 是'不存在'，不是'待创建'"
+    );
+    assert_eq!(
+        patch_channel(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            unknown,
+            false
+        )
+        .await,
+        StatusCode::NOT_FOUND
+    );
+
+    // 只有 `enabled` 是可变位：多给字段 / 少给 / 类型不对都是 400（不是 422）。
+    for body in [
+        json!({"enabled": false, "carrier_schema": {"type": "object"}}),
+        json!({"enabled": false, "formula": "per_image"}),
+        json!({}),
+        json!({"enabled": "no"}),
+        json!([true]),
+    ] {
+        let (status, response) = patch_supply(
+            &client,
+            &harness.base_url,
+            &offering_path,
+            Some(&harness.admin_token),
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+        let (status, response) = patch_supply(
+            &client,
+            &harness.base_url,
+            &channel_path,
+            Some(&harness.admin_token),
+            &body,
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{body}: {response}");
+    }
+
+    // 到这一步一次合法写入都还没有发生过，两类审计都该是空的。
+    assert!(
+        audit_events(&harness, "offering.set_enabled")
+            .await
+            .is_empty()
+    );
+    assert!(
+        audit_events(&harness, "channel.set_enabled")
+            .await
+            .is_empty()
+    );
+
+    // 合法写入：204，并各留一条审计，载荷记下改成了什么。
+    assert_eq!(
+        patch_offering(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            offering,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        patch_channel(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            channel,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    assert_eq!(
+        audit_events(&harness, "offering.set_enabled").await,
+        vec![json!({"enabled": false})]
+    );
+    assert_eq!(
+        audit_events(&harness, "channel.set_enabled").await,
+        vec![json!({"enabled": false})]
+    );
+
+    harness.cleanup().await;
+}

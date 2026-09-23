@@ -408,24 +408,42 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     );
     narrow_first["routing_priority"] = json!(0);
     narrow_first["restrictions"] = json!({"allowed_branches": ["prompt_only"], "max_images": 0});
+    // 两条候选必须来自**两个渠道**：供给身份是"模型 + 渠道"唯一，同一渠道发两条会塌成一条。
+    // 第二条因此换渠道；它按新形状只补一份映射——承载面声明的仍是**渠道原生字段名**
+    // （adapter 能在线上写出的名字），平台字段名到原生名的重命名交给 `parameter_mapping`。
     let mut narrow_second = candidate(
-        "AIHubMix",
-        "aihubmix-image-v1",
+        "APIMart",
+        "apimart-image-v1",
         &["prompt_only", "image_conditioned"],
     );
+    // 映射只覆盖**合同声明过**的字段：顶层合同来自第一条候选（只声明参考图，没有遮罩），
+    // 多映射一个合同里没有的字段会被发布期拒。
+    narrow_second["parameter_mapping"] = json!({"rename": {"image": "image_urls"}});
     narrow_second["routing_priority"] = json!(1);
     narrow_second["restrictions"] = json!({"allowed_branches": ["prompt_only"], "max_images": 0});
+    // 直接发布并把错误体带进断言：只比状态码会看不出被拒的真实原因。
+    // 顶层合同用**平台对客字段名**那一份（AIHubMix 候选的 `capability_schema`）：合同一个
+    // vendor model 只有一份，各供给只带自己的承载面映射——两条候选分走两个渠道后正需要这样。
+    let publication = publication_body(
+        model,
+        "route-test-1",
+        Some(narrow_first["capability_schema"].clone()),
+        vec![narrow_first.clone(), narrow_second.clone()],
+        None,
+    );
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&publication)
+        .send()
+        .await
+        .expect("publish request");
+    let published_status = response.status();
+    let published_body = response.text().await.expect("publish body");
     assert_eq!(
-        publish_candidates(
-            &client,
-            &base_url,
-            &admin_token,
-            model,
-            None,
-            vec![narrow_first, narrow_second]
-        )
-        .await,
-        StatusCode::OK
+        published_status,
+        StatusCode::OK,
+        "两条候选分走两个渠道后发布必须成功：{published_body}"
     );
     let mut request = route_request(model, "an edit neither candidate can carry");
     request["image"] = json!(png_data_url());
@@ -472,11 +490,14 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     // 与用例 4 的区别：这里只让**一条**候选不合格，另一条合格。若不合格的候选也参与分摊，
     // 权重 1000 会让它拿到几乎全部分流；断言"每次都落在合格那条"就是这条硬约束的证据。
     let model = "weight-model-d";
+    // 两条候选同样必须来自**两个渠道**（供给身份是"模型 + 渠道"唯一）。让**不合格**的那条
+    // 换渠道：合格那条保持 AIHubMix，请求才会打到本用例已经起好的假上游。
     let mut heavy_but_ineligible = candidate(
-        "AIHubMix",
-        "aihubmix-image-v1",
+        "APIMart",
+        "apimart-image-v1",
         &["prompt_only", "image_conditioned"],
     );
+    heavy_but_ineligible["parameter_mapping"] = json!({"rename": {"image": "image_urls"}});
     heavy_but_ineligible["routing_priority"] = json!(0);
     heavy_but_ineligible["weight"] = json!(1000);
     heavy_but_ineligible["restrictions"] =
@@ -494,7 +515,7 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
             &base_url,
             &admin_token,
             model,
-            None,
+            Some(light_but_eligible["capability_schema"].clone()),
             vec![heavy_but_ineligible, light_but_eligible]
         )
         .await,
@@ -841,6 +862,169 @@ async fn route_policies_are_runtime_configuration_and_do_not_touch_revisions() {
     assert_eq!(
         revisions_after, revisions_before,
         "策略是运行期配置：写它不该产生新修订"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 供给级启停：停掉一条供给，**之后的**受理取不到它；重新启用即恢复；已受理的 Job 不受影响。
+///
+/// 用**带加速层**的夹具：候选集会被缓存，而启停不改变修订标识——这条用例因此能看出"写入即生效"
+/// 不是靠"缓存恰好过期"。同步窗口给 1 秒：受理之后不等 Worker，Job 停在 `accepted`，正好用来
+/// 验"停用不回溯到已受理的 Job"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn disabling_an_offering_stops_later_acceptances_and_leaves_accepted_jobs_alone() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        1,
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+    let client = Client::new();
+    let offering: Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM supply.offerings o
+         JOIN publication.runtime_entries re ON re.offering_id = o.id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(harness.model)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the published offering");
+
+    // 先受理一次并跑完：候选集因此进了 route 缓存（后面那次停用必须能把它拿掉）。
+    {
+        let _worker = harness.spawn_worker();
+        let key = format!("supply-enabled-{}", Uuid::new_v4());
+        let (status, body) = post_json(
+            &harness.base_url,
+            &harness.api_key,
+            "/v1/images/generations",
+            &key,
+            &route_request(harness.model, "before the switch"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+    }
+    assert!(
+        harness.cache().route(harness.model).is_some(),
+        "受理之后候选集必须在缓存里，否则这条用例验不到失效"
+    );
+
+    // 受理一次**不等 Worker**：同步窗口 1 秒，超时返回，Job 留在 accepted。
+    let pending_key = format!("supply-pending-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &pending_key,
+        &route_request(harness.model, "already accepted"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker，受理后只会等到超时：{body}"
+    );
+    let (pending_job, pending_state, _) = harness.job(&pending_key).await;
+    assert_eq!(pending_state, "accepted");
+
+    // ── 停用这条供给 ──
+    assert_eq!(
+        patch_offering(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            offering,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+
+    // 停用即刻影响之后的受理：这个型号现在一条候选都取不到，对客是"模型不存在"；
+    // 目录里也跟着消失（两处判据同一条）。
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("job count");
+    let refused_key = format!("supply-off-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &refused_key,
+        &route_request(harness.model, "after the switch"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "停用之后取不到候选，对客是'模型不存在'：{body}"
+    );
+    let (_, catalog) = get_catalog(&client, &harness.base_url, None).await;
+    assert_eq!(
+        catalog,
+        json!({"data": []}),
+        "停用的供给不进目录：{catalog}"
+    );
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("job count");
+    assert_eq!(
+        jobs_after, jobs_before,
+        "被拒的受理不该留下 Job（它连候选都没选出来）"
+    );
+
+    // ── 已受理的 Job 不受影响：供给还停着，它照样跑完 ──
+    let _worker = harness.spawn_worker();
+    wait_for_job_state(&harness, &pending_key, "succeeded").await;
+    let (_, _, result) = harness.job(&pending_key).await;
+    let frozen_offering: Uuid =
+        sqlx::query_scalar("SELECT offering_id FROM generation.jobs WHERE id = $1")
+            .bind(pending_job)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the accepted job must keep its offering");
+    assert_eq!(
+        frozen_offering, offering,
+        "已受理的 Job 仍按受理时那一条供给执行，停用不回溯"
+    );
+    assert!(result.is_some(), "停用不影响已受理 Job 的结果交付");
+
+    // ── 重新启用：目录与受理都恢复 ──
+    assert_eq!(
+        patch_offering(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            offering,
+            true
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    let restored_key = format!("supply-on-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &restored_key,
+        &route_request(harness.model, "after re-enabling"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重新启用后必须能受理：{body}");
+    assert_sync_success("重新启用后受理", &body);
+
+    // 两次改动各留一条审计。
+    assert_eq!(
+        audit_events(&harness, "offering.set_enabled").await.len(),
+        2,
+        "启停是管理员面的写入，每次都要留痕"
     );
 
     harness.cleanup().await;

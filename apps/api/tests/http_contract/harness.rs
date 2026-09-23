@@ -2241,8 +2241,88 @@ async fn patch_gateway_model(
         .status()
 }
 
-/// 一份**对客名与厂商原生名不同**的素材：厂商原生名取 sunburst，对客名取 plus。
+/// 改一次**供给 / 渠道**的启用开关（`PATCH /api/v1/offerings/{id}`、`/api/v1/channels/{id}`）。
 ///
+/// 请求体原样发出、响应原样取回：错误形状那几条用例要自己构造"多给一个字段""少给 `enabled`"
+/// 这类不合形状的请求体，夹具先过一遍结构体就把它们磨平了。`admin_token` 给 `None` 就一个
+/// 鉴权头都不带——这条接口是运营面，用例要能看出它要凭证。
+async fn patch_supply(
+    client: &Client,
+    base_url: &str,
+    path: &str,
+    admin_token: Option<&str>,
+    body: &Value,
+) -> (StatusCode, Value) {
+    let request = client.patch(format!("{base_url}{path}")).json(body);
+    let request = match admin_token {
+        Some(token) => request.bearer_auth(token),
+        None => request,
+    };
+    let response = request.send().await.expect("supply patch");
+    let status = response.status();
+    let raw = response.text().await.expect("supply patch body");
+    (
+        status,
+        serde_json::from_str(&raw).unwrap_or(Value::String(raw)),
+    )
+}
+
+/// 启停一条供给（成功路径）。
+async fn patch_offering(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    offering_id: Uuid,
+    enabled: bool,
+) -> StatusCode {
+    patch_supply(
+        client,
+        base_url,
+        &format!("/api/v1/offerings/{offering_id}"),
+        Some(admin_token),
+        &json!({"enabled": enabled}),
+    )
+    .await
+    .0
+}
+
+/// 启停一条渠道（成功路径）。
+async fn patch_channel(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    channel_id: Uuid,
+    enabled: bool,
+) -> StatusCode {
+    patch_supply(
+        client,
+        base_url,
+        &format!("/api/v1/channels/{channel_id}"),
+        Some(admin_token),
+        &json!({"enabled": enabled}),
+    )
+    .await
+    .0
+}
+
+/// 当前生效的那条候选供给与它所在的渠道：启停用例要按 id 指认它们。
+async fn active_supply(harness: &Harness) -> (Uuid, Uuid) {
+    let row = sqlx::query(
+        "SELECT o.id AS offering_id, o.channel_id FROM supply.offerings o
+         JOIN publication.runtime_entries re ON re.offering_id = o.id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(harness.model)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the active candidate supply");
+    (
+        row.try_get("offering_id").expect("offering id"),
+        row.try_get("channel_id").expect("channel id"),
+    )
+}
+
+/// 一份**对客名与厂商原生名不同**的素材：厂商原生名取 sunburst，对客名取 plus。
 /// 只留 AIHubMix 那一条候选：这条用例只跑一家渠道，另一条留在这里会多一个用不到的假上游。
 fn renamed_material(aihubmix_upstream: &str) -> Value {
     let mut material: Value = serde_json::from_str(include_str!(

@@ -57,6 +57,24 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn set_offering_enabled(
+        &self,
+        _offering_id: OfferingId,
+        _enabled: bool,
+        _actor: &str,
+    ) -> Result<Vec<String>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn set_channel_enabled(
+        &self,
+        _channel_id: ChannelId,
+        _enabled: bool,
+        _actor: &str,
+    ) -> Result<Vec<String>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn upsert_fx_rate(&self, _rate: NewFxRate, _actor: &str) -> Result<(), ApplicationError> {
         unused_repository()
     }
