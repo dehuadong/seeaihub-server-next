@@ -175,15 +175,6 @@
       },
       "parameter_mapping": {
         "rename": { "image": "image_urls", "mask": "mask_url" }
-      },
-      "price_plan": {
-        "formula": "token_rates",
-        "currency": "USD",
-        "text_input_microusd_per_million": 5000000,
-        "image_input_microusd_per_million": 8000000,
-        "text_output_microusd_per_million": 10000000,
-        "image_output_microusd_per_million": 30000000,
-        "source_url": "https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md"
       }
     }
   ]
