@@ -531,20 +531,29 @@ impl ApimartImageAdapter {
         // 轮询到终态。任务查询是幂等读，其瞬时失败在传输层已归类为
         // AcceptanceUnknown（不重试），由平台按"已确认生成但未取到"处理。
         let task = self.poll(task_id, credential).await?;
-        let usage = task.usage()?;
+        // 终态一到手，金额就已经读得出来：这一段里的**任何**失败都把它带上——没有结果图不代表
+        // 这笔钱没花，带上它，失败件才能落 declared 或进成本缺口清单。
+        let provider_cost = task.provider_cost(cost_currency);
+        let usage = task
+            .usage()
+            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?;
         let digest = task.response_digest(task_id);
         // 结果地址原样交给调用方：平台不下载、不转存，也不替上游承诺链接的有效期。
         let images = task
-            .image_urls()?
+            .image_urls()
+            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?
             .into_iter()
             .map(GeneratedImage::from_url)
             .collect::<Vec<_>>();
         if images.is_empty() {
-            return Err(provider_error(
-                "provider_result_empty",
-                "provider returned no images".to_owned(),
-                RetrySafety::AcceptanceUnknown,
-                ProviderFailureKind::Unknown,
+            return Err(with_provider_cost(
+                provider_error(
+                    "provider_result_empty",
+                    "provider returned no images".to_owned(),
+                    RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
+                ),
+                provider_cost,
             ));
         }
         Ok(ProviderSuccess {
@@ -554,12 +563,29 @@ impl ApimartImageAdapter {
             // **不用于跨调用自动恢复**——拿它自动补齐结果需要另一套模型。
             provider_trace_id: Some(task_id.to_owned()),
             response_digest: digest,
-            provider_cost: task.provider_cost(cost_currency),
+            provider_cost,
         })
     }
 }
 
-/// 给"提交之后"的失败补上 task id，**不改** `code` / `message` / `retry_safety`。
+/// 给终态之后的失败附上"这一笔已经花了多少"：**只加** `provider_cost`，`code` / `message` /
+/// `retry_safety` / `kind` / `trace_id` 原样。
+///
+/// 终态里的金额与结果无关：读到它之后才失败，那笔成本是既成事实，而失败件是它唯一的落点。
+/// `AdapterError` 的其余变体没有位置承载成本，原样返回。
+fn with_provider_cost(error: AdapterError, provider_cost: ProviderCost) -> AdapterError {
+    match error {
+        AdapterError::Provider(mut provider) => {
+            if provider.provider_cost.is_none() {
+                provider.provider_cost = Some(provider_cost);
+            }
+            AdapterError::Provider(provider)
+        }
+        other => other,
+    }
+}
+
+/// 给"提交之后"的失败补上 task id，**不改** `code` / `message` / `retry_safety` / `provider_cost`。
 ///
 /// 为什么需要：进对账的 Job 只能靠人工去上游查，而查的依据就是这个 task id。
 /// 提交成功后它就在手里——不附上的话，`attempts.provider_trace_id` 会是空的，
@@ -1013,6 +1039,8 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
         trace_id: None,
         retry_safety,
         kind,
+        // 这一段在终态之前：金额还没读到，所以这里没有成本事实。
+        provider_cost: None,
     }
 }
 
@@ -1082,6 +1110,9 @@ fn provider_error(
         trace_id: None,
         retry_safety,
         kind,
+        // 建这个错误的地方都还没拿到终态，也就还没有金额可带；终态之后的失败由
+        // [`with_provider_cost`] 补上。
+        provider_cost: None,
     }
     .into()
 }
@@ -1094,8 +1125,8 @@ fn after_acceptance(error: AdapterError) -> AdapterError {
     with_retry_safety(error, RetrySafety::AcceptanceUnknown)
 }
 
-/// 只改处置，其余原样：`code` / `message` / `trace_id` / `kind` 都是已经判出的事实，
-/// 重建错误对象时漏掉任何一个都会丢证据。
+/// 只改处置，其余原样：`code` / `message` / `trace_id` / `kind` / `provider_cost` 都是已经判出
+/// 的事实，重建错误对象时漏掉任何一个都会丢证据。
 fn with_retry_safety(error: AdapterError, retry_safety: RetrySafety) -> AdapterError {
     match error {
         AdapterError::Provider(provider) => AdapterError::Provider(ProviderCallError {
@@ -1268,12 +1299,21 @@ mod tests {
 
     /// 造一条带（或不带）`cost` 的终态任务：`None` 表示响应里**根本没有这个字段**。
     fn task_with_cost(cost: Option<Value>) -> TaskData {
+        task_with_cost_and_images(cost, true)
+    }
+
+    /// 同上，`images` 决定终态里有没有结果图。
+    fn task_with_cost_and_images(cost: Option<Value>, images: bool) -> TaskData {
         let mut body = serde_json::json!({
             "data": {
                 "id": "task-x",
                 "status": "completed",
                 "usage": full_usage(),
-                "result": {"images": [{"url": ["https://example.invalid/a.png"]}]}
+                "result": {"images": if images {
+                    vec![serde_json::json!({"url": ["https://example.invalid/a.png"]})]
+                } else {
+                    Vec::<Value>::new()
+                }}
             }
         });
         if let Some(cost) = cost {
@@ -1348,6 +1388,38 @@ mod tests {
         let data = task("completed", full_usage(), Vec::new());
         let error = data.image_urls().expect_err("no urls must fail");
         assert!(error.to_string().contains("no image url"), "{error}");
+    }
+
+    /// 终态读到了金额、却**没有结果图**：失败照样把已经读到的成本带走。
+    ///
+    /// 这笔钱在金额读出来的那一刻就已经花了；附在错误上之后还要过补对账标识那一步，
+    /// 那一步只加不改——成本事实被冲掉，失败件在账上与缺口清单两头就都看不见。
+    #[test]
+    fn a_terminal_without_images_still_carries_the_cost_it_declared() {
+        let data = task_with_cost_and_images(Some(serde_json::json!(0.011354)), false);
+        let provider_cost = data.provider_cost("USD");
+        assert_eq!(
+            provider_cost,
+            ProviderCost::Declared(DeclaredCost {
+                amount_microusd: 11_354,
+                currency: "USD".to_owned(),
+            })
+        );
+
+        let error = data.image_urls().expect_err("no urls must fail");
+        let error = with_task_id(with_provider_cost(error, provider_cost.clone()), "task-x");
+        match error {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.code, "provider_result_missing");
+                assert_eq!(provider.trace_id.as_deref(), Some("task-x"));
+                assert_eq!(
+                    provider.provider_cost,
+                    Some(provider_cost),
+                    "补对账标识只加不改：金额与结果无关，不许跟着结果一起丢"
+                );
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
     }
 
     #[test]

@@ -1611,13 +1611,14 @@ async fn a_declared_cost_that_never_arrives_is_recorded_as_a_gap_not_guessed() {
     harness.cleanup().await;
 }
 
-/// 上游终态**给了金额、却没有任何结果图**：那笔成本今天既不在账上、也不在缺口清单里。
+/// 上游终态**给了金额、却没有任何结果图** ⇒ 失败件照样按 `declared` 落四列：
+/// 金额取上游声明值、币种取渠道声明。
 ///
-/// 这是"失败分支不采集成本"的形态：金额在终态里已经解析到手，但失败分支把它丢掉了，而来源留
-/// NULL（不是 `unavailable`）又不满足缺口清单的判据——两头都看不见。这条用例就是钉住它。
+/// 没有结果图是"结果没交付"，不是"钱没花"：金额在终态里就已经解析到手，而终态之后的失败是它
+/// 唯一的落点——丢掉它，这笔真实成本既不在账上也不在缺口里。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_terminal_without_images_loses_the_cost_it_already_declared() {
+async fn a_terminal_without_images_still_records_the_cost_it_already_declared() {
     let mut behaviour = UpstreamBehaviour::apimart();
     behaviour.terminal_without_images = true;
     let harness = Harness::start(behaviour).await;
@@ -1629,27 +1630,71 @@ async fn a_terminal_without_images_loses_the_cost_it_already_declared() {
             route_request(harness.model, "terminal without images"),
         )
         .await;
-    assert_ne!(status, StatusCode::OK, "没有结果图的那次执行是失败的：{body}");
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "没有结果图的那次执行是失败的：{body}"
+    );
+
+    let (job_id, state, _) = harness.job(&key).await;
+    // 失败件的处置不变：受理状态不明仍然进对账。成本事实与这条处置无关，只是不再跟着结果丢。
+    assert_eq!(state, "reconciliation_required", "没有结果图不该算成功");
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(
+        source.as_deref(),
+        Some("declared"),
+        "上游声明了金额就直接取它：没有结果图不代表这笔钱没花"
+    );
+    assert_eq!(amount, Some(11_354), "金额是上游声明的 0.011354");
+    assert_eq!(currency.as_deref(), Some("USD"), "币种按渠道声明");
+    assert_eq!(cny, None, "折算要用受理时冻结的汇率，这一片还没有它");
+    harness.cleanup().await;
+}
+
+/// 上游终态**没有金额字段**、也没有结果图 ⇒ 来源落 `unavailable`：金额与折算值留空，
+/// 而且这一笔**出现在成本缺口清单里**（清单的判据就是来源是 `unavailable`）。
+///
+/// `unavailable` 是"本该有金额却拿不到"的显式事实，NULL 是"根本没采"；留 NULL 的话，这笔
+/// 成本在账上与缺口两头都看不见，运营也就无从核账单。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_terminal_without_images_or_amount_lands_in_the_cost_gap_list() {
+    let mut behaviour = UpstreamBehaviour::apimart();
+    behaviour.declared_cost = None;
+    behaviour.terminal_without_images = true;
+    let harness = Harness::start(behaviour).await;
+    let key = format!("cost-empty-no-amount-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "terminal without images or amount"),
+        )
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "没有结果图的那次执行是失败的：{body}"
+    );
 
     let (job_id, state, _) = harness.job(&key).await;
     assert_ne!(state, "succeeded", "没有结果图不该算成功");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
-    assert_eq!(amount, None, "上游明明给了金额，却四项全空");
+    assert_eq!(source.as_deref(), Some("unavailable"));
+    assert_eq!(amount, None, "拿不到金额就留空：不写 0、也不用费率顶替");
     assert_eq!(currency, None);
-    assert_eq!(source, None);
     assert_eq!(cny, None);
-    // 来源是 NULL 而不是 `unavailable`：连缺口清单都筛不出它。
-    let visible: i64 = sqlx::query_scalar(
+    let gaps: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM generation.attempts \
-         WHERE job_id = $1 AND provider_cost_source IS NOT NULL",
+         WHERE job_id = $1 AND provider_cost_source = 'unavailable'",
     )
     .bind(job_id)
     .fetch_one(&harness.pool)
     .await
     .expect("gap query");
     assert_eq!(
-        visible, 0,
-        "来源留 NULL ⇒ 这笔也不进成本缺口清单，账上与缺口两头都看不见"
+        gaps, 1,
+        "来源是 `unavailable` ⇒ 这笔进成本缺口清单，运营核账单时看得到它"
     );
     harness.cleanup().await;
 }

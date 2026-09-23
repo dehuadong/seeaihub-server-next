@@ -10,7 +10,7 @@ use seeai_domain::{
     GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, MeteringEvidence,
     OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, ProviderCostFact,
     ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
-    RouteStrategy, RuntimeRevisionId, apply_enum_maps, apply_parameter_defaults,
+    RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps, apply_parameter_defaults,
     apply_parameter_renames, apply_size_mapping, carries_parameter, contract_image_parameter_kind,
     contract_model_identity, declared_defaults, declared_enum_maps, declared_field_names,
     declared_parameter_names, declared_reference_image_limit, declared_renames,
@@ -1144,9 +1144,11 @@ pub struct AttemptFailure {
     pub hold_disposition: HoldDisposition,
     /// 这次执行**已经看到**的成本事实（成本平面）。
     ///
-    /// 结果交付失败、进对账那条路径上执行已经发生、上游成本也拿得到，成本事实必须有去处——
-    /// 只有成功路径才落成本，等于把"这笔到底花了多少钱"丢在一条已经付过钱的路径上。
-    /// 拿不到（连用量都算不出）时为 `None`：那才是"这次没有成本事实可落"。
+    /// 执行已经发生、上游成本也拿得到，成本事实就必须有去处——只有成功路径才落成本，等于把
+    /// "这笔到底花了多少钱"丢在一条已经付过钱的路径上。Driver 在终态之后判定失败时把已读到的
+    /// 成本附在错误上，这里原样落库；Driver 没报回来时记 `unavailable`（来源可辨、进缺口清单）。
+    /// 只有"请求根本没交到渠道"的执行（凭证取不到、Driver 装不起来、参数被挡在请求之外）才是
+    /// `None`：那时的 NULL 说的是"根本没采"，不是"成本是 0"。
     pub provider_cost: Option<ProviderCostFact>,
 }
 
@@ -3554,6 +3556,7 @@ impl WorkerService {
                         kind: ProviderFailureKind::PlatformInternal,
                         target_state: JobState::Failed,
                         hold_disposition: HoldDisposition::Release,
+                        // 请求还没交出去：这次执行没有成本可采。
                         provider_cost: None,
                     },
                 )
@@ -3579,6 +3582,7 @@ impl WorkerService {
                         kind: ProviderFailureKind::PlatformInternal,
                         target_state: JobState::Failed,
                         hold_disposition: HoldDisposition::Release,
+                        // 请求还没交出去：这次执行没有成本可采。
                         provider_cost: None,
                     },
                 )
@@ -3593,8 +3597,11 @@ impl WorkerService {
             Ok(success) => {
                 // 成本事实**先算出来**再结算：结算失败进对账那条路径也要落成本——执行已经发生、
                 // 上游成本也拿得到，把成本留在成功路径上等于"这一笔付过钱却没有成本事实"。
-                let provider_cost =
-                    provider_cost_fact(&claimed.job.offering.price_snapshot, &success);
+                let provider_cost = provider_cost_fact(
+                    &claimed.job.offering.price_snapshot,
+                    &success.provider_cost,
+                    Some(&success.usage),
+                );
                 if let Err(error) = self
                     .complete_success(&claimed.job, attempt_id, &success, provider_cost.clone())
                     .await
@@ -3617,7 +3624,7 @@ impl WorkerService {
                 }
             }
             Err(error) => {
-                let failure = failure_from_adapter(error);
+                let failure = failure_from_adapter(&claimed.job.offering.price_snapshot, error);
                 self.fail_and_refresh(claimed.job.id, attempt_id, failure)
                     .await?;
             }
@@ -3650,6 +3657,8 @@ impl WorkerService {
                             trace_id: None,
                             retry_safety: RetrySafety::AcceptanceUnknown,
                             kind: ProviderFailureKind::PlatformInternal,
+                            // 心跳掉了是我们自己的问题，与这次执行的成本事实无关。
+                            provider_cost: None,
                         }.into());
                     }
                     return result;
@@ -3729,20 +3738,26 @@ impl WorkerService {
 /// 而"编一个数"比"承认折算不出来"糟得多。
 ///
 /// 自算失败（用量自相矛盾或溢出）时记成 `unavailable`：本该有金额却算不出来，也是缺口，
-/// 不用别的数顶替。
-fn provider_cost_fact(snapshot: &PriceSnapshot, success: &ProviderSuccess) -> ProviderCostFact {
+/// 不用别的数顶替。**用量不在手里**（失败件没有本次用量）与自算失败同处置：算不出来就是缺口。
+fn provider_cost_fact(
+    snapshot: &PriceSnapshot,
+    provider_cost: &ProviderCost,
+    usage: Option<&TokenUsage>,
+) -> ProviderCostFact {
     // 三态在 SDK 与领域各有一套写法，来源一律经那一处映射取，不在这里再判一次。
-    let mut source = ProviderCostSource::from(&success.provider_cost);
+    let mut source = ProviderCostSource::from(provider_cost);
     // 形状只有一条规则：有金额的来源两样都在，`unavailable` 两样都不在。
-    let (amount_microusd, currency) = match &success.provider_cost {
+    let (amount_microusd, currency) = match provider_cost {
         ProviderCost::Declared(cost) => (Some(cost.amount_microusd), Some(cost.currency.clone())),
-        ProviderCost::Computed => match snapshot.cost_rates().amount_microusd(&success.usage) {
-            Ok(amount) => (Some(amount), Some(snapshot.cost_rates().currency.clone())),
-            Err(_) => {
-                source = ProviderCostSource::Unavailable;
-                (None, None)
+        ProviderCost::Computed => {
+            match usage.map(|usage| snapshot.cost_rates().amount_microusd(usage)) {
+                Some(Ok(amount)) => (Some(amount), Some(snapshot.cost_rates().currency.clone())),
+                Some(Err(_)) | None => {
+                    source = ProviderCostSource::Unavailable;
+                    (None, None)
+                }
             }
-        },
+        }
         ProviderCost::Unavailable => (None, None),
     };
     let cny_microusd = match (
@@ -4040,7 +4055,12 @@ fn canonicalize_json(value: &mut Value) {
     }
 }
 
-fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
+/// Driver 报回来的失败 → 失败件的落库事实。
+///
+/// 成本事实与成功件**同源同形**：Driver 在终态之后判定失败时把已经读到的成本一起报回来，
+/// 这里用与成功路径**同一处映射**把它定成落库口径。没有报回来时按 `unavailable` 落——来源可辨、
+/// 进成本缺口清单，而不是留一个 NULL 让这笔成本在账上与缺口两头都看不见。
+fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> AttemptFailure {
     match error {
         AdapterError::Provider(provider) => AttemptFailure {
             public_code: public_error_code(provider.kind, provider.retry_safety),
@@ -4058,9 +4078,13 @@ fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
             } else {
                 HoldDisposition::Release
             },
-            // 这条路径上没有执行结果，也就没有成本事实可落——不是"成本是 0"。
-            provider_cost: None,
+            provider_cost: Some(failure_provider_cost(
+                snapshot,
+                provider.provider_cost.as_ref(),
+            )),
         },
+        // 平台自己的配置或参数问题：请求在交给渠道之前就被 Driver 挡下，这次执行**没有成本
+        // 可采**——四列留 NULL 说的是"根本没采"，与"采了没拿到"（`unavailable`）不是一件事。
         AdapterError::Configuration(message) | AdapterError::UnsupportedInput(message) => {
             AttemptFailure {
                 provider_code: "adapter_rejected".to_owned(),
@@ -4073,6 +4097,21 @@ fn failure_from_adapter(error: AdapterError) -> AttemptFailure {
                 provider_cost: None,
             }
         }
+    }
+}
+
+/// 失败件上的成本事实：Driver 报回来的那一份直接用，**没报就按 `unavailable` 落**。
+///
+/// 与成功件共用 [`provider_cost_fact`] 这一处映射，只是失败件手里没有本次用量（自算那一态
+/// 因此算不出金额，落到缺口）。留 NULL 而不是 `unavailable` 的话，这笔成本在账上与缺口清单
+/// 两头都看不见——而"去核上游账单"正是缺口清单要承载的处置。
+fn failure_provider_cost(
+    snapshot: &PriceSnapshot,
+    provider_cost: Option<&ProviderCost>,
+) -> ProviderCostFact {
+    match provider_cost {
+        Some(provider_cost) => provider_cost_fact(snapshot, provider_cost, None),
+        None => provider_cost_fact(snapshot, &ProviderCost::Unavailable, None),
     }
 }
 
@@ -6601,6 +6640,8 @@ mod tests {
         succeeds: bool,
         /// 上游确认生成、却**没交付任何图**：结果交付失败那条路径的夹具。
         empty_result: bool,
+        /// 失败时附在错误上的成本事实：扮 Driver 在终态之后判定失败、把已经读到的金额带回来。
+        failure_cost: Option<ProviderCost>,
         calls: AtomicUsize,
     }
 
@@ -6609,8 +6650,15 @@ mod tests {
             Self {
                 succeeds,
                 empty_result,
+                failure_cost: None,
                 calls: AtomicUsize::new(0),
             }
+        }
+
+        /// 让失败分支带上成本事实（负试用例里扮"终态给了金额、这次却没出图"）。
+        fn reporting_failure_cost(mut self, provider_cost: ProviderCost) -> Self {
+            self.failure_cost = Some(provider_cost);
+            self
         }
     }
 
@@ -6633,6 +6681,7 @@ mod tests {
                     trace_id: None,
                     retry_safety: RetrySafety::AcceptanceUnknown,
                     kind: ProviderFailureKind::PlatformInternal,
+                    provider_cost: self.failure_cost.clone(),
                 }
                 .into());
             }
@@ -6792,22 +6841,15 @@ mod tests {
             output_image_tokens: 196,
             total_tokens: 205,
         };
-        let success = |provider_cost| ProviderSuccess {
-            images: Vec::new(),
-            usage: usage.clone(),
-            response_digest: "digest".to_owned(),
-            provider_trace_id: None,
-            provider_cost,
-        };
-
         // 声明分支：金额与币种**都取上游随金额报回的那一份**，自算那份费率不参与这一态
         // ——不是"传了却忘了用"，是这条来源本就不认它。
         let declared = provider_cost_fact(
             &snapshot,
-            &success(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+            &ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
                 amount_microusd: 11_354,
                 currency: "CNY".to_owned(),
-            })),
+            }),
+            Some(&usage),
         );
         assert_eq!(declared.source, ProviderCostSource::Declared);
         assert_eq!(
@@ -6821,13 +6863,13 @@ mod tests {
             "币种按上游报的那一份，不取渠道声明的成本币种、也不假定 USD"
         );
 
-        let computed = provider_cost_fact(&snapshot, &success(ProviderCost::Computed));
+        let computed = provider_cost_fact(&snapshot, &ProviderCost::Computed, Some(&usage));
         assert_eq!(computed.source, ProviderCostSource::Computed);
         // 9 文本输入 × 5 + 196 图像输出 × 30（每 1M）。
         assert_eq!(computed.amount_microusd, Some(5_925));
         assert_eq!(computed.currency.as_deref(), Some("USD"));
 
-        let unavailable = provider_cost_fact(&snapshot, &success(ProviderCost::Unavailable));
+        let unavailable = provider_cost_fact(&snapshot, &ProviderCost::Unavailable, Some(&usage));
         assert_eq!(unavailable.source, ProviderCostSource::Unavailable);
         assert_eq!(
             unavailable.amount_microusd, None,
@@ -6838,6 +6880,12 @@ mod tests {
         for fact in [&declared, &computed, &unavailable] {
             assert_eq!(fact.cny_microusd, None);
         }
+
+        // 用量不在手里（失败件没有本次用量）：自算那一态算不出金额，按缺口落，不猜。
+        let without_usage = provider_cost_fact(&snapshot, &ProviderCost::Computed, None);
+        assert_eq!(without_usage.source, ProviderCostSource::Unavailable);
+        assert_eq!(without_usage.amount_microusd, None);
+        assert_eq!(without_usage.currency, None);
     }
 
     /// 折算只在**成本币种与冻结的汇率对得上**时才做，且按定点整数算。
@@ -6858,19 +6906,13 @@ mod tests {
             output_image_tokens: 0,
             total_tokens: 0,
         };
-        let success = |provider_cost| ProviderSuccess {
-            images: Vec::new(),
-            usage: usage.clone(),
-            response_digest: "digest".to_owned(),
-            provider_trace_id: None,
-            provider_cost,
-        };
         let declared = provider_cost_fact(
             &snapshot,
-            &success(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+            &ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
                 amount_microusd: 11_354,
                 currency: "USD".to_owned(),
-            })),
+            }),
+            Some(&usage),
         );
         // 11354 微美元 × 7.1 = 80613.4 微元 ⇒ 向上取整。
         assert_eq!(declared.cny_microusd, Some(80_614));
@@ -6878,10 +6920,11 @@ mod tests {
         // 上游报的币种与冻结的汇率不是一回事：不折（留空），不拿另一个币种的汇率去乘。
         let foreign = provider_cost_fact(
             &snapshot,
-            &success(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+            &ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
                 amount_microusd: 11_354,
                 currency: "CNY".to_owned(),
-            })),
+            }),
+            Some(&usage),
         );
         assert_eq!(foreign.amount_microusd, Some(11_354));
         assert_eq!(foreign.cny_microusd, None);
@@ -6918,16 +6961,7 @@ mod tests {
             .expect("consumer rates price the usage");
         assert_ne!(cost, charge, "用例得先让两个口径真的不同");
 
-        let fact = provider_cost_fact(
-            &snapshot,
-            &ProviderSuccess {
-                images: Vec::new(),
-                usage,
-                response_digest: "digest".to_owned(),
-                provider_trace_id: None,
-                provider_cost: ProviderCost::Computed,
-            },
-        );
+        let fact = provider_cost_fact(&snapshot, &ProviderCost::Computed, Some(&usage));
         assert_eq!(
             fact.amount_microusd,
             Some(cost),
@@ -6960,12 +6994,61 @@ mod tests {
             failure.hold_disposition,
             HoldDisposition::RetainForReconciliation
         );
+        // 适配器没在错误上带回成本事实：按 `unavailable` 落（来源可辨、进缺口清单），
+        // 而不是留 NULL 让这笔成本在账上与缺口两头都看不见。
+        assert_eq!(
+            failure.provider_cost,
+            Some(ProviderCostFact {
+                source: ProviderCostSource::Unavailable,
+                amount_microusd: None,
+                currency: None,
+                cny_microusd: None,
+            })
+        );
         assert!(
             repository
                 .completion
                 .lock()
                 .expect("completion lock")
                 .is_none()
+        );
+    }
+
+    /// 适配器在失败上带回的成本事实必须跟着失败件落库：执行已经发生、金额也读到了，
+    /// 把结果丢掉的同时把成本一起丢掉，等于这一笔既不在账上也不在缺口里。
+    #[tokio::test]
+    async fn worker_records_the_cost_fact_the_adapter_reported_on_failure() {
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let snapshot = offering().price_snapshot;
+        let repository = Arc::new(WorkerRepository::new(worker_job(20_000), events.clone()));
+        let adapter = Arc::new(WorkerAdapter::new(false, false).reporting_failure_cost(
+            ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+                amount_microusd: 11_354,
+                currency: snapshot.cost_currency().to_owned(),
+            }),
+        ));
+
+        assert!(
+            worker(repository.clone(), adapter.clone())
+                .run_once()
+                .await
+                .expect("worker run must converge")
+        );
+        let failure = repository
+            .failure
+            .lock()
+            .expect("failure lock")
+            .take()
+            .expect("job must fail");
+        assert_eq!(
+            failure.provider_cost,
+            Some(ProviderCostFact {
+                source: ProviderCostSource::Declared,
+                amount_microusd: Some(11_354),
+                currency: Some(snapshot.cost_currency().to_owned()),
+                cny_microusd: None,
+            }),
+            "失败件走与成功件同一套成本映射：来源、金额、币种都按适配器报的那一份"
         );
     }
 
@@ -7259,29 +7342,50 @@ mod tests {
         assert_eq!(PublicErrorCode::parse("402"), None);
     }
 
-    /// 渠道原始码留在内部，对客码独立派生。
+    /// 渠道原始码留在内部，对客码独立派生；失败件同样带着成本事实（来源可辨）。
     #[test]
     fn adapter_failures_keep_the_channel_code_internal() {
-        let failure = failure_from_adapter(AdapterError::Provider(ProviderCallError {
-            code: "payment_required".to_owned(),
-            message: "account balance is insufficient".to_owned(),
-            trace_id: Some("trace-payment".to_owned()),
-            retry_safety: RetrySafety::NotRetryable,
-            kind: ProviderFailureKind::PlatformFunding,
-        }));
+        let snapshot = offering().price_snapshot;
+        let failure = failure_from_adapter(
+            &snapshot,
+            AdapterError::Provider(ProviderCallError {
+                code: "payment_required".to_owned(),
+                message: "account balance is insufficient".to_owned(),
+                trace_id: Some("trace-payment".to_owned()),
+                retry_safety: RetrySafety::NotRetryable,
+                kind: ProviderFailureKind::PlatformFunding,
+                // 渠道用错误响应回话，没给金额：失败件落 `unavailable` 进缺口清单，
+                // 而不是留 NULL 让这笔成本两头都看不见。
+                provider_cost: None,
+            }),
+        );
         assert_eq!(failure.provider_code, "payment_required");
         assert_eq!(failure.public_code, PublicErrorCode::PlatformUnavailable);
         assert_eq!(failure.kind, ProviderFailureKind::PlatformFunding);
         assert_eq!(failure.target_state, JobState::Failed);
         assert_eq!(failure.hold_disposition, HoldDisposition::Release);
+        assert_eq!(
+            failure.provider_cost,
+            Some(ProviderCostFact {
+                source: ProviderCostSource::Unavailable,
+                amount_microusd: None,
+                currency: None,
+                cny_microusd: None,
+            }),
+            "没有成本事实的失败件按缺口落：来源可辨，不进 NULL"
+        );
 
-        let unknown = failure_from_adapter(AdapterError::Provider(ProviderCallError {
-            code: "idempotency_result_indeterminate".to_owned(),
-            message: "the request may already be accepted".to_owned(),
-            trace_id: None,
-            retry_safety: RetrySafety::AcceptanceUnknown,
-            kind: ProviderFailureKind::UpstreamRejected,
-        }));
+        let unknown = failure_from_adapter(
+            &snapshot,
+            AdapterError::Provider(ProviderCallError {
+                code: "idempotency_result_indeterminate".to_owned(),
+                message: "the request may already be accepted".to_owned(),
+                trace_id: None,
+                retry_safety: RetrySafety::AcceptanceUnknown,
+                kind: ProviderFailureKind::UpstreamRejected,
+                provider_cost: None,
+            }),
+        );
         assert_eq!(unknown.public_code, PublicErrorCode::OutcomeUnknown);
         assert_eq!(unknown.target_state, JobState::ReconciliationRequired);
         assert_eq!(
@@ -7291,16 +7395,57 @@ mod tests {
 
         // 可证明未受理（渠道按第一方依据明确"这次请求没执行"）与确定性拒绝走同一处置：
         // 失败并释放预授权——区别只留在 Attempt 的渠道原始码上。
-        let unaccepted = failure_from_adapter(AdapterError::Provider(ProviderCallError {
-            code: "429".to_owned(),
-            message: "rate_limit_error".to_owned(),
-            trace_id: None,
-            retry_safety: RetrySafety::SafeBeforeAcceptance,
-            kind: ProviderFailureKind::UpstreamRateLimited,
-        }));
+        let unaccepted = failure_from_adapter(
+            &snapshot,
+            AdapterError::Provider(ProviderCallError {
+                code: "429".to_owned(),
+                message: "rate_limit_error".to_owned(),
+                trace_id: None,
+                retry_safety: RetrySafety::SafeBeforeAcceptance,
+                kind: ProviderFailureKind::UpstreamRateLimited,
+                provider_cost: None,
+            }),
+        );
         assert_eq!(unaccepted.provider_code, "429");
         assert_eq!(unaccepted.public_code, PublicErrorCode::PlatformUnavailable);
         assert_eq!(unaccepted.target_state, JobState::Failed);
         assert_eq!(unaccepted.hold_disposition, HoldDisposition::Release);
+    }
+
+    /// 适配器在终态之后判定失败时把已经读到的金额带回来：失败件的成本事实与成功件同源同形，
+    /// 按**声明值**落库（不是自算值），币种取渠道声明的那一份。
+    #[test]
+    fn a_failure_carries_the_cost_the_adapter_already_read() {
+        let snapshot = offering().price_snapshot;
+        let declared = failure_from_adapter(
+            &snapshot,
+            AdapterError::Provider(ProviderCallError {
+                code: "provider_result_missing".to_owned(),
+                message: "completed task carried no image url".to_owned(),
+                trace_id: Some("task-declared".to_owned()),
+                retry_safety: RetrySafety::AcceptanceUnknown,
+                kind: ProviderFailureKind::Unknown,
+                provider_cost: Some(ProviderCost::Declared(seeai_adapter_sdk::DeclaredCost {
+                    amount_microusd: 11_354,
+                    currency: snapshot.cost_currency().to_owned(),
+                })),
+            }),
+        );
+        assert_eq!(
+            declared.provider_cost,
+            Some(ProviderCostFact {
+                source: ProviderCostSource::Declared,
+                amount_microusd: Some(11_354),
+                currency: Some(snapshot.cost_currency().to_owned()),
+                cny_microusd: None,
+            }),
+            "上游声明的金额直接取它：没有结果图不代表这笔钱没花"
+        );
+        assert_eq!(
+            declared.target_state,
+            JobState::ReconciliationRequired,
+            "失败件的处置口径不变"
+        );
+        assert_eq!(declared.trace_id.as_deref(), Some("task-declared"));
     }
 }

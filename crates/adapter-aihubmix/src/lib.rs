@@ -662,6 +662,8 @@ fn reference_image_unavailable(message: impl std::fmt::Display) -> AdapterError 
         trace_id: None,
         retry_safety: RetrySafety::SafeBeforeAcceptance,
         kind: ProviderFailureKind::Unknown,
+        // 请求还没发出去：这次执行没有成本事实可带。
+        provider_cost: None,
     }
     .into()
 }
@@ -673,6 +675,8 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
         trace_id: None,
         retry_safety: RetrySafety::AcceptanceUnknown,
         kind: ProviderFailureKind::UpstreamUnavailable,
+        // 响应都没读到，成本无从谈起。
+        provider_cost: None,
     }
     .into()
 }
@@ -703,14 +707,27 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
     if !status.is_success() {
         return Err(parse_provider_error(status, &body).into());
     }
-    let digest = sha256_hex(&body);
-    let parsed: ImageResponse = serde_json::from_slice(&body).map_err(|error| {
+    success_from_body(&body, provider_trace_id)
+}
+
+/// 已读取的响应体 → 成功结果：结构、计量与结果信封都按渠道给的原形。
+///
+/// 与传输分开，是为了让"响应读成了、却不能用"这几种判定（结构不可读、用量自相矛盾、结果为空）
+/// 只在这一处发生，也能直接在用例里喂一份响应体验证——它们都要带上这次执行的成本事实。
+fn success_from_body(
+    body: &[u8],
+    provider_trace_id: Option<String>,
+) -> Result<ProviderSuccess, AdapterError> {
+    let digest = sha256_hex(body);
+    let parsed: ImageResponse = serde_json::from_slice(body).map_err(|error| {
         AdapterError::Provider(ProviderCallError {
             code: "provider_response_invalid".to_owned(),
             message: error.to_string(),
             trace_id: None,
             retry_safety: RetrySafety::AcceptanceUnknown,
             kind: ProviderFailureKind::UpstreamUnavailable,
+            // 响应体读不成结构，用量与金额都取不到。
+            provider_cost: None,
         })
     })?;
     let usage = parsed.usage.into_domain()?;
@@ -722,6 +739,9 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
             trace_id: None,
             retry_safety: RetrySafety::AcceptanceUnknown,
             kind: ProviderFailureKind::UpstreamUnavailable,
+            // 响应读成了：这次执行确实发生过。这条渠道的响应里本就没有金额字段，所以成本事实
+            // 与成功分支同口径——报"渠道不给金额"，而不是报"没采到"。
+            provider_cost: Some(ProviderCost::Computed),
         }));
     }
     Ok(ProviderSuccess {
@@ -753,6 +773,8 @@ fn images_from_response(data: Vec<ImageData>) -> Result<Vec<GeneratedImage>, Ada
                     trace_id: None,
                     retry_safety: RetrySafety::AcceptanceUnknown,
                     kind: ProviderFailureKind::UpstreamUnavailable,
+                    // 单个结果项不可用就整次失败：此时响应已读进来，成本事实与成功分支同口径。
+                    provider_cost: Some(ProviderCost::Computed),
                 }));
             }
         };
@@ -768,6 +790,8 @@ fn provider_response_too_large() -> AdapterError {
         trace_id: None,
         retry_safety: RetrySafety::AcceptanceUnknown,
         kind: ProviderFailureKind::UpstreamUnavailable,
+        // 响应被截断/丢掉了，用量读不全，自算也就无从下手。
+        provider_cost: None,
     }
     .into()
 }
@@ -820,6 +844,8 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
         trace_id,
         retry_safety,
         kind,
+        // 渠道用错误响应回话：这次执行没有金额可读（本就没有金额字段的渠道更谈不上）。
+        provider_cost: None,
     }
 }
 
@@ -868,6 +894,8 @@ impl UsageResponse {
                 trace_id: None,
                 retry_safety: RetrySafety::AcceptanceUnknown,
                 kind: ProviderFailureKind::UpstreamUnavailable,
+                // 自算成本的输入自相矛盾：本该算得出金额却算不出来，记成缺口而不是猜一个数。
+                provider_cost: Some(ProviderCost::Unavailable),
             })
         })?;
         Ok(usage)
@@ -1342,6 +1370,33 @@ mod tests {
             }])
             .is_err()
         );
+    }
+
+    /// 响应读成了、却没有可用结果：**失败也要报告这次执行的成本事实**。
+    ///
+    /// 这条渠道不给金额字段，所以成本事实与成功分支同口径报 `computed`（平台按实际用量自算），
+    /// 而不是报"没采到"——后者会被读成"这次执行没有成本"，与"渠道不报金额"混成一件事。
+    #[test]
+    fn a_response_without_images_still_reports_where_the_cost_comes_from() {
+        let body = serde_json::to_vec(&serde_json::json!({
+            "data": [],
+            "usage": {
+                "input_tokens": 9,
+                "input_tokens_details": {"text_tokens": 9, "image_tokens": 0},
+                "output_tokens": 196,
+                "output_tokens_details": {"text_tokens": 0, "image_tokens": 196},
+                "total_tokens": 205
+            }
+        }))
+        .expect("a response body serializes");
+        match success_from_body(&body, None).expect_err("no images must fail") {
+            AdapterError::Provider(provider) => {
+                assert_eq!(provider.code, "provider_result_empty");
+                assert_eq!(provider.provider_cost, Some(ProviderCost::Computed));
+                assert_eq!(provider.retry_safety, RetrySafety::AcceptanceUnknown);
+            }
+            other => panic!("expected a provider error, got {other:?}"),
+        }
     }
 
     #[test]

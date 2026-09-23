@@ -788,8 +788,9 @@ impl HubRepository for PgHubRepository {
         &self,
         limit: u32,
     ) -> Result<Vec<ProviderCostGapView>, ApplicationError> {
-        // 判据只有一条：**来源是 `unavailable`**（本该有金额却拿不到）。失败的执行四列全空、
-        // 来源也是空，那不是"缺口"而是"没有成本事实"——两者处置不同，不能混在一个清单里。
+        // 判据只有一条：**来源是 `unavailable`**（本该有金额却拿不到）。请求根本没交到渠道的
+        // 失败执行四列全空、来源也是空，那不是"缺口"而是"没有成本事实"——两者处置不同，
+        // 不能混在一个清单里。
         let rows = sqlx::query(
             r#"
             SELECT a.id AS attempt_id, a.job_id, j.account_id, j.gateway_model,
@@ -1801,8 +1802,9 @@ impl HubRepository for PgHubRepository {
         if let Some(attempt_id) = attempt_id {
             // 成本事实与失败事实**一起写**：进对账那条路径上执行已经发生、上游成本也拿得到，
             // 只有成功路径才落成本，等于把"这一笔到底花了多少钱"丢在一条已经付过钱的路径上。
-            // 没有成本事实（连用量都算不出）时四列留 NULL——那是"这次没有成本事实可落"，
-            // 不是"成本是 0"。
+            // 端口接受"没有成本事实"（`None`）：那时四列留 NULL——那是"这次没有成本事实可落"，
+            // 不是"成本是 0"。调用方那一侧拿不到成本时按 `unavailable` 落（来源可辨、进缺口
+            // 清单），把 NULL 留给"根本没采"的执行。
             let provider_cost = failure.provider_cost.clone();
             let (cost_amount, cost_currency, cost_source, cost_cny) = match &provider_cost {
                 Some(cost) => (

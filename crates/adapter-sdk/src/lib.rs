@@ -312,6 +312,16 @@ pub struct ProviderCallError {
     pub retry_safety: RetrySafety,
     /// 平台侧失败类别（见 [`ProviderFailureKind`]），与 `retry_safety` 正交。
     pub kind: ProviderFailureKind,
+    /// 这次执行**已经看到**的成本事实（成本平面），随错误一起交回平台。
+    ///
+    /// 与 [`ProviderSuccess::provider_cost`] 同一组取值、同一套语义：失败件与成功件同源同形，
+    /// 终态读到金额之后就算这次没有结果图，那笔钱也已经花了，没有理由跟着结果一起丢。
+    /// `None` 表示**这次执行没采到**成本事实（例如请求根本没交到渠道），不是"成本是 0"，
+    /// 也不是"这条渠道不报金额"——后者用 [`ProviderCost::Computed`] 明说。
+    ///
+    /// 改写错误时（补对账标识、改重试安全性）只加不改：它是已判出的事实，重建错误对象时
+    /// 漏掉它，表现就是失败件的成本在账上与缺口清单两头都看不见。
+    pub provider_cost: Option<ProviderCost>,
 }
 
 #[derive(Debug, Error)]

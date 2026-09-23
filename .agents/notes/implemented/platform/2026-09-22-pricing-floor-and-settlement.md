@@ -31,7 +31,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 
 ### 承接上一片（[#15](https://github.com/dehuadong/seeaihub-server-next/issues/15)）留下的两个执行单元
 
-1. **对账路径的成本事实落库**：结果交付失败进对账那条路径上执行已经发生、上游成本也拿得到，但此前只有成功路径才写成本列。现在 `AttemptFailure` 带上成本事实，`fail_job` 把它与失败事实一起写下来（`provider_cost_microusd` / `provider_cost_currency` / `provider_cost_source` / `provider_cost_cny_microusd`）；没有成本事实时四列留空——那是"这次没有成本事实可落"，与"成本是 0"不是一回事。
+1. **对账路径的成本事实落库**：结果交付失败进对账那条路径上执行已经发生、上游成本也拿得到，但此前只有成功路径才写成本列。现在 `AttemptFailure` 带上成本事实，`fail_job` 把它与失败事实一起写下来（`provider_cost_microusd` / `provider_cost_currency` / `provider_cost_source` / `provider_cost_cny_microusd`）；适配器失败分支一律给出成本事实（Driver 没报就按 `unavailable`），只有"请求根本没交到渠道"的执行才四列留空——那是"这次没有成本事实可落"，与"成本是 0"不是一回事。
 2. **成本缺口的处置**：`unavailable` 那笔**不开对账案例、也不把 Job 推进对账态**——对账态是"受理/执行状态不明"，会把消费者的钱扣在对账里；成本缺口是平台侧的账务缺口，对客结算照常完成。它由**成本缺口清单**（`GET /api/v1/provider-cost-gaps`，带上游对账标识，仅管理员）交给运营核账单，毛利侧标"成本未知"（金额与折算值留空）。**补录归账实核对那条线**（工单 [#11](https://github.com/dehuadong/seeaihub-server-next/issues/11)），补录完成后这一笔不再出现在清单里（清单的判据就是"来源是 `unavailable`"）。
 
 ### 迁移
@@ -61,7 +61,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 - **比例型 `size` 归不出档位**：它只说了形状、没说分辨率，按封顶保底值处理（不猜一个档位）；比例型与档位组合的合同（如"比例 + 档位"两字段）走的是尺寸换算那条线，不在这里。
 - **`markup_bps` 与对客费率向量的推导关系不校验**：管理员按"成本费率 ×(1 + 加价系数)× 汇率"**设定/推导**，也可以直接录入；平台不反算校验（成本费率与汇率都随发布与时间变，反算出来的数不等于管理员该录入的数）。它只是"这个价是怎么定的"的可查依据。
 - **汇率行删了会让受理失败**：发布期保证了"有已生效的一行"，所以受理时取不到只可能是汇率表被改过——那时按平台侧配置问题处置（不是这次请求的问题），这一点写在代码注释里。
-- **上游终态给了金额、但结果为空时，成本事实被适配器丢掉**（Verify 阶段实测；**已转工单 [#17](https://github.com/dehuadong/seeaihub-server-next/issues/17)**，不在本片修）：`adapter-apimart` 的 `finish`（`crates/adapter-apimart/src/lib.rs`）与 `adapter-aihubmix` 的 `parse_response` 在"终态没有图"时直接返回错误，**只有成功分支才带 `provider_cost`**；于是 Worker 走 `failure_from_adapter` 时 `provider_cost` 是 `None`，`attempts` 四列留空，而且因为 `provider_cost_source` 是 NULL（不是 `unavailable`）**它也不进成本缺口清单**——这一笔真实成本既不在账上也不在缺口里。它不是本片验收条目所指的路径（那条是"结算失败进对账"，即 `complete_success` 出错，本片已实测落四列），根因在适配器的失败分支（[#15](https://github.com/dehuadong/seeaihub-server-next/issues/15) 的成本采集只覆盖成功路径）；修法是让适配器的错误也带上已解析到的成本事实（`AdapterError`/`ProviderCallError` 加可选成本），失败件同样能落 `declared` / `unavailable` 并进缺口清单。
+- **上游终态给了金额、但结果为空时，成本事实由适配器随错误带回**（Verify 阶段实测为丢失，随后修掉）：`adapter-apimart` 的 `finish` 与 `adapter-aihubmix` 的 `parse_response` 在终态之后判定失败时，把已经读到的成本附在 `ProviderCallError` 上带回平台；Worker 的失败分支与成功路径**共用同一套映射**落四列，失败件同样能落 `declared` / `unavailable` 并进缺口清单（细节见[渠道成本事实采集](../../implemented/platform/2026-09-22-provider-cost-facts.md)）。它不是本片验收条目所指的路径（那条是"结算失败进对账"，即 `complete_success` 出错，本片已实测落四列）。
 - **"立即生效"的折算率曾由应用时钟盖章、由数据库时钟判生效**（Verify 阶段实测；**收口时已修**）：`PUT /api/v1/fx-rates` 不给 `effective_at` 时原由 API 用 `Utc::now()` 写入，而发布期校验与受理取值都用库里的 `now()` 比。两个时钟不一致时，**刚录入的那一行会被判成"尚未生效"**：本机（Docker Desktop / WSL2）实测容器时钟相对宿主呈锯齿漂移——约 **-100ms/s** 倒退、每 ~30 秒回跳一次，幅度在 **-1.6s ~ +1.4s** 之间；偏差为负时"录完立刻发布"**15/15 被拒**（错误体是"没有已生效的折算率"）、"录完立刻受理"仍按旧汇率折算；偏差为正时同一序列 **0/15 失败**。它直接打穿了本片验收的门禁：`http_contract -- --ignored --test-threads=1` 一次性整跑在同一份代码上 **20–43/54 失败**（全部卡在夹具"启动时落折算率、随后立刻发布"这一步）。**修法（已落地）**：把"未指定生效时间"这一情形交给数据库盖章——写入口的生效时刻收成 `Option<DateTime<Utc>>`（`NewFxRate`，端口不再要求调用方先读一个时钟），SQL 写 `coalesce($4, now())` 并 `RETURNING effective_at`（审计记的是真正落库的时刻），API 侧删掉 `unwrap_or_else(Utc::now)`。**钱与生效时刻只认一个时钟**。钉桩用例 `an_fx_rate_without_an_effective_time_is_stamped_by_the_database_clock`：不指定生效时刻录一行后，直查库断言这一行的 `effective_at` 与**同一事务里那条审计事件的库侧 `created_at` 逐位相同**（两者都取该事务的 `now()`，若改回进程时钟盖章就必然差出漂移），并断言库里没有一行 `effective_at > now()`。**本条不是产品语义错**（"取受理时刻生效的那一行"这条规则本身实测正确：未来行不参与取值）。同型检查：API 侧"进程盖章、库里比较"**仅此一处**；`crates/persistence` 里租约到期时刻（`lease_expires_at = Utc::now() + lease_duration`）是同型写法，但它不在钱与生效时刻这条线上、量级（数百秒租约对秒级漂移）也无害，未在本片改动。
 
 ## 验证
@@ -107,7 +107,7 @@ verification: 验收合同为工单 [#16](https://github.com/dehuadong/seeaihub-
 - **迁移（增量）**：另建库只应用 `0001`–`0008` 并造旧数据（余额为 0 的账户、`amount=1000` 的 hold、`max_cost=20000` 的 Job、没有定价的旧修订），再由真迁移器补 `0009` → 迁移记录 `1..9`、旧行逐字不变、七个定价列留 NULL 无回填、`pricing.fx_rates` 落成空表、两处旧 CHECK 名消失且新的非负约束在位、余额可写成 -1、零额 hold 与零 `max_cost` 可写入。
 - **回归**：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features`（22 / 32 / 2 / 3 / 62 / 59 全绿，55 条端到端按设计 ignore）、`node scripts/decisions/check.mjs` 全过。`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` 修前**一次性整跑在本机不稳**：同一份代码分别跑出 34/54、17/54、24/54、11/54 通过，失败信息全是发布期"没有已生效的折算率"（根因见「后果」的时钟条目：夹具"启动时落折算率、随后立刻发布"要求"刚录入＝已生效"，而应用时钟盖章、数据库时钟判生效）；**收口修正后连续三次整跑均 55 passed / 0 failed**（54 条原有 + 1 条盖章钉桩用例），不再受时钟漂移摆布。
 
-56 项里唯一未过的是"上游终态给了金额、结果为空"那条**适配器**路径（成本四列留空）——已转工单 [#17](https://github.com/dehuadong/seeaihub-server-next/issues/17)，与残余风险一并记在「后果」；它不是本表任一验收条目所指的路径。Verify 阶段发现的时钟盖章缺陷已在收口时修掉（见同节），修后门禁连续三次整跑全绿。
+56 项里唯一未过的是"上游终态给了金额、结果为空"那条**适配器**路径（成本四列留空）——**随后修掉**：失败件与成功件同源同形地落成本四列（见[渠道成本事实采集](../../implemented/platform/2026-09-22-provider-cost-facts.md) 的「验证」）；它不是本表任一验收条目所指的路径。Verify 阶段发现的时钟盖章缺陷已在收口时修掉（见同节），修后门禁连续三次整跑全绿。
 
 ## 依据与关联
 
