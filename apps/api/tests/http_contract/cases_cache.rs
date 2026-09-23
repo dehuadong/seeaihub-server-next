@@ -688,8 +688,7 @@ async fn a_disabled_offering_is_not_routed_to_while_the_route_cache_still_lists_
     )
     .await;
     let client = Client::new();
-    // 两条候选来自两个渠道（同一渠道发两条会塌成一条）。地址都指向夹具那台假上游；这次不跑
-    // Worker，所以没有任何请求真的发出去。
+    // 地址都指向夹具那台假上游；这次不跑 Worker，所以没有任何请求真的发出去。
     let mut primary = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     primary["base_url"] = json!(harness.upstream_base_url);
     let mut secondary = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);

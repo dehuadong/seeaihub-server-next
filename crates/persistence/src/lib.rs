@@ -85,6 +85,9 @@ impl PgHubRepository {
     }
 
     async fn load_generation_job(&self, job_id: JobId) -> Result<GenerationJob, ApplicationError> {
+        // 入口地址与凭证名从 **Job 自己那两列**读：它们与适配器、渠道模型一样是受理时冻结的
+        // 执行事实，现场 JOIN 渠道行会让一次直接改库把已受理的 Job 打到别处去。渠道 JOIN 因此
+        // 只剩 `provider_kind` 这一个只在发布侧用到的值。
         let row = sqlx::query(
             r#"
             SELECT
@@ -93,9 +96,9 @@ impl PgHubRepository {
                 j.request_hash, j.max_cost_microusd, j.created_at, j.updated_at,
                 vm.id AS vendor_model_id, vm.native_revision, vm.capability_schema,
                 j.carrier_schema, j.parameter_mapping,
-                j.adapter_key, j.provider_model_id,
+                j.adapter_key, j.provider_model_id, j.base_url, j.credential_env,
                 o.id AS offering_id, o.restrictions,
-                c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
+                c.id AS channel_id, c.provider_kind,
                 j.runtime_revision_id, j.price_snapshot
             FROM generation.jobs j
             JOIN catalog.vendor_models vm ON vm.id = j.vendor_model_id
@@ -829,7 +832,8 @@ impl HubRepository for PgHubRepository {
             )));
         }
         // 这次改动影响哪些网关模型的候选集：调用方拿它失效 route 缓存。候选集的修订标识不因
-        // 启停而变，缓存里那份因此仍然"看起来是新的"，只能靠失效拿掉。
+        // 启停而变，缓存里那份因此仍然"看起来是新的"——失效只是让命中率回来，停用本身的生效
+        // 由受理路径命中缓存后按主键复核这两列兜住（判据与候选查询同一条），不依赖这次失效。
         let gateway_models =
             affected_gateway_models(&mut transaction, "re.offering_id = $1", offering_id.0).await?;
         insert_audit(
@@ -1473,8 +1477,9 @@ impl HubRepository for PgHubRepository {
                 gateway_model, native_parameters,
                 runtime_revision_id, vendor_model_id, offering_id, channel_id,
                 carrier_schema, parameter_mapping, adapter_key, provider_model_id,
+                base_url, credential_env,
                 price_snapshot, max_cost_microusd
-            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
+            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17,$18,$19)
             "#,
         )
         .bind(job_id.0)
@@ -1492,6 +1497,9 @@ impl HubRepository for PgHubRepository {
         .bind(&offering.parameter_mapping)
         .bind(&offering.adapter_key)
         .bind(&offering.provider_model_id)
+        // 入口与凭证名一并冻结：它们与被选中的这条候选同时定下，执行时不再回渠道行取。
+        .bind(&offering.base_url)
+        .bind(&offering.credential_env)
         .bind(&price_snapshot)
         .bind(max_cost)
         .execute(&mut *transaction)
@@ -2739,10 +2747,11 @@ fn row_to_gateway_model(
 fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, ApplicationError> {
     let price_snapshot: Value = row.try_get("price_snapshot").map_err(database_error)?;
     // 合同从 vendor_model 行取（它落库后不再改，因此读到的永远是受理当时那一份）；
-    // 承载面、映射、适配器与渠道模型都从 **Job 自己那几列**取——它们是受理时随 Job 冻结的快照，
-    // 不跟着发布物走，所以重发把供给行改成另一套之后，旧 Job 读到的仍是受理时那一套。
+    // 承载面、映射、适配器、Provider Model 与**执行入口**（入口地址、凭证名）都从 **Job 自己那几列**
+    // 取——它们是受理时随 Job 冻结的执行事实，不跟着发布物或渠道行走，所以重发把供给行改成另一套、
+    // 或者有人直接改库换掉渠道行的入口，旧 Job 读到的仍是受理时那一套。
     // 这不是顺手的偏好：供给行按身份复用、重发就地改写它，读那一行等于让已受理的 Job 用上
-    // 后来改的适配器与渠道模型。
+    // 后来改的适配器与 Provider Model。
     let offering = PublishedOffering {
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,

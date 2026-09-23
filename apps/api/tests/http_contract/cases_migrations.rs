@@ -251,7 +251,8 @@ async fn vendor_model_contract_migration_merges_existing_duplicate_rows() {
         older_surface
     );
     let job_row = sqlx::query(
-        "SELECT vendor_model_id, carrier_schema, parameter_mapping FROM generation.jobs WHERE id = $1",
+        "SELECT vendor_model_id, carrier_schema, parameter_mapping, base_url, credential_env
+         FROM generation.jobs WHERE id = $1",
     )
     .bind(job)
     .fetch_one(&pool)
@@ -275,6 +276,18 @@ async fn vendor_model_contract_migration_merges_existing_duplicate_rows() {
             .try_get::<Value, _>("parameter_mapping")
             .expect("mapping"),
         json!({})
+    );
+    // 执行入口与凭证名也在这次增量里从渠道行回填：老 Job 不因为库是"先建后补"就缺这两列。
+    assert_eq!(
+        job_row.try_get::<String, _>("base_url").expect("entry"),
+        "https://api.inferera.com",
+        "the legacy job must get the entry it was pointed at backfilled"
+    );
+    assert_eq!(
+        job_row
+            .try_get::<String, _>("credential_env")
+            .expect("credential name"),
+        "AIHUBMIX_API_KEY"
     );
     let entry_model: Uuid = sqlx::query_scalar(
         "SELECT vendor_model_id FROM publication.runtime_entries WHERE offering_id = $1",
@@ -666,10 +679,12 @@ async fn the_pricing_migration_relaxes_the_balance_checks_on_an_existing_databas
         "INSERT INTO generation.jobs
              (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
               native_parameters, carrier_schema, parameter_mapping, adapter_key, provider_model_id,
+              base_url, credential_env,
               runtime_revision_id, vendor_model_id, offering_id, channel_id, price_snapshot,
               max_cost_microusd)
          VALUES ($1,$2,'zero-hold','hash','accepted','prompt_only','priced-legacy',
                  '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'aihubmix-image-v1','priced-legacy',
+                 'https://api.inferera.com','AIHUBMIX_API_KEY',
                  $3,$4,$5,$6,'{}'::jsonb,0)",
     )
     .bind(Uuid::new_v4())

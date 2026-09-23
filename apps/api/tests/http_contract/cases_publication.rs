@@ -1724,16 +1724,18 @@ async fn republishing_a_model_keeps_the_disabled_supply_disabled() {
     harness.cleanup().await;
 }
 
-/// 重发把供给改成另一套适配器与渠道模型之后，**已受理但还没执行**的 Job 仍按受理时那一套执行。
+/// **已受理但还没执行**的 Job 仍按受理时那一套**执行事实**跑：适配器、渠道模型、入口地址与凭证名。
 ///
-/// 为什么单独验这一条：发布按身份复用供给行、重发**就地改写**那一行，而 Worker 执行时若现场读
-/// 这张表，一台已受理、还没被领走的 Job 就会用上后来改的适配器与渠道模型。它要交给哪个驱动、
-/// 往线文里写哪个渠道模型名，在受理那一刻就随 Job 定下了：受理与执行之间的任何一次发布都不该
-/// 动到它。所以这里刻意让 Job 停在"已受理"、改完供给再放 Worker 出去，并钉住线上请求体里的
-/// `model` 是受理时的那个渠道模型。
+/// 为什么单独验这一条：受理与执行之间有两处会动到这些值——发布按身份复用供给行、重发**就地改写**
+/// 那一行；渠道行的入口与凭证名虽没有应用内的写入方，却也能被一次直接改库（迁移或运维脚本）换掉。
+/// Worker 执行时若现场读这两张表，一台已受理、还没被领走的 Job 就会用上后来改的适配器与渠道模型、
+/// 或者带着受理时的渠道模型打到另一个入口、按新变量名去取凭证。它要交给哪个驱动、往线文里写哪个
+/// 渠道模型名、打在哪个入口、用哪个变量名取凭证，在受理那一刻就随 Job 定下了。所以这里刻意让 Job
+/// 停在"已受理"：先重发供给改掉适配器与渠道模型，再直接改库换掉渠道行的入口与凭证名，然后才放
+/// Worker 出去，并钉住这次执行**仍落在受理时那个入口上**。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn an_accepted_job_keeps_the_adapter_and_channel_model_of_its_acceptance() {
+async fn an_accepted_job_keeps_the_execution_facts_of_its_acceptance() {
     // Worker 是独立包，`cargo test -p seeai-api` 不会顺带建它，第一次起 Worker 会现场编译。
     // 这次执行要在受理之后才起 Worker，编译时间会吃掉同步入口的等待窗口，所以先把二进制建好。
     let _ = worker_binary();
@@ -1778,7 +1780,8 @@ async fn an_accepted_job_keeps_the_adapter_and_channel_model_of_its_acceptance()
     assert!(accepted, "受理必须落库，且此时还没有 Worker 领它");
 
     let row = sqlx::query(
-        "SELECT adapter_key, provider_model_id FROM generation.jobs WHERE idempotency_key = $1",
+        "SELECT adapter_key, provider_model_id, base_url, credential_env
+         FROM generation.jobs WHERE idempotency_key = $1",
     )
     .bind(&key)
     .fetch_one(&harness.pool)
@@ -1788,6 +1791,19 @@ async fn an_accepted_job_keeps_the_adapter_and_channel_model_of_its_acceptance()
     let accepted_model: String = row
         .try_get("provider_model_id")
         .expect("frozen channel model");
+    let accepted_entry: String = row.try_get("base_url").expect("frozen entry");
+    let accepted_credential: String = row
+        .try_get("credential_env")
+        .expect("frozen credential name");
+    // 受理写入的这两个值就是这条渠道行当时的取值（下面会把它们就地改掉）。
+    assert_eq!(
+        accepted_entry, harness.upstream_base_url,
+        "受理时冻结的入口地址"
+    );
+    assert_eq!(
+        accepted_credential, "AIHUBMIX_API_KEY",
+        "受理时冻结的凭证变量名"
+    );
 
     // 重发：同一个渠道身份、同一份合同（合同不可变），只改这一行上的**可变量**——另一套适配器与
     // 渠道模型。`publication_body` 会把 `provider_model_id` 写成型号名，所以这里在它之后覆盖它，
@@ -1838,6 +1854,36 @@ async fn an_accepted_job_keeps_the_adapter_and_channel_model_of_its_acceptance()
         "重发复用同一行供给与渠道"
     );
 
+    // 再**直接改库**换掉渠道行的入口与凭证名：这正是"没有应用内写入方、也没有约束挡着就地改"
+    // 的那条路径。入口指到同一条假上游下的另一个前缀（若执行时读现场，请求就会落到那个前缀上，
+    // 下面的计数与请求体都取不到），凭证名换成一个进程环境里根本没有的变量名（读现场的话这次
+    // 执行连凭证都取不到，直接失败）。
+    let rewritten_entry = format!("{}/republished-entry", harness.upstream_base_url);
+    let rewritten_credential = "CONTRACT_TEST_UNSET_KEY";
+    sqlx::query("UPDATE supply.channels SET base_url = $2, credential_env = $3 WHERE id = $1")
+        .bind(channel)
+        .bind(&rewritten_entry)
+        .bind(rewritten_credential)
+        .execute(&harness.pool)
+        .await
+        .expect("改库换入口");
+
+    // 前提：改库确实换掉了这一行上的入口与凭证名（否则下面验的就不是"不被改库带走"）。
+    let row = sqlx::query("SELECT base_url, credential_env FROM supply.channels WHERE id = $1")
+        .bind(channel)
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the rewritten channel row");
+    assert_eq!(
+        row.try_get::<String, _>("base_url").expect("entry"),
+        rewritten_entry
+    );
+    assert_eq!(
+        row.try_get::<String, _>("credential_env")
+            .expect("credential name"),
+        rewritten_credential
+    );
+
     // 放 Worker 出去执行这台早已受理的 Job。
     let worker = harness.spawn_worker();
     let (status, response_body) = in_flight.await.expect("the in-flight request");
@@ -1854,10 +1900,37 @@ async fn an_accepted_job_keeps_the_adapter_and_channel_model_of_its_acceptance()
         Some(accepted_model.as_str()),
         "线上请求体里的 `model` 必须是受理时冻结的渠道模型，不是重发写进去的那个"
     );
+    // 这次执行仍打在**受理时那个入口**上：假上游按原路径收到了它。若入口是执行时从渠道行现场读的，
+    // 请求会落到改库换上去的 `/republished-entry/v1/images/generations` 上——上面的 `submit_body`
+    // 取不到，这里的计数也是 0。
     assert_eq!(
         harness.count("POST", "/v1/images/generations"),
         1,
-        "一次执行只交一次"
+        "一次执行只交一次，而且必须交在受理时那个入口上"
+    );
+    assert_eq!(
+        harness.count("POST", "/republished-entry"),
+        0,
+        "改库换上去的入口不许被这次执行用到"
+    );
+    // Job 自己那两列仍是受理时的值：冻结的是执行事实，改库换不掉它。
+    let row = sqlx::query(
+        "SELECT base_url, credential_env FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the settled job");
+    assert_eq!(
+        row.try_get::<String, _>("base_url").expect("frozen entry"),
+        accepted_entry,
+        "Job 上的入口地址不因改库而变"
+    );
+    assert_eq!(
+        row.try_get::<String, _>("credential_env")
+            .expect("frozen credential name"),
+        accepted_credential,
+        "Job 上的凭证变量名不因改库而变"
     );
     assert_eq!(
         harness.count("GET", "/v1/tasks/"),
