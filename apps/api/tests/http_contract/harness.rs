@@ -746,11 +746,19 @@ impl Harness {
         let mut draft = material["offerings"][index].clone();
         // 上游地址换成这个用例的假上游；凭证仍从环境变量读，值只写在测试进程环境里。
         draft["base_url"] = Value::String("http://127.0.0.1:1".to_owned());
-        Self::start_with_draft(
+        // 素材的**修订级**加价系数要一起发：按张 / 按次 / 上游给金额的候选的对客价全靠它算出来，
+        // 缺了发布期就拒（夹具那条默认候选是按 token 计量量的，不带它照发）。
+        let markup_bps = material["markup_bps"]
+            .as_i64()
+            .and_then(|value| i32::try_from(value).ok());
+        Self::build(
             draft,
             Some(material["capability_schema"].clone()),
             behaviour,
             max_concurrent_jobs,
+            30,
+            None,
+            markup_bps,
         )
         .await
     }
@@ -761,7 +769,16 @@ impl Harness {
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
     ) -> Self {
-        Self::build(draft, contract, behaviour, max_concurrent_jobs, 30, None).await
+        Self::build(
+            draft,
+            contract,
+            behaviour,
+            max_concurrent_jobs,
+            30,
+            None,
+            None,
+        )
+        .await
     }
 
     /// 同 `start_with_draft`，但给 API 与 Worker 配上**加速层**（假 Redis）。
@@ -783,6 +800,7 @@ impl Harness {
             max_concurrent_jobs,
             sync_wait_seconds,
             Some(cache),
+            None,
         )
         .await
     }
@@ -794,6 +812,7 @@ impl Harness {
         max_concurrent_jobs: u64,
         sync_wait_seconds: u64,
         cache: Option<CacheFixture>,
+        markup_bps: Option<i32>,
     ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
@@ -807,7 +826,10 @@ impl Harness {
         .await;
         let client = Client::new();
         wait_until_ready(&client, &base_url, &admin_token).await;
-        let account = create_account(&client, &base_url, &admin_token).await;
+        // 夹具账户要**付得起这次发布带的那份保底额**：素材带定价之后，受理闸门（余额 ≥ 保底额）
+        // 会拿它去比，余额不够时连"参数面过滤""结果原形"这类与钱无关的用例也会 402。
+        // "钱不够就拒"那条路不靠这个数——需要低余额账户的用例自己建一个。
+        let account = create_account_with_credit(&client, &base_url, &admin_token, 1_000_000).await;
         let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
         let pool = PgPool::connect(&database_url)
             .await
@@ -825,13 +847,14 @@ impl Harness {
             .as_object()
             .cloned()
             .expect("published candidate must declare a wire surface");
-        let published = publish_candidates(
+        let published = publish_candidates_with_markup(
             &client,
             &base_url,
             &admin_token,
             Self::MODEL,
             contract,
             vec![draft],
+            markup_bps,
         )
         .await;
         assert_eq!(published, StatusCode::OK, "publication must succeed");
@@ -1659,10 +1682,10 @@ fn openai_floor_amounts() -> Value {
     })
 }
 
-/// 一个**付得起**的账户与 Key。
+/// 一个**按给定余额建出来的**账户与 Key：用例要另一个账户，或要一个指定余额的账户时用它。
 ///
-/// 夹具自带的账户余额只有 ¥0.10，比定价候选的保底额（¥0.16 起）还小——那本身是对的
-/// （受理闸门就是"余额 ≥ 保底额"），但要验售价与结算，得先有一个余额充足的账户。
+/// 夹具自己那个账户的余额够跑通带定价的发布（见 [`Harness::build`]）；"余额不够就拒"那条路
+/// 一律走这里，把余额显式写成不够的数——它不该依赖夹具账户恰好很穷。
 async fn funded_account(
     client: &Client,
     base_url: &str,
@@ -2234,6 +2257,45 @@ fn renamed_material(aihubmix_upstream: &str) -> Value {
 }
 
 // ───────────────────────── 定价、保底与结算 ─────────────────────────
+
+/// 把一条候选**重新发布成带定价的**：上游地址取夹具里那个假上游，加价系数由用例给。
+///
+/// 按张 / 按次 / 上游给金额的候选没有对客价载体，它们的对客价由成本单价乘倍率算出来——所以
+/// 这些用例必须自己给倍率（夹具那条默认候选是按 token 计量量的，不带倍率也发得出去）。
+async fn republish_candidate(
+    harness: &Harness,
+    client: &Client,
+    mut draft: Value,
+    markup_bps: i32,
+) -> StatusCode {
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    publish_candidates_with_markup(
+        client,
+        &harness.base_url,
+        &harness.admin_token,
+        Harness::MODEL,
+        None,
+        vec![draft],
+        Some(markup_bps),
+    )
+    .await
+}
+
+/// 一条**按张 / 按次**计价的候选草案：形态、单价、成本币种与那组定价参考都带上。
+///
+/// 承载面沿用夹具那条默认候选（同一份合同、同一份承载面），所以重新发布它不会撞上"合同不可变"。
+fn unit_candidate(formula: &str, unit_price_microusd: u64, currency: &str) -> Value {
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    draft["formula"] = Value::String(formula.to_owned());
+    draft["price_plan"] = Value::Null;
+    draft["cost_unit_price_microusd"] = json!(unit_price_microusd);
+    draft["cost_currency"] = json!(currency);
+    draft["reference_cost_microusd"] = json!(unit_price_microusd);
+    draft["cost_basis"] = json!("computed");
+    draft["tier_prices"] = json!({});
+    draft["floor_amounts"] = openai_floor_amounts();
+    draft
+}
 
 /// 起一个夹具并把它那条候选**重新发布成带定价的**。
 ///

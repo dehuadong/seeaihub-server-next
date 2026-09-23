@@ -234,10 +234,14 @@ async fn an_upstream_declared_supply_needs_no_rate_card_and_takes_the_upstream_a
         snapshot["rates"].is_null(),
         "没有 Price Plan 就没有那份四档费率：{snapshot}"
     );
+    assert!(
+        snapshot["consumer_rates_cny"].is_null(),
+        "对客四档向量是 token 计量量那一种形态的价格，这条供给没有它：{snapshot}"
+    );
     assert_eq!(
         snapshot["hold_source"],
-        json!("platform_default"),
-        "这条供给没有保底表 ⇒ 预授权回落到平台兜底数（§6 的兜底链）：{snapshot}"
+        json!("auto_tier"),
+        "请求没给 `size` ⇒ 默认档 2K，按该供给的保底表冻：{snapshot}"
     );
     let authorized: i64 =
         sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE id = $1")
@@ -245,10 +249,11 @@ async fn an_upstream_declared_supply_needs_no_rate_card_and_takes_the_upstream_a
             .fetch_one(&harness.pool)
             .await
             .expect("authorization");
-    assert_eq!(authorized, 20_000);
-    // 对客实收按**它发布的对客费率向量**算（14 文本输入 × 35.5 + 196 图像输出 × 213 = 42245
-    // 微元），与上游声明的成本（11354 微美元）是两个量：成本只进毛利口径。
-    assert_eq!(harness.captured_microusd(job_id).await, -42_245);
+    assert_eq!(authorized, 250_000, "保底额是 2K 档的 ¥0.25");
+    // 对客实收 = **上游声明的金额 × 倍率 × 折算率**（11354 × 1.2 × 7.1 = 96736.08 ⇒ 96737），
+    // 与成本折算（11354 × 7.1 = 80613.4 ⇒ 80614）是两个量：后者只进毛利口径。
+    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
+    assert_eq!(96_737 - 80_614, 16_123, "毛利 = 售价 − 成本折算后 CNY");
     harness.cleanup().await;
 }
 
@@ -354,6 +359,85 @@ async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
     // 毛利 = 售价（CNY）− 成本折算后 CNY：这一笔是负的（参考成本只是发布时的定价参考，
     // 上游实际声明的金额比它高），照样能逐笔算出——不猜、不掩盖。
     assert_eq!(43_680 - 80_614, -36_934);
+
+    harness.cleanup().await;
+}
+
+/// **同币种也要能录折算率**：`CNY → CNY = 1` 录得进去，声明 `cost_currency: "CNY"` 的供给因此
+/// 能发布、受理、结算，而且**对客实收不因折算而变化**——乘的是率恒为 1 的那一行。
+///
+/// 渠道币种不是"全平台统一美元"：按张计价的人民币渠道（例如方舟）就是这一条。代码里没有
+/// "这个币种不用折算"的分支——那条路走的就是折算率表里率 1 的那一行。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+
+    // 1) 同币种那一行录得进去（率 1）。
+    let response = client
+        .put(format!("{}/api/v1/fx-rates", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"currency": "CNY", "rate_micros": 1_000_000u64}))
+        .send()
+        .await
+        .expect("same-currency fx rate");
+    assert_eq!(
+        response.status(),
+        StatusCode::NO_CONTENT,
+        "CNY → CNY = 1 必须能录进折算率表"
+    );
+
+    // 2) 声明 CNY、按张计价的供给：发布、受理、结算都跑得通。单价取方舟 pro 低档的 ¥0.30/张。
+    assert_eq!(
+        republish_candidate(
+            &harness,
+            &client,
+            unit_candidate("per_image", 300_000, "CNY"),
+            2_000,
+        )
+        .await,
+        StatusCode::OK,
+        "同币种的供给必须发得出去"
+    );
+    let key = format!("cny-per-image-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "cny per image"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("同币种按张", &body);
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(snapshot["cost_currency"], json!("CNY"));
+    assert_eq!(snapshot["fx_rate"]["currency"], json!("CNY"));
+    assert_eq!(
+        snapshot["fx_rate"]["rate_micros"],
+        json!(1_000_000),
+        "同币种的折算率就是 1：{snapshot}"
+    );
+    // 对客实收 = 成本单价 300_000 微元 × 倍率 1.2 = 360_000（一张）；折算率 1 不改数。
+    assert_eq!(
+        harness.captured_microusd(job_id).await,
+        -360_000,
+        "同币种不产生折算：对客价就是成本单价乘倍率"
+    );
+    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
+    assert_eq!(amount, Some(300_000), "按张的成本 = 一张 × 单价");
+    assert_eq!(currency.as_deref(), Some("CNY"));
+    assert_eq!(source.as_deref(), Some("computed"));
+    assert_eq!(cny, Some(300_000), "率 1 折出来逐位不变");
 
     harness.cleanup().await;
 }

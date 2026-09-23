@@ -22,13 +22,18 @@
     "offering.apimart.rename": "渠道面：参考图字段是 `image_urls`（字符串数组，≤16）、遮罩是 `mask_url`，合同字段叫 `image`/`mask`，因此用 `rename` 落到渠道字段名上（受控实测见 out-reference/apimart/controlled-probe-2026-09-19.json）。2026-09-20 又做了两次真实调用（同一请求带/不带 `mask_url`）：先上传参考图与遮罩换公网 URL，再提交生成——两次都是提交 200 拿到 `task_id`、轮询到 `completed`，且 `usage` 与 `cost` **完全相同**，说明 2.5 接受 `mask_url`（该字段不在 2.5 的生成文档里）；遮罩是否真的**生效**只有弱信号，未严格证明（生成随机、无 seed）。",
     "offering.apimart.moderation": "渠道面：文档写明未传 `moderation` 时 APIMart 自己用 `low`，与厂商默认 `auto` 不同；本版没有注入显式默认值，调用方没给时仍由渠道按自己的默认处理（差异已登记，是否由映射钉死待定）。",
     "restrictions": "可走的分支沿用同一型号旧素材的声明。收图上限按承载面形态定：参考图声明成数组（`maxItems` 16），所以 `max_images` 是 16；两者必须一致，见 offering.aihubmix.image_inputs。",
-    "price_plan": "两家渠道的**计价形态不同**，各按自己的事实登记：AIHubMix 按四分项 token 计量量计价（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens，来源 URL 见它的 price_plan），APIMart **直接在上游终态给实扣金额**（`cost`，实测样例 0.011354）——它没有自己的计价参数，因此不发费率表，只声明成本币种 USD。对客卖多少钱与这两条形态都无关。",
-    "consumer_rates_cny": "**夹具值，不构成对外价**：按该渠道成本费率 ×(1 + 加价系数 0)× 该币种 → CNY 折算率（USD 7.1）推出来——文本输入 35.5 / 图像输入 56.8 / 文本输出 71 / 图像输出 213 元每 1M tokens。用处只有一个：**可被路由的供给必须能给出对客计费基准**（不然结算算不出该收多少钱）；两条供给用同一组数（APIMart 没有自己的费率表，就照同素材另一条的数填），`markup_bps` 保持缺省。"
+    "price_plan": "两家渠道的**计价形态不同**，各按自己的事实登记：AIHubMix 按四分项 token 计量量计价（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens，来源 URL 见它的 price_plan），APIMart **直接在上游终态给实扣金额**（`cost`，实测样例 0.011354）——它没有自己的计价参数，因此不发费率表，只声明成本币种 USD。",
+    "consumer_rates_cny": "**测试值**：AIHubMix 的四档对客 CNY 费率 = 该渠道成本单价（四档费率）× 倍率 1.2 × 折算率 7.1（USD → CNY）——文本输入 42.6 / 图像输入 68.16 / 文本输出 85.2 / 图像输出 255.6 元每 1M tokens。它只是这条供给的**测试价**：按 token 计量量的候选由运营按同一条乘法推导或直接录入，发布与结算都不读这里的注释。",
+    "markup_bps": "**测试值 2000**（倍率 1.2）：运营按网关模型录入的加价系数，随修订发布、随 Job 快照冻结。代码里没有它的默认值——按张 / 按次 / 上游给金额的候选的对客价全靠它算出来。",
+    "pricing_reference": "**测试值**：两条供给的参考成本都取 APIMart 实测声明过的 11354 微美元（AIHubMix 那条按 `computed`、APIMart 那条按 `declared`）——它只作定价参考，不是售价的被乘数。",
+    "floor_amounts": "**测试值**：OpenAI 系按 `size` 给的保底额（CNY）——1K ¥0.16 / 2K ¥0.25 / 4K ¥0.3，`quality` 维留空备用；两条供给的封顶保底值都是 4K 那一档。保底额只用于受理时的预授权，不由售价派生。",
+    "offerings_apimart_price": "APIMart 这条供给**没有**对客四档向量：它的对客价 = 上游这次声明的金额 × 倍率 1.2 × 折算率 7.1（受理时把倍率与折算率随快照冻结）。"
   },
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-flare",
   "native_revision": "2026-09-20-contract-1.0",
   "actor": "bootstrap",
+  "markup_bps": 2000,
   "capability_schema": {
     "$schema": "https://json-schema.org/draft/2020-12/schema",
     "type": "object",
@@ -122,10 +127,16 @@
         "source_url": "https://aihubmix.com/model/gpt-image-2.5-flare"
       },
       "consumer_rates_cny": {
-        "text_input_micros_per_million": 35500000,
-        "image_input_micros_per_million": 56800000,
-        "text_output_micros_per_million": 71000000,
-        "image_output_micros_per_million": 213000000
+        "text_input_micros_per_million": 42600000,
+        "image_input_micros_per_million": 68160000,
+        "text_output_micros_per_million": 85200000,
+        "image_output_micros_per_million": 255600000
+      },
+      "reference_cost_microusd": 11354,
+      "cost_basis": "computed",
+      "floor_amounts": {
+        "amounts": { "1K": 160000, "2K": 250000, "4K": 300000 },
+        "cap_microusd": 300000
       }
     },
     {
@@ -185,11 +196,11 @@
       },
       "formula": "upstream_declared",
       "cost_currency": "USD",
-      "consumer_rates_cny": {
-        "text_input_micros_per_million": 35500000,
-        "image_input_micros_per_million": 56800000,
-        "text_output_micros_per_million": 71000000,
-        "image_output_micros_per_million": 213000000
+      "reference_cost_microusd": 11354,
+      "cost_basis": "declared",
+      "floor_amounts": {
+        "amounts": { "1K": 160000, "2K": 250000, "4K": 300000 },
+        "cap_microusd": 300000
       }
     }
   ]

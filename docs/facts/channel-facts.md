@@ -4,7 +4,7 @@
 
 - **只放结论**，引用不复述：原始形状、逐字样本与错误码表在 `out-reference/<provider>/`，见 §1 的总账。
 - **不合并渠道**：一个渠道一族，各自独立；渠道差异属该渠道 ② Driver 的内部实现，不互相推导（依据 [`docs/design/0004`](../design/0004-layered-architecture.md) R1）。
-- **不记凭证值**，只记变量名：`AIHUBMIX_API_KEY`（AIHubMix）、`APIMART_API_KEY`（APIMart）；另有 `DOUBAO_API_KEY`（火山方舟），与本台账范围无关。三个变量在 **User 与 Machine 级都存在**，Agent 进程默认环境里读不到——用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取（2026-09-23 复核）。
+- **不记凭证值**，只记变量名：`AIHUBMIX_API_KEY`（AIHubMix）、`APIMART_API_KEY`（APIMart）、`DOUBAO_API_KEY`（火山方舟）。三个变量在 **User 与 Machine 级都存在**，Agent 进程默认环境里读不到——用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取（2026-09-23 复核）。
 - **本文不记计费调用流水**：授权依据、次数、花费与样本位置统一留档在 [`docs/verification/paid-provider-calls.md`](../verification/paid-provider-calls.md)。
 - **不记平台口径**：平台怎么取成本、怎么结算、怎么对客呈现归 [`docs/design/0007`](../design/0007-pricing-floor-and-settlement.md)、[`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md) 与 [`docs/adr/0017`](../adr/0017-provider-errors-are-rewritten-for-consumers.md)；实施清单归相应工单。
 
@@ -14,6 +14,7 @@
 | --- | --- | --- | --- |
 | AIHubMix | `https://api.inferera.com/model/gpt-image-2.5-sunburst/llms.txt`、`…/gpt-image-2.5-flare/llms.txt`、`out-reference/aihubmix/error-code.md` | `https://api.inferera.com/v1`（用户指定） | `out-reference/aihubmix/`：`response-shapes.md`、`transcript-sync-and-async-2026-09.json`、`gpt_image_2_generations.json`、`schema-gpt-image-2*.endpoints.json`、`error-code.md`、`gpt-image-2.md` |
 | APIMart | `https://docs.apib.ai/cn/api-reference/images/gpt-image-2.5/generation.md`（另有 `/tasks/status.md`、`/uploads/images.md`） | `https://api.apib.ai/v1`（用户指定；文档正文写 `api.apimart.ai`，指向同一套服务） | `out-reference/apimart/`：`response-shapes.md`、`controlled-probe-2026-09-19.json`、`transcript-image-edit-2026-09-19.json`、`catalog-models.json`、`schema-gpt-image-2.5-flare.input.json`、`gpt-image-2.5-generation.cn.md`、`tasks-status.cn.md`、`uploads-images.cn.md`、`apimart-image-api-research.md` |
+| Doubao（火山方舟） | `https://docs.volcengine.com/docs/82379/1541523`（图片生成 API；另有 [模型价格](https://docs.volcengine.com/docs/82379/1544106)、[Base URL 及鉴权](https://docs.volcengine.com/docs/82379/1298459)） | `https://ark.cn-beijing.volces.com/api/v3` | `out-reference/doubao/`：`doubao-ark-image-research.md`、`图片生成模型API调用指南.md`、`图片生成示例.md`、`doubao-price.md`、`Doubao-Seedream-5.0-pro-教程.md`、`error-code.md` |
 
 厂商侧材料：`out-reference/openai/openai-images-generate-2026-09-20.md`（`size` 像素型与 `quality` 六档的厂商口径）。
 
@@ -146,7 +147,14 @@
 - 陷阱二：失败任务会退款——`failed` 状态写明 reserved funds are refunded，`/v1/usage` 写明失败与失败后退款的调用不计入、部分成功的批次按实际交付张数计费。
 - 创建阶段另有按状态码收窄的三类（`429` 与两个幂等子类），凭据/权限类 HTTP 状态（401/402/403）判为确定性拒绝，`5xx` 不按状态码定性。
 
-## 4. 本台账未结清的部分
+## 4. Doubao（火山方舟）
+
+- **计价单位是元/张，币种 CNY**（不是按 token、也不是美元）：pro 输出单图生成 **≤261 万像素 0.30 元/张**、**>261 万像素 0.60**；pro 图层拆分场景 0.15 / 0.30；pro 输入图首张免费、第 2 张起 0.02；lite 输出 **0.22**、输入免费；4.5 输出 0.25、4.0 输出 0.20。**因审核等原因未成功输出的图片不计费**（出处：[模型价格](https://docs.volcengine.com/docs/82379/1544106)，2026-09-19 抓取；归纳见 `out-reference/doubao/doubao-ark-image-research.md` §6 的价格表 L290–L296 与 §12.1 事实 8 L525）。
+- **计费依据是成功张数**：终态 `usage.generated_images`；`output_tokens` / `total_tokens` 是 `sum(宽×高)/256` 的面积换算，**不是真实 token 消耗**，不能当作按 token 结算的计量证据（出处：同上一节 §12.1 事实 7、§12.2 推论 1）。
+- 端点与鉴权：`POST https://ark.cn-beijing.volces.com/api/v3/images/generations`，`Authorization: Bearer` + `DOUBAO_API_KEY`；图片生成**没有**异步任务 API、**没有**幂等键、**没有**任务 ID，创建请求失联后只能人工对账（出处：同上一节 §12.1 事实 1、2、11）。
+- 平台怎么取成本、怎么定价、怎么对客呈现不在这里：见 [`docs/design/0007`](../design/0007-pricing-floor-and-settlement.md) 与 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)。
+
+## 5. 本台账未结清的部分
 
 - APIMart 400 / 429 / 5xx 的**真实**报文未实测（400 与 413 形状来自上传页文档，`build_request_failed` 前缀来自生成页文档）。
 - AIHubMix 缓存输入、失败计费、促销/折扣的权威规则；`output_blocked` 明确不收生成费，`output_policy_violation` 可能仍按审核计费规则处理。

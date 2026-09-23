@@ -746,7 +746,11 @@ fn the_recorded_computed_cost_is_not_the_consumer_charge() {
         .amount_microusd(&usage)
         .expect("cost rates price the usage");
     let charge = snapshot
-        .charge_microusd(&usage)
+        .charge_microusd(ChargeFacts {
+            usage: &usage,
+            images: 1,
+            declared_cost_microusd: None,
+        })
         .expect("consumer rates price the usage");
     assert_ne!(cost, charge, "用例得先让两个口径真的不同");
 

@@ -1235,8 +1235,9 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         start_fake_upstream_with(apimart_calls.clone(), UpstreamBehaviour::apimart()).await;
     let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
     wait_until_ready(&client, &base_url, &admin_token).await;
-    // 这条用例连发四次请求，而素材现在带着**夹具对客费率**（按成本费率 × 折算率 7.1 推，比
-    // 旧口径"把 USD 费率当 CNY 收"高 7.1 倍）：受理闸门是"余额 ≥ 保底额"，所以要先把账户充上。
+    // 这条用例连发四次请求，而素材带着**测试价**（AIHubMix 的四档对客费率 = 成本单价 × 倍率
+    // 1.2 × 折算率 7.1；APIMart 那条按上游声明的金额乘同一条乘法）与保底表：受理闸门是
+    // "余额 ≥ 保底额"，所以要先把账户充上。
     let (_, api_key) = funded_account(&client, &base_url, &admin_token, 1_000_000).await;
     let pool = PgPool::connect(&database_url)
         .await

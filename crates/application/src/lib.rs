@@ -6,17 +6,18 @@ use seeai_adapter_sdk::{
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AttemptId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FloorTable, FxRate,
-    GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, MeteringEvidence,
-    OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula,
-    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
-    RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps,
-    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
-    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
-    declared_field_names, declared_parameter_names, declared_reference_image_limit,
-    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
-    declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
-    place_image_inputs, platform_image_parameters, resolve_size_tier, unit_amount_microusd,
+    AccountId, AttemptId, ChargeFacts, ConsumerRatesCny, CostBasis, CreateImageGeneration,
+    FloorTable, FxRate, GenerationJob, HoldSource, ImageBranch, ImageParameterKind, JobId,
+    JobState, MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates,
+    PriceSnapshot, PricingFormula, ProviderCostFact, ProviderCostSource, PublishedModel,
+    PublishedOffering, PublishedRevision, RoutePolicy, RouteStrategy, RuntimeRevisionId,
+    TokenUsage, apply_enum_maps, apply_parameter_defaults, apply_parameter_renames,
+    apply_size_mapping, carries_parameter, contract_image_parameter_kind, contract_model_identity,
+    declared_defaults, declared_enum_maps, declared_field_names, declared_parameter_names,
+    declared_reference_image_limit, declared_renames, declared_size_mapping,
+    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
+    is_used_parameter_value, literal_parameter_text, place_image_inputs, platform_image_parameters,
+    resolve_size_tier, unit_amount_microusd,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -65,8 +66,9 @@ pub struct PublishRuntimeCommand {
     /// 它不放在可变的开关表里：定价是修订的内容——放进可变表就等于"改价不用发布"，而
     /// 已受理的 Job 必须固定受理时那一版。**具体数值由后台录入，不属设计决策**。
     ///
-    /// 它**参与设定**对客费率向量（管理员按"该候选成本费率 ×(1 + 加价系数)× 汇率"推导），
-    /// 但**不参与结算**：结算只读受理时冻结的那份向量。
+    /// 它**参与设定**对客价：按 token 计量量的候选由管理员按"该候选成本单价 × 倍率 × 折算率"
+    /// 推导那份四档向量（直接录入时它一次都不参与计算，所以那种发布可以不给）；按张 / 按次 /
+    /// 上游给金额的候选没有对客价载体，**必须给**——它们的对客价由结算按冻结的这份倍率算出来。
     #[serde(default)]
     pub markup_bps: Option<i32>,
     pub actor: String,
@@ -155,7 +157,10 @@ pub struct OfferingDraft {
     /// 取上游声明过的金额。
     #[serde(default)]
     pub reference_cost_microusd: Option<u64>,
-    /// 该候选的**对客四档 CNY 费率向量**：售价依据（实收按它算）。
+    /// 该候选的**对客四档 CNY 费率向量**：按 token 计量量计价时的对客价（实收按它算）。
+    ///
+    /// 按张 / 按次计价或直接由上游给金额时**不给**（给了会被拒：那份向量是 `token_rates` 的价格，
+    /// 在别的形态下永远不会被读），那时对客价由成本单价乘倍率算出来。
     #[serde(default)]
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
     /// 该候选的成本来源口径：`computed` 或 `declared`。
@@ -175,9 +180,8 @@ pub struct OfferingDraft {
 /// 没给成本来源与保底表，发布出来的候选就是"说不清成本怎么记、也算不出预授权"的半成品。
 /// 打包之后"这条候选不带这些"与"带了一半"在类型上就分得开：前者是 `None`，后者发布期就拒。
 ///
-/// **对客费率向量不在这一组里**：它是每条可被路由的供给都必须给出的**对客计费基准**
-/// （见 [`normalize_consumer_basis`]），与参考成本、保底表各有各的用途。成本币种也不在这里：
-/// 它是这条供给声明的渠道事实（[`OfferingDraft::cost_currency`]）。
+/// **对客费率向量不在这一组里**：它是 `token_rates` 那一种形态的价格，与参考成本、保底表各有
+/// 各的用途。成本币种也不在这里：它是这条供给声明的渠道事实（[`OfferingDraft::cost_currency`]）。
 #[derive(Debug, Clone, PartialEq)]
 pub struct CandidatePricing {
     /// 该候选的渠道成本（**原币种**微单位）：只作定价参考，不是售价的被乘数。
@@ -241,7 +245,8 @@ pub struct NormalizedOffering {
     pub cost_unit_price_microusd: Option<u64>,
     /// 这条供给声明的成本币种；`None` = 没显式声明（取 Price Plan 的币种，旧形状的素材）。
     pub cost_currency: Option<String>,
-    /// 这条供给的**对客费率向量**（实收依据）；`None` = 没给（旧口径按 Price Plan 的费率收）。
+    /// 这条供给的**对客费率向量**（按 token 计量量的对客价）；`None` = 没给（旧口径按 Price Plan
+    /// 的费率收，或这条供给按张 / 按次 / 上游给金额计价、对客价由成本单价乘倍率算出来）。
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
     /// 档位：显式给值就用它，没给就取数组下标。同一档可以有多条候选。
     pub routing_priority: i32,
@@ -319,21 +324,35 @@ impl PublishRuntimeCommand {
 
     /// 加价系数**可以缺省**，但不可为负，且不能是一条没人读的记录。
     ///
-    /// 它只是**定价时的参考口径**：管理员按"成本费率 ×(1 + 加价系数)× 汇率"推导对客费率向量，
-    /// 也可以直接录入那份向量——直接录入时加价系数一次都不参与计算，所以"带对客费率就必须给加价
-    /// 系数"会把一条正当的录入挡在门外。要拒的是两件明显自相矛盾的事：负加价等于平台倒贴，
-    /// 不是定价（库层也有同一条约束，这里先拒是为了给出说得清的错误）；给了加价系数却没有任何
+    /// 它只是**定价时的参考口径**：管理员按"成本单价 × 倍率 × 折算率"推导对客价，按 token 计量量
+    /// 的候选也可以直接录入那份四档向量——直接录入时加价系数一次都不参与计算，所以"带对客费率就
+    /// 必须给加价系数"会把一条正当的录入挡在门外。要拒的是两件明显自相矛盾的事：负加价等于平台
+    /// 倒贴，不是定价（库层也有同一条约束，这里先拒是为了给出说得清的错误）；给了加价系数却没有任何
     /// 候选带**对客费率向量或定价参考**，那它没有任何东西可以解释。
+    ///
+    /// **反过来，缺它也可能拒**：按张 / 按次计价、或直接由上游给金额的候选没有对客价载体，它们的
+    /// 对客价就是"成本单价 × 倍率 × 折算率"——倍率是这条修订唯一的那份，缺了就算不出该收多少钱。
+    /// 那是"这条供给没有对客计费基准"，必须发布期拒：按 0 收等于白送，等到结算才发现就晚了一批请求。
     fn validate_markup(&self, offerings: &[NormalizedOffering]) -> Result<(), ApplicationError> {
         let priced = offerings
             .iter()
             .any(|offering| offering.consumer_rates_cny.is_some() || offering.pricing.is_some());
+        // 按张 / 按次 / 上游给金额的候选的对客价就是**成本单价乘倍率**：它们的倍率是有人读的。
+        let derives_its_price = offerings
+            .iter()
+            .any(|offering| offering.formula != PricingFormula::TokenRates);
         match self.markup_bps {
             Some(bps) if bps < 0 => Err(ApplicationError::Validation(
                 "markup_bps must not be negative".to_owned(),
             )),
-            Some(_) if !priced => Err(ApplicationError::Validation(
-                "markup_bps is given but no offering carries pricing".to_owned(),
+            Some(_) if !priced && !derives_its_price => Err(ApplicationError::Validation(
+                "markup_bps is given but no offering carries pricing or derives its price from it"
+                    .to_owned(),
+            )),
+            None if derives_its_price => Err(ApplicationError::Validation(
+                "markup_bps is required: a supply priced per image / per call / by the amount its \
+                 provider declares sells at its cost unit price times the markup coefficient"
+                    .to_owned(),
             )),
             _ => Ok(()),
         }
@@ -509,8 +528,9 @@ struct Billing {
 /// - `per_image` / `per_call` 要一个单价（并按张 / 按次的单位算成本）；
 /// - `upstream_declared` 什么参数都不要：金额由渠道在终态直接给出，平台没有可算的东西。
 ///
-/// 反向也拒：给了这种形态用不到的参数（例如 `upstream_declared` 带单价、按张计价带一份四档费率）
-/// 说明发布者的意图与声明的形态对不上，而那个数永远不会被读——留着它只会让人以为它在生效。
+/// 反向也拒：给了这种形态用不到的参数（例如 `upstream_declared` 带单价、按张计价带一份四档费率、
+/// 或按张计价带一份对客四档向量）说明发布者的意图与声明的形态对不上，而那个数永远不会被读——
+/// 留着它只会让人以为它在生效。
 ///
 /// 成本币种取**显式声明**，缺省取 Price Plan 的币种，两份都在就必须一致：成本平面记账、
 /// 折算与上游声明的金额都要以它为准，两个字段各说各的就没有唯一答案。没有 Price Plan 时必须
@@ -559,6 +579,18 @@ fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, App
             declared.as_str()
         )));
     }
+    // 对客四档向量是 `token_rates` 那一种形态的价格：按张 / 按次 / 上游给金额的候选对客价由
+    // 成本单价按"× 倍率 × 折算率"算出来，一份向量在这里永远不会被读。留着它只会让人以为
+    // 它在生效——发布者的意图与声明的形态对不上时，就该在发布期说清，而不是等对账时才发现
+    // 自己录的价没被用。
+    if declared != PricingFormula::TokenRates && draft.consumer_rates_cny.is_some() {
+        return Err(ApplicationError::Validation(format!(
+            "offerings[{index}].consumer_rates_cny does not apply to formula {}: the four CNY \
+             rates are the token_rates price, and a supply priced per image / per call / by the \
+             amount its provider declares sells at its cost unit price times the markup coefficient",
+            declared.as_str()
+        )));
+    }
     let (rates, price_source_url, plan_currency) = match draft.price_plan.clone() {
         Some(price_plan) => {
             let currency = price_plan.currency.clone();
@@ -587,7 +619,6 @@ fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, App
             )));
         }
     };
-    normalize_consumer_basis(index, draft, rates.as_ref())?;
     Ok(Billing {
         formula: declared,
         rates,
@@ -608,10 +639,9 @@ fn empty_object() -> Value {
 /// 发布出来的候选就是"说不清成本怎么记、也算不出预授权"的半成品——那种候选一旦生效，
 /// 问题要等到结算才暴露。因此带了一半就明确拒绝，并指出缺哪一个。
 ///
-/// **对客费率向量不在这组里**：它是"可被路由的供给必须给出的对客计费基准"
-/// （[`normalize_consumer_basis`]），与参考成本、保底表各有各的用途（一个是售价，一个是定价
-/// 参考与预授权），可以只有前者——渠道按张 / 按次计价或直接由上游给金额时，参考成本与保底表
-/// 都没有着落，但这条供给照样要能卖。
+/// **对客费率向量不在这组里**：它是 `token_rates` 那一种形态的价格，与参考成本、保底表各有各的
+/// 用途（一个是售价，一个是定价参考与预授权）。渠道按张 / 按次计价或直接由上游给金额时，参考成本
+/// 与保底表可以没有着落，但这条供给照样要能卖——它的对客价由成本单价乘倍率算出来。
 ///
 /// 成本币种也不在这里：它是这条供给声明的渠道事实（见 [`normalize_billing`]），带不带定价都要有，
 /// 而且只有一个来源。
@@ -665,30 +695,6 @@ fn normalize_candidate_pricing(
         tier_prices,
         floor_amounts,
     }))
-}
-
-/// 归一一条候选的**对客计费基准**：这条供给卖多少钱从哪里读。
-///
-/// **可被路由的供给必须给出一个基准**：对客费率向量（今天的方式），或 Price Plan 的那份费率
-/// （旧口径——历史修订与"迁移后仍生效但没有定价的旧修订"结算时读的就是它）。两样都没有就
-/// 发布期拒掉：这条供给一旦生效，受理与结算都算不出该收多少钱，而**按 0 结算等于白送**——
-/// 那是账上一条"收过钱"的 0 元记录，不是"没有价"。
-///
-/// 它**不是** Price Plan 的必填：渠道按张 / 按次计价或直接由上游给金额时没有 Price Plan，
-/// 那时基准只能是对客费率向量（"不带价目表也能发布"说的是这个，不是"连对客价一起没有"）。
-fn normalize_consumer_basis(
-    index: usize,
-    draft: &OfferingDraft,
-    rates: Option<&PriceRates>,
-) -> Result<(), ApplicationError> {
-    if draft.consumer_rates_cny.is_some() || rates.is_some() {
-        return Ok(());
-    }
-    Err(ApplicationError::Validation(format!(
-        "offerings[{index}] has no consumer charge basis: a routable supply needs either its \
-         consumer rate vector (consumer_rates_cny) or the price plan rates the platform charges \
-         from"
-    )))
 }
 
 /// 选出这次请求走的那条候选：**先定档位，再在档内按权重分摊**。
@@ -3360,7 +3366,7 @@ impl GenerationService {
     /// 没发布尺寸档案时按最长边阈值兜底。那份映射随 Job 一起冻结，所以事后重建"这次按哪一档
     /// 冻的"用的是受理当时那一份，不是今天的发布物。
     ///
-    /// 旧修订没有定价（快照里没有对客费率向量）：这一步什么都不做，返回平台兜底数，
+    /// 旧修订没有定价（快照里没有该供给的保底表）：这一步什么都不做，返回平台兜底数，
     /// 预授权与结算都走旧口径、与今天逐位相同。
     async fn freeze_pricing(
         &self,
@@ -3385,7 +3391,10 @@ impl GenerationService {
                 })?;
             offering.price_snapshot.fx_rate = Some(fx_rate);
         }
-        if offering.price_snapshot.consumer_rates_cny.is_none() {
+        // 判据是"这条候选带不带定价"，不是"有没有对客费率向量"：按张 / 按次 / 上游给金额的候选
+        // 本来就没有那份四档向量，但它们照样有保底表要查。带定价就一定有保底表（发布期两者
+        // 全有或全无），所以这里看保底表在不在。
+        if offering.price_snapshot.floor_amounts.is_none() {
             return Ok(self.max_cost_microusd);
         }
         let table = offering
@@ -3692,15 +3701,25 @@ impl WorkerService {
         success: &ProviderSuccess,
         provider_cost: ProviderCostFact,
     ) -> Result<(), ApplicationError> {
-        // 对客扣费（对客平面）：读受理时冻结的**对客费率向量**，只决定向消费者收多少。
+        // 对客扣费（对客平面）：读受理时冻结的那份快照，只决定向消费者收多少。
         //
-        // **不封顶在预授权额**：预授权只是保底，实收按实际用量算，超出部分由余额透支吸收
+        // 快照按**这条供给的计价形态**算对客价：按 token 计量量的读那份随修订发布的对客费率向量；
+        // 按张 / 按次 / 上游给金额的由成本单价 × 倍率 × 折算率算出来（见领域侧的 charge_microusd）。
+        // 倍率与折算率都取自受理时冻结的那一份，所以受理之后改价、改汇率都不影响这一个 Job。
+        //
+        // **不封顶在预授权额**：预授权只是保底，实收按实际算，超出部分由余额透支吸收
         // （透支发生在结算，不在受理）。所以这里没有"超过预授权就进对账"这一条——那是旧口径，
         // 而旧口径会把一笔正常完成的生成扣在对账里。
         let charge = job
             .offering
             .price_snapshot
-            .charge_microusd(&success.usage)
+            .charge_microusd(ChargeFacts {
+                usage: &success.usage,
+                images: success.images.len(),
+                // 上游这次声明的金额就是**成本单价**（原币种）——只有上游直接给金额的候选读它。
+                // 上游没声明时是 `None`：那条路算不出对客价，按平台侧故障处置，不按 0 收。
+                declared_cost_microusd: provider_cost.amount_microusd,
+            })
             .map_err(|error| ApplicationError::Reconciliation(error.to_string()))?;
         // 结果只是"当次信封"：渠道给 url 就留 url、给 base64 就留 base64，平台不看内容。
         if success.images.is_empty() {

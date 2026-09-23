@@ -270,27 +270,22 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
         "{error}"
     );
 
-    // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。对客计费基准
-    // 得由对客费率向量给出（没有价目表，就没有旧口径那份费率可用）。
+    // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。它的对客价由
+    // 成本单价乘倍率算出来，所以**倍率必须给**——缺了就算不出该收多少钱，发布期就拒。
     per_image_without_unit_price.cost_unit_price_microusd = Some(11_354);
     let error = PublishRuntimeCommand {
         offerings: Some(vec![per_image_without_unit_price.clone()]),
         ..base_command()
     }
     .normalize()
-    .expect_err("a supply with neither a rate card nor a consumer vector must fail");
+    .expect_err("a derived consumer price without its markup coefficient must fail");
     assert!(
-        error.to_string().contains("consumer charge basis"),
+        error.to_string().contains("markup_bps is required"),
         "{error}"
     );
-    per_image_without_unit_price.consumer_rates_cny = Some(ConsumerRatesCny {
-        text_input_micros_per_million: 35_500_000,
-        image_input_micros_per_million: 56_800_000,
-        text_output_micros_per_million: 71_000_000,
-        image_output_micros_per_million: 213_000_000,
-    });
     let normalized = PublishRuntimeCommand {
-        offerings: Some(vec![per_image_without_unit_price]),
+        markup_bps: Some(2_000),
+        offerings: Some(vec![per_image_without_unit_price.clone()]),
         ..base_command()
     }
     .normalize()
@@ -299,8 +294,30 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
     assert!(normalized.offerings[0].rates.is_none());
     assert_eq!(normalized.offerings[0].cost_currency(), Some("USD"));
     assert!(
-        normalized.offerings[0].consumer_rates_cny.is_some(),
-        "对客计费基准由对客费率向量给出"
+        normalized.offerings[0].consumer_rates_cny.is_none(),
+        "对客四档向量是 token 计量量那一种形态的价格，按张的候选没有它"
+    );
+
+    // 反向：按张计价给一份对客四档向量也要拒——那个数在别的形态下永远不会被读。
+    let mut per_image_with_rates = per_image_without_unit_price;
+    per_image_with_rates.consumer_rates_cny = Some(ConsumerRatesCny {
+        text_input_micros_per_million: 35_500_000,
+        image_input_micros_per_million: 56_800_000,
+        text_output_micros_per_million: 71_000_000,
+        image_output_micros_per_million: 213_000_000,
+    });
+    let error = PublishRuntimeCommand {
+        markup_bps: Some(2_000),
+        offerings: Some(vec![per_image_with_rates]),
+        ..base_command()
+    }
+    .normalize()
+    .expect_err("a consumer vector under per_image must fail");
+    assert!(
+        error
+            .to_string()
+            .contains("consumer_rates_cny does not apply to formula"),
+        "{error}"
     );
 
     // 反向：形态用不到的参数也要拒（它永远不会被读，留着只会让人以为它在生效）。

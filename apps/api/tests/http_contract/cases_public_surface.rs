@@ -59,7 +59,9 @@ async fn public_surface_has_no_async_task_protocol() {
         );
     }
 
-    let account = create_account(&client, &base_url, &admin_token).await;
+    // 素材带保底表，受理闸门是"余额 ≥ 保底额"：这个用例看的是"等不到结果时对客怎么说"，
+    // 所以账户要付得起那份保底额，别让 402 抢在超时前面。
+    let account = create_account_with_credit(&client, &base_url, &admin_token, 1_000_000).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     publish_bootstrap(&client, &base_url, &admin_token).await;
     reject_mismatched_model_identity(&client, &base_url, &admin_token).await;
