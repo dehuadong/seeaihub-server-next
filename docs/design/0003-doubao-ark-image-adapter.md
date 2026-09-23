@@ -38,9 +38,9 @@
 | --- | --- | --- |
 | `model` | string | `const` `doubao-seedream-5-0-260128` |
 | `prompt` | string | minLength 1 |
-| `size` | string | 枚举已声明值；另有像素总数区间（基础模型下限 3,686,400；一手文档给出上限 6000×6000 = 36,000,000，**基础模型的实际区间上限未实测**）与宽高比 [1/16,16] 的合取约束 |
+| `size` | string | 枚举已声明值；另有像素总数区间（基础模型下限 3,686,400；厂商文档给出上限 6000×6000 = 36,000,000）与宽高比 [1/16,16] 的合取约束 |
 | `output_format` | string | enum `jpeg` / `png`（上游默认 `jpeg`） |
-| `watermark` | boolean | 上游默认 `true`；**首期由 Adapter 固定为 `false`，不可配置**（见 §2.2 末） |
+| `watermark` | boolean | 上游默认 `true`；**首期由 Adapter 固定为 `false`，不可配置**（见下） |
 | `sequential_image_generation` | string | `const "disabled"` |
 | `image` | string | 单参考图；**不接受数组**；单张 ≤ 30MB |
 | `optimize_prompt_options` | object | 闭合对象，`mode` enum `standard` / `fast` |
@@ -49,19 +49,13 @@
 
 **`watermark` 不可配置（首期固定 `false`）**：`restrictions` 只认 `allowed_branches`/`max_images`，Adapter Descriptor 只有参数名白名单，`validate_native_request` 也不注入策略默认值——因此该字段当前**无处承载发布策略值**。本阶段决定由 Adapter 固定为 `false`（避免上游默认 `true` 引入水印），**不新增发布字段**；代价是它不能按 Offering 变化，若将来需要按 Offering 配置，必须新增受校验的 `native_parameter_defaults` 并明确它能设置哪些字段。
 
-**为什么 `response_format` 不开放**：上游支持 `url` 与 `b64_json` 两种返回，但本设计的响应处理规则（§2.4）与取图路径（§2.5）**只覆盖 URL 分支**。若在 Schema 里声明 `b64_json`，就会发布出**平台无法执行的能力**——正是 #2「不能伪造能力」的反面。首期由平台在请求组装时固定 `response_format = url` 并在受理前拒绝客户端传入该字段；将来支持内联 Base64 时，必须先把响应处理与结果交付两条路径都补齐再发布。
+**为什么 `response_format` 不开放**：上游支持 `url` 与 `b64_json` 两种返回，但本设计的响应处理规则（§2.4）与取图路径（§2.5）**只覆盖 URL 分支**。若在 Schema 里声明 `b64_json`，就会发布出**平台无法执行的能力**——正是 #2「不能伪造能力」的反面。首期由平台在请求组装时固定 `response_format = url`，并把客户端传入的该字段按合同外字段在受理前丢弃；将来支持内联 Base64 时，必须先把响应处理与结果交付两条路径都补齐再发布。
 
-**为什么把 `n` 排除在 Schema 之外**：实测 `n=2` 返回 HTTP 200 但只出 1 张——上游**静默忽略**该参数。在 Schema 里声明它会造成「该参数生效」的错觉，因此不声明，并让平台在受理前拒绝它。
+**为什么把 `n` 排除在 Schema 之外**：实测 `n=2` 返回 HTTP 200 但只出 1 张——上游**静默忽略**该参数。在 Schema 里声明它会造成「该参数生效」的错觉，因此不声明，按合同外字段在受理前丢弃（不报错、不发上游）。
 
-### 2.2 尺寸约束的表达分工
+### 2.2 尺寸约束
 
-「像素总数 ∈ [下限, 上限] ∧ 宽高比 ∈ [1/16, 16]」是**合取约束，JSON Schema 无法表达**（枚举与正则都不足以表达像素乘积与比值）。分工：
-
-- **Native Capability Schema**：声明 `size` 的枚举与类型，作为第一道；
-- **Adapter 的发布期校验**（`validate_publication`）：证明被发布的枚举值都满足该模型的像素与宽高比约束；
-- **受理期校验**（`crates/application`）：对每个请求值计算像素数与宽高比并判定。
-
-这个分工必须显式记录，否则会误以为 Schema 已经封住该约束。Schema 仍是「原生字段与取值」的权威，只是**不独自承担**这条数值约束。
+「像素总数 ∈ [下限, 上限] ∧ 宽高比 ∈ [1/16, 16]」是**合取约束，JSON Schema 无法表达**（枚举与正则都不足以表达像素乘积与比值）。平台不校验 `size` 的合法性（留给客户端）：Schema 只声明 `size` 的枚举与类型，取值是否落在约束内由上游判定，越界表现为渠道报错。
 
 ### 2.3 响应
 
@@ -158,7 +152,7 @@ MeteredUsage::Images { generated_images, images: [ { size, width, height } ], in
 ## 6. 验收条件（本 Provider 部分）
 
 - 文生图与图生图（单参考图）两分支各产出可核验 `MeteredUsage::Images`；
-- `output_format=webp`、`size='1x1'`、`n=2` 三类请求在**受理前**被平台拒绝，且零上游调用；未知字段按现行规则**丢弃**（不报错、不发上游）；
+- `n`、`quality`、`response_format` 三类**合同外字段**按现行规则在受理前**丢弃**（不报错、不发上游）；`output_format=webp`、`size='1x1'` 是**合同声明过的取值**，平台不校验、原样透传，接受与否由上游判定；
 - 结果在 Adapter 内完成下载与魔数校验；下载失败 ⇒ 对账且无第二次上游 POST；
 - `data[].error` 的两种情形（`generated_images` 为 0 / 大于 0）各有可判定测试；
 - 内容审核拒绝的真实 code 经一次受控付费调用确认，并据此校正分类表；

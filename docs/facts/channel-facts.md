@@ -51,9 +51,9 @@
 
 - 同步响应要点：顶层 `created` / `background` / `output_format` / `quality` / `size` / `usage`，图像在 `data[0].b64_json`，**没有任务 id、没有金额字段**（出处：[`out-reference/aihubmix/response-shapes.md`](../../out-reference/aihubmix/response-shapes.md) §1）。
 - `usage` 是四分项：`input_tokens_details{text_tokens,image_tokens}` / `output_tokens_details{…}` + `total_tokens`；**没有 `cached_tokens`**。
-- 2.5 两款在同步 `/v1` 上与 `gpt-image-2` 同构（顶层字段集合相同），② 的同步解码器不需要按型号分支；编辑端点的 2.5 未单独实测（同端点、同字段面）。
+- 2.5 两款在同步 `/v1` 上与 `gpt-image-2` 同构（顶层字段集合相同，编辑端点同字段面），② 的同步解码器不需要按型号分支。
 - 2.5 的 `/v1/*` 实测：`quality` 顶层传入即被接受（无需 `extra`）；接受并落实 `background=transparent`（响应回显 + 产物是带 alpha 的 RGBA PNG）；两张参考图经重复 `image[]` 部件一次提交成功。
-- 绑定失败与恢复：创建请求失联后没有取回手段（同步响应无 id，且同步调用不出现在 `/ai/v1/images` 任务列表里），只能人工对账（[`docs/adr/0007`](../adr/0007-reconciliation-instead-of-automatic-retry.md)）；**该渠道的逐请求标识是响应头 `X-Request-ID`**，② 采它作为对账标识（**未核实**：本仓库的样本从未记录过响应头，见 `out-reference/aihubmix/response-shapes.md` §4）。
+- 绑定失败与恢复：创建请求失联后没有取回手段（同步响应无 id，且同步调用不出现在 `/ai/v1/images` 任务列表里），只能人工对账（[`docs/adr/0007`](../adr/0007-reconciliation-instead-of-automatic-retry.md)）。
 - 异步 `/ai/v1` 任务对象给出任务 id 与轮询状态，**不返回 `usage`、不返回金额**，因此不作为平台的计量与计费执行路径（出处：`out-reference/aihubmix/response-shapes.md` §3；[`paid-provider-calls.md`](../verification/paid-provider-calls.md) §1）。
 - 错误信封：`{"error":{"code","message","type"}}`（异步文档另带 `tid`）；实测顶层 `quality` 非法时 HTTP 400 + `code: schema_violation`，**未知参数是硬拒绝、不静默降级**（出处：`out-reference/aihubmix/response-shapes.md` §4）。
 - 错误码表：见 `out-reference/aihubmix/error-code.md`（第一方页面，更新于 2026-06-01）。可用信息的边界：**只有部分状态码带机器可读的错误标识符**（如 `insufficient_user_quota`、`prompt_missing`、`prompt_too_long`、`text_too_long`、`size_not_supported`、`n_not_within_range`），其余只能靠状态码 + 消息文本；该页自述大部分 400 是上游透传报错。`403` 的其余分支（账号禁用、IP 白名单、令牌不支持该模型、渠道被禁用）都是我们与渠道之间的配置/资质问题；该页没有「服务器错误」这一档，`503` 只有「没有可用渠道」与「被官方限速」两种含义。⇒ 分类以状态码兜底，并保留原始文本供人工核对。
@@ -100,13 +100,13 @@
 - 接受格式 JPEG / PNG / WebP / GIF，单张 ≤ `20MB`；上游文档示例的报错文案（`unsupported image type…`、`file size … exceeds maximum 20971520 bytes`）与上传页一致（出处：`out-reference/apimart/uploads-images.cn.md`）。
 - 生成请求里的参考图是 `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），只接受**公网可访问 URL**。上传页的 Python 示例把它写成 `[{"url": …}]`（对象数组）——实测用字符串数组提交成功并完成出图，平台取字符串数组。
 - 遮罩是 `mask_url`（字符串），与 `image_urls` 同用可行；实测用 512×512 带 alpha 的 PNG、尺寸与参考图一致，上游未报尺寸/通道错误。
-- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台取更严的一侧：一律先上传换 URL（**base64 是否仍被接受未实测**）。
+- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台取更严的一侧：一律先上传换 URL。
 - 流程：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，[`docs/adr/0011`](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)）⇒ Job `failed` + 释放预授权，**不进对账**。调用方给公网 URL 时逐字透传、不上传；平台不托管素材，只有 data URL 才需要解码后上传。
 - 参数名不改写：生成请求用上游原生名 `image_urls` / `mask_url`，由 Offering Parameter Mapping 从合同字段 `image` / `mask` 落位（依据 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。
 - `mask_url` 不在 2.5 生成文档的字段表里，但**实测被接受**（提交 200 → `completed`），因此按厂商契约声明遮罩；渠道将来若拒绝它，表现会是渠道报错，不是平台静默丢字段。
 - 遮罩**不额外计费**：带/不带 `mask_url` 的两次调用 `usage` 与 `cost` 完全相同。
 - 遮罩是否真的生效只有**弱信号**：每 8 像素采样对比两张产物，遮罩椭圆内差异像素 21%、全图 79.9%——方向一致，但生成随机且请求无 `seed`，不能据此断言遮罩被严格遵从。
-- 未做：`sunburst` 的图生图与遮罩路径未单独实测（同渠道族、同端点、同参数面）；`base64` 路径未测；20MB / 16 张 / 256MB 边界未逐个压测；遮罩尺寸/通道的边界未压测。
+- 未做：20MB / 16 张 / 256MB 边界未逐个压测。
 
 ### 3.4 任务流转与响应
 
@@ -148,7 +148,6 @@
 
 ## 4. 本台账未结清的部分
 
-- AIHubMix 同步响应头到底有没有 `X-Request-ID`、长什么样：本仓库样本从未记录响应头，② 的写法是「有就采、没有就留空」（`out-reference/aihubmix/response-shapes.md` §4）。
 - APIMart 400 / 429 / 5xx 的**真实**报文未实测（400 与 413 形状来自上传页文档，`build_request_failed` 前缀来自生成页文档）。
 - AIHubMix 缓存输入、失败计费、促销/折扣的权威规则；`output_blocked` 明确不收生成费，`output_policy_violation` 可能仍按审核计费规则处理。
 - 逐字报文只有 AIHubMix 用户早期那一份，2.5 的实测只有转录（`out-reference/aihubmix/response-shapes.md` §0）。

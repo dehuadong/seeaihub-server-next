@@ -2,7 +2,7 @@
 title: 合同与承载面分层、映射声明化与对客目录（#10 落地）
 status: implemented
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-23
 approval: 用户 2026-09-20 明确"方向需求很明确，你自己判断，提供设计方案落实"，并在讨论中确认三条裁定（图片字段合同外一律 400、defaults 加发布期校验、对客目录必做且暂不引入路由策略层）
 verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings` 均 exit 0；`cargo test --workspace --all-features` 全绿；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **37 passed / 0 failed**（由收口者逐片重跑，零真实计费调用）。后续 AIHubMix 承载面补齐（`background`/`output_compression`/`moderation` 按厂商契约声明）与多图 `image[]`（参考图声明成数组 ≤16、Driver 按张数编码 `image`/`image[]`）已并入同一批素材与用例。
 ---
@@ -34,7 +34,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
 
 ## 已定的裁定（原未决）
 
-图片字段合同外一律 400（不丢弃、不走 503）；`defaults` 加发布期校验 R6；对客目录必做、形状如上；**路由策略层暂不引入**，沿用 `ADR-0009` 的优先级选路（交接文档那条记为被取代，等真出现多个互相竞争的供给再谈）。
+图片字段合同外一律 400（不丢弃、不走 503）；`defaults` 加发布期校验 R6；对客目录必做、形状如上；**路由策略层已引入**（[`docs/adr/0020`](../../../../docs/adr/0020-routing-strategy-layer-configured-by-operations.md)），**未配置策略时**按 `ADR-0009` 的优先级选路。
 
 ## 厂商侧证据（2026-09-20，用户告知）
 
@@ -45,7 +45,7 @@ verification: 2026-09-20 本地：`cargo fmt --all --check`、`cargo clippy --wo
   - `quality` 默认 `auto`，**2.5 两款额外支持 `xhigh`/`max`**，与用户告知的六档一致。
   [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 里那条"未结清"已据此改成**已结清**。
 - OpenAI 最新上线提供 **`gpt-image-2.5-flare` 与 `gpt-image-2.5-sunburst`** 两种模型；**与旧模型的核心区别是支持 `low`/`medium`/`high`/`xhigh`/`max`/`auto` 六档质量设置**。⇒ 这两个模型名**是厂商侧真实模型**，`quality` 的六档与默认 `auto` 也据此归厂商侧，不再算渠道 schema 的推断。
-- 仓库里那份 OpenAI 官方快照（`out-reference/openai/openai-images-api.md`）正文只覆盖到 `gpt-image-2`，**不含 2.5**，且**全仓没有任何文档引用它**——2.5 的其余特有项（例如 `size` 上限是否仍 `3840x2160`、16 的倍数与 1:3~3:1 约束是否照旧）仍按"沿用 gpt-image 家族面、未对 2.5 单独确认"标注，不冒充已确认。
+- 三份 2026-09-20 一手快照（`out-reference/openai/` 下的 `openai-images-generate-2026-09-20.md`、`openai-images-edit-2026-09-20.md`、`openai-image-generation-guide-2026-09-20.md`）的模型枚举与 `size` / `quality` 段都包含 `gpt-image-2.5-flare` / `-sunburst` 两款。
 - 素材迁移（一个 Vendor Model 一份顶层合同 + AIHubMix / APIMart 两条 offering）与逐项出处清单见提交历史与素材自身的 `_evidence`。
 
 <!-- agent-note-format: alternatives-not-recorded (pre-format Agent Note) -->

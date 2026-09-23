@@ -15,5 +15,16 @@ services:
     volumes:
       - seeai-postgres:/var/lib/postgresql/data
 
+  # 加速层（路由候选集与余额缓存）的本地 Redis。宿主端口用 63799，避开本机 ServBay 已在 6379 监听的实例。
+  redis:
+    image: redis:7-alpine
+    ports:
+      - "63799:6379"
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
+
 volumes:
   seeai-postgres:
