@@ -72,23 +72,38 @@ async fn main() -> Result<()> {
     )?
     .with_acceleration(acceleration);
     info!(%worker_id, "worker started");
+    // 终止信号只决定"**不再领下一轮**"：正在跑的那一轮（上游调用 + 落账 + 结算）要让它跑完，
+    // 否则在飞调用被丢掉，Job 会留在提交中直到租约过期才被回收。因此信号不放在 select 的
+    // 分支里直接返回，而是先置位，再把手上这一轮的 future 等完。
+    let shutdown = tokio::signal::ctrl_c();
+    tokio::pin!(shutdown);
     loop {
-        tokio::select! {
-            signal = tokio::signal::ctrl_c() => {
-                signal.context("failed to listen for shutdown signal")?;
-                info!("worker stopping");
-                return Ok(());
-            }
-            result = worker.run_once() => {
-                match result {
-                    Ok(true) => {}
-                    Ok(false) => tokio::time::sleep(poll_interval).await,
-                    Err(error) => {
-                        error!(error = %error, "worker iteration failed");
-                        tokio::time::sleep(poll_interval).await;
+        let iteration = worker.run_once();
+        tokio::pin!(iteration);
+        let mut draining = false;
+        let result = loop {
+            tokio::select! {
+                signal = &mut shutdown => {
+                    signal.context("failed to listen for shutdown signal")?;
+                    if !draining {
+                        draining = true;
+                        info!("worker draining: finishing the in-flight iteration before exit");
                     }
                 }
+                result = &mut iteration => break result,
             }
+        };
+        match result {
+            Ok(true) => {}
+            Ok(false) => tokio::time::sleep(poll_interval).await,
+            Err(error) => {
+                error!(error = %error, "worker iteration failed");
+                tokio::time::sleep(poll_interval).await;
+            }
+        }
+        if draining {
+            info!("worker stopped");
+            return Ok(());
         }
     }
 }
