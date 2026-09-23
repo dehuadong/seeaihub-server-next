@@ -1724,6 +1724,153 @@ async fn republishing_a_model_keeps_the_disabled_supply_disabled() {
     harness.cleanup().await;
 }
 
+/// 重发把供给改成另一套适配器与渠道模型之后，**已受理但还没执行**的 Job 仍按受理时那一套执行。
+///
+/// 为什么单独验这一条：发布按身份复用供给行、重发**就地改写**那一行，而 Worker 执行时若现场读
+/// 这张表，一台已受理、还没被领走的 Job 就会用上后来改的适配器与渠道模型。它要交给哪个驱动、
+/// 往线文里写哪个渠道模型名，在受理那一刻就随 Job 定下了：受理与执行之间的任何一次发布都不该
+/// 动到它。所以这里刻意让 Job 停在"已受理"、改完供给再放 Worker 出去，并钉住线上请求体里的
+/// `model` 是受理时的那个渠道模型。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_accepted_job_keeps_the_adapter_and_channel_model_of_its_acceptance() {
+    // Worker 是独立包，`cargo test -p seeai-api` 不会顺带建它，第一次起 Worker 会现场编译。
+    // 这次执行要在受理之后才起 Worker，编译时间会吃掉同步入口的等待窗口，所以先把二进制建好。
+    let _ = worker_binary();
+
+    // 候选只声明文生图：承载面在这些名字上对两家适配器都成立，于是"换适配器"不被承载面差异
+    // 挡住，换的确实是适配器本身。
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    let (offering, channel) = active_supply(&harness).await;
+
+    // 同步入口受理之后会一直等到终态。这里先不放 Worker，让它停在"已受理"。
+    let key = format!("frozen-supply-{}", Uuid::new_v4());
+    let in_flight = tokio::spawn({
+        let base_url = harness.base_url.clone();
+        let api_key = harness.api_key.clone();
+        let key = key.clone();
+        let body = route_request(harness.model, "frozen supply identity");
+        async move { post_json(&base_url, &api_key, "/v1/images/generations", &key, &body).await }
+    });
+    // 等它真的受理落库：这一刻 Job 上的适配器与渠道模型就该定下来。这里轮询库而不是睡一会儿，
+    // 因为要等的事实是"Job 已经在库里"，不是一个时长。
+    let mut accepted = false;
+    for _ in 0..200 {
+        let state: Option<String> =
+            sqlx::query_scalar("SELECT state FROM generation.jobs WHERE idempotency_key = $1")
+                .bind(&key)
+                .fetch_optional(&harness.pool)
+                .await
+                .expect("job lookup");
+        if state.as_deref() == Some("accepted") {
+            accepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(accepted, "受理必须落库，且此时还没有 Worker 领它");
+
+    let row = sqlx::query(
+        "SELECT adapter_key, provider_model_id FROM generation.jobs WHERE idempotency_key = $1",
+    )
+    .bind(&key)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the accepted job");
+    let accepted_adapter: String = row.try_get("adapter_key").expect("frozen adapter");
+    let accepted_model: String = row
+        .try_get("provider_model_id")
+        .expect("frozen channel model");
+
+    // 重发：同一个渠道身份、同一份合同（合同不可变），只改这一行上的**可变量**——另一套适配器与
+    // 渠道模型。`publication_body` 会把 `provider_model_id` 写成型号名，所以这里在它之后覆盖它，
+    // 那正是本次要观察的值；上游地址必须与夹具那条逐字相同，否则渠道身份变了，落下来的会是另
+    // 一条供给行，就验不到"就地改写复用行"这件事了。
+    let mut republished = publication_body(
+        harness.model,
+        "route-test-1",
+        None,
+        vec![candidate("AIHubMix", "apimart-image-v1", &["prompt_only"])],
+        None,
+    );
+    republished["offerings"][0]["base_url"] = json!(harness.upstream_base_url);
+    republished["offerings"][0]["provider_model_id"] = json!("republished-channel-model");
+    let response = client
+        .post(format!("{}/api/v1/runtime-revisions", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&republished)
+        .send()
+        .await
+        .expect("runtime publication");
+    let status = response.status();
+    let raw = response.text().await.expect("publication body");
+    assert_eq!(status, StatusCode::OK, "重发必须成功：{raw}");
+
+    // 前提：重发确实改掉了这一行上的那两个值（否则下面验的就不是"不受后续发布影响"）。
+    let row =
+        sqlx::query("SELECT adapter_key, provider_model_id FROM supply.offerings WHERE id = $1")
+            .bind(offering)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the reused supply row");
+    let rewritten_adapter: String = row.try_get("adapter_key").expect("adapter");
+    let rewritten_model: String = row.try_get("provider_model_id").expect("channel model");
+    assert_eq!(
+        rewritten_adapter, "apimart-image-v1",
+        "重发就地改写这条供给的适配器"
+    );
+    assert_eq!(
+        rewritten_model, "republished-channel-model",
+        "重发就地改写这条供给的渠道模型"
+    );
+    assert_ne!(accepted_adapter, rewritten_adapter);
+    assert_ne!(accepted_model, rewritten_model);
+    assert_eq!(
+        active_supply(&harness).await,
+        (offering, channel),
+        "重发复用同一行供给与渠道"
+    );
+
+    // 放 Worker 出去执行这台早已受理的 Job。
+    let worker = harness.spawn_worker();
+    let (status, response_body) = in_flight.await.expect("the in-flight request");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "受理时那一套仍然可用，这次执行必须成功：{response_body}"
+    );
+    assert_sync_success("受理时冻结的供给身份", &response_body);
+
+    let submit = harness.submit_body("/v1/images/generations");
+    assert_eq!(
+        submit["model"].as_str(),
+        Some(accepted_model.as_str()),
+        "线上请求体里的 `model` 必须是受理时冻结的渠道模型，不是重发写进去的那个"
+    );
+    assert_eq!(
+        harness.count("POST", "/v1/images/generations"),
+        1,
+        "一次执行只交一次"
+    );
+    assert_eq!(
+        harness.count("GET", "/v1/tasks/"),
+        0,
+        "走的是受理时那个同步适配器：任务式适配器交完之后会去轮询任务"
+    );
+    let (_, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "内部执行记录必须跑到终态");
+
+    drop(worker);
+    harness.cleanup().await;
+}
+
 /// 两条供给级启停接口的对外形状：管理员凭证、目标不存在、只允许改 `enabled`。
 ///
 /// 形状本身就是合同的一部分：多给一个字段必须**被拒**而不是被静默忽略——忽略会让调用方以为

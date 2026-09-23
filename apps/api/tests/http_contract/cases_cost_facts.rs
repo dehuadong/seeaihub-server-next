@@ -620,12 +620,12 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         sqlx::query(
             "INSERT INTO generation.jobs
                  (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
-                  native_parameters, carrier_schema, parameter_mapping, runtime_revision_id,
-                  vendor_model_id, offering_id, channel_id, price_snapshot, max_cost_microusd,
-                  lease_owner, lease_expires_at)
+                  native_parameters, carrier_schema, parameter_mapping, adapter_key, provider_model_id,
+                  runtime_revision_id, vendor_model_id, offering_id, channel_id, price_snapshot,
+                  max_cost_microusd, lease_owner, lease_expires_at)
              VALUES ($1,$2,$3,'hash','submitting','prompt_only','cost-path',
-                     '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$4,$5,$6,$7,'{}'::jsonb,20000,
-                     'worker-x', now() + interval '1 hour')",
+                     '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'aihubmix-image-v1','cost-path',
+                     $4,$5,$6,$7,'{}'::jsonb,20000,'worker-x', now() + interval '1 hour')",
         )
         .bind(job_id)
         .bind(account)

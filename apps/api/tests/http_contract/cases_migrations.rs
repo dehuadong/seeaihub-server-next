@@ -665,10 +665,12 @@ async fn the_pricing_migration_relaxes_the_balance_checks_on_an_existing_databas
     sqlx::query(
         "INSERT INTO generation.jobs
              (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
-              native_parameters, carrier_schema, parameter_mapping, runtime_revision_id,
-              vendor_model_id, offering_id, channel_id, price_snapshot, max_cost_microusd)
+              native_parameters, carrier_schema, parameter_mapping, adapter_key, provider_model_id,
+              runtime_revision_id, vendor_model_id, offering_id, channel_id, price_snapshot,
+              max_cost_microusd)
          VALUES ($1,$2,'zero-hold','hash','accepted','prompt_only','priced-legacy',
-                 '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,$3,$4,$5,$6,'{}'::jsonb,0)",
+                 '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'aihubmix-image-v1','priced-legacy',
+                 $3,$4,$5,$6,'{}'::jsonb,0)",
     )
     .bind(Uuid::new_v4())
     .bind(account)

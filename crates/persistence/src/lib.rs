@@ -91,7 +91,8 @@ impl PgHubRepository {
                 j.request_hash, j.max_cost_microusd, j.created_at, j.updated_at,
                 vm.id AS vendor_model_id, vm.native_revision, vm.capability_schema,
                 j.carrier_schema, j.parameter_mapping,
-                o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
+                j.adapter_key, j.provider_model_id,
+                o.id AS offering_id, o.restrictions,
                 c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
                 j.runtime_revision_id, j.price_snapshot
             FROM generation.jobs j
@@ -1440,9 +1441,9 @@ impl HubRepository for PgHubRepository {
                 id, account_id, idempotency_key, request_hash, state, branch,
                 gateway_model, native_parameters,
                 runtime_revision_id, vendor_model_id, offering_id, channel_id,
-                carrier_schema, parameter_mapping,
+                carrier_schema, parameter_mapping, adapter_key, provider_model_id,
                 price_snapshot, max_cost_microusd
-            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15)
+            ) VALUES ($1,$2,$3,$4,'accepted',$5,$6,$7,$8,$9,$10,$11,$12,$13,$14,$15,$16,$17)
             "#,
         )
         .bind(job_id.0)
@@ -1458,6 +1459,8 @@ impl HubRepository for PgHubRepository {
         .bind(offering.channel_id.0)
         .bind(&offering.carrier_schema)
         .bind(&offering.parameter_mapping)
+        .bind(&offering.adapter_key)
+        .bind(&offering.provider_model_id)
         .bind(&price_snapshot)
         .bind(max_cost)
         .execute(&mut *transaction)
@@ -2705,8 +2708,10 @@ fn row_to_gateway_model(
 fn row_to_generation_job(row: &sqlx::postgres::PgRow) -> Result<GenerationJob, ApplicationError> {
     let price_snapshot: Value = row.try_get("price_snapshot").map_err(database_error)?;
     // 合同从 vendor_model 行取（它落库后不再改，因此读到的永远是受理当时那一份）；
-    // 承载面与映射从 **Job 自己那两列**取——它们是受理时随 Job 冻结的快照，
-    // 不跟着发布物走，所以改发布之后旧 Job 读到的仍是旧承载面。
+    // 承载面、映射、适配器与渠道模型都从 **Job 自己那几列**取——它们是受理时随 Job 冻结的快照，
+    // 不跟着发布物走，所以重发把供给行改成另一套之后，旧 Job 读到的仍是受理时那一套。
+    // 这不是顺手的偏好：供给行按身份复用、重发就地改写它，读那一行等于让已受理的 Job 用上
+    // 后来改的适配器与渠道模型。
     let offering = PublishedOffering {
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,
