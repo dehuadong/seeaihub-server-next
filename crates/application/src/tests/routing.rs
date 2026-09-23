@@ -29,6 +29,7 @@ fn routing_skips_a_candidate_that_cannot_carry_a_used_field() {
         &request,
         branch,
         &[candidate_of(&narrow, 0), candidate_of(&wide, 1)],
+        None,
     )
     .expect("the second candidate can carry quality");
     assert_eq!(chosen.offering_id, wide.offering_id);
@@ -51,7 +52,7 @@ fn routing_skips_a_candidate_that_cannot_carry_a_used_field() {
     assert!(decision.considered[1].skip_reason.is_none());
 
     // 一条都不合格：平台侧供给问题，与"请求违反合同"分开报。
-    let error = select_candidate(&request, branch, &[candidate_of(&narrow, 0)])
+    let error = select_candidate(&request, branch, &[candidate_of(&narrow, 0)], None)
         .expect_err("no candidate can carry quality");
     assert!(
         matches!(error, ApplicationError::NoEligibleOffering(_)),
@@ -59,11 +60,11 @@ fn routing_skips_a_candidate_that_cannot_carry_a_used_field() {
     );
     // 请求本身违反合同（缺必填）：仍然是参数错。
     let missing_prompt = image_request(serde_json::json!({"quality": "high"}));
-    let error = select_candidate(&missing_prompt, branch, &[candidate_of(&narrow, 0)])
+    let error = select_candidate(&missing_prompt, branch, &[candidate_of(&narrow, 0)], None)
         .expect_err("prompt is missing");
     assert!(matches!(error, ApplicationError::Validation(_)), "{error}");
     // 该型号一条 active 供给都没有：是"不存在"，不是"承载不了"。
-    let error = select_candidate(&request, branch, &[]).expect_err("no active offering");
+    let error = select_candidate(&request, branch, &[], None).expect_err("no active offering");
     assert!(matches!(error, ApplicationError::NotFound(_)), "{error}");
 }
 
@@ -144,8 +145,9 @@ fn least_cost_compares_discounted_estimates() {
     let request = image_request(serde_json::json!({"prompt": "hello"}));
     let branch = request.branch().expect("prompt only");
     let candidates = vec![plain_candidate, discounted_candidate];
-    let (chosen, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
-        .expect("a candidate must be chosen");
+    let (chosen, _, _) =
+        select_candidate_with_strategy(&request, branch, &candidates, None, &choice)
+            .expect("a candidate must be chosen");
     assert_eq!(
         chosen.offering_id, discounted.offering_id,
         "折扣之后估算更小的那条要赢，而不是原始成本更小的那条"
@@ -175,8 +177,9 @@ fn user_tag_takes_the_mapped_candidate_and_falls_back_when_it_cannot_carry() {
     };
     let request = image_request(serde_json::json!({"prompt": "hello"}));
     let branch = request.branch().expect("prompt only");
-    let (chosen, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
-        .expect("a candidate must be chosen");
+    let (chosen, _, _) =
+        select_candidate_with_strategy(&request, branch, &candidates, None, &choice)
+            .expect("a candidate must be chosen");
     assert_eq!(
         chosen.offering_id, mapped.offering_id,
         "标签映射指向的候选要赢"
@@ -191,8 +194,9 @@ fn user_tag_takes_the_mapped_candidate_and_falls_back_when_it_cannot_carry() {
         tag_channel_map: &unknown_map,
         account_tag: Some("vip"),
     };
-    let (chosen, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
-        .expect("退回默认顺序也必须有候选");
+    let (chosen, _, _) =
+        select_candidate_with_strategy(&request, branch, &candidates, None, &choice)
+            .expect("退回默认顺序也必须有候选");
     assert!(
         candidates
             .iter()
@@ -229,7 +233,7 @@ fn weighted_random_ignores_tiers_and_replays_to_the_same_candidate() {
         request.idempotency_key = format!("weighted-key-{index}");
         let branch = request.branch().expect("prompt only");
         let (chosen, _, decision) =
-            select_candidate_with_strategy(&request, branch, &candidates, &choice)
+            select_candidate_with_strategy(&request, branch, &candidates, None, &choice)
                 .expect("a candidate must be chosen");
         let hit = decision
             .considered
@@ -238,8 +242,9 @@ fn weighted_random_ignores_tiers_and_replays_to_the_same_candidate() {
             .expect("命中项必须在判定记录里");
         assert!(hit.eligible, "策略不得选中不合格候选：{hit:?}");
         // 重放：同一请求再来一次，必须落同一条候选。
-        let (again, _, _) = select_candidate_with_strategy(&request, branch, &candidates, &choice)
-            .expect("a replay must be chosen");
+        let (again, _, _) =
+            select_candidate_with_strategy(&request, branch, &candidates, None, &choice)
+                .expect("a replay must be chosen");
         assert_eq!(
             again.offering_id, chosen.offering_id,
             "同一 (账户, 幂等键) 必须落同一条候选"
@@ -277,8 +282,8 @@ fn weight_splits_within_one_tier_deterministically() {
         request.account_id = account_id;
         request.idempotency_key = format!("weight-key-{index}");
         let branch = request.branch().expect("prompt only");
-        let (chosen, _, decision) =
-            select_candidate(&request, branch, &candidates).expect("a candidate must be chosen");
+        let (chosen, _, decision) = select_candidate(&request, branch, &candidates, None)
+            .expect("a candidate must be chosen");
         assert_eq!(
             chosen.offering_id.0,
             expected_weight_split(account_id, &request.idempotency_key, &tier),
@@ -312,8 +317,8 @@ fn weight_splits_within_one_tier_deterministically() {
         request.account_id = account_id;
         request.idempotency_key = format!("weight-key-{index}");
         let branch = request.branch().expect("prompt only");
-        let (chosen, _, _) =
-            select_candidate(&request, branch, &candidates).expect("a candidate must be chosen");
+        let (chosen, _, _) = select_candidate(&request, branch, &candidates, None)
+            .expect("a candidate must be chosen");
         second_pass.push(chosen.offering_id);
     }
     assert_eq!(first_pass, second_pass, "同一批输入必须逐条可复现");
@@ -341,8 +346,8 @@ fn weight_never_outranks_a_tier_that_has_an_eligible_candidate() {
         let mut request = image_request(serde_json::json!({"prompt": "hello"}));
         request.idempotency_key = format!("tier-key-{index}");
         let branch = request.branch().expect("prompt only");
-        let (chosen, _, _) =
-            select_candidate(&request, branch, &candidates).expect("a candidate must be chosen");
+        let (chosen, _, _) = select_candidate(&request, branch, &candidates, None)
+            .expect("a candidate must be chosen");
         assert_eq!(
             chosen.offering_id, first.offering_id,
             "档 0 有合格候选时权重不该把它让给后面的档"
@@ -380,7 +385,7 @@ fn an_ineligible_candidate_never_wins_the_split() {
         request.idempotency_key = format!("eligible-key-{index}");
         let branch = request.branch().expect("prompt only");
         let (chosen, _, decision) =
-            select_candidate(&request, branch, &candidates).expect("the wide candidate fits");
+            select_candidate(&request, branch, &candidates, None).expect("the wide candidate fits");
         assert_eq!(
             chosen.offering_id, wide.offering_id,
             "不合格的候选不得因为权重大而被选中"
@@ -400,6 +405,49 @@ fn an_ineligible_candidate_never_wins_the_split() {
             skipped.skip_reason
         );
     }
+}
+
+/// 复核说某条供给已经停用 ⇒ 它与"承载面表达不了"同一条路：不合格，权重再大也换不来一次选中。
+///
+/// 复核结果只由**缓存给出的**候选集带来（`None` 表示这批候选刚回源读来），所以 `None` 那一支
+/// 必须与复核引入之前逐位相同。
+#[test]
+fn a_reviewed_disabled_offering_is_ineligible_and_never_wins_the_split() {
+    let disabled = offering();
+    let mut still_on = offering();
+    still_on.offering_id = OfferingId::new();
+    let candidates = vec![
+        candidate_with_weight(&disabled, 0, 1_000),
+        candidate_with_weight(&still_on, 1, 1),
+    ];
+    let request = image_request(serde_json::json!({"prompt": "hello"}));
+    let branch = request.branch().expect("prompt only");
+
+    // 只有优先级 1 那条还在启用里：停用那条连档位都不占，落点因此下移。
+    let enabled: HashSet<OfferingId> = [still_on.offering_id].into_iter().collect();
+    let (chosen, _, decision) = select_candidate(&request, branch, &candidates, Some(&enabled))
+        .expect("the second candidate is still enabled");
+    assert_eq!(chosen.offering_id, still_on.offering_id);
+    assert!(!decision.considered[0].eligible);
+    assert_eq!(
+        decision.considered[0].skip_reason.as_deref(),
+        Some(DISABLED_OFFERING_REASON),
+        "落选原因要写明是停用，运营才解释得清为什么没走这条"
+    );
+    assert!(decision.considered[1].eligible);
+
+    // 一条都不在启用里：全不合格是平台侧供给问题，不是"模型不存在"（候选本身是有的）。
+    let error = select_candidate(&request, branch, &candidates, Some(&HashSet::new()))
+        .expect_err("every candidate was disabled");
+    assert!(
+        matches!(error, ApplicationError::NoEligibleOffering(_)),
+        "{error}"
+    );
+
+    // 不复核（候选刚回源读来）：仍按档位选优先级 0 那条，逐位不变。
+    let (chosen, _, _) = select_candidate(&request, branch, &candidates, None)
+        .expect("an unreviewed candidate set routes as before");
+    assert_eq!(chosen.offering_id, disabled.offering_id);
 }
 
 /// 显式档位与权重按候选归一；**缺省仍是"下标即档位、权重 1"**（老素材行为逐位不变）。

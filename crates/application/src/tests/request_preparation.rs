@@ -435,6 +435,7 @@ fn auto_is_passed_through_and_a_size_converting_offering_cannot_take_it() {
         &request,
         branch,
         &[candidate_of(&converting, 0), candidate_of(&pass_through, 1)],
+        None,
     )
     .expect("the pass-through candidate carries auto");
     assert_eq!(chosen.offering_id, pass_through.offering_id);
@@ -453,7 +454,7 @@ fn auto_is_passed_through_and_a_size_converting_offering_cannot_take_it() {
     assert!(decision.considered[1].eligible);
 
     // 一条都收不了 `auto`：不是参数错，是平台侧供给问题。
-    let error = select_candidate(&request, branch, &[candidate_of(&converting, 0)])
+    let error = select_candidate(&request, branch, &[candidate_of(&converting, 0)], None)
         .expect_err("no candidate can take auto");
     assert!(
         matches!(error, ApplicationError::NoEligibleOffering(_)),
@@ -497,6 +498,7 @@ fn an_enum_map_replaces_the_value_and_an_unmapped_one_skips_the_candidate() {
         &request,
         branch,
         &[candidate_of(&mapped, 0), candidate_of(&wide, 1)],
+        None,
     )
     .expect("the second candidate carries the value as it is");
     assert_eq!(chosen.offering_id, wide.offering_id);
@@ -510,7 +512,7 @@ fn an_enum_map_replaces_the_value_and_an_unmapped_one_skips_the_candidate() {
         "落选原因必须写明是哪个字段的取值映射不了：{:?}",
         decision.considered[0].skip_reason
     );
-    let error = select_candidate(&request, branch, &[candidate_of(&mapped, 0)])
+    let error = select_candidate(&request, branch, &[candidate_of(&mapped, 0)], None)
         .expect_err("no candidate can map this value");
     assert!(
         matches!(error, ApplicationError::NoEligibleOffering(_)),

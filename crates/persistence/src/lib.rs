@@ -16,17 +16,19 @@ use seeai_domain::{
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
+use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
 /// **唯一的候选可用性判据**：这条候选现在真的能走吗——它自己启用，且它所在的渠道也启用。
 ///
-/// 三处都判它：对客目录（列哪些模型）、受理（取哪些候选）、管理员视图（每个候选的 `enabled`
-/// 字段）。只写一遍是因为分散之后，将来加一条闸门（比如渠道维护窗口）必然漏掉其中一处，
-/// 而漏掉的那一处会让"目录里列着、提交时却取不到候选"重新出现——那种模型对调用方是 404，
-/// 比不列更糟。
+/// 四处都判它：对客目录（列哪些模型）、受理（取哪些候选）、管理员视图（每个候选的 `enabled`
+/// 字段），以及受理路径对 route 缓存给出的候选集的**开关复核**（缓存只按修订标识比对新旧，
+/// 启停看不见，见 [`HubRepository::enabled_offerings`]）。只写一遍是因为分散之后，将来加一条
+/// 闸门（比如渠道维护窗口）必然漏掉其中一处，而漏掉的那一处会让"目录里列着、提交时却取不到
+/// 候选"重新出现——那种模型对调用方是 404，比不列更糟。
 ///
-/// 列名 `o`/`c` 是这三条查询里供给与渠道的固定别名。管理员视图不把它放进 `WHERE`（它要连
+/// 列名 `o`/`c` 是这四条查询里供给与渠道的固定别名。管理员视图不把它放进 `WHERE`（它要连
 /// **停用**的候选一起列出来，运营才看得出"为什么它调不动"），而是放进 `SELECT` 当一列读。
 ///
 /// 用它拼查询要经过 `AssertSqlSafe`：`sqlx::query` 默认只收字面量，为的是逼动态 SQL 先被审
@@ -640,6 +642,35 @@ impl HubRepository for PgHubRepository {
             }
         }
         Ok(candidates)
+    }
+
+    async fn enabled_offerings(
+        &self,
+        offering_ids: &[OfferingId],
+    ) -> Result<HashSet<OfferingId>, ApplicationError> {
+        // 按主键点读：一次一批（`= ANY`），不 JOIN 发布条目、不比修订标识。判据就是
+        // `CANDIDATE_AVAILABLE_SQL` 那一条——供给自己启用，且它所在的渠道也启用。取不到行
+        // （供给被删）与停用一样，都不在这个集合里。
+        if offering_ids.is_empty() {
+            return Ok(HashSet::new());
+        }
+        let ids: Vec<Uuid> = offering_ids
+            .iter()
+            .map(|offering_id| offering_id.0)
+            .collect();
+        let rows = sqlx::query_scalar::<_, Uuid>(AssertSqlSafe(format!(
+            r#"
+            SELECT o.id
+            FROM supply.offerings o
+            JOIN supply.channels c ON c.id = o.channel_id
+            WHERE o.id = ANY($1) AND {CANDIDATE_AVAILABLE_SQL}
+            "#
+        )))
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(rows.into_iter().map(OfferingId).collect())
     }
 
     async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {

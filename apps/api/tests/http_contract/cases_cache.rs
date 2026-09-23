@@ -668,3 +668,227 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
 
     harness.cleanup().await;
 }
+
+/// **停用立刻生效，且不依赖那次失效**：route 缓存里留着"停用前"那份候选集（修订标识也没变，
+/// 下一次受理照样命中它），停用的那条照样取不到。
+///
+/// 两条候选（优先级 0 的 AIHubMix、优先级 1 的 APIMart）：停用前者的**供给**之后必须落到后者；
+/// 再停掉后者的**渠道**，两条就全不合格，对客是 503 平台侧故障——不是"模型不存在"（缓存里那份
+/// 候选集还列着它们）。全程不跑 Worker：选路发生在调用上游之前，结论从判定记录读，零外部调用。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_disabled_offering_is_not_routed_to_while_the_route_cache_still_lists_it() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        1,
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+    let client = Client::new();
+    // 两条候选来自两个渠道（同一渠道发两条会塌成一条）。地址都指向夹具那台假上游；这次不跑
+    // Worker，所以没有任何请求真的发出去。
+    let mut primary = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    primary["base_url"] = json!(harness.upstream_base_url);
+    let mut secondary = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
+    secondary["base_url"] = json!(harness.upstream_base_url);
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            harness.model,
+            None,
+            vec![primary, secondary],
+        )
+        .await,
+        StatusCode::OK,
+        "两条候选的发布必须成功"
+    );
+    let candidates: Vec<(Uuid, i32, Uuid)> = sqlx::query(
+        "SELECT re.offering_id, re.routing_priority, o.channel_id
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         WHERE re.active AND re.gateway_model = $1 ORDER BY re.routing_priority ASC",
+    )
+    .bind(harness.model)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("这次发布的两条候选必须可读")
+    .iter()
+    .map(|row| {
+        (
+            row.try_get("offering_id").expect("offering id"),
+            row.try_get("routing_priority").expect("priority"),
+            row.try_get("channel_id").expect("channel id"),
+        )
+    })
+    .collect();
+    assert_eq!(candidates.len(), 2, "这次发布写入两条候选");
+    let (primary_offering, secondary_offering) = (candidates[0].0, candidates[1].0);
+    let secondary_channel = candidates[1].2;
+    assert_ne!(
+        candidates[0].2, secondary_channel,
+        "两条候选必须落在两个渠道上，否则下面那一支验不到渠道的开关"
+    );
+
+    // ① 先受理一次：route 缓存因此写下"停用前"那份候选集（两条都在）。
+    let first_key = format!("cache-disable-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &first_key,
+        &route_request(harness.model, "before the switch"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker，受理之后只会等到超时：{body}"
+    );
+    assert_eq!(
+        chosen_offering(&harness, &first_key).await,
+        primary_offering,
+        "停用之前走优先级最小的那条"
+    );
+    let cached = harness
+        .cache()
+        .route(harness.model)
+        .expect("受理之后候选集必须在缓存里");
+    assert_eq!(cached["candidates"].as_array().expect("候选集").len(), 2);
+
+    // ② 停用优先级 0 那条，并让这次**失效失败**：缓存里留着的仍是"停用前"那份候选集，修订标识
+    //    也没变 ⇒ 下一次受理照样命中它。停用能不能生效，因此与这次失效无关。
+    harness.cache().set_fail_writes(true);
+    assert_eq!(
+        patch_offering(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            primary_offering,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    harness.cache().set_fail_writes(false);
+    let stale = harness
+        .cache()
+        .route(harness.model)
+        .expect("失效没成功，缓存里那份还在");
+    assert_eq!(
+        stale["runtime_revision_id"], cached["runtime_revision_id"],
+        "启停不改变修订标识，缓存里那份仍然'看起来是新的'"
+    );
+    assert_eq!(
+        stale["candidates"].as_array().expect("候选集").len(),
+        2,
+        "缓存里仍然列着刚被停用的那条"
+    );
+
+    // ③ 立刻受理：被停用的那条不进合格集合，落到另一条；判定记录写明它为什么落选。
+    let second_key = format!("cache-disable-next-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &second_key,
+        &route_request(harness.model, "after the switch"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "受理必须成功（落到另一条合格候选）：{body}"
+    );
+    assert_eq!(
+        chosen_offering(&harness, &second_key).await,
+        secondary_offering,
+        "被停用的那条不得被选中"
+    );
+    let (second_job, _, _) = harness.job(&second_key).await;
+    let considered: Value =
+        sqlx::query_scalar("SELECT considered FROM generation.routing_decisions WHERE job_id = $1")
+            .bind(second_job)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("受理必然写下判定记录");
+    let considered = considered.as_array().expect("considered is an array");
+    assert_eq!(considered.len(), 2, "两条候选都要进判定记录");
+    assert_eq!(considered[0]["eligible"], json!(false));
+    assert_eq!(
+        considered[0]["skip_reason"],
+        json!("this offering or its channel is disabled"),
+        "落选原因要写明是停用"
+    );
+    assert_eq!(considered[1]["eligible"], json!(true));
+
+    // ④ 停掉另一条候选的**渠道**（同样让失效失败）：判据是"供给自己启用且它的渠道也启用"，
+    //    渠道这一列同样在这条复核里判。两条候选于是全不合格 —— 缓存里那份还列着它们，对客是
+    //    平台侧故障 503，不是"模型不存在"。
+    harness.cache().set_fail_writes(true);
+    assert_eq!(
+        patch_channel(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            secondary_channel,
+            false
+        )
+        .await,
+        StatusCode::NO_CONTENT
+    );
+    harness.cache().set_fail_writes(false);
+    assert_eq!(
+        harness
+            .cache()
+            .route(harness.model)
+            .expect("失效没成功，缓存里那份还在")["candidates"]
+            .as_array()
+            .expect("候选集")
+            .len(),
+        2,
+        "缓存里仍然列着两条候选"
+    );
+    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("job count");
+    let third_key = format!("cache-disable-none-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &third_key,
+        &route_request(harness.model, "every candidate is disabled"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "一条合格的都没有是平台侧故障：{body}"
+    );
+    assert_eq!(body["error"]["code"], json!("platform_unavailable"));
+    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("job count");
+    assert_eq!(jobs_after, jobs_before, "被拒的受理不该留下 Job");
+
+    harness.cleanup().await;
+}
+
+/// 这次受理最终选了哪条供给（判定记录与 Job 同事务写入）。
+async fn chosen_offering(harness: &Harness, key: &str) -> Uuid {
+    let (job_id, _, _) = harness.job(key).await;
+    sqlx::query_scalar(
+        "SELECT chosen_offering_id FROM generation.routing_decisions WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("受理必然写下判定记录")
+}

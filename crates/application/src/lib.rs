@@ -23,7 +23,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
-    collections::{BTreeMap, BTreeSet},
+    collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::Duration,
 };
@@ -703,9 +703,10 @@ fn normalize_candidate_pricing(
 
 /// 选出这次请求走的那条候选：**先定档位，再在档内按权重分摊**。
 ///
-/// 合格 = 该候选自己的 `restrictions` 允许本次分支与图片张数，**且**这条供给的承载面能承载
-/// 这次请求**实际用到**的每个字段（图片要能落到它声明的参数名上）。两个条件都必须用该候选
-/// 自己的声明判断——这正是「每条供给各自声明承载面、限制只收窄」的落地方式。
+/// 合格 = 启用复核放行（见 `enabled_offerings`），**且**该候选自己的 `restrictions` 允许本次分支
+/// 与图片张数，**且**这条供给的承载面能承载这次请求**实际用到**的每个字段（图片要能落到它声明的
+/// 参数名上）。后两个条件都必须用该候选自己的声明判断——这正是「每条供给各自声明承载面、限制只
+/// 收窄」的落地方式。
 ///
 /// **合格性先于分流**：不合格的候选连分摊的资格都没有——它们不进权重之和、也不在区间里。
 /// 于是"权重写得再大"也换不来一次选中，这是"任何策略都不得选中不合格候选"这条硬约束在
@@ -728,6 +729,7 @@ fn select_candidate(
     request: &CreateImageGenerationRequest,
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
+    enabled_offerings: Option<&HashSet<OfferingId>>,
 ) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
     // 零配置路径：一条策略都没有时的选路，也就是策略层引入之前的行为。
     let choice = RouteChoice {
@@ -736,18 +738,33 @@ fn select_candidate(
         tag_channel_map: &BTreeMap::new(),
         account_tag: None,
     };
-    select_candidate_with_strategy(request, branch, candidates, &choice)
+    select_candidate_with_strategy(request, branch, candidates, enabled_offerings, &choice)
+}
+
+/// 复核发现供给或它的渠道已停用时的落选原因：它进判定记录，是运营解释"为什么没走这条"的依据。
+const DISABLED_OFFERING_REASON: &str = "this offering or its channel is disabled";
+
+/// 复核是否把这条候选判掉了：只有复核结果存在、且这条供给不在"仍然启用"里时才算停用。
+///
+/// 复核结果不存在表示这批候选刚回源读来（取数时已经判过开关），此时一条都不判停用：没有缓存的
+/// 那条路径因此与复核引入之前逐位相同。
+fn reviewed_as_disabled(
+    candidate: &OfferingCandidate,
+    enabled_offerings: Option<&HashSet<OfferingId>>,
+) -> bool {
+    enabled_offerings.is_some_and(|enabled| !enabled.contains(&candidate.offering_id))
 }
 
 /// 同 [`select_candidate`]，但由调用方给出这次受理用什么策略、以及该策略要吃的输入。
 ///
-/// 策略只决定"在一批合格候选里挑哪一条"：候选合格与否仍由承载面与分支/张数判定，策略不改它们，
+/// 策略只决定"在一批合格候选里挑哪一条"：候选合格与否仍由启用复核与承载面判定，策略不改它们，
 /// 也不改选中之后的参数准备与冻结路径。取值空间只有合格候选——不合格的既不进权重之和，也不在
 /// 分摊区间里，**策略指定不了它们**。
 fn select_candidate_with_strategy(
     request: &CreateImageGenerationRequest,
     branch: ImageBranch,
     candidates: &[OfferingCandidate],
+    enabled_offerings: Option<&HashSet<OfferingId>>,
     choice: &RouteChoice<'_>,
 ) -> Result<(PublishedOffering, Value, RoutingDecision), ApplicationError> {
     if candidates.is_empty() {
@@ -768,17 +785,25 @@ fn select_candidate_with_strategy(
             let published = candidate.clone().into_published();
             let mut skip_reason = None;
             let mut parameters = Value::Null;
-            match prepare_carrier_parameters(&contract_parameters, request, &published) {
-                Err(reason) => skip_reason = Some(reason),
-                Ok(prepared) => {
-                    if let Err(error) = validate_restrictions(
-                        branch,
-                        request.reference_images.len(),
-                        &candidate.restrictions,
-                    ) {
-                        skip_reason = Some(error.to_string());
-                    } else {
-                        parameters = prepared;
+            // 复核（只在缓存给出的候选集上做）说这条供给或它的渠道已经停用 ⇒ 不合格，与"承载面
+            // 表达不了"同一条路：不进权重之和、不被任何策略指定。判在承载面之前：开关关掉是更准确
+            // 的落选原因（进判定记录，运营据此解释"为什么没走这条"），也无须替一条已经停用的候选
+            // 再准备参数。
+            if reviewed_as_disabled(candidate, enabled_offerings) {
+                skip_reason = Some(DISABLED_OFFERING_REASON.to_owned());
+            } else {
+                match prepare_carrier_parameters(&contract_parameters, request, &published) {
+                    Err(reason) => skip_reason = Some(reason),
+                    Ok(prepared) => {
+                        if let Err(error) = validate_restrictions(
+                            branch,
+                            request.reference_images.len(),
+                            &candidate.restrictions,
+                        ) {
+                            skip_reason = Some(error.to_string());
+                        } else {
+                            parameters = prepared;
+                        }
                     }
                 }
             }
@@ -1391,6 +1416,21 @@ pub trait HubRepository: Send + Sync {
         gateway_model: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError>;
 
+    /// 受理路径的**开关复核**：这些供给里，此刻仍然启用的有哪些（它的渠道也启用）。
+    ///
+    /// 判据与 [`Self::active_offering`] 那条 `o.enabled AND c.enabled` **同一条**，取值方式不同：
+    /// 这里按供给的主键点读（一次一批，不逐条查），不重新解析发布、不看修订标识。启停是可变表里
+    /// 的事、**不改变修订标识**——route 缓存里那份候选集在停用之后仍然"看起来是新的"，所以停用
+    /// 要立刻生效只能靠这次复核，而它与那次失效有没有成功无关。
+    ///
+    /// 只回"还作数的供给 id"，不回候选本身：候选由缓存给出，这里判的是它还作不作数。空集合直接
+    /// 回空集合，不查库。读失败按平台侧故障往外抛（出错就整次受理失败），不退化成"不复核"——
+    /// 静默放行会让停用在读失败的那几次请求上重新失效。
+    async fn enabled_offerings(
+        &self,
+        offering_ids: &[OfferingId],
+    ) -> Result<HashSet<OfferingId>, ApplicationError>;
+
     /// 对客目录的取数：当前真的能调的模型，一个型号一条，带它那份模型级合同。
     ///
     /// 判据与 [`Self::active_offering`] **同一条**（生效的发布条目 + 启用的供给 + 启用的渠道）：
@@ -1418,7 +1458,8 @@ pub trait HubRepository: Send + Sync {
     /// 管理员写：只改一条**供给**的启用开关，写一条审计事件。
     ///
     /// 返回这条供给现在出现在哪些网关模型的**生效**候选集里——调用方拿这些名字失效 route 缓存。
-    /// 启停不改变修订标识，缓存里那份候选集在停用之后仍然"看起来是新的"，只能靠失效拿掉。
+    /// 启停不改变修订标识，缓存里那份候选集在停用之后仍然"看起来是新的"，失效因此只影响命中率：
+    /// 停用本身的生效由受理路径按主键复核启用状态兜住（见 [`Self::enabled_offerings`]）。
     ///
     /// 没发布过的供给 id 返回 [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**
     /// 任何东西。停用只影响之后的受理——已受理 Job 的候选与定价早已随快照冻结在 Job 上。
@@ -2129,6 +2170,26 @@ pub enum BalanceSource {
     Reconciler,
 }
 
+/// 一次候选取数的结果：候选集，外加"这份候选集能不能直接用来判合格"。
+///
+/// 两条来源的可检性不同：
+///
+/// - **回源数据库**（没有缓存，或缓存未命中）：取数 SQL 里已经判过供给与渠道的启用状态，
+///   读回来的每一条都启用，判合格不需要再查一次；
+/// - **命中 route 缓存**：缓存的值只带**写它那次发布**的修订标识，而启停是可变表里的事、不改变
+///   修订标识——停用之后那份候选集仍然"看起来是新的"。所以缓存给出的候选集必须按主键复核一遍
+///   启用状态，复核结果随候选集一起交出去。
+///
+/// 复核结果**不写回缓存**：缓存里的值始终是那一版发布的候选集，写回被裁过的集合会让"重新启用"
+/// 在一个 TTL 内看不见。
+#[derive(Debug, Clone)]
+pub struct CandidateSet {
+    /// 候选，`routing_priority` 升序。
+    pub candidates: Vec<OfferingCandidate>,
+    /// `Some`：只有出现在集合里的供给才合格。`None`：这份候选集刚回源读来，不需要复核。
+    pub enabled_offerings: Option<HashSet<OfferingId>>,
+}
+
 /// route 缓存的值：候选集 + **写它那次发布**的修订标识。
 ///
 /// 修订标识是这一层的可检性来源：受理时与当前生效的修订比对，不一致就当未命中——因此
@@ -2242,18 +2303,34 @@ impl AccelerationService {
     ///
     /// 关掉（或从未发布）的模型**不看缓存**：开关是可变表里的事、不改变修订标识，缓存里那份
     /// 候选集在模型被关掉之后仍然"看起来是新的"。
+    ///
+    /// 命中缓存时还要**按主键复核一遍供给与渠道的启用状态**（启停同样不改变修订标识）：复核说
+    /// 已经停用的候选因此取不到，与那次失效有没有成功无关。回源那一支不用复核——取数已经判过
+    /// 开关，复核结果因此只在缓存给出的候选集上出现（见 [`CandidateSet`]）。
     pub async fn candidates(
         &self,
         gateway_model: &str,
         probe: &AcceptanceProbe,
-    ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+    ) -> Result<CandidateSet, ApplicationError> {
         let Some(effective) = probe.effective_revision_id.filter(|_| probe.enabled) else {
-            return Ok(Vec::new());
+            return Ok(CandidateSet {
+                candidates: Vec::new(),
+                enabled_offerings: None,
+            });
         };
         if let Some(cached) = self.read_route(gateway_model).await
             && cached.runtime_revision_id == effective
         {
-            return Ok(cached.candidates);
+            let offering_ids = cached
+                .candidates
+                .iter()
+                .map(|candidate| candidate.offering_id)
+                .collect::<Vec<_>>();
+            let enabled_offerings = self.repository.enabled_offerings(&offering_ids).await?;
+            return Ok(CandidateSet {
+                candidates: cached.candidates,
+                enabled_offerings: Some(enabled_offerings),
+            });
         }
         let candidates = self.repository.active_offering(gateway_model).await?;
         // **空候选集不入缓存**：它是"这个型号现在调不动"的瞬时状态，而回源它只发生在错误路径上。
@@ -2262,7 +2339,10 @@ impl AccelerationService {
             self.write_route(gateway_model, effective, &candidates)
                 .await;
         }
-        Ok(candidates)
+        Ok(CandidateSet {
+            candidates,
+            enabled_offerings: None,
+        })
     }
 
     /// 受理前的余额预检：**只有新鲜的值才允许提前拒绝**，返回 `true` 表示"凭缓存拒绝"。
@@ -2359,8 +2439,9 @@ impl AccelerationService {
 
     /// 发布成功（事务提交后）与启停开关改动后失效 route 缓存。
     ///
-    /// 失效失败不影响正确性：旧值带着旧修订标识，受理时的比对必然不一致 ⇒ 回源数据库；
-    /// 开关那一项由受理时按主键读的那一行兜住。失败只记一条日志（运营要能发现）。
+    /// 失效失败不影响正确性：旧值带着旧修订标识，受理时的比对必然不一致 ⇒ 回源数据库；启停不改变
+    /// 修订标识，它那一项由受理路径按主键复核启用状态兜住（见 [`CandidateSet`]）。失败只记一条
+    /// 日志（运营要能发现命中率在下降）。
     pub async fn invalidate_route(&self, gateway_model: &str) {
         let Some(cache) = self.cache.as_ref() else {
             return;
@@ -2370,7 +2451,7 @@ impl AccelerationService {
             tracing::warn!(
                 key,
                 error = %error,
-                "cache invalidation failed; a stale entry would be detected at acceptance time"
+                "cache invalidation failed; a stale entry is still caught at acceptance time"
             );
         }
     }
@@ -2745,8 +2826,8 @@ impl RuntimeService {
     /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。
     ///
     /// 改完失效该型号的 route 缓存：开关**不改变修订标识**，缓存里那份候选集在关掉之后仍然
-    /// "看起来是新的"，只能靠失效把它拿掉。失效失败也不影响正确性——受理时那一次按主键读的
-    /// `enabled` 会兜住（见 `AccelerationService::candidates`）。
+    /// "看起来是新的"，只能靠失效把它拿掉。失效失败也不影响正确性——受理前那次轻量读
+    /// （`acceptance_probe`）取的就是这一个开关，关掉的模型在它那里被当成"模型不存在"。
     pub async fn set_gateway_model_enabled(
         &self,
         gateway_model: &str,
@@ -2764,8 +2845,8 @@ impl RuntimeService {
     ///
     /// 停用即刻影响之后的受理：候选取数本来就同时读供给与渠道的开关，写入即生效，**不需要重发
     /// 修订**——启停是运行状态，不是定义。已受理的 Job 不受影响（候选已冻结在它们的快照里）。
-    /// 缓存里那份候选集带着的修订标识没变，因此只能靠失效拿掉；失效失败也只是让这次停用晚一个
-    /// TTL 生效，不会让停用丢失（下一轮对账或 TTL 到期后回源）。
+    /// 缓存里那份候选集带着的修订标识没变，失效拿不掉它就还会命中——但受理路径会按主键复核启用
+    /// 状态，停用照样在这一次受理上生效；失效只影响命中率。
     pub async fn set_offering_enabled(
         &self,
         offering_id: OfferingId,
@@ -3385,8 +3466,16 @@ impl GenerationService {
         };
         let candidates = match &probe {
             Some(probe) => self.acceleration.candidates(&request.model, probe).await?,
-            None => self.repository.active_offering(&request.model).await?,
+            None => CandidateSet {
+                candidates: self.repository.active_offering(&request.model).await?,
+                // 没有缓存：候选刚由数据库给出，取数时已经判过供给与渠道的启用状态。
+                enabled_offerings: None,
+            },
         };
+        // 复核结果只在缓存给出的候选集上是 `Some`（见 [`CandidateSet`]）：停用因此不依赖那次失效
+        // 有没有成功——被停用的供给或渠道在这一步变成不合格候选，一条都不合格时按平台侧故障处置。
+        let enabled_offerings = candidates.enabled_offerings.as_ref();
+        let candidates = &candidates.candidates;
         // 这次受理用哪条策略：按模型覆盖优先、其次全局那条。**一条策略都没有时走原来的选路
         // 函数**——零配置下的行为由构造保证与策略层引入之前逐位相同，而不是靠某个默认参数"应该
         // 等价"。策略是运行期配置，改它不影响已经受理的 Job：那些 Job 的候选早已固定在快照里。
@@ -3405,9 +3494,15 @@ impl GenerationService {
                     tag_channel_map: &policy.tag_channel_map,
                     account_tag: account_tag.as_deref(),
                 };
-                select_candidate_with_strategy(&request, branch, &candidates, &choice)?
+                select_candidate_with_strategy(
+                    &request,
+                    branch,
+                    candidates,
+                    enabled_offerings,
+                    &choice,
+                )?
             }
-            None => select_candidate(&request, branch, &candidates)?,
+            None => select_candidate(&request, branch, candidates, enabled_offerings)?,
         };
         // 受理时把定价随快照冻结，并算定这次的预授权额（保底额）。策略在受理时已经定下候选，
         // 所以售价**不必等上游回来**；冻结之后结算只读那份快照，受理之后改汇率、改加价系数、

@@ -40,6 +40,13 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn enabled_offerings(
+        &self,
+        _offering_ids: &[OfferingId],
+    ) -> Result<HashSet<OfferingId>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
         unused_repository()
     }
