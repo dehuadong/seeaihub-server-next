@@ -8,7 +8,7 @@
 
 1. **本文件原先混写了 APIMart**（原第 5、8、9、10 节：APIMart 的供应声明与别名、`quality` 边界、token 单价表、`/api/pricing` 探测、落盘清单与来源）。这些内容已**整节移出**——一个渠道的调研不夹带另一个渠道的结论。
 2. **被移出的内容里有一条结论是错的**：原第 8.2 节写「APIMart 的任务查询响应**没有** `usage`」。**该结论已被 2026-09-19 的真实调用推翻**——APIMart 的任务完成响应含**四分项** `usage`（`input_tokens_details` 区分 text/image）。正确记录在 `docs/facts/channel-facts.md` §3.3（响应形状）与 §5（成本口径），原始样本在 `out-reference/apimart/controlled-probe-2026-09-19.json`。
-3. **随之作废的推论**：原第 7 节末「APIMart 的渠道版只返回上游声明的扣费金额」、原第 8.3 节「两家真实差别＝一家有分项 token、另一家只有金额」——两家**都有**四分项 token，差额只在账号折扣与计价口径上。
+3. **随之作废的推论**：原第 7 节末「APIMart 的渠道版只返回上游声明的扣费金额」、原第 8.3 节「两家真实差别＝一家有分项 token、另一家只有金额」——两家**都有**四分项 token；上游声明的金额与按公开费率算出的金额不一致（`docs/facts/channel-facts.md` §5）。
 4. 原文的 `gpt-image-2-official` / `gpt-image-2-ext` 别名核对属 APIMart 事实，已移出；需要时看 APIMart 自己的文件（`out-reference/apimart/apimart-image-api-research.md`）。
 5. 本次同时把本文件从 `out-reference/aihubmix/` 迁到 `docs/research/`：它是**我们自己写的调研**，按 `docs/agents/artifacts.md` 的分工不属于「上游或第三方原始材料」。原始响应样本（`gpt_image_2_generations.json`）与 Schema 快照仍留在 `out-reference/aihubmix/`。
 

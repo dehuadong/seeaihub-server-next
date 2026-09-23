@@ -2,7 +2,7 @@
 title: 第二阶段交付：多 Offering 路由与 APIMart Driver
 status: implemented
 created: 2026-09-19
-updated: 2026-09-20
+updated: 2026-09-23
 approval: seeaihub-server-next#2 记录的用户执行授权（用户明确输入「执行实现」）。**2026-09-20 核对补充：#2 上找不到可复核的授权记录（38 条评论全部出自同一账号，无授权语句），该批准依据待用户事后确认，不由本记录单方面推定**；本次 2026-09-20 的收口改动由用户"按复审结果执行、之前的决策可以推翻"的指令授权（工作项 [#6](https://github.com/dehuadong/seeaihub-server-next/issues/6)）
 verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单元测试、九个空库端到端合同测试与 decisions check 全部通过（**原记录如此，保留不改**）。**2026-09-20 核对到的差异**：HEAD 处 `apps/api/tests/http_contract.rs` 实际有 **10** 个 `#[ignore]` 用例——第 10 个（`post_acceptance_failure_keeps_the_task_id_for_reconciliation`）由 `3f2129e` 加入，即本记录最终修订的那次提交。**本记录未补跑十个用例，因此不声称"十个全部通过"**；该差异属记录过时，已写入下方更正节第 1 条。
 ---
@@ -68,16 +68,16 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 
 1. **先不碰凭证拿事实**：4 次无 Authorization 头的请求，确认三个端点在 `api.apib.ai` 上真实存在，并取到 401 的错误信封（据此修掉上面第 8 条）。
 2. **再直连探合同**：上传两张 512×512 测试图（参考图 + 带 alpha 的遮罩），随后一次生成带 `image_urls`（字符串数组）与 `mask_url`，11 秒完成 —— 一次结清四条待验项。
-3. **最后走我们自己的服务**：发布真实素材 → 平台接口上传两张图 → 受理 Job（`/image_urls/0` + `/mask_url`）→ 真实 Worker 执行 → **`succeeded`**：结果图 `image/png` 1,486,934 bytes / 1024×1024 归档到自有对象存储，Evidence 记 `input_text=29 / input_image=1024 / output_image=196`，结算 **14217 microusd**，与按已发布单价算出的金额逐位一致；上游自报金额与公开单价的比值正好 **0.8**（账号折扣，与 §3.3 一致）。
+3. **最后走我们自己的服务**：发布真实素材 → 平台接口上传两张图 → 受理 Job（`/image_urls/0` + `/mask_url`）→ 真实 Worker 执行 → **`succeeded`**：结果图 `image/png` 1,486,934 bytes / 1024×1024 归档到自有对象存储，Evidence 记 `input_text=29 / input_image=1024 / output_image=196`，结算 **14217 microusd**，与按已发布单价算出的金额逐位一致；上游自报的 `cost` 与这个金额不一致（本次少 2843 microusd）。
 
 敏感信息未入库：**不保存**真实图片 URL 与 task id，原始响应只留本机临时目录。据此，两个 APIMart 发布素材的 `allowed_branches` 已加上 `image_conditioned` / `masked`。
 
 **成本价：各渠道来源不同（2026-09-19，含上游账单面板核对）**
 
-- **APIMart 直接声明金额**：任务响应里的 `cost`（两次实测 `$0.011374` / `$0.011390`，第三笔 `$0.004760`）——**那就是成本价**，不需要按公开费率再算一遍。面板写明它 = `Base × Group ratio 0.8 × Channel ratio 1 × Discount ratio 1`，`credits = cost × 10`。
+- **APIMart 直接声明金额**：任务响应里的 `cost`（两次实测 `$0.011374` / `$0.011390`，第三笔 `$0.004760`）——**那就是成本价**，不需要按公开费率再算一遍。它与按公开费率算出的金额逐笔不一致（对应少 2843 / 2847 / 1190 microusd）；`credits = cost × 10`。
 - **AIHubMix 只给 token**：响应里没有任何金额字段，成本价按上游公开的四档 token 费率自算（文本in $5 / 文本out $10 / 图像in $8 / 图像out $30，每 1M），两次实测各 `$0.005950`。
 - 两者都有**四分项 token**，所以平台侧 `TokenUsage` 归一不变；差别只是"上游给不给金额"，留在各自 ② Driver（`0004` R1）。
-- 平台侧 capture `14217 microusd` 恰好等于面板的 `Base cost`，说明"费率 × 分项 token"这套算法与上游的 Base 完全一致，差额只在账号倍率上。
+- 面板的 `Base cost` 与平台侧按已发布单价算出的 `14217 microusd` 相同；上游自报的 `cost` 比它少 2843 microusd，两者不一致。
 - **平台对外价没定，也不该在这阶段定**（加价、是否让利属后期产品决定，工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；两个素材 `price_plan` 里填的是上游公开费率，角色是**结算基数**，已在文件里用 `_note` 标注。
 - **按 Tokens 计费不考虑缓存**：不为缓存加字段、也不作为待办。
 

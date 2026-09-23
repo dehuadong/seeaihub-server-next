@@ -41,89 +41,12 @@
 - 免鉴权机器 Schema：`https://aihubmix.com/call/schema/models/{model}/endpoints`。
 - 输出 URL **约 30 分钟**过期，下载需带同一 `Authorization: Bearer`。
 
-### 2.2 同步 `/v1` 的真实响应（**用户早期采集**的样本，随仓库建立入库）
+### 2.2 同步 `/v1` 的响应形状
 
-`out-reference/aihubmix/gpt_image_2_generations.json`（HTTP 200，耗时 21.05 秒）：
+原始响应样例在 `out-reference/aihubmix/`；要点：同步面回 `data[0].b64_json`、顶层有 `created/background/output_format/quality/size/usage`，**没有任务 id**。
+### 2.3 异步 `/ai/v1` 的响应形状
 
-> **来源说明（2026-09-20 更正）**：这份样本**不是**本仓库的受控实测——它是**用户自己早期采集**的，响应体里的 `created = 1785485861` ⇒ **2026-07-31 16:17:41 +08:00**，随仓库建立提交 `1fe462a`（"establish independent image generation server"）入库。
-> 另外：**响应体没有 `model` 字段**，所以"它来自 `gpt-image-2`"是按文件名与 `out-reference/aihubmix/gpt-image-2.md` **推断**的，报文本身证明不了。
-
-```json
-{ "created": 1785485861, "background": "opaque", "output_format": "png",
-  "quality": "low", "size": "1024x1024",
-  "data": [ { "b64_json": "<2,096,080 字符 base64 PNG>" } ],
-  "usage": { "input_tokens": 13,
-             "input_tokens_details":  { "image_tokens": 0,   "text_tokens": 13 },
-             "output_tokens": 196,
-             "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
-             "total_tokens": 209 } }
-```
-
-**四分项 → 领域 `TokenUsage` 的映射（② 的归一职责）**：
-
-| 响应字段 | `TokenUsage` |
-| --- | --- |
-| `usage.input_tokens_details.text_tokens` | `input_text_tokens` |
-| `usage.input_tokens_details.image_tokens` | `input_image_tokens` |
-| `usage.output_tokens_details.text_tokens` | `output_text_tokens` |
-| `usage.output_tokens_details.image_tokens` | `output_image_tokens` |
-| `usage.total_tokens` | 一致性校验 |
-
-**按费率算一次**（microusd，`1_000_000 microusd = $1`）：
-
-```
-13×5,000,000 + 0×8,000,000 + 0×10,000,000 + 196×30,000,000 = 5,945,000,000
-÷ 1,000,000（向上取整） = 5,945 microusd = $0.005945
-```
-
-### 2.3 异步 `/ai/v1` 的真实响应
-
-> ⚠️ **本节原写于 2026-09-19，是一次重复验证——第一阶段（2026-09-18）已完成更完整的同类实测。**
-> 权威记录原是 `docs/research/gpt-image-2-inferera-research.md` **§13.1**（**该文件已于 2026-09-20 清理删除，提交 `ed140c2`**；`docs/research/` 这个位置本身保留；以下转述其结论）：三个场景（纯文生图 / 单图输入 / 图像+alpha mask）各一次真实付费调用，**创建与详情的 `usage` 均为「无」**；任务列表项只有 `id/object/model/status/output/error/created_at/completed_at/expires_at`，**无 prompt、无 metadata、无 correlation ID、无 usage**。
-> §13.3 第 6 条原已作出结论：`/ai/v1` 保留为 Adapter 已验证能力，**在提供可关联 usage/账单证据前，不发布为正式计费 Offering 的执行路径**。
-> 本节 2026-09-19 的实测**与该结论一致，不构成新发现**，仅补了 2.5 之前的一个样本。留此以供交叉核对，**结论归因于第一阶段**。
-
-**创建**（`{"model":"gpt-image-2","prompt":"…","n":1,"async":true}`，HTTP 200）：
-
-```json
-{"completed_at":null,"created_at":1789804016,"error":null,"expires_at":null,
- "id":"t_<…已脱敏…>","model":"gpt-image-2","object":"image",
- "output":[],"status":"pending"}
-```
-
-**轮询**（`GET /ai/v1/images/{id}`，HTTP 200，约 12 秒后终态）：
-
-```json
-{"completed_at":1789804028,"created_at":1789804016,"error":null,"expires_at":1789811227,
- "id":"t_<…已脱敏…>","model":"gpt-image-2","object":"image",
- "output":[{"b64_json":null,
-            "content_url":"https://aihubmix.com/ai/v1/images/<id>/content/res_…",
-            "index":0,"type":"file"}],
- "status":"completed"}
-```
-
-**这次实测确认的**：
-
-1. 任务对象**只有 9 个字段**：`id`、`object`、`model`、`status`、`output`、`error`、`created_at`、`completed_at`、`expires_at`；
-2. **任务对象里没有 `usage`**——全文检索 `"usage"` **0 次**；对历史任务列表（3 条已完成任务）检索同样为 0；
-3. `output[]` 项为 `{index, type, content_url, b64_json}`，本次 `b64_json: null`，只给 `content_url`；
-4. 状态：受理即 `pending`，十几秒内 `completed`；
-5. **`quality` 不是 `/ai/v1` 的顶层参数**：顶层传它被硬拒 ——
-   `HTTP 400 {"error":{"code":"schema_violation","message":"Unknown request parameter: \`quality\`.","type":"invalid_request_error"}}`；
-   ⇒ 在 `/ai/v1` 那族端点上必须放进 `extra`。**本平台不调用那族端点**：执行路径是同步 `/v1/*`，那里 `quality` 就在顶层（本仓库的发布素材已按顶层声明，不再有 `extra`）。**未知参数是硬拒绝，不静默接受**（与火山方舟相反）。
-
-**尚未测**：本次用的是 `gpt-image-2`（已退役），**未对 `gpt-image-2.5-flare`/`-sunburst` 做异步调用**；2.5 的异步任务对象形状是否相同**未验证**。
-
-**本渠道对第二阶段的直接含义**：**关键区分不是「哪个端点」，而是「同步还是异步」**。
-
-| 返回形态 | 端点 | 计量 |
-| --- | --- | --- |
-| **同步**响应体（`data[0].b64_json`） | `/v1/images/generations`、`/v1/images/edits` | **有**四分项 `usage` |
-| **任务对象**（`id` + 轮询 `/ai/v1/images/{id}`） | 仅 `/ai/v1/images/generations`（`async: true`；权威 Schema 中**只有它**声明 `async` 且 `supports_async=true`，`/v1/*` 未声明异步） | **无** `usage` |
-
-⇒ **任务式返回不带计量，是「任务对象」这种格式本身的性质，换端点也一样**（只要能异步，返回的就是任务对象）。第一阶段 §13.3 第 4 条据此选定 `/v1`：**其成功响应提供可审计 token usage，能完成 Price Snapshot + Metering Evidence 结算**。
-因此仓库现有计费路径（`TokenUsage` 四分项）**只与同步 `/v1` 相容**。
-
+原始响应样例在 `out-reference/aihubmix/`；要点：异步面给出任务 id 与轮询状态，金额字段仍然没有。
 ### 2.4 AIHubMix 的费率（四档）
 
 按 **Tokens 计费**（上游口径）：
@@ -190,68 +113,6 @@
 
 **计费**（两次相同）：`14×$5 + 0×$8 + 0×$10 + 196×$30` per 1M → **5950 microusd = $0.005950**。**响应里没有金额字段**，只有 token。
 
-### 2.6b 2.5-sunburst 的完整响应样例
-
-```json
-{ "created": 1789804584, "background": "opaque", "output_format": "png",
-  "quality": "low", "size": "1024x1024",
-  "data": [ { "b64_json": "<244,700 字符 base64 PNG>" } ],
-  "usage": { "input_tokens": 14,
-             "input_tokens_details":  { "image_tokens": 0,   "text_tokens": 14 },
-             "output_tokens": 196,
-             "output_tokens_details": { "image_tokens": 196, "text_tokens": 0 },
-             "total_tokens": 210 } }
-```
-
-（flare 那次 `b64_json` 为 320,708 字符，其余字段同形。）
-
-### 2.7 本渠道独立待办
-
-- ~~2.5 两款在同步 `/v1` 上是否同构~~ → **已测（2.6）：两款均同构** ✅
-- ~~`gpt-image-2.5-flare` 单独调用~~ → **已测（2.6）** ✅
-- ~~AIHubMix 的响应头里到底有没有逐请求标识~~ → **已测：有，`X-Request-ID`（§2.6）** ✅
-- 2.5 两款在**异步 `/ai/v1`** 上是否同样无 `usage` —— **未测**，且**不必测**：任务对象格式本身不带计量已由第一阶段 §13.1 三场景证实，且 `/ai/v1` 已判定不作为正式计费路径（2026-09-20 复核：该端点不带 `async` 时同样是任务对象，同样无 `usage`）；
-- ~~带参考图的编辑路径（`/v1/images/edits`，multipart）—— 第一阶段在 `gpt-image-2` 上测过（图片输入 1024 tokens），**2.5 未测**~~ → **已测（§2.14）**：2.5 一次调用发**两张**参考图（重复 `image[]` 部件）+ `background=transparent`，HTTP 200、图片输入 2545 tokens ✅
-
-### 2.8 发布 2.5 供给所需的渠道侧事实（就绪清单）
-
-供发布 ③ Profile / ④ Offering / ⑤ Price 时取用。**只列渠道侧已确认的事实**；发布动作本身属实现范围。
-
-**Profile（③）与 `gpt-image-2` 的差异**（来源：本地机器 Schema 快照，2026-09-19 抓取）：
-
-| 项 | `gpt-image-2` | 2.5 两款 |
-| --- | --- | --- |
-| `model.const` 字面值 | `gpt-image-2` | **`gpt-image-2.5-flare` / `gpt-image-2.5-sunburst`**（各与 `native_model_id` 同名） |
-| `quality` 取值 | `low`/`medium`/`high` | **新增 `xhigh`、`max`**，共 `low`/`medium`/`high`/`xhigh`/`max`/`auto`（默认 `auto`）；在本平台采用的同步 `/v1` 端点上是**顶层**参数 |
-| `moderation` | **无** | 上游 `/ai/v1` 机器 Schema 有（`auto`/`low`）；**素材按厂商契约声明**（2026-09-20 晚更正：不再因"`/v1` 族 Schema 没有"而收回，见 §2.9） |
-| `background` | 上游有 | 上游 `/ai/v1` 有；**素材按厂商契约声明**（同上；`transparent` 已被实测落实，见 §2.14） |
-| `n` | `min 1, max 10` | `min 1, max 10`（**同**） |
-
-**Offering（④）参数**：
-
-| 项 | 值 |
-| --- | --- |
-| `provider_kind` | `AIHubMix` |
-| `adapter_key` | `aihubmix-image-v1`（**沿用现有 Driver**，2.5 同构故不新增） |
-| `base_url` | `https://api.inferera.com`（Channel 字段，不写死） |
-| `credential_env` | `AIHUBMIX_API_KEY` |
-| `provider_model_id` | `gpt-image-2.5-flare` / `gpt-image-2.5-sunburst` |
-| 执行端点 | `/v1/images/generations`（文生图）、`/v1/images/edits`（图生图/编辑）——**同步** |
-| 参数位置（② 负责） | `quality` 在 `/v1/*` **顶层** |
-
-**Price（⑤）**：
-
-| 计费项 | 单价 |
-| --- | --- |
-| 文本输入 | `$5 / 1M tokens` |
-| 图像输入 | `$8 / 1M tokens` |
-| 文本输出 | `$10 / 1M tokens` |
-| 图像输出 | `$30 / 1M tokens` |
-
-与 `crates/domain/src/lib.rs:345-348` 的默认 `PriceRates` 逐项一致。**响应不返回金额**，结算按 `usage` 四分项 × 上述单价计算（已用真实响应验证：14 文本输入 + 196 图像输出 → $0.005950）。
-
-**本渠道就绪判定**：③④⑤ 所需事实**齐备**；② 沿用现有 Driver（2.5 实测同构）。
-
 ### 2.9 素材的参数面：以该模型对应端点的 `request.schema` 为准
 
 **执行路径是同步 `/v1/*`，没有 `extra` 这一层**（`extra` 属 `/ai/v1` 那族端点，见 §2.5）。素材声明的就是这两个端点 `request.schema` 里的字段：
@@ -265,19 +126,6 @@
 **2026-09-20 的两轮变化**：先把 `quality` 等从 `extra` 内提到顶层（那一轮还按第一方文档把 `background`/`output_compression`/`user`/`moderation` 声明在顶层）；同日又按端点 `request.schema` **收回那四项、去掉 `size`/`output_format` 自造的枚举、并修正 `gpt-image-2` 的 `quality`**（schema 里它没有 `auto`）。口径是：**声明面以端点 `request.schema` 为准，不以文档的宽面为准**（依据见 [`ADR-0018`](../adr/0018-open-parameters-by-first-party-docs.md) 与 [`ADR-0002`](../adr/0002-native-capability-schema-not-canonical.md) 的 2026-09-20 修订）。
 
 **（2026-09-20 晚更正：上一段的"以端点 Schema 为准"已被取代）** 声明面改为**按厂商契约**：聚合渠道转售的就是上游模型的能力，**渠道机器 Schema 写没写不构成渠道不能**；渠道若不接受某个已声明的取值，就表现为**渠道报错**，平台不静默降级、也不替渠道把字段吞掉。据此 `background` / `output_compression` / `moderation` 重新按厂商契约声明（枚举与默认值照厂商契约，不再以"这两个端点没有这四项"为由收回），参考图按厂商契约声明成字符串数组（≤16），`size` 按厂商的**像素型**声明。促成这次改口的是一条实测：`/v1/*` 的机器 Schema 里确实没有 `background`，但端点**接受并落实**了 `background=transparent`（§2.14）——窄 Schema 不等于端点不认。**唯一不变的是型号差异**：`gpt-image-2` 的 `quality` 仍按它自己的取值集合（不含 `auto`），那是型号面的事、不是渠道宽窄的事。
-
-### 2.10 已生成的发布素材
-
-| 文件 | 内容 |
-| --- | --- |
-| `config/bootstrap/gpt-image-2.5-flare.json` | `gpt-image-2.5-flare` 的**厂商合同**（顶层 `capability_schema`）+ 两条承载面（AIHubMix 下标 0、APIMart 下标 1）+ 各自 `price_plan`（草案） |
-| `config/bootstrap/gpt-image-2.5-sunburst.json` | 同上，`sunburst` |
-
-**（2026-09-20 晚更正）** 本节此前列的是**旧形状**的两份 AIHubMix 单供给素材（`aihubmix-gpt-image-2.5-flare.json` / `-sunburst.json`，顶层 `capability_schema` 兼作渠道面）；合同与承载面分层后，同一型号改成上面这两份"一份合同 + 多供给"的素材，旧形状文件已退役。
-
-两个文件都通过发布校验（承载面字段从合同可达、落到 Driver 能写上线文的字段名、`defaults` 键在合同里；见 `crates/application` 的发布期校验）。
-
-**前置（文件内 `_status` 已写明）**：未获「执行实现」授权前不得用于生产；素材是"草案 · 未发布"。
 
 ### 2.11 费率
 
@@ -451,17 +299,6 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 ⚠️ 注：`api.apib.ai` 与文档正文示例里的 `api.apimart.ai` 指向同一套服务；**平台固化使用用户指定的 `https://api.apib.ai/v1`**。
 
-### 3.6 本渠道独立待办
-
-- ~~`usage` 实际是否存在~~ → **实测：存在**（§3.3）✅
-- ~~分项粒度~~ → **实测：四分项，含 `cached_tokens`**（§3.3）✅
-- ~~`cost` / `credits_cost` 与 `usage` 的关系~~ → **已结清**：`cost` 是这次的实际扣费，`credits = cost × 10`（§5）✅
-- ~~`Idempotency-Key` 是否定义~~ → **机器 Schema 明确声明**（§3.4）✅
-- **异步状态取值集合** —— 本次实测见到的终态为 `completed`；完整集合仍以两份文档的**并集**处理（未知取值继续轮询，不得当失败）。**未逐一实测**，属 ② 层实现时按并集容错即可，不阻塞；
-- **`image_urls` 图生图路径** —— **已受控实测结清**（见 §3.7、留档 §6）；
-- ~~2.5 是否接受 `mask_url`（该字段不在 2.5 的生成文档里）~~ → **已实测：接受**，提交 200、轮询到 `completed`（§3.11）✅；遮罩是否**生效**只有弱信号，未严格证明。
-- **`sunburst` 型号** —— 未单独实测（目录中已确认在册，`endpoint_types` 与 flare 相同）；图生图按同渠道族 flare 的实测开放。
-
 ### 3.7 参考图与遮罩：必须先上传（**2026-09-19 已受控实测结清**）
 
 原始材料：`out-reference/apimart/uploads-images.cn.md`（上传页，2026-09-19 抓取）；实测记录见留档 §6。
@@ -559,50 +396,9 @@ AIHubMix 的 **`403` 是平台侧欠费/额度不足**——说的是**我们在
 
 正确做法：**每个渠道各自的 ② Driver 负责把它自己的响应归一成领域形状**（`TokenUsage`），差异留在各自的 Driver 与其测试里，不进入 ①③④⑤，也不互相推导。
 
-## 5. 平台成本价：各渠道怎么得到（2026-09-19，含上游账单面板核对）
+## 5. 平台成本价
 
-> **本阶段只做成本侧**：拿到上游的价格或计算方式，得到**平台成本价**。平台**对外价**（加价、让利）属后期产品决定，本阶段不做——见 §5.3 与工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)。
-
-### 5.1 两个渠道的成本来源不同（这正是 ② 层各归一的事）
-
-| 渠道 | 成本价从哪来 | 依据 |
-| --- | --- | --- |
-| **APIMart** | **上游直接声明金额**：任务响应里的 `cost`（USD）。`credits_cost = cost × 10` | `out-reference/apimart/controlled-probe-2026-09-19.json`、留档 §3/§6、上游账单面板 |
-| **AIHubMix** | **上游只给 token，金额要自己按费率算**：按 Tokens 计费，文本输入 **$5** / 文本输出 **$10** / 图像输入 **$8** / 图像输出 **$30**，每 1M tokens ⇒ 成本 = Σ(分项 token × 费率) | `docs/facts/channel-facts.md` §2.4/§2.6（同步 `/v1` 响应只有四分项 token，**没有金额字段**） |
-
-⇒ **不要用公开费率反算 APIMart 的成本**：它自己给了数，直接取 `cost`。用费率反算只会引入失真。
-
-### 5.2 实测成本（三笔，都是上游口径）
-
-| 渠道 / 调用 | token 分项（文本in / 图片in / 图片out） | **成本价** | 来源 |
-| --- | --- | --- | --- |
-| APIMart 走我们自己的服务 | 29 / 1024 / 196 | **$0.011374** | 上游 `cost`（= 面板 Actual cost） |
-| APIMart curl 直连 | 33 / 1024 / 196 | **$0.011390** | 上游 `cost`（= 面板 Actual cost） |
-| APIMart curl 直连（纯文生图） | 14 / 0 / 196 | **$0.004760** | 上游 `cost`（见留档 §3） |
-| AIHubMix 同步 `/v1`（2.5 两款） | 14 / 0 / 196 | **$0.005950** | 自算：14×$5 + 196×$30 per 1M（响应无金额字段） |
-
-**两个渠道的共同点**：都有**四分项 token**（`input_text` / `input_image` / `output_text` / `output_image`），所以平台侧的 `TokenUsage` 归一不变；差别只是"上游给不给金额"，留在各自 ② Driver 里（`0004` R1）。
-
-**结算基数与成本**：平台的**结算基数**是已发布 `price_plan` 的费率 × 真实分项 token；**APIMart 的成本直接取上游声明的 `cost`**，不用公开费率反算（决策见 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)）。**平台对外价未定**（工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。
-**缓存不参与**：本阶段按 Tokens 计费，**不区分缓存**——不建模缓存档、不为它加字段、也不把它当待办。
-
-### 5.3 平台侧现在怎么用这些数（以及没有做什么）
-
-- 平台结算用的是**已发布 `price_plan` 的费率 × 真实分项 token**。两个 APIMart 素材的 `price_plan` 现在填的是上游公开费率——它现在的角色是**结算基数**，不是"平台对外定价决定"。
-- **`owned_by` 不携带厂商信息（2026-09-20 登记）**：APIMart 的目录接口响应对**所有**模型都返回 `"owned_by": "custom"`（含 `gemini-*` 等明确非 OpenAI 的模型），因此它**既不能证明也不能否证**某个 `gpt-image-*` 的 Vendor 归属。原始材料见 `out-reference/apimart/catalog-models.json`。⇒ 本仓库 `vendor_id: OpenAI` 是**运营方的显式配置决定**（发布命令里的 `vendor_id` + `native_model_id`，见 `config/bootstrap/*.json` 与工作项 `#2` 的规划范围），不是由渠道字段推导出来的事实。
-- **平台对外价尚未决定**：要不要在基数之上加价、要不要在基数之上加价（账号侧差异不进平台口径），都是**后期产品决定**（跟踪工作项 [#5](https://github.com/dehuadong/seeaihub-server-next/issues/5)）。本阶段**只固化成本价**。
-- 上游声明的 `cost`（APIMart）作为**成本价**是对的，但**不能**反过来当作"可复现的计量事实"去替代分项 token（这也是金额型证据被否决的原因之一，见 `.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`）。**成本口径按渠道取数的决策见 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)**（原 `0016` 已合并进该条）：APIMart 取 `cost`、AIHubMix 按费率自算。
-
-### 5.4 逐笔调用与取数
-
-三笔真实调用的用量、上游自报金额与平台侧结算基数逐笔留档在 `docs/verification/paid-provider-calls.md`。
-
-**取数口径**：APIMart 的成本取上游声明的 `cost`；AIHubMix 不给金额字段，成本按已发布费率 × 真实分项 token 自算。**平台侧结算基数**是已发布费率 × 真实分项 token，与上游实收是两个量。
-
-**金额不替代计量**：金额随账号变化、不可复现，所以结算必须由分项 token 推出，上游声明的金额只用来核成本。
-
-**来源**：用户 2026-09-19 在会话中提供的两张上游控制台详情面板截图（含 `task_id` 与密钥标签，故截图本身不入库）。
-
+平台侧怎么取成本、怎么结算归 [`docs/design/0007`](../design/0007-pricing-floor-and-settlement.md) 与 [`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md)；本台账只记渠道侧事实，不重复平台口径。三笔真实调用的金额留档在 [`docs/verification/paid-provider-calls.md`](../verification/paid-provider-calls.md)。
 ---
 
 真实计费调用（授权依据、次数、花费、样本位置）留档在 `docs/verification/paid-provider-calls.md`。

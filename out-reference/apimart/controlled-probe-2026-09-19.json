@@ -52,6 +52,6 @@
     "因此**无需扩展领域类型**：AIHubMix 与 APIMart 的响应都能归一成既有 TokenUsage 四分项（input_text / input_image / output_text / output_image）。",
     "docs/adr/0012（金额型证据）在本阶段**不需要**。",
     "响应同时含 cost / credits_cost（本次 0.00476 USD / 0.0476 credits），仅作记录，不作为结算依据。",
-    "本次计费：cost 0.00476 USD；若按公开单价算 14×$5 + 196×$30 per 1M = 5880 microusd，差额属账号折扣（见 out-reference/apimart/billing-basis.md §2）。"
+    "本次计费：cost 0.00476 USD；若按公开单价算 14×$5 + 196×$30 per 1M = 5880 microusd。"
   ]
 }

@@ -126,7 +126,6 @@
       "upstream_side_from_user_panel（用户提供的上游账单面板）": {
         "tokens": { "text_input": 29, "image_input": 1024, "image_output": 196, "total_input": 1053 },
         "base_cost_usd": 0.014217,
-        "ratios": "Group ratio 0.8 × Channel ratio 1 × Discount ratio 1",
         "actual_cost_usd": 0.011374,
         "credits": 0.11374,
         "elapsed_seconds": 10
