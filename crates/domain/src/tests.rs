@@ -1,0 +1,542 @@
+use super::*;
+
+fn usage() -> TokenUsage {
+    TokenUsage {
+        input_tokens: 1051,
+        input_text_tokens: 27,
+        input_image_tokens: 1024,
+        output_tokens: 196,
+        output_text_tokens: 0,
+        output_image_tokens: 196,
+        total_tokens: 1247,
+    }
+}
+
+#[test]
+fn calculates_edit_charge_from_verified_usage() {
+    let snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    assert_eq!(snapshot.charge_microusd(&usage()), Ok(14_207));
+}
+
+/// 成本自算与对客扣费是**两个口径**：算式同一个，读的费率各自一份。
+///
+/// 今天 Price Plan 暂时兼作渠道成本费率，两份费率恰好是同一张表，所以两条路算出来的数
+/// 相同；用例把两份费率**人为设成不同的值**，钉住"成本读成本费率、扣费读对客费率"——
+/// 对客费率将来拆成自己的 CNY 向量时，成本不能跟着售价漂移。
+#[test]
+fn computed_cost_reads_the_channel_cost_rates_not_the_consumer_charge() {
+    let cost_snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    let consumer_snapshot =
+        snapshot_with_rates("CNY", 7_000_000, 9_000_000, 11_000_000, 40_000_000);
+
+    let cost = cost_snapshot
+        .cost_rates()
+        .expect("这条快照带 Price Plan")
+        .amount_microusd(&usage());
+    let charge = consumer_snapshot.charge_microusd(&usage());
+    // 成本：27 文本输入 × 5 + 1024 图像输入 × 8 + 196 图像输出 × 30（每 1M）。
+    assert_eq!(cost, Ok(14_207));
+    // 对客：同一份用量，换成对客那份费率，金额就不一样了。
+    assert_eq!(charge, Ok(17_245));
+    assert_ne!(
+        cost, charge,
+        "两份费率不同时，成本与对客扣费必须各自算各自的，不能互相顶替"
+    );
+    assert_eq!(
+        cost_snapshot.cost_currency(),
+        Some("USD"),
+        "成本币种取渠道声明的那一份，不假定 USD、也不跟着对客 CNY 走"
+    );
+}
+
+/// 造一份价格快照：四档费率按参数给，其余字段取与用例无关的定值。
+///
+/// `pricing` 留空 = 旧口径（已发布费率兼作对客费率、预授权回落平台兜底数）。
+fn snapshot_with_rates(
+    currency: &str,
+    text_input: u64,
+    image_input: u64,
+    text_output: u64,
+    image_output: u64,
+) -> PriceSnapshot {
+    PriceSnapshot {
+        price_plan_id: Some(PricePlanId::new()),
+        rates: Some(PriceRates {
+            currency: currency.to_owned(),
+            text_input_microusd_per_million: text_input,
+            image_input_microusd_per_million: image_input,
+            text_output_microusd_per_million: text_output,
+            image_output_microusd_per_million: image_output,
+        }),
+        formula: PricingFormula::TokenRates,
+        cost_unit_price_microusd: None,
+        captured_at: Utc::now(),
+        hit_candidate: None,
+        consumer_rates_cny: None,
+        tier_prices: None,
+        floor_amounts: None,
+        hold_microusd: None,
+        hold_source: None,
+        cost_basis: None,
+        reference_cost_microusd: None,
+        cost_currency: None,
+        markup_bps: None,
+        fx_rate: None,
+    }
+}
+
+#[test]
+fn rejects_inconsistent_usage() {
+    let mut invalid = usage();
+    invalid.total_tokens = 1;
+    assert_eq!(invalid.validate(), Err(DomainError::InconsistentUsage));
+}
+
+/// 成本来源的落库字符串是**库层 CHECK 的取值集合**，读写必须自洽：
+/// 落下去的值读不回来，等于把事实写成了一次性写入。
+#[test]
+fn provider_cost_sources_round_trip_through_their_stored_form() {
+    for source in [
+        ProviderCostSource::Computed,
+        ProviderCostSource::Declared,
+        ProviderCostSource::Unavailable,
+    ] {
+        assert_eq!(ProviderCostSource::parse(source.as_str()), Some(source));
+    }
+    assert_eq!(ProviderCostSource::parse("guessed"), None);
+}
+
+#[test]
+fn rejects_unsafe_state_jump() {
+    assert!(matches!(
+        JobState::Accepted.transition(JobState::Succeeded),
+        Err(DomainError::InvalidStateTransition { .. })
+    ));
+}
+
+#[test]
+fn reconciliation_cannot_be_promoted_to_success_without_evidence() {
+    assert!(matches!(
+        JobState::ReconciliationRequired.transition(JobState::Succeeded),
+        Err(DomainError::InvalidStateTransition { .. })
+    ));
+    assert_eq!(
+        JobState::ReconciliationRequired.transition(JobState::Failed),
+        Ok(JobState::Failed)
+    );
+}
+
+#[test]
+fn allows_lease_failure_before_provider_submission() {
+    assert_eq!(
+        JobState::Leased.transition(JobState::Failed),
+        Ok(JobState::Failed)
+    );
+}
+
+/// 一份发布在**某条供给**下的保底表：只按 `size` 填（OpenAI 系当前形态）。
+fn openai_floor_table() -> FloorTable {
+    FloorTable::from_json(&serde_json::json!({
+        "amounts": {"1K": 160_000, "2K": 250_000, "4K": 300_000},
+        "cap_microusd": 300_000,
+    }))
+    .expect("the published floor table parses")
+}
+
+/// 归位一次并查表：把"请求的 `size` → 档位 → 保底额"这条链走完。
+fn hold_for(
+    table: &FloorTable,
+    size: Option<&str>,
+    quality: Option<&str>,
+) -> Option<(u64, HoldSource)> {
+    let tier = resolve_size_tier(size, &SizeProfile::default());
+    table.lookup(tier.as_ref(), quality)
+}
+
+#[test]
+fn floor_lookup_takes_the_tier_the_request_asked_for() {
+    let table = openai_floor_table();
+    assert_eq!(
+        hold_for(&table, Some("2K"), None),
+        Some((250_000, HoldSource::Tier))
+    );
+    // `quality` 维留空即按 `size` 档：带任意质量都查到同一个 `size` 档保底额。
+    for quality in ["low", "medium", "high", "xhigh", "max", "auto"] {
+        assert_eq!(
+            hold_for(&table, Some("2K"), Some(quality)),
+            Some((250_000, HoldSource::Tier)),
+            "只填了 size 维时，quality 不该改变查到的档位"
+        );
+    }
+    // 档位写法的大小写不影响查表：调用方给 `2k` 与管理员的 `2K` 是同一个档。
+    assert_eq!(
+        hold_for(&table, Some("2k"), None),
+        Some((250_000, HoldSource::Tier))
+    );
+}
+
+/// **像素型 `size` 先归到档位再查表**：用户口径是"按分辨率保底、通过 `size` 判断 1K/2K/4K"。
+///
+/// 这条供给没发布尺寸档案（OpenAI 系当前的形态），所以走**最长边**阈值兜底。
+#[test]
+fn pixel_sizes_resolve_to_a_tier_before_the_lookup() {
+    let table = openai_floor_table();
+    assert_eq!(
+        hold_for(&table, Some("1024x1024"), None),
+        Some((160_000, HoldSource::Tier)),
+        "最长边 1024 ⇒ 1K 档"
+    );
+    assert_eq!(
+        hold_for(&table, Some("2048x2048"), None),
+        Some((250_000, HoldSource::Tier)),
+        "最长边 2048 ⇒ 2K 档"
+    );
+    assert_eq!(
+        hold_for(&table, Some("3840x2160"), None),
+        Some((300_000, HoldSource::Tier)),
+        "最长边 3840 ⇒ 4K 档"
+    );
+    // 阈值看的是**最长边**：短边小不改变档位。
+    assert_eq!(
+        hold_for(&table, Some("1024x2048"), None),
+        Some((250_000, HoldSource::Tier))
+    );
+    // 质量维照旧只在同一档位内取格。
+    assert_eq!(
+        hold_for(&table, Some("1024x1024"), Some("high")),
+        Some((160_000, HoldSource::Tier))
+    );
+}
+
+/// **该供给发布的档位像素表优先**：同一个像素在别的供给上属于别的档位，只有它自己的表算数。
+#[test]
+fn the_supply_size_profile_wins_over_the_longest_edge_fallback() {
+    let table = openai_floor_table();
+    // 这条供给把 1024x1024 归在 2K 档（各供给的档位像素不同）。
+    let profile = SizeProfile::from_json(&serde_json::json!({
+        "2K": {"1:1": "1024x1024", "16:9": "2048x1152"},
+    }))
+    .expect("the published size profile parses");
+    let tier = resolve_size_tier(Some("1024x1024"), &profile).expect("the profile knows this cell");
+    assert_eq!(tier.tier, "2K");
+    assert_eq!(
+        table.lookup(Some(&tier), None),
+        Some((250_000, HoldSource::Tier)),
+        "按该供给自己的档位像素表归位，最长边兜底不参与"
+    );
+    // 表里没有这一格 ⇒ 回到最长边兜底（最长边 1024 ⇒ 1K）。
+    let tier = resolve_size_tier(Some("1024x768"), &profile).expect("pixels always resolve");
+    assert_eq!(tier.tier, "1K");
+    assert_eq!(
+        table.lookup(Some(&tier), None),
+        Some((160_000, HoldSource::Tier))
+    );
+}
+
+#[test]
+fn auto_and_a_missing_size_take_the_default_tier() {
+    let table = openai_floor_table();
+    // `size = auto` ⇒ 默认档 2K（中间档：既不是最小、也不是最大）。
+    assert_eq!(
+        hold_for(&table, Some("auto"), None),
+        Some((250_000, HoldSource::AutoTier))
+    );
+    // 没给 size 与 `auto` 同义：都是"调用方没钉尺寸、由模型自选"。
+    assert_eq!(
+        hold_for(&table, None, None),
+        Some((250_000, HoldSource::AutoTier))
+    );
+    // `auto` 也照旧受质量维影响。
+    assert_eq!(
+        hold_for(&table, Some("auto"), Some("high")),
+        Some((250_000, HoldSource::AutoTier))
+    );
+}
+
+/// **空串不是"没给"**：`size` 的字面量就是调用方说的那个尺寸，平台不替它 trim、也不把
+/// "给了个空"当成"没说话"再猜一个默认档——归不出就回落该供给的封顶保底值。
+#[test]
+fn an_empty_or_padded_size_is_given_and_is_not_the_missing_size() {
+    let table = openai_floor_table();
+    assert_eq!(
+        resolve_size_tier(Some(""), &SizeProfile::default()),
+        None,
+        "空串归不出档位，不落到 `auto` 的默认档上"
+    );
+    assert_eq!(
+        hold_for(&table, Some(""), None),
+        Some((300_000, HoldSource::SupplyCap)),
+        "空串与'没给这个字段'必须落到不同的保底额上"
+    );
+    assert_eq!(
+        hold_for(&table, None, None),
+        Some((250_000, HoldSource::AutoTier)),
+        "只有字段缺失才走 `auto` 的默认档 2K"
+    );
+    // 纯空白同理：它也是一个字面量，不是"没给"。
+    assert_eq!(
+        hold_for(&table, Some("  "), None),
+        Some((300_000, HoldSource::SupplyCap))
+    );
+    // `auto` 只有这一个写法：别名与带空格的写法都照字面读，认不出即回落。
+    for value in ["AUTO", "Auto", " auto", "auto "] {
+        assert_eq!(
+            hold_for(&table, Some(value), None),
+            Some((300_000, HoldSource::SupplyCap)),
+            "`{value}` 不是那个字面量 `auto`"
+        );
+    }
+}
+
+#[test]
+fn floor_lookup_falls_back_to_the_supply_cap_when_the_tier_cannot_be_resolved() {
+    let table = openai_floor_table();
+    // 比例型只说了形状、没说分辨率：归不出档位 ⇒ 回落该供给的封顶保底值。
+    assert_eq!(
+        hold_for(&table, Some("16:9"), None),
+        Some((300_000, HoldSource::SupplyCap))
+    );
+    // 认不出的取值同理。
+    assert_eq!(
+        hold_for(&table, Some("huge"), None),
+        Some((300_000, HoldSource::SupplyCap))
+    );
+    // 归得出档位、但表里没有这一档 ⇒ 也是封顶值。
+    let partial = FloorTable::from_json(&serde_json::json!({
+        "amounts": {"1K": 160_000},
+        "cap_microusd": 300_000,
+    }))
+    .expect("the published floor table parses");
+    assert_eq!(
+        hold_for(&partial, Some("4K"), None),
+        Some((300_000, HoldSource::SupplyCap))
+    );
+}
+
+#[test]
+fn floor_lookup_falls_back_to_the_platform_default_when_the_supply_declares_nothing() {
+    let empty = FloorTable::from_json(&serde_json::json!({})).expect("an empty table is legal");
+    assert!(empty.is_empty());
+    // 连封顶保底值都没有 ⇒ 查不到，由调用方回落到平台兜底数。
+    assert_eq!(hold_for(&empty, Some("2K"), None), None);
+    assert_eq!(hold_for(&empty, Some("auto"), None), None);
+    assert_eq!(hold_for(&empty, Some("1024x1024"), None), None);
+}
+
+#[test]
+fn floor_lookup_prefers_the_quality_specific_entry_then_the_size_entry() {
+    let table = FloorTable::from_json(&serde_json::json!({
+        "amounts": {"2K": 250_000, "2K/high": 900_000, "4K": 300_000},
+    }))
+    .expect("the published floor table parses");
+    assert_eq!(
+        hold_for(&table, Some("2K"), Some("high")),
+        Some((900_000, HoldSource::Tier))
+    );
+    // 没为这个质量单列 ⇒ 取该档位"任意质量"的那一格，不拿别的档位顶上。
+    assert_eq!(
+        hold_for(&table, Some("2K"), Some("low")),
+        Some((250_000, HoldSource::Tier))
+    );
+    // 该档位连"任意质量"都没有（只有 `2K/high`）⇒ 算没查到这一档。
+    let quality_only = FloorTable::from_json(&serde_json::json!({
+        "amounts": {"2K/high": 900_000},
+        "cap_microusd": 300_000,
+    }))
+    .expect("the published floor table parses");
+    assert_eq!(
+        hold_for(&quality_only, Some("2K"), Some("low")),
+        Some((300_000, HoldSource::SupplyCap))
+    );
+    // `auto` 取默认档 `2K`：它只有质量单列 ⇒ 质量对得上就用它。
+    assert_eq!(
+        hold_for(&quality_only, Some("auto"), Some("high")),
+        Some((900_000, HoldSource::AutoTier))
+    );
+    // 默认档没有这个质量的那一格 ⇒ 回落封顶值，不拿别的档位顶上。
+    assert_eq!(
+        hold_for(&quality_only, Some("auto"), Some("low")),
+        Some((300_000, HoldSource::SupplyCap))
+    );
+}
+
+#[test]
+fn a_floor_table_that_declares_one_tier_twice_is_rejected() {
+    // 规范化之后撞到同一个档位：同一档两个保底额，查出来的数就不确定了。
+    let error = FloorTable::from_json(&serde_json::json!({
+        "amounts": {"2K": 250_000, "2k": 260_000},
+    }))
+    .expect_err("the same tier twice is ambiguous");
+    assert!(error.contains("2K"), "{error}");
+    assert!(
+        FloorTable::from_json(&serde_json::json!({"amounts": {"2K/": 1}})).is_err(),
+        "半截的 size/quality 键不是档位"
+    );
+}
+
+#[test]
+fn fx_conversion_is_fixed_point_and_rounds_up() {
+    let rate = FxRate {
+        currency: "USD".to_owned(),
+        // 1 美元 = 7.1 元人民币。
+        rate_micros: 7_100_000,
+        effective_at: Utc::now(),
+    };
+    // 11354 微美元 × 7.1 = 80613.4 微元 ⇒ 向上取整 80614。
+    assert_eq!(rate.to_cny_microusd(11_354), Ok(80_614));
+    assert_eq!(rate.to_cny_microusd(0), Ok(0));
+    // 折算率是定点整数：1:1 的币种（例如人民币自己）折出来逐位不变。
+    let identity = FxRate {
+        currency: "CNY".to_owned(),
+        rate_micros: FX_RATE_DENOMINATOR,
+        effective_at: Utc::now(),
+    };
+    assert_eq!(identity.to_cny_microusd(5950), Ok(5950));
+}
+
+/// 有定价时实收读**对客费率向量**，不是已发布费率；没有定价时才走旧口径。
+///
+/// 两份费率**人为设成不同的值**：拿错一份就会算出另一个数，用例因此钉得住"实收按哪份费率"。
+#[test]
+fn the_charge_reads_the_consumer_vector_when_the_snapshot_carries_pricing() {
+    let mut snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    assert_eq!(snapshot.charge_microusd(&usage()), Ok(14_207), "旧口径");
+    assert_eq!(snapshot.hold_microusd, None);
+    snapshot.consumer_rates_cny = Some(ConsumerRatesCny {
+        text_input_micros_per_million: 7_000_000,
+        image_input_micros_per_million: 9_000_000,
+        text_output_micros_per_million: 11_000_000,
+        image_output_micros_per_million: 40_000_000,
+    });
+    snapshot.cost_basis = Some(CostBasis::Declared);
+    snapshot.reference_cost_microusd = Some(11_354);
+    snapshot.cost_currency = Some("USD".to_owned());
+    snapshot.markup_bps = Some(2_000);
+    snapshot.hold_microusd = Some(250_000);
+    snapshot.hold_source = Some(HoldSource::Tier);
+    snapshot.fx_rate = Some(FxRate {
+        currency: "USD".to_owned(),
+        rate_micros: 7_100_000,
+        effective_at: Utc::now(),
+    });
+    assert_eq!(
+        snapshot.charge_microusd(&usage()),
+        Ok(17_245),
+        "对客费率向量"
+    );
+    // 成本侧不受影响：它仍读该渠道的成本费率。
+    assert_eq!(
+        snapshot
+            .cost_rates()
+            .expect("这条快照带 Price Plan")
+            .amount_microusd(&usage()),
+        Ok(14_207)
+    );
+    assert_eq!(snapshot.hold_microusd, Some(250_000));
+    assert_eq!(
+        snapshot.fx_rate.as_ref().map(|rate| rate.rate_micros),
+        Some(7_100_000)
+    );
+}
+
+/// 历史快照（没有 `consumer_rates_cny` / `hold_microusd` 这些键）必须照样读得回来。
+///
+/// 库里的 `price_snapshot` 是 jsonb：加字段这件事只有在**旧 JSON 仍能解析**时才不破坏
+/// 已受理 Job 的结算——解析失败会让历史 Job 直接读不出来。
+#[test]
+fn a_snapshot_without_the_pricing_keys_still_parses() {
+    let legacy = serde_json::json!({
+        "price_plan_id": PricePlanId::new(),
+        "rates": {
+            "currency": "USD",
+            "text_input_microusd_per_million": 5_000_000,
+            "image_input_microusd_per_million": 8_000_000,
+            "text_output_microusd_per_million": 10_000_000,
+            "image_output_microusd_per_million": 30_000_000,
+        },
+        "captured_at": Utc::now(),
+    });
+    let snapshot: PriceSnapshot =
+        serde_json::from_value(legacy).expect("a legacy snapshot must still parse");
+    assert_eq!(snapshot.consumer_rates_cny, None);
+    assert_eq!(snapshot.hold_microusd, None);
+    assert_eq!(snapshot.fx_rate, None);
+    assert_eq!(snapshot.hit_candidate, None);
+    assert_eq!(
+        snapshot.formula,
+        PricingFormula::TokenRates,
+        "历史快照缺这个键时按当时唯一存在的计价形态读"
+    );
+    assert_eq!(snapshot.charge_microusd(&usage()), Ok(14_207));
+}
+
+/// 对客实收的取值链只有两条：对客费率向量，或 Price Plan 的费率（旧口径）。
+///
+/// 两条都没有 = 这条供给**没有对客计费基准**：算不出实收，返回错误由调用方按平台侧故障
+/// 处置（发布期已拒；只有历史修订才可能走到这里）。**不按 0 结算**——0 元等于白送。
+#[test]
+fn a_supply_without_a_consumer_basis_cannot_be_charged() {
+    let mut snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    snapshot.price_plan_id = None;
+    snapshot.rates = None;
+    snapshot.formula = PricingFormula::UpstreamDeclared;
+    snapshot.cost_currency = Some("USD".to_owned());
+    assert_eq!(
+        snapshot.charge_microusd(&usage()),
+        Err(DomainError::MissingConsumerRate)
+    );
+    assert_eq!(snapshot.cost_rates(), None);
+    assert_eq!(
+        snapshot.cost_currency(),
+        Some("USD"),
+        "声明还在：成本记账要用它，但对客金额与它无关"
+    );
+}
+
+/// 按张 / 按次的一笔金额逐位等于"数量 × 单价"，溢出按错误落。
+#[test]
+fn unit_prices_multiply_bit_exactly() {
+    // 3 张 × 11_354 微单位 = 34_062。
+    assert_eq!(unit_amount_microusd(3, 11_354), Ok(34_062));
+    // 1 次 × 11354 = 11354（按次就是一次的钱）。
+    assert_eq!(unit_amount_microusd(1, 11_354), Ok(11_354));
+    assert_eq!(unit_amount_microusd(0, 11_354), Ok(0));
+    assert_eq!(
+        unit_amount_microusd(u64::MAX, 2),
+        Err(DomainError::ArithmeticOverflow)
+    );
+}
+
+#[test]
+fn pricing_formulas_round_trip_through_their_stored_form() {
+    for formula in [
+        PricingFormula::TokenRates,
+        PricingFormula::PerImage,
+        PricingFormula::PerCall,
+        PricingFormula::UpstreamDeclared,
+    ] {
+        assert_eq!(PricingFormula::parse(formula.as_str()), Some(formula));
+    }
+    assert_eq!(PricingFormula::parse("by_the_hour"), None);
+    assert!(PricingFormula::PerImage.takes_unit_price());
+    assert!(PricingFormula::PerCall.takes_unit_price());
+    assert!(!PricingFormula::TokenRates.takes_unit_price());
+    assert!(!PricingFormula::UpstreamDeclared.takes_unit_price());
+}
+
+#[test]
+fn hold_sources_and_cost_bases_round_trip_through_their_stored_form() {
+    for source in [
+        HoldSource::Tier,
+        HoldSource::AutoTier,
+        HoldSource::SupplyCap,
+        HoldSource::PlatformDefault,
+    ] {
+        assert_eq!(HoldSource::parse(source.as_str()), Some(source));
+    }
+    assert_eq!(HoldSource::parse("guessed"), None);
+    for basis in [CostBasis::Computed, CostBasis::Declared] {
+        assert_eq!(CostBasis::parse(basis.as_str()), Some(basis));
+    }
+    assert_eq!(CostBasis::parse("unavailable"), None);
+}

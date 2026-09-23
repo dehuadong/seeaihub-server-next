@@ -2,7 +2,7 @@
 title: 对客请求体扁平化与 image/mask 角色化，AIHubMix 去掉 extra
 status: implemented
 created: 2026-09-20
-updated: 2026-09-20
+updated: 2026-09-23
 approval: 用户 2026-09-20 指出"`native_parameters` 是多余的、其下应该都是顶层""`quality` 怎么还是在 `extra`""`asset_bindings` 应兼容 OpenAI 的 `mask`"并要求直接实现（GitHub 上没有对应的授权语句记录，本条只陈述出处，不额外推定）
 verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features` 全部通过；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **13/13 通过**（含参考图、遮罩、上传失败三条真实链路，两个 OpenAI 兼容入口的**同步**响应，以及并发上限）
 ---
@@ -79,7 +79,7 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
 
 | 行为 | 证据 |
 | --- | --- |
-| 扁平请求体受理成功 | `apps/api/tests/http_contract.rs` 的 `route_request`（全部端到端用例都走它） |
+| 扁平请求体受理成功 | `apps/api/tests/http_contract/harness.rs` 的 `route_request`（全部端到端用例都走它） |
 | 参考图：调用方给 `image`，平台落到 APIMart 的 `image_urls` | `apimart_driver_uploads_reference_images_before_submitting` |
 | 遮罩：`image` + `mask` 各落各的位置、各上传一次 | `apimart_driver_uploads_reference_image_and_mask_together` |
 | 候选表达不了参考图时不合格 | `injects_array_bindings_into_the_vendors_own_array_parameter` 的后半段 |

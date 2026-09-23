@@ -1,0 +1,1549 @@
+use super::*;
+
+/// 同一个网关模型的**并发发布**：替换必须真的是一次替换——两份修订的 active 条目不得并存。
+///
+/// 为什么单独验这一条：唯一索引从"每型号每档一条"换成"每型号每条供给一行"之后，它不再能拦住
+/// "两份修订同时生效"。而"active 候选跨修订并存"是**读时**才会暴露的问题：表现是这个型号的
+/// 所有请求一起失败（平台侧故障），直到有人重新发布一次。发布事务按名字取事务级咨询锁就是为了
+/// 让这件事不可能发生——没有那把锁时，两条并发发布的"先失效、后插入"会交错。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn concurrent_publications_of_one_gateway_model_leave_a_single_active_revision() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+
+    let model = "concurrent-publish-model";
+    let mut tasks = Vec::new();
+    for index in 0..6_u64 {
+        let mut offering = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+        offering["routing_priority"] = json!(index % 2);
+        offering["weight"] = json!(index + 1);
+        let body = publication_body(model, "route-test-1", None, vec![offering], None);
+        let client = client.clone();
+        let url = format!("{base_url}/api/v1/runtime-revisions");
+        let token = admin_token.clone();
+        tasks.push(tokio::spawn(async move {
+            client
+                .post(url)
+                .bearer_auth(token)
+                .json(&body)
+                .send()
+                .await
+                .expect("concurrent publication")
+                .status()
+        }));
+    }
+    for task in tasks {
+        let status = task.await.expect("publication task must not panic");
+        assert_eq!(status, StatusCode::OK, "并发发布各自都该成功");
+    }
+
+    let revisions: i64 = sqlx::query_scalar(
+        "SELECT count(DISTINCT runtime_revision_id) FROM publication.runtime_entries
+         WHERE active AND gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("active revisions");
+    assert_eq!(
+        revisions, 1,
+        "同一名字的 active 条目必须来自同一次发布（并发发布不得交错）"
+    );
+
+    // 受理照常：跨修订并存会让这个型号的所有请求一起失败。
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        "concurrent-publish-0001",
+        &route_request(model, "concurrent publish"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "并发发布之后这个型号仍要能受理（没有 Worker，只会等到超时）：{body}"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 第二阶段的**发布素材**要真的能用：一个 Vendor Model 一份文件、只落**一份合同**，
+/// 而每个候选各带**自己的承载面**——缺一不可：素材发不出去、或候选没带上自己的承载面，
+/// 都算没覆盖。
+///
+/// 素材本身就是完整的发布命令（顶层一份合同 + 两条供给），所以直接按它发布：
+/// AIHubMix 下标 0（收 `image` / `mask`），APIMart 下标 1（收 `image_urls` / `mask_url`），
+/// 两家能承载的字段面不同，正是"合同一份、承载面各一份"要覆盖的情形。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let material: Value = serde_json::from_str(include_str!(
+        "../../../../config/bootstrap/gpt-image-2.5-flare.json"
+    ))
+    .expect("2.5 material parses");
+    let model = material["native_model_id"]
+        .as_str()
+        .expect("native model id")
+        .to_owned();
+    // 路由条目挂的是**平台对客名**：合同按厂商原生名落行，候选集按对客名生效。种子素材不写
+    // 这个字段，按发布期的回退规则取厂商原生名；平台自命名的例子见命名层那条用例。
+    let gateway = material["gateway_model"]
+        .as_str()
+        .unwrap_or(&model)
+        .to_owned();
+    let revision = material["native_revision"]
+        .as_str()
+        .expect("native revision")
+        .to_owned();
+    let offerings = material["offerings"]
+        .as_array()
+        .expect("offerings must be an array")
+        .clone();
+    assert_eq!(offerings.len(), 2, "一份素材两条供给");
+    assert_eq!(
+        offerings[0]["provider_kind"], "AIHubMix",
+        "下标 0 是首选：AIHubMix"
+    );
+    assert_eq!(
+        offerings[1]["provider_kind"], "APIMart",
+        "下标 1 是次选：APIMart"
+    );
+    // 两家能承载的面必须真的不同——否则这个用例覆盖不到"承载面各自一份"。
+    let carriers = [
+        offerings[0]["carrier_schema"].clone(),
+        offerings[1]["carrier_schema"].clone(),
+    ];
+    assert_ne!(
+        carriers[0], carriers[1],
+        "this test only covers the split surface if the two carriers actually differ"
+    );
+
+    let published = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&material)
+        .send()
+        .await
+        .expect("publication request");
+    assert_eq!(
+        published.status(),
+        StatusCode::OK,
+        "the prepared 2.5 material must be publishable: {:?}",
+        published.text().await
+    );
+
+    // 合同是**模型级唯一一份**：同一个型号的这一版只落一行，内容就是顶层那一份。
+    let contracts = sqlx::query(
+        "SELECT id, capability_schema FROM catalog.vendor_models
+         WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = $3",
+    )
+    .bind(material["vendor_id"].as_str().expect("vendor id"))
+    .bind(&model)
+    .bind(&revision)
+    .fetch_all(&pool)
+    .await
+    .expect("contract rows");
+    assert_eq!(contracts.len(), 1, "one contract per vendor model revision");
+    let stored_contract: Value = contracts[0].try_get("capability_schema").expect("contract");
+    assert_eq!(
+        stored_contract, material["capability_schema"],
+        "the stored contract must be the one given at the top level"
+    );
+
+    // 每个候选携带**它自己**的承载面，而合同只读那一份。
+    let rows = sqlx::query(
+        "SELECT o.provider_model_id, o.adapter_key, o.carrier_schema, o.parameter_mapping,
+                c.provider_kind, vm.capability_schema
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         JOIN supply.channels c ON c.id = o.channel_id
+         JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+         WHERE re.active AND re.gateway_model = $1
+         ORDER BY re.routing_priority",
+    )
+    .bind(&gateway)
+    .fetch_all(&pool)
+    .await
+    .expect("candidate rows");
+    assert_eq!(rows.len(), 2, "both providers must be active candidates");
+
+    let stored_carriers: Vec<Value> = rows
+        .iter()
+        .map(|row| row.try_get("carrier_schema").expect("carrier"))
+        .collect();
+    assert_ne!(
+        stored_carriers[0], stored_carriers[1],
+        "each candidate must carry its own surface, not a shared one"
+    );
+    for (index, offering) in offerings.iter().enumerate() {
+        let row = &rows[index];
+        let provider_model_id: String = row.try_get("provider_model_id").expect("provider model");
+        let adapter_key: String = row.try_get("adapter_key").expect("adapter key");
+        assert_eq!(provider_model_id, offering["provider_model_id"]);
+        assert_eq!(adapter_key, offering["adapter_key"]);
+        assert_eq!(
+            stored_carriers[index], offering["carrier_schema"],
+            "candidate {index} must carry its own surface"
+        );
+        assert_eq!(
+            stored_carriers[index], carriers[index],
+            "候选带上线的承载面必须逐字就是素材里那一份"
+        );
+        // 每个候选读到的合同都是同一份，且它的 `model.const` 就是该型号。
+        let contract: Value = row.try_get("capability_schema").expect("contract");
+        assert_eq!(contract, stored_contract);
+        assert_eq!(contract["properties"]["model"]["const"], model);
+        // 承载面的每个字段名都要**从合同可达**（R1 的判据，这里独立复核一遍）：要么合同直接声明，
+        // 要么被 `rename` 接过去——线上名不必等于合同名（APIMart 的 `image_urls` 就是这么来的）。
+        let mapping: Value = row.try_get("parameter_mapping").expect("mapping");
+        let wires: Vec<Value> = mapping["rename"]
+            .as_object()
+            .map(|renames| renames.values().cloned().collect())
+            .unwrap_or_default();
+        for name in stored_carriers[index]["properties"]
+            .as_object()
+            .expect("carrier properties")
+            .keys()
+        {
+            let declared = contract["properties"]
+                .as_object()
+                .expect("contract properties")
+                .contains_key(name);
+            let renamed = wires
+                .iter()
+                .any(|wire| wire.as_str() == Some(name.as_str()));
+            assert!(
+                declared || renamed,
+                "carrier field {name} must be reachable from the contract"
+            );
+        }
+    }
+
+    // 快照指纹跟着"合同 + 承载面"走：两个候选承载面不同，指纹就该不同。
+    let snapshot: Value = sqlx::query_scalar(
+        "SELECT snapshot FROM publication.runtime_revisions rr
+         JOIN publication.runtime_entries re ON re.runtime_revision_id = rr.id
+         WHERE re.active AND re.gateway_model = $1 LIMIT 1",
+    )
+    .bind(&gateway)
+    .fetch_one(&pool)
+    .await
+    .expect("runtime revision snapshot");
+    let candidates = snapshot["candidates"]
+        .as_array()
+        .expect("snapshot candidates");
+    assert_eq!(candidates.len(), 2);
+    for candidate in candidates {
+        assert!(
+            candidate.get("schema_hash").is_none(),
+            "快照指纹必须覆盖合同与承载面，不再是只有一份 schema 的哈希"
+        );
+        assert!(candidate["contract_carrier_hash"].is_string());
+    }
+    assert_ne!(
+        candidates[0]["contract_carrier_hash"], candidates[1]["contract_carrier_hash"],
+        "different carriers must produce different snapshot fingerprints"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 承载面 ⊆ 合同（R1）：供给不能凭空多出调用方可提交的字段。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn carrier_field_outside_the_contract_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+
+    let model = "contract-boundary-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    // 承载面多声明了 `quality`：合同里没有它，客户端按合同提交永远不会发这个名字。
+    let carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "contract-boundary-1",
+        contract,
+        vec![("aihubmix-image-v1", carrier)],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a carrier field the contract does not declare must be rejected"
+    );
+
+    // 把 `quality` 补进合同后同一份承载面就能发布：拒绝的是那条边界，不是 `quality` 本身。
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "contract-boundary-2",
+        contract,
+        vec![("aihubmix-image-v1", carrier)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 承载面 ⊆ Driver 能写上线文的字段名（R2）：声明了发不出去的字段就拒绝。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn carrier_field_the_driver_cannot_write_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+
+    let model = "driver-boundary-model";
+    // `resolution` 是 APIMart 那一侧的渠道字段名，AIHubMix 的 Driver 写不出去。
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "resolution": {"type": "string", "enum": ["1k", "2k"]}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "driver-boundary-1",
+        contract.clone(),
+        vec![("aihubmix-image-v1", contract.clone())],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a carrier field the driver cannot write must be rejected"
+    );
+
+    // 同一份声明面挂到能写 `resolution` 的 Driver 上就能发布：判的是"发得出去吗"。
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "driver-boundary-2",
+        contract.clone(),
+        vec![("apimart-image-v1", contract)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 合同行不可变：同一 (vendor, model, revision) 重发幂等、不就地改写；
+/// 内容不同的重发要拒绝；新修订才落新行。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idempotent() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "immutable-contract-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let publish = |revision: &'static str, contract: Value| {
+        let client = client.clone();
+        let base_url = base_url.clone();
+        let admin_token = admin_token.clone();
+        async move {
+            publish_with_surfaces(
+                &client,
+                &base_url,
+                &admin_token,
+                model,
+                revision,
+                contract.clone(),
+                vec![("aihubmix-image-v1", contract)],
+            )
+            .await
+        }
+    };
+
+    assert_eq!(
+        publish("immutable-1", contract.clone()).await,
+        StatusCode::OK
+    );
+    let first = contract_row(&pool, model, "immutable-1").await;
+    // 同一修订重发（内容相同）：幂等——还是那一行，且**没有**被改写（时间戳与内容都不变）。
+    assert_eq!(
+        publish("immutable-1", contract.clone()).await,
+        StatusCode::OK
+    );
+    let again = contract_row(&pool, model, "immutable-1").await;
+    assert_eq!(again.0, first.0, "a republish must not create a second row");
+    assert_eq!(
+        again.1, first.1,
+        "a republish must not rewrite the contract"
+    );
+    assert_eq!(
+        again.2, first.2,
+        "a republish must not touch the row at all"
+    );
+
+    // 同一修订换个合同：拒绝。合同落库后不可改，改合同要发新修订。
+    let changed = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string"}
+    }));
+    assert_eq!(
+        publish("immutable-1", changed).await,
+        StatusCode::BAD_REQUEST,
+        "the same revision must not accept a different contract"
+    );
+    let after = contract_row(&pool, model, "immutable-1").await;
+    assert_eq!(
+        after, first,
+        "a rejected republish must leave the row untouched"
+    );
+
+    // 新修订落新行：同一个模型可以有多版合同，但每一版只有一份。
+    assert_eq!(
+        publish("immutable-2", contract.clone()).await,
+        StatusCode::OK
+    );
+    let revisions: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM catalog.vendor_models WHERE native_model_id = $1")
+            .bind(model)
+            .fetch_one(&pool)
+            .await
+            .expect("contract revision count");
+    assert_eq!(revisions, 2, "a new revision is a new contract row");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 显式默认值的每个键必须被这条供给承载：声明了一个发不出去的默认值，发布被拒。
+///
+/// 与"承载面 ⊆ 合同 ⊆ Driver 能写上线文的名字"同一条道理——声明了却做不到，就是声明与行为分了家。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn defaults_the_carrier_cannot_carry_are_rejected_at_publication() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+
+    let model = "defaults-boundary-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    // 承载面承载不了 `quality`：这条默认值永远不会生效。
+    let narrow = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    // 同一份承载面、不带默认值时照常发布：拒绝的是那条默认值，不是承载面本身。
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "defaults-0",
+        contract.clone(),
+        vec![("aihubmix-image-v1", narrow.clone(), json!({}))],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "defaults-1",
+        contract.clone(),
+        vec![(
+            "aihubmix-image-v1",
+            narrow.clone(),
+            json!({"defaults": {"quality": "low"}}),
+        )],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a default the carrier cannot carry must be rejected"
+    );
+
+    // 承载面声明了它：同一份默认值照常发布。
+    let wide = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "defaults-2",
+        contract.clone(),
+        vec![(
+            "aihubmix-image-v1",
+            wide,
+            json!({"defaults": {"quality": "low"}}),
+        )],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 对客目录：`GET /v1/models` 只列**当前真的能调**的型号，合同就是发布的那一份。
+///
+/// 目录**公开**：不带任何鉴权头就能取，乱给的 Key 也不会把它变成 401——调用方要先知道有哪些
+/// 型号、各自的参数面，才建得出表单。
+/// 判据与受理期选路**同一条**（生效的发布条目 + 启用的供给 + 启用的渠道）：目录里列出的型号
+/// 必须真的提交得起来。列着却提交不了比不列更糟——调用方会照它建表单，然后在提交时落空。
+/// 本用例只读发布物与目录，不起 Worker、不连上游：零外部调用。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_model_catalog_lists_only_callable_models_with_their_published_contract() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 同步入口在这个用例里只用来验"停用之后真的调不了"；那一步在受理前就失败，不会等超时。
+    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // ── 目录公开：不带任何鉴权头也 200；乱给的 Key 同样不影响它 ──
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK, "公开目录不该要 Key：{catalog}");
+    assert_public_only("无鉴权头的目录请求", &catalog);
+    assert_eq!(
+        catalog,
+        json!({"data": []}),
+        "还没发布任何型号时，目录是空列表而不是错误：{catalog}"
+    );
+    let (status, catalog) = get_catalog(&client, &base_url, Some("sk_seeai_not_a_real_key")).await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "目录根本不读 Authorization，乱给的 Key 也不该被拒：{catalog}"
+    );
+
+    // 两个型号、两份不同的合同：目录里每一条都必须带**它自己**那份，且逐字一致。
+    let model = "catalog-model-a";
+    let other = "catalog-model-b";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let other_contract = surface_schema(json!({
+        "model": {"const": other},
+        "prompt": {"type": "string", "minLength": 1},
+        "quality": {"type": "string", "enum": ["low", "high"]}
+    }));
+    let published = [
+        (model, "catalog-a-1", &contract),
+        (other, "catalog-b-1", &other_contract),
+    ];
+    for (name, revision, schema) in published {
+        let status = publish_with_surfaces(
+            &client,
+            &base_url,
+            &admin_token,
+            name,
+            revision,
+            schema.clone(),
+            vec![("aihubmix-image-v1", schema.clone())],
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{name} 必须发布成功");
+    }
+
+    // ── 两个型号都在，形状是 `{name, vendor_id, revision, contract}`；照旧不带鉴权头 ──
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK, "got {catalog}");
+    assert_public_only("目录", &catalog);
+    assert_eq!(
+        catalog.as_object().map(serde_json::Map::len),
+        Some(1),
+        "目录顶层只有 data：{catalog}"
+    );
+    let entries = catalog["data"].as_array().expect("data is an array");
+    assert_eq!(entries.len(), 2, "两个在售型号都要在目录里：{catalog}");
+    for (name, revision, schema) in published {
+        let entry = entries
+            .iter()
+            .find(|entry| entry["name"].as_str() == Some(name))
+            .unwrap_or_else(|| panic!("`{name}` 必须在目录里：{catalog}"));
+        let mut keys: Vec<&str> = entry
+            .as_object()
+            .expect("entry is an object")
+            .keys()
+            .map(String::as_str)
+            .collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec!["contract", "name", "revision", "vendor_id"],
+            "目录条目只有 name / vendor_id / revision / contract 四个字段：{entry}"
+        );
+        assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
+        assert_eq!(entry["revision"].as_str(), Some(revision));
+        // 厂商原生名不进对客面：这两个型号的对客名恰好等于原生名，因此这里只钉住"响应里
+        // 没有 native_model_id 这个**字段**"；名字不同时"正文不含原生名"由专门的用例钉。
+        assert!(
+            entry.get("native_model_id").is_none(),
+            "对客目录不许出现 native_model_id：{entry}"
+        );
+        assert_eq!(
+            &entry["contract"], schema,
+            "目录里的合同必须与发布的那一份逐字一致（对客名与原生名同值时逐字相同）"
+        );
+    }
+
+    // ── 停用供给：该型号从目录里消失，提交也确实取不到候选 ──
+    sqlx::query(
+        "UPDATE supply.offerings SET enabled = false
+         WHERE vendor_model_id = (SELECT id FROM catalog.vendor_models WHERE native_model_id = $1)",
+    )
+    .bind(model)
+    .execute(&pool)
+    .await
+    .expect("disable the offering");
+    let (_, catalog) = get_catalog(&client, &base_url, None).await;
+    let names: Vec<&str> = catalog["data"]
+        .as_array()
+        .expect("data is an array")
+        .iter()
+        .filter_map(|entry| entry["name"].as_str())
+        .collect();
+    assert_eq!(names, vec![other], "停用的型号必须从目录里消失：{catalog}");
+    let key = format!("catalog-disabled-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(model, "disabled model"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "目录不列的型号，受理期同样取不到候选：{body}"
+    );
+
+    // ── 渠道停用与供给停用是**同一条**判据：它同样让型号从目录里消失 ──
+    sqlx::query(
+        "UPDATE supply.channels SET enabled = false
+         WHERE id = (SELECT o.channel_id FROM supply.offerings o
+                     JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+                     WHERE vm.native_model_id = $1)",
+    )
+    .bind(other)
+    .execute(&pool)
+    .await
+    .expect("disable the channel");
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(
+        catalog,
+        json!({"data": []}),
+        "供给与渠道全停用后，目录是空列表而不是错误：{catalog}"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 命名层：对客面只出现**平台网关模型名**，厂商原生名留在管理端。
+///
+/// 素材刻意让两个名字不同（厂商 `gpt-image-2.5-sunburst`、对客 `gpt-image-2.5-plus`），
+/// 一次把命名层的几条硬约束都钉住：
+/// - 素材把**对客名**写进合同正文会被发布期拒掉（合同正文那个常量是厂商模型的身份）；
+/// - 目录的 `name` 是对客名、带 `vendor_id`、**正文全文不含**厂商原生名（含合同正文）；
+/// - 用对客名能真的受理（假上游跑通），用厂商原生名是"模型不存在"；
+/// - 存的那份合同不动：库里 `model.const` 仍是厂商原生名，只有投射给调用方时替换；
+/// - 运维开关一关，目录与受理**同时**消失，管理端照样列得出来（否则关了就没法打开）。
+///
+/// 零外部调用：假上游在进程内，凭证只从环境变量读。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
+    const NATIVE: &str = "gpt-image-2.5-sunburst";
+    const GATEWAY: &str = "gpt-image-2.5-plus";
+
+    let (database_url, database_name) = isolated_database_url().await;
+    let client = Client::new();
+    let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = start_fake_upstream_with(
+        calls.clone(),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+    )
+    .await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let material = renamed_material(&upstream.base_url);
+
+    // ── 素材把**对客名**写进合同正文 → 发布期拒掉 ──
+    //
+    // 这条同时是"响应全文不含原生名"可判定的前提：合同正文里没有第二个模型名来源。
+    let mut misnamed = material.clone();
+    misnamed["capability_schema"]["properties"]["model"]["const"] =
+        Value::String(GATEWAY.to_owned());
+    let rejected = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&misnamed)
+        .send()
+        .await
+        .expect("misnamed publication");
+    assert_eq!(
+        rejected.status(),
+        StatusCode::BAD_REQUEST,
+        "合同正文写对客名必须被拒：{:?}",
+        rejected.text().await
+    );
+
+    // ── 正常发布：厂商原生名写进合同正文，对客名写在顶层 ──
+    let published = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&material)
+        .send()
+        .await
+        .expect("publication request");
+    let status = published.status();
+    let body = published.text().await.expect("publication body");
+    assert_eq!(status, StatusCode::OK, "素材必须能发布：{body}");
+
+    // ── 对客目录：name 是对客名，带 vendor_id，正文全文不含厂商原生名 ──
+    let raw = client
+        .get(format!("{base_url}/v1/models"))
+        .send()
+        .await
+        .expect("catalog request")
+        .text()
+        .await
+        .expect("catalog text");
+    assert!(
+        !raw.contains(NATIVE),
+        "对客目录正文不许出现厂商原生名（含合同正文）：{raw}"
+    );
+    let catalog: Value = serde_json::from_str(&raw).expect("catalog JSON");
+    assert_eq!(
+        catalog_names(&catalog),
+        vec![GATEWAY.to_owned()],
+        "{catalog}"
+    );
+    let entry = &catalog["data"][0];
+    assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
+    assert_eq!(entry["revision"], material["native_revision"]);
+    assert!(
+        entry.get("native_model_id").is_none(),
+        "对客目录不许出现 native_model_id：{entry}"
+    );
+    assert_eq!(
+        entry["contract"],
+        consumer_contract(material["capability_schema"].clone(), GATEWAY),
+        "目录里的合同是发布的那一份，只有 model.const 换成对客名"
+    );
+    assert_eq!(entry["contract"]["properties"]["model"]["const"], GATEWAY);
+
+    // ── 存的那份合同**不动**：库里那个常量仍是厂商原生名 ──
+    let stored_contract: Value = sqlx::query_scalar(
+        "SELECT capability_schema FROM catalog.vendor_models WHERE native_model_id = $1",
+    )
+    .bind(NATIVE)
+    .fetch_one(&pool)
+    .await
+    .expect("stored contract");
+    assert_eq!(
+        stored_contract["properties"]["model"]["const"], NATIVE,
+        "合同行不可变：替换只发生在投射那一步"
+    );
+    let vendor_model_id: Uuid =
+        sqlx::query_scalar("SELECT id FROM catalog.vendor_models WHERE native_model_id = $1")
+            .bind(NATIVE)
+            .fetch_one(&pool)
+            .await
+            .expect("vendor model id");
+
+    // ── 管理员读：一条网关模型一项，带候选清单与运维开关 ──
+    let (unauthorized, _) = get_gateway_models(&client, &base_url, None).await;
+    assert_eq!(
+        unauthorized,
+        StatusCode::UNAUTHORIZED,
+        "运营视图要管理员凭证，与公开的对客目录不是一回事"
+    );
+    let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
+    assert_eq!(status, StatusCode::OK, "{admin}");
+    assert_eq!(
+        admin.as_object().map(serde_json::Map::len),
+        Some(1),
+        "管理端清单只有 gateway_models 一个顶层字段：{admin}"
+    );
+    let listed = admin["gateway_models"]
+        .as_array()
+        .expect("gateway_models is an array");
+    assert_eq!(listed.len(), 1, "{admin}");
+    let view = &listed[0];
+    assert_eq!(view["gateway_model"], GATEWAY);
+    assert_eq!(view["enabled"], true);
+    assert_eq!(view["vendor_id"], "OpenAI");
+    assert_eq!(view["native_model_id"], NATIVE, "厂商原生名只在管理端出现");
+    assert_eq!(view["native_revision"], material["native_revision"]);
+    assert!(
+        view["runtime_revision_id"].as_str().is_some(),
+        "要能看出这是哪一次发布：{view}"
+    );
+    assert!(
+        view["published_at"].as_str().is_some(),
+        "要能看出这次发布是什么时候发的：{view}"
+    );
+    let candidates = view["candidates"].as_array().expect("candidates");
+    assert_eq!(candidates.len(), 1, "一条候选：{view}");
+    assert_eq!(candidates[0]["provider_kind"], "AIHubMix");
+    assert_eq!(candidates[0]["provider_model_id"], NATIVE);
+    assert_eq!(candidates[0]["adapter_key"], "aihubmix-image-v1");
+    assert_eq!(candidates[0]["routing_priority"], 0);
+    assert_eq!(candidates[0]["enabled"], true);
+    assert!(
+        candidates[0]["offering_id"].as_str().is_some(),
+        "候选要能被指认：{view}"
+    );
+    assert!(
+        candidates[0]["carrier_schema"].is_object()
+            && candidates[0]["parameter_mapping"].is_object(),
+        "候选自带承载面与映射，不必直查库：{view}"
+    );
+    assert!(
+        candidates[0].get("credential_env").is_none(),
+        "不回显渠道凭证：{view}"
+    );
+
+    // ── 用**对客名**受理：假上游真跑通；上行给渠道的仍是厂商原生名 ──
+    let _worker = spawn_worker_process(&database_url);
+    let key = format!("naming-gateway-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(GATEWAY, "命名层：按对客名受理"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "对客名必须真的能受理：{body}");
+    assert_sync_success("按对客名受理", &body);
+    assert_eq!(
+        count_calls(&calls, "POST", "/v1/images/generations"),
+        1,
+        "请求要真的发到假上游"
+    );
+    let submit = last_submit_body(&calls, "/v1/images/generations");
+    assert_eq!(
+        submit["model"], NATIVE,
+        "上行给渠道的是厂商原生名，不是对客名：{submit}"
+    );
+    let stored_model: String =
+        sqlx::query_scalar("SELECT gateway_model FROM generation.jobs WHERE idempotency_key = $1")
+            .bind(&key)
+            .fetch_one(&pool)
+            .await
+            .expect("job gateway model");
+    assert_eq!(stored_model, GATEWAY, "Job 固化的是对客名");
+    let (revision_gateway, revision_vendor_model): (String, Uuid) = {
+        let row = sqlx::query(
+            "SELECT gateway_model, vendor_model_id FROM publication.runtime_revisions
+             WHERE id = (SELECT runtime_revision_id FROM publication.runtime_entries
+                         WHERE active AND gateway_model = $1 LIMIT 1)",
+        )
+        .bind(GATEWAY)
+        .fetch_one(&pool)
+        .await
+        .expect("runtime revision naming columns");
+        (
+            row.try_get("gateway_model").expect("gateway model"),
+            row.try_get("vendor_model_id").expect("vendor model id"),
+        )
+    };
+    assert_eq!(revision_gateway, GATEWAY, "修订上记的是对客名");
+    assert_eq!(
+        revision_vendor_model, vendor_model_id,
+        "修订指向它挂的那行合同"
+    );
+
+    // ── 用**厂商原生名**受理：模型不存在 ──
+    let native_key = format!("naming-native-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &native_key,
+        &route_request(NATIVE, "命名层：按厂商原生名受理"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "厂商原生名不是对客身份，受理期取不到候选：{body}"
+    );
+    assert_eq!(
+        count_calls(&calls, "POST", "/v1/images/generations"),
+        1,
+        "被拒的请求不该发到上游"
+    );
+
+    // ── 运维开关：关掉之后目录与受理同时消失，管理端照样列得出来 ──
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, GATEWAY, false).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(
+        catalog,
+        json!({"data": []}),
+        "关掉的模型从目录里消失：{catalog}"
+    );
+    let off_key = format!("naming-off-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &off_key,
+        &route_request(GATEWAY, "命名层：关掉之后受理"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::NOT_FOUND,
+        "关掉的模型受理得到'模型不存在'：{body}"
+    );
+    let (_, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
+    assert_eq!(
+        admin["gateway_models"][0]["gateway_model"], GATEWAY,
+        "关掉的模型照样列得出来，否则关了就没法打开：{admin}"
+    );
+    assert_eq!(admin["gateway_models"][0]["enabled"], false);
+    let audits: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM operations.audit_events
+         WHERE action = 'gateway_model.set_enabled' AND subject_id = $1",
+    )
+    .bind(GATEWAY)
+    .fetch_one(&pool)
+    .await
+    .expect("audit events");
+    assert_eq!(audits, 1, "PATCH 要写出一条审计事件");
+
+    // ── 重新启用：目录与受理都恢复 ──
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, GATEWAY, true).await,
+        StatusCode::NO_CONTENT
+    );
+    let (_, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(
+        catalog_names(&catalog),
+        vec![GATEWAY.to_owned()],
+        "重新启用后回到目录：{catalog}"
+    );
+    let on_key = format!("naming-on-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &on_key,
+        &route_request(GATEWAY, "命名层：重新启用之后受理"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "重新启用后必须能受理：{body}");
+    assert_sync_success("重新启用后受理", &body);
+
+    // ── 没发布过的名字：404，而且不留下任何审计事件 ──
+    let unknown = format!("never-published-{}", Uuid::new_v4());
+    assert_eq!(
+        patch_gateway_model(&client, &base_url, &admin_token, &unknown, false).await,
+        StatusCode::NOT_FOUND,
+        "没发布过的名字是'不存在'，不是'待创建'"
+    );
+    let unknown_audits: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM operations.audit_events WHERE subject_id = $1")
+            .bind(&unknown)
+            .fetch_one(&pool)
+            .await
+            .expect("audit events");
+    assert_eq!(unknown_audits, 0, "被拒的 PATCH 不该留下审计事件");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// **不带对客名**的发布命令照常可发布：对客名回退取厂商原生名，行为与今天逐位一致。
+///
+/// 这是命名层"缺省回退"那条兼容承诺的证据：命令不带 `gateway_model` 时，目录里的 `name`
+/// 就是厂商原生名，受理也照旧跑得通。素材在测试内构造（顶层一份合同 + 候选自带承载面），
+/// 刻意不带对客名。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let client = Client::new();
+    let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+    let upstream = start_fake_upstream_with(
+        calls.clone(),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+    )
+    .await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
+    wait_until_ready(&client, &base_url).await;
+    let account = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let contract = json!({
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": { "const": "gpt-image-2" },
+            "prompt": { "type": "string", "minLength": 1 },
+            "image": { "type": "array", "items": { "type": "string" }, "minItems": 1, "maxItems": 16 },
+            "mask": { "type": "string" },
+            "n": { "type": "integer", "minimum": 1, "maximum": 10, "default": 1 },
+            "size": { "type": "string", "anyOf": [{ "const": "auto" }, { "pattern": "^[0-9]+x[0-9]+$" }] },
+            "output_format": { "type": "string", "enum": ["png", "jpeg"], "default": "png" },
+            "quality": { "type": "string", "enum": ["low", "medium", "high"] },
+            "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
+            "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
+            "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" }
+        },
+        "allOf": [
+            { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
+        ]
+    });
+    let command = json!({
+        "vendor_id": "OpenAI",
+        "native_model_id": "gpt-image-2",
+        "native_revision": "2026-09-18-validated-1.3",
+        "actor": "bootstrap",
+        "capability_schema": contract.clone(),
+        "offerings": [{
+            "provider_kind": "AIHubMix",
+            "adapter_key": "aihubmix-image-v1",
+            "provider_model_id": "gpt-image-2",
+            "base_url": upstream.base_url.clone(),
+            "credential_env": "AIHUBMIX_API_KEY",
+            "restrictions": {
+                "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
+                "max_images": 16
+            },
+            "carrier_schema": contract.clone(),
+            "formula": "token_rates",
+            "price_plan": {
+                "currency": "USD",
+                "text_input_microusd_per_million": 5000000,
+                "image_input_microusd_per_million": 8000000,
+                "text_output_microusd_per_million": 10000000,
+                "image_output_microusd_per_million": 30000000,
+                "source_url": "https://aihubmix.com/model/gpt-image-2"
+            }
+        }]
+    });
+    assert!(
+        command.get("gateway_model").is_none(),
+        "这份构造刻意不带对客名，缺省回退才有的可验"
+    );
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&command)
+        .send()
+        .await
+        .expect("publication request");
+    let status = response.status();
+    let body = response.text().await.expect("publication body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "不带对客名的命令必须照常可发布：{body}"
+    );
+
+    // ── 目录逐位一致：name 是厂商原生名，形状就是新的四字段形状 ──
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert_eq!(
+        catalog,
+        json!({"data": [{
+            "name": "gpt-image-2",
+            "vendor_id": "OpenAI",
+            "revision": "2026-09-18-validated-1.3",
+            "contract": contract,
+        }]}),
+        "缺省回退之后目录与今天逐位一致：{catalog}"
+    );
+
+    // ── 受理行为同样照旧：按回退出来的名字跑通 ──
+    let _worker = spawn_worker_process(&database_url);
+    let key = format!("naming-fallback-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request("gpt-image-2", "不带对客名：缺省回退"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "不带对客名的命令必须照常受理：{body}"
+    );
+    assert_sync_success("不带对客名的命令受理", &body);
+
+    // ── 落库事实：修订上的对客名就是回退出来的厂商原生名，开关行也在（默认启用）──
+    let revision_gateway: String = sqlx::query_scalar(
+        "SELECT rr.gateway_model FROM publication.runtime_revisions rr
+         JOIN publication.runtime_entries re ON re.runtime_revision_id = rr.id
+         WHERE re.active AND re.gateway_model = 'gpt-image-2' LIMIT 1",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("runtime revision naming column");
+    assert_eq!(revision_gateway, "gpt-image-2");
+    let enabled: bool = sqlx::query_scalar(
+        "SELECT enabled FROM publication.gateway_models WHERE gateway_model = $1",
+    )
+    .bind("gpt-image-2")
+    .fetch_one(&pool)
+    .await
+    .expect("gateway model switch");
+    assert!(enabled, "首次发布成功时落一行开关，默认开着");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// 发布命令只有"候选数组"这一种形状：不带 `offerings` 的请求在发布期被拒（400），
+/// 不是"发布成功但没有候选"，也不落任何行。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn publication_without_the_offering_array_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "vendor_id": "OpenAI",
+            "native_model_id": "no-offerings-model",
+            "native_revision": "no-offerings-1",
+            "actor": "contract-test",
+            "capability_schema": {"type": "object"}
+        }))
+        .send()
+        .await
+        .expect("publication request");
+    let status = response.status();
+    let body = response.text().await.expect("publication body");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "没有候选集合必须在发布期被拒：{body}"
+    );
+    assert!(
+        body.contains("offerings is required"),
+        "错误要说清缺什么：{body}"
+    );
+    let revisions: i64 = sqlx::query_scalar("SELECT count(*) FROM publication.runtime_revisions")
+        .fetch_one(&pool)
+        .await
+        .expect("runtime revisions");
+    assert_eq!(revisions, 0, "被拒的发布不落任何行");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
+/// **汇率按受理时刻生效的那一行取值**，且**没有折算率的币种在发布期被拒**。
+///
+/// 未来生效的一行是调价预告：受理时该用的仍是受理时刻之前已生效的那一行。受理之后再录一行
+/// 也不动已受理 Job 的折算——快照已经把它冻住了。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_rate_effective_at_acceptance_is_frozen_and_a_missing_rate_blocks_publication() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+
+    // 调价预告：未来生效的一行不参与受理时的取值。
+    let future = chrono::Utc::now() + chrono::Duration::days(1);
+    let response = client
+        .put(format!("{}/api/v1/fx-rates", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "currency": "USD",
+            "rate_micros": 9_000_000u64,
+            "effective_at": future.to_rfc3339(),
+        }))
+        .send()
+        .await
+        .expect("future fx rate");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    // 没有折算率的币种：发布期拒绝，整份发布不落任何行。
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    draft["price_plan"]["currency"] = json!("EUR");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            "eur-model",
+            None,
+            vec![draft]
+        )
+        .await,
+        StatusCode::BAD_REQUEST,
+        "该币种没有折算率就必须在发布期被拒"
+    );
+    let revisions: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM publication.runtime_revisions WHERE gateway_model = 'eur-model'",
+    )
+    .fetch_one(&harness.pool)
+    .await
+    .expect("revisions");
+    assert_eq!(revisions, 0, "被拒的发布不落任何行");
+
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK
+    );
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let _worker = harness.spawn_worker();
+    let key = format!("fx-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "fx rate"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(
+        snapshot["fx_rate"]["rate_micros"],
+        json!(7_100_000),
+        "取的是受理时刻生效的那一行，不是未来那一行"
+    );
+    let (job_id, _, _) = harness.job(&key).await;
+    assert_eq!(harness.attempt_cost(job_id).await.3, Some(42_245));
+
+    // 受理之后再录一行（立即生效）：已受理 Job 的折算用的是冻结的那个数。
+    let response = client
+        .put(format!("{}/api/v1/fx-rates", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"currency": "USD", "rate_micros": 5_000_000u64}))
+        .send()
+        .await
+        .expect("later fx rate");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &key).await["fx_rate"]["rate_micros"],
+        json!(7_100_000),
+        "快照已经冻住了受理当时那一行"
+    );
+    assert_eq!(
+        harness.attempt_cost(job_id).await.3,
+        Some(42_245),
+        "已受理 Job 的成本折算不变"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 发布期校验**计价形态**：形态必填、取值受控，而且**形态与参数配套**。
+///
+/// 不配套的三条都要拒并说清缺什么；反过来，"按张计价**不带**那份四档费率"是合法的——Price Plan
+/// 只是"按 token 计量量计价"这一种形态的参数，不是每条供给都有的东西。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let model = "formula-model";
+
+    async fn publish(
+        client: &Client,
+        base_url: &str,
+        admin_token: &str,
+        model: &str,
+        offerings: Vec<Value>,
+    ) -> (StatusCode, Value) {
+        let body = publication_body(model, "route-test-1", None, offerings, None);
+        let response = client
+            .post(format!("{base_url}/api/v1/runtime-revisions"))
+            .bearer_auth(admin_token)
+            .json(&body)
+            .send()
+            .await
+            .expect("runtime publication");
+        let status = response.status();
+        let body = response.json().await.unwrap_or(Value::Null);
+        (status, body)
+    }
+    let message = |body: &Value| {
+        body["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_owned()
+    };
+
+    // 1) 缺形态：说不清一条供给按什么计价，它的成本就没有算法。
+    let mut without_formula = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    without_formula["formula"] = Value::Null;
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![without_formula],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("formula is required"), "{body}");
+
+    // 2) 取值受控：认不出的形态一样拒。
+    let mut unknown_formula = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    unknown_formula["formula"] = json!("by_the_hour");
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![unknown_formula],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("must be token_rates"), "{body}");
+
+    // 3) 按 token 计量量计价却没有那份四档费率。
+    let mut token_without_plan = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    token_without_plan["price_plan"] = Value::Null;
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![token_without_plan],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("price_plan is required"), "{body}");
+
+    // 4) 反向也要拒：形态用不到的参数永远不会被读，留着只会让人以为它在生效。
+    let mut declared_with_plan = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    declared_with_plan["formula"] = json!("upstream_declared");
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![declared_with_plan],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(
+        message(&body).contains("does not apply to formula"),
+        "{body}"
+    );
+
+    // 5) 按张计价**不带**费率表也能发布：参数是单价，不是那份四档费率。
+    let mut per_image = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    per_image["formula"] = json!("per_image");
+    per_image["price_plan"] = Value::Null;
+    per_image["cost_unit_price_microusd"] = json!(11_354);
+    per_image["cost_currency"] = json!("USD");
+    // 6) 没有对客计费基准（既无对客费率向量、又没有 Price Plan 的费率）：发布期就拒——
+    //    "不带价目表也能发布"不等于"连对客价一起没有"，那样结算只能按 0 收（等于白送）。
+    per_image["consumer_rates_cny"] = Value::Null;
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![per_image.clone()],
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(
+        message(&body).contains("no consumer charge basis"),
+        "{body}"
+    );
+
+    // 7) 给它一份对客费率向量（没有价目表也可以）：发布成功，受理照常、快照冻结形态与单价。
+    per_image["consumer_rates_cny"] = json!({
+        "text_input_micros_per_million": 35_500_000u64,
+        "image_input_micros_per_million": 56_800_000u64,
+        "text_output_micros_per_million": 71_000_000u64,
+        "image_output_micros_per_million": 213_000_000u64
+    });
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![per_image.clone()],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "有对客计费基准、没有价目表照样发布：{body}"
+    );
+
+    // 落库：形态与单价在供给行上，价目行为 0、条目上的 Price Plan 为空。
+    let row = sqlx::query(
+        "SELECT o.formula, o.cost_unit_price_microusd, re.price_plan_id,
+                (SELECT count(*) FROM pricing.price_plans p WHERE p.offering_id = o.id) AS plans
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("the published candidate");
+    assert_eq!(
+        row.try_get::<String, _>("formula").expect("formula"),
+        "per_image"
+    );
+    assert_eq!(
+        row.try_get::<Option<i64>, _>("cost_unit_price_microusd")
+            .expect("unit price"),
+        Some(11_354)
+    );
+    assert!(
+        row.try_get::<Option<Uuid>, _>("price_plan_id")
+            .expect("price plan id")
+            .is_none()
+    );
+    assert_eq!(row.try_get::<i64, _>("plans").expect("plans"), 0);
+
+    // 受理照常，且形态与单价随 Job 快照冻结。这里**不起 Worker**：受理本身就把快照冻好了，
+    // 等不到终态只是这次请求超时回错——要看的是快照。
+    let account_id = create_account(&client, &base_url, &admin_token).await;
+    let api_key = issue_key(&client, &base_url, &admin_token, &account_id).await;
+    let key = format!("per-image-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(model, "priced per image"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker 时这次请求超时（受理已经发生）：{body}"
+    );
+    let snapshot = frozen_snapshot(&pool, &key).await;
+    assert_eq!(snapshot["formula"], json!("per_image"));
+    assert_eq!(snapshot["cost_unit_price_microusd"], json!(11_354));
+    assert_eq!(snapshot["cost_currency"], json!("USD"));
+    assert!(
+        snapshot["fx_rate"].is_object(),
+        "声明了成本币种就把折算率冻结下来（毛利要用它）：{snapshot}"
+    );
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
