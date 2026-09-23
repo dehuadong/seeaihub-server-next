@@ -12,7 +12,7 @@ async fn concurrent_publications_of_one_gateway_model_leave_a_single_active_revi
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");
@@ -90,7 +90,7 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");
@@ -274,7 +274,7 @@ async fn carrier_field_outside_the_contract_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
 
     let model = "contract-boundary-model";
     let contract = surface_schema(json!({
@@ -336,7 +336,7 @@ async fn carrier_field_the_driver_cannot_write_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
 
     let model = "driver-boundary-model";
     // `resolution` 是 APIMart 那一侧的渠道字段名，AIHubMix 的 Driver 写不出去。
@@ -385,7 +385,7 @@ async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idemp
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");
@@ -477,7 +477,7 @@ async fn defaults_the_carrier_cannot_carry_are_rejected_at_publication() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
 
     let model = "defaults-boundary-model";
     let contract = surface_schema(json!({
@@ -561,7 +561,7 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
     // 同步入口在这个用例里只用来验"停用之后真的调不了"；那一步在受理前就失败，不会等超时。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -737,7 +737,7 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     )
     .await;
     let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -1054,7 +1054,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
     )
     .await;
     let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -1193,7 +1193,7 @@ async fn publication_without_the_offering_array_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");
@@ -1354,7 +1354,7 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");

@@ -7,7 +7,7 @@ async fn public_surface_has_no_async_task_protocol() {
     // 这个用例不起 Worker：同步入口必然等到超时，正好用来验"等不到时对客怎么说"。
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
 
     let unauthorized = client
         .post(format!("{base_url}/api/v1/accounts"))

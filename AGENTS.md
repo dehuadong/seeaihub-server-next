@@ -42,7 +42,7 @@ cargo test --workspace --all-features
 - 未经批准不发起任何计费调用
 - 未经批准不自主选择渠道模型
 - 当需要记录持久的ADR架构设计决策时必须获得用户确认
-- 测试不写在源码文件里：源码文件只留 `#[cfg(test)] mod tests;`，用例放同级的 `tests.rs`（`src/lib.rs`、`src/main.rs` 用 `src/tests.rs`，`src/<模块>.rs` 用 `src/<模块>/tests.rs`），多了就在对应 `tests/` 子目录里按主题分文件；生产代码的可见性不为测试放宽，夹具可放宽到测试模块内部；只有需要真实数据库、真实 Redis 或独立进程的端到端用例才进 crate 的 `tests/`，`#[ignore]` 必须写明前置条件
+- 测试不写在源码文件里：源码文件只留 `#[cfg(test)] mod tests;`，用例放同级的 `tests.rs`（`src/lib.rs`、`src/main.rs` 用 `src/tests.rs`，`src/<模块>.rs` 用 `src/<模块>/tests.rs`），多了就在对应 `tests/` 子目录里按主题分文件；生产代码的可见性不为测试放宽，夹具可放宽到测试模块内部；只有需要真实数据库、真实 Redis 或独立进程的端到端用例才进 crate 的 `tests/`（测试夹具自身的检查随夹具同处），`#[ignore]` 必须写明前置条件
 
 ## 工程工作流
 

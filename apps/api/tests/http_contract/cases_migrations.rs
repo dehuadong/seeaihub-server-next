@@ -475,7 +475,7 @@ async fn gateway_model_naming_migration_backfills_existing_publications() {
     // 5) 迁移后立刻可读、可停用：走管理端接口（不起 Worker，也不连上游）。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
     assert_eq!(status, StatusCode::OK, "{admin}");
     let view = &admin["gateway_models"][0];

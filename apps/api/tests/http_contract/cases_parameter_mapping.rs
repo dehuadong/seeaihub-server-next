@@ -8,7 +8,7 @@ async fn carrier_surface_is_frozen_into_the_job() {
     // 同步入口会等到超时（没有 Worker）：给小值，别让用例白等。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -104,7 +104,7 @@ async fn a_field_a_carrier_cannot_carry_skips_it_and_fails_platform_side_when_no
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -458,7 +458,7 @@ async fn a_size_combination_the_profile_lacks_makes_the_candidate_ineligible() {
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -635,7 +635,7 @@ async fn the_auto_size_is_passed_through_and_never_converted() {
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -933,7 +933,7 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
     // 没有 Worker：同步入口只会等到超时，正好用来只看"受理与选路"。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -1127,7 +1127,7 @@ async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_paramete
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -1234,7 +1234,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
     let apimart_upstream =
         start_fake_upstream_with(apimart_calls.clone(), UpstreamBehaviour::apimart()).await;
     let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     // 这条用例连发四次请求，而素材现在带着**夹具对客费率**（按成本费率 × 折算率 7.1 推，比
     // 旧口径"把 USD 费率当 CNY 收"高 7.1 倍）：受理闸门是"余额 ≥ 保底额"，所以要先把账户充上。
     let (_, api_key) = funded_account(&client, &base_url, &admin_token, 1_000_000).await;

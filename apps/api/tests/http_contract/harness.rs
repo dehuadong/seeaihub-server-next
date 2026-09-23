@@ -53,6 +53,10 @@ mod cases_publication;
 #[path = "cases_routing.rs"]
 mod cases_routing;
 
+// 夹具自身的检查：不启平台进程、不用数据库，因此不进 `#[ignore]`，由 workspace 单测那一步跑。
+#[path = "harness_check.rs"]
+mod harness_check;
+
 /// 一个最小合法 PNG（1×1），用作假上游返回的结果图，也用作调用方传的参考图。
 const PNG_FIXTURE: &[u8] = &[
     0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48, 0x44, 0x52,
@@ -509,6 +513,16 @@ struct ApiProcess {
     child: Child,
 }
 
+impl ApiProcess {
+    /// 子进程已经退出的话，返回它的退出状态。
+    ///
+    /// 它 bind 失败时会**静默退出**（`stderr` 是 null），所以这是"端口上坐着的不是我们"最直接的
+    /// 信号，也是启动失败时唯一还拿得到的线索。
+    fn exit_status(&mut self) -> Option<String> {
+        self.child.try_wait().ok().flatten().map(|s| s.to_string())
+    }
+}
+
 impl Drop for ApiProcess {
     fn drop(&mut self) {
         let _ = self.child.kill();
@@ -535,51 +549,73 @@ async fn start_api(
 /// 同 [`start_api`]，但可以给这个进程配上**加速层**（缓存）。
 ///
 /// 不配就是今天的路径：加速层根本不构造，受理不额外读库、不预检、不写缓存。
+///
+/// 端口是**先占后放**的：`bind(:0)` 读到端口就释放，子进程要到连库与迁移之后才真正 bind。
+/// 中间那段空窗里端口可能被别人拿走，那时子进程 bind 失败会静默退出。所以这里换端口重试。
 async fn start_api_with(
     database_url: &str,
     sync_wait_seconds: u64,
     max_concurrent_jobs: u64,
     cache: Option<&CacheFixture>,
 ) -> (String, String, ApiProcess) {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
-    let port = listener.local_addr().expect("test address").port();
-    drop(listener);
-    let base_url = format!("http://127.0.0.1:{port}");
-    let admin_token = format!("contract-admin-{}", Uuid::new_v4());
-    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
-    command
-        .env("DATABASE_URL", database_url)
-        .env("API_BIND", format!("127.0.0.1:{port}"))
-        .env("ADMIN_TOKEN", &admin_token)
-        .env(
-            "GENERATION_MAX_CONCURRENT_JOBS",
-            max_concurrent_jobs.to_string(),
-        )
-        .env(
-            "GENERATION_SYNC_WAIT_SECONDS",
-            sync_wait_seconds.to_string(),
-        )
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
-    apply_cache_env(&mut command, cache);
-    let child = command.spawn().expect("API process should start");
+    const ATTEMPTS: usize = 5;
+
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
-    for (currency, rate_micros) in [("USD", 7_100_000_u64), ("CNY", 1_000_000_u64)] {
-        let response = client
-            .put(format!("{base_url}/api/v1/fx-rates"))
-            .bearer_auth(&admin_token)
-            .json(&json!({"currency": currency, "rate_micros": rate_micros}))
-            .send()
-            .await
-            .expect("fx rate fixture request");
-        assert_eq!(
-            response.status(),
-            StatusCode::NO_CONTENT,
-            "fixture fx rate for {currency} must be recorded"
-        );
+    let admin_token = format!("contract-admin-{}", Uuid::new_v4());
+    let mut last_failure = String::new();
+    for attempt in 1..=ATTEMPTS {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+        let port = listener.local_addr().expect("test address").port();
+        drop(listener);
+        let base_url = format!("http://127.0.0.1:{port}");
+        let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+        command
+            .env("DATABASE_URL", database_url)
+            .env("API_BIND", format!("127.0.0.1:{port}"))
+            .env("ADMIN_TOKEN", &admin_token)
+            .env(
+                "GENERATION_MAX_CONCURRENT_JOBS",
+                max_concurrent_jobs.to_string(),
+            )
+            .env(
+                "GENERATION_SYNC_WAIT_SECONDS",
+                sync_wait_seconds.to_string(),
+            )
+            .stdout(Stdio::null())
+            .stderr(Stdio::null());
+        apply_cache_env(&mut command, cache);
+        let child = command.spawn().expect("API process should start");
+        // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
+        let mut process = ApiProcess { child };
+        match await_api_ready(&client, &base_url, &admin_token).await {
+            Ok(()) => {
+                for (currency, rate_micros) in [("USD", 7_100_000_u64), ("CNY", 1_000_000_u64)] {
+                    let response = client
+                        .put(format!("{base_url}/api/v1/fx-rates"))
+                        .bearer_auth(&admin_token)
+                        .json(&json!({"currency": currency, "rate_micros": rate_micros}))
+                        .send()
+                        .await
+                        .expect("fx rate fixture request");
+                    assert_eq!(
+                        response.status(),
+                        StatusCode::NO_CONTENT,
+                        "fixture fx rate for {currency} must be recorded"
+                    );
+                }
+                return (base_url, admin_token, process);
+            }
+            Err(reason) => {
+                last_failure = match process.exit_status() {
+                    Some(status) => {
+                        format!("attempt {attempt}: {reason}; the API process exited ({status})")
+                    }
+                    None => format!("attempt {attempt}: {reason}"),
+                };
+            }
+        }
     }
-    (base_url, admin_token, ApiProcess { child })
+    panic!("API did not become ready after {ATTEMPTS} attempts; last: {last_failure}");
 }
 
 /// 起一个真实 Worker 进程（丢弃返回值即结束它）。
@@ -770,7 +806,7 @@ impl Harness {
         )
         .await;
         let client = Client::new();
-        wait_until_ready(&client, &base_url).await;
+        wait_until_ready(&client, &base_url, &admin_token).await;
         let account = create_account(&client, &base_url, &admin_token).await;
         let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
         let pool = PgPool::connect(&database_url)
@@ -1669,19 +1705,77 @@ fn strip_key(body: &Value) -> Value {
     body
 }
 
-async fn wait_until_ready(client: &Client, base_url: &str) {
-    for _ in 0..100 {
-        if client
-            .get(format!("{base_url}/health"))
-            .send()
-            .await
-            .is_ok_and(|response| response.status().is_success())
-        {
-            return;
+/// 单次探活的超时。
+///
+/// 占住端口的也可能是**只完成握手、从不作答**的监听者：没有超时，一次探活会永远等下去，
+/// 而 `Client` 默认不设超时。
+const PROBE_TIMEOUT: Duration = Duration::from_secs(2);
+
+/// 等 API 就绪的整体上限。
+const READY_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// 探一次：`base_url` 上坐着的到底是不是**我们起的那个** API 进程。
+///
+/// 三层判据缺一不可：`/health` 回 2xx 只说明有个 HTTP 服务在；响应体是那一份 `/health` 才说明
+/// 它是个平台 API（假上游对任何 GET 都回 200 + PNG）；**这份管理员令牌在它上面有效**才说明它是
+/// 我们自己起的那一个（另一条用例的 API 进程回的也是同一份 `/health`，但它不认我们的令牌）。
+///
+/// 失败时返回**实际**看到的原因，供调用方原样报出来。
+async fn probe_api(client: &Client, base_url: &str, admin_token: &str) -> Result<(), &'static str> {
+    let response = client
+        .get(format!("{base_url}/health"))
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .map_err(|_| "no answer on /health")?;
+    if !response.status().is_success() {
+        return Err("/health did not answer with a success status");
+    }
+    let healthy = response
+        .json::<Value>()
+        .await
+        .ok()
+        .is_some_and(|body| body.get("status").and_then(Value::as_str) == Some("ok"));
+    if !healthy {
+        return Err("/health did not answer with the platform payload");
+    }
+    let ours = client
+        .get(format!("{base_url}/api/v1/route-policies"))
+        .bearer_auth(admin_token)
+        .timeout(PROBE_TIMEOUT)
+        .send()
+        .await
+        .is_ok_and(|response| response.status().is_success());
+    if !ours {
+        return Err("the responder does not accept this test's admin token");
+    }
+    Ok(())
+}
+
+/// 轮询到 API 就绪；到点返回最后一次探测**实际**看到的原因。
+async fn await_api_ready(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+) -> Result<(), &'static str> {
+    let deadline = tokio::time::Instant::now() + READY_TIMEOUT;
+    loop {
+        let last = match probe_api(client, base_url, admin_token).await {
+            Ok(()) => return Ok(()),
+            Err(reason) => reason,
+        };
+        if tokio::time::Instant::now() >= deadline {
+            return Err(last);
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("API did not become ready");
+}
+
+/// 等 API 就绪；等不到就 panic，panic 里带最后一次探测看到的原因。给**自己起进程**的调用点用。
+async fn wait_until_ready(client: &Client, base_url: &str, admin_token: &str) {
+    if let Err(reason) = await_api_ready(client, base_url, admin_token).await {
+        panic!("API at {base_url} did not become ready: {reason}");
+    }
 }
 
 async fn create_account(client: &Client, base_url: &str, admin_token: &str) -> String {

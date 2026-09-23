@@ -12,7 +12,7 @@ async fn multiple_active_offerings_route_by_priority() {
     // 同步入口会等到超时（没有 Worker）：给小值，别让用例白等。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
     let pool = PgPool::connect(&database_url)
@@ -228,7 +228,7 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
-    wait_until_ready(&client, &base_url).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
         .await
         .expect("contract database");
