@@ -1,61 +1,41 @@
-# Domain Docs
+# 领域工程判断
 
-工程技能在探索本仓库代码库时应如何消费领域文档。
+本文件只定义进行领域判断时读什么、如何使用术语、怎样处理冲突，以及什么决定值得进入 ADR。文档位置与职责见 [`docs/AGENTS.md`](../AGENTS.md#文档分层)。
 
-## Before exploring, read these
+## 判断前读取
 
-用项目指令引用的[工件注册表](artifacts.md)确认当前与历史的决定属主；具体决定登记在别处时读那一处，不要另建竞争性的 ADR 目录。
+按当前问题读取相关来源：
 
-注册表与根路径从项目指令和既有注册确定的管理根目录解析，而不是当前子项目工作目录；多个上下文共用该注册表与根级 `.agents/notes/`。上下文映射只负责选择领域文档，不划分工程注册或记录分类。
+- 根 [`CONTEXT.md`](../../CONTEXT.md)：术语与定义。
+- `docs/specs/`：适用的已评审行为合同；其范围与写法见 [`docs/AGENTS.md`](../AGENTS.md#文档分层)。
+- `docs/design/`：适用的技术方案、约束与取舍。
+- `docs/adr/`：仍然有效的持久决定；退役或合并条目只是保留旧链接的存根。
+- `docs/facts/`：已核实的渠道事实。
+- 代码与测试：当前实现证据，不自动取代 Spec、RFC 或 ADR。
 
-- **`CONTEXT.md`** — 仓库根，本仓库唯一的领域词汇表。
-- **`CONTEXT-MAP.md`** — 单上下文时不出现；出现该文件时它才指向各上下文的 `CONTEXT.md`，需读取与主题相关的每一个。
-- **`docs/design/`** — 读与即将工作的区域相关的独立技术设计 RFC（`NNNN-slug.md`）：`0001-image-generation.md` 登记实现映射，`0002-image-generation-tech-design.md` 是技术设计 v5 的权威副本。
-- **`docs/adr/`** — 读与即将工作的区域相关的 ADR；编号、准入、退役与引用写法见下「持久决定的准入与引用」。退役或合并的条目是**存根**，不算决策。
+`docs/research/` 与 `out-reference/` 只提供调查和原始证据，Agent Note 只记录一次变更的理由与验证；它们都不自动成为当前规则。来源冲突时先比较主题和职责，不用简单的目录优先级覆盖，并按下文显式标注。
 
-这些文件不存在时静默继续：不要标记缺失，也不要主动建议创建。`domain-modeling` 技能会在术语或决定真正敲定时惰性创建它们。
+## 使用词汇表术语
 
-`out-reference/` 是外部参考资源：探索时只作背景证据读取，运行中的服务只使用经审核发布的 Runtime Revision，不跟随该目录内容变化。登记与入库范围见 [`artifacts.md`](artifacts.md) 的「外部参考资源」。
-
-## File structure
-
-单上下文仓库里的领域文档部分：
-
-```
-/
-├── CONTEXT.md
-├── docs/
-│   ├── agents/                ← 本技能的配置
-│   ├── design/                ← 独立技术设计 RFC
-│   │   ├── 0001-image-generation.md
-│   │   └── 0002-image-generation-tech-design.md
-│   └── adr/                   ← 决策
-└── out-reference/             ← 外部参考资源
-```
-
-代码、表与迁移的落点见 `docs/architecture.md`，目录的完整结构以仓库本身为准。
-
-本仓库是单上下文：没有 `CONTEXT-MAP.md`，仓库根 `CONTEXT.md` 是唯一的词汇表，被 `apps/api` 与 `apps/worker` 共同使用。库分层（`crates/domain`、`crates/application`、基础设施 crate）是实现分层，不是领域边界。
-
-若将来出现真正独立的领域边界，再在仓库根加入 `CONTEXT-MAP.md` 指向各上下文的 `CONTEXT.md`；注册表与 Agent Notes 安装位置保持在仓库根不变。
-
-## Use the glossary's vocabulary
-
-当输出命名某个领域概念时（issue 标题、重构提案、假设、测试名），使用 `CONTEXT.md` 中定义的说法；不要漂移到该文件明确标注 _Avoid_ 的同义词——例如用 **Vendor** 而不是「Provider」或「渠道」，用 **Vendor Model** 而不是「平台模型」，用 **Provider** 而不是「Vendor」，用 **Offering** 而不是「模型」或「渠道」，用 **Generation Job** 而不是「Provider Task」，用 **Metering Evidence** 而不是「费用」，用 **Reconciliation Case** 而不是「普通失败」。
+命名领域概念时（Issue 标题、提案、类型、测试名），使用 `CONTEXT.md` 定义的说法，不使用其中明确要求避免的同义词。
 
 若需要的概念还不在词汇表里，这是一个信号：要么你在发明项目不用的语言（重新考虑），要么存在真实的词汇缺口（记为缺口，交给 `domain-modeling`）。
 
-## Flag conflicts
+## 标注冲突
 
 当输出与已交付的决定冲突时，显式指出而不是静默覆盖，并引用具体文档：
 
 > _与 `docs/design/0001-image-generation.md` 的「不自动重提，创建 Reconciliation Case」冲突——但值得重开，因为……_
 
-决策落位规则：做一个决定就写进 `docs/adr/` 的 ADR，`.agents/notes/` 只引用它、不复制决策正文；属主与边界以[工件注册表](artifacts.md)为准。
+发现冲突不等于立即改写权威文档；先确认是事实变化、实现偏离还是合同需要重新批准，再更新相应属主。
 
 ## 持久决定的准入与引用
 
-`docs/adr/` **只收三条判据都成立的决定**：① **难反悔**；② **不看记录会奇怪**；③ **真权衡过**（有像样的备选，当时为具体理由选了一个）。
+`docs/adr/` 只收同时满足三条判据的持久架构决定：① **难以逆转**，并能指出改变它需要迁移什么或承担什么成本；② **脱离上下文会令人困惑**；③ **经过真实权衡**，并能说清可行备选、选择理由和接受的代价。提交多、代码多或影响面广本身不构成难以逆转。
+
+创建 ADR 前先判断内容属主：规范性行为、协议要求、安全策略、兼容要求与运维不变量归 Spec；满足合同的模块、接口、数据流与处理机制归 RFC；可变配置或实测结论分别归配置与 facts。ADR 只记录剩余的架构选择及其权衡理由，并链接相关 Spec/RFC，不复制行为合同或实现机制。纯边界声明、目录划分、职责分配或机制选择若没有可说明的长期反悔成本，不进入 ADR。
+
+ADR 正文必须能回答：改变决定要迁移什么、曾有哪些真实可行的选项、为何选择当前方案并承担什么代价。任一项说不清，就由 Spec、RFC、facts 或 Agent Note 承载。
 
 以下内容不进 ADR，各有去处：改数据或配置就能回去的东西（在售型号与目录状态、价格取值、路由优先级取值）→ 发布物；某阶段的实施范围与先后 → Proposal / 工作项；被实测回答掉的候选问题 → `docs/facts/` 或 `.agents/notes/rejected/`；当前实现状态与待办缺口 → Agent Notes 或工作项。
 

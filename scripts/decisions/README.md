@@ -13,7 +13,4 @@ node scripts/decisions/check.mjs
 ## 本地修补（升级 setup bundle 时先逐文件比对，不要覆盖）
 
 - `lib.mjs` 的 `resolveTarget()` 用显式栈逐段解析相对链接，不用 `path.resolve` / `path.normalize` / `path.join`：本机 Node v24.10.0（Windows）上这些原语会把正确的跨目录相对链接误判为断链。
-- `lib.mjs` 的 `rootDir` 是仓库管理根目录（`../../`）。原版写成 `../../../` 会落到仓库外一层，读注册表失败又被 `.catch(() => null)` 吞掉——检查会静默空跑。
-- `check.mjs` 有一处本地新增：检查 `docs/agents/artifacts.md` 除「历史工件与新旧衔接」一节之外没有具体日期、提交号与变更说明。
-
 bundle 里若带索引渲染器（`update-index.mjs`）与索引新鲜度检查，不随升级引入。

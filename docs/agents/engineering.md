@@ -20,7 +20,7 @@ For end-to-end work, skip Planning when the work already satisfies the Implement
 
 Identify the Proposal or existing work item for the current change by its ID, URL or path. It defines the selected delivery scope and planning status, and points to the applicable product contract and technical design. Reuse it; a separate Proposal, Spec or RFC is needed only when its content needs a new owner.
 
-When product behavior, scope or acceptance conditions need an independent owner, use a Spec. A Spec owns what the product does, important non-goals and observable acceptance conditions. Small work without an independent RFC may keep that contract directly in the work item.
+When normative behavior needs an independent owner, use a Spec as defined in [docs/AGENTS.md](../AGENTS.md#文档分层). Its accepted revision directly guides implementation and verification. Small work without an independent Spec may keep the contract directly in the work item.
 
 An RFC may begin as a non-authoritative feasibility draft before its Spec is stable when technical constraints can materially change product scope. Feed those findings back into the Spec. Only after that Spec is stable may the RFC be accepted as an implementation basis. One Spec may be carried by multiple RFCs.
 
@@ -33,7 +33,7 @@ If a later stage exposes a material unresolved contract decision, return to `pla
 Enter implementation only when:
 
 * the identified Proposal or existing work item specifies the selected implementation scope
-* observable acceptance conditions are stated in the applicable Spec or directly in the work item
+* the applicable Spec revision has been reviewed and accepted, or the work item's equivalent contract is approved for small work; it states observable acceptance conditions
 * each required RFC identifies the Spec revision and sections it carries, without unresolved omissions, scope expansion or contradiction
 * necessary design decisions, required planning review and approvals are evidenced, with no material unresolved decision affecting this scope
 * dependencies and blockers allow the selected scope to start
@@ -53,7 +53,7 @@ Do not stop at the first working implementation when authorized end-to-end work 
 
 After implementation and Implementation Review are complete, use the `verify` skill through its final result and completion conditions.
 
-**Verify 的职责还包含记录收尾**：最终验证完成，即**按约定更新相关文档与记录的状态、归属**（约定见 [`artifacts.md`](artifacts.md) 与 [`.agents/notes/README.md`](../../.agents/notes/README.md)）。
+**Verify 的职责还包含记录收尾**：最终验证完成，即**按约定更新相关文档与记录的状态、归属**（文档归属见 [`docs/AGENTS.md`](../AGENTS.md)，Agent Note 生命周期见 [`.agents/notes/README.md`](../../.agents/notes/README.md)）。
 
 Only successful verification completes the work.
 

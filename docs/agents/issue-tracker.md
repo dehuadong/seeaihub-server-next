@@ -17,7 +17,7 @@
 
 ## Proposal workflow
 
-Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/seeaihub-server-next#<n>`）作为工作标识。同一工作复用已有 issue，不重复创建；独立的 Spec、RFC 与其他工件留在其注册位置并链接，不复制正文。Proposal 负责本次选定的交付范围、规划状态和批准证据；详细产品范围与验收由适用 Spec 拥有，没有独立 Spec 的小改动才由 Proposal 直接承载。
+Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/seeaihub-server-next#<n>`）作为工作标识。同一工作复用已有 issue，不重复创建；独立的 Spec、RFC 与其他文档留在 [`docs/AGENTS.md`](../AGENTS.md#文档分层) 定义的位置并链接，不复制正文。Proposal 负责本次选定的交付范围、规划状态和批准证据；详细产品范围与验收由适用 Spec 拥有，没有独立 Spec 的小改动才由 Proposal 直接承载。
 
 工作状态用标签表示，不用正文状态字段：
 

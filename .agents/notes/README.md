@@ -2,7 +2,7 @@
 
 本目录保存影响本仓库的工程提案与已交付决定，以及代码、测试和当前文档无法表达的选择理由、放弃方案与实际后果。已有 Spec、RFC 或 ADR 已经完整拥有相关内容时，Agent Note 只记录本次工程变更独有的理由与验证，不复制正文。
 
-正文遵循 [`docs/AGENTS.md`](../../docs/AGENTS.md)，工件位置遵循 [`docs/agents/artifacts.md`](../../docs/agents/artifacts.md)。
+文档分层、位置与正文写法遵循 [`docs/AGENTS.md`](../../docs/AGENTS.md)。
 
 ## 布局与命名
 

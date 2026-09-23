@@ -4,7 +4,7 @@
 
 ## 按改动面选证据
 
-- 每处改动选择能挡住回归的**最小**证据：Rust 改动运行相关 crate 的定向用例，传输或协议改动补对客端到端；Agent Note 与工件注册表运行 `node scripts/decisions/check.mjs`；其他代理文档检查本地链接、运行 `git diff --check` 并按写作规则审阅。
+- 每处改动选择能挡住回归的**最小**证据：Rust 改动运行相关 crate 的定向用例，传输或协议改动补对客端到端；Agent Note 运行 `node scripts/decisions/check.mjs`；其他代理文档检查本地链接、运行 `git diff --check` 并按写作规则审阅。
 - **要提交或推送，不构成把已经通过的检查再跑一遍的理由。** 根 `AGENTS.md` 里的三条命令是完整 Rust 门禁，按改动面需要时运行，不是每次提交的仪式。
 - **只报告实际跑过的命令**：没跑就写没跑，不用「应该没问题」代替证据。
 - **Rust 全量门禁由 CI 承担**（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)）：CI 在 Ubuntu 上运行格式、Clippy、Workspace 测试与 ignored HTTP 合同测试。文档、Agent Note 与技能仍按上一条在本地验证。本地重复跑 Rust 全量只用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。

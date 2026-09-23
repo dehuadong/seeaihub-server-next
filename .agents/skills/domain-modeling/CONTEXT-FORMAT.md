@@ -53,7 +53,7 @@ _Avoid_: Client, buyer, account
 
 The skill infers which structure applies:
 
-Resolve the root from project instructions and existing registration before these checks; the current working directory may be a subproject. Use the shared root artifact registry for ownership and Agent Notes; the context map does not create separate registries or record categories. Paths shown in the map are Markdown links relative to the map file.
+Resolve the root from project instructions before these checks; the current working directory may be a subproject. Use the project documentation hierarchy for ownership; the context map does not create separate record categories. Paths shown in the map are Markdown links relative to the map file.
 
 - If `CONTEXT-MAP.md` exists, read it to find contexts
 - If only a root `CONTEXT.md` exists, single context

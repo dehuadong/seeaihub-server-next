@@ -9,9 +9,9 @@ Actively build and sharpen the project's domain model as you design. This is the
 
 ## File structure
 
-Follow the artifact registry referenced by project instructions, or `docs/agents/artifacts.md` when present, for historical/current decision ownership. If change records own durable decisions, use that owner instead of creating duplicate ADRs. Paths and creation rules below are fallbacks where no project convention overrides them.
+Follow the documentation hierarchy referenced by project instructions for current decision ownership. If an existing ADR owns a durable decision, use it instead of creating a duplicate. Paths and creation rules below are fallbacks where no project convention overrides them.
 
-Resolve the repository management root from project instructions and existing registration, using the Git top-level only as a fallback. Working inside a subproject does not change it. The root registry routes all contexts; a root `CONTEXT-MAP.md` selects their domain documents. New Agent Notes installations stay at root `.agents/notes/`, with historical locations preserved as registered. Do not create a registry or record system per context, or derive record categories automatically from contexts.
+Resolve the repository management root from project instructions, using the Git top-level only as a fallback. Working inside a subproject does not change it. A root `CONTEXT-MAP.md` selects domain documents when the repository has multiple contexts. Do not create a separate record system per context or derive record categories automatically from contexts.
 
 Most repos have a single context:
 
@@ -41,7 +41,7 @@ If a `CONTEXT-MAP.md` exists at the root, the repo has multiple contexts. The ma
 │       └── docs/adr/
 ```
 
-Create files lazily in the selected context or repository-wide owner: only when you have something to write. Resolve context paths from the map and registry; the `src/` layout above is an example. An existing context ADR remains the decision's authority; Agent Notes may reference it without copying the decision. Create an ADR directory only when an independent ADR is needed at its registered or fallback owner.
+Create files lazily in the selected context or repository-wide owner: only when you have something to write. Resolve context paths from project instructions and the context map; the `src/` layout above is an example. An existing context ADR remains the decision's authority; Agent Notes may reference it without copying the decision. Create an ADR directory only when an independent ADR is needed at the project-defined or fallback owner.
 
 ## During the session
 
@@ -75,4 +75,4 @@ Only offer to create an ADR when all three are true:
 2. **Surprising without context**: a future reader will wonder "why did they do it this way?"
 3. **The result of a real trade-off**: there were genuine alternatives and you picked one for specific reasons
 
-If any of the three is missing, skip the ADR. Use the format in [ADR-FORMAT.md](./ADR-FORMAT.md).
+If any of the three is missing, skip the ADR. Invoke the `adr` skill for its eligibility rules, status, and template; it is the single source for ADR format.

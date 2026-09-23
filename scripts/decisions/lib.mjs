@@ -2,9 +2,6 @@ import { readdir, readFile, access } from 'node:fs/promises';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 export const root = fileURLToPath(new URL('../../.agents/notes/', import.meta.url));
-// 仓库管理根目录：lib.mjs 在 scripts/decisions/ 下，`../../` 才是仓库根（写成 `../../../` 会落到仓库外，
-// 读取注册表时被 `.catch` 静默吞掉，检查等于空跑——实测过）。
-export const rootDir = fileURLToPath(new URL('../../', import.meta.url));
 export const lifecycles = ['proposed', 'implemented', 'rejected'];
 
 /** 元数据块允许的键与顺序：只用这套键，按这个顺序。各生命周期的必填与禁用见 metadataRules。 */
