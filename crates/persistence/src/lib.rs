@@ -1453,10 +1453,14 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Vec<BalanceChange>, ApplicationError> {
         // 窗口在**库侧**算：`now() - $1` 用的是数据库的时钟，与写穿缓存时盖章的 `updated_at`
         // 同一个来源；换成进程时钟就会因为漂移漏掉刚变过的账户。
+        //
+        // 只要消费者账户：这条增量喂的是**余额缓存**，而平台账户不对客、没有缓存（它只在库里有
+        // 一行，运营查成本流水时直接读库）。把平台账户也算进来，每记一笔成本就多一轮没有缓存
+        // 条目可比的空检查。
         let rows = sqlx::query(
             r#"
             SELECT id, balance_microusd, updated_at FROM ledger.accounts
-            WHERE updated_at >= now() - make_interval(secs => $1)
+            WHERE kind = 'consumer' AND updated_at >= now() - make_interval(secs => $1)
             ORDER BY updated_at ASC, id ASC
             "#,
         )
@@ -2041,7 +2045,8 @@ impl HubRepository for PgHubRepository {
         }
         // Job 回到可领取：**预授权一动不动**（`ledger.holds` 与余额都不碰）。这次失败上游没开始
         // 计费，重投的不是一笔新业务；重新预授权等于把同一笔钱扣两遍，而释放再扣一遍也一样。
-        // 结算与释放只发生在最后那次成功或用尽额度失败时。
+        // 结算与释放只发生在最后那次成功或用尽额度失败时；账本上也**不该**出现成本条目——上游
+        // 没受理就没计费，这次没有任何成本事实可记。
         let requeued = sqlx::query(
             r#"
             UPDATE generation.jobs
@@ -2297,6 +2302,14 @@ impl HubRepository for PgHubRepository {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+            // **平台自担的成本这一刻进账本**：执行收尾与成本事实落到它自己那行是同一件事，
+            // 所以这里就是账上该看见这笔钱的时刻——与预授权怎么处置无关。金额为 0 或没有折算值
+            // 时不写：那不是"花掉 0 元"，是"这次没有可记账的成本事实"（来源可辨，见成本缺口清单）。
+            // 进对账那条路**不在这里之外再补一笔**：退款只是释放消费者的预授权，成本已经在它
+            // 上面那次事务里记过，补记会被业务键的唯一约束挡下（同一笔执行只记一次）。
+            if let Some(cny_microusd) = cost_cny.filter(|amount| *amount > 0) {
+                insert_platform_cost(&mut transaction, job_id, attempt_id, cny_microusd).await?;
+            }
         }
         sqlx::query(
             r#"
@@ -2956,6 +2969,47 @@ async fn insert_ledger_entry(
     .await
     .map_err(database_error)?;
     Ok(())
+}
+
+/// 把平台自己承担的一笔上游成本记进账本：平台账户余额减、`cost` 分录记负。
+///
+/// 平台账户按 `kind` 找，不把 id 写进代码——账户是数据（`migrations/0019_ledger_platform_cost.sql`
+/// 种下那一行）。找不到它说明库没迁到位：这里报错回滚整笔事务，绝不静默丢掉一笔真花掉的钱。
+///
+/// 业务键按**执行**唯一：同一笔执行的成本只记一次，重放或将来多一个写入方都会被库挡下。
+async fn insert_platform_cost(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: JobId,
+    attempt_id: AttemptId,
+    cny_microusd: i64,
+) -> Result<(), ApplicationError> {
+    let platform: Option<Uuid> = sqlx::query_scalar(
+        r#"
+        UPDATE ledger.accounts
+        SET balance_microusd = balance_microusd - $1, updated_at = now()
+        WHERE kind = 'platform'
+        RETURNING id
+        "#,
+    )
+    .bind(cny_microusd)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    let platform = platform.ok_or_else(|| {
+        ApplicationError::Persistence(
+            "no platform account is seeded; see migrations/0019_ledger_platform_cost.sql"
+                .to_owned(),
+        )
+    })?;
+    insert_ledger_entry(
+        transaction,
+        AccountId(platform),
+        Some(job_id),
+        LedgerEntryKind::Cost.as_str(),
+        -cny_microusd,
+        &format!("job:{job_id}:attempt:{attempt_id}:cost"),
+    )
+    .await
 }
 
 fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, ApplicationError> {

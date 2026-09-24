@@ -2,7 +2,7 @@
 title: 渠道成本事实采集：成本来源三态与按渠道声明的币种
 status: implemented
 created: 2026-09-22
-updated: 2026-09-23
+updated: 2026-09-24
 approval: 用户在会话中授权实施 P2a（成本事实采集）；范围与验收见提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 的 P2a 工单 [#15](https://github.com/dehuadong/seeaihub-server-next/issues/15)
 verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-server-next/issues/15) 的逐条可勾选验收清单（依据 `docs/design/0007` §1/§7/§8/§9）。**手工端到端**（真实 API `127.0.0.1:8091` + 真实 Worker + 假上游 `127.0.0.1:9099`，全新库 `seeai_p2a_verify` 上迁移 0001–0008 全新应用；零真实计费调用）：`declared` 落 `11354` / `USD`（上游声明的 11354 与渠道费率自算的 5950 不同，证明是直接取而非自算）、非 USD 声明（`CNY`）落声明值、字符串形态 `"0.011354"` 同样读出 11354、`unavailable` 三种（终态缺字段 / `cost = -0.01` / `cost = "n/a"`）金额与币种与折算值**全为 NULL**、`computed` 落 `5950`（= 14 文本输入 × 5 + 196 图像输出 × 30，每 1M）且币种 `USD`、失败执行四列 NULL（该形态已由「失败件也带成本事实」取代：见「决定」与「验证」）；同批断言对客实收恒为 `-5950`、计量证据 `total_tokens = 210`，即采集成本**不改对客金额与计量事实**。**库层"不猜"**：对 `generation.attempts` 直写 15 条（10 条违反 CHECK + 5 条合法对照）——首轮实测发现"来源 NULL 但金额非空"被库**接受**（`CHECK` 表达式求值为 NULL 时算通过，而来源为 NULL 时 `provider_cost_source IN (...)` 求值为 NULL），已就地修正 `0008` 的 `attempts_provider_cost_shape`（两支补显式 `provider_cost_source IS NOT NULL`）；修正后 10 条全部 REJECTED、5 条对照全部 ACCEPTED，另补"来源 NULL + 仅币种"与"来源 NULL + 仅折算值"两条半填同样 REJECTED。**迁移增量**：在只应用 0001–0007 的库上造一条旧 `attempts` 行，再应用 0008 → 旧行四列 NULL、其余字段逐字未变、四列无 DEFAULT（无回填）、三条 CHECK 与部分索引就位、旧行不计入 `unavailable` 缺口；增量库上新约束同样拒半填。**门禁**：`cargo fmt --all --check` exit 0；`cargo clippy --workspace --all-targets --all-features -- -D warnings` exit 0；`cargo test --workspace --all-features` 全绿（22 / 32 / 2 / 3 / 56 / 46 各 crate 单测通过，43 条端到端用例按设计 ignore）；空库端到端 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` **43 passed / 0 failed**，含本次新增的三条成本用例与币种用例；`node scripts/decisions/check.mjs` 通过。另做一次反向探针：临时把来源判定改成一律记 `unavailable`，`declared` / `computed` / 币种三条单测立刻失败（`left: Unavailable`），确认它们钉得住来源判定而不是靠断言互相抵消过关；探针已完全撤除。
 ---
@@ -65,7 +65,7 @@ verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-
 
 ## 后果
 
-- **成本只留痕，不进账本**：成功件与失败件的成本都只落在执行尝试的四列上；成本进账本与缺口补录归账实核对那条线。
+- **成功那一次的成本只留痕、不进账本**：它只落在执行尝试的四列上（毛利口径）；**失败件那份同时进账本**——`cost` 科目、挂平台账户，见[平台自担成本进账本](./2026-09-24-platform-cost-in-ledger.md)。缺口补录仍是人的动作。
 - **缺口只"查得出来"，没有告警**：按来源筛得到，但不会主动通知运营；毛利侧标"成本未知"。
 - **请求根本没交到渠道的执行四列留 NULL**：那是"根本没采"，不是漏写（见上）。
 

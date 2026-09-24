@@ -1,4 +1,5 @@
 use super::*;
+use seeai_application::RefundReconciliationCommand;
 
 /// 渠道声明了会给金额，这次却**拿不到**（终态里没有这个字段）⇒ 不猜：
 /// 金额与币种留空、来源记 `unavailable`，缺口查得出来；对客结算照常完成。
@@ -513,11 +514,99 @@ async fn a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconc
     harness.cleanup().await;
 }
 
+/// **平台自担的成本在管理员面的流水里查得到**：科目是它自己的 `cost`、金额为负，挂在平台账户上；
+/// 消费者的流水里没有它。
+///
+/// 上游终态给了金额却没有结果图就是这条路径的典型形态：钱已经花了，消费者那一侧的预授权还留着
+/// （等对账处置），平台先把这笔钱认在自己账上。这条链路同时钉住"科目取值能被读回来"——漏认一个
+/// 科目，管理员查流水看到的是 500（见 `LedgerEntryKind::parse`）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_platform_cost_is_queryable_under_its_own_kind_on_the_platform_account() {
+    let mut behaviour = UpstreamBehaviour::apimart();
+    behaviour.terminal_without_images = true;
+    let harness = Harness::start(behaviour).await;
+    let key = format!("platform-cost-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "who pays for this"),
+        )
+        .await;
+    assert_ne!(
+        status,
+        StatusCode::OK,
+        "没有结果图的那次执行是失败的：{body}"
+    );
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "reconciliation_required", "金额到手、结果没交付");
+
+    let client = Client::new();
+    let platform = platform_account(&harness.pool).await;
+    let listed: Value = client
+        .get(format!(
+            "{}/api/v1/accounts/{platform}/entries",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("platform entries")
+        .json()
+        .await
+        .expect("platform entries JSON");
+    let entries = listed["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 1, "平台账户上只有这一笔自担成本：{listed}");
+    assert_eq!(
+        entries[0]["kind"].as_str(),
+        Some("cost"),
+        "成本是它自己的科目，不混进 `adjustment`：{listed}"
+    );
+    assert_eq!(
+        entries[0]["amount_microusd"].as_i64(),
+        Some(-80_614),
+        "金额为负，就是上游实扣的那笔折算额：{listed}"
+    );
+    assert_eq!(
+        entries[0]["job_id"].as_str(),
+        Some(job_id.to_string().as_str()),
+        "要指得出是哪次执行花的钱：{listed}"
+    );
+
+    // 消费者那一侧只认自己的预授权：成本不进它的流水，也就不进它的余额。
+    let consumer: Value = client
+        .get(format!(
+            "{}/api/v1/accounts/{}/entries",
+            harness.base_url, harness.account_id
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("consumer entries")
+        .json()
+        .await
+        .expect("consumer entries JSON");
+    let consumer_entries = consumer["entries"].as_array().expect("entries array");
+    assert!(
+        consumer_entries
+            .iter()
+            .all(|entry| entry["kind"].as_str() != Some("cost")),
+        "平台自担的成本不许写进消费者的流水：{consumer}"
+    );
+
+    harness.cleanup().await;
+}
+
 /// **进对账那条路径也落成本事实**：执行已经发生、上游成本也拿得到，成本必须有去处。
 ///
 /// 直接调仓库端口的 `fail_job`：结果交付失败在端到端里很难构造（假上游总会给图），而这条路径
 /// 的写入本来就是库层的事。同时验"没有成本事实时四列留空"——那是"这次没有成本事实可落"，
 /// 与"成本是 0"不是一回事。
+///
+/// 同一批写入的另一半在账本上：平台自担的成本记成 `cost` 条目、挂在平台账户上（两种预授权处置
+/// 各一条），对账退款只释放消费者的预授权、**不补记**成本，消费者的余额从头到尾没有它。
+/// 对管理员面可见的那一条另见 `the_platform_cost_is_queryable_under_its_own_kind_on_the_platform_account`。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
@@ -613,9 +702,10 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
     .await
     .expect("runtime entry fixture");
 
-    // 两条停在"正在调上游"、持有租约的 Job：一条带成本事实进对账，一条不带。
+    // 三条停在"正在调上游"、持有租约的 Job：两条带成本事实（一条进对账，一条终态失败释放预
+    // 授权），一条不带成本事实。
     let mut jobs = Vec::new();
-    for key in ["with-cost", "without-cost"] {
+    for key in ["with-cost-retained", "with-cost-released", "without-cost"] {
         let job_id = Uuid::new_v4();
         sqlx::query(
             "INSERT INTO generation.jobs
@@ -649,10 +739,27 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         .execute(&pool)
         .await
         .expect("attempt fixture");
+        // 预授权行：释放与对账退款都要它，账上那笔成本才对应得到一次真发生过的执行。
+        sqlx::query(
+            "INSERT INTO ledger.holds (id, account_id, job_id, amount_microusd, status)
+             VALUES ($1,$2,$3,20000,'active')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(account)
+        .bind(job_id)
+        .execute(&pool)
+        .await
+        .expect("hold fixture");
         jobs.push((JobId(job_id), AttemptId(attempt_id)));
     }
 
-    let failure = |provider_cost| AttemptFailure {
+    let cost_fact = || ProviderCostFact {
+        source: ProviderCostSource::Computed,
+        amount_microusd: Some(5_950),
+        currency: Some("USD".to_owned()),
+        cny_microusd: Some(42_245),
+    };
+    let failure = |provider_cost, (target_state, hold_disposition)| AttemptFailure {
         provider_code: "result_delivery_failed".to_owned(),
         public_code: PublicErrorCode::OutcomeUnknown,
         message: "provider returned no image".to_owned(),
@@ -660,22 +767,32 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         kind: ProviderFailureKind::PlatformInternal,
         // 结果已经生成、只是交付不了：这一态在重投判据里是"绝不重投"的那一态。
         retry_safety: seeai_adapter_sdk::RetrySafety::AcceptanceUnknown,
-        target_state: seeai_domain::JobState::ReconciliationRequired,
-        hold_disposition: HoldDisposition::RetainForReconciliation,
+        target_state,
+        hold_disposition,
         provider_cost,
     };
-    let (with_cost, with_cost_attempt) = jobs[0];
+    let retained_failure = || {
+        failure(
+            Some(cost_fact()),
+            (
+                seeai_domain::JobState::ReconciliationRequired,
+                HoldDisposition::RetainForReconciliation,
+            ),
+        )
+    };
+    let released_failure = || {
+        failure(
+            Some(cost_fact()),
+            (seeai_domain::JobState::Failed, HoldDisposition::Release),
+        )
+    };
+    let (retained, retained_attempt) = jobs[0];
     repository
         .fail_job(
-            with_cost,
+            retained,
             "worker-x",
-            Some(with_cost_attempt),
-            failure(Some(ProviderCostFact {
-                source: ProviderCostSource::Computed,
-                amount_microusd: Some(5_950),
-                currency: Some("USD".to_owned()),
-                cny_microusd: Some(42_245),
-            })),
+            Some(retained_attempt),
+            retained_failure(),
         )
         .await
         .expect("the reconciliation path must record the cost it already has");
@@ -685,7 +802,7 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
                 provider_cost_cny_microusd, provider_trace_id
          FROM generation.attempts WHERE id = $1",
     )
-    .bind(with_cost_attempt.0)
+    .bind(retained_attempt.0)
     .fetch_one(&pool)
     .await
     .expect("attempt after failure");
@@ -714,20 +831,58 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
     let cases: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
     )
-    .bind(with_cost.0)
+    .bind(retained.0)
     .fetch_one(&pool)
     .await
     .expect("cases");
     assert_eq!(cases, 1, "结果交付失败仍然进对账（与成本缺口不同）");
 
-    // 没有成本事实（连用量都算不出）：四列留空，不写成 0。
-    let (without_cost, without_cost_attempt) = jobs[1];
+    // **平台自担的成本进了账本**：这笔钱上游已经扣了，账上必须看得见，而且记在平台账户上——
+    // 消费者那一侧的余额由它自己的 `capture` / `release` 说了算，成本不进那只口袋。
+    let platform = platform_account(&pool).await;
+    assert_ne!(platform, account, "平台账户与消费者账户是两个账户");
+    assert_eq!(
+        platform_cost_count(&pool, platform).await,
+        1,
+        "进对账那条路也要在账上留一条成本记录"
+    );
+    assert_eq!(
+        platform_cost_of(&pool, platform, retained).await,
+        Some(-42_245),
+        "金额为负，就是上游实扣的那笔折算额"
+    );
+
+    // 终态失败、释放预授权那条路：同一笔成本、不同的预授权处置，账上照样一条。
+    let (released, released_attempt) = jobs[1];
+    repository
+        .fail_job(
+            released,
+            "worker-x",
+            Some(released_attempt),
+            released_failure(),
+        )
+        .await
+        .expect("a released failure with a cost fact still records the cost");
+    assert_eq!(
+        platform_cost_of(&pool, platform, released).await,
+        Some(-42_245),
+        "两种处置各留一条成本记录，互不合并"
+    );
+
+    // 没有成本事实（连用量都算不出）：四列留空，不写成 0；账上也不该凭空多一条成本条目。
+    let (without_cost, without_cost_attempt) = jobs[2];
     repository
         .fail_job(
             without_cost,
             "worker-x",
             Some(without_cost_attempt),
-            failure(None),
+            failure(
+                None,
+                (
+                    seeai_domain::JobState::ReconciliationRequired,
+                    HoldDisposition::RetainForReconciliation,
+                ),
+            ),
         )
         .await
         .expect("a failure without a cost fact is still recorded");
@@ -756,9 +911,85 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         row.get::<Option<i64>, _>("provider_cost_cny_microusd")
             .is_none()
     );
+    assert_eq!(
+        platform_cost_count(&pool, platform).await,
+        2,
+        "没有成本事实就一条都不记：'没有' 不是 '0'"
+    );
+
+    // 对账退款结案：退的是**消费者**的预授权，成本在上面那次事务里已经记过了——同一笔成本不
+    // 记两次（业务键按执行唯一，真记两次会被库直接挡下）。
+    repository
+        .refund_reconciliation(RefundReconciliationCommand {
+            job_id: retained,
+            note: "upstream never delivered a result".to_owned(),
+            business_key: format!("refund-{retained}"),
+            actor: "operator".to_owned(),
+        })
+        .await
+        .expect("the refund settles the case");
+    assert_eq!(
+        platform_cost_count(&pool, platform).await,
+        2,
+        "退款只释放消费者的预授权，成本条目一条都不多"
+    );
+
+    // 平台账户的余额就是它承担的成本总额（负数）：账实核对比的就是这个等式。
+    assert_eq!(
+        account_balance(&pool, platform).await,
+        -84_490,
+        "两笔成本都落在平台账户的余额上"
+    );
+    // 消费者账户**一点成本都没沾**：初始 100000，加上两次释放回来的预授权（每条 20000）。
+    assert_eq!(
+        account_balance(&pool, account).await,
+        140_000,
+        "成本只动平台账户：消费者的余额里找不到它"
+    );
 
     pool.close().await;
     drop_isolated_database(&database_name).await;
+}
+
+/// 平台账户那一行的 id：按 `kind` 找，不写死任何常量——账户是数据，迁移种下它。
+async fn platform_account(pool: &PgPool) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM ledger.accounts WHERE kind = 'platform'")
+        .fetch_one(pool)
+        .await
+        .expect("the migrations seed exactly one platform account")
+}
+
+/// 平台账户上成本条目的条数。
+async fn platform_cost_count(pool: &PgPool, platform: Uuid) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM ledger.entries WHERE account_id = $1 AND kind = 'cost'",
+    )
+    .bind(platform)
+    .fetch_one(pool)
+    .await
+    .expect("platform cost count")
+}
+
+/// 某次执行落在平台账户上的成本金额（负数）；这次执行没记成本条目时是 `None`。
+async fn platform_cost_of(pool: &PgPool, platform: Uuid, job_id: JobId) -> Option<i64> {
+    sqlx::query_scalar(
+        "SELECT amount_microusd FROM ledger.entries
+         WHERE account_id = $1 AND kind = 'cost' AND job_id = $2",
+    )
+    .bind(platform)
+    .bind(job_id.0)
+    .fetch_optional(pool)
+    .await
+    .expect("platform cost of a job")
+}
+
+/// 一个账户当前的余额，直接读库（余额的权威只有这一处）。
+async fn account_balance(pool: &PgPool, account: Uuid) -> i64 {
+    sqlx::query_scalar("SELECT balance_microusd FROM ledger.accounts WHERE id = $1")
+        .bind(account)
+        .fetch_one(pool)
+        .await
+        .expect("account balance")
 }
 
 /// **每日扣费上限**：账户当天已经从账本上扣掉的钱达到运营设的上限时，新的受理在**受理前**被拒

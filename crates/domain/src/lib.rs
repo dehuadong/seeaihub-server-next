@@ -234,8 +234,8 @@ pub struct ProviderCostFact {
 
 /// 一条账目分录的类别。
 ///
-/// 五种类别的**符号语义**在金额上：持有与扣费是**负数**（钱被占住或真的扣掉），入账、释放与
-/// 调整为**正数**。正负号因此是答案的一部分，读账目的人不能只看绝对值。
+/// 六种类别的**符号语义**在金额上：持有、扣费与成本是**负数**（钱被占住、真的扣掉或真的花掉），
+/// 入账、释放与调整为**正数**。正负号因此是答案的一部分，读账目的人不能只看绝对值。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum LedgerEntryKind {
     /// 入账：建账户时的初始额度与之后的充值。它**不是**对某次执行的收费。
@@ -248,6 +248,13 @@ pub enum LedgerEntryKind {
     Release,
     /// 调整：运营或对账对账目的改正。
     Adjustment,
+    /// 成本：平台付给上游、自己承担的那笔费用，金额为负。
+    ///
+    /// 它记在**平台账户**上（`ledger.accounts.kind = 'platform'`，`migrations/0019_ledger_platform_cost.sql`
+    /// 种下的那一行），与消费者的余额无关：上游已经扣了钱、而这次执行没有让消费者付费（判失败、
+    /// 或对账退款结案）时，这笔钱由平台自己承担，账上必须看得见。成功那一次的成本留在执行事实上
+    /// （`generation.attempts` 的成本四列），只进毛利口径，不落账本。
+    Cost,
 }
 
 impl LedgerEntryKind {
@@ -262,6 +269,7 @@ impl LedgerEntryKind {
             Self::Capture => "capture",
             Self::Release => "release",
             Self::Adjustment => "adjustment",
+            Self::Cost => "cost",
         }
     }
 
@@ -275,6 +283,7 @@ impl LedgerEntryKind {
             "capture" => Some(Self::Capture),
             "release" => Some(Self::Release),
             "adjustment" => Some(Self::Adjustment),
+            "cost" => Some(Self::Cost),
             _ => None,
         }
     }
@@ -287,7 +296,7 @@ impl LedgerEntryKind {
 pub struct LedgerEntry {
     pub account_id: AccountId,
     pub kind: LedgerEntryKind,
-    /// 分录金额（人民币微单位）：持有与扣费为负、释放与调整为正。
+    /// 分录金额（人民币微单位）：持有、扣费与成本为负，释放与调整为正。
     pub amount_microusd: i64,
     /// 归属的执行记录；建账户与充值这类不挂在执行上的分录没有它。
     pub job_id: Option<JobId>,
