@@ -199,7 +199,10 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
-    async fn account_for_api_key(&self, _key_hash: &str) -> Result<AccountId, ApplicationError> {
+    async fn api_key_identity(
+        &self,
+        _key_hash: &str,
+    ) -> Result<(Uuid, AccountId), ApplicationError> {
         unused_repository()
     }
 

@@ -2,7 +2,7 @@ use anyhow::{Context, Result};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
-    http::{HeaderMap, StatusCode, header},
+    http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
@@ -12,11 +12,11 @@ use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
-    CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationService,
-    HubRepository, IdentityService, JobView, MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService,
-    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RoutePolicyService,
-    RuntimeService,
+    CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationRateLimit,
+    GenerationService, HubRepository, IdentityService, JobView, MAX_OPERATIONAL_LIMIT, NewFxRate,
+    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
+    RoutePolicyService, RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -87,10 +87,17 @@ async fn main() -> Result<()> {
     // 服务，本进程在，兜底就在。
     if acceleration.is_enabled() {
         tokio::spawn(acceleration.clone().run_reconciler());
+    } else {
+        // 速率计数就落在这个缓存上：没有缓存时它无处可落，限流这一层等于不生效（见
+        // `AccelerationService::consume_request_slot`）。这是部署期看得见的事实，不是静默降级。
+        tracing::warn!(
+            "no cache service configured; the per-API-key rate limit does not apply in this process"
+        );
     }
     let state = AppState {
         admin_token,
-        identity: IdentityService::new(repository_port.clone()),
+        identity: IdentityService::new(repository_port.clone())
+            .with_rate_limit(acceleration.clone(), generation_rate_limit()?),
         runtime: RuntimeService::new(repository_port.clone(), adapters)
             .with_acceleration(acceleration.clone()),
         reconciliation: ReconciliationService::new(repository_port.clone())
@@ -1103,15 +1110,25 @@ fn sync_error_response_with(
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId, ApiError> {
     let token = bearer_token(headers)?;
-    state
-        .identity
-        .authenticate(token)
-        .await
-        .map_err(|_| ApiError {
+    match state.identity.authenticate(token).await {
+        Ok(identity) => Ok(identity.account_id),
+        // 速率超限是"你是谁我们知道了，但现在太密"，与"这把密钥无效"要分开：混成 401 会让
+        // 调用方以为该换密钥，而它其实只需要等一会儿。
+        Err(ApplicationError::RateLimitExceeded { retry_after }) => Err(ApiError {
+            status: StatusCode::TOO_MANY_REQUESTS,
+            code: "rate_limit_exceeded",
+            message: "too many requests for this API key; retry after the seconds in the \
+                      Retry-After header"
+                .to_owned(),
+            retry_after: Some(retry_after),
+        }),
+        Err(_) => Err(ApiError {
             status: StatusCode::UNAUTHORIZED,
             code: "invalid_api_key",
             message: "API key is invalid or revoked".to_owned(),
-        })
+            retry_after: None,
+        }),
+    }
 }
 
 fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
@@ -1123,6 +1140,7 @@ fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> 
             status: StatusCode::FORBIDDEN,
             code: "admin_forbidden",
             message: "admin authorization failed".to_owned(),
+            retry_after: None,
         })
     }
 }
@@ -1137,6 +1155,7 @@ fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
             status: StatusCode::UNAUTHORIZED,
             code: "authorization_required",
             message: "Bearer authorization is required".to_owned(),
+            retry_after: None,
         })
 }
 
@@ -1145,6 +1164,9 @@ struct ApiError {
     status: StatusCode,
     code: &'static str,
     message: String,
+    /// `Retry-After`（秒）。只有"等一下再来"这类错误有它：调用方要的答案不是"你错了"，是"什么时候
+    /// 再来"，不给它就只能盲目重试。
+    retry_after: Option<Duration>,
 }
 
 impl ApiError {
@@ -1153,6 +1175,7 @@ impl ApiError {
             status: StatusCode::BAD_REQUEST,
             code,
             message: message.into(),
+            retry_after: None,
         }
     }
 }
@@ -1179,6 +1202,11 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::TooManyInFlight => {
                 (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight")
             }
+            // 速率超限走到这里时（不是入口那条路径），也只说"太密了"：`Retry-After` 在
+            // [`ApiError::from`] 的通用路径上没有位置放，因此认证入口自己那条分支才是对客的正常路径。
+            ApplicationError::RateLimitExceeded { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
+            }
             ApplicationError::Configuration(_)
             | ApplicationError::Persistence(_)
             | ApplicationError::Reconciliation(_) => {
@@ -1194,14 +1222,24 @@ impl From<ApplicationError> for ApiError {
             status,
             code,
             message,
+            retry_after: None,
         }
     }
 }
 
 impl IntoResponse for ApiError {
     fn into_response(self) -> Response {
+        let mut headers = HeaderMap::new();
+        if let Some(retry_after) = self.retry_after {
+            // 向上取整到秒：说"1 秒后可以再来"必须真的够等，向下取整会让调用方在窗口边界上再撞一次。
+            let seconds = retry_after.as_secs() + u64::from(retry_after.subsec_millis() > 0);
+            if let Ok(value) = HeaderValue::from_str(&seconds.max(1).to_string()) {
+                headers.insert(header::RETRY_AFTER, value);
+            }
+        }
         (
             self.status,
+            headers,
             Json(json!({
                 "error": {
                     "code": self.code,
@@ -1254,6 +1292,15 @@ fn generation_max_concurrent_jobs() -> Result<u64> {
             .context("GENERATION_MAX_CONCURRENT_JOBS must be an integer"),
         _ => Ok(1),
     }
+}
+
+/// 每把 API Key 的请求速率上限（默认每分钟 60 次）。读法与上一项相同，两个环境变量：
+/// `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` 与 `GENERATION_RATE_LIMIT_WINDOW_MS`。
+///
+/// 它是**运维取值**，不是产品档位：不同部署（内部工具、压测、开发机）要挡住的数量级差得很远，
+/// 所以留成部署期可调，而不是写死在代码里。
+fn generation_rate_limit() -> Result<GenerationRateLimit> {
+    Ok(GenerationRateLimit::from_env()?)
 }
 
 fn init_tracing() {

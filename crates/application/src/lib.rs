@@ -1061,6 +1061,70 @@ pub struct CreateImageGenerationRequest {
     pub idempotency_key: String,
 }
 
+/// 每把 API Key 的请求速率上限：**一个窗口**内允许多少次请求，以及这个窗口有多长。
+///
+/// 默认是"每分钟 60 次"，取的是运维口径而不是产品口径：它要挡住的是**一把密钥刷满整个平台**这种
+/// 形态（脚本没退避、密钥被贴进别人的工具里），不是给正常调用方设精算过的档位。因此这个数只保证
+/// "明显异常的密度必然被挡"，正常用量离它很远；要按客户分级，改的是部署期的环境变量，不是这里。
+///
+/// 计数落在缓存里、且**缓存不可用时放行**，理由见 [`AccelerationService::consume_request_slot`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationRateLimit {
+    pub max_requests: u64,
+    pub window: Duration,
+}
+
+impl GenerationRateLimit {
+    /// 运维默认值：每分钟 60 次。
+    #[must_use]
+    pub fn default_limit() -> Self {
+        Self {
+            max_requests: 60,
+            window: Duration::from_secs(60),
+        }
+    }
+
+    pub fn new(max_requests: u64, window: Duration) -> Result<Self, ApplicationError> {
+        if max_requests == 0 {
+            return Err(ApplicationError::Configuration(
+                "the generation rate limit must allow at least one request per window".to_owned(),
+            ));
+        }
+        // 窗口为 0 时"每个窗口的次数"没有意义，而且 `set` 的存活时间会变成 0。
+        if window.is_zero() {
+            return Err(ApplicationError::Configuration(
+                "the generation rate limit window must be positive".to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_requests,
+            window,
+        })
+    }
+
+    /// 从环境变量读运维取值：`GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` 与
+    /// `GENERATION_RATE_LIMIT_WINDOW_MS`，两项都没给就用默认值。
+    ///
+    /// 窗口按**毫秒**读，好让部署与用例能配到秒以下的窗口；默认值仍是设计里那个"每分钟"。
+    pub fn from_env() -> Result<Self, ApplicationError> {
+        Self::new(
+            rate_limit_env("GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW", 60)?,
+            Duration::from_millis(rate_limit_env("GENERATION_RATE_LIMIT_WINDOW_MS", 60_000)?),
+        )
+    }
+}
+
+/// 读一个"次数"或"毫秒数"的整数参数；没给或给空取默认值。
+fn rate_limit_env(name: &str, default: u64) -> Result<u64, ApplicationError> {
+    match std::env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .map_err(|_| ApplicationError::Configuration(format!("{name} must be an integer"))),
+        _ => Ok(default),
+    }
+}
+
 impl CreateImageGenerationRequest {
     /// 这个请求属于哪条图片分支：有图无遮罩=图生图、两者都有=带遮罩、都没=文生图。
     ///
@@ -1390,6 +1454,13 @@ pub enum ApplicationError {
     InsufficientBalance,
     #[error("too many requests in flight")]
     TooManyInFlight,
+    /// 这把密钥在当前窗口内已经用满每分钟请求数。
+    ///
+    /// 与 [`Self::TooManyInFlight`] 分成两个错误：那个是"上一个还没跑完"，等一会儿重发同一个请求
+    /// 就行；这个是"这一分钟发得太密"，要等到下一个窗口。对客因此要能用两个不同的码区分。
+    /// 窗口长度随错误一起给出，调用方才知道该说"多久之后再来"。
+    #[error("rate limit exceeded; retry after {retry_after:?}")]
+    RateLimitExceeded { retry_after: Duration },
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("persistence error: {0}")]
@@ -1627,7 +1698,10 @@ pub trait HubRepository: Send + Sync {
     /// 什么"；把重复吊销报成错误只会让重发求助变成故障。键不存在返回 `NotFound`。
     async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError>;
 
-    async fn account_for_api_key(&self, key_hash: &str) -> Result<AccountId, ApplicationError>;
+    /// 按密钥摘要查这个调用方是谁：**账户**与**密钥标识**。吊销判定在这一条读里（只认
+    /// `revoked_at IS NULL`），因此认证路径每次都要走它。
+    async fn api_key_identity(&self, key_hash: &str)
+    -> Result<(Uuid, AccountId), ApplicationError>;
 
     /// 创建 Job，并与 Job **同事务**写入路由判定记录。
     ///
@@ -1859,15 +1933,53 @@ impl PricingService {
     }
 }
 
+/// 认证成功后这个调用方是谁：**哪个账户**、以及**哪把密钥**。
+///
+/// 密钥标识单独带出来，是因为限流、审计、排障都以"哪把密钥"为单位：一个账户可以有多把密钥，
+/// 按账户限流会让一把失控的密钥拖住同一账户的其它密钥。密钥标识本身不含明文，它本来就是
+/// 管理员吊销时要用的那个 id。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ApiKeyIdentity {
+    pub account_id: AccountId,
+    pub key_id: Uuid,
+}
+
 #[derive(Clone)]
 pub struct IdentityService {
     repository: Arc<dyn HubRepository>,
+    /// 加速层：认证路径**每次**读库换账户（吊销要即刻生效），只把**速率计数**放进缓存；
+    /// 计数怎么判、缓存挂了怎么办，见 [`AccelerationService::consume_request_slot`]。
+    acceleration: Arc<AccelerationService>,
+    /// 每把密钥的请求速率上限。
+    rate_limit: GenerationRateLimit,
 }
 
 impl IdentityService {
+    /// 没有加速层、也没有额外配置的认证：速率计数没有缓存可落，于是不设限。
     #[must_use]
     pub fn new(repository: Arc<dyn HubRepository>) -> Self {
-        Self { repository }
+        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
+        Self {
+            repository,
+            acceleration,
+            rate_limit: GenerationRateLimit::default_limit(),
+        }
+    }
+
+    /// 装上加速层与运维给的速率上限。**上限是配置项**：它随部署形态变（内部工具、压测、
+    /// 单机开发各要一个数），所以由调用方给，而不是写死在这里。
+    ///
+    /// 加速层没配缓存（[`AccelerationService::disabled`]）时速率计数无处可落，限流**不生效**：
+    /// 调用方要按部署事实把这件事讲出来（见 `apps/api` 启动时那条日志），别让它静悄悄地不发生。
+    #[must_use]
+    pub fn with_rate_limit(
+        mut self,
+        acceleration: Arc<AccelerationService>,
+        rate_limit: GenerationRateLimit,
+    ) -> Self {
+        self.acceleration = acceleration;
+        self.rate_limit = rate_limit;
+        self
     }
 
     /// 发一把密钥。返回 `(key_id, 明文)`。
@@ -1906,18 +2018,29 @@ impl IdentityService {
         self.repository.revoke_api_key(key_id, actor).await
     }
 
-    /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里。
+    /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里；读到了就为这把密钥占一个
+    /// 当前窗口的速率名额。
     ///
     /// 刻意**不**缓存"这把密钥还有效吗"：吊销的语义是"立刻停止使用"，任何缓存都会让吊销在 TTL
     /// 内不生效——而吊销恰恰是那种"多延迟一秒都在放行不该放行的请求"的动作。这里一次唯一索引点查
     /// 很便宜，用它换"吊销即生效"是划算的。
-    pub async fn authenticate(&self, plaintext: &str) -> Result<AccountId, ApplicationError> {
+    ///
+    /// 速率判定放在这里、而不是生成流程里面：它只依赖"哪把密钥"，是入口就能判的事；放进生成流程
+    /// 等于让每个入口各自记得调用一次。被吊销的密钥读不到账户，因此也**不占**速率名额。
+    pub async fn authenticate(&self, plaintext: &str) -> Result<ApiKeyIdentity, ApplicationError> {
         if !plaintext.starts_with("sk_seeai_") {
             return Err(ApplicationError::NotFound("api key".to_owned()));
         }
-        self.repository
-            .account_for_api_key(&sha256_hex(plaintext.as_bytes()))
-            .await
+        let (key_id, account_id) = self
+            .repository
+            .api_key_identity(&sha256_hex(plaintext.as_bytes()))
+            .await?;
+        // 窗口按进程时钟取：窗口只是"多久算一轮"，时钟漂移只会让某一轮稍长或稍短，不会让计数
+        // 跑到别的键或别的窗口上去；为它多打一次数据库不值。
+        self.acceleration
+            .consume_request_slot(key_id, self.rate_limit, Utc::now())
+            .await?;
+        Ok(ApiKeyIdentity { account_id, key_id })
     }
 }
 
@@ -2262,6 +2385,17 @@ pub struct ReconcileReport {
     pub routes_invalidated: u64,
 }
 
+/// 速率计数缓存的值：**哪个窗口**、这个窗口里已经数到几。
+///
+/// 窗口标识一起存进去，是因为键的存活时间由缓存自己管、与窗口边界只是"差不多同时"：缓存里可能
+/// 留着上一个窗口的键（时钟有偏差、写入失败过）。比对窗口标识把这种残留判成"这个窗口从零开始"，
+/// 而不是把上个窗口的次数接着往下数——计数偏高会拒掉本来合规的请求。
+#[derive(Debug, Serialize, Deserialize)]
+struct CachedRateLimit {
+    window: i64,
+    count: u64,
+}
+
 /// 加速层：把"哪些东西可以缓、值长什么样、什么时候能拿它下结论"收在一处。
 ///
 /// 三条不变量，改这个类型时必须一起守住：
@@ -2321,6 +2455,103 @@ impl AccelerationService {
 
     fn balance_key(account_id: AccountId) -> String {
         format!("user_balance:{account_id}")
+    }
+
+    /// 速率计数的键：**密钥标识 + 窗口序号**。窗口写进键里，跨窗口因此天然是一份新计数，
+    /// 不依赖上一次写入的存活时间算得准。
+    fn rate_limit_key(key_id: Uuid, window: i64) -> String {
+        format!("rate_limit:{key_id}:{window}")
+    }
+
+    /// 为这把密钥占用当前窗口的一个名额。返回 `Err` 表示这个窗口已经用满，并带上"多久之后
+    /// 可以再来"。
+    ///
+    /// 计数落在**缓存**里：限流是保护机制、不是业务事实，写库会把每个请求变成一次写——而限流要挡
+    /// 的恰恰是"请求很多"这种形态，用它自己把数据库写满是最糟的失败方式。
+    ///
+    /// **缓存不可用时放行。** 限流是保护，不是准入：读不到计数就当作"这个窗口还没数过"，把请求
+    /// 放过去。反过来（读不到就拒）会让加速层的一次降级直接把全部请求拒掉——一次降级放大成一次
+    /// 故障。同理，写入失败只记日志：那一笔少数的请求会过去，下一个请求接着读不到、接着放行，
+    /// 直到缓存回来为止；宁可少挡几次，也不要拒掉合规的调用方。
+    ///
+    /// 计数**不是严格原子**的：`CacheStore` 只有读写两条命令（没有 `INCR`），并发请求可能读到同
+    /// 一个数再各自写回，于是这个窗口里实际能过去的请求可能比上限多几个。这是刻意的取舍——限流
+    /// 要挡的是数量级上的异常（脚本没退避），不是精确的第 61 次；为此把缓存接口撑大、让实现方也懂
+    /// "计数"反而会把两边的语义各自漂移（见 [`CacheStore`]）。
+    ///
+    /// `now` 由调用方给：窗口只是"多久算一轮"，时钟漂移的唯一后果是某一轮稍长或稍短，不改变
+    /// "计数在缓存、缓存挂了就放行"这两条。
+    pub async fn consume_request_slot(
+        &self,
+        key_id: Uuid,
+        limit: GenerationRateLimit,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApplicationError> {
+        let window = self.rate_limit_window(limit.window, now);
+        let current = match self.read_rate_limit(key_id, window).await {
+            Some(cached) => cached,
+            // 读不到（缓存不可用、或这个窗口还没有计数）就当从零开始：放行。
+            None => CachedRateLimit { window, count: 0 },
+        };
+        let count = current.count.saturating_add(1);
+        self.write(
+            &Self::rate_limit_key(key_id, window),
+            &json!({ "window": window, "count": count }).to_string(),
+            self.rate_limit_ttl(limit.window, now),
+        )
+        .await;
+        if count > limit.max_requests {
+            return Err(ApplicationError::RateLimitExceeded {
+                retry_after: self.rate_limit_retry_after(limit.window, now),
+            });
+        }
+        Ok(())
+    }
+
+    /// 这次请求落在第几个窗口。窗口按钟点等分，序号本身没有含义，只用来判断"是不是同一个窗口"。
+    fn rate_limit_window(&self, window: Duration, now: DateTime<Utc>) -> i64 {
+        let millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now_millis = now.timestamp_millis().max(0) as u64;
+        (now_millis / millis) as i64
+    }
+
+    /// 这条计数该活多久：本窗口剩下的时间。窗口一过它就该消失——留着只会让下一个窗口的第一次
+    /// 写入多一次"读到旧值"的机会。至少 1 毫秒：存活时间为 0 会被缓存当成非法命令。
+    fn rate_limit_ttl(&self, window: Duration, now: DateTime<Utc>) -> Duration {
+        let remaining = self.window_remaining(window, now);
+        remaining.max(Duration::from_millis(1))
+    }
+
+    /// 到下一个窗口还有多久（对客的 `Retry-After`）。
+    fn rate_limit_retry_after(&self, window: Duration, now: DateTime<Utc>) -> Duration {
+        // 据实取值，不四舍五入到窗口长度：窗口只剩 2 秒时告诉调用方"等 2 秒"，它才真的能接着用。
+        self.window_remaining(window, now)
+            .max(Duration::from_millis(1))
+    }
+
+    fn window_remaining(&self, window: Duration, now: DateTime<Utc>) -> Duration {
+        let millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
+        let now_millis = now.timestamp_millis().max(0) as u64;
+        Duration::from_millis(millis - (now_millis % millis))
+    }
+
+    async fn read_rate_limit(&self, key_id: Uuid, window: i64) -> Option<CachedRateLimit> {
+        let key = Self::rate_limit_key(key_id, window);
+        let raw = self.read(&key).await?;
+        match serde_json::from_str::<CachedRateLimit>(&raw) {
+            Ok(cached) if cached.window == window => Some(cached),
+            // 值读不出来、或它是**别的窗口**留下的：当这个窗口还没数过。计数偏高会拒掉合规的
+            // 请求，偏低只是少挡几次——两种错里只有前者会伤到调用方。
+            Ok(_) => None,
+            Err(error) => {
+                tracing::warn!(
+                    key,
+                    error = %error,
+                    "the cached rate limit counter is unreadable; counting this window from zero"
+                );
+                None
+            }
+        }
     }
 
     /// 取该网关模型的候选集：缓存命中且**修订标识一致**才用缓存，否则回源数据库并重建缓存。

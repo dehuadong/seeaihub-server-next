@@ -543,7 +543,61 @@ async fn start_api(
     sync_wait_seconds: u64,
     max_concurrent_jobs: u64,
 ) -> (String, String, ApiProcess) {
-    start_api_with(database_url, sync_wait_seconds, max_concurrent_jobs, None).await
+    start_api_with(
+        database_url,
+        sync_wait_seconds,
+        max_concurrent_jobs,
+        &ApiProcessSettings::default(),
+    )
+    .await
+}
+
+/// 一次用例要给 API 进程配的**速率上限**（每把 API Key）。
+///
+/// 默认那一套是每分钟 60 次，用例要观察"超限被拒"就得把它调到 1 次——按默认值跑，光是把上限
+/// 撞到就要先发 61 次请求。字段直接就是那两个环境变量的值。
+#[derive(Debug, Clone, Copy)]
+struct ApiRateLimit {
+    requests_per_window: u64,
+    window_ms: u64,
+}
+
+impl ApiRateLimit {
+    /// 一个窗口只放一次：第二次请求必然越限，用例不必等到 60 次。
+    fn once_per(window_ms: u64) -> Self {
+        Self {
+            requests_per_window: 1,
+            window_ms,
+        }
+    }
+}
+
+/// API 进程的两项可选配置：**加速层**与**每把密钥的速率上限**。
+///
+/// 两者绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流这一层
+/// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
+#[derive(Default)]
+struct ApiProcessSettings {
+    cache: Option<CacheFixture>,
+    rate_limit: Option<ApiRateLimit>,
+}
+
+impl ApiProcessSettings {
+    /// 配置好加速层，并用默认的速率上限（每分钟 60 次）。
+    fn with_cache(cache: CacheFixture) -> Self {
+        Self {
+            cache: Some(cache),
+            rate_limit: None,
+        }
+    }
+
+    /// 同 [`Self::with_cache`]，但把速率上限也调小。
+    fn with_cache_and_rate_limit(cache: CacheFixture, rate_limit: ApiRateLimit) -> Self {
+        Self {
+            cache: Some(cache),
+            rate_limit: Some(rate_limit),
+        }
+    }
 }
 
 /// 同 [`start_api`]，但可以给这个进程配上**加速层**（缓存）。
@@ -556,7 +610,7 @@ async fn start_api_with(
     database_url: &str,
     sync_wait_seconds: u64,
     max_concurrent_jobs: u64,
-    cache: Option<&CacheFixture>,
+    settings: &ApiProcessSettings,
 ) -> (String, String, ApiProcess) {
     const ATTEMPTS: usize = 5;
 
@@ -583,7 +637,18 @@ async fn start_api_with(
             )
             .stdout(Stdio::null())
             .stderr(Stdio::null());
-        apply_cache_env(&mut command, cache);
+        apply_cache_env(&mut command, settings.cache.as_ref());
+        if let Some(rate_limit) = settings.rate_limit {
+            command
+                .env(
+                    "GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW",
+                    rate_limit.requests_per_window.to_string(),
+                )
+                .env(
+                    "GENERATION_RATE_LIMIT_WINDOW_MS",
+                    rate_limit.window_ms.to_string(),
+                );
+        }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
         let mut process = ApiProcess { child };
@@ -757,7 +822,7 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             30,
-            None,
+            ApiProcessSettings::default(),
             markup_bps,
         )
         .await
@@ -775,7 +840,7 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             30,
-            None,
+            ApiProcessSettings::default(),
             None,
         )
         .await
@@ -799,7 +864,30 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             sync_wait_seconds,
-            Some(cache),
+            ApiProcessSettings::with_cache(cache),
+            None,
+        )
+        .await
+    }
+
+    /// 同 [`Self::start_with_cache`]，但把**每把密钥的速率上限**也调小：用例因此不必发满默认的
+    /// 每分钟 60 次，第二次请求就能看到越限那条路。
+    async fn start_with_cache_and_rate_limit(
+        draft: Value,
+        contract: Option<Value>,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+        cache: CacheFixture,
+        rate_limit: ApiRateLimit,
+    ) -> Self {
+        Self::build(
+            draft,
+            contract,
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
+            ApiProcessSettings::with_cache_and_rate_limit(cache, rate_limit),
             None,
         )
         .await
@@ -811,7 +899,7 @@ impl Harness {
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
         sync_wait_seconds: u64,
-        cache: Option<CacheFixture>,
+        settings: ApiProcessSettings,
         markup_bps: Option<i32>,
     ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
@@ -821,7 +909,7 @@ impl Harness {
             &database_url,
             sync_wait_seconds,
             max_concurrent_jobs,
-            cache.as_ref(),
+            &settings,
         )
         .await;
         let client = Client::new();
@@ -872,7 +960,7 @@ impl Harness {
             declared_surface,
             _api: process,
             _upstream: upstream,
-            cache,
+            cache: settings.cache,
         }
     }
 
@@ -2594,6 +2682,11 @@ impl CacheFixture {
                 expires_at: None,
             },
         );
+    }
+
+    /// 直接删一条（绕过服务）：用例用它构造"这条值不在了"（例如到了别的限流窗口）。
+    fn delete(&self, key: &str) {
+        self.state.lock().expect("cache state lock").remove(key);
     }
 
     /// 让后续的 `SET` / `DEL` 全部失败：模拟"发布之后的失效没成功"。

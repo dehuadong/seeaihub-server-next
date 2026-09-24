@@ -1412,10 +1412,13 @@ impl HubRepository for PgHubRepository {
     /// 认证链路上没有、也不能有"这把密钥还有效吗"的缓存：吊销的语义是"从这一刻起停止使用"，把它
     /// 缓存住就等于把吊销推迟到缓存过期之后——正是吊销要阻止的事。代价只是每个请求一次唯一索引
     /// 点查，换来吊销即生效。
-    async fn account_for_api_key(&self, key_hash: &str) -> Result<AccountId, ApplicationError> {
-        let account_id: Uuid = sqlx::query_scalar(
+    async fn api_key_identity(
+        &self,
+        key_hash: &str,
+    ) -> Result<(Uuid, AccountId), ApplicationError> {
+        let identity: (Uuid, Uuid) = sqlx::query_as(
             r#"
-            SELECT account_id FROM identity.api_keys
+            SELECT id, account_id FROM identity.api_keys
             WHERE key_hash = $1 AND revoked_at IS NULL
             "#,
         )
@@ -1424,7 +1427,7 @@ impl HubRepository for PgHubRepository {
         .await
         .map_err(database_error)?
         .ok_or_else(|| ApplicationError::NotFound("api key".to_owned()))?;
-        Ok(AccountId(account_id))
+        Ok((identity.0, AccountId(identity.1)))
     }
 
     async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
