@@ -1,5 +1,5 @@
 use super::*;
-use seeai_adapter_sdk::{GeneratedImage, ProviderCallError};
+use seeai_adapter_sdk::{GeneratedImage, ProviderCallError, RetrySafety};
 use seeai_domain::{
     ChannelId, OfferingId, PricePlanId, PriceSnapshot, RuntimeRevisionId, TokenUsage, VendorModelId,
 };

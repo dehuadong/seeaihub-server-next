@@ -6,7 +6,7 @@ use seeai_application::{
     LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, ProviderCostGapView,
     ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
     PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
-    declared_output_images,
+    UnacceptedAttempt, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -1930,7 +1930,7 @@ impl HubRepository for PgHubRepository {
         worker_id: &str,
         attempt_id: AttemptId,
         request_digest: &str,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<u32, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let updated = sqlx::query(
             r#"
@@ -1949,18 +1949,118 @@ impl HubRepository for PgHubRepository {
                 "job {job_id} lease is not valid"
             )));
         }
+        // 号在同一台 Job 的锁里算：这次 `UPDATE` 已经把 Job 那一行锁住（同事务、未提交），
+        // 同一台 Job 的第二次执行拿不到锁，所以"现有行数 + 1"在并发下也是唯一的。
+        let attempt_no: i32 = sqlx::query_scalar(
+            r#"
+            SELECT coalesce(max(attempt_no), 0) + 1 FROM generation.attempts WHERE job_id = $1
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let attempt_no = u32::try_from(attempt_no).map_err(|_| {
+            ApplicationError::Persistence(
+                "attempt number overflows the 32-bit range used by the worker".to_owned(),
+            )
+        })?;
         sqlx::query(
             r#"
-            INSERT INTO generation.attempts (id, job_id, state, request_digest)
-            VALUES ($1,$2,'submitting',$3)
+            INSERT INTO generation.attempts (id, job_id, state, request_digest, attempt_no)
+            VALUES ($1,$2,'submitting',$3,$4)
             "#,
         )
         .bind(attempt_id.0)
         .bind(job_id.0)
         .bind(request_digest)
+        .bind(i32::try_from(attempt_no).map_err(|_| {
+            ApplicationError::Persistence("attempt number is out of range".to_owned())
+        })?)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(attempt_no)
+    }
+
+    async fn requeue_after_unaccepted(
+        &self,
+        command: UnacceptedAttempt,
+    ) -> Result<(), ApplicationError> {
+        let UnacceptedAttempt {
+            job_id,
+            worker_id,
+            attempt_id,
+            attempt_no,
+            failure,
+            next_attempt_at,
+        } = command;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 这次执行的收尾：状态、渠道码、原文与**它自己那一行的成本四列**，与终态那次同一套口径
+        // （逐次归）。所以重投产生的每一行都有本次执行的用量与成本，不合并、不覆盖。
+        let provider_cost = failure.provider_cost.clone();
+        let (cost_amount, cost_currency, cost_source, cost_cny) = match &provider_cost {
+            Some(cost) => (
+                cost.amount_microusd.map(to_i64).transpose()?,
+                cost.currency.clone(),
+                Some(cost.source.as_str()),
+                cost.cny_microusd.map(to_i64).transpose()?,
+            ),
+            None => (None, None, None, None),
+        };
+        let completed = sqlx::query(
+            r#"
+            UPDATE generation.attempts
+            SET state = 'failed', provider_trace_id = $4, provider_error_code = $5,
+                provider_error_message = $6, provider_cost_microusd = $7,
+                provider_cost_currency = $8, provider_cost_source = $9,
+                provider_cost_cny_microusd = $10, completed_at = now()
+            WHERE id = $1 AND job_id = $2 AND attempt_no = $3 AND state = 'submitting'
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .bind(i32::try_from(attempt_no).map_err(|_| {
+            ApplicationError::Persistence("attempt number is out of range".to_owned())
+        })?)
+        .bind(&failure.trace_id)
+        .bind(&failure.provider_code)
+        .bind(&failure.message)
+        .bind(cost_amount)
+        .bind(&cost_currency)
+        .bind(cost_source)
+        .bind(cost_cny)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if completed.rows_affected() != 1 {
+            return Err(ApplicationError::Conflict(format!(
+                "attempt {attempt_id} of job {job_id} is not submitting"
+            )));
+        }
+        // Job 回到可领取：**预授权一动不动**（`ledger.holds` 与余额都不碰）。这次失败上游没开始
+        // 计费，重投的不是一笔新业务；重新预授权等于把同一笔钱扣两遍，而释放再扣一遍也一样。
+        // 结算与释放只发生在最后那次成功或用尽额度失败时。
+        let requeued = sqlx::query(
+            r#"
+            UPDATE generation.jobs
+            SET state = 'accepted', lease_owner = NULL, lease_expires_at = NULL,
+                next_attempt_at = $3, version = version + 1, updated_at = now()
+            WHERE id = $1 AND lease_owner = $2
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(&worker_id)
+        .bind(next_attempt_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if requeued.rows_affected() != 1 {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is not leased by {worker_id}"
+            )));
+        }
         transaction.commit().await.map_err(database_error)
     }
 
@@ -2476,7 +2576,17 @@ impl HubRepository for PgHubRepository {
                    c.provider_kind, j.failure_kind, j.error_code, j.updated_at,
                    a.provider_trace_id, a.provider_error_code, a.provider_error_message
             FROM generation.jobs j
-            LEFT JOIN generation.attempts a ON a.job_id = j.id
+            -- 一个 Job 现在可以有多行 Attempt（只有"可证明未受理"才重投）。运营面列的是**失败
+            -- 的 Job**，所以取**最后一次**执行的记录：一次重投之后还挂着第一次的渠道码，运营
+            -- 看到的会是已经被重投消解掉的那次失败的原因。`LATERAL` 而不是普通 JOIN 加分组，
+            -- 是为了让"一条 Job 一行"由查询本身保证——分成多行会让下面的条数与 limit 一起失真。
+            LEFT JOIN LATERAL (
+                SELECT provider_trace_id, provider_error_code, provider_error_message
+                FROM generation.attempts
+                WHERE job_id = j.id
+                ORDER BY attempt_no DESC
+                LIMIT 1
+            ) a ON true
             LEFT JOIN supply.channels c ON c.id = j.channel_id
             WHERE j.failure_kind IS NOT NULL
               AND ($1::text[] IS NULL OR j.failure_kind = ANY($1))

@@ -53,6 +53,9 @@ pub use request_timeout::{
     requested_image_count, upstream_timeout,
 };
 
+mod retry;
+pub use retry::{DEFAULT_BACKOFF_BASE_MS, DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS, RetryPolicy};
+
 /// 发布一个 Vendor Model 的供给。
 ///
 /// 一次发布携带该模型**完整、有序**的候选集合（`offerings`，必填且非空）；
@@ -1339,6 +1342,12 @@ pub struct AttemptFailure {
     pub trace_id: Option<String>,
     /// 平台侧失败类别：决定对客码与"是否属平台侧事件"。
     pub kind: ProviderFailureKind,
+    /// 这次失败在**上游受理**这件事上的可判定性（Driver 如实区分的那一态）。
+    ///
+    /// 落库不需要它（Attempt 的状态由 `target_state` 决定），但重投的判据只有它：
+    /// `SafeBeforeAcceptance` 是"可证明上游没有受理"，重投不会付两次上游成本；其余两态一律
+    /// 不重投。放在这里而不是在编排层按错误码再猜一遍——能用哪一态只有 Driver 手里的报文说得清。
+    pub retry_safety: RetrySafety,
     pub target_state: JobState,
     pub hold_disposition: HoldDisposition,
     /// 这次执行**已经看到**的成本事实（成本平面）。
@@ -1385,6 +1394,25 @@ pub struct RefundReconciliationCommand {
     pub note: String,
     pub business_key: String,
     pub actor: String,
+}
+
+/// 一次"可证明未受理"的失败：把这次执行收尾，并让同一台 Job 在稍后重投。
+///
+/// 与 [`AttemptFailure`] 分开，是因为它**不是终态处置**：预授权在重投期间原样保留
+/// （不释放、不重新扣一遍），Job 回到"等执行"，只结算一次——也就是这台 Job 最后成功或
+/// 用尽额度失败的那一次。把它塞进 [`AttemptFailure`] 会让"失败处置"同时有两种意思
+/// （终态 / 还要再来一次），而这两种意思在账上的后果完全不同。
+#[derive(Debug, Clone)]
+pub struct UnacceptedAttempt {
+    pub job_id: JobId,
+    pub worker_id: String,
+    pub attempt_id: AttemptId,
+    /// 这次是第几次执行（`attempt_no`），用来算退避与判定还有没有额度。
+    pub attempt_no: u32,
+    /// 这次执行自己的失败事实（渠道码、原文、成本四列）——**逐次归**，与终态那次一样。
+    pub failure: AttemptFailure,
+    /// 下一次允许领取这台 Job 的时刻（由编排层按退避算好）。
+    pub next_attempt_at: DateTime<Utc>,
 }
 
 /// 待录入的一行折算率：`effective_at` 为 `None` 表示"立即生效"，**由数据库盖章**。
@@ -1890,12 +1918,31 @@ pub trait HubRepository: Send + Sync {
 
     async fn recover_expired_leases(&self) -> Result<LeaseRecovery, ApplicationError>;
 
+    /// 开始一次执行：把 Job 推成"提交中"，并**为这次执行写一行 Attempt**。
+    ///
+    /// `attempt_no` 是同一台 Job 内的第几次（从 1 起）：重投出来的每一次执行都占一行、各记
+    /// 自己的用量与成本，所以"这是第几次"必须是落库时确定的序号，不是一个可以事后重排的排序。
+    /// **返回值就是这次执行落库的号**——调用方拿它判重投额度，所以定号与写入必须是同一个动作。
     async fn begin_attempt(
         &self,
         job_id: JobId,
         worker_id: &str,
         attempt_id: AttemptId,
         request_digest: &str,
+    ) -> Result<u32, ApplicationError>;
+
+    /// 可证明未受理的失败：这次执行收尾，同一台 Job 稍后重投。
+    ///
+    /// **预授权原样保留**（`ledger.holds` 不动、余额不动）：这次失败上游没开始计费，重投的不是
+    /// 一笔新业务，重新预授权等于把同一笔钱扣两遍。余额因此也没有变化，调用方不必写穿缓存。
+    ///
+    /// Job 回到"等执行"（`state = 'accepted'`）并把 `next_attempt_at` 推到退避之后：领取那条
+    /// 查询本来就按 `next_attempt_at <= now()` 取，退避因此不需要另外的调度器。
+    ///
+    /// 执行到上限仍失败时**不走这里**：那时按既有失败处置（[`Self::fail_job`]）落终态与释放。
+    async fn requeue_after_unaccepted(
+        &self,
+        command: UnacceptedAttempt,
     ) -> Result<(), ApplicationError>;
 
     async fn renew_lease(
@@ -4166,6 +4213,8 @@ pub struct WorkerService {
     /// 为什么不是固定值：对客是同步接口，`n` 张图就是一次上游调用，耗时随 `n` 增长；固定超时会
     /// 在 `n` 大时把还在生成的上游调用掐断——上游照样计费，我们却拿不到结果。
     timeouts: RequestTimeoutPolicy,
+    /// 可证明未受理时的重投策略（上限与退避）。见 [`RetryPolicy`]。
+    retry_policy: RetryPolicy,
     /// 加速层：结算与失败收尾都改余额，提交后要把新余额写穿缓存。
     acceleration: Arc<AccelerationService>,
     /// 平台故障告警出口：**配了才有**。没配时连候选的连续失败计数都不读。
@@ -4194,9 +4243,22 @@ impl WorkerService {
             worker_id,
             lease_duration,
             timeouts,
+            // 缺省策略就是**开着**的重投（次数有限、退避有上限）：这条能力不靠部署时记得配开关，
+            // 而"关掉重投"是显式配 `GENERATION_RETRY_MAX_ATTEMPTS=1`。
+            retry_policy: RetryPolicy::default(),
             acceleration,
             alerts: None,
         })
+    }
+
+    /// 装上运维给的重投策略（上限与退避基）。
+    ///
+    /// 它是配置项：最坏情况下一个请求会占用对客同步窗口多久，由这两项决定，而窗口与上游的
+    /// 抖动程度都随部署形态变，写死在代码里就只能靠改代码调。
+    #[must_use]
+    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
+        self.retry_policy = retry_policy;
+        self
     }
 
     /// 装上加速层：结算与失败收尾之后要把余额写穿缓存。
@@ -4242,6 +4304,59 @@ impl WorkerService {
             .await;
         self.raise_platform_alerts(job, &failure).await;
         Ok(())
+    }
+
+    /// 这次执行**可证明上游没有受理**，还有额度 ⇒ 稍后重投；否则按既有失败处置。
+    ///
+    /// 判据只有一条，来自 Driver 如实区分的失败分类（[`RetrySafety`]）：
+    ///
+    /// - `SafeBeforeAcceptance`：可证明未受理（连不上、上传失败、参考图取不到、上游明确拒绝
+    ///   受理），上游**没开始计费**——重投不会付两次，且还有额度时重投；
+    /// - `AcceptanceUnknown`（超时、5xx、响应读不出）：状态不确定，**一律不重投**，按既有口径
+    ///   进对账。宁可进对账，也不重投——这是"不会为同一个请求付两次上游成本"的保证；
+    /// - `NotRetryable`（参数/凭证类确定性拒绝）：重投同一份请求只会得到同一个答复，不重投。
+    ///
+    /// 重投**不重新预授权**：预授权在重投期间原样保留，到最后那次成功（结算一次）或用尽额度
+    /// 失败（释放一次）才动。所以这里只把这次执行收尾、把 Job 推回可领取。
+    ///
+    /// 额度用尽时走 [`Self::fail_and_refresh`]：不新增任何对账态语义，这一次失败的处置与今天
+    /// 逐位相同（释放预授权、Job 落 `failed`）。
+    async fn retry_or_fail(
+        &self,
+        job: &GenerationJob,
+        attempt_id: AttemptId,
+        attempt_no: u32,
+        failure: AttemptFailure,
+    ) -> Result<(), ApplicationError> {
+        let unaccepted = failure.retry_safety == RetrySafety::SafeBeforeAcceptance;
+        if !unaccepted || !self.retry_policy.allows_another_attempt(attempt_no) {
+            return self.fail_and_refresh(job, attempt_id, failure).await;
+        }
+        let backoff = self.retry_policy.backoff_for(attempt_no);
+        tracing::info!(
+            job_id = %job.id,
+            attempt_no,
+            backoff_ms = backoff.as_millis(),
+            max_attempts = self.retry_policy.max_attempts,
+            "the provider provably did not accept this request; the job will be retried"
+        );
+        self.repository
+            .requeue_after_unaccepted(UnacceptedAttempt {
+                job_id: job.id,
+                worker_id: self.worker_id.clone(),
+                attempt_id,
+                attempt_no,
+                failure,
+                // 退避的时刻用**进程时钟**算，但落库之后一律由库的 `now()` 比较：领取那条查询
+                // 判的是 `next_attempt_at <= now()`，所以这个值只是"从现在起等这么久"。
+                next_attempt_at: Utc::now()
+                    + ChronoDuration::from_std(backoff).map_err(|_| {
+                        ApplicationError::Configuration(
+                            "GENERATION_RETRY_BACKOFF_BASE_MS is out of range".to_owned(),
+                        )
+                    })?,
+            })
+            .await
     }
 
     /// 这次失败要不要外发一条平台故障告警。
@@ -4324,7 +4439,11 @@ impl WorkerService {
                 .to_owned(),
         };
         let request_digest = request_digest(&prepared)?;
-        self.repository
+        // 这次是同一台 Job 内的第几次执行：**由库在写入那一刻定号**（现有行数 + 1），返回值就是
+        // 这次执行的号。不在这里读一次行数再自己加一——两次执行并发时读到的行数会同时是同一个，
+        // 而重投的次数上限正是拿这个号比的，号重复等于上限失效。
+        let attempt_no = self
+            .repository
             .begin_attempt(claimed.job.id, &self.worker_id, attempt_id, &request_digest)
             .await?;
         let credential = match self
@@ -4342,6 +4461,9 @@ impl WorkerService {
                         message: error.to_string(),
                         trace_id: None,
                         kind: ProviderFailureKind::PlatformInternal,
+                        // 取不到凭证确实"请求没交出去"，但重投同一份配置只会得到同一个结果：
+                        // 这是平台自己的配置问题，重投解决不了，按确定性失败处置。
+                        retry_safety: RetrySafety::NotRetryable,
                         target_state: JobState::Failed,
                         hold_disposition: HoldDisposition::Release,
                         // 请求还没交出去：这次执行没有成本可采。
@@ -4374,6 +4496,8 @@ impl WorkerService {
                         message: error.to_string(),
                         trace_id: None,
                         kind: ProviderFailureKind::PlatformInternal,
+                        // 同上：装不起来是我们自己的配置问题，重投不会有别的结果。
+                        retry_safety: RetrySafety::NotRetryable,
                         target_state: JobState::Failed,
                         hold_disposition: HoldDisposition::Release,
                         // 请求还没交出去：这次执行没有成本可采。
@@ -4412,6 +4536,9 @@ impl WorkerService {
                             message: error.to_string(),
                             trace_id: None,
                             kind: ProviderFailureKind::PlatformInternal,
+                            // 结果已经生成、只是交付不了：这不是"未受理"，绝不重投
+                            // （重投等于为同一个请求再付一次上游成本）。
+                            retry_safety: RetrySafety::AcceptanceUnknown,
                             target_state: JobState::ReconciliationRequired,
                             hold_disposition: HoldDisposition::RetainForReconciliation,
                             provider_cost: Some(provider_cost),
@@ -4422,7 +4549,7 @@ impl WorkerService {
             }
             Err(error) => {
                 let failure = failure_from_adapter(&claimed.job.offering.price_snapshot, error);
-                self.fail_and_refresh(&claimed.job, attempt_id, failure)
+                self.retry_or_fail(&claimed.job, attempt_id, attempt_no, failure)
                     .await?;
             }
         }
@@ -4922,6 +5049,9 @@ fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> Attemp
             message: provider.message,
             trace_id: provider.trace_id,
             kind: provider.kind,
+            // 失败分类**原样带过来**：它是 Driver 对"上游有没有可能已经受理"的唯一判定，编排层
+            // 只消费它、不再按状态码或错误码猜一遍（猜一遍就等于平台自己另立了一套判据）。
+            retry_safety: provider.retry_safety,
             target_state: if provider.retry_safety == RetrySafety::AcceptanceUnknown {
                 JobState::ReconciliationRequired
             } else {
@@ -4939,6 +5069,7 @@ fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> Attemp
         },
         // 平台自己的配置或参数问题：请求在交给渠道之前就被 Driver 挡下，这次执行**没有成本
         // 可采**——四列留 NULL 说的是"根本没采"，与"采了没拿到"（`unavailable`）不是一件事。
+        // 这类也不重投：同一份参数与配置再交一次，Driver 会以同样的方式挡下。
         AdapterError::Configuration(message) | AdapterError::UnsupportedInput(message) => {
             AttemptFailure {
                 provider_code: "adapter_rejected".to_owned(),
@@ -4946,6 +5077,7 @@ fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> Attemp
                 message,
                 trace_id: None,
                 kind: ProviderFailureKind::PlatformInternal,
+                retry_safety: RetrySafety::NotRetryable,
                 target_state: JobState::Failed,
                 hold_disposition: HoldDisposition::Release,
                 provider_cost: None,

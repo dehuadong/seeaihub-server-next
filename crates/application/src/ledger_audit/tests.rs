@@ -9,7 +9,7 @@ use crate::{
     AcceptanceProbe, AlertSink, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
     GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate, ProviderCostGapView,
     ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest, ReconciliationCaseView,
-    RefundReconciliationCommand, RoutingDecision,
+    RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use seeai_domain::{
@@ -289,6 +289,13 @@ impl HubRepository for AuditRepository {
         _worker_id: &str,
         _attempt_id: AttemptId,
         _request_digest: &str,
+    ) -> Result<u32, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn requeue_after_unaccepted(
+        &self,
+        _command: UnacceptedAttempt,
     ) -> Result<(), ApplicationError> {
         unused_repository()
     }

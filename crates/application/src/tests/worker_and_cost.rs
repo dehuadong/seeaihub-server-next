@@ -4,6 +4,8 @@ struct WorkerRepository {
     job: Mutex<Option<GenerationJob>>,
     completion: Mutex<Option<CompleteJob>>,
     failure: Mutex<Option<AttemptFailure>>,
+    /// 编排层要求重投的那一次（`None` 表示这台 Job 没有走重投）。
+    requeue: Mutex<Option<UnacceptedAttempt>>,
     events: Arc<Mutex<Vec<&'static str>>>,
 }
 
@@ -13,6 +15,7 @@ impl WorkerRepository {
             job: Mutex::new(Some(job)),
             completion: Mutex::new(None),
             failure: Mutex::new(None),
+            requeue: Mutex::new(None),
             events,
         }
     }
@@ -269,7 +272,24 @@ impl HubRepository for WorkerRepository {
         _worker_id: &str,
         _attempt_id: AttemptId,
         _request_digest: &str,
+    ) -> Result<u32, ApplicationError> {
+        Ok(1)
+    }
+
+    /// 重投这条路径在单测里由编排层验（真库那侧的序号与预授权保留由端到端用例验）：假仓库只记下
+    /// "编排层要求重投了"，不假装自己会写库。
+    async fn requeue_after_unaccepted(
+        &self,
+        command: UnacceptedAttempt,
     ) -> Result<(), ApplicationError> {
+        self.events
+            .lock()
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?
+            .push("requeue");
+        *self
+            .requeue
+            .lock()
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))? = Some(command);
         Ok(())
     }
 

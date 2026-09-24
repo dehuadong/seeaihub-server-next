@@ -658,6 +658,8 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         message: "provider returned no image".to_owned(),
         trace_id: Some("task-1".to_owned()),
         kind: ProviderFailureKind::PlatformInternal,
+        // 结果已经生成、只是交付不了：这一态在重投判据里是"绝不重投"的那一态。
+        retry_safety: seeai_adapter_sdk::RetrySafety::AcceptanceUnknown,
         target_state: seeai_domain::JobState::ReconciliationRequired,
         hold_disposition: HoldDisposition::RetainForReconciliation,
         provider_cost,

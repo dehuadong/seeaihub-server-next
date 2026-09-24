@@ -1,5 +1,6 @@
 use super::*;
 use crate::{HoldDisposition, PublicErrorCode};
+use seeai_adapter_sdk::RetrySafety;
 use std::sync::Mutex;
 
 /// 一个只记账、不真发信的出口：用例要验的是"失败怎么收口"，不是 HTTP。
@@ -46,6 +47,8 @@ fn failure(kind: ProviderFailureKind, target_state: JobState) -> AttemptFailure 
         message: "channel message".to_owned(),
         trace_id: None,
         kind,
+        // 告警这条路径与重投无关：这里给一个不确定态，正是"不许重投"的那一态。
+        retry_safety: RetrySafety::AcceptanceUnknown,
         target_state,
         hold_disposition: HoldDisposition::Release,
         provider_cost: None,

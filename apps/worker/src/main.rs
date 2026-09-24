@@ -7,7 +7,7 @@ use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AdapterRegistry, ApplicationError, CachePolicy, CredentialProvider,
     HubRepository, NO_CONTRACT_MAX_OUTPUT_IMAGES, PlatformAlerter, RequestTimeoutPolicy,
-    WorkerService,
+    RetryPolicy, WorkerService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_persistence::{PgHubRepository, max_declared_output_images};
@@ -66,6 +66,17 @@ async fn main() -> Result<()> {
     );
     let lease_seconds = i64::try_from(timeouts.worker_lease.as_secs())
         .context("WORKER_LEASE_SECONDS is out of range")?;
+    // 重投策略也是运维取值：**上限**决定最坏情况下一个请求会用掉几次上游调用（也就决定了最坏
+    // 情况下多花多少钱），**退避基**决定这几次调用摊在多长的窗口里。两者都随上游的抖动程度与
+    // 对客的同步窗口变，所以既不在代码里写死，也不给一个"看起来合理"的隐藏取值：读不到就用
+    // 缺省值，读到不合法就带着点名到那个变量的报错退出。
+    let retry_policy = RetryPolicy::from_env().map_err(anyhow::Error::from)?;
+    info!(
+        max_attempts = retry_policy.max_attempts,
+        backoff_base_ms = retry_policy.backoff_base.as_millis(),
+        "safe retries are configured: a retry only happens when the provider provably did not \
+         accept the request"
+    );
     let repository_port: Arc<dyn HubRepository> = repository;
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
@@ -91,7 +102,8 @@ async fn main() -> Result<()> {
         ChronoDuration::seconds(lease_seconds),
         timeouts,
     )?
-    .with_acceleration(acceleration);
+    .with_acceleration(acceleration)
+    .with_retry_policy(retry_policy);
     // 平台故障告警出口是**配置项**：`PROVIDER_ALERT_WEBHOOK` 没配就没有出口，一条也不外发；
     // 阈值（某候选连续失败几次才告警）只在有出口时才读。地址写错在这里就失败，不让进程带着一个
     // "永远发不出去"的出口跑起来。

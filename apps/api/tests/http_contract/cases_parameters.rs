@@ -198,9 +198,11 @@ async fn multipart_text_image_fields_follow_the_same_contract() {
     harness.cleanup().await;
 }
 
-/// 上传失败 = 生成任务**可证明未受理**：Job 走失败、预授权释放，不进对账。
+/// 上传失败 = 生成任务**可证明未受理**：重投到额度用完仍失败时，Job 走失败、预授权释放，不进对账。
 ///
-/// 这与"提交之后出错进对账"是两条路径，不能混为一谈。
+/// 这与"提交之后出错进对账"是两条路径，不能混为一谈。注意这里验的是**用尽额度之后**的处置：
+/// 单次上传失败本身是可证明未受理的失败，重投它的意义在于"也许下一次上传就通了"（见
+/// `cases_retry.rs`）；一直失败时按既有失败处置落失败终态。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn upload_failure_fails_the_job_before_the_create_request() {

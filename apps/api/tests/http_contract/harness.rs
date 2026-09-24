@@ -50,6 +50,8 @@ mod cases_pricing;
 mod cases_public_surface;
 #[path = "cases_publication.rs"]
 mod cases_publication;
+#[path = "cases_retry.rs"]
+mod cases_retry;
 #[path = "cases_routing.rs"]
 mod cases_routing;
 
@@ -116,6 +118,18 @@ struct UpstreamBehaviour {
     pending_times: usize,
     /// 非 0 时，上传接口固定返回这个错误状态码 —— 覆盖"上传失败即确定未受理"。
     upload_failure_status: u16,
+    /// 上面那种上传失败**前几次**（0 表示一直失败）。
+    ///
+    /// 上传失败是可证明未受理（生成任务此时还没提交），所以"失败一次就恢复"正好是重投要覆盖的
+    /// 那个形态：第一次上游没受理、第二次成功，中间只多了一次上传。
+    upload_failure_times: usize,
+    /// 生成请求**前几次**直接以这个状态码被拒（之后正常应答）。
+    ///
+    /// 它用来观察重投：上游明确拒绝受理这类失败是"可证明未受理"，重投不会付两次上游成本。
+    /// `0` 就是今天的路径——第一次就正常应答。
+    create_rejection_status: u16,
+    /// 上面那种拒绝**前几次**——0 表示一直拒（用来观察"到上限仍失败"）。
+    create_rejection_times: usize,
     submit: SubmitBehaviour,
     sync_image: SyncImageShape,
     /// 任务终态里声明的成本：`None` 表示响应里**根本没有这个字段**（渠道没给），
@@ -135,6 +149,9 @@ impl UpstreamBehaviour {
             unknown_status_times: 0,
             pending_times: 0,
             upload_failure_status: 0,
+            upload_failure_times: 0,
+            create_rejection_status: 0,
+            create_rejection_times: 0,
             submit: SubmitBehaviour::Accepted,
             sync_image: SyncImageShape::Url,
             declared_cost: Some(json!(0.011354)),
@@ -167,6 +184,7 @@ async fn start_fake_upstream_with(
     // 查询与上传的行为按调用次数推进。
     let query_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let upload_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let create_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = tokio::spawn(async move {
         loop {
             let Ok((mut socket, _)) = listener.accept().await else {
@@ -176,10 +194,17 @@ async fn start_fake_upstream_with(
             let behaviour = behaviour.clone();
             let query_count = query_count.clone();
             let upload_count = upload_count.clone();
+            let create_count = create_count.clone();
             tokio::spawn(async move {
-                let _ =
-                    serve_fake_upstream(&mut socket, calls, behaviour, query_count, upload_count)
-                        .await;
+                let _ = serve_fake_upstream(
+                    &mut socket,
+                    calls,
+                    behaviour,
+                    query_count,
+                    upload_count,
+                    create_count,
+                )
+                .await;
             });
         }
     });
@@ -195,6 +220,7 @@ async fn serve_fake_upstream(
     behaviour: UpstreamBehaviour,
     query_count: Arc<std::sync::atomic::AtomicUsize>,
     upload_count: Arc<std::sync::atomic::AtomicUsize>,
+    create_count: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
     // 正经读完一个请求：请求行 + 头 + 按 Content-Length 读满请求体。
     let (method, path, body) = read_request(socket).await?;
@@ -211,7 +237,9 @@ async fn serve_fake_upstream(
     // 而且它的失败**不**代表"生成可能已发生"——生成任务此时还没提交。
     if method == "POST" && path == "/v1/uploads/images" {
         let index = upload_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        if behaviour.upload_failure_status != 0 {
+        if behaviour.upload_failure_status != 0
+            && (behaviour.upload_failure_times == 0 || index <= behaviour.upload_failure_times)
+        {
             // 上游上传失败的错误体只有 type 与 message，**没有** error.code。
             let payload = serde_json::to_vec(&json!({
                 "error": {"type": "invalid_request_error", "message": "unsupported image type"}
@@ -244,6 +272,34 @@ async fn serve_fake_upstream(
     {
         let payload = serde_json::to_vec(body).expect("rejection body");
         return write_response(socket, *status, "Error", "application/json", &payload).await;
+    }
+
+    // 前几次生成请求直接以配置的状态码被拒，之后正常应答 —— 覆盖"重投"。
+    //
+    // 拒绝体按 APIMart 的形状给 `error.code`：分类要看它，不能只看 HTTP 状态码（同一批状态码在
+    // 两家渠道上的含义不同）。
+    if behaviour.create_rejection_status != 0
+        && method == "POST"
+        && (path.ends_with("/images/generations") || path.ends_with("/images/edits"))
+    {
+        let seen = create_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        if behaviour.create_rejection_times == 0 || seen <= behaviour.create_rejection_times {
+            let payload = serde_json::to_vec(&json!({
+                "error": {
+                    "code": behaviour.create_rejection_status,
+                    "message": "rejected before the generation started"
+                }
+            }))
+            .expect("create rejection body");
+            return write_response(
+                socket,
+                behaviour.create_rejection_status,
+                "Error",
+                "application/json",
+                &payload,
+            )
+            .await;
+        }
     }
 
     // 同步渠道（AIHubMix）：`/v1/images/generations` 与 `/v1/images/edits` 都在同一个响应里
@@ -695,6 +751,18 @@ struct LedgerAudit {
     webhook: Option<String>,
 }
 
+/// 一次用例的全部进程配置：API 进程那一套、发布时的修订级加价系数、以及 Worker 的重投策略。
+///
+/// 三件事装在一起，只是因为它们都是"这次用例怎么起这套服务"的参数：分成三个参数传下去会让
+/// `Harness::build` 的参数表长到读不出哪一项管什么。
+#[derive(Default)]
+struct CaseSettings {
+    api: ApiProcessSettings,
+    /// 发布时的**修订级**加价系数（按张 / 按次 / 上游给金额的候选要靠它算对客价）。
+    markup_bps: Option<i32>,
+    retry: RetrySettings,
+}
+
 impl ApiProcessSettings {
     /// 配置好加速层，并用默认的速率上限（每分钟 60 次）。
     fn with_cache(cache: CacheFixture) -> Self {
@@ -846,13 +914,47 @@ async fn start_api_with(
 /// 环境变量只有一份，两个调用点（[`Harness`] 与直接起进程的用例）共用：两家渠道的凭证都写在
 /// 测试进程的环境里，取值只在进程内假上游上用过，不写入配置、日志或响应。
 fn spawn_worker_process(database_url: &str) -> WorkerProcess {
-    spawn_worker_process_with(database_url, None, None)
+    spawn_worker_process_with(database_url, None, None, RetrySettings::default())
+}
+
+/// 一次用例给 Worker 配的**重投策略**：一次请求最多调几次上游、第一次重投前等多久。
+///
+/// 字段直接就是那两个环境变量的值。重投只在**可证明未受理**时发生，而"证明"来自假上游怎么
+/// 应答（见 [`UpstreamBehaviour::create_rejection_status`]）——所以用例能精确地构造出
+/// "第一次没被受理、第二次成功"与"一直被拒直到用完额度"这两种形态。
+///
+/// 缺省那套（[`Self::default`]）把退避压到毫秒级、上限给 3：用例跑得快，而"重投发生过"仍然
+/// 看得见。把它们当成"测试专用的一套语义"是错的——它们本来就是运维配置，生产缺省是 3 次 /
+/// 1 秒起步。
+#[derive(Debug, Clone, Copy)]
+struct RetrySettings {
+    max_attempts: u32,
+    backoff_base_ms: u64,
+}
+
+impl Default for RetrySettings {
+    fn default() -> Self {
+        Self {
+            max_attempts: 3,
+            backoff_base_ms: 20,
+        }
+    }
+}
+
+impl RetrySettings {
+    /// 关掉重投：上限 1 就是"一次请求只调一次上游"。
+    fn disabled() -> Self {
+        Self {
+            max_attempts: 1,
+            ..Self::default()
+        }
+    }
 }
 
 /// 一次用例给 Worker 配的**平台故障告警出口**。
 ///
 /// 字段直接就是那两个环境变量的值；`PROVIDER_ALERT_WEBHOOK` 没配（`None`）就是今天的路径——
-/// 一条都不外发。超时与重试用生产缺省：它们是配置项，用例不该为了跑得快把它们改成另一套语义。
+/// 一条都不外发。超时用生产缺省：它是配置项，用例不该为了跑得快把它改成另一套语义。
 struct WorkerAlerts {
     webhook: String,
     /// 某候选连续失败几次才外发。
@@ -865,6 +967,7 @@ fn spawn_worker_process_with(
     database_url: &str,
     cache: Option<&CacheFixture>,
     alerts: Option<&WorkerAlerts>,
+    retry: RetrySettings,
 ) -> WorkerProcess {
     let mut command = Command::new(worker_binary());
     command
@@ -879,6 +982,16 @@ fn spawn_worker_process_with(
         .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "4")
         .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
         .env("PROVIDER_TIMEOUT_SECONDS", "10")
+        // 重投策略：只在**可证明未受理**时才会用上它，所以这条配置不影响"状态不确定"那类用例
+        // （那些一次上游调用都不会多发）。用例用自己的量级，不占用生产缺省的分钟级退避。
+        .env(
+            "GENERATION_RETRY_MAX_ATTEMPTS",
+            retry.max_attempts.to_string(),
+        )
+        .env(
+            "GENERATION_RETRY_BACKOFF_BASE_MS",
+            retry.backoff_base_ms.to_string(),
+        )
         .env("APIMART_API_KEY", "contract-test-key")
         .env("AIHUBMIX_API_KEY", "contract-test-key")
         .stdout(Stdio::null())
@@ -937,6 +1050,8 @@ struct Harness {
     _upstream: FakeUpstream,
     /// 这次用例给 API 与 Worker 配的加速层（假 Redis）；没配就是"没有缓存"的那条路径。
     cache: Option<CacheFixture>,
+    /// 这次用例给 Worker 配的重投策略；默认那套是生产缺省（3 次、1 秒起步）。
+    retry: RetrySettings,
 }
 
 impl Harness {
@@ -1009,8 +1124,10 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             30,
-            ApiProcessSettings::default(),
-            markup_bps,
+            CaseSettings {
+                markup_bps,
+                ..CaseSettings::default()
+            },
         )
         .await
     }
@@ -1027,8 +1144,31 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             30,
-            ApiProcessSettings::default(),
+            CaseSettings::default(),
+        )
+        .await
+    }
+
+    /// 同 [`Self::start_with_draft`]，但给 Worker 定下**重投策略**（上限与退避基）。
+    ///
+    /// 用例要能观察到"重投了几次"就必须把退避压到秒级：生产缺省是 1 秒起步、指数增长，靠它
+    /// 跑重投会把每条用例拖成分钟级。这两项本来就是运维配置，用例按自己等得起的量级给。
+    async fn start_with_retry(
+        draft: Value,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        retry: RetrySettings,
+    ) -> Self {
+        Self::build(
+            draft,
             None,
+            behaviour,
+            max_concurrent_jobs,
+            30,
+            CaseSettings {
+                retry,
+                ..CaseSettings::default()
+            },
         )
         .await
     }
@@ -1051,8 +1191,10 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             sync_wait_seconds,
-            ApiProcessSettings::with_cache(cache),
-            None,
+            CaseSettings {
+                api: ApiProcessSettings::with_cache(cache),
+                ..CaseSettings::default()
+            },
         )
         .await
     }
@@ -1074,8 +1216,10 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             sync_wait_seconds,
-            ApiProcessSettings::with_cache_and_rate_limit(cache, rate_limit),
-            None,
+            CaseSettings {
+                api: ApiProcessSettings::with_cache_and_rate_limit(cache, rate_limit),
+                ..CaseSettings::default()
+            },
         )
         .await
     }
@@ -1100,8 +1244,10 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             sync_wait_seconds,
-            ApiProcessSettings::with_cache_and_daily_spend_limit(cache, limit_microusd),
-            None,
+            CaseSettings {
+                api: ApiProcessSettings::with_cache_and_daily_spend_limit(cache, limit_microusd),
+                ..CaseSettings::default()
+            },
         )
         .await
     }
@@ -1121,11 +1267,13 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             30,
-            ApiProcessSettings {
-                ledger_audit: Some(ledger_audit),
-                ..ApiProcessSettings::default()
+            CaseSettings {
+                api: ApiProcessSettings {
+                    ledger_audit: Some(ledger_audit),
+                    ..ApiProcessSettings::default()
+                },
+                ..CaseSettings::default()
             },
-            None,
         )
         .await
     }
@@ -1136,8 +1284,7 @@ impl Harness {
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
         sync_wait_seconds: u64,
-        settings: ApiProcessSettings,
-        markup_bps: Option<i32>,
+        settings: CaseSettings,
     ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
@@ -1146,7 +1293,7 @@ impl Harness {
             &database_url,
             sync_wait_seconds,
             max_concurrent_jobs,
-            &settings,
+            &settings.api,
         )
         .await;
         let client = Client::new();
@@ -1179,7 +1326,7 @@ impl Harness {
             Self::MODEL,
             contract,
             vec![draft],
-            markup_bps,
+            settings.markup_bps,
         )
         .await;
         assert_eq!(published, StatusCode::OK, "publication must succeed");
@@ -1198,7 +1345,8 @@ impl Harness {
             declared_surface,
             _api: process,
             _upstream: upstream,
-            cache: settings.cache,
+            cache: settings.api.cache,
+            retry: settings.retry,
         }
     }
 
@@ -1207,12 +1355,17 @@ impl Harness {
     /// Worker 与 API 共用同一个缓存服务：结算改余额之后要把新余额写穿，否则缓存会留着一个
     /// 刚写过、但偏高的余额。
     fn spawn_worker(&self) -> WorkerProcess {
-        spawn_worker_process_with(&self.database_url, self.cache.as_ref(), None)
+        spawn_worker_process_with(&self.database_url, self.cache.as_ref(), None, self.retry)
     }
 
     /// 同 [`Self::spawn_worker`]，但给这个 Worker 配上告警出口。
     fn spawn_worker_with_alerts(&self, alerts: &WorkerAlerts) -> WorkerProcess {
-        spawn_worker_process_with(&self.database_url, self.cache.as_ref(), Some(alerts))
+        spawn_worker_process_with(
+            &self.database_url,
+            self.cache.as_ref(),
+            Some(alerts),
+            self.retry,
+        )
     }
 
     /// 这次用例的假 Redis；没配缓存的用例调用它会直接失败（那是用例写错了）。
@@ -1333,6 +1486,21 @@ impl Harness {
         self.recorded()
             .iter()
             .filter(|call| call.method == method && call.path.starts_with(path_prefix))
+            .count()
+    }
+
+    /// 假上游收到的**生成请求**次数：重投的判据是"上游被调了几次"，不是"内部记了几行"。
+    ///
+    /// 两家的生成端点路径不同（同步渠道是 `/v1/images/generations` 与 `/v1/images/edits`，
+    /// 任务式渠道也是这两条），所以判据只能是"POST 到生成端点"，不能钉死其中一条。
+    fn create_calls(&self) -> usize {
+        self.recorded()
+            .iter()
+            .filter(|call| {
+                call.method == "POST"
+                    && (call.path.ends_with("/images/generations")
+                        || call.path.ends_with("/images/edits"))
+            })
             .count()
     }
 
