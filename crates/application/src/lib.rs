@@ -43,6 +43,16 @@ pub use ledger_audit::{
     OpenLedgerCaseCommand,
 };
 
+mod declared_images;
+pub use declared_images::{DeclaredOutputImages, declared_output_images};
+
+mod request_timeout;
+pub use request_timeout::{
+    DEFAULT_BASE_SECONDS, DEFAULT_INCLUDED_IMAGES, DEFAULT_PER_IMAGE_SECONDS,
+    NO_CONTRACT_MAX_OUTPUT_IMAGES, RequestTimeoutPolicy, SYNC_WAIT_OVERHEAD_SECONDS,
+    requested_image_count, upstream_timeout,
+};
+
 /// 发布一个 Vendor Model 的供给。
 ///
 /// 一次发布携带该模型**完整、有序**的候选集合（`offerings`，必填且非空）；
@@ -3473,7 +3483,7 @@ impl RuntimeService {
 ///
 /// Restrictions 的形状很小，目前只有两项，因此可判定地检查两项：
 /// - `allowed_branches`：每个分支都必须能在承载面的 `required`/`properties` 下成立；
-/// - `max_images`：不得超过承载面对参考图数量的声明。
+/// - `max_reference_images`：不得超过承载面对参考图数量的声明。
 fn validate_restrictions_within_profile(
     offering: &NormalizedOffering,
 ) -> Result<(), ApplicationError> {
@@ -3524,24 +3534,24 @@ fn validate_restrictions_within_profile(
             }
         }
     }
-    if let Some(max_images) = offering
+    if let Some(max_reference_images) = offering
         .restrictions
-        .get("max_images")
+        .get("max_reference_images")
         .and_then(Value::as_u64)
     {
-        // 限制只能收窄：承载面没承诺收图上限（数组没写 `maxItems`）时，任何正的 `max_images`
-        // 都算凭空放宽，同样拒绝。`0` 不需要承载面声明任何参考图参数。
-        if max_images > 0 {
+        // 限制只能收窄：承载面没承诺收图上限（数组没写 `maxItems`）时，任何正的
+        // `max_reference_images` 都算凭空放宽，同样拒绝。`0` 不需要承载面声明任何参考图参数。
+        if max_reference_images > 0 {
             match declared_reference_image_limit(schema) {
-                Some(declared) if max_images <= declared => {}
+                Some(declared) if max_reference_images <= declared => {}
                 Some(declared) => {
                     return Err(ApplicationError::Validation(format!(
-                        "restriction allows {max_images} image(s), but the carrier surface declares at most {declared}"
+                        "restriction allows at most {max_reference_images} reference image(s), but the carrier surface declares at most {declared}"
                     )));
                 }
                 None => {
                     return Err(ApplicationError::Validation(format!(
-                        "restriction allows {max_images} image(s), but the carrier surface declares no reference image count"
+                        "restriction allows at most {max_reference_images} reference image(s), but the carrier surface declares no reference image count"
                     )));
                 }
             }
@@ -3834,15 +3844,16 @@ fn validate_adapter_compatibility(
             }
         }
     }
-    let max_images = offering
+    // 比的是**输入参考图**张数上限：这个数由 Driver 说，供给的 `max_reference_images` 只能更小。
+    let max_reference_images = offering
         .restrictions
-        .get("max_images")
+        .get("max_reference_images")
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    if max_images > descriptor.max_images {
+    if max_reference_images > descriptor.max_reference_images {
         return Err(ApplicationError::Validation(format!(
-            "adapter {} supports at most {} image inputs",
-            descriptor.key, descriptor.max_images
+            "adapter {} supports at most {} reference image inputs",
+            descriptor.key, descriptor.max_reference_images
         )));
     }
     if let Some(branches) = offering
@@ -4150,7 +4161,11 @@ pub struct WorkerService {
     credentials: Arc<dyn CredentialProvider>,
     worker_id: String,
     lease_duration: ChronoDuration,
-    provider_timeout: Duration,
+    /// 一次上游调用的超时**取值口径**：按本次请求的张数算，封顶在上限。
+    ///
+    /// 为什么不是固定值：对客是同步接口，`n` 张图就是一次上游调用，耗时随 `n` 增长；固定超时会
+    /// 在 `n` 大时把还在生成的上游调用掐断——上游照样计费，我们却拿不到结果。
+    timeouts: RequestTimeoutPolicy,
     /// 加速层：结算与失败收尾都改余额，提交后要把新余额写穿缓存。
     acceleration: Arc<AccelerationService>,
     /// 平台故障告警出口：**配了才有**。没配时连候选的连续失败计数都不读。
@@ -4164,7 +4179,7 @@ impl WorkerService {
         credentials: Arc<dyn CredentialProvider>,
         worker_id: String,
         lease_duration: ChronoDuration,
-        provider_timeout: Duration,
+        timeouts: RequestTimeoutPolicy,
     ) -> Result<Self, ApplicationError> {
         if worker_id.trim().is_empty() {
             return Err(ApplicationError::Configuration(
@@ -4178,7 +4193,7 @@ impl WorkerService {
             credentials,
             worker_id,
             lease_duration,
-            provider_timeout,
+            timeouts,
             acceleration,
             alerts: None,
         })
@@ -4337,10 +4352,16 @@ impl WorkerService {
                 return Ok(());
             }
         };
+        // 这次上游调用要用多久：按**冻结在这条 Job 上的张数**算（缺 `n` 就是一张），不是配置里
+        // 那个固定值。取 Job 上的那份，而不是本次执行恰好带进来的什么值——受理时定下的请求形状
+        // 才是这次要在上游生成几张的依据。
+        let provider_timeout = self
+            .timeouts
+            .upstream_timeout_for(requested_image_count(&claimed.job.native_parameters));
         let adapter = match self.adapters.create(
             &claimed.job.offering.adapter_key,
             &claimed.job.offering.base_url,
-            self.provider_timeout,
+            provider_timeout,
         ) {
             Ok(adapter) => adapter,
             Err(error) => {
@@ -4644,13 +4665,14 @@ fn validate_restrictions(
             )));
         }
     }
-    let max_images = restrictions
-        .get("max_images")
+    // 这里判的是**带进来的参考图**张数，与"这次要出几张图"（合同声明的是 `n`）无关。
+    let max_reference_images = restrictions
+        .get("max_reference_images")
         .and_then(Value::as_u64)
         .unwrap_or(1);
-    if u64::try_from(image_count).unwrap_or(u64::MAX) > max_images {
+    if u64::try_from(image_count).unwrap_or(u64::MAX) > max_reference_images {
         return Err(ApplicationError::Validation(format!(
-            "offering accepts at most {max_images} image(s)"
+            "offering accepts at most {max_reference_images} reference image(s)"
         )));
     }
     Ok(())

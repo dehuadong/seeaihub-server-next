@@ -15,13 +15,13 @@
     "contract.image_mask": "厂商一手：edit 页——参考图是 `file` 或 `file[]`（最多 16 张）、`mask` 可选；该页当前的字段形状是 `images[]` 与 `mask` 对象（URL 或 file_id），对客契约沿用平台自己的字段名 `image`/`mask`（受理侧按这三个名字取图，再由承载面把图落到渠道字段名上）。**契约按厂商契约把 `image` 声明成字符串数组（≤16）、`mask` 声明成字符串，都不写 `format: binary`**：那是 multipart 的传输痕迹，不是参数语义——值是公网 URL 还是 data URL、到渠道那一步要不要变成文件部件，都属传输侧的事，由 Driver 按渠道要的形态处理。",
     "contract.mask_requires_image": "平台判断：遮罩只划定编辑范围，脱离参考图没有意义——与平台按名字角色装载图片的既有约定一致，因此写成声明而不是留给上游报错。",
     "offering.aihubmix.carrier_schema": "厂商契约：这条供给承载的字段面按**厂商契约**声明，不拿渠道自己的机器 Schema 或参数表来判宽窄——聚合渠道转售的就是上游模型的能力，「渠道没写」不构成「渠道不能」。因此 `background`（auto/opaque/transparent，默认 auto）、`output_compression`（0–100，默认 100）、`moderation`（auto/low，默认 auto）与 APIMart 对等声明，枚举与默认值照厂商契约；参考图按厂商契约的 edit 面声明成数组（≤16），不照抄 `format: binary`（理由见 contract.image_mask）。渠道若不接受某个已声明的取值，就表现为渠道报错：平台不静默降级，也不替渠道把字段吞掉。",
-    "offering.aihubmix.image_inputs": "厂商契约 + 实测：edit 端点的 `image` 支持 `file[]`（最多 16 张）——对客契约里的 `image` 是同一个角色，承载面因此按字符串数组声明（≤16）。**多张参考图已实测成立**：旧仓库（seeaihub）的探针脚本 tests/image-generation/aihubmix_gpt_image_2_edit_probe.py 用 `POST /v1/images/edits` 发两张参考图成功（依据是多图融合示例）；**线上字段名是重复的 `image[]`，重复单值 `image` 会 400**——渠道机器 Schema 里那个单值 `image: string` 只是 schema 的简化（JSON Schema 表达不了 multipart 的重复字段），不是上限。**编码由 Driver 按张数承担**（一张发 `image`、多张发 `image[]`），不写进合同与承载面。16 是厂商契约的上限，未逐一压测，不为此花钱。`restrictions.max_images` 必须与承载面形态一致（数组 `maxItems` 16），否则发布期会以「限制超出承载面承诺」拒掉。**2026-09-20 的一次真实调用**（两张参考图、走重复的 `image[]` 部件）：`background=transparent`、`output_format=png`、`n=1`、`size=1024x1024`、`quality=low` → HTTP 200，响应 `background: \"transparent\"`，返回 **RGBA PNG（color type 6）1,495,027 bytes**，`usage.input_tokens 2589`（`image_tokens 2545`）/`output_tokens 196`——多图经 `image[]` 可用，`background=transparent` 被接受并落实（未逐像素核透明区域；16 张未压测）。",
+    "offering.aihubmix.image_inputs": "厂商契约 + 实测：edit 端点的 `image` 支持 `file[]`（最多 16 张）——对客契约里的 `image` 是同一个角色，承载面因此按字符串数组声明（≤16）。**多张参考图已实测成立**：旧仓库（seeaihub）的探针脚本 tests/image-generation/aihubmix_gpt_image_2_edit_probe.py 用 `POST /v1/images/edits` 发两张参考图成功（依据是多图融合示例）；**线上字段名是重复的 `image[]`，重复单值 `image` 会 400**——渠道机器 Schema 里那个单值 `image: string` 只是 schema 的简化（JSON Schema 表达不了 multipart 的重复字段），不是上限。**编码由 Driver 按张数承担**（一张发 `image`、多张发 `image[]`），不写进合同与承载面。16 是厂商契约的上限，未逐一压测，不为此花钱。`restrictions.max_reference_images` 必须与承载面形态一致（数组 `maxItems` 16），否则发布期会以「限制超出承载面承诺」拒掉。**2026-09-20 的一次真实调用**（两张参考图、走重复的 `image[]` 部件）：`background=transparent`、`output_format=png`、`n=1`、`size=1024x1024`、`quality=low` → HTTP 200，响应 `background: \"transparent\"`，返回 **RGBA PNG（color type 6）1,495,027 bytes**，`usage.input_tokens 2589`（`image_tokens 2545`）/`output_tokens 196`——多图经 `image[]` 可用，`background=transparent` 被接受并落实（未逐像素核透明区域；16 张未压测）。",
     "offering.aihubmix.size": "渠道面：端点 schema 的 `size` 就是 `auto` 或 `宽x高`（像素型），与合同同型——因此不需要换算，也不声明尺寸档案，`parameter_mapping` 为空。",
     "offering.apimart.carrier_schema": "厂商契约：这条供给承载的字段面按**厂商契约**声明，不拿渠道自己的机器 Schema 或参数表来判宽窄——聚合渠道转售的就是上游模型的能力，「渠道没写」不构成「渠道不能」。渠道面只作**字段名与传输形态**的参考（APIMart 的 2.5 生成文档快照 out-reference/apimart/gpt-image-2.5-generation.cn.md）：`mask_url` 就不在该文档的字段表里，但参考图 + 遮罩是厂商契约里的能力，因此照样声明——2026-09-20 的一次真实调用确认 2.5 接受 `mask_url`（渠道事实台账已登记）。渠道若不接受某个已声明的取值，就表现为渠道报错：平台不静默降级，也不替渠道把字段吞掉。",
     "offering.apimart.size": "渠道面：该文档明写 `size` 收精确像素（如 `1600x1200`），且给精确像素时 `resolution` 被忽略；承载面因此只声明与合同同型的 `auto`|`宽x高`。渠道另有 15 个比例名与 `1k/2k/4k` 档位：比例名合同产不出、`resolution` 无法从合同到达（承载面字段必须从合同可达，否则发布被拒），两者都不声明。",
     "offering.apimart.rename": "渠道面：参考图字段是 `image_urls`（字符串数组，≤16）、遮罩是 `mask_url`，合同字段叫 `image`/`mask`，因此用 `rename` 落到渠道字段名上（受控实测见 out-reference/apimart/controlled-probe-2026-09-19.json）。2026-09-20 又做了两次真实调用（同一请求带/不带 `mask_url`）：先上传参考图与遮罩换公网 URL，再提交生成——两次都是提交 200 拿到 `task_id`、轮询到 `completed`，且 `usage` 与 `cost` **完全相同**，说明 2.5 接受 `mask_url`（该字段不在 2.5 的生成文档里）；遮罩是否真的**生效**只有弱信号，未严格证明（生成随机、无 seed）。",
     "offering.apimart.moderation": "渠道面：文档写明未传 `moderation` 时 APIMart 自己用 `low`，与厂商默认 `auto` 不同；本版没有注入显式默认值，调用方没给时仍由渠道按自己的默认处理（差异已登记，是否由映射钉死待定）。",
-    "restrictions": "可走的分支沿用同一型号旧素材的声明。收图上限按承载面形态定：参考图声明成数组（`maxItems` 16），所以 `max_images` 是 16；两者必须一致，见 offering.aihubmix.image_inputs。",
+    "restrictions": "可走的分支沿用同一型号旧素材的声明。收图上限按承载面形态定：参考图声明成数组（`maxItems` 16），所以 `max_reference_images` 是 16；两者必须一致，见 offering.aihubmix.image_inputs。",
     "price_plan": "两家渠道的**计价形态不同**，各按自己的事实登记：AIHubMix 按四分项 token 计量量计价（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens，来源 URL 见它的 price_plan），APIMart **直接在上游终态给实扣金额**（`cost`，实测样例 0.011354）——它没有自己的计价参数，因此不发费率表，只声明成本币种 USD。",
     "consumer_rates_cny": "**测试值**：AIHubMix 的四档对客 CNY 费率 = 该渠道成本单价（四档费率）× 倍率 1.2 × 折算率 7.1（USD → CNY）——文本输入 42.6 / 图像输入 68.16 / 文本输出 85.2 / 图像输出 255.6 元每 1M tokens。它只是这条供给的**测试价**：按 token 计量量的候选由运营按同一条乘法推导或直接录入，发布与结算都不读这里的注释。",
     "markup_bps": "**测试值 2000**（倍率 1.2）：运营按网关模型录入的加价系数，随修订发布、随 Job 快照冻结。代码里没有它的默认值——按张 / 按次 / 上游给金额的候选的对客价全靠它算出来。",
@@ -79,7 +79,7 @@
       "credential_env": "AIHUBMIX_API_KEY",
       "restrictions": {
         "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-        "max_images": 16
+        "max_reference_images": 16
       },
       "carrier_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",
@@ -147,7 +147,7 @@
       "credential_env": "APIMART_API_KEY",
       "restrictions": {
         "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-        "max_images": 16
+        "max_reference_images": 16
       },
       "carrier_schema": {
         "$schema": "https://json-schema.org/draft/2020-12/schema",

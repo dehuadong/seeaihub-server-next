@@ -22,7 +22,7 @@ fn restriction_allowing_more_images_than_declared_is_rejected() {
             "prompt": {"type": "string"},
             "images": {"type": "array", "maxItems": 1}
         }),
-        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 4}),
+        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_reference_images": 4}),
     );
     let error = validate_restrictions_within_profile(&offering)
         .expect_err("more images than declared must be rejected");
@@ -41,7 +41,7 @@ fn restriction_staying_within_the_profile_is_accepted() {
         }),
         serde_json::json!({
             "allowed_branches": ["image_conditioned", "masked"],
-            "max_images": 2
+            "max_reference_images": 2
         }),
     );
     assert!(validate_restrictions_within_profile(&offering).is_ok());
@@ -49,14 +49,14 @@ fn restriction_staying_within_the_profile_is_accepted() {
 
 #[test]
 fn restriction_cannot_allow_edits_when_only_one_image_is_supported() {
-    // 收窄的另一面：Profile 只有单图字段时，`max_images: 1` 合法、`2` 不合法。
+    // 收窄的另一面：Profile 只有单图字段时，`max_reference_images: 1` 合法、`2` 不合法。
     let single = offering_with(
         serde_json::json!({
             "model": {"const": "m"},
             "prompt": {"type": "string"},
             "image": {"type": "string"}
         }),
-        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 1}),
+        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_reference_images": 1}),
     );
     assert!(validate_restrictions_within_profile(&single).is_ok());
     let widened = offering_with(
@@ -65,7 +65,7 @@ fn restriction_cannot_allow_edits_when_only_one_image_is_supported() {
             "prompt": {"type": "string"},
             "image": {"type": "string"}
         }),
-        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 2}),
+        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_reference_images": 2}),
     );
     assert!(validate_restrictions_within_profile(&widened).is_err());
 }
@@ -83,7 +83,7 @@ fn restriction_recognises_image_and_mask_parameters_by_name() {
         }),
         serde_json::json!({
             "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-            "max_images": 16
+            "max_reference_images": 16
         }),
     );
     assert!(validate_restrictions_within_profile(&vendor_names).is_ok());
@@ -97,14 +97,14 @@ fn restriction_recognises_image_and_mask_parameters_by_name() {
         serde_json::json!({"allowed_branches": ["masked"]}),
     );
     assert!(validate_restrictions_within_profile(&mask_without_image).is_err());
-    // 数组形式没写 `maxItems` ＝ Profile 没有承诺上限，不能据它接受 `max_images`。
+    // 数组形式没写 `maxItems` ＝ Profile 没有承诺上限，不能据它接受 `max_reference_images`。
     let unbounded = offering_with(
         serde_json::json!({
             "model": {"const": "m"},
             "prompt": {"type": "string"},
             "image_urls": {"type": "array", "items": {"type": "string"}}
         }),
-        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_images": 16}),
+        serde_json::json!({"allowed_branches": ["image_conditioned"], "max_reference_images": 16}),
     );
     assert!(validate_restrictions_within_profile(&unbounded).is_err());
 }
@@ -238,7 +238,7 @@ fn carrier_within_the_contract_and_the_driver_is_accepted() {
             "image": {"type": "string"},
             "quality": {"type": "string"}
         }),
-        serde_json::json!({"allowed_branches": ["prompt_only"], "max_images": 0}),
+        serde_json::json!({"allowed_branches": ["prompt_only"], "max_reference_images": 0}),
     );
     offering.carrier_schema = contract.clone();
     assert!(

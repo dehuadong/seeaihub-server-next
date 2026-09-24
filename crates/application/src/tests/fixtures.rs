@@ -15,7 +15,7 @@ pub(super) fn offering() -> PublishedOffering {
         parameter_mapping: serde_json::json!({}),
         restrictions: serde_json::json!({
             "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-            "max_images": 1
+            "max_reference_images": 1
         }),
         adapter_key: "aihubmix-image-v1".to_owned(),
         provider_model_id: "gpt-image-2".to_owned(),
@@ -227,7 +227,7 @@ pub(super) fn descriptor() -> AdapterDescriptor {
             ImageBranch::ImageConditioned,
             ImageBranch::Masked,
         ],
-        max_images: 1,
+        max_reference_images: 1,
     }
 }
 

@@ -513,7 +513,16 @@ fn worker(repository: Arc<WorkerRepository>, adapter: Arc<WorkerAdapter>) -> Wor
         Arc::new(WorkerCredentialProvider),
         "worker-test".to_owned(),
         ChronoDuration::seconds(30),
-        Duration::from_secs(1),
+        // 夹具只要一条自洽的链：每张预算为 0，所以"按张算"在这里退化成那个固定值。
+        RequestTimeoutPolicy {
+            base: Duration::from_secs(1),
+            included_images: 1,
+            per_image: Duration::ZERO,
+            provider_timeout: Duration::from_secs(1),
+            worker_lease: Duration::from_secs(30),
+            sync_wait: Duration::from_secs(1),
+            max_output_images: 1,
+        },
     )
     .expect("worker fixture must be valid")
 }

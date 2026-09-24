@@ -47,7 +47,7 @@
 
 **不声明**：`n`、`quality`、`stream`、`tools`、`layer_decomposition`、`background`、`sequential_image_generation_options`、**`response_format`**。
 
-**`watermark` 不可配置（首期固定 `false`）**：`restrictions` 只认 `allowed_branches`/`max_images`，Adapter Descriptor 只有参数名白名单，`validate_native_request` 也不注入策略默认值——因此该字段当前**无处承载发布策略值**。本阶段决定由 Adapter 固定为 `false`（避免上游默认 `true` 引入水印），**不新增发布字段**；代价是它不能按 Offering 变化，若将来需要按 Offering 配置，必须新增受校验的 `native_parameter_defaults` 并明确它能设置哪些字段。
+**`watermark` 不可配置（首期固定 `false`）**：`restrictions` 只认 `allowed_branches`/`max_reference_images`，Adapter Descriptor 只有参数名白名单，`validate_native_request` 也不注入策略默认值——因此该字段当前**无处承载发布策略值**。本阶段决定由 Adapter 固定为 `false`（避免上游默认 `true` 引入水印），**不新增发布字段**；代价是它不能按 Offering 变化，若将来需要按 Offering 配置，必须新增受校验的 `native_parameter_defaults` 并明确它能设置哪些字段。
 
 **为什么 `response_format` 不开放**：上游支持 `url` 与 `b64_json` 两种返回，但本设计的响应处理规则（§2.4）与取图路径（§2.5）**只覆盖 URL 分支**。若在 Schema 里声明 `b64_json`，就会发布出**平台无法执行的能力**——正是 #2「不能伪造能力」的反面。首期由平台在请求组装时固定 `response_format = url`，并把客户端传入的该字段按合同外字段在受理前丢弃；将来支持内联 Base64 时，必须先把响应处理与结果交付两条路径都补齐再发布。
 

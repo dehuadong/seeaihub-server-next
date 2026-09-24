@@ -75,7 +75,7 @@ fn the_descriptor_allows_the_sixteen_reference_images_the_materials_declare() {
     let descriptor = AihubmixAdapterFactory
         .descriptor(ADAPTER_KEY)
         .expect("the adapter describes itself");
-    assert_eq!(descriptor.max_images, 16);
+    assert_eq!(descriptor.max_reference_images, 16);
 }
 
 #[test]

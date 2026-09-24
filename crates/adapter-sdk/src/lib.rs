@@ -300,7 +300,10 @@ pub struct AdapterDescriptor {
     /// 能写进某个嵌套容器里的字段名；容器本身同样必须是上表里的一个顶层字段名。
     pub supported_extra_parameters: &'static [&'static str],
     pub supported_branches: &'static [ImageBranch],
-    pub max_images: u64,
+    /// 一次调用**能带进去几张参考图**的上限。
+    ///
+    /// 只管输入：输出张数由合同声明的 `n` 表达，与这个数不是一回事，别拿它当输出上限。
+    pub max_reference_images: u64,
 }
 
 #[derive(Debug, Clone, Error)]

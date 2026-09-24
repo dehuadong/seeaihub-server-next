@@ -15,17 +15,18 @@ use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
     CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
     GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
-    LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT, NewFxRate,
-    PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
-    RefundReconciliationCommand, RoutePolicyService, RuntimeService,
+    LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
+    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
+    ReconciliationService, RefundReconciliationCommand, RequestTimeoutPolicy, RoutePolicyService,
+    RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
     AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, OfferingId, PublishedModel,
     RoutePolicy, RouteStrategy, contract_image_parameter_kind, replace_contract_model_identity,
 };
-use seeai_persistence::PgHubRepository;
+use seeai_persistence::{PgHubRepository, max_declared_output_images};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeMap, env, net::SocketAddr, sync::Arc, time::Duration};
@@ -65,6 +66,29 @@ async fn main() -> Result<()> {
     let admin_token: Arc<str> = Arc::from(required_env("ADMIN_TOKEN")?);
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
+    // 超时链整条校验：输出张数上限取自**合同自己声明的取值面**（读库，所以要连库之后才知道），
+    // 两条链的比较因此比的是"合同允许的最大一档请求"。这一进程持有**对客同步等待窗口**——窗口
+    // 短于上游超时就是"消费者拿到 504、而上游还在生成、照样计费"那条路；租约在 Worker 上，但两个
+    // 进程读同一组变量，所以这里也看得到、也一起校验。校验不过就点名报错退出，不让服务带着一条
+    // 断链跑起来。
+    let (max_output_images, declared_by, undecodable) =
+        max_declared_output_images(repository.pool(), NO_CONTRACT_MAX_OUTPUT_IMAGES).await?;
+    let timeouts =
+        RequestTimeoutPolicy::from_env(max_output_images).map_err(anyhow::Error::from)?;
+    timeouts.validate().map_err(anyhow::Error::from)?;
+    let sync_wait = timeouts.sync_wait;
+    info!(
+        worker_lease_seconds = timeouts.worker_lease.as_secs(),
+        sync_wait_seconds = timeouts.sync_wait.as_secs(),
+        provider_timeout_seconds = timeouts.provider_timeout.as_secs(),
+        base_seconds = timeouts.base.as_secs(),
+        included_images = timeouts.included_images,
+        per_image_seconds = timeouts.per_image.as_secs(),
+        max_output_images = timeouts.max_output_images,
+        declared_by = declared_by.as_deref().unwrap_or("no active contract"),
+        undecodable_contracts = undecodable,
+        "the timeout chain is consistent"
+    );
     let repository_port: Arc<dyn HubRepository> = repository;
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
@@ -130,7 +154,7 @@ async fn main() -> Result<()> {
         accounts: AccountsService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
         route_policies: RoutePolicyService::new(repository_port.clone()),
-        sync_wait: generation_sync_wait()?,
+        sync_wait,
         repository: repository_port.clone(),
         generations: GenerationService::new(
             repository_port,
@@ -1393,19 +1417,6 @@ fn generation_max_cost_microusd() -> Result<u64> {
             .context("GENERATION_MAX_COST_MICROUSD must be an integer"),
         _ => Ok(20_000),
     }
-}
-
-/// 同步入口等任务跑完的窗口（秒，默认 120）：超了就按失败回 504——对客没有可查询的
-/// 执行记录，所以这个窗口之外拿不到图，只能由调用方自己重来。
-fn generation_sync_wait() -> Result<Duration> {
-    let seconds = match env::var("GENERATION_SYNC_WAIT_SECONDS") {
-        Ok(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse::<u64>()
-            .context("GENERATION_SYNC_WAIT_SECONDS must be an integer")?,
-        _ => 120,
-    };
-    Ok(Duration::from_secs(seconds))
 }
 
 /// 一个账户同时能有多少个在跑的生成任务（默认 1）。

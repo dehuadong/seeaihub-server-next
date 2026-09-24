@@ -6,6 +6,7 @@ use seeai_application::{
     LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, ProviderCostGapView,
     ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
     PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
+    declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -36,6 +37,55 @@ use uuid::Uuid;
 /// 一遍。这里拼进去的只有这个编译期常量（列名与一个布尔与），不含任何外部输入或用户数据，
 /// 所以那个断言是"审过了"，不是把检查绕过去——别的动态 SQL 不要走这条路。
 const CANDIDATE_AVAILABLE_SQL: &str = "o.enabled AND c.enabled";
+
+/// 读**所有在效合同**里声明的输出张数上限，取最大的那份。
+///
+/// 超时链上"按最大输出张数算出来的上限"要有个来源，这就是它：合同自己给 `n` 声明的取值面
+/// （`capability_schema.properties.n.maximum`），不是代码里写死的数、也不是输入参考图上限
+/// （`restrictions.max_reference_images` 说的是能带几张图进去）。一次发布的合同对全平台生效，所以这里扫的
+/// 是全部 active 条目，不是某一条候选的承载面。
+///
+/// 提交之后才查：运行中的进程不会看到未提交的发布；发布是原子的（一次修订全量替换），所以扫出来
+/// 的一定是某一个完整修订的合同集合。
+///
+/// 三种情形都落回 `fallback`：还没发布过任何东西、在效合同一条都没声明 `n`、以及合同解码不出来的
+/// 行。解码失败不报错——它不该让整个进程起不来，那时取兜底值更保守；解不出来的行数随结果一起返回，
+/// 由调用方记日志。返回的是最大值以及声明它的那条合同，启动日志因此说得出"这个数哪来的"。
+pub async fn max_declared_output_images(
+    pool: &PgPool,
+    fallback: u64,
+) -> Result<(u64, Option<String>, usize), ApplicationError> {
+    let rows = sqlx::query(
+        r#"
+        SELECT DISTINCT re.gateway_model, vm.capability_schema
+        FROM publication.runtime_entries re
+        JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+        WHERE re.active
+        "#,
+    )
+    .fetch_all(pool)
+    .await
+    .map_err(database_error)?;
+    let mut declared: Vec<(String, u64)> = Vec::with_capacity(rows.len());
+    let mut undecodable = 0_usize;
+    for row in &rows {
+        let gateway_model: String = row.try_get("gateway_model").map_err(database_error)?;
+        let capability_schema: Value = row.try_get("capability_schema").map_err(database_error)?;
+        if capability_schema.as_object().is_none() {
+            // 合同不是一份 JSON 对象：这一行的内容读不出来，得报给调用方（合同没声明 `n` 是另一回事，
+            // 那种模型本来就只生成一张，不算异常）。
+            undecodable += 1;
+            continue;
+        }
+        if let Some(maximum) = declared_output_images(&gateway_model, &capability_schema) {
+            declared.push((gateway_model, maximum.maximum));
+        }
+    }
+    match declared.into_iter().max_by_key(|(_, maximum)| *maximum) {
+        Some((gateway_model, maximum)) => Ok((maximum, Some(gateway_model), undecodable)),
+        None => Ok((fallback, None, undecodable)),
+    }
+}
 
 #[derive(Debug, Clone)]
 pub struct PgHubRepository {

@@ -334,7 +334,7 @@ fn descriptor_declares_apimart_parameters_without_extra_wrapper() {
             "{name} must be a top-level parameter"
         );
     }
-    assert_eq!(descriptor.max_images, 16);
+    assert_eq!(descriptor.max_reference_images, 16);
     assert!(factory.descriptor("some-other-key").is_none());
 }
 

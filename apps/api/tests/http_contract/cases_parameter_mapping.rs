@@ -1534,7 +1534,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
                 // 只走文生图：带图与带遮罩的请求都不该落在它身上；既然不承诺收图，上限就是 0。
                 offering["restrictions"] = json!({
                     "allowed_branches": ["prompt_only"],
-                    "max_images": 0
+                    "max_reference_images": 0
                 });
                 narrowed = true;
             }
@@ -1568,7 +1568,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         .expect("the narrowed AIHubMix entry must be active");
         assert_eq!(
             restrictions,
-            json!({"allowed_branches": ["prompt_only"], "max_images": 0}),
+            json!({"allowed_branches": ["prompt_only"], "max_reference_images": 0}),
             "{gateway} 的变体发布后，AIHubMix 这条供给只允许文生图"
         );
     }

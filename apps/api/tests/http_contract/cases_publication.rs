@@ -1097,7 +1097,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
             "credential_env": "AIHUBMIX_API_KEY",
             "restrictions": {
                 "allowed_branches": ["prompt_only", "image_conditioned", "masked"],
-                "max_images": 16
+                "max_reference_images": 16
             },
             "carrier_schema": contract.clone(),
             "formula": "token_rates",

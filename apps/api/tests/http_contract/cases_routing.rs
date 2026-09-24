@@ -407,7 +407,8 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
         &["prompt_only", "image_conditioned"],
     );
     narrow_first["routing_priority"] = json!(0);
-    narrow_first["restrictions"] = json!({"allowed_branches": ["prompt_only"], "max_images": 0});
+    narrow_first["restrictions"] =
+        json!({"allowed_branches": ["prompt_only"], "max_reference_images": 0});
     // 第二条因此换渠道；它按新形状只补一份映射——承载面声明的仍是**渠道原生字段名**
     // （adapter 能在线上写出的名字），平台字段名到原生名的重命名交给 `parameter_mapping`。
     let mut narrow_second = candidate(
@@ -419,7 +420,8 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     // 多映射一个合同里没有的字段会被发布期拒。
     narrow_second["parameter_mapping"] = json!({"rename": {"image": "image_urls"}});
     narrow_second["routing_priority"] = json!(1);
-    narrow_second["restrictions"] = json!({"allowed_branches": ["prompt_only"], "max_images": 0});
+    narrow_second["restrictions"] =
+        json!({"allowed_branches": ["prompt_only"], "max_reference_images": 0});
     // 直接发布并把错误体带进断言：只比状态码会看不出被拒的真实原因。
     // 顶层合同用**平台对客字段名**那一份（AIHubMix 候选的 `capability_schema`）：合同一个
     let publication = publication_body(
@@ -498,7 +500,7 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     heavy_but_ineligible["routing_priority"] = json!(0);
     heavy_but_ineligible["weight"] = json!(1000);
     heavy_but_ineligible["restrictions"] =
-        json!({"allowed_branches": ["prompt_only"], "max_images": 0});
+        json!({"allowed_branches": ["prompt_only"], "max_reference_images": 0});
     let mut light_but_eligible = candidate(
         "AIHubMix",
         "aihubmix-image-v1",

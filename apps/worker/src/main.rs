@@ -6,10 +6,11 @@ use seeai_adapter_sdk::ProviderCredential;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AdapterRegistry, ApplicationError, CachePolicy, CredentialProvider,
-    HubRepository, PlatformAlerter, WorkerService,
+    HubRepository, NO_CONTRACT_MAX_OUTPUT_IMAGES, PlatformAlerter, RequestTimeoutPolicy,
+    WorkerService,
 };
 use seeai_cache_redis::RedisCache;
-use seeai_persistence::PgHubRepository;
+use seeai_persistence::{PgHubRepository, max_declared_output_images};
 use std::{env, num::NonZeroU64, sync::Arc, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -39,13 +40,32 @@ async fn main() -> Result<()> {
     let database_url = required_env("DATABASE_URL")?;
     let worker_id = env::var("WORKER_ID").unwrap_or_else(|_| "worker-local-1".to_owned());
     let poll_interval = Duration::from_millis(parse_env("WORKER_POLL_INTERVAL_MS", 1_000_u64)?);
-    let lease_seconds = parse_env("WORKER_LEASE_SECONDS", 900_i64)?;
-    let provider_timeout = Duration::from_secs(parse_env("PROVIDER_TIMEOUT_SECONDS", 660_u64)?);
-    if lease_seconds <= i64::try_from(provider_timeout.as_secs()).unwrap_or(i64::MAX) {
-        anyhow::bail!("WORKER_LEASE_SECONDS must exceed PROVIDER_TIMEOUT_SECONDS");
-    }
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
+    // 超时链整条校验：输出张数上限取自**合同自己声明的取值面**（读库，所以要连库之后才知道），
+    // 两条链的比较因此比的是"合同允许的最大一档请求"。租约短于上游超时会让同一个 Job 被另一个
+    // worker 领走再调一次上游（付两次钱），而对客窗口短于上游超时是消费者拿到 504、上游照样计费
+    // 的那条路——窗口在 API 进程上，所以这个进程也要看到它、也校验它。校验不通过就带着点名到
+    // 具体那条链与两边当前值的报错退出，不让进程带着一条断链的服务跑起来。
+    let (max_output_images, declared_by, undecodable) =
+        max_declared_output_images(repository.pool(), NO_CONTRACT_MAX_OUTPUT_IMAGES).await?;
+    let timeouts =
+        RequestTimeoutPolicy::from_env(max_output_images).map_err(anyhow::Error::from)?;
+    timeouts.validate().map_err(anyhow::Error::from)?;
+    info!(
+        worker_lease_seconds = timeouts.worker_lease.as_secs(),
+        sync_wait_seconds = timeouts.sync_wait.as_secs(),
+        provider_timeout_seconds = timeouts.provider_timeout.as_secs(),
+        base_seconds = timeouts.base.as_secs(),
+        included_images = timeouts.included_images,
+        per_image_seconds = timeouts.per_image.as_secs(),
+        max_output_images = timeouts.max_output_images,
+        declared_by = declared_by.as_deref().unwrap_or("no active contract"),
+        undecodable_contracts = undecodable,
+        "the timeout chain is consistent"
+    );
+    let lease_seconds = i64::try_from(timeouts.worker_lease.as_secs())
+        .context("WORKER_LEASE_SECONDS is out of range")?;
     let repository_port: Arc<dyn HubRepository> = repository;
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
@@ -69,7 +89,7 @@ async fn main() -> Result<()> {
         Arc::new(EnvironmentCredentialProvider),
         worker_id.clone(),
         ChronoDuration::seconds(lease_seconds),
-        provider_timeout,
+        timeouts,
     )?
     .with_acceleration(acceleration);
     // 平台故障告警出口是**配置项**：`PROVIDER_ALERT_WEBHOOK` 没配就没有出口，一条也不外发；

@@ -78,7 +78,7 @@ impl AdapterFactory for ApimartAdapterFactory {
                 ImageBranch::ImageConditioned,
                 ImageBranch::Masked,
             ],
-            max_images: 16,
+            max_reference_images: 16,
         })
     }
 
@@ -151,11 +151,13 @@ fn validate_apimart_publication(
     {
         return Err("image_urls must be declared as an array".to_owned());
     }
-    let max_images = restrictions
-        .get("max_images")
+    // 这里读的是**输入参考图**张数上限：APIMart 的 uploads 端点一次能换回的图 URL 就那么几张，
+    // 与"这次要出几张图"（合同里的 `n`）无关。
+    let max_reference_images = restrictions
+        .get("max_reference_images")
         .and_then(Value::as_u64)
         .unwrap_or(1);
-    if max_images > 16 {
+    if max_reference_images > 16 {
         return Err("APIMart supports at most 16 reference images".to_owned());
     }
     Ok(())

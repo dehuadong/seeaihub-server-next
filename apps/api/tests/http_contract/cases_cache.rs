@@ -1009,12 +1009,16 @@ async fn chosen_offering(harness: &Harness, key: &str) -> Uuid {
 /// 别的窗口；删掉之后从 1 重新数起，它同时验了各窗口各算各的。
 ///
 /// 计数落在**缓存**里，所以夹具可以直接读它、删它：这也顺带证明判定真的走了缓存。
+///
+/// 窗口取 60 秒而不是 10 秒：第一次请求在窗口里要等同步窗口到期（装置给的下限是 10 秒），窗口太短
+/// 的话第二次请求会落到**下一个**窗口里，那时计数从 1 重新数起，越限就看不到了。窗口长度是本用例
+/// 自己选的，放松它不改变要验的判定。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
-    const WINDOW_MS: i64 = 10_000;
+    const WINDOW_MS: i64 = 60_000;
     // 离边界太近就先过去：给"两次请求 + 清理"留出足够余量，不至于刚对齐就撞上下一条边界。
-    const MARGIN_MS: i64 = 3_000;
+    const MARGIN_MS: i64 = 30_000;
 
     let harness = Harness::start_with_cache_and_rate_limit(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
@@ -1093,7 +1097,7 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
     let retry_after = retry_after.expect("越限必须给出 Retry-After");
     let seconds: u64 = retry_after.parse().expect("Retry-After 是秒数");
     assert!(
-        (1..=10).contains(&seconds),
+        (1..=u64::try_from(WINDOW_MS / 1_000).expect("window in seconds")).contains(&seconds),
         "Retry-After 是到下一个窗口的秒数，落在 1..=窗口长度 里，实得 {seconds}"
     );
 

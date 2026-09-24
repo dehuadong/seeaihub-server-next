@@ -51,7 +51,7 @@ impl AdapterFactory for AihubmixAdapterFactory {
                 ImageBranch::ImageConditioned,
                 ImageBranch::Masked,
             ],
-            max_images: 16,
+            max_reference_images: 16,
         })
     }
 
@@ -471,9 +471,9 @@ fn decode_inline_image(value: &str) -> Result<DecodedImage, AdapterError> {
 /// 这个 Driver 的编辑端点要**至少**一张参考图（外加至多一张遮罩）：一张都不给就直接拒绝，不静默
 /// 发一个没有图的编辑请求。
 ///
-/// 多张**不在这里拦**：这条面按"最多 16 张"发布（`restrictions.max_images`），收几张是发布物与
-/// 选路的事；这里再拦一道，等于让声明的能力与实现互相矛盾——而且被拦下的请求是平台侧故障，
-/// 调用方完全无从判断。
+/// 多张**不在这里拦**：这条面按"最多 16 张参考图"发布（`restrictions.max_reference_images`），
+/// 收几张是发布物与选路的事；这里再拦一道，等于让声明的能力与实现互相矛盾——而且被拦下的请求是
+/// 平台侧故障，调用方完全无从判断。
 fn reference_inputs(request: &PreparedImageRequest) -> Result<ImageInputs, AdapterError> {
     let inputs = image_inputs(&request.native_parameters, &request.platform_parameters)
         .map_err(AdapterError::UnsupportedInput)?;

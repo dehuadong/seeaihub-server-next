@@ -745,6 +745,14 @@ async fn start_api_with(
         let port = listener.local_addr().expect("test address").port();
         drop(listener);
         let base_url = format!("http://127.0.0.1:{port}");
+        // 这个进程的**对客同步等待窗口**：用例给多长就是多长，但有一个下限——链上要求
+        // "窗口 ≥ 上游超时"，而生产那套按张算超时的**取值**在这里压不到 1s：APIMart 的 Driver 每 3s
+        // 轮询一次任务，而"上游超时"同时是这一次执行的**总期限**，压到 1s 会让"提交 + 轮询到终态"
+        // 必然超时（实测两条用例因此变成"结果不明"）。所以窗口与上游超时都取 10s 与用例窗口里较大
+        // 的那个：1s / 2s 那些用例要观察的"窗口先到期"仍然成立——它们不跑 Worker，Job 一直停在受理
+        // 态，窗口一到就回 504。生产取值（300s 级）不能搬进用例：每条都要等上几分钟，而且会逼着
+        // 校验放宽。
+        let test_chain_seconds = sync_wait_seconds.max(10);
         let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
         command
             .env("DATABASE_URL", database_url)
@@ -756,8 +764,19 @@ async fn start_api_with(
             )
             .env(
                 "GENERATION_SYNC_WAIT_SECONDS",
-                sync_wait_seconds.to_string(),
+                test_chain_seconds.to_string(),
             )
+            .env(
+                "PROVIDER_TIMEOUT_BASE_SECONDS",
+                test_chain_seconds.to_string(),
+            )
+            .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "4")
+            .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
+            .env("PROVIDER_TIMEOUT_SECONDS", test_chain_seconds.to_string())
+            // 租约是链的下半条（租约 ≥ 上游超时），所以它跟着同一条下限走，不能写成一个固定数——
+            // 用例给的窗口有 60s 的，写 30s 就把链断在启动校验上。租约同时要够把一条 Job 跑完一次：
+            // 比上游超时短会让它在任务执行中途到期，回收循环于是把同一条 Job 再跑一遍。
+            .env("WORKER_LEASE_SECONDS", test_chain_seconds.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         apply_cache_env(&mut command, settings.cache.as_ref());
@@ -852,12 +871,18 @@ fn spawn_worker_process_with(
         .env("DATABASE_URL", database_url)
         .env("WORKER_ID", "driver-contract-worker")
         .env("WORKER_POLL_INTERVAL_MS", "200")
-        .env("WORKER_LEASE_SECONDS", "300")
-        .env("PROVIDER_TIMEOUT_SECONDS", "60")
+        // 与 API 进程同一组超时取值（见 `start_api_with`）：10s 的秒级下限让 APIMart 每 3s 一次的
+        // 轮询跑得完，链上三环（窗口 ≥ 上限、租约 ≥ 上限）因此都成；租约同值，一条 Job 跑得完一次
+        // 而不被回收循环中途领走。
+        .env("WORKER_LEASE_SECONDS", "10")
+        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "10")
+        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "4")
+        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
+        .env("PROVIDER_TIMEOUT_SECONDS", "10")
         .env("APIMART_API_KEY", "contract-test-key")
         .env("AIHUBMIX_API_KEY", "contract-test-key")
         .stdout(Stdio::null())
-        .stderr(Stdio::null());
+        .stderr(Stdio::inherit());
     apply_cache_env(&mut command, cache);
     if let Some(alerts) = alerts {
         command.env("PROVIDER_ALERT_WEBHOOK", &alerts.webhook).env(
@@ -1731,7 +1756,7 @@ async fn publish_with_mappings(
                 "provider_model_id": model,
                 "base_url": "http://127.0.0.1:1",
                 "credential_env": "AIHUBMIX_API_KEY",
-                "restrictions": {"allowed_branches": ["prompt_only"], "max_images": 0},
+                "restrictions": {"allowed_branches": ["prompt_only"], "max_reference_images": 0},
                 "carrier_schema": carrier,
                 "parameter_mapping": parameter_mapping,
                 "formula": "token_rates",
@@ -1836,7 +1861,7 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
         "restrictions": {
             "allowed_branches": branches,
             // 收图上限也要与 Profile 自洽：纯文生图只声明 prompt，收图数就是 0。
-            "max_images": if declares_image { 1 } else { 0 }
+            "max_reference_images": if declares_image { 1 } else { 0 }
         },
         "capability_schema": schema,
         // 这份测试构造体按**四分项 token 计量量**计价（用例要的是可复现的费率），所以它带一份

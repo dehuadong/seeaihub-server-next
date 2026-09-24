@@ -44,8 +44,12 @@ _Avoid_: 对客任务、任务号、Provider Task、HTTP 请求
 Generation Job 对某个 Offering 和 Channel 发起的一次外部副作用尝试。它同时承载对账标识（Provider 的逐请求标识），该标识只用于对账，不参与计价，也不属于 Metering Evidence。
 _Avoid_: 重试、Job
 
+**Input Reference**（输入参考资源）:
+请求里作为**输入**交给模型的外部资源。它是**与资源种类无关**的分类：今天接入的种类**只有图片**（见 [Reference Image / Mask](#reference-imagemask参考图与遮罩)），视频、音频以及图片与它们的混合输入属于同一类。它的**数量上限**是这条渠道/这条供给能接收的参考资源个数上限，随 Runtime Revision 按供给声明；今天只有图片这一种，上限的名字是 `max_reference_images`（发布数据里是 `restrictions.max_reference_images`）——**名字点明它管的是图片**。它与 `n`（输出张数）是两件事：`n` 说这次要生成几张，`max_reference_images` 说这次能收几张参考资源，两者互不顶替。
+_Avoid_: 把输入参考资源与输出张数混为一谈、用 `max_images` 这种看不出是输入还是输出的名字、把"今天只有图片"说成"这类限制只可能有图片这一种"
+
 **Reference Image / Mask**（参考图与遮罩）:
-调用方给出的图片参数值：公网 URL 或 data URL。它**只是参数值**——平台不落盘、不校验其内容、不给它独立身份，由渠道决定接受什么形态、拒绝什么形态。平台认的调用方图片契约字段只有 `image` / `image_urls` / `mask` 三个名字（`image` 与 `image_urls` 同义）；候选**声明**的参数名另有一套判定：名字以 `image` 开头的是参考图、含 `mask` 的是遮罩（**两者都像时以遮罩为准**），它只用于"把调用方的图落到该候选的哪个参数上"，不用于拦截调用方字段。合同过滤与承载校验见 [Vendor Model Contract 与 Offering Parameter Mapping 落地设计](docs/design/0005-vendor-model-contract-and-offering-mapping.md) §4。
+调用方给出的图片参数值：公网 URL 或 data URL，今天**唯一**一种 [Input Reference](#input-reference输入参考资源)。它**只是参数值**——平台不落盘、不校验其内容、不给它独立身份，由渠道决定接受什么形态、拒绝什么形态。平台认的调用方图片契约字段只有 `image` / `image_urls` / `mask` 三个名字（`image` 与 `image_urls` 同义）；候选**声明**的参数名另有一套判定：名字以 `image` 开头的是参考图、含 `mask` 的是遮罩（**两者都像时以遮罩为准**），它只用于"把调用方的图落到该候选的哪个参数上"，不用于拦截调用方字段。合同过滤与承载校验见 [Vendor Model Contract 与 Offering Parameter Mapping 落地设计](docs/design/0005-vendor-model-contract-and-offering-mapping.md) §4。
 _Avoid_: Asset、资产、素材库、把渠道参数名当作模型参数名、在每个渠道重复一套判定
 
 **Result Envelope**（结果信封）:
