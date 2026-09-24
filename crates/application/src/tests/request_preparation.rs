@@ -32,8 +32,8 @@ fn parameters_the_contract_never_declared_are_dropped_without_an_error() {
     vendor.carrier_schema = declared;
     let request = image_request(serde_json::json!({
         "prompt": "hello",
-        "n": "not-a-number",
-        "quality": "high",
+        "n": 1,
+        "quality": 42,
         "channel_specific_knob": {"a": 1},
         "seed": 7,
         "foo": "bar",
@@ -45,9 +45,11 @@ fn parameters_the_contract_never_declared_are_dropped_without_an_error() {
         vec!["model", "n", "prompt", "quality"],
         "只有合同声明过的名字留到 Job 里：{face:?}"
     );
-    // 合同声明过的参数取值不校验：类型不对也照原样留下。
-    assert_eq!(face.get("n"), Some(&serde_json::json!("not-a-number")));
-    assert_eq!(face.get("quality"), Some(&serde_json::json!("high")));
+    // 合同声明过的参数取值不校验：`quality` 的取值不在它声明的 `enum` 里也照原样留下，判它该由
+    // 上游那一侧说。**唯一的例外是输出张数 `n`**——它的取值面是平台自己算超时与成本要用的输入，
+    // 见 `validate_declared_integer`（那是它自己的用例）。
+    assert_eq!(face.get("quality"), Some(&serde_json::json!(42)));
+    assert_eq!(face.get("n"), Some(&serde_json::json!(1)));
     let prepared = prepare_carrier_parameters(&face, &request, &vendor)
         .expect("the carrier declares every field the request uses");
     assert_eq!(prepared, Value::Object(face));

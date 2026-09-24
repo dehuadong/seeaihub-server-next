@@ -4990,6 +4990,9 @@ fn contract_parameter_face(
         missing.push(name.to_owned());
     }
     if missing.is_empty() {
+        // 合同为**输出张数**声明的取值面是唯一在这里判取值的参数：它与别的参数不同，平台自己就要
+        // 按它算超时与成本（见 [`validate_declared_integer`]）。
+        validate_declared_integer(contract, &parameters, "n", &request.model)?;
         Ok(parameters)
     } else {
         Err(ApplicationError::Validation(format!(
@@ -4997,6 +5000,72 @@ fn contract_parameter_face(
             missing.join(", ")
         )))
     }
+}
+
+/// 按**合同自己**为某个整数参数声明的取值面（`type: integer` 与 `minimum` / `maximum`）校验它的值。
+///
+/// 只对**输出张数** `n` 做这件事，理由是它与别的参数在平台这一侧的分量不同：这一次请求的超时窗口
+/// （按张数推导）与成本护栏（按张数乘单价）都拿它当输入，而它同时也是发给上游的"要几张"。放它
+/// 过去，合同里那句 `maximum` 就只是一句文档：调用方给 `n = 100`，平台按合同的 10 算超时与成本，
+/// 上游却可能真的生成 100 张。别的参数（`quality`、`seed`…）的取值仍然不在这里判——那是上游按
+/// 自己的 schema 处置的事，平台替它判会把"上游认得的取值"变成平台要维护的清单。
+///
+/// 判据取自**合同自己那份声明**：不同型号声明不同的界（`config/bootstrap` 里顶层合同是 10，
+/// APIMart 那条候选的承载面是 4），平台没有、也不该有一个统一的数。
+///
+/// 只判声明过的部分：合同没声明这个参数、或没声明 `type` 与上下界时**不判**——把一条不存在的
+/// 条款变成对客错误，比放过它更糟。对客是**调用方的参数问题**（`400 invalid_parameter`），不是
+/// 平台侧故障：值是他给的，改法也在他那一侧。
+fn validate_declared_integer(
+    contract: &Value,
+    parameters: &Map<String, Value>,
+    name: &str,
+    model: &str,
+) -> Result<(), ApplicationError> {
+    let Some(value) = parameters.get(name).filter(|value| !value.is_null()) else {
+        return Ok(());
+    };
+    let Some(schema) = contract
+        .get("properties")
+        .and_then(|properties| properties.get(name))
+    else {
+        return Ok(());
+    };
+    let declared_integer = schema.get("type").and_then(Value::as_str) == Some("integer");
+    let minimum = schema.get("minimum").and_then(Value::as_i64);
+    let maximum = schema.get("maximum").and_then(Value::as_i64);
+    if !declared_integer && minimum.is_none() && maximum.is_none() {
+        return Ok(());
+    }
+    let Some(number) = declared_integer_value(value) else {
+        return Err(ApplicationError::InvalidParameter(format!(
+            "{name} for model {model} must be an integer, got {value}"
+        )));
+    };
+    if let Some(minimum) = minimum
+        && number < minimum
+    {
+        return Err(ApplicationError::InvalidParameter(format!(
+            "{name} for model {model} must be at least {minimum}, got {number}"
+        )));
+    }
+    if let Some(maximum) = maximum
+        && number > maximum
+    {
+        return Err(ApplicationError::InvalidParameter(format!(
+            "{name} for model {model} must be at most {maximum}, got {number}"
+        )));
+    }
+    Ok(())
+}
+
+/// 这个值是不是一个整数（`3.0` 也算：JSON Schema 的 `integer` 就是"没有小数部分"）。
+fn declared_integer_value(value: &Value) -> Option<i64> {
+    if let Some(number) = value.as_i64() {
+        return Some(number);
+    }
+    let number = value.as_f64()?;
+    (number.fract() == 0.0).then_some(number as i64)
 }
 
 /// 合同字段名下的图片输入是否"在场"。

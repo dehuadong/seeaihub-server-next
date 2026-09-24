@@ -368,3 +368,54 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
     );
     harness.cleanup().await;
 }
+
+/// 合同为**输出张数**声明的上界就是调用方的界：越界在受理前被拒（**参数问题**，400），不建 Job、
+/// 不扣款；恰好等于上界照常跑完。
+///
+/// 用**真素材**起夹具：`n` 的上界写在型号的合同里（顶层 `capability_schema`），各型号不同——平台
+/// 没有一个写死的数。夹具那条手写的最小合同根本不声明 `n`，用它验不出这件事。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_requested_image_count_beyond_the_contracts_maximum_is_rejected_before_acceptance() {
+    let harness =
+        Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
+    let account_id = Uuid::parse_str(&harness.account_id).expect("account id");
+
+    let mut over = route_request(harness.model, "one image too many");
+    over["n"] = json!(11);
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &format!("contract-n-over-{}", Uuid::new_v4()),
+            over,
+        )
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "合同说最多 10 张，11 张是调用方的参数问题：{body}"
+    );
+    assert_eq!(body["error"]["code"], json!("invalid_parameter"), "{body}");
+    assert_public_only("合同上界", &body);
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job count");
+    assert_eq!(jobs, 0, "越界的请求不许建 Job");
+
+    let mut boundary = route_request(harness.model, "exactly the declared maximum");
+    boundary["n"] = json!(10);
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &format!("contract-n-ok-{}", Uuid::new_v4()),
+            boundary,
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "恰好等于上界必须放行：{body}");
+    assert_sync_success("合同上界之内", &body);
+
+    harness.cleanup().await;
+}

@@ -9,6 +9,7 @@ use std::sync::{
 };
 
 mod carrier_validation;
+mod contract_face;
 mod failure_mapping;
 mod fixtures;
 mod publish_normalize;
