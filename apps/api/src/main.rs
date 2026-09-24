@@ -18,8 +18,8 @@ use seeai_application::{
     LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
     NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
     ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RequestTimeoutPolicy, RoutePolicyService,
-    RuntimeService,
+    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
+    RoutePolicyService, RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -147,7 +147,8 @@ async fn main() -> Result<()> {
         identity: IdentityService::new(repository_port.clone())
             .with_rate_limit(acceleration.clone(), generation_rate_limit()?),
         runtime: RuntimeService::new(repository_port.clone(), adapters)
-            .with_acceleration(acceleration.clone()),
+            .with_acceleration(acceleration.clone())
+            .with_cost_ceiling(cost_ceiling()?),
         reconciliation: ReconciliationService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
         pricing: PricingService::new(repository_port.clone()),
@@ -163,6 +164,8 @@ async fn main() -> Result<()> {
         )
         // 每日扣费上限：定额度是运维取值，判定每次回账本读（见 `GenerationService::create`）。
         .with_daily_spend_limit(generation_daily_spend_limit()?)
+        // 成本护栏：发布期与受理期判的是同一个数（见 `RequestCostCeiling`）。
+        .with_cost_ceiling(cost_ceiling()?)
         .with_acceleration(acceleration),
     };
     let app = Router::new()
@@ -1338,6 +1341,13 @@ impl From<ApplicationError> for ApiError {
                 tracing::warn!(reason = %reason, "no offering can carry the request");
                 (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
             }
+            ApplicationError::RequestCostCeilingExceeded(ref reason) => {
+                // 平台自己划的成本护栏挡住了这次执行：客户的余额可能够、请求本身也没错，是这次
+                // 执行可能让平台付得太多。同样发生在受理之前、没有 Job 可记，因此在这里留日志
+                // ——这道护栏撞上的时候，运营要么调上限，要么改那条候选的定价。
+                tracing::warn!(reason = %reason, "the request cost ceiling rejected an acceptance");
+                (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
+            }
             ApplicationError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApplicationError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             ApplicationError::InsufficientBalance => {
@@ -1447,6 +1457,14 @@ fn generation_rate_limit() -> Result<GenerationRateLimit> {
 /// 计数，这一项每次都从账本聚合，因为"今天已经花掉多少"是事实。
 fn generation_daily_spend_limit() -> Result<GenerationDailySpendLimit> {
     Ok(GenerationDailySpendLimit::from_env()?)
+}
+
+/// 单次请求的上游**成本上限**：`GENERATION_MAX_REQUEST_COST_MICROUSD`（microusd，默认 10 元等值）。
+///
+/// 判据、两处判定与它的边界见 [`RequestCostCeiling`]。它与 `GENERATION_MAX_COST_MICROUSD` **不是
+/// 同一个量**：那个是查不到供给封顶保底值时的兜底**保底额**。
+fn cost_ceiling() -> Result<RequestCostCeiling> {
+    Ok(RequestCostCeiling::from_env()?)
 }
 
 fn init_tracing() {

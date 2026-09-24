@@ -34,6 +34,8 @@ mod cases_aihubmix;
 mod cases_apimart;
 #[path = "cases_cache.rs"]
 mod cases_cache;
+#[path = "cases_cost_ceiling.rs"]
+mod cases_cost_ceiling;
 #[path = "cases_cost_facts.rs"]
 mod cases_cost_facts;
 #[path = "cases_lifecycle.rs"]
@@ -722,22 +724,26 @@ impl ApiRateLimit {
     }
 }
 
-/// API 进程的四项可选配置：**加速层**、**每把密钥的速率上限**、**每账户每日扣费上限**，以及
-/// **账实核对**。
+/// API 进程的可选配置：**加速层**、**每把密钥的速率上限**、**每账户每日扣费上限**、**账实核对**
+/// 与**成本护栏**。
 ///
 /// 前两项绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流那一层
 /// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
 ///
-/// 第三项**不**依赖缓存：每日扣费上限问的是账本上的事实，有没有加速层都从账本聚合，所以它可以
-/// 单独配。这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
+/// 每日扣费上限**不**依赖缓存：它问的是账本上的事实，有没有加速层都从账本聚合，所以它可以单独配。
+/// 这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
 ///
-/// 第四项同样不依赖缓存：账实核对读的是账本与余额（见 [`LedgerAudit`]）。
+/// 账实核对同样不依赖缓存：它读的是账本与余额（见 [`LedgerAudit`]）。
+///
+/// 成本护栏是单次请求可能花掉的上游成本上限（`GENERATION_MAX_REQUEST_COST_MICROUSD`）。它由
+/// **发布期与受理期共用**，所以夹具自己那条候选必须在上限之下，否则连发布都过不去。
 #[derive(Default)]
 struct ApiProcessSettings {
     cache: Option<CacheFixture>,
     rate_limit: Option<ApiRateLimit>,
     daily_spend_limit_microusd: Option<u64>,
     ledger_audit: Option<LedgerAudit>,
+    cost_ceiling_microusd: Option<u64>,
 }
 
 /// 一次用例给 API 进程配的**账实核对**：周期，以及可选的一个告警接收器。
@@ -863,6 +869,12 @@ async fn start_api_with(
             command.env(
                 "GENERATION_MAX_DAILY_SPEND_MICROUSD",
                 limit_microusd.to_string(),
+            );
+        }
+        if let Some(ceiling_microusd) = settings.cost_ceiling_microusd {
+            command.env(
+                "GENERATION_MAX_REQUEST_COST_MICROUSD",
+                ceiling_microusd.to_string(),
             );
         }
         if let Some(ledger_audit) = &settings.ledger_audit {
@@ -1270,6 +1282,33 @@ impl Harness {
             CaseSettings {
                 api: ApiProcessSettings {
                     ledger_audit: Some(ledger_audit),
+                    ..ApiProcessSettings::default()
+                },
+                ..CaseSettings::default()
+            },
+        )
+        .await
+    }
+
+    /// 同 [`Self::start_with_draft`]，但给 API 进程定下**单次请求成本上限**。
+    ///
+    /// 上限是**进程启动时**读的环境变量，发布期与受理期判的是同一个数：夹具那条候选因此必须在
+    /// 上限之下（发布才过得去），用例再去看"上限挡住的是什么"。
+    async fn start_with_cost_ceiling(
+        draft: Value,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        ceiling_microusd: u64,
+    ) -> Self {
+        Self::build(
+            draft,
+            None,
+            behaviour,
+            max_concurrent_jobs,
+            30,
+            CaseSettings {
+                api: ApiProcessSettings {
+                    cost_ceiling_microusd: Some(ceiling_microusd),
                     ..ApiProcessSettings::default()
                 },
                 ..CaseSettings::default()

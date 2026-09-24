@@ -180,8 +180,8 @@
 ### 范围边界（不待决，归其他工作项）
 
 - **对外价策略与具体数值**（含是否分档、加价系数与汇率的具体取值）归 [`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)——本主题只给机制；
-- **成本护栏**（服务端成本上限一类的运营护栏）归 [`#9`](https://github.com/dehuadong/seeaihub-server-next/issues/9)——本主题只把**客户余额**当受理上限（[`0007`](./0007-pricing-floor-and-settlement.md) §6）；
-- **成本进账本与账实核对**归 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)；
+- **成本护栏**（服务端成本上限）不在本主题（见 [运维底线与运行面](./0009-operational-baseline.md) §7）——本主题只把**客户余额**当受理上限（[`0007`](./0007-pricing-floor-and-settlement.md) §6）；
+- **成本进账本与账实核对**不在本主题（见 [`docs/architecture.md`](../architecture.md) §5 与 `CONTEXT.md` 的 `Platform Account`）；
 - **运行期回退**（上游请求已发出之后改道另一条候选）归 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)（[`0008`](./0008-routing-strategy-and-caching.md) §4）；
 - **调用记录查询接口**按用户口径不做（§3）。
 

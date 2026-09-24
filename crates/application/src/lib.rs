@@ -56,6 +56,9 @@ pub use request_timeout::{
 mod retry;
 pub use retry::{DEFAULT_BACKOFF_BASE_MS, DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS, RetryPolicy};
 
+mod cost_ceiling;
+pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
+
 /// 发布一个 Vendor Model 的供给。
 ///
 /// 一次发布携带该模型**完整、有序**的候选集合（`offerings`，必填且非空）；
@@ -1605,6 +1608,14 @@ pub enum ApplicationError {
     /// 表达不了这次请求，是平台的供给面不够宽——对客必须说成平台侧故障，不是参数错。
     #[error("no eligible offering: {0}")]
     NoEligibleOffering(String),
+    /// 这次受理按该候选的计价形态算下来，可能花掉的上游成本超过了运营设的**单次请求成本上限**。
+    ///
+    /// 与 [`Self::InsufficientBalance`] 分开：那个是**客户**的钱不够，这个是**平台**自己划的护栏
+    /// ——请求本身没问题、客户的余额也够，是这次执行可能让平台付得太多（上限被调小、折算率变差、
+    /// 或发布物配错了）。对客必须是**平台侧故障**，不是"你余额不足"。
+    /// 带的是这次算出来的成本与上限本身，写给运营看（对客那层只说平台不可用）。
+    #[error("request cost ceiling exceeded: {0}")]
+    RequestCostCeilingExceeded(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
@@ -3287,6 +3298,8 @@ pub struct RuntimeService {
     repository: Arc<dyn HubRepository>,
     adapters: Arc<dyn AdapterFactory>,
     acceleration: Arc<AccelerationService>,
+    /// 成本护栏：单次请求可能花掉的上游成本上限（运营取值，与受理侧**同一个数**）。
+    cost_ceiling: RequestCostCeiling,
 }
 
 impl RuntimeService {
@@ -3297,7 +3310,17 @@ impl RuntimeService {
             repository,
             adapters,
             acceleration,
+            cost_ceiling: RequestCostCeiling::default_ceiling(),
         }
+    }
+
+    /// 装上运维给的**单次请求成本上限**。
+    ///
+    /// 上限是配置项：它随部署形态与上游价格变，所以由调用方给，而不是写死在这里。
+    #[must_use]
+    pub fn with_cost_ceiling(mut self, ceiling: RequestCostCeiling) -> Self {
+        self.cost_ceiling = ceiling;
+        self
     }
 
     /// 装上加速层：发布与启停都要失效该型号的 route 缓存。
@@ -3338,6 +3361,8 @@ impl RuntimeService {
             normalized.push(self.validate_offering(&contract, offering)?);
         }
         validate_supply_identities(&normalized)?;
+        self.validate_cost_ceiling(&command.native_model_id, &contract, &normalized)
+            .await?;
         let request = command.into_request(contract, normalized);
         validate_gateway_model_identity(&request)?;
         let gateway_model = request.gateway_model.clone();
@@ -3413,6 +3438,72 @@ impl RuntimeService {
             .await?;
         for gateway_model in affected {
             self.acceleration.invalidate_route(&gateway_model).await;
+        }
+        Ok(())
+    }
+
+    /// 发布期的**成本护栏**：任何一条候选的**最大单次成本**超过上限就拒整份发布。
+    ///
+    /// 判据按**合同允许的最大输出张数**算（见 [`single_request_cost_native`]）——发布期问的是
+    /// "这条供给最坏能花掉多少"，那正是合同允许的最坏情况。折算率取**此刻生效的那一行**：发布期
+    /// 没有"受理时刻"这个东西，而这道判据要的是"按今天的折算率看它是不是离谱"。
+    ///
+    /// **算不出成本的候选跳过**（没有参考成本、没有成本币种、或该币种没有生效折算率）：判不出
+    /// "有没有超"时不动它——当作"超了"会让旧形状的素材发不出去，当作 0 又等于静默放行。真正
+    /// 落地的那一笔由受理期那道兜底判。
+    ///
+    /// 整份发布一起拒，而不是"把超了的那条候选剔掉"：候选集是发布者给的一个整体（档位与权重
+    /// 合起来才是路由），替发布者删一条会让路由悄悄变成另一副样子。
+    async fn validate_cost_ceiling(
+        &self,
+        native_model_id: &str,
+        contract: &Value,
+        offerings: &[NormalizedOffering],
+    ) -> Result<(), ApplicationError> {
+        // 合同的 `n` 上限：模型级唯一一份，全平台的候选共用它。
+        let max_images = declared_output_images(native_model_id, contract)
+            .map(|declared| declared.maximum)
+            // 合同没声明 `n` = 这个模型收不到 `n`，一次请求只生成一张。
+            .unwrap_or(1);
+        // 折算率按币种取一次就够：同一份发布里的候选常常共用币种，而这是一条管理员路径，
+        // 不值得为每个候选各读一次汇率表。
+        let mut rates: BTreeMap<String, Option<FxRate>> = BTreeMap::new();
+        for (index, offering) in offerings.iter().enumerate() {
+            let Some(currency) = offering.cost_currency() else {
+                continue;
+            };
+            let fx_rate = match rates.get(currency) {
+                Some(rate) => rate.clone(),
+                None => {
+                    let rate = self.repository.effective_fx_rate(currency).await?;
+                    rates.insert(currency.to_owned(), rate.clone());
+                    rate
+                }
+            };
+            let Some(cost_cny) = single_request_cost_cny(
+                offering.formula,
+                offering.cost_unit_price_microusd,
+                offering
+                    .pricing
+                    .as_ref()
+                    .map(|pricing| pricing.reference_cost_microusd),
+                Some(currency),
+                fx_rate.as_ref(),
+                max_images,
+            ) else {
+                continue;
+            };
+            if self.cost_ceiling.exceeded_by(cost_cny) {
+                return Err(ApplicationError::Validation(format!(
+                    "offerings[{index}] ({} {}) may cost up to {cost_cny} microusd of upstream cost \
+                     for a single request (n up to {max_images}), over the ceiling of {} microusd \
+                     set by GENERATION_MAX_REQUEST_COST_MICROUSD: fix the candidate's pricing or \
+                     raise the ceiling",
+                    offering.provider_kind,
+                    offering.provider_model_id,
+                    self.cost_ceiling.max_request_cost_microusd()
+                )));
+            }
         }
         Ok(())
     }
@@ -3951,6 +4042,8 @@ pub struct GenerationService {
     max_daily_spend_microusd: u64,
     /// 加速层：候选集从缓存取、受理后把余额写穿、以及**只在新鲜时**的提前拒绝。
     acceleration: Arc<AccelerationService>,
+    /// 成本护栏：单次请求可能花掉的上游成本上限（运营取值）。
+    cost_ceiling: RequestCostCeiling,
 }
 
 impl GenerationService {
@@ -3968,7 +4061,17 @@ impl GenerationService {
             max_daily_spend_microusd: GenerationDailySpendLimit::default_limit()
                 .max_daily_spend_microusd,
             acceleration,
+            cost_ceiling: RequestCostCeiling::default_ceiling(),
         }
+    }
+
+    /// 装上运维给的**单次请求成本上限**。
+    ///
+    /// 上限是配置项：它随部署形态与上游价格变，所以由调用方给，而不是写死在这里。
+    #[must_use]
+    pub fn with_cost_ceiling(mut self, ceiling: RequestCostCeiling) -> Self {
+        self.cost_ceiling = ceiling;
+        self
     }
 
     /// 装上运维给的**每日扣费上限**。
@@ -4077,6 +4180,29 @@ impl GenerationService {
         // 所以售价**不必等上游回来**；冻结之后结算只读那份快照，受理之后改汇率、改加价系数、
         // 重发修订都不影响这一个 Job。
         let hold_microusd = self.freeze_pricing(&request, &mut offering).await?;
+        // 成本护栏（兜底）：发布期已经按"这条供给最坏能花多少"判过一次，这里按**这一次请求**再判
+        // 一次——上限被调小、或折算率变差之后，**已经发布出去的**供给不会自己重判，而它此刻真的
+        // 会花掉这么多。判在预检与建 Job 之前：不建 Job、不扣款、不留预授权。
+        //
+        // 判的是**成本**，不是售价、也不是客户余额：对客是平台侧故障（503），不是"你余额不足"。
+        if let Some(cost_cny) = single_request_cost_cny(
+            offering.price_snapshot.formula,
+            offering.price_snapshot.cost_unit_price_microusd,
+            offering.price_snapshot.reference_cost_microusd,
+            offering.price_snapshot.cost_currency.as_deref(),
+            offering.price_snapshot.fx_rate.as_ref(),
+            requested_image_count(&native_parameters),
+        ) && self.cost_ceiling.exceeded_by(cost_cny)
+        {
+            return Err(ApplicationError::RequestCostCeilingExceeded(format!(
+                "model {} offering {} could cost up to {cost_cny} microusd of upstream cost for \
+                 this request, over the ceiling of {} microusd set by \
+                 GENERATION_MAX_REQUEST_COST_MICROUSD",
+                request.model,
+                offering.offering_id,
+                self.cost_ceiling.max_request_cost_microusd()
+            )));
+        }
         // 预检：缓存里的余额**新鲜**且明显不够时提前拒绝。它只读不写、不建 Job、不扣款，
         // 因此必然留下一条审计（`precheck_balance` 里落）；不新鲜一律交给下面的数据库条件更新。
         if let Some(probe) = &probe

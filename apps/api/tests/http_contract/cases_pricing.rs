@@ -286,8 +286,12 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     );
 
     // ── 只改参考成本重发：对客实收只随对客费率向量变 ──
+    // 取值要留在**成本护栏**之下（默认 10 元；按 7.1 的折算率约合 1_408_450 微美元）：它一旦被那道
+    // 护栏判成"配得离谱"，发布会被整份拒——那时拒绝来自护栏，与这里要验的"参考成本不参与对客实收"
+    // 无关，用例会变成一个在验另一件事的用例。1_200_000 微美元约合 8.52 元，既明显不同于原值，
+    // 又留有边界余量。
     let mut repriced = second.clone();
-    repriced["reference_cost_microusd"] = json!(7_777_777);
+    repriced["reference_cost_microusd"] = json!(1_200_000);
     assert_eq!(
         publish_on_revision(
             &harness,
@@ -315,7 +319,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
     assert_eq!(
         next_snapshot["reference_cost_microusd"],
-        json!(7_777_777),
+        json!(1_200_000),
         "重发确实换掉了参考成本（否则下面那条断言就是空的）"
     );
     assert_eq!(
