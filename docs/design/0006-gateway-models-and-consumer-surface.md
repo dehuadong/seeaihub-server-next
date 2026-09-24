@@ -162,7 +162,7 @@
 - **跨厂商统一图片参数语义**（`ADR-0015`：属后期独立规划）；
 - **通用参数映射引擎**（沿用 `#10` 口径：只做"合同 → 该候选承载面"的校验与装载）；
 - **发布的分步 CRUD / 草稿态**（§2.4 理由）；
-- **自动重试与失败后改道**（`ADR-0009`/`ADR-0011`，属 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)）；
+- **失败后改道（换候选）**：上游请求一旦失败就改选另一条候选，仍不做（`ADR-0009`/`ADR-0011`，属 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)）——"可证明未受理"的失败重投的是同一份请求、同一个候选，不属本项；
 - **成本进账本与账实核对**（[`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11) 的成本进账本与账实核对那部分）；
 - **对外价策略本身与具体数值**（[`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；
 - **把 `config/bootstrap/*.json` 当后台**（用户明确：只作初始化种子与测试夹具）。

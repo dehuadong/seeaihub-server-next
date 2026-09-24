@@ -102,7 +102,7 @@
 - 生成请求里的参考图是 `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），只接受**公网可访问 URL**。上传页的 Python 示例把它写成 `[{"url": …}]`（对象数组）——实测用字符串数组提交成功并完成出图，平台取字符串数组。
 - 遮罩是 `mask_url`（字符串），与 `image_urls` 同用可行；实测用 512×512 带 alpha 的 PNG、尺寸与参考图一致，上游未报尺寸/通道错误。
 - 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台取更严的一侧：一律先上传换 URL。
-- 流程：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，[`docs/adr/0011`](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)）⇒ Job `failed` + 释放预授权，**不进对账**。调用方给公网 URL 时逐字透传、不上传；平台不托管素材，只有 data URL 才需要解码后上传。
+- 流程：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，[`docs/adr/0011`](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)）⇒ 在额度内重投，用尽后 Job `failed` + 释放预授权，**不进对账**。调用方给公网 URL 时逐字透传、不上传；平台不托管素材，只有 data URL 才需要解码后上传。
 - 参数名不改写：生成请求用上游原生名 `image_urls` / `mask_url`，由 Offering Parameter Mapping 从合同字段 `image` / `mask` 落位（依据 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。
 - `mask_url` 不在 2.5 生成文档的字段表里，但**实测被接受**（提交 200 → `completed`），因此按厂商契约声明遮罩；渠道将来若拒绝它，表现会是渠道报错，不是平台静默丢字段。
 - 遮罩**不额外计费**：带/不带 `mask_url` 的两次调用 `usage` 与 `cost` 完全相同。
