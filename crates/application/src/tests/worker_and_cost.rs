@@ -313,6 +313,12 @@ impl HubRepository for WorkerRepository {
         Ok(0)
     }
 
+    /// 这个仓库只服务 Worker 那条路径：受理路径的每日扣费聚合在这里没有意义，所以报"用错了"
+    /// 而不是编一个 0——编一个 0 等于让这道门在测试里悄悄失效。
+    async fn daily_spend_microusd(&self, _account_id: AccountId) -> Result<u64, ApplicationError> {
+        unused_repository()
+    }
+
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {

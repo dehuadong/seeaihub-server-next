@@ -572,14 +572,18 @@ impl ApiRateLimit {
     }
 }
 
-/// API 进程的两项可选配置：**加速层**与**每把密钥的速率上限**。
+/// API 进程的三项可选配置：**加速层**、**每把密钥的速率上限**与**每账户每日扣费上限**。
 ///
-/// 两者绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流这一层
+/// 前两项绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流那一层
 /// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
+///
+/// 第三项**不**依赖缓存：每日扣费上限问的是账本上的事实，有没有加速层都从账本聚合，所以它可以
+/// 单独配。这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
 #[derive(Default)]
 struct ApiProcessSettings {
     cache: Option<CacheFixture>,
     rate_limit: Option<ApiRateLimit>,
+    daily_spend_limit_microusd: Option<u64>,
 }
 
 impl ApiProcessSettings {
@@ -587,7 +591,7 @@ impl ApiProcessSettings {
     fn with_cache(cache: CacheFixture) -> Self {
         Self {
             cache: Some(cache),
-            rate_limit: None,
+            ..Self::default()
         }
     }
 
@@ -596,6 +600,16 @@ impl ApiProcessSettings {
         Self {
             cache: Some(cache),
             rate_limit: Some(rate_limit),
+            ..Self::default()
+        }
+    }
+
+    /// 同 [`Self::with_cache`]，但把**每日扣费上限**调小。
+    fn with_cache_and_daily_spend_limit(cache: CacheFixture, limit_microusd: u64) -> Self {
+        Self {
+            cache: Some(cache),
+            daily_spend_limit_microusd: Some(limit_microusd),
+            ..Self::default()
         }
     }
 }
@@ -648,6 +662,12 @@ async fn start_api_with(
                     "GENERATION_RATE_LIMIT_WINDOW_MS",
                     rate_limit.window_ms.to_string(),
                 );
+        }
+        if let Some(limit_microusd) = settings.daily_spend_limit_microusd {
+            command.env(
+                "GENERATION_MAX_DAILY_SPEND_MICROUSD",
+                limit_microusd.to_string(),
+            );
         }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
@@ -732,6 +752,9 @@ struct Harness {
     database_name: String,
     base_url: String,
     admin_token: String,
+    /// 这个用例那个夹具账户的标识。用例要往账本里造"今天已经花掉"的事实时按它落地——
+    /// 配额判的是**账户**维度的钱，不是某一把密钥的。
+    account_id: String,
     api_key: String,
     pool: PgPool,
     calls: UpstreamCalls,
@@ -893,6 +916,32 @@ impl Harness {
         .await
     }
 
+    /// 同 [`Self::start_with_cache`]，但把**每账户每日扣费上限**调小。
+    ///
+    /// 上限是**进程启动时**读的环境变量，所以要在起进程之前就定下来：想按"这笔实际花了多少"
+    /// 来定额度，就得先让那笔跑完（见用例里那次充值——余额与额度是两回事，用例把前者抬开，
+    /// 好让被拒的唯一理由就是"今天到头了"）。
+    async fn start_with_cache_and_daily_spend_limit(
+        draft: Value,
+        contract: Option<Value>,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+        cache: CacheFixture,
+        limit_microusd: u64,
+    ) -> Self {
+        Self::build(
+            draft,
+            contract,
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
+            ApiProcessSettings::with_cache_and_daily_spend_limit(cache, limit_microusd),
+            None,
+        )
+        .await
+    }
+
     async fn build(
         mut draft: Value,
         contract: Option<Value>,
@@ -953,6 +1002,7 @@ impl Harness {
             database_name,
             base_url,
             admin_token,
+            account_id: account,
             api_key,
             pool,
             calls,

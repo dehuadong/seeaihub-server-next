@@ -12,11 +12,11 @@ use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
-    CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationRateLimit,
-    GenerationService, HubRepository, IdentityService, JobView, MAX_OPERATIONAL_LIMIT, NewFxRate,
-    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
-    RoutePolicyService, RuntimeService,
+    CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
+    GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
+    MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
+    RefundReconciliationCommand, RoutePolicyService, RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -113,6 +113,8 @@ async fn main() -> Result<()> {
             generation_max_cost_microusd()?,
             generation_max_concurrent_jobs()?,
         )
+        // 每日扣费上限：定额度是运维取值，判定每次回账本读（见 `GenerationService::create`）。
+        .with_daily_spend_limit(generation_daily_spend_limit()?)
         .with_acceleration(acceleration),
     };
     let app = Router::new()
@@ -1182,6 +1184,13 @@ impl ApiError {
 
 impl From<ApplicationError> for ApiError {
     fn from(error: ApplicationError) -> Self {
+        // 每日扣费上限那条路要把"到次日零点还有多久"带到对客响应上，所以它在匹配之前先被
+        // 取出来。这是这个转换里**唯一**需要另带走一个值的错误：`Retry-After` 不是"你错了"，
+        // 是"什么时候再来"，消费者要的答案就在那个数里。
+        let retry_after = match &error {
+            ApplicationError::DailySpendLimitExceeded { retry_after } => Some(*retry_after),
+            _ => None,
+        };
         let (status, code) = match error {
             ApplicationError::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
             // 调用方这次请求在参数上不成立（例如合同没声明图片字段却带了图）：与一般校验失败分开，
@@ -1207,6 +1216,11 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::RateLimitExceeded { .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
             }
+            // 今天已经花到运营设的额度：与上面两个 429 各用各的码，消费者才分得清"慢点再来"
+            // "并发太多""今天到头了"。
+            ApplicationError::DailySpendLimitExceeded { .. } => {
+                (StatusCode::TOO_MANY_REQUESTS, "daily_spend_limit_exceeded")
+            }
             ApplicationError::Configuration(_)
             | ApplicationError::Persistence(_)
             | ApplicationError::Reconciliation(_) => {
@@ -1222,7 +1236,7 @@ impl From<ApplicationError> for ApiError {
             status,
             code,
             message,
-            retry_after: None,
+            retry_after,
         }
     }
 }
@@ -1301,6 +1315,16 @@ fn generation_max_concurrent_jobs() -> Result<u64> {
 /// 所以留成部署期可调，而不是写死在代码里。
 fn generation_rate_limit() -> Result<GenerationRateLimit> {
     Ok(GenerationRateLimit::from_env()?)
+}
+
+/// 每账户每日扣费上限（默认每天 50 美元等值）。读法与上面两项相同，一个环境变量：
+/// `GENERATION_MAX_DAILY_SPEND_MICROUSD`，单位 microusd。
+///
+/// 它是**运营取值**，不是产品档位：它挡的是"没人看管的脚本在一天里把余额烧光"，不是一个
+/// 精算过的客户额度，所以留成部署期可调。它与限流的读法相同、**判据不同**——限流读缓存里的
+/// 计数，这一项每次都从账本聚合，因为"今天已经花掉多少"是事实。
+fn generation_daily_spend_limit() -> Result<GenerationDailySpendLimit> {
+    Ok(GenerationDailySpendLimit::from_env()?)
 }
 
 fn init_tracing() {

@@ -2195,6 +2195,35 @@ impl HubRepository for PgHubRepository {
         Ok(u64::try_from(count).unwrap_or(u64::MAX))
     }
 
+    async fn daily_spend_microusd(&self, account_id: AccountId) -> Result<u64, ApplicationError> {
+        // **从账本读事实**：今天已经扣掉多少，只有这条路径能回答。按需聚合、不写缓存、
+        // 也不读缓存——配额判的是"钱花到哪了"，拿一份可能过时的计数去判会放出不该放的请求。
+        //
+        // 判据是 `today`（数据库的 `now()` 落在哪个 UTC 自然日）：一天的边界应当由**事实的
+        // 书写者**（数据库）划，而不是由受理进程的本地时区划；否则同一份账本在两个时区的
+        // 进程眼里是两天的花销。
+        //
+        // `capture` 在结算时是**负数**（见结算那段：预授权释放一笔正数、实收一笔负数），
+        // 所以这里取负数的相反数——"花掉多少"是正着说的。持有与释放都不是花费：预授权只是
+        // 占位，它已经由余额那条路挡着；释放是把没花的退回去。既然余额不足时受理会拒，这个
+        // 和式就不会为负；真出现负数（对账退款之类）也只归到 0，绝不折成一个巨大的 `u64`。
+        let spent: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(sum(-e.amount_microusd), 0)::bigint
+            FROM ledger.entries e
+            WHERE e.account_id = $1
+              AND e.kind = 'capture'
+              AND e.amount_microusd < 0
+              AND e.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            "#,
+        )
+        .bind(account_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(u64::try_from(spent).unwrap_or(0))
+    }
+
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {

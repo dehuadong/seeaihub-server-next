@@ -1125,6 +1125,83 @@ fn rate_limit_env(name: &str, default: u64) -> Result<u64, ApplicationError> {
     }
 }
 
+/// 每账户**当天已经花掉**多少（microusd）。
+///
+/// 与 [`GenerationRateLimit`] 刻意不同：那个量的是**请求速率**，是保护机制，计数落在缓存里、
+/// 读不到就放行；这个量的是**已经发生的费用**，是事实，只能从账本按需聚合——事实不写缓存，
+/// 也不读缓存，缓存里那份迟早会与账本对不上，而"今天花超了没有"正是不能拿一份可能过时的数
+/// 去判的事。按需聚合的代价是每个受理请求多一次索引扫描，换来的是判据永远等于账本。
+///
+/// 默认是每账户每天 50 美元等值（`50_000_000` microusd）。这是**运营取值**而不是产品档位：
+/// 它挡的是"没人看管的脚本把账户余额在一天里烧光"这种形态，不是一个精算过的额度；要按客户
+/// 分级，改的是部署期的环境变量，不是这里。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GenerationDailySpendLimit {
+    /// 一个自然日（UTC）内允许扣掉的总额度，单位 microusd。
+    pub max_daily_spend_microusd: u64,
+}
+
+impl GenerationDailySpendLimit {
+    /// 运维默认值：每天 50 美元等值。
+    #[must_use]
+    pub fn default_limit() -> Self {
+        Self {
+            max_daily_spend_microusd: 50_000_000,
+        }
+    }
+
+    /// 上限必须是正数：0 等于"这个账户一次都不许花"，那不是额度、是关停；真要关停应当走
+    /// 账户与密钥那条路，而不是把额度设成 0 让每个请求都撞在一个说不清的错误上。
+    pub fn new(max_daily_spend_microusd: u64) -> Result<Self, ApplicationError> {
+        if max_daily_spend_microusd == 0 {
+            return Err(ApplicationError::Configuration(
+                "the daily spend limit must be positive".to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_daily_spend_microusd,
+        })
+    }
+
+    /// 从环境变量读运维取值：`GENERATION_MAX_DAILY_SPEND_MICROUSD`；没给或给空用默认值。
+    pub fn from_env() -> Result<Self, ApplicationError> {
+        Self::new(rate_limit_env(
+            "GENERATION_MAX_DAILY_SPEND_MICROUSD",
+            50_000_000,
+        )?)
+    }
+}
+
+/// 判这次受理会不会把账户当天花超，并在超了时给出"到次日零点还有多久"。
+///
+/// 判据是 `spent_microusd >= limit`：**已花到顶**就拒，而不是"要超过才拒"——额度是一天的
+/// 天花板，花到正好等于天花板时，今天已经没有余量再受理一次了。
+///
+/// `retry_after` 是**到当天结束**的秒数，不是某个窗口的长度：配额按自然日恢复，消费者要的
+/// 答案就是"明天零点之后再来"。向上取整到秒由对客那一层做，这里不提前取整，否则一个
+/// "还有 0.4 秒"的余量会被写成 1 秒以外的值、或干脆写成 0。
+fn daily_spend_limit_error(
+    max_daily_spend_microusd: u64,
+    spent_microusd: u64,
+    now: DateTime<Utc>,
+) -> Option<ApplicationError> {
+    if spent_microusd < max_daily_spend_microusd {
+        return None;
+    }
+    let next_day = (now.date_naive() + ChronoDuration::days(1))
+        .and_hms_opt(0, 0, 0)
+        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
+    let retry_after = next_day
+        .map(|next_day| next_day - now)
+        .and_then(|remaining| remaining.to_std().ok())
+        // 时钟落在当天最后一刻时余量可能不足 1 纳秒：给 1 毫秒，不给出 0——0 会被对客那一层
+        // 当成"没有值"或"立刻可重试"，两种都不是事实。
+        .unwrap_or_else(|| Duration::from_millis(1));
+    Some(ApplicationError::DailySpendLimitExceeded {
+        retry_after: retry_after.max(Duration::from_millis(1)),
+    })
+}
+
 impl CreateImageGenerationRequest {
     /// 这个请求属于哪条图片分支：有图无遮罩=图生图、两者都有=带遮罩、都没=文生图。
     ///
@@ -1461,6 +1538,14 @@ pub enum ApplicationError {
     /// 窗口长度随错误一起给出，调用方才知道该说"多久之后再来"。
     #[error("rate limit exceeded; retry after {retry_after:?}")]
     RateLimitExceeded { retry_after: Duration },
+    /// 该账户**当天已经花掉**的钱达到了运营设的每日上限。
+    ///
+    /// 与 [`Self::RateLimitExceeded`]、[`Self::TooManyInFlight`] 三者互不相同，因为对客该做
+    /// 的事完全不同：那个是"这一分钟发得太密，等一下再发"、那个是"上一个还没跑完"、这个是
+    /// "今天的额度用完了，明天再来"——合成一个码，消费者只能盲目重试。
+    /// `retry_after` 是到次日零点（UTC）的秒数。
+    #[error("daily spend limit reached; retry after {retry_after:?}")]
+    DailySpendLimitExceeded { retry_after: Duration },
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("persistence error: {0}")]
@@ -1770,6 +1855,16 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
         except_idempotency_key: &str,
     ) -> Result<u64, ApplicationError>;
+
+    /// 该账户**当天（UTC 自然日）从账本上扣掉的**总额（microusd）。
+    ///
+    /// 与在飞计数不同，这里问的是**事实**而不是计数：今天已经花掉多少，只有账本能回答。
+    /// 聚合按需做、不落缓存——缓存一份"今日累计"就得管它的失效与漂移，而漂移出来的数恰好
+    /// 会用来决定"要不要拒"，那种错不可接受（详情见 [`GenerationDailySpendLimit`]）。
+    ///
+    /// 刻意**不给缺省实现**：受理路径上的这道门必须每次都能拿到答案，一个"没实现就当 0
+    /// （今天还没花）"的缺省会让新仓库在无声无息中把上限关掉，而"少花钱"这件事没人会发现。
+    async fn daily_spend_microusd(&self, account_id: AccountId) -> Result<u64, ApplicationError>;
 
     async fn list_open_reconciliation_cases(
         &self,
@@ -3663,6 +3758,12 @@ pub struct GenerationService {
     /// 这是最初的并发设计：一个账户同时只跑一个，超出的直接拒（429），
     /// 免得一次提交一堆把上游额度与平台成本一起打满。
     max_concurrent_jobs: u64,
+    /// 该账户**当天**最多能花掉多少（microusd，运营取值，见 [`GenerationDailySpendLimit`]）。
+    ///
+    /// 它与并发上限守的不是同一件事：并发上限守的是"同时在跑几个"，钱烧光的形态却是**串行**
+    /// 的——一个接一个地跑、每一个都合规，照样能在一天里把余额花完。所以这里问的是账本上
+    /// "今天已经扣掉多少"，而不是任何计数器。
+    max_daily_spend_microusd: u64,
     /// 加速层：候选集从缓存取、受理后把余额写穿、以及**只在新鲜时**的提前拒绝。
     acceleration: Arc<AccelerationService>,
 }
@@ -3679,8 +3780,19 @@ impl GenerationService {
             repository,
             max_cost_microusd,
             max_concurrent_jobs,
+            max_daily_spend_microusd: GenerationDailySpendLimit::default_limit()
+                .max_daily_spend_microusd,
             acceleration,
         }
+    }
+
+    /// 装上运维给的**每日扣费上限**。
+    ///
+    /// 上限是配置项：它随部署形态与客户分级变，所以由调用方给，而不是写死在这里。
+    #[must_use]
+    pub fn with_daily_spend_limit(mut self, limit: GenerationDailySpendLimit) -> Self {
+        self.max_daily_spend_microusd = limit.max_daily_spend_microusd;
+        self
     }
 
     /// 装上加速层。
@@ -3710,6 +3822,20 @@ impl GenerationService {
             >= self.max_concurrent_jobs
         {
             return Err(ApplicationError::TooManyInFlight);
+        }
+        // 每日扣费上限：**从账本读**"这个账户今天已经花掉多少"，与缓存无关也**不写缓存**。
+        // 这与上面那条并发判定刻意不同——那是"同时在跑几个"（保护上游与渠道），这是"今天
+        // 已经花掉多少钱"（保护钱）。花钱的形态可以是完全串行的，所以并发计数看不见它；
+        // 而既然问的是事实，判据就必须是账本本身，不能是一份可能过时或漂移的计数。
+        // 放在受理路径上、紧挨并发判定：两者都是"这次请求进不进得来"的门，进门之前判。
+        let spent_microusd = self
+            .repository
+            .daily_spend_microusd(request.account_id)
+            .await?;
+        if let Some(rejected) =
+            daily_spend_limit_error(self.max_daily_spend_microusd, spent_microusd, Utc::now())
+        {
+            return Err(rejected);
         }
         // 加速层开着时先做一次轻量读（生效修订标识 + 开关 + 数据库时钟），候选集再从缓存取；
         // 关着时这一步不做，取数路径与没有这一层时逐字相同。
