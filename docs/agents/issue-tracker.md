@@ -13,7 +13,6 @@
 - **增删标签**：`gh issue edit <number> --add-label "..."` / `--remove-label "..."`。
 - **关闭**：`gh issue close <number> --comment "..."`。
 
-跨仓库引用（例如历史提案）必须显式指定 `-R dehuadong/seeaihub <number>`。
 
 ## Proposal workflow
 
