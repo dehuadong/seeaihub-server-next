@@ -666,18 +666,33 @@ impl ApiRateLimit {
     }
 }
 
-/// API 进程的三项可选配置：**加速层**、**每把密钥的速率上限**与**每账户每日扣费上限**。
+/// API 进程的四项可选配置：**加速层**、**每把密钥的速率上限**、**每账户每日扣费上限**，以及
+/// **账实核对**。
 ///
 /// 前两项绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流那一层
 /// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
 ///
 /// 第三项**不**依赖缓存：每日扣费上限问的是账本上的事实，有没有加速层都从账本聚合，所以它可以
 /// 单独配。这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
+///
+/// 第四项同样不依赖缓存：账实核对读的是账本与余额（见 [`LedgerAudit`]）。
 #[derive(Default)]
 struct ApiProcessSettings {
     cache: Option<CacheFixture>,
     rate_limit: Option<ApiRateLimit>,
     daily_spend_limit_microusd: Option<u64>,
+    ledger_audit: Option<LedgerAudit>,
+}
+
+/// 一次用例给 API 进程配的**账实核对**：周期，以及可选的一个告警接收器。
+///
+/// 它是**任务级**配置：周期压到用例等得起的量级（生产默认是分钟级），接收器不给就是"没有出口"
+/// 那条路径——核对照样发现、照样建案，只是一条都不外发。
+struct LedgerAudit {
+    /// 核对周期（毫秒）。
+    interval_ms: u64,
+    /// 告警接收器地址（`PROVIDER_ALERT_WEBHOOK`）；`None` 就是没配接收器。
+    webhook: Option<String>,
 }
 
 impl ApiProcessSettings {
@@ -762,6 +777,16 @@ async fn start_api_with(
                 "GENERATION_MAX_DAILY_SPEND_MICROUSD",
                 limit_microusd.to_string(),
             );
+        }
+        if let Some(ledger_audit) = &settings.ledger_audit {
+            // 开关本身不配：默认就是开着的，用例要验的正是"开着的时候做什么"。
+            command.env(
+                "LEDGER_AUDIT_INTERVAL_MS",
+                ledger_audit.interval_ms.to_string(),
+            );
+            if let Some(webhook) = &ledger_audit.webhook {
+                command.env("PROVIDER_ALERT_WEBHOOK", webhook);
+            }
         }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
@@ -1051,6 +1076,30 @@ impl Harness {
             max_concurrent_jobs,
             sync_wait_seconds,
             ApiProcessSettings::with_cache_and_daily_spend_limit(cache, limit_microusd),
+            None,
+        )
+        .await
+    }
+
+    /// 同 `start_with`，但给 API 进程配上**账实核对**（周期与可选的告警接收器）。
+    ///
+    /// 它**不**启缓存：核对读的是账本与余额，与加速层无关——顺带也就验了"没有缓存时这条任务
+    /// 照样跑"（那条缓存对账在没有缓存时根本不进循环，两条任务的启用条件不同）。
+    async fn start_with_ledger_audit(
+        ledger_audit: LedgerAudit,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+    ) -> Self {
+        Self::build(
+            candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+            None,
+            behaviour,
+            max_concurrent_jobs,
+            30,
+            ApiProcessSettings {
+                ledger_audit: Some(ledger_audit),
+                ..ApiProcessSettings::default()
+            },
             None,
         )
         .await
@@ -2176,6 +2225,12 @@ async fn verify_reconciliation_contract(
             .expect("reconciliation job");
     let attempt_id = Uuid::new_v4();
     let case_id = Uuid::new_v4();
+    let account_id: Uuid =
+        sqlx::query_scalar("SELECT account_id FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&pool)
+            .await
+            .expect("reconciliation account");
     let balance_after_hold: i64 = sqlx::query_scalar(
         "SELECT a.balance_microusd FROM ledger.accounts a JOIN generation.jobs j ON j.account_id = a.id WHERE j.id = $1",
     )
@@ -2197,11 +2252,12 @@ async fn verify_reconciliation_contract(
     .await
     .expect("attempt fixture");
     sqlx::query(
-        "INSERT INTO operations.reconciliation_cases (id, job_id, attempt_id, reason) VALUES ($1,$2,$3,'contract')",
+        "INSERT INTO operations.reconciliation_cases (id, job_id, attempt_id, account_id, reason) VALUES ($1,$2,$3,$4,'contract')",
     )
     .bind(case_id)
     .bind(job_id)
     .bind(attempt_id)
+    .bind(account_id)
     .execute(&pool)
     .await
     .expect("case fixture");
@@ -3089,6 +3145,83 @@ async fn database_balance(harness: &Harness, account_id: &str) -> i64 {
         .fetch_one(&harness.pool)
         .await
         .expect("balance")
+}
+
+/// 该账户账本条目的**符号和**：账实核对拿它当"账本说是多少"。
+async fn ledger_total_microusd(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(amount_microusd), 0)::bigint FROM ledger.entries WHERE account_id = $1",
+    )
+    .bind(Uuid::parse_str(account_id).expect("account id"))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("ledger total")
+}
+
+/// 该账户的账本条目数：核对**不许**往账本里补条目，用例据此断言它一条都没写。
+async fn ledger_entry_count(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM ledger.entries WHERE account_id = $1")
+        .bind(Uuid::parse_str(account_id).expect("account id"))
+        .fetch_one(&harness.pool)
+        .await
+        .expect("ledger entry count")
+}
+
+/// 把某个账户的余额**直接改错**：只改这一边，账本条目一条不动——账实不符的那种形态。
+async fn forge_account_balance(harness: &Harness, account_id: &str, balance: i64) {
+    sqlx::query(
+        "UPDATE ledger.accounts SET balance_microusd = $2, updated_at = now() WHERE id = $1",
+    )
+    .bind(Uuid::parse_str(account_id).expect("account id"))
+    .bind(balance)
+    .execute(&harness.pool)
+    .await
+    .expect("forged balance");
+}
+
+/// 这个账户当前**未结案**的账户级案例数（`job_id IS NULL` 那一类）。
+async fn open_ledger_cases(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM operations.reconciliation_cases
+         WHERE account_id = $1 AND job_id IS NULL AND status = 'open'",
+    )
+    .bind(Uuid::parse_str(account_id).expect("account id"))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("open ledger cases")
+}
+
+/// 全部案例的条数（含已结案）：一致时这个数不许动。
+async fn reconciliation_case_count(harness: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM operations.reconciliation_cases")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("case count")
+}
+
+/// 等账实核对在库里留下那条案例（返回案例 id 与它写的理由）。
+///
+/// 核对跑在 API 进程的定时循环里、周期是毫秒级，但"这一轮跑到哪了"只能由库里的痕迹回答，
+/// 所以有上限地等，而不是睡一个固定时长就断言。
+async fn wait_for_open_ledger_case(harness: &Harness, account_id: &str) -> (Uuid, String) {
+    for _ in 0..200 {
+        let row = sqlx::query(
+            "SELECT id, reason FROM operations.reconciliation_cases
+             WHERE account_id = $1 AND job_id IS NULL AND status = 'open'",
+        )
+        .bind(Uuid::parse_str(account_id).expect("account id"))
+        .fetch_optional(&harness.pool)
+        .await
+        .expect("case probe");
+        if let Some(row) = row {
+            return (
+                row.try_get("id").expect("case id"),
+                row.try_get("reason").expect("case reason"),
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    panic!("账实核对必须在这些轮次里为这个账户留下一条案例");
 }
 
 /// 某一类审计事件的载荷（运营要能发现平台侧事件）。

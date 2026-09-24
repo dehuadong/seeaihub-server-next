@@ -11,7 +11,7 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use seeai_domain::{GenerationJob, JobId, JobState};
+use seeai_domain::{AccountId, GenerationJob, JobId, JobState};
 use std::{
     num::NonZeroU64,
     sync::{
@@ -24,14 +24,42 @@ use crate::{ApplicationError, AttemptFailure, ProviderFailureKind};
 
 /// 一条外发的平台侧告警：**给定位所需的最小集**，字段名就是它的线上表示。
 ///
+/// 两种形态共用一个出口：**某次执行**上的平台侧事件（[`ExecutionAlert`]），与**一次账实核对
+/// 发现的不符**（[`LedgerMismatchAlert`]）。后者不是执行，所以它不借用前者的字段——一条对不上的
+/// 余额既说不出 `job_id`，也说不出失败类别，硬塞进去只会让收到告警的人去查一个不存在的东西。
+///
+/// 序列化是 `untagged` 的：一种形态一个对象，加一种形态**不改**另一种的线上表示。
+///
 /// 它刻意不带凭证、提示词与图片：告警外发到仓库之外，对客内容不出门。要多带一个字段之前先问
 /// 一句"收到它的人靠这条字段能不能做成一件事"——不能就不加。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
-pub struct PlatformAlert {
+#[serde(untagged)]
+pub enum PlatformAlert {
+    Execution(ExecutionAlert),
+    LedgerMismatch(LedgerMismatchAlert),
+}
+
+/// 某次执行上的平台侧事件：失败本身，或这次失败把 Job 推进了对账。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct ExecutionAlert {
     pub job_id: JobId,
     /// 渠道类别（例如 AIHubMix / APIMart）。
     pub provider_kind: String,
     pub failure_kind: ProviderFailureKind,
+    pub occurred_at: DateTime<Utc>,
+}
+
+/// 一次账实核对发现的不符：某个账户**账本的符号和**与它**行上的余额**对不上。
+///
+/// 三个数就是定位所需：哪个账户、账本说是多少、余额说是多少。差额是两者之差，收到的人自己会算，
+/// 所以不另发一个字段。它**不带**"谁对谁错"——这条任务只发现不符，改账是人的决定。
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
+pub struct LedgerMismatchAlert {
+    pub account_id: AccountId,
+    /// `ledger.entries` 按账户求和的符号金额。
+    pub ledger_total_microusd: i64,
+    /// `ledger.accounts` 那一行上的余额。
+    pub balance_microusd: i64,
     pub occurred_at: DateTime<Utc>,
 }
 
@@ -40,11 +68,72 @@ impl PlatformAlert {
     /// 与库里的业务时刻不是同一件事。
     #[must_use]
     pub fn of(job: &GenerationJob, failure_kind: ProviderFailureKind) -> Self {
-        Self {
+        Self::Execution(ExecutionAlert {
             job_id: job.id,
             provider_kind: job.offering.provider_kind.clone(),
             failure_kind,
             occurred_at: Utc::now(),
+        })
+    }
+
+    /// 一次账实不符外发的那条告警。时间同样是**观测到它的时刻**（见 [`Self::of`]）。
+    #[must_use]
+    pub fn ledger_mismatch(
+        account_id: AccountId,
+        ledger_total_microusd: i64,
+        balance_microusd: i64,
+    ) -> Self {
+        Self::LedgerMismatch(LedgerMismatchAlert {
+            account_id,
+            ledger_total_microusd,
+            balance_microusd,
+            occurred_at: Utc::now(),
+        })
+    }
+
+    /// 日志里定位这条告警的那一行：执行告警给 Job 与失败类别，账实不符给账户与两个数。
+    ///
+    /// **按形态给它自己的字段名**，执行告警沿用原来那几个（`job_id` / `provider_kind` /
+    /// `failure_kind`）——运营的日志查询是按它们写的；账实不符那条没有 Job，于是给账户与两个数。
+    /// 这些字段只由载荷自己的字段拼出来：日志与线上表示说的是同一件事。
+    fn log_delivered(&self, delivered: u64) {
+        match self {
+            Self::Execution(alert) => tracing::debug!(
+                job_id = %alert.job_id,
+                provider_kind = alert.provider_kind.as_str(),
+                failure_kind = alert.failure_kind.as_str(),
+                delivered,
+                "platform alert delivered"
+            ),
+            Self::LedgerMismatch(alert) => tracing::debug!(
+                account_id = %alert.account_id,
+                ledger_total_microusd = alert.ledger_total_microusd,
+                balance_microusd = alert.balance_microusd,
+                delivered,
+                "platform alert delivered"
+            ),
+        }
+    }
+
+    /// 送不出去的那条日志（字段同上）。
+    fn log_undelivered(&self, failed: u64, error: &ApplicationError) {
+        match self {
+            Self::Execution(alert) => tracing::warn!(
+                job_id = %alert.job_id,
+                provider_kind = alert.provider_kind.as_str(),
+                failure_kind = alert.failure_kind.as_str(),
+                failed,
+                error = %error,
+                "platform alert could not be delivered"
+            ),
+            Self::LedgerMismatch(alert) => tracing::warn!(
+                account_id = %alert.account_id,
+                ledger_total_microusd = alert.ledger_total_microusd,
+                balance_microusd = alert.balance_microusd,
+                failed,
+                error = %error,
+                "platform alert could not be delivered"
+            ),
         }
     }
 }
@@ -99,32 +188,14 @@ impl PlatformAlerter {
 
     /// 外发一条告警。**没有返回值**：发送失败在这里收口。
     pub async fn notify(&self, alert: PlatformAlert) {
-        let subject = (
-            alert.failure_kind.as_str(),
-            alert.provider_kind.as_str(),
-            alert.job_id,
-        );
         match self.sink.send(&alert).await {
             Ok(()) => {
                 let delivered = self.delivered.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::debug!(
-                    job_id = %subject.2,
-                    provider_kind = subject.1,
-                    failure_kind = subject.0,
-                    delivered,
-                    "platform alert delivered"
-                );
+                alert.log_delivered(delivered);
             }
             Err(error) => {
                 let failed = self.failed.fetch_add(1, Ordering::Relaxed) + 1;
-                tracing::warn!(
-                    job_id = %subject.2,
-                    provider_kind = subject.1,
-                    failure_kind = subject.0,
-                    failed,
-                    error = %error,
-                    "platform alert could not be delivered"
-                );
+                alert.log_undelivered(failed, &error);
             }
         }
     }

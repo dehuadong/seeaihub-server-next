@@ -33,7 +33,14 @@ use uuid::Uuid;
 
 mod alerts;
 pub use alerts::{
-    AlertCounters, AlertSink, PlatformAlert, PlatformAlertExit, PlatformAlerter, is_platform_event,
+    AlertCounters, AlertSink, ExecutionAlert, LedgerMismatchAlert, PlatformAlert,
+    PlatformAlertExit, PlatformAlerter, is_platform_event,
+};
+
+mod ledger_audit;
+pub use ledger_audit::{
+    LedgerAuditPolicy, LedgerAuditReport, LedgerAuditor, LedgerBalanceMismatch,
+    OpenLedgerCaseCommand,
 };
 
 /// 发布一个 Vendor Model 的供给。
@@ -1385,14 +1392,18 @@ pub struct NewFxRate {
 
 /// 一个待人工处置的对账案例。
 ///
+/// 两种来源共用一个案例：**某次执行**（`job_id` / `attempt_id` 有值——上游是否受理不确定，或结果
+/// 交付不了），与**某个账户的账实不符**（两个都为空、只有 `account_id`：被核对的是余额与它的
+/// 账本，不是某一次执行）。两种共用同一张表、同一套状态与同一个清单，不另立一套。
+///
 /// `provider_trace_id` 是**人工去上游核对的依据**（任务式上游的 task id；
 /// 逐请求式上游的响应头标识）。没有它，对账的人不知道该查哪个任务——
-/// 所以它必须出现在列表里，而不是只能去翻数据库。
+/// 所以它必须出现在列表里，而不是只能去翻数据库。账户级案例没有它：没有上游请求可查。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ReconciliationCaseView {
     pub id: Uuid,
-    pub job_id: JobId,
-    pub attempt_id: AttemptId,
+    pub job_id: Option<JobId>,
+    pub attempt_id: Option<AttemptId>,
     pub account_id: AccountId,
     pub reason: String,
     pub provider_trace_id: Option<String>,
@@ -1948,6 +1959,28 @@ pub trait HubRepository: Send + Sync {
         &self,
         command: RefundReconciliationCommand,
     ) -> Result<BalanceChange, ApplicationError>;
+
+    /// 余额与**它自己那本账**对不上的账户（只读）。
+    ///
+    /// 判据是库内两个事实的比对：`ledger.accounts.balance_microusd` 与该账户
+    /// `ledger.entries.amount_microusd` 的符号和。**这不是缓存对账**：两个数都取自数据库，
+    /// 缓存不参与；它也**不改任何账**——发现不符是这条查询的全部职责。
+    ///
+    /// 每一笔账都同时改这两边：充值写一条正数条目并加余额；预授权写一条负数条目并减余额；
+    /// 结算写"释放"（正）与"实收"（负）两条并加回差额；失败释放、对账退款同理。所以"两边相等"
+    /// 是一条不变量，对不上就意味着有人只改了一边——那正是要报出来的东西。
+    async fn accounts_with_ledger_mismatch(
+        &self,
+    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError>;
+
+    /// 给一个对不上的账户建一条对账案例。已经有未结案的那条时什么都不做，返回 `false`。
+    ///
+    /// 这条案例**没有 Job、也没有 Attempt**：被核对的是账户的余额与它的账本，不是某一次执行。
+    /// 状态沿用既有取值（`open` / `resolved`），不新造状态。
+    async fn open_ledger_reconciliation_case(
+        &self,
+        command: OpenLedgerCaseCommand,
+    ) -> Result<bool, ApplicationError>;
 }
 
 /// 平台侧失败清单不传类别时的默认集合：只列**平台侧事件**。

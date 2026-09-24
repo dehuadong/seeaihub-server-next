@@ -354,6 +354,21 @@ impl HubRepository for WorkerRepository {
     ) -> Result<BalanceChange, ApplicationError> {
         unused_repository()
     }
+
+    /// 账实核对不在 Worker 这条路径上：这里报到"用错了"，而不是编一个"没有不符"的答案——
+    /// 编出来的空集合会让一个真的对不上的账户在测试里看起来是好的。
+    async fn accounts_with_ledger_mismatch(
+        &self,
+    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn open_ledger_reconciliation_case(
+        &self,
+        _command: OpenLedgerCaseCommand,
+    ) -> Result<bool, ApplicationError> {
+        unused_repository()
+    }
 }
 
 /// 假仓库给出的余额变更：这组用例只验 Worker 的编排，加速层是关着的，数值没有意义。
@@ -1079,9 +1094,12 @@ async fn worker_alerts_the_platform_event_it_just_committed() {
     );
     let sent = sink.sent();
     assert_eq!(sent.len(), 1, "平台侧事件必须外发一条");
-    assert_eq!(sent[0].job_id, job_id);
-    assert_eq!(sent[0].provider_kind, provider_kind);
-    assert_eq!(sent[0].failure_kind, ProviderFailureKind::PlatformInternal);
+    let PlatformAlert::Execution(alert) = &sent[0] else {
+        panic!("Worker 外发的是执行告警");
+    };
+    assert_eq!(alert.job_id, job_id);
+    assert_eq!(alert.provider_kind, provider_kind);
+    assert_eq!(alert.failure_kind, ProviderFailureKind::PlatformInternal);
 }
 
 /// 送不出去也**不改**这条失败的处置：告警是旁路，它的失败只进日志与计数。

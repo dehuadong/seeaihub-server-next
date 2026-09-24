@@ -15,6 +15,7 @@ http.workspace = true
 seeai-adapter-aihubmix = { path = "../../crates/adapter-aihubmix" }
 seeai-adapter-apimart = { path = "../../crates/adapter-apimart" }
 seeai-adapter-sdk = { path = "../../crates/adapter-sdk" }
+seeai-alert-webhook = { path = "../../crates/alert-webhook" }
 seeai-application = { path = "../../crates/application" }
 seeai-cache-redis = { path = "../../crates/cache-redis" }
 seeai-domain = { path = "../../crates/domain" }

@@ -3,9 +3,9 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     AcceptanceProbe, ApplicationError, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
     GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LeaseRecovery, NewFxRate, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
-    RefundReconciliationCommand, RoutingDecision,
+    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -1803,7 +1803,7 @@ impl HubRepository for PgHubRepository {
 
         let expired_submissions = sqlx::query(
             r#"
-            SELECT j.id AS job_id, a.id AS attempt_id
+            SELECT j.id AS job_id, j.account_id, a.id AS attempt_id
             FROM generation.jobs j
             JOIN generation.attempts a ON a.job_id = j.id
             WHERE j.state = 'submitting' AND j.lease_expires_at <= now()
@@ -1816,6 +1816,7 @@ impl HubRepository for PgHubRepository {
 
         for row in &expired_submissions {
             let job_id: Uuid = row.try_get("job_id").map_err(database_error)?;
+            let account_id: Uuid = row.try_get("account_id").map_err(database_error)?;
             let attempt_id: Uuid = row.try_get("attempt_id").map_err(database_error)?;
             sqlx::query(
                 r#"
@@ -1850,14 +1851,15 @@ impl HubRepository for PgHubRepository {
             sqlx::query(
                 r#"
                 INSERT INTO operations.reconciliation_cases
-                    (id, job_id, attempt_id, reason)
-                VALUES ($1,$2,$3,'worker lease expired after provider submission began')
+                    (id, job_id, attempt_id, account_id, reason)
+                VALUES ($1,$2,$3,$4,'worker lease expired after provider submission began')
                 ON CONFLICT (job_id) DO NOTHING
                 "#,
             )
             .bind(Uuid::new_v4())
             .bind(job_id)
             .bind(attempt_id)
+            .bind(account_id)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -2181,14 +2183,17 @@ impl HubRepository for PgHubRepository {
             sqlx::query(
                 r#"
                 INSERT INTO operations.reconciliation_cases
-                    (id, job_id, attempt_id, reason)
-                VALUES ($1,$2,$3,$4)
+                    (id, job_id, attempt_id, account_id, reason)
+                VALUES ($1,$2,$3,$4,$5)
                 ON CONFLICT (job_id) DO NOTHING
                 "#,
             )
             .bind(Uuid::new_v4())
             .bind(job_id.0)
             .bind(attempt_id.0)
+            // 案例说到底问的是"哪个账户的钱出了问题"：执行类的案例也把账户写上，运营看清单时
+            // 不必再回 Job 表捞一次。
+            .bind(account_id.0)
             .bind(&failure.message)
             .execute(&mut *transaction)
             .await
@@ -2296,12 +2301,14 @@ impl HubRepository for PgHubRepository {
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
+        // LEFT JOIN 而不是 INNER：账户级的账实案例没有 Job（也就没有 Attempt），用 INNER 会让它
+        // 从这个清单里消失——而那正是最需要人看见的一类。账户取案例自己那一列：两种来源的案例都
+        // 写了它（执行类案例建案时由它那个 Job 给出）。
         let rows = sqlx::query(
             r#"
-            SELECT rc.id, rc.job_id, rc.attempt_id, j.account_id, rc.reason, rc.created_at,
+            SELECT rc.id, rc.job_id, rc.attempt_id, rc.account_id, rc.reason, rc.created_at,
                    a.provider_trace_id
             FROM operations.reconciliation_cases rc
-            JOIN generation.jobs j ON j.id = rc.job_id
             LEFT JOIN generation.attempts a ON a.id = rc.attempt_id
             WHERE rc.status = 'open'
             ORDER BY rc.created_at
@@ -2314,8 +2321,14 @@ impl HubRepository for PgHubRepository {
             .map(|row| {
                 Ok(ReconciliationCaseView {
                     id: row.try_get("id").map_err(database_error)?,
-                    job_id: JobId(row.try_get("job_id").map_err(database_error)?),
-                    attempt_id: AttemptId(row.try_get("attempt_id").map_err(database_error)?),
+                    job_id: row
+                        .try_get::<Option<Uuid>, _>("job_id")
+                        .map_err(database_error)?
+                        .map(JobId),
+                    attempt_id: row
+                        .try_get::<Option<Uuid>, _>("attempt_id")
+                        .map_err(database_error)?
+                        .map(AttemptId),
                     account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
                     reason: row.try_get("reason").map_err(database_error)?,
                     provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
@@ -2323,6 +2336,73 @@ impl HubRepository for PgHubRepository {
                 })
             })
             .collect()
+    }
+
+    async fn accounts_with_ledger_mismatch(
+        &self,
+    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError> {
+        // 一次全表比对：账户行上的余额 vs 它自己账本条目的符号和。两个数都来自库，缓存不参与，
+        // 这条 SQL 也不写任何一行——"发现"是它的全部职责（改账是人的决定）。
+        //
+        // `HAVING` 里重算一次和而不是引用别名：余额与账本两边都取自 GROUP BY 的同一批行，
+        // 这样写不依赖任何 SELECT 别名的解析顺序。`COALESCE` 让"一条条目都没有"的账户按 0 比，
+        // 于是"余额非 0 却没有任何条目"这种形态也报得出来。
+        let rows = sqlx::query(
+            r#"
+            SELECT a.id AS account_id,
+                   a.balance_microusd,
+                   COALESCE(sum(e.amount_microusd), 0)::bigint AS ledger_total_microusd
+            FROM ledger.accounts a
+            LEFT JOIN ledger.entries e ON e.account_id = a.id
+            GROUP BY a.id, a.balance_microusd
+            HAVING a.balance_microusd <> COALESCE(sum(e.amount_microusd), 0)
+            ORDER BY a.id
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                Ok(LedgerBalanceMismatch {
+                    account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+                    ledger_total_microusd: row
+                        .try_get("ledger_total_microusd")
+                        .map_err(database_error)?,
+                    balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn open_ledger_reconciliation_case(
+        &self,
+        command: OpenLedgerCaseCommand,
+    ) -> Result<bool, ApplicationError> {
+        // `ON CONFLICT DO NOTHING` 落在那条"一个账户同时只留一条未结案账实案例"的部分唯一索引
+        // 上：核对是周期跑的，没有它每跑一轮就多一条同样的案例。插入被挡下时返回 `false`，
+        // 调用方据此**不重复外发告警**（见 `LedgerAuditor::audit_once`）。
+        //
+        // 这条案例**不写** `job_id` / `attempt_id`（两列留空）：它指向的是一条账户的余额与账本，
+        // 不是某一次执行。
+        let reason = format!(
+            "ledger entries total {} microusd does not match the account balance {} microusd",
+            command.ledger_total_microusd, command.balance_microusd
+        );
+        let inserted = sqlx::query(
+            r#"
+            INSERT INTO operations.reconciliation_cases (id, account_id, reason)
+            VALUES ($1, $2, $3)
+            ON CONFLICT DO NOTHING
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(command.account_id.0)
+        .bind(&reason)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(inserted.rows_affected() == 1)
     }
 
     async fn provider_failures(

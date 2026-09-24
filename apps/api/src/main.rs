@@ -10,13 +10,15 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
+use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
     CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
     GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
-    LedgerEntryView, MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RoutePolicyService, RuntimeService,
+    LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT, NewFxRate,
+    PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
+    RefundReconciliationCommand, RoutePolicyService, RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -93,6 +95,28 @@ async fn main() -> Result<()> {
         tracing::warn!(
             "no cache service configured; the per-API-key rate limit does not apply in this process"
         );
+    }
+    // 账实核对：比对**账本汇总**与**账户余额**。它**不是**上面那个缓存对账——那个问的是"缓存里的
+    // 值还是不是库里的值"，做法是以库为准覆盖缓存，改的是缓存；这条问的是"库里那个余额还是不是
+    // 它自己那本账的和"，两边都是库里的**事实**。它只发现、不改账：不一致就告警并建一条对账案例，
+    // 改账是人的决定。读的是账本，与有没有缓存无关，所以两个进程状态都挂。
+    if let Some(policy) = LedgerAuditPolicy::from_env()? {
+        info!(
+            interval_ms = policy.interval.as_millis(),
+            "the ledger audit is enabled"
+        );
+        let auditor = LedgerAuditor::new(repository_port.clone(), policy);
+        // 告警出口与 Worker 共用同一组配置项与同一个实现：没配 `PROVIDER_ALERT_WEBHOOK` 就没有
+        // 出口，那时核对照样发现、照样建案，只是一条都不外发。地址写错在构造时就失败，不让进程
+        // 带着一个"永远发不出去"的出口跑起来。
+        let auditor = match WebhookAlertSink::from_env()? {
+            Some(sink) => {
+                info!("the platform alert webhook is configured for the ledger audit");
+                auditor.with_alerts(Arc::new(PlatformAlerter::new(Arc::new(sink))))
+            }
+            None => auditor,
+        };
+        tokio::spawn(Arc::new(auditor).run());
     }
     let state = AppState {
         admin_token,

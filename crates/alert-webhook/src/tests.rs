@@ -1,6 +1,6 @@
 use super::*;
 use chrono::Utc;
-use seeai_application::ProviderFailureKind;
+use seeai_application::{ExecutionAlert, ProviderFailureKind};
 use seeai_domain::JobId;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
@@ -97,12 +97,12 @@ async fn serve(
 }
 
 fn alert() -> PlatformAlert {
-    PlatformAlert {
+    PlatformAlert::Execution(ExecutionAlert {
         job_id: JobId::new(),
         provider_kind: "APIMart".to_owned(),
         failure_kind: ProviderFailureKind::PlatformFunding,
         occurred_at: Utc::now(),
-    }
+    })
 }
 
 /// 线上发的就是那条告警：POST 一个 JSON 对象，键与值都能逐字对上。
@@ -112,6 +112,9 @@ async fn an_alert_is_posted_as_json() {
     let sink = WebhookAlertSink::new(&receiver.url, Duration::from_secs(5), 0)
         .expect("the receiver address is usable");
     let sent = alert();
+    let PlatformAlert::Execution(execution) = &sent else {
+        panic!("这条夹具是执行告警");
+    };
 
     sink.send(&sent)
         .await
@@ -123,10 +126,10 @@ async fn an_alert_is_posted_as_json() {
     assert_eq!(
         payload,
         serde_json::json!({
-            "job_id": sent.job_id.0.to_string(),
+            "job_id": execution.job_id.0.to_string(),
             "provider_kind": "APIMart",
             "failure_kind": "platform_funding",
-            "occurred_at": sent.occurred_at,
+            "occurred_at": execution.occurred_at,
         }),
         "线上必须只有这四个字段，且取值与那条告警一模一样"
     );

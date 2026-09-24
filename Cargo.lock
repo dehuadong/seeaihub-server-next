@@ -2039,6 +2039,7 @@ dependencies = [
  "seeai-adapter-aihubmix",
  "seeai-adapter-apimart",
  "seeai-adapter-sdk",
+ "seeai-alert-webhook",
  "seeai-application",
  "seeai-cache-redis",
  "seeai-domain",

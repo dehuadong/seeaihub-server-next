@@ -6,7 +6,8 @@
 //! 超时与重试都**有界**、都是配置项（`PROVIDER_ALERT_TIMEOUT_MS` / `PROVIDER_ALERT_RETRIES`）：
 //! 告警是旁路，不能因为对端不响应把发它的那一轮拖住。重试之间是固定的小退避，不做指数增长。
 //!
-//! 请求体就是 [`PlatformAlert`] 的四个字段——不带凭证，也不带提示词与图片。
+//! 请求体就是 [`PlatformAlert`] 的那几个**定位字段**（一次执行上的失败四个、一次账实不符四个）
+//! ——不带凭证，也不带提示词与图片。
 
 use async_trait::async_trait;
 use reqwest::Client;
