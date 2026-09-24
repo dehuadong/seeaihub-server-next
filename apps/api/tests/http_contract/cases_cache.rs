@@ -76,6 +76,111 @@ async fn the_admin_reads_a_balance_from_the_database_not_the_cache() {
     harness.cleanup().await;
 }
 
+/// **流水与对客账户面读的也是数据库那一行，不是缓存**。
+///
+/// 与管理员读余额同一条口径、同一个理由：缓存里的值可能滞后、也可能刚被对账覆盖写回，而这两条
+/// 读的用途正是让人查看与核对"这笔钱到底扣没扣"。所以先把缓存改成一个错的数，两个接口读回来的
+/// 仍必须都是库里的值。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_ledger_view_and_the_consumer_account_read_the_database_not_the_cache() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        // 余额缓存与 route 缓存都调得很长：真走缓存的话，下面读到的就会是那个错数。
+        CacheFixture::start(CacheSettings {
+            route_ttl_seconds: 600,
+            balance_ttl_seconds: 600,
+            ..CacheSettings::default()
+        })
+        .await,
+    )
+    .await;
+    let client = Client::new();
+    // 夹具账户已经有余额，照着它发一把对客 Key。
+    let api_key = issue_key(
+        &client,
+        &harness.base_url,
+        &harness.admin_token,
+        &harness.account_id,
+    )
+    .await;
+    let account_id = harness.account_id.clone();
+
+    // 先把缓存改成一个错数。
+    let fresh = harness
+        .cache()
+        .balance(&account_id)
+        .expect("建账户之后缓存里应有余额");
+    let written_at = fresh["written_at"].clone();
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 7, "db_commit", written_at);
+
+    let db_balance = database_balance(&harness, &account_id).await;
+    assert_ne!(db_balance, 7, "库里的值与缓存里的错数要分得开，才试得出来");
+
+    let entries: Value = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("ledger entries")
+        .json()
+        .await
+        .expect("ledger entries JSON");
+    assert_eq!(
+        entries["count"].as_u64(),
+        Some(1),
+        "账户只有充值那一条：{entries}"
+    );
+    assert_eq!(
+        entries["entries"][0]["kind"].as_str(),
+        Some("credit"),
+        "流水里看到的是账本上真实的那一条：{entries}"
+    );
+    let credited = entries["entries"][0]["amount_microusd"]
+        .as_i64()
+        .expect("credit amount");
+    assert_eq!(
+        credited, db_balance,
+        "账本上的充值额就是库里的余额：{entries}"
+    );
+
+    let own: Value = client
+        .get(format!("{}/v1/account", harness.base_url))
+        .bearer_auth(&api_key)
+        .send()
+        .await
+        .expect("consumer account")
+        .json()
+        .await
+        .expect("consumer account JSON");
+    assert_eq!(
+        own["balance_microusd"].as_i64(),
+        Some(db_balance),
+        "对客面读的是库里的 {db_balance}，不是缓存里那个错的 7：{own}"
+    );
+    assert_eq!(
+        own["held_microusd"].as_i64(),
+        Some(0),
+        "没有任何持有中的预授权：{own}"
+    );
+    assert_eq!(
+        harness.cache().balance(&account_id).expect("cache entry")["balance_microusd"],
+        json!(7),
+        "缓存里那个错数还在：这两个接口没有去动它（读不写回）"
+    );
+
+    harness.cleanup().await;
+}
+
 /// **写穿**：充值、受理预授权扣减、结算三条路径都在数据库提交之后把余额写进缓存。
 ///
 /// 一次用例把三条路径都走一遍：充值后缓存立刻是充值后的值；不跑 Worker 发一次请求（同步入口

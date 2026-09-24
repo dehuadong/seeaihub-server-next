@@ -745,3 +745,20 @@ fn hold_sources_and_cost_bases_round_trip_through_their_stored_form() {
     }
     assert_eq!(CostBasis::parse("unavailable"), None);
 }
+
+/// 分录类别与存储取值一一对应：库里的 `CHECK` 认的那五个（含入账）都必须读得回来。
+///
+/// 漏掉一个的代价是把一整个账户的流水读成错误——管理员查账时看到的是 500，而不是"少了一条"。
+#[test]
+fn ledger_entry_kinds_round_trip_through_their_stored_form() {
+    for kind in [
+        LedgerEntryKind::Credit,
+        LedgerEntryKind::Hold,
+        LedgerEntryKind::Capture,
+        LedgerEntryKind::Release,
+        LedgerEntryKind::Adjustment,
+    ] {
+        assert_eq!(LedgerEntryKind::parse(kind.as_str()), Some(kind));
+    }
+    assert_eq!(LedgerEntryKind::parse("refund"), None);
+}

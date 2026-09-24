@@ -14,9 +14,9 @@ use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
     CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
     GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
-    MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
-    RefundReconciliationCommand, RoutePolicyService, RuntimeService,
+    LedgerEntryView, MAX_OPERATIONAL_LIMIT, NewFxRate, PricingService, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
+    ReconciliationService, RefundReconciliationCommand, RoutePolicyService, RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -121,6 +121,10 @@ async fn main() -> Result<()> {
         .route("/health", get(health))
         .route("/api/v1/accounts", post(create_account))
         .route("/api/v1/accounts/{account_id}", get(read_account_balance))
+        .route(
+            "/api/v1/accounts/{account_id}/entries",
+            get(list_account_entries),
+        )
         .route("/api/v1/accounts/{account_id}/tag", put(set_account_tag))
         .route(
             "/api/v1/accounts/{account_id}/credits",
@@ -159,6 +163,7 @@ async fn main() -> Result<()> {
         .route("/api/v1/provider-cost-gaps", get(list_provider_cost_gaps))
         .route("/v1/images/generations", post(generate_image))
         .route("/v1/images/edits", post(edit_image))
+        .route("/v1/account", get(read_own_account))
         .route("/v1/models", get(list_models))
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(tower_http::request_id::SetRequestIdLayer::new(
@@ -288,6 +293,88 @@ async fn read_account_balance(
     let change = state.accounts.read_balance(AccountId(account_id)).await?;
     Ok(Json(AccountBalanceResponse {
         balance_microusd: change.balance_microusd,
+        updated_at: change.updated_at,
+    }))
+}
+
+/// 管理员看账目流水的查询参数：`since` 是 RFC3339 的增量起点（开区间），`limit` 是条数上限。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountEntriesQuery {
+    since: Option<DateTime<Utc>>,
+    limit: Option<u32>,
+}
+
+const DEFAULT_ENTRIES_LIMIT: u32 = 100;
+
+/// 流水响应：`count` 与 `truncated` 一起给，是因为这条读按**时间倒序**取。
+///
+/// 倒序 + 截断时被截掉的是**更旧**的那一段，调用方要接着往下翻；`truncated` 就是那个信号
+/// ——判别据是 `limit` 满了。要刷新的人则应该用**最新一条**的 `created_at` 作下次的 `since`，
+/// 不去碰旧的尾巴。
+#[derive(Debug, Serialize)]
+struct AccountEntriesResponse {
+    entries: Vec<LedgerEntryView>,
+    count: usize,
+    truncated: bool,
+}
+
+/// 管理员看某个账户的**账目流水**（时间倒序，`since` 增量拉、`limit` 分页）。
+///
+/// 读的是 `ledger.entries`，**不读缓存**：这条读的用途是运营查看与核对，缓存里的值可能滞后、
+/// 也可能刚被对账覆盖写回，拿它当答案就把"账实不符"读成了"账实相符"。它**只读**——不改状态，
+/// 也不写审计（读不是变更）。账户不存在是 404：与"这个账户还没有任何流水"（空数组）分开。
+async fn list_account_entries(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    headers: HeaderMap,
+    Query(query): Query<AccountEntriesQuery>,
+) -> Result<Json<AccountEntriesResponse>, ApiError> {
+    require_admin(&state, &headers)?;
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_ENTRIES_LIMIT)
+        .clamp(1, MAX_OPERATIONAL_LIMIT);
+    let entries = state
+        .accounts
+        .read_entries(AccountId(account_id), query.since, limit)
+        .await?
+        .into_iter()
+        .map(LedgerEntryView::from)
+        .collect::<Vec<_>>();
+    Ok(Json(AccountEntriesResponse {
+        count: entries.len(),
+        truncated: entries.len() as u32 == limit,
+        entries,
+    }))
+}
+
+/// 对客的账户面：**自己的**余额与持有中。
+///
+/// 两者**分开给、不合成一个数**：余额是可用额，持有中是已预授权但还没结算的部分——预授权不是
+/// 扣款，它只是先把钱占住。合成一个"总资产"会让"这笔钱到底扣没扣"说不清，而这两个数的用途
+/// 正是让人看清这件事。
+///
+/// 两个数都以**数据库**为准、不读缓存：缓存里的值可能滞后、也可能刚被对账覆盖写回，而这条读
+/// 的用途正是查看与核对，拿被怀疑的一方作证没有意义。认证沿用对客那条路径（消费者自己的 API
+/// Key），所以看到的只可能是自己的账户。
+#[derive(Debug, Serialize)]
+struct OwnAccountResponse {
+    balance_microusd: i64,
+    held_microusd: i64,
+    updated_at: DateTime<Utc>,
+}
+
+async fn read_own_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<OwnAccountResponse>, ApiError> {
+    let account_id = authenticate(&state, &headers).await?;
+    let change = state.accounts.read_balance(account_id).await?;
+    let held_microusd = state.accounts.read_held(account_id).await?;
+    Ok(Json(OwnAccountResponse {
+        balance_microusd: change.balance_microusd,
+        held_microusd,
         updated_at: change.updated_at,
     }))
 }

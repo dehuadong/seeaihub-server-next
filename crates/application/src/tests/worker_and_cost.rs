@@ -123,6 +123,19 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn read_ledger_entries(
+        &self,
+        _account_id: AccountId,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+        _limit: u32,
+    ) -> Result<Vec<LedgerEntry>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn held_microusd(&self, _account_id: AccountId) -> Result<i64, ApplicationError> {
+        unused_repository()
+    }
+
     async fn probe(&self) -> Result<(), ApplicationError> {
         unused_repository()
     }

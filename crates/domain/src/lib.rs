@@ -232,6 +232,70 @@ pub struct ProviderCostFact {
     pub cny_microusd: Option<u64>,
 }
 
+/// 一条账目分录的类别。
+///
+/// 五种类别的**符号语义**在金额上：持有与扣费是**负数**（钱被占住或真的扣掉），入账、释放与
+/// 调整为**正数**。正负号因此是答案的一部分，读账目的人不能只看绝对值。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum LedgerEntryKind {
+    /// 入账：建账户时的初始额度与之后的充值。它**不是**对某次执行的收费。
+    Credit,
+    /// 持有：受理时按保底额占住的预授权。**不是扣款**，钱还在账上只是不可用。
+    Hold,
+    /// 扣费：结算时的实收，金额为负。
+    Capture,
+    /// 释放：把占住的钱退回来（结算的差额、失败或对账退款），金额为正。
+    Release,
+    /// 调整：运营或对账对账目的改正。
+    Adjustment,
+}
+
+impl LedgerEntryKind {
+    /// 落库取值，也是管理员面看到的 `kind`。
+    ///
+    /// 它与库里的 `CHECK` 约束、以及落库那几处字面量是同一份取值：改这里就是改存储取值。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Credit => "credit",
+            Self::Hold => "hold",
+            Self::Capture => "capture",
+            Self::Release => "release",
+            Self::Adjustment => "adjustment",
+        }
+    }
+
+    /// 认不出的取值返回 `None`：账本里出现本版本不认识的类别时，调用方要能按"读不出来"处理，
+    /// 而不是猜一个方向（猜错的表现是把一笔占位读成扣款）。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "credit" => Some(Self::Credit),
+            "hold" => Some(Self::Hold),
+            "capture" => Some(Self::Capture),
+            "release" => Some(Self::Release),
+            "adjustment" => Some(Self::Adjustment),
+            _ => None,
+        }
+    }
+}
+
+/// 账本上的一条分录（管理员流水的读模型）。
+///
+/// 它是账本行的**只读投影**：金额与余额的权威都是账本本身，流水不改写它们。
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct LedgerEntry {
+    pub account_id: AccountId,
+    pub kind: LedgerEntryKind,
+    /// 分录金额（人民币微单位）：持有与扣费为负、释放与调整为正。
+    pub amount_microusd: i64,
+    /// 归属的执行记录；建账户与充值这类不挂在执行上的分录没有它。
+    pub job_id: Option<JobId>,
+    /// 数据库盖章的写入时刻。**同一个事务里写的多条共用它**（`now()` 是事务时间），所以它
+    /// 只用来分段，不用来定序同一笔事务内部的先后。
+    pub created_at: DateTime<Utc>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct PriceRates {
     pub currency: String,

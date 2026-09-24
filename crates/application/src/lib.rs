@@ -8,8 +8,8 @@ pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ChargeFacts, ConsumerRatesCny, CostBasis,
     CreateImageGeneration, FloorTable, FxRate, GenerationJob, HoldSource, ImageBranch,
-    ImageParameterKind, JobId, JobState, MeteringEvidence, OfferingCandidate, OfferingId,
-    ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
+    ImageParameterKind, JobId, JobState, LedgerEntry, MeteringEvidence, OfferingCandidate,
+    OfferingId, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
     ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
     RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps, apply_parameter_defaults,
     apply_parameter_renames, apply_size_mapping, carries_parameter, contract_image_parameter_kind,
@@ -1393,6 +1393,33 @@ pub struct ReconciliationCaseView {
     pub created_at: DateTime<Utc>,
 }
 
+/// 流水里的一条账目（管理员的读模型）：条目身份、类别、金额，以及归属的执行记录与写入时刻。
+///
+/// `kind` 用字符串落在这个视图上（`credit` / `hold` / `capture` / `release` / `adjustment`）：
+/// 它是**管理端取值契约**，与账本里的存储取值同名——改枚举名即改接口。金额带上正负号，符号是
+/// 语义的一部分。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct LedgerEntryView {
+    pub account_id: AccountId,
+    pub kind: String,
+    /// 人民币微单位；持有与扣费为负、释放与调整为正。
+    pub amount_microusd: i64,
+    pub job_id: Option<JobId>,
+    pub created_at: DateTime<Utc>,
+}
+
+impl From<LedgerEntry> for LedgerEntryView {
+    fn from(entry: LedgerEntry) -> Self {
+        Self {
+            account_id: entry.account_id,
+            kind: entry.kind.as_str().to_owned(),
+            amount_microusd: entry.amount_microusd,
+            job_id: entry.job_id,
+            created_at: entry.created_at,
+        }
+    }
+}
+
 /// 一条平台侧失败记录：运营用它发现平台在渠道侧欠费、凭证/配置问题，以及平台自己的 bug。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ProviderFailureView {
@@ -1728,6 +1755,27 @@ pub trait HubRepository: Send + Sync {
         &self,
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError>;
+
+    /// 按账户读账本流水：**时间倒序**、只取 `since` 之后的、最多 `limit` 条。
+    ///
+    /// 权威是 `ledger.entries` 本身，这条读不改写任何东西、也不写审计。`since` 是**开区间**：
+    /// 上一次拉到的位置本身不该被重复计入增量。同一个事务里写的多条共用 `created_at`（`now()`
+    /// 是事务时间），所以分页**只保证时间倒序**，同一时刻内部的先后不承诺——调用方要按整段
+    /// 事务去理解它们。账户不存在时返回 [`ApplicationError::NotFound`]，让 404 与"没有流水"
+    /// 分得开。
+    async fn read_ledger_entries(
+        &self,
+        account_id: AccountId,
+        since: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<LedgerEntry>, ApplicationError>;
+
+    /// 该账户**当前持有中**的金额（人民币微单位）：`ledger.holds` 里还没结算的那些预授权之和。
+    ///
+    /// 权威在库；它与余额是**两个数**，不合成一个"总资产"——持有中是已预授权未结算的部分，
+    /// 也就是说这笔钱**还没真的扣**（预授权不是扣款），合成一个总数会让"这笔钱到底扣没扣"
+    /// 说不清。账户不存在时返回 [`ApplicationError::NotFound`]。
+    async fn held_microusd(&self, account_id: AccountId) -> Result<i64, ApplicationError>;
 
     /// 探一次**事实源**是否可达：只做一次 `SELECT 1`，不读任何业务表。
     ///
@@ -2208,6 +2256,33 @@ impl AccountsService {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError> {
         self.repository.read_account_balance(account_id).await
+    }
+
+    /// 读账户**账目流水**（权威在账本；管理员面与对客面共用这条读）。
+    ///
+    /// 与 [`Self::read_balance`] 同一条口径：走仓库、不读缓存——流水的用途也是查看与核对。
+    /// 它**只读**：不改状态，也不写审计。
+    pub async fn read_entries(
+        &self,
+        account_id: AccountId,
+        since: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<LedgerEntry>, ApplicationError> {
+        self.repository
+            .read_ledger_entries(account_id, since, limit)
+            .await
+    }
+
+    /// 读账户**持有中**的金额（权威在库）。
+    ///
+    /// 它与余额是**两个数**，调用方不合并：
+    ///
+    /// * 余额是**可用额**——已经真的从账上扣掉的部分；
+    /// * 持有中是**已预授权、还没结算**的部分——这笔钱**还没有被扣**，预授权只是先把钱占住。
+    ///
+    /// 合成一个"总资产"会让"这笔钱到底扣没扣"说不清，而这两条读的用途正是让人看清这件事。
+    pub async fn read_held(&self, account_id: AccountId) -> Result<i64, ApplicationError> {
+        self.repository.held_microusd(account_id).await
     }
 
     /// 设账户标签（管理员面）：只有生效的 `user_tag` 策略消费它，没有那种策略时它不改变任何

@@ -9,9 +9,10 @@ use seeai_application::{
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
-    GenerationJob, HitCandidate, ImageBranch, JobId, OfferingCandidate, OfferingId, PricePlanId,
-    PriceRates, PriceSnapshot, PricingFormula, PublishedModel, PublishedOffering,
-    PublishedRevision, RoutePolicy, RouteStrategy, RuntimeRevisionId, VendorModelId,
+    GenerationJob, HitCandidate, ImageBranch, JobId, LedgerEntry, LedgerEntryKind,
+    OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PricingFormula,
+    PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy, RouteStrategy,
+    RuntimeRevisionId, VendorModelId,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -82,6 +83,18 @@ impl PgHubRepository {
                 .map_err(database_error)?
                 .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
         balance_change(&row, account_id)
+    }
+
+    /// 一次索引探测：账户这一行在不在。
+    ///
+    /// 读流水与读持有额都要先把"账户不存在"与"这个账户什么都没有"分开——前者是 404，后者是
+    /// 空结果。判据只能是 `ledger.accounts`：账户事实只有这一处。
+    async fn account_exists(&self, account_id: AccountId) -> Result<bool, ApplicationError> {
+        sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM ledger.accounts WHERE id = $1)")
+            .bind(account_id.0)
+            .fetch_one(&self.pool)
+            .await
+            .map_err(database_error)
     }
 
     async fn load_generation_job(&self, job_id: JobId) -> Result<GenerationJob, ApplicationError> {
@@ -999,6 +1012,62 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError> {
         self.account_balance(account_id).await
+    }
+
+    /// 按账户读账本流水：时间**倒序**、`since` 开区间、`limit` 截断。
+    ///
+    /// 先判账户在不在，再取分录：一条不存在的账户与"这个账户还没有任何流水"必须分得开，否则
+    /// 管理员面会把 404 说成"没有账目"。判据是 `ledger.accounts` 那一行——账本的账户事实只有
+    /// 这一处。排序带 `id` 作次级键：`ORDER BY` 不完全定序时分页会漏条或重条，同一事务里写的
+    /// 多条尤其会并列（`created_at` 取的是事务时间）。
+    async fn read_ledger_entries(
+        &self,
+        account_id: AccountId,
+        since: Option<DateTime<Utc>>,
+        limit: u32,
+    ) -> Result<Vec<LedgerEntry>, ApplicationError> {
+        if !self.account_exists(account_id).await? {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        let rows = sqlx::query(
+            r#"
+            SELECT account_id, job_id, kind, amount_microusd, created_at
+            FROM ledger.entries
+            WHERE account_id = $1
+              AND ($2::timestamptz IS NULL OR created_at > $2)
+            ORDER BY created_at DESC, id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(since)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(ledger_entry_from_row).collect()
+    }
+
+    /// 该账户当前持有中的金额：`ledger.holds` 里还没结算的预授权之和。
+    ///
+    /// `COALESCE` 让"没有任何持有"读成 0，而不是"读不出来"：持有额是**合计**，空集合的合计就是
+    /// 0。账户不存在仍然是 404——先判那一行在不在。
+    async fn held_microusd(&self, account_id: AccountId) -> Result<i64, ApplicationError> {
+        if !self.account_exists(account_id).await? {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        let held: i64 = sqlx::query_scalar(
+            r#"
+            SELECT COALESCE(sum(amount_microusd), 0)::bigint
+            FROM ledger.holds
+            WHERE account_id = $1 AND status = 'active'
+            "#,
+        )
+        .bind(account_id.0)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(held)
     }
 
     /// 只探连接能不能用：`SELECT 1`，不碰任何业务表。
@@ -2479,6 +2548,29 @@ fn balance_change_with_account(
     row: &sqlx::postgres::PgRow,
 ) -> Result<BalanceChange, ApplicationError> {
     balance_change(row, AccountId(row.try_get("id").map_err(database_error)?))
+}
+
+/// 从一行分录还原一条流水。
+///
+/// 类别是受控取值（库里有 `CHECK`）：解析不到说明存储被绕过，按错误处理而不是猜一个方向——
+/// 猜错的表现是把一笔占位读成扣款，而读流水的人正是拿它核对的。
+fn ledger_entry_from_row(row: &sqlx::postgres::PgRow) -> Result<LedgerEntry, ApplicationError> {
+    let stored_kind: String = row.try_get("kind").map_err(database_error)?;
+    let kind = LedgerEntryKind::parse(&stored_kind).ok_or_else(|| {
+        ApplicationError::Persistence(format!(
+            "unknown ledger entry kind in storage: {stored_kind}"
+        ))
+    })?;
+    Ok(LedgerEntry {
+        account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+        kind,
+        amount_microusd: row.try_get("amount_microusd").map_err(database_error)?,
+        job_id: row
+            .try_get::<Option<Uuid>, _>("job_id")
+            .map_err(database_error)?
+            .map(JobId),
+        created_at: row.try_get("created_at").map_err(database_error)?,
+    })
 }
 
 /// 从一行策略还原。

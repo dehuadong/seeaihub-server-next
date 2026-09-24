@@ -458,3 +458,493 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
         harness.cleanup().await;
     }
 }
+
+/// 把响应里的 `created_at`（`…+00:00`）改成能进查询串的等价写法（`…Z`）。
+///
+/// `+` 在查询串里会被读成空格，所以响应的原样值不能直接当查询参数；`Z` 与 `+00:00` 是同一个
+/// 时刻，字符也全在安全集里。除了时区写法什么都不动：微秒必须留着，否则分界会落到那条分录之前。
+fn wire_time(created_at: &str) -> String {
+    let converted = created_at.replace("+00:00", "Z");
+    assert!(
+        !converted.contains('+'),
+        "写入时刻的时区写法变了，`since` 需要跟着改：{created_at}"
+    );
+    converted
+}
+
+/// 一个**字面**的 `since` 偏移量：以某条分录自己的时刻为基准，往前或往后挪若干秒。
+///
+/// `since` 的契约是 RFC3339 的**时刻字面量**：SQL 表达式（`now() + interval …`）过不了反序列化，
+/// 所以要挪只能在这边算好再发过去。秒级偏移足够把分界放到两条分录之间——它们的间隔是分钟。
+fn offset_seconds(created_at: &str, seconds: i64) -> String {
+    let parsed =
+        chrono::DateTime::parse_from_rfc3339(&created_at.replace("+00:00", "Z")).expect("RFC3339");
+    let shifted = parsed + chrono::Duration::seconds(seconds);
+    format!(
+        "{:04}-{:02}-{:02}T{:02}:{:02}:{:02}Z",
+        chrono::Datelike::year(&shifted),
+        chrono::Datelike::month(&shifted),
+        chrono::Datelike::day(&shifted),
+        chrono::Timelike::hour(&shifted),
+        chrono::Timelike::minute(&shifted),
+        chrono::Timelike::second(&shifted),
+    )
+}
+
+/// 一次完整的"受理 → 结算"之后，账目流水上能看到 hold / release / capture 三条，且与余额一致。
+///
+/// 判据不只是"三条都在"：三条的**金额**必须与库里的余额、与这次结算实际扣的钱对得上，符号也要
+/// 对——持有与扣费是负的（占住 / 真的扣掉），释放是正的（把估高的那部分退回来）。对不上就说明
+/// 流水这条读视图漏了或错了一支分录，而流水正是拿来核对账目的东西。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_settled_job_leaves_hold_release_and_capture_in_the_ledger_view() {
+    let harness = Harness::start_with(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+
+    let key = format!("entries-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "a settled job leaves three entries");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    // Worker 必须**拿在手上**：`WorkerProcess` 一落到 `_` 就被 Drop 掉，Job 会停在"已受理"，
+    // 同步入口等到窗口尽头按失败回 504——那时根本没有结算，也就没有流水可看。
+    let _worker = harness.spawn_worker();
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(status, StatusCode::OK, "got {body}; state={state}");
+    assert_sync_success("受理到结算", &body);
+    assert_eq!(state, "succeeded", "结算完才能谈流水");
+    let captured = -harness.captured_microusd(job_id).await;
+    assert!(captured > 0, "结算必须真的扣了钱，实得 {captured}");
+
+    // 持有额取库里那一行：它是受理时的保底额，不是从流水反推出来的。
+    let held: i64 =
+        sqlx::query_scalar("SELECT amount_microusd FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("hold row");
+    let db_balance = database_balance(&harness, &account_id).await;
+
+    let listed: Value = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("ledger entries")
+        .json()
+        .await
+        .expect("ledger entries JSON");
+    let entries = listed["entries"].as_array().expect("entries array");
+    // 这次用例的账户只有建账户那一笔充值加上这次结算的三条：多出来的条目说明有别的路径在写账。
+    assert_eq!(entries.len(), 4, "这次结算只该留下三条分录：{listed}");
+
+    let find = |kind: &str| {
+        entries
+            .iter()
+            .find(|entry| entry["kind"].as_str() == Some(kind))
+            .unwrap_or_else(|| panic!("流水里必须看得到 {kind}：{listed}"))
+    };
+    let hold = find("hold");
+    let release = find("release");
+    let capture = find("capture");
+
+    assert_eq!(
+        hold["amount_microusd"].as_i64(),
+        Some(-held),
+        "持有是占住保底额，金额为负：{listed}"
+    );
+    assert_eq!(
+        release["amount_microusd"].as_i64(),
+        Some(held),
+        "释放把占住的整笔退回来，金额为正：{listed}"
+    );
+    assert_eq!(
+        capture["amount_microusd"].as_i64(),
+        Some(-captured),
+        "扣费是实收，金额为负：{listed}"
+    );
+    assert_eq!(
+        hold["job_id"].as_str(),
+        Some(job_id.to_string().as_str()),
+        "每一条都要指得出是哪次执行：{listed}"
+    );
+    assert!(capture["created_at"].is_string(), "每条都要带写入时刻");
+
+    // 三条与余额**互相印证**：受理时占住整笔保底额，结算时把整笔释放、再扣掉实收，所以这三条
+    // 加起来就是这次执行对余额的净影响（等于负的实收），而余额正好是初始额减去它。
+    assert_eq!(
+        hold["amount_microusd"].as_i64().unwrap_or_default()
+            + release["amount_microusd"].as_i64().unwrap_or_default()
+            + capture["amount_microusd"].as_i64().unwrap_or_default(),
+        -captured,
+        "持有 + 释放 + 扣费就是这次执行对余额的净影响：{listed}"
+    );
+    assert_eq!(
+        db_balance,
+        1_000_000 - captured,
+        "余额只被这次结算动过（充值的 1000000 加上这三条的净影响）"
+    );
+    assert!(
+        held > captured,
+        "保底额要估得比实收高，这条用例才试得出'先占住、结算时退回差额'：持有 {held}、实收 {captured}"
+    );
+
+    // 时间倒序：持有发生在受理那一刻，结算那两条同样板之间的先后不承诺（同一事务共用
+    // `now()`），所以这里只钉"更早的持有排在后面"。
+    let position = |kind: &str| {
+        entries
+            .iter()
+            .position(|entry| entry["kind"].as_str() == Some(kind))
+            .expect("kind")
+    };
+    assert!(
+        position("hold") > position("capture"),
+        "受理时的持有比结算那两条更早，所以排在它们后面：{listed}"
+    );
+    let times: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| entry["created_at"].as_str())
+        .collect();
+    assert_eq!(times.len(), entries.len(), "每条都要带写入时刻：{listed}");
+    let mut sorted = times.clone();
+    sorted.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(times, sorted, "流水必须按时间倒序：{listed}");
+
+    harness.cleanup().await;
+}
+
+/// 流水的分页与增量：`limit` 截断、`since` 只取之后的，两者都能用。
+///
+/// 用**直接写账本**的方式把四条分录在时间上分开放（各自相差十分钟）：这里要试的是**这条读**的
+/// 分页与增量语义，不走一次真实结算——受理与结算那条路上的分录共用同一个事务时间，反而试不出
+/// "时间上分得开"这件事。
+///
+/// 分界一律写成 `now() - interval '…'` 这类**相对**时刻（`%20` 是 URL 里的空格）而不是把分录自己的
+/// 时间戳原样回传：`since` 的契约是 RFC3339，而响应里的时间戳带微秒，任何转写都可能丢掉精度，
+/// 于是分界会悄悄落到分录之前、断言就测不到"开区间"那件事了。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
+    let harness = Harness::start_with(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let account_uuid = Uuid::parse_str(&account_id).expect("account id");
+
+    // 建账户那条 `credit` 落在 now()；下面三条依次往前挪 10 / 20 / 30 分钟。
+    for (minutes_ago, business_key) in [(10_i64, "newer"), (20, "middle"), (30, "older")] {
+        sqlx::query(
+            "INSERT INTO ledger.entries (id, account_id, kind, amount_microusd, business_key, created_at)
+             VALUES ($1, $2, 'adjustment', $3, $4, now() - make_interval(secs => $5 * 60.0))",
+        )
+        .bind(Uuid::new_v4())
+        .bind(account_uuid)
+        .bind(1_000_i64)
+        .bind(format!("paging-{business_key}-{}", Uuid::new_v4()))
+        .bind(minutes_ago as f64)
+        .execute(&harness.pool)
+        .await
+        .expect("seeded ledger entry");
+    }
+
+    let read = |query: String| {
+        let client = Client::new();
+        let base_url = harness.base_url.clone();
+        let admin_token = harness.admin_token.clone();
+        async move {
+            let response = client
+                .get(format!(
+                    "{base_url}/api/v1/accounts/{account_uuid}/entries{query}"
+                ))
+                .bearer_auth(&admin_token)
+                .send()
+                .await
+                .expect("ledger read");
+            let status = response.status();
+            let body: Value = response.json().await.expect("ledger JSON");
+            assert_eq!(status, StatusCode::OK, "query={query} body={body}");
+            body
+        }
+    };
+    let kinds = |body: &Value| -> Vec<String> {
+        body["entries"]
+            .as_array()
+            .expect("entries")
+            .iter()
+            .map(|entry| entry["kind"].as_str().expect("kind").to_owned())
+            .collect()
+    };
+
+    // 不截断时四条都在，且**时间倒序**。
+    let all = read(String::new()).await;
+    assert_eq!(all["count"].as_u64(), Some(4), "四条分录都该在：{all}");
+    assert_eq!(all["truncated"], json!(false), "没截断：{all}");
+    let all_entries = all["entries"].as_array().expect("entries").clone();
+    assert_eq!(
+        kinds(&all),
+        vec!["credit", "adjustment", "adjustment", "adjustment"],
+        "最新的排在最前（充值落在 now()，三条调整依次更早）：{all}"
+    );
+    let times: Vec<&str> = all_entries
+        .iter()
+        .map(|entry| entry["created_at"].as_str().expect("created_at"))
+        .collect();
+    let mut sorted = times.clone();
+    sorted.sort_unstable_by(|left, right| right.cmp(left));
+    assert_eq!(times, sorted, "时间倒序：{all}");
+
+    // `limit` 生效，截掉的是更旧的那一段，且如实说自己截断了。
+    let limited = read("?limit=2".to_owned()).await;
+    assert_eq!(limited["count"].as_u64(), Some(2), "limit=2：{limited}");
+    assert_eq!(limited["truncated"], json!(true), "limit=2：{limited}");
+    assert_eq!(
+        limited["entries"].as_array().expect("entries"),
+        &all_entries[..2],
+        "截断时留下的是最新的两条：{limited}"
+    );
+    assert_eq!(
+        kinds(&limited),
+        vec!["credit", "adjustment"],
+        "留下的确实是最新那两条：{limited}"
+    );
+
+    // `since` 只取之后的：分界落在最旧那条与它上一条**之间**（往最旧那条之后挪 5 秒），更旧的
+    // 那条调整不该出现。分界由响应里自己的时刻算出来，所以不受进程时钟与库钟差的影响。
+    let oldest = all_entries[3]["created_at"].as_str().expect("oldest time");
+    let between = read(format!("?since={}", offset_seconds(oldest, 5))).await;
+    assert_eq!(
+        kinds(&between),
+        vec!["credit", "adjustment", "adjustment"],
+        "分界之后只有更新的三条：{between}"
+    );
+
+    // `since` 是**开区间**：分界正好取在"最旧那只调整"自己的时刻上，它自己不该被算作"之后"。
+    // 分界逐微秒转写自那条分录——少写一位精度，分界就落到它之前，这一段就白测了。
+    let boundary = wire_time(oldest);
+    let after_oldest = read(format!("?since={boundary}")).await;
+    assert_eq!(
+        kinds(&after_oldest),
+        vec!["credit", "adjustment", "adjustment"],
+        "分界上那条自己不算之后：{after_oldest}"
+    );
+
+    // 反过来：分界取在**最新那条**自己的时刻上，就没有比它更新的东西了——开区间的另一个端点。
+    let newest = all_entries[0]["created_at"].as_str().expect("newest time");
+    let empty = read(format!("?since={}", wire_time(newest))).await;
+    assert!(
+        kinds(&empty).is_empty(),
+        "最新那条自己不算之后，所以一条都不剩：{empty}"
+    );
+    assert_eq!(empty["truncated"], json!(false), "空结果不算截断：{empty}");
+
+    // 分界取在**未来**：没有比它更新的东西，给空数组而不是报错。
+    let future = read("?since=2100-01-01T00:00:00Z".to_owned()).await;
+    assert_eq!(
+        &kinds(&future),
+        &Vec::<String>::new(),
+        "未来时刻之后什么都没有：{future}"
+    );
+    assert_eq!(
+        future["truncated"],
+        json!(false),
+        "空结果不算截断：{future}"
+    );
+
+    // 边界：没有管理员凭证 401；账户不存在 404（与"没有流水"分开）；消费者的 Key 不是管理员凭证。
+    let anonymous = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries",
+            harness.base_url
+        ))
+        .send()
+        .await
+        .expect("anonymous ledger read");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+
+    let unknown = client
+        .get(format!(
+            "{}/api/v1/accounts/{}/entries",
+            harness.base_url,
+            Uuid::new_v4()
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("unknown account ledger read");
+    assert_eq!(
+        unknown.status(),
+        StatusCode::NOT_FOUND,
+        "账户不存在与'没有流水'要分开"
+    );
+
+    let consumer = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries",
+            harness.base_url
+        ))
+        .bearer_auth(&api_key)
+        .send()
+        .await
+        .expect("consumer key on the admin ledger route");
+    assert_eq!(
+        consumer.status(),
+        StatusCode::FORBIDDEN,
+        "对客的 Key 不是管理员凭证"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 对客账户面：只给**自己的**余额与持有中，两者**分开给**，且与库里一致。
+///
+/// 换一把 Key 必须看不到别人的账户；余额与持有中不合成一个数——合成"总资产"会让"这笔钱到底
+/// 扣没扣"说不清。这里用一个**停在持有中**的 Job 把两个数拉开：余额已经少了保底额，持有中
+/// 正好是那个保底额，而它还没有被结算。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_consumer_account_view_shows_only_its_own_balance_and_hold() {
+    let harness = Harness::start_with(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    let other = funded_account(&client, &harness.base_url, &harness.admin_token, 500_000).await;
+    let (other_id, other_key) = other;
+    let own_id = harness.account_id.clone();
+    let own_key = harness.api_key.clone();
+
+    // 一次受理（不起 Worker）：预授权扣掉了余额，同时留下一条持有中的预授权。
+    let key = format!("statement-hold-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &own_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "a job left holding"),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker 时同步入口超时"
+    );
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "accepted", "受理完成、还没执行：{body}");
+    let held: i64 =
+        sqlx::query_scalar("SELECT amount_microusd FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("hold row");
+
+    let own: Value = client
+        .get(format!("{}/v1/account", harness.base_url))
+        .bearer_auth(&own_key)
+        .send()
+        .await
+        .expect("own account read")
+        .json()
+        .await
+        .expect("own account JSON");
+    assert_eq!(
+        own["balance_microusd"].as_i64(),
+        Some(database_balance(&harness, &own_id).await),
+        "余额与库一致：{own}"
+    );
+    assert_eq!(
+        own["held_microusd"].as_i64(),
+        Some(held),
+        "持有中是已预授权未结算的那一笔：{own}"
+    );
+    assert!(
+        own["balance_microusd"].as_i64().unwrap_or_default()
+            < database_balance(&harness, &own_id).await + held,
+        "持有中没有被算进余额：{own}"
+    );
+    assert!(
+        own["updated_at"].is_string(),
+        "一起给出写入时刻，才看得出这个数是什么时候的：{own}"
+    );
+    assert_public_only("对客账户面", &own);
+
+    // 另一把 Key：只看到它自己的账户，看不到上面那个持有。
+    let stranger: Value = client
+        .get(format!("{}/v1/account", harness.base_url))
+        .bearer_auth(&other_key)
+        .send()
+        .await
+        .expect("stranger account read")
+        .json()
+        .await
+        .expect("stranger account JSON");
+    assert_eq!(
+        stranger["balance_microusd"].as_i64(),
+        Some(database_balance(&harness, &other_id).await),
+        "看到的是自己的余额：{stranger}"
+    );
+    assert_eq!(
+        stranger["held_microusd"].as_i64(),
+        Some(0),
+        "别人的持有中不该露出来，自己也没有持有：{stranger}"
+    );
+    assert_ne!(
+        own["balance_microusd"], stranger["balance_microusd"],
+        "两个账户的余额不同，才说明这条读真的按调用者分账户"
+    );
+
+    // 没有凭证 401；无效凭证也 401（不是 403：调用方要换的是 Key）。
+    let anonymous = client
+        .get(format!("{}/v1/account", harness.base_url))
+        .send()
+        .await
+        .expect("anonymous account read");
+    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    let bogus = client
+        .get(format!("{}/v1/account", harness.base_url))
+        .bearer_auth("sk_seeai_not-a-real-key")
+        .send()
+        .await
+        .expect("bogus key read");
+    assert_eq!(bogus.status(), StatusCode::UNAUTHORIZED);
+
+    harness.cleanup().await;
+}
