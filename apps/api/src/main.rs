@@ -379,6 +379,11 @@ struct IssueApiKeyBody {
 #[derive(Debug, Serialize)]
 struct IssueApiKeyResponse {
     api_key: String,
+    /// 密钥标识，就是吊销那条路径上的 `{key_id}`。
+    ///
+    /// 明文只在这一次响应里出现，事后谁也拿不回来；只回明文的话，"要不要吊销这一把"就只能回库捞 id，
+    /// 而管理员没有库权限——所以标识必须和明文一起交到发密钥的人手里。
+    key_id: Uuid,
 }
 
 async fn issue_api_key(
@@ -388,11 +393,11 @@ async fn issue_api_key(
     Json(body): Json<IssueApiKeyBody>,
 ) -> Result<Json<IssueApiKeyResponse>, ApiError> {
     require_admin(&state, &headers)?;
-    let api_key = state
+    let (key_id, api_key) = state
         .identity
         .issue_api_key(AccountId(account_id), &body.label, "admin-api")
         .await?;
-    Ok(Json(IssueApiKeyResponse { api_key }))
+    Ok(Json(IssueApiKeyResponse { api_key, key_id }))
 }
 
 /// 管理员写：吊销一把 API Key（`DELETE /api/v1/api-keys/{key_id}`）。

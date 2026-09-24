@@ -172,6 +172,9 @@ async fn public_surface_has_no_async_task_protocol() {
 /// 按密钥的缓存，这里就会在缓存寿命内放行一把已吊销的密钥，用例立刻变红。
 ///
 /// 吊销不删行（创建与吊销都是历史事实），所以还要验重复吊销仍然成功、且不改第一次的吊销时刻。
+///
+/// 吊销要用的标识**只从发密钥的响应里拿**：明文只出现一次，库里只有它的摘要，反查不出 id；管理员
+/// 也没有库权限。所以这条用例同时钉住"发密钥回的那把 id 就是吊销路径认的那把"。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
@@ -179,8 +182,27 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
         Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
     let client = Client::new();
     // 被吊销的密钥属于夹具之外的账户：吊销改的是那把密钥自己，别顺手把夹具的密钥也停掉。
-    let (account_id, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let account_id =
+        create_account_with_credit(&client, &harness.base_url, &harness.admin_token, 1_000_000)
+            .await;
+    let issued = issue_key_response(
+        &client,
+        &harness.base_url,
+        &harness.admin_token,
+        &account_id,
+    )
+    .await;
+    // 响应必须同时给明文和标识：少了标识，"吊销哪一把"就只剩回库捞这一条路，而管理员没有库权限。
+    assert!(
+        issued.get("key_id").is_some_and(Value::is_string),
+        "发密钥的响应必须带密钥标识：{issued}"
+    );
+    let api_key = issued["api_key"]
+        .as_str()
+        .expect("发密钥的响应必须带明文密钥")
+        .to_owned();
+    let key_id =
+        Uuid::parse_str(issued["key_id"].as_str().expect("key_id")).expect("密钥标识得是个 UUID");
 
     // ── 吊销前：这把密钥能受理并跑完一次生成（进程内假上游，不产生任何外部调用）──
     let worker = harness.spawn_worker();
@@ -197,11 +219,18 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
     assert_sync_success("吊销前", &body);
 
     // ── 吊销：204，与既有管理员写接口一致；痕迹落在 `revoked_at` 上而不是删行 ──
-    let key_id: Uuid = sqlx::query_scalar("SELECT id FROM identity.api_keys WHERE account_id = $1")
-        .bind(Uuid::parse_str(&account_id).expect("account id"))
-        .fetch_one(&harness.pool)
-        .await
-        .expect("the issued key must be in the database");
+    // 这里只**核对**响应给的标识指向刚建的那一行（建完还没吊销），id 本身不是从库里捞的。
+    let stored_account: Uuid =
+        sqlx::query_scalar("SELECT account_id FROM identity.api_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("响应里的标识必须能定位到刚发出来的那一行");
+    assert_eq!(
+        stored_account.to_string(),
+        account_id,
+        "标识得指向这个账户的密钥"
+    );
     let revoked = client
         .delete(format!("{}/api/v1/api-keys/{key_id}", harness.base_url))
         .bearer_auth(&harness.admin_token)

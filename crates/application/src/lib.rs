@@ -1612,13 +1612,14 @@ pub trait HubRepository: Send + Sync {
     /// 管理员看的策略清单：全局那条（若有）与各网关模型的覆盖。
     async fn route_policies(&self) -> Result<Vec<RoutePolicy>, ApplicationError>;
 
+    /// 建一把密钥。返回新行的 id：调用方（发密钥的响应）要把它交给管理员，好让"吊销哪一把"不必回库捞。
     async fn create_api_key(
         &self,
         account_id: AccountId,
         label: &str,
         key_hash: &str,
         actor: &str,
-    ) -> Result<(), ApplicationError>;
+    ) -> Result<Uuid, ApplicationError>;
 
     /// 吊销一把密钥：写 `revoked_at`，**不删行**——创建与吊销都是要留痕的历史事实。
     ///
@@ -1869,12 +1870,17 @@ impl IdentityService {
         Self { repository }
     }
 
+    /// 发一把密钥。返回 `(key_id, 明文)`。
+    ///
+    /// 明文只在这一刻存在：库里只有摘要，事后**没有**任何路径能把它还原出来，也就没有"再查一次密钥"的
+    /// 接口。正因如此，吊销要用的标识必须和明文一起回给调用方——不然管理员除了回库翻 id 别无他法，
+    /// 而管理员恰恰没有库权限。
     pub async fn issue_api_key(
         &self,
         account_id: AccountId,
         label: &str,
         actor: &str,
-    ) -> Result<String, ApplicationError> {
+    ) -> Result<(Uuid, String), ApplicationError> {
         if label.trim().is_empty() {
             return Err(ApplicationError::Validation(
                 "api key label must not be empty".to_owned(),
@@ -1884,10 +1890,11 @@ impl IdentityService {
         let second = Uuid::new_v4().simple();
         let plaintext = format!("sk_seeai_{first}{second}");
         let key_hash = sha256_hex(plaintext.as_bytes());
-        self.repository
+        let key_id = self
+            .repository
             .create_api_key(account_id, label, &key_hash, actor)
             .await?;
-        Ok(plaintext)
+        Ok((key_id, plaintext))
     }
 
     /// 吊销一把密钥（管理员，写审计）。

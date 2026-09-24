@@ -1828,18 +1828,31 @@ async fn create_account_with_credit(
         .to_owned()
 }
 
-async fn issue_key(client: &Client, base_url: &str, admin_token: &str, account_id: &str) -> String {
-    client
+/// 发一把密钥，把**响应原样**交回去：明文与密钥标识（`api_key` / `key_id`）都在里面。
+///
+/// 要标识的用例（吊销那条路）用它；只要明文的用例走 [`issue_key`]，不必各自解一遍 JSON。
+async fn issue_key_response(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    account_id: &str,
+) -> Value {
+    let response = client
         .post(format!("{base_url}/api/v1/accounts/{account_id}/api-keys"))
         .bearer_auth(admin_token)
         .json(&json!({"label": "contract"}))
         .send()
         .await
-        .expect("key creation")
-        .json::<Value>()
+        .expect("key creation");
+    assert_eq!(response.status(), StatusCode::OK, "key issuance");
+    response.json::<Value>().await.expect("key JSON")
+}
+
+async fn issue_key(client: &Client, base_url: &str, admin_token: &str, account_id: &str) -> String {
+    issue_key_response(client, base_url, admin_token, account_id)
         .await
-        .expect("key JSON")["api_key"]
-        .as_str()
+        .get("api_key")
+        .and_then(Value::as_str)
         .expect("API key")
         .to_owned()
 }

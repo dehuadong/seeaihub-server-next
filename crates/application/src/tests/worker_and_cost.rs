@@ -195,7 +195,7 @@ impl HubRepository for WorkerRepository {
         _label: &str,
         _key_hash: &str,
         _actor: &str,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<Uuid, ApplicationError> {
         unused_repository()
     }
 

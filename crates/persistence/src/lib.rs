@@ -1370,13 +1370,16 @@ impl HubRepository for PgHubRepository {
         transaction.commit().await.map_err(database_error)
     }
 
+    /// 建一行密钥，返回它的 id。id 在这里生成，所以也只能由这里交回去——发密钥的响应要靠它定位
+    /// "刚才发的是哪一把"，否则吊销就退化成"回库捞 id"。
     async fn create_api_key(
         &self,
         account_id: AccountId,
         label: &str,
         key_hash: &str,
         actor: &str,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<Uuid, ApplicationError> {
+        let key_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query(
             r#"
@@ -1384,7 +1387,7 @@ impl HubRepository for PgHubRepository {
             VALUES ($1, $2, $3, $4)
             "#,
         )
-        .bind(Uuid::new_v4())
+        .bind(key_id)
         .bind(account_id.0)
         .bind(label)
         .bind(key_hash)
@@ -1400,7 +1403,8 @@ impl HubRepository for PgHubRepository {
             &serde_json::json!({"label": label}),
         )
         .await?;
-        transaction.commit().await.map_err(database_error)
+        transaction.commit().await.map_err(database_error)?;
+        Ok(key_id)
     }
 
     /// 按密钥标识取账户，**吊销判定就在这条语句里**（`revoked_at IS NULL`）。
