@@ -1620,6 +1620,12 @@ pub trait HubRepository: Send + Sync {
         actor: &str,
     ) -> Result<(), ApplicationError>;
 
+    /// 吊销一把密钥：写 `revoked_at`，**不删行**——创建与吊销都是要留痕的历史事实。
+    ///
+    /// 幂等：已吊销的再调一次仍然成功。调用方要的是"它现在不可用"这个状态，不是"这次调用改变了
+    /// 什么"；把重复吊销报成错误只会让重发求助变成故障。键不存在返回 `NotFound`。
+    async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError>;
+
     async fn account_for_api_key(&self, key_hash: &str) -> Result<AccountId, ApplicationError>;
 
     /// 创建 Job，并与 Job **同事务**写入路由判定记录。
@@ -1884,6 +1890,20 @@ impl IdentityService {
         Ok(plaintext)
     }
 
+    /// 吊销一把密钥（管理员，写审计）。
+    ///
+    /// 幂等：已经吊销过的再吊销一次仍然成功——调用方在意的是"它现在不可用"。写完提交，**下一个**
+    /// 请求就走不通了：认证路径每次读库判吊销状态（见 [`Self::authenticate`]），这里没有中间缓存
+    /// 要等。
+    pub async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
+        self.repository.revoke_api_key(key_id, actor).await
+    }
+
+    /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里。
+    ///
+    /// 刻意**不**缓存"这把密钥还有效吗"：吊销的语义是"立刻停止使用"，任何缓存都会让吊销在 TTL
+    /// 内不生效——而吊销恰恰是那种"多延迟一秒都在放行不该放行的请求"的动作。这里一次唯一索引点查
+    /// 很便宜，用它换"吊销即生效"是划算的。
     pub async fn authenticate(&self, plaintext: &str) -> Result<AccountId, ApplicationError> {
         if !plaintext.starts_with("sk_seeai_") {
             return Err(ApplicationError::NotFound("api key".to_owned()));

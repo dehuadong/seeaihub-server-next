@@ -203,6 +203,10 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn revoke_api_key(&self, _key_id: Uuid, _actor: &str) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
     async fn create_job(
         &self,
         _command: CreateImageGeneration,

@@ -1403,6 +1403,11 @@ impl HubRepository for PgHubRepository {
         transaction.commit().await.map_err(database_error)
     }
 
+    /// 按密钥标识取账户，**吊销判定就在这条语句里**（`revoked_at IS NULL`）。
+    ///
+    /// 认证链路上没有、也不能有"这把密钥还有效吗"的缓存：吊销的语义是"从这一刻起停止使用"，把它
+    /// 缓存住就等于把吊销推迟到缓存过期之后——正是吊销要阻止的事。代价只是每个请求一次唯一索引
+    /// 点查，换来吊销即生效。
     async fn account_for_api_key(&self, key_hash: &str) -> Result<AccountId, ApplicationError> {
         let account_id: Uuid = sqlx::query_scalar(
             r#"
@@ -1416,6 +1421,49 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)?
         .ok_or_else(|| ApplicationError::NotFound("api key".to_owned()))?;
         Ok(AccountId(account_id))
+    }
+
+    async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 只改**还没吊销**的那一行：一条语句就把"第一次吊销"与"重复吊销"分开了——重复调用影响 0 行。
+        // 0 行既可能是"早就吊销过"（幂等成功）也可能是"这把键根本不存在"（404），下面再查一次区分。
+        let revoked_account: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE identity.api_keys
+            SET revoked_at = now()
+            WHERE id = $1 AND revoked_at IS NULL
+            RETURNING account_id
+            "#,
+        )
+        .bind(key_id)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let Some(account_id) = revoked_account else {
+            let existing: Option<Uuid> =
+                sqlx::query_scalar("SELECT account_id FROM identity.api_keys WHERE id = $1")
+                    .bind(key_id)
+                    .fetch_optional(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+            // 已经吊销过：幂等成功，也不再写一条"又吊销了一次"的审计——吊销是一件事、只发生一次，
+            // 重复调用说明的是调用方不知道它已经生效，不是新的事实。
+            return match existing {
+                Some(_) => Ok(()),
+                None => Err(ApplicationError::NotFound("api key".to_owned())),
+            };
+        };
+        // 不删行：创建与吊销都是要留痕的历史事实，排障要看这把密钥什么时候被谁停掉。
+        insert_audit(
+            &mut transaction,
+            actor,
+            "api_key.revoke",
+            "api_key",
+            &key_id.to_string(),
+            &serde_json::json!({"account_id": account_id.to_string()}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)
     }
 
     async fn create_job(

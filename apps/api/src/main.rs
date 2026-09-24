@@ -4,7 +4,7 @@ use axum::{
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
     http::{HeaderMap, StatusCode, header},
     response::{IntoResponse, Response},
-    routing::{get, patch, post, put},
+    routing::{delete, get, patch, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Utc};
@@ -121,6 +121,7 @@ async fn main() -> Result<()> {
             "/api/v1/accounts/{account_id}/api-keys",
             post(issue_api_key),
         )
+        .route("/api/v1/api-keys/{key_id}", delete(revoke_api_key))
         .route("/api/v1/runtime-revisions", post(publish_runtime))
         .route("/api/v1/gateway-models", get(list_gateway_models))
         .route(
@@ -392,6 +393,22 @@ async fn issue_api_key(
         .issue_api_key(AccountId(account_id), &body.label, "admin-api")
         .await?;
     Ok(Json(IssueApiKeyResponse { api_key }))
+}
+
+/// 管理员写：吊销一把 API Key（`DELETE /api/v1/api-keys/{key_id}`）。
+///
+/// 吊销**不删行**：创建与吊销都是历史事实，排障要看这把密钥什么时候被停掉，所以只写 `revoked_at`。
+/// 它**立刻**生效——认证路径每次读库判吊销状态、不缓存"有效"，所以这里成功返回之后紧接着的那次
+/// 使用就会被拒。重复吊销是成功的空操作（调用方在意的是"现在不可用"，不是这次调用改变了什么）；
+/// 键不存在是 404——这里只给已经发出来的行盖章，不创建任何东西。
+async fn revoke_api_key(
+    State(state): State<AppState>,
+    Path(key_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    require_admin(&state, &headers)?;
+    state.identity.revoke_api_key(key_id, "admin-api").await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 async fn publish_runtime(
