@@ -24,11 +24,17 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
+    num::NonZeroU64,
     sync::Arc,
     time::Duration,
 };
 use thiserror::Error;
 use uuid::Uuid;
+
+mod alerts;
+pub use alerts::{
+    AlertCounters, AlertSink, PlatformAlert, PlatformAlertExit, PlatformAlerter, is_platform_event,
+};
 
 /// 发布一个 Vendor Model 的供给。
 ///
@@ -1923,6 +1929,19 @@ pub trait HubRepository: Send + Sync {
         &self,
         query: ProviderFailureQuery,
     ) -> Result<Vec<ProviderFailureView>, ApplicationError>;
+
+    /// 某条候选（供给）**最近** `window` 次已定终态的执行里，开头连续失败了几次。
+    ///
+    /// 判据只看终态：`failed` 与 `reconciliation_required` 都算失败（都不是"结果交付成功"），
+    /// `succeeded` 截断连续段；还没定终态的执行既不计入也不截断——它们还没有结论。
+    ///
+    /// 这只是**现有执行记录的读法**：计数从 Job 的终态现算，不新增表、也不落一份会漂移的计数。
+    /// 读失败按平台侧故障抛出，由调用方决定"这一次不外发"。
+    async fn consecutive_offering_failures(
+        &self,
+        offering_id: OfferingId,
+        window: u32,
+    ) -> Result<u64, ApplicationError>;
 
     /// 对账退款（释放预授权）。返回**账户**与退款后的余额：调用方要按账户把余额写穿缓存。
     async fn refund_reconciliation(
@@ -4101,6 +4120,8 @@ pub struct WorkerService {
     provider_timeout: Duration,
     /// 加速层：结算与失败收尾都改余额，提交后要把新余额写穿缓存。
     acceleration: Arc<AccelerationService>,
+    /// 平台故障告警出口：**配了才有**。没配时连候选的连续失败计数都不读。
+    alerts: Option<PlatformAlertExit>,
 }
 
 impl WorkerService {
@@ -4126,6 +4147,7 @@ impl WorkerService {
             lease_duration,
             provider_timeout,
             acceleration,
+            alerts: None,
         })
     }
 
@@ -4136,24 +4158,76 @@ impl WorkerService {
         self
     }
 
+    /// 装上平台故障告警出口。
+    ///
+    /// `consecutive_failures` 是配置项：某条候选连续失败到这个次数才外发。不装这个出口就是今天的
+    /// 路径——不告警，也不为告警多读一次库。
+    #[must_use]
+    pub fn with_platform_alerts(
+        mut self,
+        alerter: Arc<PlatformAlerter>,
+        consecutive_failures: NonZeroU64,
+    ) -> Self {
+        self.alerts = Some(PlatformAlertExit::new(alerter, consecutive_failures));
+        self
+    }
+
     /// 失败收尾 + 写穿余额。
     ///
     /// 释放预授权的那些分支会改动余额，**不写穿的话缓存里会留着一个刚写过、但偏高的余额**——
     /// 那正好是"看起来新鲜、其实已经不对"的那类值，下一次受理就可能凭它误拒。
+    ///
+    /// 告警外发在**处置提交之后**：那时 Job 的终态与这条失败已经落库，告警是旁路，读的是已提交的
+    /// 事实，也不会反过来改它。
     async fn fail_and_refresh(
         &self,
-        job_id: JobId,
+        job: &GenerationJob,
         attempt_id: AttemptId,
         failure: AttemptFailure,
     ) -> Result<(), ApplicationError> {
         let change = self
             .repository
-            .fail_job(job_id, &self.worker_id, Some(attempt_id), failure)
+            .fail_job(job.id, &self.worker_id, Some(attempt_id), failure.clone())
             .await?;
         self.acceleration
             .write_balance(&change, BalanceSource::DbCommit)
             .await;
+        self.raise_platform_alerts(job, &failure).await;
         Ok(())
+    }
+
+    /// 这次失败要不要外发一条平台故障告警。
+    ///
+    /// 三个触发条件都是**平台侧事件**，同一次失败**最多外发一条**：平台欠费或凭证类失败、对账
+    /// 案例新增、某候选连续失败 N 次。前两条看这次失败本身，第三条才去数这条候选最近的终态——
+    /// 前两条成立时不再数，是因为再发一条逐字相同的告警没有信息量（聚合与静默期是接入方的事，
+    /// 但这里连重复都不产生）。
+    ///
+    /// 全程不返回错误：读不到计数只记日志，这一次失败就不外发——旁路出问题不改主流程的结论。
+    async fn raise_platform_alerts(&self, job: &GenerationJob, failure: &AttemptFailure) {
+        let Some(exit) = &self.alerts else {
+            return;
+        };
+        if is_platform_event(failure) {
+            exit.notify(PlatformAlert::of(job, failure.kind)).await;
+            return;
+        }
+        match self
+            .repository
+            .consecutive_offering_failures(job.offering.offering_id, exit.window())
+            .await
+        {
+            Ok(count) if count >= exit.threshold() => {
+                exit.notify(PlatformAlert::of(job, failure.kind)).await;
+            }
+            Ok(_) => {}
+            Err(error) => tracing::warn!(
+                job_id = %job.id,
+                offering_id = %job.offering.offering_id,
+                error = %error,
+                "could not count the candidate's consecutive failures; no alert is sent for this failure"
+            ),
+        }
     }
 
     pub async fn run_once(&self) -> Result<bool, ApplicationError> {
@@ -4212,7 +4286,7 @@ impl WorkerService {
             Ok(credential) => credential,
             Err(error) => {
                 self.fail_and_refresh(
-                    claimed.job.id,
+                    &claimed.job,
                     attempt_id,
                     AttemptFailure {
                         provider_code: "credential_unavailable".to_owned(),
@@ -4238,7 +4312,7 @@ impl WorkerService {
             Ok(adapter) => adapter,
             Err(error) => {
                 self.fail_and_refresh(
-                    claimed.job.id,
+                    &claimed.job,
                     attempt_id,
                     AttemptFailure {
                         provider_code: "adapter_configuration_failed".to_owned(),
@@ -4276,7 +4350,7 @@ impl WorkerService {
                     .await
                 {
                     self.fail_and_refresh(
-                        claimed.job.id,
+                        &claimed.job,
                         attempt_id,
                         AttemptFailure {
                             provider_code: "result_delivery_failed".to_owned(),
@@ -4294,7 +4368,7 @@ impl WorkerService {
             }
             Err(error) => {
                 let failure = failure_from_adapter(&claimed.job.offering.price_snapshot, error);
-                self.fail_and_refresh(claimed.job.id, attempt_id, failure)
+                self.fail_and_refresh(&claimed.job, attempt_id, failure)
                     .await?;
             }
         }

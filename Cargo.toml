@@ -9,6 +9,7 @@ members = [
   "crates/adapter-apimart",
   "crates/persistence",
   "crates/cache-redis",
+  "crates/alert-webhook",
 ]
 resolver = "3"
 

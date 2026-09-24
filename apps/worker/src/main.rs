@@ -3,13 +3,14 @@ use chrono::Duration as ChronoDuration;
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_adapter_sdk::ProviderCredential;
+use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AdapterRegistry, ApplicationError, CachePolicy, CredentialProvider,
-    HubRepository, WorkerService,
+    HubRepository, PlatformAlerter, WorkerService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_persistence::PgHubRepository;
-use std::{env, sync::Arc, time::Duration};
+use std::{env, num::NonZeroU64, sync::Arc, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -71,6 +72,25 @@ async fn main() -> Result<()> {
         provider_timeout,
     )?
     .with_acceleration(acceleration);
+    // 平台故障告警出口是**配置项**：`PROVIDER_ALERT_WEBHOOK` 没配就没有出口，一条也不外发；
+    // 阈值（某候选连续失败几次才告警）只在有出口时才读。地址写错在这里就失败，不让进程带着一个
+    // "永远发不出去"的出口跑起来。
+    let worker = match WebhookAlertSink::from_env()? {
+        Some(sink) => {
+            let consecutive_failures = parse_env("PROVIDER_ALERT_CONSECUTIVE_FAILURES", 3_u64)?;
+            let consecutive_failures = NonZeroU64::new(consecutive_failures)
+                .context("PROVIDER_ALERT_CONSECUTIVE_FAILURES must be at least 1")?;
+            info!(
+                consecutive_failures = consecutive_failures.get(),
+                "platform failure alerts are enabled"
+            );
+            worker.with_platform_alerts(
+                Arc::new(PlatformAlerter::new(Arc::new(sink))),
+                consecutive_failures,
+            )
+        }
+        None => worker,
+    };
     info!(%worker_id, "worker started");
     // 终止信号只决定"**不再领下一轮**"：正在跑的那一轮（上游调用 + 落账 + 结算）要让它跑完，
     // 否则在飞调用被丢掉，Job 会留在提交中直到租约过期才被回收。因此信号不放在 select 的

@@ -2396,6 +2396,37 @@ impl HubRepository for PgHubRepository {
             .collect()
     }
 
+    /// 某条候选最近若干次终态执行里的连续失败次数。
+    ///
+    /// 只取终态（`succeeded` / `failed` / `reconciliation_required`）并按 `updated_at` 倒序，
+    /// 于是"开头有几个不是成功"就是连续失败次数；在队或在跑的那些没有结论，不参与。
+    /// `LIMIT` 用调用方给的窗口：要判"够不够 N 次"就不必再往回读。
+    async fn consecutive_offering_failures(
+        &self,
+        offering_id: OfferingId,
+        window: u32,
+    ) -> Result<u64, ApplicationError> {
+        let states: Vec<String> = sqlx::query_scalar(
+            r#"
+            SELECT state FROM generation.jobs
+            WHERE offering_id = $1
+              AND state IN ('succeeded', 'failed', 'reconciliation_required')
+            ORDER BY updated_at DESC, id DESC
+            LIMIT $2
+            "#,
+        )
+        .bind(offering_id.0)
+        .bind(i64::from(window))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let streak = states
+            .iter()
+            .take_while(|state| *state != "succeeded")
+            .count();
+        Ok(u64::try_from(streak).unwrap_or(u64::MAX))
+    }
+
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,

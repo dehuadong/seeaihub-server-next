@@ -153,7 +153,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | 文件 | 负责什么 | 明确不负责 |
 | --- | --- | --- |
 | `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移、装配加速层并挂起缓存对账循环 | 业务规则、SQL、上游调用 |
-| `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现（含加速层）、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
+| `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现（含加速层与告警出口）、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
 | `apps/api/tests/http_contract/` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**与**进程内假 Redis**（零外部费用）。`main.rs` 是模块根，`harness.rs` 是共享装置，`cases_*.rs` 是按主题分的用例，`harness_check.rs` 是夹具自身的检查（不启进程、不用库） | 单元测试（在各 crate 内） |
 | `crates/*/src/tests.rs`、`crates/*/src/<模块>/tests.rs`、`crates/application/src/tests/` | 各 crate 的单元测试（`crates/application` 的按主题分在 `src/tests/` 下）。落点约定见根 [`AGENTS.md`](../AGENTS.md) 的「通用约定」 | 端到端合同测试（在 `apps/api/tests/http_contract/`） |
 | `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PricingFormula`（计价形态：按 token 计量量 / 按张 / 按次 / 上游直接给金额）、`PriceSnapshot`（计价形态与其单价 / 对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
@@ -161,6 +161,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService` / `AccountsService`）、端口 trait（含 `CacheStore`）、发布期校验（含"限制只能收窄"与定价"全有或全无"）、候选选择（**先按档位取第一个有合格候选的档，再在档内按权重确定性分摊**）、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生、加速层语义（`AccelerationService`：键名与值形状、候选集的修订标识比对、写穿与来源标记、新鲜度判定与凭缓存拒绝的审计、缓存对账、**每把 API Key 的速率计数**） | SQL、HTTP、上游协议、Redis 命令 |
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射；余额变更一律用 `RETURNING` 把**提交后**的余额带回给用例（供写穿缓存） | 业务判定（只执行用例给出的结论） |
 | `crates/cache-redis/src/lib.rs` | 加速层的 Redis 实现：`GET` / `SET … PX` / `DEL` 三条命令、惰性连接与单次操作超时；连不上或命令报错一律返回错误，由用例层当"未命中"处理。`REDIS_URL` 为空时不构造（`from_env` 返回 `None`） | 键名、值形状、新鲜度与拒绝判定（都在 `crates/application`） |
+| `crates/alert-webhook/src/lib.rs` | 平台故障告警出口的 HTTP 实现：把一条 `PlatformAlert` 以 POST JSON 发出、有界超时与重试。`PROVIDER_ALERT_WEBHOOK` 为空时不构造（`from_env` 返回 `None`），地址不可用时构造即失败 | 何时告警、告警内容、发送失败如何收口（都在 `crates/application` 的 `PlatformAlerter`） |
 | `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 解码、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`（**失败件同样带成本事实报告**：终态之后判定失败时把已经读到的成本随错误交回平台）、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：data URL 就地解码，公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、data URL 就地解码后上传换 URL 再回填、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |

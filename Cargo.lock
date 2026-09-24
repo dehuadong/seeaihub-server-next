@@ -2012,6 +2012,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeai-alert-webhook"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "reqwest",
+ "seeai-application",
+ "seeai-domain",
+ "serde_json",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "seeai-api"
 version = "0.1.0"
 dependencies = [
@@ -2107,6 +2121,7 @@ dependencies = [
  "seeai-adapter-aihubmix",
  "seeai-adapter-apimart",
  "seeai-adapter-sdk",
+ "seeai-alert-webhook",
  "seeai-application",
  "seeai-cache-redis",
  "seeai-persistence",

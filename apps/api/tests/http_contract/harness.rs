@@ -196,39 +196,8 @@ async fn serve_fake_upstream(
     query_count: Arc<std::sync::atomic::AtomicUsize>,
     upload_count: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
-    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
-
     // 正经读完一个请求：请求行 + 头 + 按 Content-Length 读满请求体。
-    let (method, path, body) = {
-        let mut reader = BufReader::new(&mut *socket);
-        let mut request_line = String::new();
-        reader.read_line(&mut request_line).await?;
-        let mut parts = request_line.split_whitespace();
-        let method = parts.next().unwrap_or_default().to_owned();
-        let path = parts.next().unwrap_or_default().to_owned();
-
-        let mut content_length = 0_usize;
-        loop {
-            let mut header = String::new();
-            if reader.read_line(&mut header).await? == 0 {
-                break;
-            }
-            let header = header.trim_end();
-            if header.is_empty() {
-                break;
-            }
-            if let Some((name, value)) = header.split_once(':')
-                && name.eq_ignore_ascii_case("content-length")
-            {
-                content_length = value.trim().parse().unwrap_or(0);
-            }
-        }
-        let mut body = vec![0_u8; content_length];
-        if content_length > 0 {
-            reader.read_exact(&mut body).await?;
-        }
-        (method, path, body)
-    };
+    let (method, path, body) = read_request(socket).await?;
     if let Ok(mut calls) = calls.lock() {
         calls.push(UpstreamCall {
             method: method.clone(),
@@ -410,6 +379,131 @@ async fn write_response(
 
 fn port_of(socket: &tokio::net::TcpStream) -> u16 {
     socket.local_addr().map(|addr| addr.port()).unwrap_or(0)
+}
+
+/// 读完一个 HTTP 请求：请求行、头，以及按 `Content-Length` 读满的请求体。
+///
+/// 两个进程内接收器（假上游与告警接收器）共用它：要验的正是"线上到底发了什么"，
+/// 所以两边都按同一套办法把原始报文读出来。
+async fn read_request(
+    socket: &mut tokio::net::TcpStream,
+) -> std::io::Result<(String, String, Vec<u8>)> {
+    use tokio::io::{AsyncBufReadExt, AsyncReadExt, BufReader};
+
+    let mut reader = BufReader::new(&mut *socket);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).await?;
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default().to_owned();
+    let path = parts.next().unwrap_or_default().to_owned();
+
+    let mut content_length = 0_usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).await? == 0 {
+            break;
+        }
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    let mut body = vec![0_u8; content_length];
+    if content_length > 0 {
+        reader.read_exact(&mut body).await?;
+    }
+    Ok((method, path, body))
+}
+
+/// 一个只收告警的本地接收器：记下每条请求的正文（告警就是 JSON），按给定状态码应答。
+///
+/// 告警是**旁路**，所以接收器可以正常应答、回错、或者根本不存在：三种都只该影响"送出去了没有"，
+/// 不影响 Job 的处置与对客结果。
+struct AlertReceiver {
+    url: String,
+    bodies: Arc<Mutex<Vec<Value>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl AlertReceiver {
+    async fn start(status: u16) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the alert receiver binds a local port");
+        let port = listener
+            .local_addr()
+            .expect("the alert receiver address")
+            .port();
+        let bodies = Arc::new(Mutex::new(Vec::new()));
+        let recorded = bodies.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let _ = serve_alert(&mut socket, recorded, status).await;
+                });
+            }
+        });
+        Self {
+            url: format!("http://127.0.0.1:{port}/alerts"),
+            bodies,
+            _task: task,
+        }
+    }
+
+    fn bodies(&self) -> Vec<Value> {
+        self.bodies.lock().expect("alert bodies lock").clone()
+    }
+
+    /// 等到收到 `count` 条为止（有上限地等）：外发发生在另一个进程里，断言要等它到。
+    async fn wait_for(&self, count: usize) -> Vec<Value> {
+        for _ in 0..200 {
+            let bodies = self.bodies();
+            if bodies.len() >= count {
+                return bodies;
+            }
+            tokio::time::sleep(Duration::from_millis(25)).await;
+        }
+        self.bodies()
+    }
+}
+
+async fn serve_alert(
+    socket: &mut tokio::net::TcpStream,
+    bodies: Arc<Mutex<Vec<Value>>>,
+    status: u16,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+
+    let (_, _, body) = read_request(socket).await?;
+    if let Ok(mut bodies) = bodies.lock() {
+        bodies.push(serde_json::from_slice(&body).unwrap_or(Value::Null));
+    }
+    let reason = if status < 400 { "OK" } else { "Error" };
+    let head =
+        format!("HTTP/1.1 {status} {reason}\r\ncontent-length: 0\r\nconnection: close\r\n\r\n");
+    socket.write_all(head.as_bytes()).await?;
+    socket.flush().await
+}
+
+/// 一条告警载荷的**键**（排序后）：用例据此钉住"外发的就是那四个定位字段"。
+fn alert_keys(alert: &Value) -> Vec<String> {
+    let mut keys: Vec<String> = alert
+        .as_object()
+        .expect("an alert payload is a JSON object")
+        .keys()
+        .cloned()
+        .collect();
+    keys.sort();
+    keys
 }
 
 fn body_contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
@@ -708,12 +802,26 @@ async fn start_api_with(
 /// 环境变量只有一份，两个调用点（[`Harness`] 与直接起进程的用例）共用：两家渠道的凭证都写在
 /// 测试进程的环境里，取值只在进程内假上游上用过，不写入配置、日志或响应。
 fn spawn_worker_process(database_url: &str) -> WorkerProcess {
-    spawn_worker_process_with(database_url, None)
+    spawn_worker_process_with(database_url, None, None)
+}
+
+/// 一次用例给 Worker 配的**平台故障告警出口**。
+///
+/// 字段直接就是那两个环境变量的值；`PROVIDER_ALERT_WEBHOOK` 没配（`None`）就是今天的路径——
+/// 一条都不外发。超时与重试用生产缺省：它们是配置项，用例不该为了跑得快把它们改成另一套语义。
+struct WorkerAlerts {
+    webhook: String,
+    /// 某候选连续失败几次才外发。
+    consecutive_failures: u64,
 }
 
 /// 同 [`spawn_worker_process`]，但可以给 Worker 也配上加速层：结算与失败收尾都改余额，
 /// 提交后要把新余额写穿缓存，所以两个进程必须看同一个缓存服务。
-fn spawn_worker_process_with(database_url: &str, cache: Option<&CacheFixture>) -> WorkerProcess {
+fn spawn_worker_process_with(
+    database_url: &str,
+    cache: Option<&CacheFixture>,
+    alerts: Option<&WorkerAlerts>,
+) -> WorkerProcess {
     let mut command = Command::new(worker_binary());
     command
         .env("DATABASE_URL", database_url)
@@ -726,6 +834,12 @@ fn spawn_worker_process_with(database_url: &str, cache: Option<&CacheFixture>) -
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     apply_cache_env(&mut command, cache);
+    if let Some(alerts) = alerts {
+        command.env("PROVIDER_ALERT_WEBHOOK", &alerts.webhook).env(
+            "PROVIDER_ALERT_CONSECUTIVE_FAILURES",
+            alerts.consecutive_failures.to_string(),
+        );
+    }
     let child = command.spawn().expect("worker process should start");
     WorkerProcess { child }
 }
@@ -1019,7 +1133,12 @@ impl Harness {
     /// Worker 与 API 共用同一个缓存服务：结算改余额之后要把新余额写穿，否则缓存会留着一个
     /// 刚写过、但偏高的余额。
     fn spawn_worker(&self) -> WorkerProcess {
-        spawn_worker_process_with(&self.database_url, self.cache.as_ref())
+        spawn_worker_process_with(&self.database_url, self.cache.as_ref(), None)
+    }
+
+    /// 同 [`Self::spawn_worker`]，但给这个 Worker 配上告警出口。
+    fn spawn_worker_with_alerts(&self, alerts: &WorkerAlerts) -> WorkerProcess {
+        spawn_worker_process_with(&self.database_url, self.cache.as_ref(), Some(alerts))
     }
 
     /// 这次用例的假 Redis；没配缓存的用例调用它会直接失败（那是用例写错了）。

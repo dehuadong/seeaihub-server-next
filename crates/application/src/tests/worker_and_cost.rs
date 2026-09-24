@@ -318,6 +318,16 @@ impl HubRepository for WorkerRepository {
         Ok(Vec::new())
     }
 
+    /// 这个假仓库只服务 Worker 那条路径：告警的连续性阈值用例在别处（端到端那条），这里报到
+    /// "用错了"而不是编一个数——编一个数会让"某候选连续失败"那道判据在测试里悄悄变成常量。
+    async fn consecutive_offering_failures(
+        &self,
+        _offering_id: OfferingId,
+        _window: u32,
+    ) -> Result<u64, ApplicationError> {
+        unused_repository()
+    }
+
     async fn count_in_flight_jobs(
         &self,
         _account_id: AccountId,
@@ -1004,5 +1014,113 @@ async fn worker_sends_settlement_failure_to_reconciliation_with_its_own_code() {
             .expect("completion lock")
             .is_none(),
         "no settlement may happen when the provider delivered no result"
+    );
+}
+
+/// 一个只记账、不真发信的出口：这条用例验的是 Worker 在**什么时机**、拿**什么内容**外发。
+struct RecordingSink {
+    sent: Mutex<Vec<PlatformAlert>>,
+}
+
+impl RecordingSink {
+    fn new() -> Self {
+        Self {
+            sent: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn sent(&self) -> Vec<PlatformAlert> {
+        self.sent.lock().expect("sent lock").clone()
+    }
+}
+
+#[async_trait]
+impl AlertSink for RecordingSink {
+    async fn send(&self, alert: &PlatformAlert) -> Result<(), ApplicationError> {
+        self.sent.lock().expect("sent lock").push(alert.clone());
+        Ok(())
+    }
+}
+
+/// 一个**永远送不出去**的出口：用来钉住"一次外发失败改不了 Job 的处置"。
+struct RefusingSink;
+
+#[async_trait]
+impl AlertSink for RefusingSink {
+    async fn send(&self, _alert: &PlatformAlert) -> Result<(), ApplicationError> {
+        Err(ApplicationError::Persistence(
+            "the alert receiver answered 500".to_owned(),
+        ))
+    }
+}
+
+/// 告警外发落在**失败处置已经提交之后**，内容是那条已提交的事实：Job 标识、渠道、失败类别、时间。
+///
+/// 这里走的是"对账案例新增"那一个触发条件：上游已确认生成、平台交付不了结果，Worker 把它推进
+/// `reconciliation_required`（建案在 `fail_job` 里），告警跟着这条事实走。
+#[tokio::test]
+async fn worker_alerts_the_platform_event_it_just_committed() {
+    let job = worker_job(20_000);
+    let job_id = job.id;
+    let provider_kind = job.offering.provider_kind.clone();
+    let repository = Arc::new(WorkerRepository::new(job, Arc::new(Mutex::new(Vec::new()))));
+    let adapter = Arc::new(WorkerAdapter::new(false, false));
+    let sink = Arc::new(RecordingSink::new());
+
+    assert!(
+        worker(repository.clone(), adapter)
+            .with_platform_alerts(
+                Arc::new(PlatformAlerter::new(sink.clone())),
+                NonZeroU64::new(3).expect("the threshold is non-zero"),
+            )
+            .run_once()
+            .await
+            .expect("worker run must converge")
+    );
+    let sent = sink.sent();
+    assert_eq!(sent.len(), 1, "平台侧事件必须外发一条");
+    assert_eq!(sent[0].job_id, job_id);
+    assert_eq!(sent[0].provider_kind, provider_kind);
+    assert_eq!(sent[0].failure_kind, ProviderFailureKind::PlatformInternal);
+}
+
+/// 送不出去也**不改**这条失败的处置：告警是旁路，它的失败只进日志与计数。
+#[tokio::test]
+async fn a_refused_alert_delivery_leaves_the_failure_disposition_alone() {
+    let repository = Arc::new(WorkerRepository::new(
+        worker_job(20_000),
+        Arc::new(Mutex::new(Vec::new())),
+    ));
+    let adapter = Arc::new(WorkerAdapter::new(false, false));
+
+    assert!(
+        worker(repository.clone(), adapter)
+            .with_platform_alerts(
+                Arc::new(PlatformAlerter::new(Arc::new(RefusingSink))),
+                NonZeroU64::new(3).expect("the threshold is non-zero"),
+            )
+            .run_once()
+            .await
+            .expect("a refused alert must not fail the worker run")
+    );
+    let failure = repository
+        .failure
+        .lock()
+        .expect("failure lock")
+        .take()
+        .expect("job must fail to reconciliation");
+    assert_eq!(failure.target_state, JobState::ReconciliationRequired);
+    assert_eq!(
+        failure.hold_disposition,
+        HoldDisposition::RetainForReconciliation
+    );
+    assert_eq!(failure.public_code, PublicErrorCode::OutcomeUnknown);
+    assert!(
+        repository
+            .completion
+            .lock()
+            .expect("completion lock")
+            .is_none(),
+        "外发失败不许把一次失败的 Job 变成成功"
     );
 }

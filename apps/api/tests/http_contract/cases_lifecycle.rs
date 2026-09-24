@@ -948,3 +948,352 @@ async fn the_consumer_account_view_shows_only_its_own_balance_and_hold() {
 
     harness.cleanup().await;
 }
+
+// ── 平台故障告警出口 ──
+//
+// 出口是**配置项**：`PROVIDER_ALERT_WEBHOOK` 指到本地接收器，触发条件是平台侧事件，发送失败是
+// 旁路。四条用例共用"一次平台欠费失败"这个场景：它的类别（`platform_funding`）正是第一个触发条件。
+
+/// 上游拒绝提交、判为平台欠费的那一次失败（对客是平台侧故障，预授权释放）。
+fn funding_rejection() -> UpstreamBehaviour {
+    UpstreamBehaviour {
+        submit: SubmitBehaviour::Rejected {
+            status: 402,
+            body: json!({"error": {"code": 402, "message": "payment_required: account balance is insufficient"}}),
+        },
+        ..UpstreamBehaviour::apimart()
+    }
+}
+
+/// 一次平台欠费失败跑完之后，**对客看到的那一份**与**内部留下的那一份**。
+///
+/// "逐位相同"要的是同一组事实，所以这里把两边的读数装进一个结构再整体比：响应状态与正文、
+/// Job 的终态与对客错误码、预授权处置、结果信封、余额与账本分录。
+#[derive(Debug, PartialEq)]
+struct FailureOutcome {
+    http: StatusCode,
+    body: Value,
+    state: String,
+    error_code: Option<String>,
+    error_message: Option<String>,
+    hold: String,
+    images: Option<Value>,
+    balance: i64,
+    entries: Vec<(String, i64)>,
+}
+
+/// 跑一次平台欠费失败，取这次执行的结局。`alerts` 给 `None` 就是**没配出口**的那条路径。
+async fn funding_failure_outcome(alerts: Option<&WorkerAlerts>) -> FailureOutcome {
+    let harness = Harness::start_with(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only"],
+        None,
+        funding_rejection(),
+        64,
+    )
+    .await;
+    let worker = match alerts {
+        Some(alerts) => harness.spawn_worker_with_alerts(alerts),
+        None => harness.spawn_worker(),
+    };
+    let key = format!("alert-outcome-{}", Uuid::new_v4());
+    let (http, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "alert side path"),
+    )
+    .await;
+    drop(worker);
+
+    let (job_id, state, images) = harness.job(&key).await;
+    let row = sqlx::query("SELECT error_code, error_message FROM generation.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&harness.pool)
+        .await
+        .expect("job row");
+    let hold: String = sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+        .bind(job_id)
+        .fetch_one(&harness.pool)
+        .await
+        .expect("hold row");
+    let balance = database_balance(&harness, &harness.account_id).await;
+    let rows = sqlx::query(
+        "SELECT kind, amount_microusd FROM ledger.entries WHERE account_id = $1
+         ORDER BY kind, amount_microusd",
+    )
+    .bind(Uuid::parse_str(&harness.account_id).expect("account id"))
+    .fetch_all(&harness.pool)
+    .await
+    .expect("ledger entries");
+    let entries = rows
+        .iter()
+        .map(|row| {
+            (
+                row.try_get("kind").expect("entry kind"),
+                row.try_get("amount_microusd").expect("entry amount"),
+            )
+        })
+        .collect();
+    let outcome = FailureOutcome {
+        http,
+        body,
+        state,
+        error_code: row.try_get("error_code").expect("error code"),
+        error_message: row.try_get("error_message").expect("error message"),
+        hold,
+        images,
+        balance,
+        entries,
+    };
+    harness.cleanup().await;
+    outcome
+}
+
+/// 把 webhook 指向本地接收器，一次平台欠费失败就该收到一条 JSON：job、渠道、失败类别、时间。
+///
+/// 载荷同时钉住两件事：它就是那四个字段（多一个键都算多带一份仓库里的东西出门），且不含调用方的
+/// 提示词与渠道凭证的值——告警外发到仓库之外，对客内容与密钥都不出门。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_platform_funding_failure_reaches_the_configured_alert_webhook() {
+    let receiver = AlertReceiver::start(200).await;
+    let harness = Harness::start_with(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only"],
+        None,
+        funding_rejection(),
+        64,
+    )
+    .await;
+    // 阈值调高：这条用例只看"平台欠费或凭证类失败"那一个触发条件。
+    let worker = harness.spawn_worker_with_alerts(&WorkerAlerts {
+        webhook: receiver.url.clone(),
+        consecutive_failures: 100,
+    });
+    let prompt = format!("prompt-secret-{}", Uuid::new_v4());
+    let key = format!("alert-payload-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, &prompt),
+    )
+    .await;
+    drop(worker);
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "平台欠费对客是平台侧故障：{body}"
+    );
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "failed", "平台欠费失败落在失败终态");
+
+    let alerts = receiver.wait_for(1).await;
+    assert_eq!(alerts.len(), 1, "一次平台欠费失败就是一条告警：{alerts:?}");
+    let alert = &alerts[0];
+    assert_eq!(
+        alert_keys(alert),
+        ["failure_kind", "job_id", "occurred_at", "provider_kind"]
+            .map(str::to_owned)
+            .to_vec(),
+        "载荷就是定位所需的最小集：{alert}"
+    );
+    assert_eq!(alert["job_id"].as_str(), Some(job_id.to_string().as_str()));
+    assert_eq!(alert["provider_kind"].as_str(), Some("APIMart"));
+    assert_eq!(alert["failure_kind"].as_str(), Some("platform_funding"));
+    let occurred_at = alert["occurred_at"].as_str().expect("时间是个字符串");
+    chrono::DateTime::parse_from_rfc3339(occurred_at).expect("时间是个可解析的时刻");
+    let rendered = alert.to_string();
+    assert!(!rendered.contains(&prompt), "提示词不得外发：{rendered}");
+    assert!(
+        !rendered.contains("contract-test-key"),
+        "渠道凭证不得外发：{rendered}"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 对账案例新增也是平台侧事件：这次失败把 Job 推成 `reconciliation_required`（建案），告警跟着
+/// 这条**已提交的事实**走。
+///
+/// 这次失败的类别是渠道限流——它自己不是平台侧事件、也不在"欠费/凭证"那一类里，所以这条用例证明
+/// 的是第二个触发条件独立成立：进对账就告警，不管失败是哪一类。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_new_reconciliation_case_reaches_the_configured_alert_webhook() {
+    let receiver = AlertReceiver::start(200).await;
+    let harness = Harness::start_with(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour {
+            // 渠道侧限流：受理状态不确定，按既有口径保留预授权并进对账。
+            submit: SubmitBehaviour::Rejected {
+                status: 429,
+                body: json!({"error": {"code": "upstream_rate_limited", "message": "slow down"}}),
+            },
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
+        64,
+    )
+    .await;
+    // 阈值调高：这条用例只看"对账案例新增"那一个触发条件。
+    let worker = harness.spawn_worker_with_alerts(&WorkerAlerts {
+        webhook: receiver.url.clone(),
+        consecutive_failures: 100,
+    });
+    let key = format!("alert-reconciliation-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "reconciliation alert"),
+    )
+    .await;
+    drop(worker);
+    assert_eq!(
+        status,
+        StatusCode::BAD_GATEWAY,
+        "结果不明对客仍是平台侧故障：{body}"
+    );
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "reconciliation_required", "这次失败必须进对账");
+
+    let alerts = receiver.wait_for(1).await;
+    assert_eq!(alerts.len(), 1, "新增一条对账案例就是一条告警：{alerts:?}");
+    assert_eq!(
+        alerts[0]["job_id"].as_str(),
+        Some(job_id.to_string().as_str())
+    );
+    assert_eq!(alerts[0]["provider_kind"].as_str(), Some("AIHubMix"));
+    assert_eq!(
+        alerts[0]["failure_kind"].as_str(),
+        Some("upstream_rate_limited"),
+        "类别是那次失败自己的类别：进对账与类别无关"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 某候选连续失败 N 次才告警，N 是**配置项**：阈值之前一条都不发，到阈值那一次才发。
+///
+/// 这里的失败是渠道限流——它自己不是平台侧事件、也不进对账，所以这条用例证明的是第三个触发条件
+/// 独立成立：一条候选连着失败到阈值就告警。收到的那一条必须属于**达到阈值的那次**执行。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_candidate_alerts_only_when_its_failure_streak_reaches_the_configured_threshold() {
+    let receiver = AlertReceiver::start(200).await;
+    let harness = Harness::start_with(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour {
+            submit: SubmitBehaviour::Rejected {
+                status: 429,
+                body: json!({"error": {"code": 429, "message": "rate_limit_error"}}),
+            },
+            ..UpstreamBehaviour::apimart()
+        },
+        64,
+    )
+    .await;
+    let _worker = harness.spawn_worker_with_alerts(&WorkerAlerts {
+        webhook: receiver.url.clone(),
+        consecutive_failures: 2,
+    });
+
+    let first = format!("alert-streak-1-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &first,
+        &route_request(harness.model, "streak one"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let (_, first_state, _) = harness.job(&first).await;
+    assert_eq!(first_state, "failed");
+    assert!(
+        receiver.bodies().is_empty(),
+        "第一次失败还没到阈值，一条都不该外发：{:?}",
+        receiver.bodies()
+    );
+
+    let second = format!("alert-streak-2-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &second,
+        &route_request(harness.model, "streak two"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "{body}");
+    let (second_job, second_state, _) = harness.job(&second).await;
+    assert_eq!(second_state, "failed");
+
+    let alerts = receiver.wait_for(1).await;
+    assert_eq!(alerts.len(), 1, "阈值上的那一次失败外发一条：{alerts:?}");
+    assert_eq!(
+        alerts[0]["job_id"].as_str(),
+        Some(second_job.to_string().as_str()),
+        "告警属于把连续失败数推到阈值的那次执行"
+    );
+    assert_eq!(alerts[0]["provider_kind"].as_str(), Some("APIMart"));
+    assert_eq!(
+        alerts[0]["failure_kind"].as_str(),
+        Some("upstream_rate_limited")
+    );
+
+    harness.cleanup().await;
+}
+
+/// 送不出去**不改**任何东西：接收器回 500（发送会重试到有界次数后认输）时，对客响应、Job 的终态与
+/// 对客错误码、预授权处置、结果信封、余额与账本，与**没配出口**时逐位相同。
+///
+/// 断言里还要看到"接收器真的被调用过"：否则这条对比证明不了旁路，只证明了两边都没发。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_webhook_that_refuses_delivery_leaves_the_job_and_the_consumer_answer_bit_identical() {
+    let without = funding_failure_outcome(None).await;
+    let receiver = AlertReceiver::start(500).await;
+    let refusing = funding_failure_outcome(Some(&WorkerAlerts {
+        webhook: receiver.url.clone(),
+        consecutive_failures: 100,
+    }))
+    .await;
+
+    assert_eq!(
+        without, refusing,
+        "告警是旁路：发不出去也不许改 Job 的处置、结算与对客结果"
+    );
+    assert!(
+        !receiver.bodies().is_empty(),
+        "接收器必须真的被调用过，否则这条对比什么也没证明"
+    );
+}
+
+/// 没配 `PROVIDER_ALERT_WEBHOOK` 时**一条都不外发**：接收器在跑、失败照样发生，它什么都收不到。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn no_configured_webhook_means_nothing_leaves_the_worker() {
+    let receiver = AlertReceiver::start(200).await;
+    let outcome = funding_failure_outcome(None).await;
+    assert_eq!(outcome.state, "failed", "失败本身照旧");
+    // 失败处置落库之后外发才可能发生：给那条路径一点时间，然后确认它什么也没发。
+    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert!(
+        receiver.bodies().is_empty(),
+        "没配出口就不外发：{:?}",
+        receiver.bodies()
+    );
+}
