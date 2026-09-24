@@ -144,7 +144,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据**、**渠道成本事实**（来源 `computed`/`declared`/`unavailable` + 原币种金额 + 该渠道声明的币种 + **按冻结汇率折算后 CNY**）。成功、"结果交付失败进对账"、Driver 在终态之后判定失败三条路径都写成本事实（拿不到事实时写 `unavailable`）；只有请求根本没交到渠道的执行四列留空 | `begin_attempt`、`complete_job`、`fail_job` |
 | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 余额、预授权、账目。**余额可为负**（透支发生在结算：实收超过保底额时差额把余额扣成负数），**保底额可为 0** | `create_job`（hold）、`complete_job`（capture）、`fail_job`（release） |
 | `identity.api_keys` | API Key 摘要 | `IdentityService` |
-| `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载"凭缓存提前拒绝"与缓存对账发现的覆盖） | `fail_job`、`ReconciliationService`、`AccelerationService`（`insert_audit_event`） |
+| `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载"凭缓存提前拒绝"与缓存对账发现的覆盖） | `fail_job`、`ReconciliationService`、`AccelerationService`（`insert_audit_event`）、`LedgerAuditor`（账户级账实不符案例） |
 
 `crates/persistence` 是这些表的唯一写入方；其他 crate 只能通过 `crates/application` 的 `HubRepository` 端口访问，不直接写 SQL。
 

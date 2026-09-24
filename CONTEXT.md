@@ -139,6 +139,10 @@ _Avoid_: 靠"发布后失效成功"保证正确性、把启用开关交给缓存
 **Cache Reconciliation**（缓存对账）:
 以数据库为准把加速层覆盖回去的定时任务：把余额按增量写回（来源标记 `reconciler`）、把不是当前生效修订的候选集拿掉，发现不一致时覆盖并写审计。它**不是** [Reconciliation Case](#reconciliation-case)：后者是上游受理状态不明、要人工处置的业务事实。
 _Avoid_: 把缓存对账当成业务对账、用缓存对账替代账实核对
+**Ledger Audit**（账实核对）:
+按账户比对**账本汇总**（`ledger.entries` 的金额之和）与**账户余额**（`ledger.accounts.balance_microusd`）的定时任务：两者本该一体（每笔分录都同时改两边），不等即说明有漏写、手工改库或半提交。不一致时**建一条账户级对账案例**（一直对不上只留一条）并**只在新建那次**发一条平台侧告警。它**只发现、不改账**——自动改回去会把"为什么对不上"一起抹掉。它**不是** [Cache Reconciliation](#cache-reconciliation缓存对账)：那条比的是库与缓存两份副本，这条比的是库里两个事实。
+_Avoid_: 把账实核对当成缓存对账、让核对任务自动改账、每轮不符都刷告警
+
 
 **Route Policy**（路由策略）:
 在一批合格候选（[Offering](#offering)）里"挑哪一条"的**运行期配置**：全局一条、可按 [Gateway Model](#gateway-model) 覆盖，未配置时默认 `priority_failover`。四种策略：`priority_failover`（按档位顺序、档内按权重）、`weighted_random`（不看档位、在全部合格候选里按权重）、`least_cost`（按**折后成本估算**最小）、`user_tag`（按 [Account Tag](#account-tag账户标签) 经映射指定）。它**不进不可变修订**（不是"卖什么"，而是"在已发布的合格候选里怎么选"），改它即刻影响之后的受理、已受理的 [Generation Job](#generation-job) 不受影响。取值空间**只有合格候选**：承载面表达不了这次请求的候选先被排除，策略与标签映射都指定不了它们；`least_cost` 与 `user_tag` 给不出答案时退回默认顺序，不判失败。
