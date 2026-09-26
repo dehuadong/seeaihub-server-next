@@ -13,6 +13,8 @@ const baseURL = `http://admin.localhost:${settings.port}`;
 
 export default defineConfig({
   testDir: './e2e',
+  // 只收 `*.spec.ts`。`.capture.ts` 是**抓图脚本**（给界面留档用，供人眼看），它不是断言，
+  // 跑 e2e 时不该被执行——需要时单独跑 `npx playwright test e2e/capture-screenshots.capture.ts`。
   testMatch: '**/*.spec.ts',
   // 每个用例都会建客户、跑请求；共用一份库时彼此会看见对方的数据，串行跑最省事也最诚实。
   workers: 1,

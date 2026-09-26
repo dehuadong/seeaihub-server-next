@@ -1,3 +1,16 @@
+import { App as AntApp, ConfigProvider, Layout, Menu, Typography, theme } from 'antd';
+import {
+  ApiOutlined,
+  AuditOutlined,
+  DeploymentUnitOutlined,
+  DollarOutlined,
+  KeyOutlined,
+  LogoutOutlined,
+  MenuFoldOutlined,
+  MenuUnfoldOutlined,
+  SwapOutlined,
+  UserOutlined,
+} from '@ant-design/icons';
 import { useCallback, useMemo, useState } from 'react';
 import { AdminClient } from './client';
 import { useAdminSession } from './session';
@@ -10,18 +23,39 @@ import { PublishPage } from './pages/Publish';
 import { RatesPage } from './pages/Rates';
 import { RoutingPage } from './pages/Routing';
 
-const NAV: { route: Route; label: string }[] = [
-  { route: 'models', label: '网关模型' },
-  { route: 'publish', label: '发布修订' },
-  { route: 'rates', label: '折算率' },
-  { route: 'routing', label: '路由策略' },
-  { route: 'accounts', label: '账户与密钥' },
-  { route: 'diagnostics', label: '对账与诊断' },
+const NAV: { route: Route; label: string; icon: React.ReactNode }[] = [
+  { route: 'models', label: '网关模型', icon: <DeploymentUnitOutlined /> },
+  { route: 'publish', label: '发布修订', icon: <ApiOutlined /> },
+  { route: 'rates', label: '折算率', icon: <DollarOutlined /> },
+  { route: 'routing', label: '路由策略', icon: <SwapOutlined /> },
+  { route: 'accounts', label: '账户与密钥', icon: <KeyOutlined /> },
+  { route: 'diagnostics', label: '对账与诊断', icon: <AuditOutlined /> },
 ];
 
+/// 管理端外壳。
+///
+/// 主题与语言在这里收口：`ConfigProvider` 一处配好，各页不必各自设字号与颜色；`AntApp` 提供
+/// `message` / `modal` 的上下文（操作反馈统一走它，不再各页自己摆一行提示文字）。
 export function App() {
+  return (
+    <ConfigProvider
+      theme={{
+        algorithm: theme.defaultAlgorithm,
+        token: { colorPrimary: '#1668dc', borderRadius: 6 },
+      }}
+    >
+      <AntApp>
+        <Console />
+      </AntApp>
+    </ConfigProvider>
+  );
+}
+
+function Console() {
   const { token, email, signOut } = useAdminSession();
   const [route, navigate] = useHashRoute();
+  const [collapsed, setCollapsed] = useState(false);
+  /// "改口令"面板默认收起：它是低频操作，不该常占着页面。
   const [showPassword, setShowPassword] = useState(false);
 
   /// 令牌的取值函数传给客户端：它每次请求时读当前值，所以换会话不必重建客户端。
@@ -32,41 +66,97 @@ export function App() {
   // 管理 API 取数请求（Spec M7）——会话过期或被吊销时，返回来的 403 会把我们带回这里。
   if (!token) return <LoginPage />;
 
+  const current = NAV.find((item) => item.route === route);
+
   return (
-    <div className="layout">
-      <aside className="sidebar">
-        <h1>seeai 运营后台</h1>
-        <p>{email}</p>
-        <nav className="nav">
-          {NAV.map((item) => (
-            <button
-              key={item.route}
-              type="button"
-              className={route === item.route ? 'active' : ''}
-              onClick={() => navigate(item.route)}
-            >
-              {item.label}
-            </button>
-          ))}
-        </nav>
-        <p style={{ marginTop: 16 }}>
-          <button type="button" onClick={() => setShowPassword((value) => !value)}>
-            {showPassword ? '收起改口令' : '改口令'}
-          </button>{' '}
-          <button type="button" onClick={signOut}>
-            退出登录
-          </button>
-        </p>
-      </aside>
-      <div>
-        {showPassword ? <ChangePasswordPanel /> : null}
-        {route === 'models' ? <ModelsPage client={client} /> : null}
-        {route === 'publish' ? <PublishPage client={client} /> : null}
-        {route === 'rates' ? <RatesPage client={client} /> : null}
-        {route === 'routing' ? <RoutingPage client={client} /> : null}
-        {route === 'accounts' ? <AccountsPage client={client} /> : null}
-        {route === 'diagnostics' ? <DiagnosticsPage client={client} /> : null}
-      </div>
-    </div>
+    <Layout style={{ minHeight: '100vh' }}>
+      <Layout.Sider
+        theme="light"
+        collapsible
+        collapsed={collapsed}
+        onCollapse={setCollapsed}
+        trigger={null}
+        width={216}
+        style={{ borderInlineEnd: '1px solid #f0f0f0' }}
+      >
+        <div style={{ padding: collapsed ? '16px 8px' : '16px 20px' }}>
+          <Typography.Text strong style={{ fontSize: 16, whiteSpace: 'nowrap' }}>
+            {collapsed ? 'seeai' : 'seeai 运营后台'}
+          </Typography.Text>
+        </div>
+        <Menu
+          mode="inline"
+          selectedKeys={[route]}
+          style={{ borderInlineEnd: 0 }}
+          items={NAV.map((item) => ({
+            key: item.route,
+            icon: item.icon,
+            label: item.label,
+          }))}
+          onClick={({ key }) => navigate(key as Route)}
+        />
+      </Layout.Sider>
+      <Layout>
+        <Layout.Header
+          style={{
+            background: '#fff',
+            borderBottom: '1px solid #f0f0f0',
+            paddingInline: 20,
+            display: 'flex',
+            alignItems: 'center',
+            justifyContent: 'space-between',
+          }}
+        >
+          <Menu
+            mode="horizontal"
+            selectable={false}
+            style={{ borderBottom: 0, flex: 1 }}
+            items={[
+              {
+                key: 'toggle',
+                icon: collapsed ? <MenuUnfoldOutlined /> : <MenuFoldOutlined />,
+                label: '',
+                onClick: () => setCollapsed((value) => !value),
+              },
+              { key: 'where', label: current?.label ?? '', disabled: true },
+            ]}
+          />
+          <Menu
+            mode="horizontal"
+            selectable={false}
+            style={{ borderBottom: 0 }}
+            items={[
+              {
+                key: 'me',
+                icon: <UserOutlined />,
+                label: email ?? '',
+                children: [
+                  { key: 'password', label: '改口令' },
+                  { type: 'divider' as const },
+                  { key: 'signout', label: '退出登录', icon: <LogoutOutlined />, danger: true },
+                ],
+                onClick: ({ key }) => {
+                  if (key === 'signout') signOut();
+                  if (key === 'password') setShowPassword(true);
+                },
+              },
+            ]}
+          />
+        </Layout.Header>
+        <Layout.Content style={{ padding: 20 }}>
+          {showPassword ? (
+            <div style={{ marginBottom: 16 }}>
+              <ChangePasswordPanel onClose={() => setShowPassword(false)} />
+            </div>
+          ) : null}
+          {route === 'models' ? <ModelsPage client={client} /> : null}
+          {route === 'publish' ? <PublishPage client={client} /> : null}
+          {route === 'rates' ? <RatesPage client={client} /> : null}
+          {route === 'routing' ? <RoutingPage client={client} /> : null}
+          {route === 'accounts' ? <AccountsPage client={client} /> : null}
+          {route === 'diagnostics' ? <DiagnosticsPage client={client} /> : null}
+        </Layout.Content>
+      </Layout>
+    </Layout>
   );
 }

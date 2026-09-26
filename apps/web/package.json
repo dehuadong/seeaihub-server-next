@@ -9,9 +9,12 @@
     "typecheck": "tsc --noEmit",
     "preview": "vite preview",
     "e2e": "playwright test",
+    "capture": "playwright test --config playwright.capture.config.ts",
     "check:isolation": "node e2e/check-bundle-isolation.mjs"
   },
   "dependencies": {
+    "@ant-design/icons": "^6.3.4",
+    "antd": "^6.6.5",
     "react": "^19.2.0",
     "react-dom": "^19.2.0"
   },

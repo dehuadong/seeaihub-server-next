@@ -15,7 +15,17 @@ test.describe('管理页面读的是库里的数据', () => {
     await page.getByTestId('admin-email').fill(settings.adminEmail);
     await page.getByTestId('admin-password').fill(settings.adminPassword);
     await page.getByTestId('admin-sign-in').click();
-    await expect(page.getByRole('button', { name: '网关模型' })).toBeVisible();
+    // 侧栏出现即已进后台；限定在侧栏里，页头另有一份"当前在哪一页"的指示。
+    await expect(sidebar(page, '网关模型')).toBeVisible();
+  }
+
+  /// 切到某一页。导航项不是 button，是按角色的 menuitem；限定在侧栏内避免与页头重复。
+  async function goTo(page: Page, label: string): Promise<void> {
+    await sidebar(page, label).click();
+  }
+
+  function sidebar(page: Page, label: string) {
+    return page.locator('.ant-layout-sider').getByRole('menuitem', { name: label });
   }
 
   test('折算率页显示刚录入的那一行', async ({ page, request }) => {
@@ -28,7 +38,7 @@ test.describe('管理页面读的是库里的数据', () => {
     expect(written.status()).toBe(204);
 
     await signIn(page);
-    await page.getByRole('button', { name: '折算率' }).click();
+    await goTo(page, '折算率');
 
     // 页面上出现的必须是**这一行**：币种对得上，数值也对得上（7.15）。
     const row = page.getByRole('row', { name: new RegExp(currency) });
@@ -46,18 +56,17 @@ test.describe('管理页面读的是库里的数据', () => {
     expect(accountId).toBeTruthy();
 
     await signIn(page);
-    await page.getByRole('button', { name: '账户与密钥' }).click();
+    await goTo(page, '账户与密钥');
 
     // 在这一页上按刚建的账户标识去读余额：读出来的必须正是那个数（12.34 元）。
     await page.getByTestId('accounts-lookup-id').fill(accountId);
     await page.getByRole('button', { name: '读余额与流水' }).click();
 
-    // 余额那一格同时印元和微单位，所以按**那一格**断言，不用裸文本（会命中两处）。
-    const balanceCell = page
-      .locator('.field')
-      .filter({ hasText: '余额' })
-      .first();
-    await expect(balanceCell).toContainText('12.34 元');
-    await expect(balanceCell).toContainText('12340000 微单位');
+    // 余额与微单位分两行显示，所以按**那一块描述列表**断言，不用裸文本（会命中两处）。
+    // antd 会把文本切成多个节点，`getByText('12.34 元')` 匹配不到——按容器 + 归一化文本断言。
+    const balanceBlock = page.locator('.ant-descriptions').first();
+    await expect(balanceBlock).toContainText('12.34');
+    await expect(balanceBlock).toContainText('12340000');
+    await expect(balanceBlock).toContainText('微单位');
   });
 });

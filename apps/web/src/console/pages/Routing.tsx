@@ -1,7 +1,10 @@
+import { Alert, App as AntApp, Button, Form, Input, Select, Table, Tag, Typography } from 'antd';
+import { SaveOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { AdminClient } from '../client';
 import type { RouteStrategy } from '../../shared/types';
-import { Page, useLoadable } from '../../shared/ui';
+import { useLoadable } from '../../shared/ui';
+import { ConsolePage, Panel } from '../ui';
 
 const STRATEGIES: { value: RouteStrategy; label: string }[] = [
   { value: 'priority_failover', label: '按档位顺序（默认）' },
@@ -10,27 +13,39 @@ const STRATEGIES: { value: RouteStrategy; label: string }[] = [
   { value: 'user_tag', label: '按账户标签映射' },
 ];
 
+const STRATEGY_LABEL = new Map(STRATEGIES.map((item) => [item.value, item.label]));
+
 /// 路由策略：**在合格候选里挑哪一条**由运营配置。它不进不可变修订，改它即刻影响之后的受理；
 /// 已受理的 Job 的候选与定价早已随快照冻结，不受影响。
 export function RoutingPage({ client }: { client: AdminClient }) {
+  const { message } = AntApp.useApp();
   const policies = useLoadable(() => client.routePolicies(), [client]);
-  const [scope, setScope] = useState('');
-  const [strategy, setStrategy] = useState<RouteStrategy>('priority_failover');
-  const [discounts, setDiscounts] = useState('');
-  const [tags, setTags] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [form] = Form.useForm<{
+    scope?: string;
+    strategy: RouteStrategy;
+    discounts?: string;
+    tags?: string;
+  }>();
 
-  async function submit() {
+  async function submit(values: {
+    scope?: string;
+    strategy: RouteStrategy;
+    discounts?: string;
+    tags?: string;
+  }) {
     setBusy(true);
     setError(null);
     try {
       await client.upsertRoutePolicy(
-        scope.trim() || null,
-        strategy,
-        parseNumberMap(discounts, '折扣率'),
-        parseStringMap(tags, '标签映射'),
+        values.scope?.trim() || null,
+        values.strategy,
+        parseNumberMap(values.discounts ?? '', '折扣率'),
+        parseStringMap(values.tags ?? '', '标签映射'),
       );
+      message.success('策略已写入');
+      form.resetFields(['scope', 'discounts', 'tags']);
       policies.reload();
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
@@ -40,77 +55,106 @@ export function RoutingPage({ client }: { client: AdminClient }) {
   }
 
   return (
-    <Page title="路由策略" hint="不配置＝按档位顺序，即零配置行为" error={error ?? policies.error} loading={policies.loading} onReload={policies.reload}>
-      <div className="panel">
-        <h3>写入（或覆盖）一条策略</h3>
-        <div className="row">
-          <label className="field">
-            <span>作用域（空＝全局）</span>
-            <input value={scope} onChange={(event) => setScope(event.target.value)} placeholder="gpt-image-2.5-flare" size={26} />
-          </label>
-          <label className="field">
-            <span>策略</span>
-            <select value={strategy} onChange={(event) => setStrategy(event.target.value as RouteStrategy)}>
-              {STRATEGIES.map((item) => (
-                <option key={item.value} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-        </div>
-        <div className="row" style={{ marginTop: 8 }}>
-          <label className="field">
-            <span>折扣率（只有按成本最小用；形如 offeringId=8000，逗号分隔）</span>
-            <input value={discounts} onChange={(event) => setDiscounts(event.target.value)} size={40} />
-          </label>
-        </div>
-        <div className="row" style={{ marginTop: 8 }}>
-          <label className="field">
-            <span>标签映射（只有账户标签策略用；形如 vip=offeringId，逗号分隔）</span>
-            <input value={tags} onChange={(event) => setTags(event.target.value)} size={40} />
-          </label>
-          <button type="button" disabled={busy} onClick={submit}>
-            {busy ? '写入中…' : '写入'}
-          </button>
-        </div>
-        <p className="muted">
-          任何策略都不得选中不合格候选——策略只决定"在合格候选里挑哪一条"。写进一个实现不了的取值会被拒，
-          不会悄悄落成默认。
-        </p>
-      </div>
+    <ConsolePage
+      title="路由策略"
+      hint="不配置＝按档位顺序，即零配置行为"
+      error={error ?? policies.error}
+      loading={policies.loading}
+      onReload={policies.reload}
+    >
+      <Panel
+        title="写入（或覆盖）一条策略"
+        description="任何策略都不得选中不合格候选——策略只决定在合格候选里挑哪一条。写进一个实现不了的取值会被拒，不会悄悄落成默认。"
+      >
+        <Form
+          form={form}
+          layout="vertical"
+          onFinish={submit}
+          initialValues={{ strategy: 'priority_failover' }}
+        >
+          <div
+            style={{
+              display: 'grid',
+              gridTemplateColumns: 'repeat(auto-fit, minmax(240px, 1fr))',
+              gap: 16,
+            }}
+          >
+            <Form.Item name="scope" label="作用域（空＝全局）">
+              <Input placeholder="gpt-image-2.5-flare" allowClear />
+            </Form.Item>
+            <Form.Item name="strategy" label="策略" rules={[{ required: true }]}>
+              <Select options={STRATEGIES} />
+            </Form.Item>
+            <Form.Item
+              name="discounts"
+              label="折扣率（只有按成本最小用）"
+              tooltip="形如 offeringId=8000，逗号分隔"
+            >
+              <Input placeholder="offering-id=8000" allowClear />
+            </Form.Item>
+            <Form.Item
+              name="tags"
+              label="标签映射（只有账户标签策略用）"
+              tooltip="形如 vip=offeringId，逗号分隔"
+            >
+              <Input placeholder="vip=offering-id" allowClear />
+            </Form.Item>
+          </div>
+          <Form.Item style={{ marginBottom: 0 }}>
+            <Button type="primary" icon={<SaveOutlined />} htmlType="submit" loading={busy}>
+              写入
+            </Button>
+          </Form.Item>
+        </Form>
+      </Panel>
 
-      <div className="panel">
-        <h3>当前策略</h3>
-        {(policies.data?.route_policies ?? []).length === 0 ? (
-          <p className="muted">一条策略都没有：走默认的按档位顺序。</p>
-        ) : (
-          <table>
-            <thead>
-              <tr>
-                <th>作用域</th>
-                <th>策略</th>
-                <th>折扣率</th>
-                <th>标签映射</th>
-                <th>版本</th>
-              </tr>
-            </thead>
-            <tbody>
-              {(policies.data?.route_policies ?? []).map((policy, index) => (
-                <tr key={`${policy.gateway_model ?? 'global'}-${index}`}>
-                  <td>{policy.gateway_model ?? '全局'}</td>
-                  <td>{policy.strategy}</td>
-                  <td className="mono">{Object.entries(policy.discount_rates).map(([k, v]) => `${k}=${v}`).join(', ') || '—'}</td>
-                  <td className="mono">{Object.entries(policy.tag_channel_map).map(([k, v]) => `${k}=${v}`).join(', ') || '—'}</td>
-                  <td>{policy.version}</td>
-                </tr>
-              ))}
-            </tbody>
-          </table>
-        )}
-      </div>
-    </Page>
+      <Panel title="当前策略" extra={<Button onClick={policies.reload}>重取</Button>}>
+        <Table
+          size="small"
+          loading={policies.loading}
+          rowKey={(policy, index) => `${policy.gateway_model ?? 'global'}-${index ?? 0}`}
+          dataSource={policies.data?.route_policies ?? []}
+          pagination={false}
+          locale={{
+            emptyText: (
+              <Alert type="info" showIcon message="一条策略都没有：走默认的按档位顺序。" />
+            ),
+          }}
+          columns={[
+            {
+              title: '作用域',
+              dataIndex: 'gateway_model',
+              render: (value: string | null) =>
+                value ? <Typography.Text code>{value}</Typography.Text> : <Tag>全局</Tag>,
+            },
+            {
+              title: '策略',
+              dataIndex: 'strategy',
+              render: (value: RouteStrategy) => STRATEGY_LABEL.get(value) ?? value,
+            },
+            {
+              title: '折扣率',
+              dataIndex: 'discount_rates',
+              render: (value: Record<string, number>) => mapText(value),
+            },
+            {
+              title: '标签映射',
+              dataIndex: 'tag_channel_map',
+              render: (value: Record<string, string>) => mapText(value),
+            },
+            { title: '版本', dataIndex: 'version', align: 'right', width: 80 },
+          ]}
+        />
+      </Panel>
+    </ConsolePage>
   );
+}
+
+/// 把 `{a: 1}` 这类映射渲染成一行等宽文本；空映射显示 `—`，不显示一个空单元格。
+function mapText(value: Record<string, unknown> | null | undefined): string {
+  const entries = Object.entries(value ?? {});
+  if (entries.length === 0) return '—';
+  return entries.map(([key, item]) => `${key}=${item}`).join(', ');
 }
 
 /// `a=1,b=2` → `{a: 1, b: 2}`。形状写错就当场说清，不静默丢键。
