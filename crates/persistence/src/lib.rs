@@ -2930,13 +2930,48 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)
     }
 
+    async fn ensure_admin_account(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<(Uuid, bool), ApplicationError> {
+        // `DO NOTHING` 是这条的关键：账号已存在时**连口令都不动**。运维改过口令之后，
+        // 每次重启再把环境变量里的值写回去等于把口令打回初始值。
+        //
+        // 插进去的那次影响 1 行（新建）；撞上已有账号时影响 0 行，此时再按邮箱把它读出来。
+        let inserted: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            INSERT INTO identity.admin_users (id, email, password_hash)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (lower(email)) DO NOTHING
+            RETURNING id
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(email)
+        .bind(password_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if let Some(id) = inserted {
+            return Ok((id, true));
+        }
+        let existing: Uuid = sqlx::query_scalar(
+            "SELECT id FROM identity.admin_users WHERE lower(email) = lower($1)",
+        )
+        .bind(email)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok((existing, false))
+    }
+
     async fn upsert_admin_password(
         &self,
         email: &str,
         password_hash: &str,
     ) -> Result<Uuid, ApplicationError> {
-        // 按邮箱 upsert：首次引导建号，之后运维改口令走同一条路径。`last_login_at` **不动**——
-        // 改口令不是一次登录。
+        // 按邮箱 upsert：**覆盖**口令，用于运维按邮箱改口令（引导不走这条，见 `ensure_admin_account`）。
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO identity.admin_users (id, email, password_hash)

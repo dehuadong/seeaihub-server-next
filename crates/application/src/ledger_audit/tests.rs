@@ -179,6 +179,14 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
+    async fn ensure_admin_account(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+    ) -> Result<(Uuid, bool), ApplicationError> {
+        unused_repository()
+    }
+
     async fn upsert_admin_password(
         &self,
         _email: &str,

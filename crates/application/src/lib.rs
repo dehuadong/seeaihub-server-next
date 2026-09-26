@@ -2109,7 +2109,17 @@ pub trait HubRepository: Send + Sync {
         email: &str,
     ) -> Result<Option<(Uuid, String)>, ApplicationError>;
 
-    /// 写入（或覆盖）一个管理员账号的口令：按邮箱 upsert。用于首次引导与运维改口令。
+    /// **只在账号不存在时**建立它，返回 `(admin_id, 是否新建)`。
+    ///
+    /// 引导走这条而不是 [`Self::upsert_admin_password`]：运维改过口令之后，每次重启再把环境变量里
+    /// 那个值写回去，等于把口令打回初始值——引导必须幂等且**不改已有账号**。
+    async fn ensure_admin_account(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<(Uuid, bool), ApplicationError>;
+
+    /// 写入（或覆盖）一个管理员账号的口令：按邮箱 upsert。
     async fn upsert_admin_password(
         &self,
         email: &str,
@@ -2523,16 +2533,21 @@ impl IdentityService {
             .await
     }
 
-    /// 引导管理员账号：按邮箱 upsert 口令。运维在部署时用它设初始邮箱与口令。
+    /// 引导管理员账号：按邮箱**只建不改**。运维在部署时用它设初始邮箱与口令。
     ///
     /// **明文口令进得来、出不去**：只把哈希交给仓储。邮箱或口令不合形状时明确失败，不悄悄建一个
-    /// 登不进去的账号。
+    /// 登不进去的账号。账号已存在时**什么都不做**（连口令都不动）——否则每次重启都会把运维改过的
+    /// 口令打回环境变量里的那个。
     pub async fn seed_admin(&self, email: &str, password: &str) -> Result<Uuid, ApplicationError> {
         let email = normalize_email(email)?;
         check_secret(password, "admin password")?;
         let hash = hash_password(password)?;
-        let admin_id = self.repository.upsert_admin_password(&email, &hash).await?;
-        tracing::info!(%email, %admin_id, "admin account is ready");
+        let (admin_id, created) = self.repository.ensure_admin_account(&email, &hash).await?;
+        if created {
+            tracing::info!(%email, %admin_id, "admin account is ready");
+        } else {
+            tracing::info!(%email, %admin_id, "admin account already exists; the bootstrap left it untouched");
+        }
         Ok(admin_id)
     }
 
