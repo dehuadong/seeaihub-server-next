@@ -59,3 +59,30 @@ fn an_input_reference_image_limit_is_not_an_output_count() {
         "a carrier that accepts 16 reference images declares nothing about n"
     );
 }
+
+/// 读取按**调用方给的名字**走：承载面把输出张数声明成别的线上名时，用那个名字读到的是同一条规则
+/// 的同一个数（受理时按候选承载面收敛就靠它）。
+#[test]
+fn the_maximum_is_read_by_the_name_the_caller_asks_for() {
+    let carrier_schema = serde_json::json!({
+        "properties": {"num_images": {"type": "integer", "minimum": 1, "maximum": 4}}
+    });
+    assert_eq!(
+        declared_output_image_maximum(&carrier_schema, "num_images"),
+        Some(4)
+    );
+    assert_eq!(
+        declared_output_image_maximum(&carrier_schema, "n"),
+        None,
+        "承载面没声明 `n` 这个名字：不能凭空读出一个上限"
+    );
+    // 这个读法不带取值语义：`maximum: 0` 原样读出来。按 0 当"没声明"是**超时链**的口径，
+    // 由 `declared_output_images` 那一侧过滤（那条路按 0 比会让上限恒真）。
+    assert_eq!(
+        declared_output_image_maximum(
+            &serde_json::json!({"properties": {"n": {"type": "integer", "maximum": 0}}}),
+            "n"
+        ),
+        Some(0)
+    );
+}

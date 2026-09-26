@@ -55,6 +55,108 @@ fn parameters_the_contract_never_declared_are_dropped_without_an_error() {
     assert_eq!(prepared, Value::Object(face));
 }
 
+/// 输出张数超过**这条候选承载面**声明的上限时夹到上限，跟着这份参数面落进 Job、发给上游。
+///
+/// 界不是一个平台级的数，也不是合同那一个数：同一份合同下各候选声明的上限不同（AIHubMix 10、
+/// APIMart 4）。夹只发生在**超上界**这一侧：上界之内照原样发，承载面根本没声明 `n` 时这条候选
+/// 连这个字段都承载不了（既有口径，与本件无关）。
+#[test]
+fn the_requested_image_count_is_capped_at_the_carriers_declared_maximum() {
+    let mut vendor = offering();
+    let contract = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10}
+    }));
+    vendor.capability_schema = contract.clone();
+    vendor.carrier_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 4}
+    }));
+
+    let over = image_request(serde_json::json!({"prompt": "hello", "n": 6}));
+    let face = contract_parameter_face(&over, &contract).expect("6 is within the contract");
+    let prepared = prepare_carrier_parameters(&face, &over, &vendor).expect(
+        "a count above the carrier's maximum is capped, not a reason to drop the candidate",
+    );
+    assert_eq!(
+        prepared.get("n"),
+        Some(&serde_json::json!(4)),
+        "这条候选最多 4 张，请求 6 张按 4 张发：{prepared}"
+    );
+
+    for inside in [1, 3, 4] {
+        let request = image_request(serde_json::json!({"prompt": "hello", "n": inside}));
+        let face = contract_parameter_face(&request, &contract).expect("within the contract");
+        let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+            .expect("the carrier accepts a count up to its maximum");
+        assert_eq!(
+            prepared.get("n"),
+            Some(&serde_json::json!(inside)),
+            "上限之内的 {inside} 张原样发出，不许被夹到别的数：{prepared}"
+        );
+    }
+
+    // 承载面没声明 `n`：它连这个参数都承载不了，请求用到了它就是这条候选不合格（既有口径），
+    // 不是"夹成一张"。
+    let mut without_n = offering();
+    without_n.capability_schema = contract.clone();
+    let request = image_request(serde_json::json!({"prompt": "hello", "n": 6}));
+    let face = contract_parameter_face(&request, &without_n.capability_schema)
+        .expect("the contract declares n");
+    let reason = prepare_carrier_parameters(&face, &request, &without_n)
+        .expect_err("the carrier does not declare n at all");
+    assert!(reason.contains('n'), "{reason}");
+
+    // 上限声明成 1 也是同一条规则：请求几张都按 1 张发。
+    let mut one_at_most = offering();
+    one_at_most.capability_schema = contract.clone();
+    one_at_most.carrier_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 1}
+    }));
+    let request = image_request(serde_json::json!({"prompt": "hello", "n": 6}));
+    let face = contract_parameter_face(&request, &contract).expect("within the contract");
+    let prepared = prepare_carrier_parameters(&face, &request, &one_at_most)
+        .expect("one image at most is still a carrier that can take the request");
+    assert_eq!(prepared.get("n"), Some(&serde_json::json!(1)), "{prepared}");
+}
+
+/// 上界按**承载面线上那个名字**找：承载面把输出张数叫 `num_images`、由改名表把 `n` 接过去时，
+/// 超界的值照样夹得住——不会因为换了个线上名字就把 `6` 原样发给只收 4 张的渠道。
+#[test]
+fn the_cap_follows_the_carriers_wire_name_for_the_image_count() {
+    let mut vendor = offering();
+    let contract = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10}
+    }));
+    vendor.capability_schema = contract.clone();
+    vendor.carrier_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "num_images": {"type": "integer", "minimum": 1, "maximum": 4}
+    }));
+    vendor.parameter_mapping = serde_json::json!({"rename": {"n": "num_images"}});
+
+    let request = image_request(serde_json::json!({"prompt": "hello", "n": 6}));
+    let face = contract_parameter_face(&request, &contract).expect("6 is within the contract");
+    let prepared = prepare_carrier_parameters(&face, &request, &vendor)
+        .expect("the carrier carries n under its wire name");
+    assert_eq!(
+        prepared.get("num_images"),
+        Some(&serde_json::json!(4)),
+        "线上名字是 `num_images`，夹后的值落在它上面：{prepared}"
+    );
+    assert!(
+        prepared.get("n").is_none(),
+        "合同名 `n` 已经被改名落到线上名上：{prepared}"
+    );
+}
+
 /// 请求**用到的**字段必须在这条候选的承载面里；缺了就是这条候选不合格。
 ///
 /// 注意它与"请求违反合同"是两件事：请求本身没问题（`quality` 在合同里），只是这条供给

@@ -18,6 +18,7 @@ use seeai_domain::{
     declared_size_mapping, declares_mask_parameter, declares_parameter,
     declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
     place_image_inputs, platform_image_parameters, resolve_size_tier, unit_amount_microusd,
+    wire_parameter_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -5068,6 +5069,46 @@ fn declared_integer_value(value: &Value) -> Option<i64> {
     (number.fract() == 0.0).then_some(number as i64)
 }
 
+/// 把参数面上的输出张数 `n` 夹到**这条候选承载面**为它声明的 `maximum`。
+///
+/// 请求里的 `n` 是"最多要几张"，不是"必须给我几张"：合同声明 `10`、这条候选只声明 `4` 时，
+/// 调用方给 `6` 表达的是"至少 4 张也成，多多益善"。夹到 `4` 照常受理，比为此判这条候选承载不了
+/// （换候选，全不行即 503）更贴合那个意思——值在合同之内，调用方没有说错话。
+///
+/// 上界按**承载面最终落到的那个名字**找（承载面自己声明了 `n` 就用它，否则看改名表把 `n` 落到
+/// 哪个名字上，与承载校验是同一条规则）：这样"承载面线上叫 `num_images`"的候选照样夹得住，
+/// 不会因为换了个线上名字就把超界的值原样发出去。平台拿这个数算超时与单次成本（见
+/// [`requested_image_count`] 与 [`single_request_cost_cny`]），所以改了它两处跟着改。承载面声明的
+/// 下界不在这里判：把值往上抬等于替调用方多要图，平台不做这件事。
+///
+/// 这里不套用 [`declared_output_image_maximum`]：那个读法把 `maximum: 0` 当"没声明"（超时链的
+/// 口径），而这条路上 0 就是"一张都出不了"——照读照夹，不额外发明一个语义。
+fn cap_output_image_count(
+    carrier: &Value,
+    renames: Option<&ParameterRenames>,
+    parameters: &mut Map<String, Value>,
+) {
+    // 判据是承载面**自己**那份声明：各候选的界不同（同一份合同下 AIHubMix 声明 10、APIMart 声明 4）。
+    let Some(wire_name) = wire_parameter_name(carrier, renames, "n") else {
+        return;
+    };
+    let Some(maximum) = carrier
+        .get("properties")
+        .and_then(|properties| properties.get(&wire_name))
+        .and_then(|n| n.get("maximum"))
+        .and_then(Value::as_u64)
+    else {
+        return;
+    };
+    let over = parameters
+        .get("n")
+        .and_then(declared_integer_value)
+        .is_some_and(|requested| requested > maximum as i64);
+    if over {
+        parameters.insert("n".to_owned(), Value::from(maximum));
+    }
+}
+
 /// 合同字段名下的图片输入是否"在场"。
 ///
 /// 参考图与遮罩在受理侧就按契约字段名从参数面里取了出来（它们有自己的去处：选路后落到候选声明的
@@ -5093,16 +5134,21 @@ fn contract_image_input_present(request: &CreateImageGenerationRequest, name: &s
 ///   发出去的字段——像素面渠道的线上根本没有 `resolution` 这个名字，正因为有换算它才承载得了；
 /// - 换算本身失败（档案缺那一格、取值不成形状）同样是"这条候选不合格"，理由照旧写进判定记录。
 ///
+/// **输出张数 `n` 超过这条候选声明的上界不算承载不了**：值取该上界发出去（见
+/// [`cap_output_image_count`]）——`n` 是"最多要几张"，请求给得更多是"少给几张也成"。承载校验
+/// 不判取值：这条候选声明的 `n` 下界不是判据，低于它的值原样上行，由上游按自己的 schema 处置。
+///
 /// 合格之后才组装要落进 Job、并发给上游的参数面：
 /// 1. 按承载留下名字：承载面声明了这个名字就用它，否则用改名表映射出来的**线上名字**；两边都
 ///    落不到的名字（含调用方给了空值的）在这里去掉——空值不携带信息，而发一个承载不了的字段名
 ///    给上游，只会得到上游自己的一套解释；
 /// 2. 把参考图与遮罩落到这条候选**自己声明的**参数名上（声明不了就是不合格，绝不静默丢图）；
 /// 3. 注入映射声明的**显式默认值**：调用方没给的字段由平台定，而不是由渠道自己的默认值定；
-/// 4. 按映射声明做**尺寸换算**：这一步在改名之前做，因为换算的源字段是**合同字段名**；
-/// 5. 改名：把还没落到线上的合同字段名换成这条供给线上要发的名字；
-/// 6. 按**取值映射表**把取值换成线上取值：表里没有的取值让这条候选不合格（不猜、不透传原值）；
-/// 7. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
+/// 4. 把输出张数 `n` 夹到这条候选**自己声明的**上限（见 [`cap_output_image_count`]）；
+/// 5. 按映射声明做**尺寸换算**：这一步在改名之前做，因为换算的源字段是**合同字段名**；
+/// 6. 改名：把还没落到线上的合同字段名换成这条供给线上要发的名字；
+/// 7. 按**取值映射表**把取值换成线上取值：表里没有的取值让这条候选不合格（不猜、不透传原值）；
+/// 8. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
 ///    平台不替它省。放在最后是因为前几步都可能把必填项补上（图落在承载面的名字上、默认值注入、
 ///    尺寸换算写进目标字段），先判会把"其实跑得通"的候选误判成不合格。
 ///
@@ -5151,6 +5197,7 @@ fn prepare_carrier_parameters(
         declared_defaults(mapping),
         &mut parameters,
     );
+    cap_output_image_count(&offering.carrier_schema, renames.as_ref(), &mut parameters);
     if let Some(size) = &size {
         // 换算结果写进承载面声明的目标字段。发布期已经拦下"目标字段没被承载面声明"的映射，
         // 这里再判一次是因为落库的那一行也可能来自更早的发布：宁可判这条候选不合格，

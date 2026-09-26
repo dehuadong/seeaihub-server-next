@@ -6,7 +6,7 @@ status: accepted
 
 **决定**：在一批**合格候选**里"挑哪一条"由**运营配置的路由策略**决定。策略存**运行期可改的表**（`route_policies`），**不进不可变 Runtime Revision**——发布物定的是"有哪些候选、按什么顺序"（[0009](./0009-multiple-active-offerings-and-routing.md)），策略定的是"在合格候选里怎么挑"，两者不是同一个量。作用域**全局一条 + 可按网关模型覆盖**（按模型取"有覆盖用覆盖、没有用全局"）；**未配置时默认 `priority_failover`**——按 `routing_priority` 数字小者优先、该档没有合格候选时依次降级、同一档内按 `weight` 分摊，即**今天的行为**。因此零配置下选路逐位相同：策略层是"加旋钮"，不是"换引擎"。
 
-**策略只是"选一条合格候选"，候选合格性优先于策略**：承载面表达不了这次请求、分支/张数不被该候选允许的候选**先被排除**（合格是合取判据，见 [0009](./0009-multiple-active-offerings-and-routing.md)），**任何策略都不得选中不合格候选**——策略的取值空间只有合格候选，没有"策略指定了就绕过承载校验"这回事；全部候选都不合格时仍是 [0009](./0009-multiple-active-offerings-and-routing.md) 的结论（调用上游之前失败），策略不改这个结果。策略**不改写参数映射与承载面**（调用方合同与承载面归 [0015](./0015-vendor-model-contract-and-offering-parameter-mapping.md) 的 Offering Parameter Mapping），也不改请求参数、对客价格与成本口径。
+**策略只是"选一条合格候选"，候选合格性优先于策略**：承载面表达不了这次请求或分支不允许的候选**先被排除**（合格是合取判据，见 [0009](./0009-multiple-active-offerings-and-routing.md)；承载校验只判字段名，`n` 超过候选承载面声明的上界由 [0015](./0015-vendor-model-contract-and-offering-parameter-mapping.md) 的 2026-09-24 修订段按上限发出，不合格性不因此成立），**任何策略都不得选中不合格候选**——策略的取值空间只有合格候选，没有"策略指定了就绕过承载校验"这回事；全部候选都不合格时仍是 [0009](./0009-multiple-active-offerings-and-routing.md) 的结论（调用上游之前失败），策略不改这个结果。策略**不改写参数映射与承载面**（调用方合同与承载面归 [0015](./0015-vendor-model-contract-and-offering-parameter-mapping.md) 的 Offering Parameter Mapping），也不改请求参数、对客价格与成本口径。
 
 **策略的输入**：`priority`（数字小者优先）、`weight`（加权随机）、`discount_rate`（**只作 `least_cost` 的比较输入，不进成本**）、**账户标签**（`user_tag`，为此账户对象要加标签字段）。四个量都只是**输入**、单独不生效——只有某条生效的策略在消费它时，改它才改变选路。**成本永远记实际扣费**（`Declared` 取上游 `cost`、`Computed` 按实际 `usage` 分项 token × 费率，见 [0006](./0006-no-settlement-without-metering-evidence.md)）；`discount_rate` 只是 `least_cost` 用的**估算**，**与实际扣费不一致时以实际扣费为准**——它不进账本、不改成本事实、不改对客金额。
 

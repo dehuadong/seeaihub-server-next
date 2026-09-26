@@ -696,7 +696,7 @@ impl CostBasis {
 /// 零配置时的默认值是 [`RouteStrategy::PriorityFailover`]——它按 `routing_priority` 数字小的
 /// 优先、该档不合格时依次降级、同档内按 `weight` 分摊，也就是策略层引入之前的行为。
 ///
-/// 取值空间**只有合格候选**：承载面表达不了这次请求、分支或张数不被允许的候选先被排除，
+/// 取值空间**只有合格候选**：承载面表达不了这次请求、或分支不被该候选允许的候选先被排除，
 /// 任何策略都不得选中它们。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]

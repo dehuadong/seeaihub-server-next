@@ -355,6 +355,67 @@ fn weight_never_outranks_a_tier_that_has_an_eligible_candidate() {
     }
 }
 
+/// 输出张数超过某条候选承载面的上界**不影响它合格**：两条候选都进合格集合，选路结果与"谁会被夹"
+/// 无关；被选中那条发出去的是它自己的上限。
+///
+/// 判据是"合格性先于策略"落在这里的形态：夹取发生在组装参数面时，而合格与否是同一趟算出来的——
+/// 若把超上界当成不合格，这条权重策略就会永远跳过它，而调用方什么错都没犯。
+#[test]
+fn a_count_above_the_carriers_maximum_does_not_disqualify_it() {
+    let contract = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10}
+    }));
+    // 同档两条：窄承载面（`n` 最多 4）权重 1000，宽承载面（跟合同一样 10）权重 1。
+    let mut narrow = offering();
+    narrow.capability_schema = contract.clone();
+    narrow.carrier_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 4}
+    }));
+    let mut wide = offering();
+    wide.capability_schema = contract.clone();
+    wide.carrier_schema = contract;
+    wide.offering_id = OfferingId::new();
+    let candidates = vec![
+        candidate_with_weight(&narrow, 0, 1_000),
+        candidate_with_weight(&wide, 0, 1),
+    ];
+    let choice = RouteChoice {
+        strategy: RouteStrategy::WeightedRandom,
+        discount_rates: &BTreeMap::new(),
+        tag_channel_map: &BTreeMap::new(),
+        account_tag: None,
+    };
+    for index in 0..16 {
+        let mut request = image_request(serde_json::json!({"prompt": "hello", "n": 6}));
+        request.idempotency_key = format!("capped-key-{index}");
+        let branch = request.branch().expect("prompt only");
+        let (chosen, parameters, decision) =
+            select_candidate_with_strategy(&request, branch, &candidates, None, &choice)
+                .expect("both carriers take a request for 6 images");
+        assert!(
+            decision
+                .considered
+                .iter()
+                .all(|considered| considered.eligible),
+            "两条候选都合格：超承载面上界不是落选理由：{:?}",
+            decision.considered
+        );
+        assert_eq!(
+            chosen.offering_id, narrow.offering_id,
+            "权重 1000 的那条照常按权重赢下分流"
+        );
+        assert_eq!(
+            parameters.get("n"),
+            Some(&serde_json::json!(4)),
+            "选中那条发出去的是它自己声明的上限：{parameters}"
+        );
+    }
+}
+
 /// 不合格的候选**不进分摊**：权重写得再大也换不来一次选中。
 ///
 /// 这就是"候选合格性优先于策略"在本层的落点——合格集合先算出来，权重只在集合内部起作用。

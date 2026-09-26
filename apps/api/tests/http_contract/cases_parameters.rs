@@ -419,3 +419,71 @@ async fn a_requested_image_count_beyond_the_contracts_maximum_is_rejected_before
 
     harness.cleanup().await;
 }
+
+/// 输出张数落在**合同之内、这条候选承载面声明的上界之外**时，按承载面的上界发出去：受理照常，
+/// 不判候选不合格、不返回 503。
+///
+/// 界是两个数：合同是**调用方**的界面（这里声明 10），承载面是**这条候选**的能力面（这里声明 4）。
+/// 调用方给 6 表达的是"最多 6 张"，而这条候选最多出 4 张——按 4 张发、按实际产出的张数结算，
+/// 比把一次合法请求判成平台侧故障更贴合那个意思。请求超过**合同**那 10 张时仍是 400（见上一条）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum() {
+    // 候选用测试构造体那一份（渠道、计价、地址齐全），只把**承载面**换成声明 `n` 最多 4 张的一份；
+    // 合同另外给（声明最多 10 张），这样才能构造出"在合同之内、在承载面之外"这个区间。
+    let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    draft["carrier_schema"] = surface_schema(json!({
+        "model": {"const": "placeholder"},
+        "prompt": {"type": "string", "minLength": 1},
+        "n": {"type": "integer", "minimum": 1, "maximum": 4, "default": 1}
+    }));
+    let contract = surface_schema(json!({
+        "model": {"const": "placeholder"},
+        "prompt": {"type": "string", "minLength": 1},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1}
+    }));
+    let harness = Harness::start_with_draft(
+        draft,
+        Some(contract),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+
+    let key = format!("carrier-n-cap-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "six images, the carrier stops at four");
+    request["n"] = json!(6);
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "合同之内、承载面之外不该被拒：{body}"
+    );
+    // 假上游一次只回一张图（它不按请求的 `n` 出图）：这里验的是"请求照常跑完、结果照原形回"，
+    // 出图张数与受理时那个数没有保证关系——结算按实际产出算，正是这条裁决的前提。
+    assert_sync_success("按承载面的上界发出", &body);
+
+    let submit = harness.submit_body("/v1/images/generations");
+    assert_eq!(
+        submit["n"],
+        json!(4),
+        "上线文里必须是这条候选声明的上限，不是调用方给的 6：{submit}"
+    );
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "夹过的请求照常跑完");
+    let frozen: Value =
+        sqlx::query_scalar("SELECT native_parameters FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the accepted job keeps the parameter face");
+    assert_eq!(
+        frozen["n"],
+        json!(4),
+        "冻结进 Job 的就是夹后的张数：超时窗口与成本护栏都按它算：{frozen}"
+    );
+
+    harness.cleanup().await;
+}
