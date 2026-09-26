@@ -607,6 +607,9 @@ async fn the_api_serves_the_front_end_without_swallowing_api_404s() {
     wait_until_ready(&client, &base_url, &admin_token).await;
 
     // 两份入口产物都在（先跑 `npm run build`；没构建时 API 不托管前端，这里会以 404 说明原因）。
+    //
+    // **按文件名直达**：两份产物在同一个目录里，只按主机名分发时，本机（开发出口开着）就只剩管理端
+    // 一条路。文件名优先让两个入口在任何主机上都各有一条明确地址。
     for entry in ["/console.html", "/portal.html"] {
         let response = client
             .get(format!("{base_url}{entry}"))
@@ -621,6 +624,27 @@ async fn the_api_serves_the_front_end_without_swallowing_api_404s() {
         let body = response.text().await.expect("entry body");
         assert!(body.contains("<!doctype html"), "{entry} 应当是一份 HTML");
     }
+    // 两个入口是**不同的**两份产物，不是同一个文件：各自的标题不一样。
+    let console = client
+        .get(format!("{base_url}/console.html"))
+        .send()
+        .await
+        .expect("console request")
+        .text()
+        .await
+        .expect("console body");
+    let portal = client
+        .get(format!("{base_url}/portal.html"))
+        .send()
+        .await
+        .expect("portal request")
+        .text()
+        .await
+        .expect("portal body");
+    assert!(
+        console.contains("运营后台") && portal.contains("seeai 控制台") && console != portal,
+        "两个入口必须是各自那一份产物"
+    );
 
     // 未注册的 API 路径：**JSON 404**，不是 HTML。
     for path in ["/api/v1/nope", "/v1/nope"] {
@@ -808,6 +832,47 @@ async fn a_customer_registers_manages_its_own_keys() {
         .await
         .expect("duplicate register request");
     assert_eq!(duplicate.status(), StatusCode::CONFLICT);
+
+    // 形状或取值不合法：参数错（V-C2 的另一半）。**未认证**与**参数错**必须分开——
+    // 混成一个答复会让调用方不知道是"你还没登录"还是"你填错了"。
+    //
+    // 两种错法各有各的码，所以分开断言：**字段缺失/类型不对**是请求体解不出来（422），
+    // 而**字段在但取值不合规**是业务校验拒绝（400）。把两者合成一个数会让调用方分不清该改结构还是改值。
+    for (label, body, expected) in [
+        (
+            "邮箱不是邮箱",
+            json!({"email": "not-an-email", "password": "a-long-enough-password"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "口令太短",
+            json!({"email": "short@example.com", "password": "short"}),
+            StatusCode::BAD_REQUEST,
+        ),
+        (
+            "口令恰好等于下限",
+            json!({"email": "floor@example.com", "password": "12345678"}),
+            StatusCode::CREATED,
+        ),
+        (
+            "缺口令",
+            json!({"email": "missing@example.com"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+        (
+            "缺邮箱",
+            json!({"password": "a-long-enough-password"}),
+            StatusCode::UNPROCESSABLE_ENTITY,
+        ),
+    ] {
+        let response = client
+            .post(format!("{base_url}/v1/customers"))
+            .json(&body)
+            .send()
+            .await
+            .expect("register request");
+        assert_eq!(response.status(), expected, "{label}");
+    }
 
     // 发密钥：明文只这一次。
     let issued = client

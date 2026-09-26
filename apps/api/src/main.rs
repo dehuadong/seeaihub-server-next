@@ -360,24 +360,37 @@ struct StaticSpa {
     ///
     /// 生产不设它——分发判据就是主机名 `admin.<domain>`。但本机起服务时往往没有域名可指（写 hosts
     /// 要管理员权限，容器里也没有），没有这个出口就**根本打不开管理端**。它只是一次取值，运行期不改。
+    ///
+    /// 设了之后，`/portal.html` 仍可按**文件名**直达客户入口（见 [`Self::serve`]），所以两个入口在本机
+    /// 都有一条明确地址。
     console_dev_host: Option<String>,
 }
 
 impl StaticSpa {
     async fn serve(&self, request: axum::extract::Request) -> axum::response::Response {
+        let path = request.uri().path();
         let host = request
             .headers()
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
             .map(|host| host.split(':').next().unwrap_or(host).to_owned());
-        // 判据：主机名第一段是 `admin`（生产），或命中本地开发出口（默认无）。
-        let is_console = host.as_deref().is_some_and(|host| {
-            host.starts_with("admin")
-                || self
-                    .console_dev_host
-                    .as_deref()
-                    .is_some_and(|dev| dev.eq_ignore_ascii_case(host))
-        });
+        // 判据：**精确的入口文件名**优先，其次是主机名第一段是 `admin`（生产），最后是本地开发出口
+        // （默认无）。
+        //
+        // 入口文件名优先是为了让两份产物在**任何**主机上都各有一条明确地址：`/console.html` 与
+        // `/portal.html` 都是静态文件，只认主机名的话开发出口一开，`/portal.html` 也会被顶成管理端
+        // （实际踩到过），于是本机反而拿不到客户入口。它不影响深链兜底——那条走的是不存在的路径。
+        let is_console = match path {
+            "/console.html" => true,
+            "/portal.html" => false,
+            _ => host.as_deref().is_some_and(|host| {
+                host.starts_with("admin")
+                    || self
+                        .console_dev_host
+                        .as_deref()
+                        .is_some_and(|dev| dev.eq_ignore_ascii_case(host))
+            }),
+        };
         let root = if is_console {
             &self.console
         } else {
@@ -388,7 +401,7 @@ impl StaticSpa {
         } else {
             "portal.html"
         };
-        serve_from(root, entry, request.uri().path()).await
+        serve_from(root, entry, path).await
     }
 }
 
