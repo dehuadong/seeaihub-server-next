@@ -24,8 +24,76 @@ export function Dashboard({ client }: { client: CustomerClient }) {
         </div>
       </header>
       <AccountPanel client={client} />
+      <PasswordPanel client={client} />
       <KeysPanel client={client} />
       <UsagePanel client={client} />
+    </div>
+  );
+}
+
+/// 改自己的口令（Spec C4）。改完**该客户此前所有会话都失效**，所以只能回到登录页重新登录。
+function PasswordPanel({ client }: { client: CustomerClient }) {
+  const { signOut } = useCustomerSession();
+  const [current, setCurrent] = useState('');
+  const [next, setNext] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  return (
+    <div className="panel">
+      <h3>改口令</h3>
+      {error ? <p className="error">{error}</p> : null}
+      <div className="row">
+        <label className="field">
+          <span>当前口令</span>
+          <input
+            type="password"
+            value={current}
+            onChange={(event) => setCurrent(event.target.value)}
+            size={22}
+            autoComplete="current-password"
+          />
+        </label>
+        <label className="field">
+          <span>新口令（至少 8 个字符）</span>
+          <input
+            type="password"
+            value={next}
+            onChange={(event) => setNext(event.target.value)}
+            size={22}
+            autoComplete="new-password"
+          />
+        </label>
+        <button
+          type="button"
+          disabled={busy || !current || !next}
+          onClick={async () => {
+            setBusy(true);
+            setError(null);
+            try {
+              await client.changePassword(current, next);
+              setDone(true);
+              setCurrent('');
+              setNext('');
+            } catch (failure) {
+              setError(failure instanceof Error ? failure.message : String(failure));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {busy ? '提交中…' : '改口令'}
+        </button>
+      </div>
+      {done ? (
+        <p className="muted">
+          口令已改。**此前所有登录会话都已失效**，请用新口令重新登录。
+          <button type="button" style={{ marginLeft: 8 }} onClick={signOut}>
+            回登录页
+          </button>
+        </p>
+      ) : null}
     </div>
   );
 }

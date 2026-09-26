@@ -138,6 +138,15 @@ export interface CreateAccountResponse {
   account_id: string;
 }
 
+/// 管理端看到的一条客户：邮箱身份与它指向的账户（**不含口令哈希、会话与余额**）。
+export interface CustomerView {
+  customer_id: string;
+  email: string;
+  account_id: string;
+  created_at: string;
+  last_login_at: string | null;
+}
+
 /// 发密钥的响应：明文只在这一次出现，标识用来事后吊销。
 export interface IssueApiKeyResponse {
   api_key: string;

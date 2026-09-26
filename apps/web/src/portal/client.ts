@@ -43,6 +43,16 @@ export class CustomerClient {
     });
   }
 
+  /// 凭运营转交的一次性令牌设置新口令（**无需登录**：忘了口令的人本来就进不来）。
+  redeemPasswordReset(resetToken: string, newPassword: string): Promise<void> {
+    return this.send(
+      '/v1/customer/password-resets/redeem',
+      'POST',
+      { reset_token: resetToken, new_password: newPassword },
+      false,
+    );
+  }
+
   apiKeys(): Promise<CustomerKeysResponse> {
     return this.get('/v1/customer/api-keys');
   }

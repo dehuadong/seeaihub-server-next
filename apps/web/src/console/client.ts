@@ -3,6 +3,7 @@ import type {
   AccountBalance,
   AccountEntriesResponse,
   CreateAccountResponse,
+  CustomerView,
   GatewayModelsResponse,
   IssueApiKeyResponse,
   ProviderCostGapsResponse,
@@ -47,6 +48,38 @@ export class AdminClient {
     const body: Record<string, unknown> = { currency, rate_micros: rateMicros };
     if (effectiveAt) body.effective_at = effectiveAt;
     return this.send('/api/v1/fx-rates', 'PUT', body);
+  }
+
+  /// 每个币种**当前生效**的那一行（页面要能看出平台真正在用哪个数）。
+  fxRates(): Promise<{ rates: { currency: string; rate_micros: number; effective_at: string }[] }> {
+    return this.get('/api/v1/fx-rates');
+  }
+
+  /// 替客户开户：不给 `accountId` 就新建空账户，给了就把登录身份配到那个**已有账户**上。
+  openCustomer(email: string, password?: string, accountId?: string): Promise<CustomerView> {
+    const body: Record<string, unknown> = { email };
+    if (password) body.password = password;
+    if (accountId) body.account_id = accountId;
+    return this.send('/api/v1/customers', 'POST', body);
+  }
+
+  /// 按邮箱找客户账户（给客户充值、签重置令牌都要先拿到账户标识）。
+  findCustomer(email: string): Promise<{ customers: CustomerView[] }> {
+    return this.get(`/api/v1/customers?email=${encodeURIComponent(email)}`);
+  }
+
+  listCustomers(limit = 50): Promise<{ customers: CustomerView[] }> {
+    return this.get(`/api/v1/customers?limit=${limit}`);
+  }
+
+  /// 为客户账户签发一次性重置令牌（运营转交；平台不发邮件）。
+  issueCustomerPasswordReset(
+    accountId: string,
+  ): Promise<{ reset_token: string; expires_at: string }> {
+    return this.send(
+      `/api/v1/accounts/${encodeURIComponent(accountId)}/password-reset`,
+      'POST',
+    );
   }
 
   routePolicies(): Promise<RoutePoliciesResponse> {

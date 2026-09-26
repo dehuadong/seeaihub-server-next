@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
+import type { CustomerView } from '../../shared/types';
 import { Page } from '../../shared/ui';
 import { when, yuan } from '../../shared/routes';
 
@@ -146,7 +147,148 @@ export function AccountsPage({ client }: { client: AdminClient }) {
       </div>
 
       {notice ? <p style={{ color: 'var(--ok)' }}>{notice}</p> : null}
+
+      <CustomersPanel client={client} onError={setError} onNotice={setNotice} />
     </Page>
+  );
+}
+
+/// 客户登录身份：替客户开户、按邮箱找账户、签一次性重置令牌。
+///
+/// 三件事都要先有账户标识：客户自助注册出来的账户只存在于客户表里，运营不查就找不到它——没有这一块，
+/// "给新客户充值""帮忘了口令的客户重置"都没有入口。
+function CustomersPanel(props: {
+  client: AdminClient;
+  onError: (message: string) => void;
+  onNotice: (message: string) => void;
+}) {
+  const [email, setEmail] = useState('');
+  const [password, setPassword] = useState('');
+  const [customerAccountId, setCustomerAccountId] = useState('');
+  const [found, setFound] = useState<CustomerView | null>(null);
+  const [issued, setIssued] = useState<{ reset_token: string; expires_at: string } | null>(null);
+
+  async function run(action: () => Promise<void>) {
+    try {
+      await action();
+    } catch (failure) {
+      props.onError(failure instanceof Error ? failure.message : String(failure));
+    }
+  }
+
+  return (
+    <div className="panel">
+      <h3>客户登录身份</h3>
+      <p className="muted">
+        一个客户邮箱对应一个账户。**不填账户标识就新建一个空账户**；填了就把它配到那个已有账户上
+        （配身份不动余额、密钥与历史）。不填口令时运营改用重置令牌让客户自己设。
+      </p>
+      <div className="row" style={{ marginTop: 8 }}>
+        <label className="field">
+          <span>客户邮箱</span>
+          <input value={email} onChange={(event) => setEmail(event.target.value)} size={26} />
+        </label>
+        <label className="field">
+          <span>初始口令（至少 8 字符，可空）</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            size={22}
+          />
+        </label>
+        <label className="field">
+          <span>已有账户标识（可空）</span>
+          <input
+            value={customerAccountId}
+            onChange={(event) => setCustomerAccountId(event.target.value)}
+            size={36}
+          />
+        </label>
+      </div>
+      <div className="row" style={{ marginTop: 8 }}>
+        <button
+          type="button"
+          disabled={!email.trim()}
+          onClick={() =>
+            run(async () => {
+              const created = await props.client.openCustomer(
+                email.trim(),
+                password || undefined,
+                customerAccountId.trim() || undefined,
+              );
+              setFound(created);
+              props.onNotice(`已开户：${created.email} → 账户 ${created.account_id}`);
+            })
+          }
+        >
+          开户
+        </button>
+        <button
+          type="button"
+          disabled={!email.trim()}
+          onClick={() =>
+            run(async () => {
+              const result = await props.client.findCustomer(email.trim());
+              const first = result.customers[0];
+              if (!first) {
+                setFound(null);
+                props.onNotice(`没有找到 ${email.trim()} 的登录身份`);
+                return;
+              }
+              setFound(first);
+              setCustomerAccountId(first.account_id);
+            })
+          }
+        >
+          按邮箱找账户
+        </button>
+      </div>
+
+      {found ? (
+        <div className="grid" style={{ marginTop: 8 }}>
+          <div className="field">
+            <span>客户</span>
+            <div>{found.email}</div>
+          </div>
+          <div className="field">
+            <span>账户</span>
+            <div className="mono">{found.account_id}</div>
+          </div>
+          <div className="field">
+            <span>上次登录</span>
+            <div>{when(found.last_login_at)}</div>
+          </div>
+          <div className="field">
+            <span>重置口令</span>
+            <div>
+              <button
+                type="button"
+                onClick={() =>
+                  run(async () => {
+                    const token = await props.client.issueCustomerPasswordReset(found.account_id);
+                    setIssued(token);
+                    props.onNotice('已签发一次性重置令牌——请当面或经既有渠道转交客户');
+                  })
+                }
+              >
+                签发重置令牌
+              </button>
+            </div>
+          </div>
+        </div>
+      ) : null}
+
+      {issued ? (
+        <div className="panel" style={{ marginTop: 8 }}>
+          <div className="field">
+            <span>重置令牌（只显示这一次，转交客户后由他设置新口令）</span>
+            <div className="mono">{issued.reset_token}</div>
+          </div>
+          <p className="muted">有效期至 {when(issued.expires_at)}；用过一次即失效。</p>
+        </div>
+      ) : null}
+    </div>
   );
 }
 

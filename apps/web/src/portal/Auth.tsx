@@ -1,5 +1,6 @@
 import { useState } from 'react';
 import { apiFetch } from '../shared/api';
+import { CustomerClient } from './client';
 import { useCustomerSession } from './session';
 import { useLoadable } from '../shared/ui';
 
@@ -104,6 +105,69 @@ export function AuthPage() {
           忘了口令也**不能自助重置**——请找运营，由他们签发一枚一次性重置令牌给你，你再用它设置新口令。
         </p>
       </div>
+      <ResetPanel />
+    </div>
+  );
+}
+
+/// 凭运营转交的令牌设置新口令（Spec C12 的对客一侧）。
+///
+/// 平台上没有"提交邮箱就收到重置链接"这条路——不发邮件、不做邮箱验证，那种入口等于"知道邮箱就能
+/// 接管账户"。所以这里只收**运营转交过来的令牌**。
+function ResetPanel() {
+  const client = new CustomerClient(() => null);
+  const [token, setToken] = useState('');
+  const [password, setPassword] = useState('');
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+
+  return (
+    <div className="panel">
+      <h3>用重置令牌设置新口令</h3>
+      <p className="muted">
+        口令忘了就找运营要一枚**一次性重置令牌**（平台不发邮件）。拿到之后填在这里，设置新口令即可登录。
+        重置成功会使此前所有登录会话失效。
+      </p>
+      <div className="row">
+        <label className="field">
+          <span>重置令牌</span>
+          <input value={token} onChange={(event) => setToken(event.target.value)} size={44} />
+        </label>
+        <label className="field">
+          <span>新口令（至少 8 个字符）</span>
+          <input
+            type="password"
+            value={password}
+            onChange={(event) => setPassword(event.target.value)}
+            size={22}
+            autoComplete="new-password"
+          />
+        </label>
+        <button
+          type="button"
+          disabled={busy || !token.trim() || !password}
+          onClick={async () => {
+            setBusy(true);
+            setError(null);
+            setDone(false);
+            try {
+              await client.redeemPasswordReset(token.trim(), password);
+              setDone(true);
+              setToken('');
+              setPassword('');
+            } catch (failure) {
+              setError(failure instanceof Error ? failure.message : String(failure));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          {busy ? '提交中…' : '设置新口令'}
+        </button>
+      </div>
+      {error ? <p className="error">{error}</p> : null}
+      {done ? <p style={{ color: 'var(--ok)' }}>口令已重置，回到上面用新口令登录。</p> : null}
     </div>
   );
 }
