@@ -41,13 +41,15 @@ npm run build     # tsc --noEmit && vite build -> dist/ 下的两份产物
 仍然回既有的 JSON 404**——兜底不吃 API 的 404。
 
 两份产物互不引用：`portal.html` 只引客户那一份脚本，管理端的代码不在里面（反之亦然）。这条是
-Spec D4 要的性质，改完 `vite.config.ts` 的入口或共享层之后值得用下面两条再核一次：
+Spec D4 要的性质，改完 `vite.config.ts` 的入口或共享层之后值得再核一次。**按带引号的精确路径搜，
+别用裸路径**——`/v1/customers` 是管理端自己的 `/api/v1/customers` 的子串，用裸路径搜会得到假阳性：
 
 ```sh
-# 客户产物里不该出现管理端的端点名
-grep -c 'gateway-models' dist/assets/portal-*.js      # 期望 0
-# 管理产物里不该出现对客自助的路径
-grep -c '/v1/customer/' dist/assets/console-*.js      # 期望 0
+# 客户产物里不该出现任何管理面端点，也不该有控制台的会话键
+grep -c '"\/api\/v1\/' dist/assets/portal-*.js          # 期望 0
+grep -c 'seeai.console.session' dist/assets/portal-*.js # 期望 0
+# 管理产物里不该出现对客自助端点
+grep -c '"\/v1\/customer\/' dist/assets/console-*.js    # 期望 0
 ```
 
 ## 边界

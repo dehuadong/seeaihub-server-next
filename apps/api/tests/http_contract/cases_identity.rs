@@ -729,6 +729,50 @@ async fn customer_endpoints_distinguish_unauthenticated_from_not_yours() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 管理面"没带凭据"与"凭据不对"**逐字同答复**（Spec §4.1）。
+///
+/// 两者可分（一个 401 一个 403）就等于告诉调用方"你连格式都没带对"；而这条端点对外只有一个含义：
+/// 这次访问不被接受。对客面另有一条一致的口径：未认证一律 401，与"不是你的东西"（404）也分得开。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn admin_endpoints_do_not_reveal_whether_a_credential_was_sent() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let path = format!("{base_url}/api/v1/gateway-models");
+
+    // 没带任何凭据。
+    let missing = client.get(&path).send().await.expect("request");
+    let missing_status = missing.status();
+    let missing_body = missing.json::<Value>().await.expect("body");
+
+    // 带了但是错的。
+    let wrong = client
+        .get(&path)
+        .bearer_auth("not-a-real-token")
+        .send()
+        .await
+        .expect("request");
+    let wrong_status = wrong.status();
+    let wrong_body = wrong.json::<Value>().await.expect("body");
+
+    // 连"格式都不对"也算在内（没有 Bearer 前缀）。
+    let malformed = client
+        .get(&path)
+        .header("authorization", "not-a-bearer-token")
+        .send()
+        .await
+        .expect("request");
+
+    assert_eq!(missing_status, wrong_status, "状态码必须相同");
+    assert_eq!(missing_body, wrong_body, "响应体必须逐字相同");
+    assert_eq!(malformed.status(), wrong_status, "格式不对也必须同答复");
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 客户自助：注册 → 发密钥 → 列密钥（**没有明文**）→ 吊销 → 该密钥不能再调对客接口。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]

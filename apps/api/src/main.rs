@@ -66,7 +66,7 @@ impl AppState {
     /// 两条都不命中时的答复与"共享令牌写错了"**完全一样**（同一个状态码与错误码）：调用方分不出
     /// 自己拿的是哪种凭据，也分不出凭据是不存在还是过期。
     async fn admin_identity(&self, headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
-        let token = bearer_token(headers)?;
+        let token = admin_bearer_token(headers)?;
         if constant_time_eq(token.as_bytes(), self.admin_token.as_bytes()) {
             return Ok(None);
         }
@@ -2057,6 +2057,15 @@ fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
         .zip(right.iter())
         .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
         == 0
+}
+
+/// 管理端的 bearer 凭据：**没带、格式不对、空值**都回 [`admin_forbidden`]。
+///
+/// 与 [`bearer_token`] 的差别就在这里：管理面对"凭据不对"回的是 403 `admin_forbidden`，所以"没带凭据"
+/// 也必须回同一个答复——否则调用方按状态码就能分出自己是不是根本没带，而 Spec §4.1 要的正是两者相同。
+/// 对客面用的是 [`bearer_token`]（未认证一律 401），两边各自一致。
+fn admin_bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
+    bearer_token(headers).map_err(|_| admin_forbidden())
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {

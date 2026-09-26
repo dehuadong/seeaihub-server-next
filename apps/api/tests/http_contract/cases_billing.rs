@@ -315,3 +315,151 @@ async fn a_customer_reads_balance_and_held_separately() {
 
     harness.cleanup().await;
 }
+
+/// 账单口径的边界（V-C8）：
+///
+/// - 区间是**半开**的 `[since, until)`：`until` 放在请求**之前**，那一次就不该被算进来；
+/// - 扣费总额**只计扣费与调整**：预授权 `hold` 与它的 `release` 是一进一出，算进来会得到
+///   "平台占用过多少"而不是"扣了多少"——这条用例按类型分别求和来钉住它。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_billing_window_is_half_open_and_ignores_holds() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let email = "window@example.com";
+    let password = "a-long-enough-password";
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": email, "password": password, "account_id": account_id}))
+            .send()
+            .await
+            .expect("open customer request")
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // 窗口边界取在请求的**前**与**后**：请求之后再取一次"现在"，用它当 `until` 就该是 0 条。
+    let before = chrono::Utc::now();
+    let _worker = harness.spawn_worker();
+    let key = format!("window-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "window contract"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    let after = chrono::Utc::now();
+
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    // 区间包住那一次：算进来。
+    //
+    // 时间戳按**秒精度 UTC** 给：`to_rfc3339()` 会带上纳秒（`...465153900+00:00`），服务端不认。
+    let stamp = |instant: chrono::DateTime<chrono::Utc>| {
+        instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let included = client
+        .get(format!(
+            "{}/v1/customer/billing?since={}&until={}",
+            harness.base_url,
+            stamp(before),
+            stamp(after + chrono::Duration::seconds(1))
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("billing request")
+        .json::<Value>()
+        .await
+        .expect("billing body");
+    assert_eq!(included["requests"], json!(1), "区间包住时应当算进来");
+
+    // `until` 在请求之前：半开区间把它排除在外。
+    let excluded = client
+        .get(format!(
+            "{}/v1/customer/billing?until={}",
+            harness.base_url,
+            stamp(before)
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("billing request")
+        .json::<Value>()
+        .await
+        .expect("billing body");
+    assert_eq!(
+        excluded["requests"],
+        json!(0),
+        "until 在请求之前时不该算进来"
+    );
+    assert_eq!(excluded["charged_microusd"], json!(0));
+
+    // 库里按类型分别求和：扣费总额等于 `capture`，**不是** `capture + hold + release`。
+    let sums: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT kind, COALESCE(SUM(amount_microusd), 0)::bigint FROM ledger.entries \
+         WHERE account_id = $1 GROUP BY kind ORDER BY kind",
+    )
+    .bind(Uuid::parse_str(&account_id).expect("account id"))
+    .fetch_all(&harness.pool)
+    .await
+    .expect("ledger sums");
+
+    let capture = sums
+        .iter()
+        .find(|(kind, _)| kind == "capture")
+        .map(|(_, total)| *total)
+        .unwrap_or(0);
+    let holds = sums
+        .iter()
+        .filter(|(kind, _)| kind == "hold" || kind == "release")
+        .map(|(_, total)| *total)
+        .sum::<i64>();
+    assert!(capture < 0, "夹具应当真的扣了一笔：{sums:?}");
+    assert_eq!(holds, 0, "hold 与 release 应当正好抵消：{sums:?}");
+    assert_eq!(
+        included["charged_microusd"],
+        json!(capture),
+        "扣费总额必须等于 capture 的求和，不能把 hold/release 算进来"
+    );
+
+    harness.cleanup().await;
+}
