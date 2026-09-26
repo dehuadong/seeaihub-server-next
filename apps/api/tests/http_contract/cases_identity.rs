@@ -595,6 +595,60 @@ async fn the_bootstrap_variables_are_all_or_nothing() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 静态托管（V-D1）：两个入口产物的 HTML 能取到；未注册的 API 路径**仍然是 JSON 404**。
+///
+/// 后者是重点：兜底成一份 HTML 会把"路径写错了"变成"调用成功"。第一版实现就是这样错的，实测才发现。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_api_serves_the_front_end_without_swallowing_api_404s() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    // 两份入口产物都在（先跑 `npm run build`；没构建时 API 不托管前端，这里会以 404 说明原因）。
+    for entry in ["/console.html", "/portal.html"] {
+        let response = client
+            .get(format!("{base_url}{entry}"))
+            .send()
+            .await
+            .expect("entry request");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "入口产物必须能被取到（先跑 npm run build）：{entry}"
+        );
+        let body = response.text().await.expect("entry body");
+        assert!(body.contains("<!doctype html"), "{entry} 应当是一份 HTML");
+    }
+
+    // 未注册的 API 路径：**JSON 404**，不是 HTML。
+    for path in ["/api/v1/nope", "/v1/nope"] {
+        let response = client
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .expect("unknown api request");
+        assert_eq!(
+            response.status(),
+            StatusCode::NOT_FOUND,
+            "{path} 必须是 404"
+        );
+        let content_type = response
+            .headers()
+            .get("content-type")
+            .and_then(|value| value.to_str().ok())
+            .unwrap_or_default()
+            .to_owned();
+        assert!(
+            content_type.starts_with("application/json"),
+            "{path} 必须回 JSON，实际是 {content_type}"
+        );
+    }
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 客户自助：注册 → 发密钥 → 列密钥（**没有明文**）→ 吊销 → 该密钥不能再调对客接口。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
