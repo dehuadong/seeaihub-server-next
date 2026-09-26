@@ -246,10 +246,7 @@ async fn main() -> Result<()> {
             "/api/v1/accounts/{account_id}/password-reset",
             post(issue_customer_password_reset),
         )
-        .route(
-            "/api/v1/api-keys/{key_id}",
-            delete(revoke_api_key),
-        )
+        .route("/api/v1/api-keys/{key_id}", delete(revoke_api_key))
         .route("/api/v1/customers", get(list_customers).post(open_customer))
         .route("/api/v1/admin/session", get(read_admin_session))
         .route("/api/v1/admin/password", put(change_admin_password))
@@ -675,9 +672,7 @@ struct UpsertRoutePolicyBody {
 }
 
 /// 管理员看策略清单：全局那条（若有）与各网关模型的覆盖。
-async fn list_route_policies(
-    State(state): State<AppState>,
-) -> Result<Json<Value>, ApiError> {
+async fn list_route_policies(State(state): State<AppState>) -> Result<Json<Value>, ApiError> {
     let policies = state.route_policies.list().await?;
     let views: Vec<Value> = policies.iter().map(route_policy_view).collect();
     Ok(Json(json!({"route_policies": views})))
@@ -1018,9 +1013,7 @@ struct FxRateView {
 /// 读当前生效的折算率（`GET /api/v1/fx-rates`）：折算率页要显示"当前录入结果"。
 ///
 /// 每个币种只回**当前生效的那一行**（受理时取的就是它），按币种排序，免得页面自己去挑。
-async fn list_fx_rates(
-    State(state): State<AppState>,
-) -> Result<Json<FxRatesResponse>, ApiError> {
+async fn list_fx_rates(State(state): State<AppState>) -> Result<Json<FxRatesResponse>, ApiError> {
     let rates = state
         .pricing
         .current_fx_rates()

@@ -729,6 +729,51 @@ async fn start_api_with_admin(
     .await
 }
 
+/// 只配**引导变量**起一个 API 进程，回报它"起来了"还是"退出了"（V-A8 的三分支）。
+///
+/// 与 [`start_api`] 的区别是它**不**等 `/health` 等到超时：引导只给一个变量时进程本来就该启动失败。
+/// 返回 `Ok(())` 表示它还在跑（已收掉），`Err(状态)` 表示已经退出。日志不抓（管道不留心就会把子进程
+/// 堵死），"两个都不给时日志里有没有警告"由别的用例读启动日志覆盖。
+async fn probe_api_startup_with_seed(
+    database_url: &str,
+    email: Option<&str>,
+    password: Option<&str>,
+) -> Result<(), std::process::ExitStatus> {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    command
+        .env("DATABASE_URL", database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", "seed-probe-token")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
+        .env("PROVIDER_TIMEOUT_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
+        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
+        .env("WORKER_LEASE_SECONDS", "30")
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    // 两个都没给时要**明确不设**这两个变量，而不是设成空串（空串与"没配"在引导里是两回事）。
+    if let Some(email) = email {
+        command.env("ADMIN_EMAIL", email);
+    }
+    if let Some(password) = password {
+        command.env("ADMIN_PASSWORD", password);
+    }
+    let mut child = command.spawn().expect("API process should start");
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    match child.try_wait().expect("try_wait") {
+        Some(status) => Err(status),
+        None => {
+            let _ = child.kill();
+            let _ = child.wait();
+            Ok(())
+        }
+    }
+}
+
 /// 一次用例要给 API 进程配的**速率上限**（每把 API Key）。
 ///
 /// 默认那一套是每分钟 60 次，用例要观察"超限被拒"就得把它调到 1 次——按默认值跑，光是把上限

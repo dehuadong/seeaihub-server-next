@@ -74,6 +74,16 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn record_audit(
+        &self,
+        _actor: &str,
+        _action: &str,
+        _subject_type: &str,
+        _subject_id: &str,
+    ) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
     async fn set_admin_password(
         &self,
         _admin_id: Uuid,

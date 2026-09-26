@@ -192,6 +192,20 @@ function KeysPanel({ client }: { client: CustomerClient }) {
   );
 }
 
+/// 对客状态的展示文案。取值由服务端收敛，界面只翻译，不自己判断含义。
+function statusLabel(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
+  switch (status) {
+    case 'succeeded':
+      return '成功';
+    case 'failed':
+      return '未产出';
+    case 'canceled':
+      return '已取消';
+    default:
+      return '处理中';
+  }
+}
+
 /// 用量与账单：逐笔明细按时间倒序、汇总按区间全量。
 function UsagePanel({ client }: { client: CustomerClient }) {
   const usage = useLoadable(() => client.usage(50), [client]);
@@ -242,7 +256,7 @@ function UsagePanel({ client }: { client: CustomerClient }) {
                   <td>{when(row.created_at)}</td>
                   <td>{row.gateway_model}</td>
                   <td>{row.kind === 'edit' ? '图片编辑' : '同步生成'}</td>
-                  <td>{row.status === 'succeeded' ? '成功' : row.status === 'failed' ? '未产出' : '处理中'}</td>
+                  <td>{statusLabel(row.status)}</td>
                   <td>{row.image_count}</td>
                   <td>{yuan(row.charged_microusd)}</td>
                 </tr>

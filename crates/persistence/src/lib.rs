@@ -3318,6 +3318,27 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)
     }
 
+    async fn record_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            action,
+            subject_type,
+            subject_id,
+            &serde_json::json!({}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
     async fn set_admin_password(
         &self,
         admin_id: Uuid,

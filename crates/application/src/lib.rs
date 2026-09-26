@@ -1539,15 +1539,17 @@ pub struct CustomerUsageView {
     pub charged_microusd: i64,
 }
 
-/// 对客状态：**收敛过的三值**，不是内部 `JobState` 的取值面。
+/// 对客状态：**收敛过的取值**，不是内部 `JobState` 的取值面。
 ///
 /// 映射写在 [`customer_usage_status`] 上，与既有对客错误改写同一条纪律：内部状态取值不进对客响应。
+/// 取消单独一个值而不是并进 `pending`：取消是**终态**，并进去客户会一直看到"处理中"。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CustomerUsageStatus {
     Succeeded,
     Failed,
     Pending,
+    Canceled,
 }
 
 /// 对客的调用类别：同步生成 / 图片编辑。
@@ -1558,7 +1560,7 @@ pub enum CustomerUsageKind {
     Edit,
 }
 
-/// 把内部 Job 状态收敛成对客三值。
+/// 把内部 Job 状态收敛成对客取值。
 #[must_use]
 pub fn customer_usage_status(state: seeai_domain::JobState) -> CustomerUsageStatus {
     match state {
@@ -1567,10 +1569,11 @@ pub fn customer_usage_status(state: seeai_domain::JobState) -> CustomerUsageStat
         seeai_domain::JobState::Failed | seeai_domain::JobState::ReconciliationRequired => {
             CustomerUsageStatus::Failed
         }
+        // 取消是终态，不能并进"处理中"。
+        seeai_domain::JobState::Canceled => CustomerUsageStatus::Canceled,
         seeai_domain::JobState::Accepted
         | seeai_domain::JobState::Leased
-        | seeai_domain::JobState::Submitting
-        | seeai_domain::JobState::Canceled => CustomerUsageStatus::Pending,
+        | seeai_domain::JobState::Submitting => CustomerUsageStatus::Pending,
     }
 }
 
@@ -2243,6 +2246,15 @@ pub trait HubRepository: Send + Sync {
     /// 删掉一条管理员会话（退出）。不存在的摘要也算成功：调用方在意的是"它现在不可用"。
     async fn delete_admin_session(&self, token_hash: &str) -> Result<(), ApplicationError>;
 
+    /// 记一条**没有账本副作用**的审计（签发重置令牌这类"只是留痕"的动作）。
+    async fn record_audit(
+        &self,
+        actor: &str,
+        action: &str,
+        subject_type: &str,
+        subject_id: &str,
+    ) -> Result<(), ApplicationError>;
+
     /// 改口令：写新的哈希、吊销该身份全部会话、写一条审计（`admin.password_change`），
     /// **同一个事务**。返回 `false` 表示没有这个管理员。
     ///
@@ -2833,6 +2845,14 @@ impl IdentityService {
             return Err(ApplicationError::NotFound("admin account".to_owned()));
         };
         let (token, expires_at) = self.issue_reset_token("admin", admin_id, ttl).await?;
+        self.repository
+            .record_audit(
+                "admin-self",
+                "admin.password_reset",
+                "admin_user",
+                &admin_id.to_string(),
+            )
+            .await?;
         Ok((admin_id, token, expires_at))
     }
 
@@ -2913,6 +2933,14 @@ impl IdentityService {
                 ))
             })?;
         let (token, expires_at) = self.issue_reset_token("customer", customer_id, ttl).await?;
+        self.repository
+            .record_audit(
+                "admin-self",
+                "customer.password_reset",
+                "customer",
+                &customer_id.to_string(),
+            )
+            .await?;
         Ok((customer_id, token, expires_at))
     }
 

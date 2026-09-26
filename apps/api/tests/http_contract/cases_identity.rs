@@ -265,6 +265,336 @@ async fn an_expired_session_is_rejected() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 管理员改口令（V-A4）：旧口令失效、新口令可用，**改之前发出的全部会话都失效**。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn changing_the_admin_password_revokes_every_session() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let email = "ops@example.com";
+    let password = "a-long-enough-password";
+    let (base_url, admin_token, _process) =
+        start_api_with_admin(&database_url, email, password).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let session = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    // 当前口令不对：被拒，且什么都不改。
+    let wrong = client
+        .put(format!("{base_url}/api/v1/admin/password"))
+        .bearer_auth(&session)
+        .json(&json!({"current_password": "not-the-password", "new_password": "another-long-password"}))
+        .send()
+        .await
+        .expect("change request");
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    let still_works = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(
+        still_works.status(),
+        StatusCode::OK,
+        "失败的改口令不该动任何东西"
+    );
+
+    let changed = client
+        .put(format!("{base_url}/api/v1/admin/password"))
+        .bearer_auth(&session)
+        .json(&json!({"current_password": password, "new_password": "another-long-password"}))
+        .send()
+        .await
+        .expect("change request");
+    assert_eq!(changed.status(), StatusCode::NO_CONTENT);
+
+    let after = client
+        .get(format!("{base_url}/api/v1/gateway-models"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("gateway models request");
+    assert_eq!(after.status(), StatusCode::FORBIDDEN, "旧会话必须失效");
+
+    let old = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(old.status(), StatusCode::BAD_REQUEST);
+    let fresh = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": "another-long-password"}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(fresh.status(), StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 引导幂等，而且**不改已有账号的口令**（V-A5）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_bootstrap_never_overwrites_a_changed_password() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let email = "ops@example.com";
+    let password = "a-long-enough-password";
+    let (base_url, admin_token, process) =
+        start_api_with_admin(&database_url, email, password).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let session = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    assert_eq!(
+        client
+            .put(format!("{base_url}/api/v1/admin/password"))
+            .bearer_auth(&session)
+            .json(&json!({"current_password": password, "new_password": "another-long-password"}))
+            .send()
+            .await
+            .expect("change request")
+            .status(),
+        StatusCode::NO_CONTENT
+    );
+
+    // 用**同一份环境变量**（还是旧口令）再起一个进程。
+    drop(process);
+    let (base_url, admin_token, _second) =
+        start_api_with_admin(&database_url, email, password).await;
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.admin_users")
+        .fetch_one(&pool)
+        .await
+        .expect("admin count");
+    assert_eq!(admins, 1, "引导不该产生第二个账号");
+    pool.close().await;
+
+    let changed = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": "another-long-password"}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(changed.status(), StatusCode::OK, "改过的口令必须还在");
+    let restored = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(
+        restored.status(),
+        StatusCode::BAD_REQUEST,
+        "引导不该把口令打回环境变量里的那个"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 客户口令出路整条链（V-C9/C12/C14）：运营开户给初始口令 → 客户改口令 → 旧会话失效；
+/// 另一条：运营只签重置令牌 → 客户凭它设口令 → 能登录，且**签发留了痕**。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_customer_can_change_or_reset_its_password() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let email = "customer-password@example.com";
+    let initial = "a-long-enough-password";
+    let opened = client
+        .post(format!("{base_url}/api/v1/customers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({"email": email, "password": initial}))
+        .send()
+        .await
+        .expect("open customer request");
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    let account_id = opened.json::<Value>().await.expect("open body")["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    let session = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": initial}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+    let changed = client
+        .put(format!("{base_url}/v1/customer/password"))
+        .bearer_auth(&session)
+        .json(&json!({"current_password": initial, "new_password": "another-long-password"}))
+        .send()
+        .await
+        .expect("change request");
+    assert_eq!(changed.status(), StatusCode::NO_CONTENT);
+
+    let after = client
+        .get(format!("{base_url}/v1/customer/account"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("account request");
+    assert_eq!(after.status(), StatusCode::UNAUTHORIZED, "旧会话必须失效");
+    let old = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": initial}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(old.status(), StatusCode::BAD_REQUEST);
+    let fresh = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": "another-long-password"}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(fresh.status(), StatusCode::OK);
+
+    // 第二条出路：运营签重置令牌，客户凭它设口令。
+    let issued = client
+        .post(format!(
+            "{base_url}/api/v1/accounts/{account_id}/password-reset"
+        ))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("issue reset request");
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let reset_token = issued.json::<Value>().await.expect("reset body")["reset_token"]
+        .as_str()
+        .expect("reset token")
+        .to_owned();
+
+    let redeemed = client
+        .post(format!("{base_url}/v1/customer/password-resets/redeem"))
+        .json(&json!({"reset_token": reset_token, "new_password": "third-long-password"}))
+        .send()
+        .await
+        .expect("redeem request");
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+
+    let again = client
+        .post(format!("{base_url}/v1/customer/password-resets/redeem"))
+        .json(&json!({"reset_token": reset_token, "new_password": "fourth-long-password"}))
+        .send()
+        .await
+        .expect("second redeem request");
+    assert_eq!(again.status(), StatusCode::BAD_REQUEST, "令牌是一次性的");
+    let after_reset = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": "third-long-password"}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(after_reset.status(), StatusCode::OK);
+
+    // 签发重置令牌留了痕（V-A7 的审计一半）。
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let audited: i64 = sqlx::query_scalar(
+        "SELECT COUNT(*) FROM operations.audit_events WHERE action = 'customer.password_reset'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("audit count");
+    assert_eq!(audited, 1, "签发重置令牌必须写审计");
+    pool.close().await;
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 引导变量的三种组合（V-A8）：两个都不给**不建号、进程照起**；只给一个**启动失败**。
+///
+/// "两个都不给时不建号、且日志里说得出后台登录不可用"另有一条：这里只看进程起没起来。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_bootstrap_variables_are_all_or_nothing() {
+    let (database_url, database_name) = isolated_database_url().await;
+
+    // 两个都给：起来了。
+    assert!(
+        probe_api_startup_with_seed(
+            &database_url,
+            Some("ops@example.com"),
+            Some("a-long-enough-password")
+        )
+        .await
+        .is_ok(),
+        "两个都给时进程必须起来"
+    );
+
+    // 两个都不给：进程照起（后台登录不可用不该让 API 起不来）。
+    assert!(
+        probe_api_startup_with_seed(&database_url, None, None)
+            .await
+            .is_ok(),
+        "两个都不给不该让进程起不来"
+    );
+
+    // 只给一个：启动失败。
+    assert!(
+        probe_api_startup_with_seed(&database_url, Some("ops@example.com"), None)
+            .await
+            .is_err(),
+        "只给邮箱必须启动失败"
+    );
+    assert!(
+        probe_api_startup_with_seed(&database_url, None, Some("a-long-enough-password"))
+            .await
+            .is_err(),
+        "只给口令必须启动失败"
+    );
+
+    // 上一步"两个都不给"那次不该建出账号。
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let admins: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.admin_users")
+        .fetch_one(&pool)
+        .await
+        .expect("admin count");
+    pool.close().await;
+    assert_eq!(
+        admins, 1,
+        "只有'两个都给'那一次该建号，现在应当只有一个账号"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 客户自助：注册 → 发密钥 → 列密钥（**没有明文**）→ 吊销 → 该密钥不能再调对客接口。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]

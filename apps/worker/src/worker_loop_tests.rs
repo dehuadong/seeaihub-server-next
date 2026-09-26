@@ -106,6 +106,16 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
+    async fn record_audit(
+        &self,
+        _actor: &str,
+        _action: &str,
+        _subject_type: &str,
+        _subject_id: &str,
+    ) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
     async fn set_admin_password(
         &self,
         _admin_id: Uuid,

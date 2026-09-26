@@ -186,8 +186,8 @@ export interface CustomerKeysResponse {
 /// 用量里的一次生成请求：执行记录的**对客投影**，不含 Job 标识与内部状态。
 export interface CustomerUsageRow {
   gateway_model: string;
-  /// 对客三值：`succeeded` / `failed` / `pending`。
-  status: 'succeeded' | 'failed' | 'pending';
+  /// 对客状态：`succeeded` / `failed` / `pending` / `canceled`（内部 Job 状态收敛过的取值）。
+  status: 'succeeded' | 'failed' | 'pending' | 'canceled';
   /// `generation` / `edit`。
   kind: 'generation' | 'edit';
   created_at: string;
