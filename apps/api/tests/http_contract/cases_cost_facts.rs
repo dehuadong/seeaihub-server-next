@@ -509,7 +509,7 @@ async fn a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconc
         .send()
         .await
         .expect("unauthorized cost gap list");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 
     harness.cleanup().await;
 }

@@ -446,7 +446,7 @@ async fn channel_rejections_reach_consumers_as_platform_problems() {
             .send()
             .await
             .expect("anonymous failures");
-        assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
         let consumer_key = Client::new()
             .get(format!("{}/api/v1/provider-failures", harness.base_url))
             .bearer_auth(&harness.api_key)
@@ -784,7 +784,7 @@ async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
         "空结果不算截断：{future}"
     );
 
-    // 边界：没有管理员凭证 401；账户不存在 404（与"没有流水"分开）；消费者的 Key 不是管理员凭证。
+    // 边界：没有管理员凭证 403；账户不存在 404（与"没有流水"分开）；消费者的 Key 不是管理员凭证。
     let anonymous = client
         .get(format!(
             "{}/api/v1/accounts/{account_id}/entries",
@@ -793,7 +793,7 @@ async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
         .send()
         .await
         .expect("anonymous ledger read");
-    assert_eq!(anonymous.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(anonymous.status(), StatusCode::FORBIDDEN);
 
     let unknown = client
         .get(format!(

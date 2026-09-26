@@ -56,13 +56,13 @@ async fn the_admin_reads_a_balance_from_the_database_not_the_cache() {
             .expect("account row");
     assert_eq!(body["balance_microusd"].as_i64(), Some(in_db));
 
-    // 没有管理员凭证：401；账户不存在：404。
+    // 没有管理员凭证：403；账户不存在：404。
     let response = client
         .get(format!("{}/api/v1/accounts/{account_id}", harness.base_url))
         .send()
         .await
         .expect("unauthenticated read");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let unknown = Uuid::new_v4();
     let response = client

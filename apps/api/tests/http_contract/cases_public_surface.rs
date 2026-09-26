@@ -85,9 +85,9 @@ async fn public_surface_has_no_async_task_protocol() {
         .send()
         .await
         .expect("unauthorized request");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 
-    // ── 对客没有异步入口：受理与查询两条路径都**不存在**（不是 202、也不是 401）──
+    // ── 对客没有异步入口：受理与查询两条路径都**不存在**（不是 202、也不是鉴权失败）──
     let removed_accept = client
         .post(format!("{base_url}/v1/image-generations"))
         .json(&json!({"model": "gpt-image-2", "prompt": "x"}))
@@ -355,13 +355,13 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
         .expect("missing key revocation");
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
-    // ── 无管理员凭证：401（与既有管理员写接口同一条鉴权路径）──
+    // ── 无管理员凭证：403（管理面所有凭据失败都回同一个答复）──
     let unauthorized = client
         .delete(format!("{}/api/v1/api-keys/{key_id}", harness.base_url))
         .send()
         .await
         .expect("unauthorized revocation");
-    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
 
     harness.cleanup().await;
 }

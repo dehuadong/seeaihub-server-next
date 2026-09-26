@@ -833,7 +833,7 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     let (unauthorized, _) = get_gateway_models(&client, &base_url, None).await;
     assert_eq!(
         unauthorized,
-        StatusCode::UNAUTHORIZED,
+        StatusCode::FORBIDDEN,
         "运营视图要管理员凭证，与公开的对客目录不是一回事"
     );
     let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
@@ -1957,7 +1957,7 @@ async fn the_supply_switches_take_only_enabled_and_need_admin_credentials() {
     let offering_path = format!("/api/v1/offerings/{offering}");
     let channel_path = format!("/api/v1/channels/{channel}");
 
-    // 无凭证：401。鉴权先于取数，所以不存在的 id 也一样。
+    // 无凭证：403。鉴权先于取数，所以不存在的 id 也一样。
     for path in [&offering_path, &channel_path] {
         let (status, body) = patch_supply(
             &client,
@@ -1967,7 +1967,7 @@ async fn the_supply_switches_take_only_enabled_and_need_admin_credentials() {
             &json!({"enabled": false}),
         )
         .await;
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path}: {body}");
+        assert_eq!(status, StatusCode::FORBIDDEN, "{path}: {body}");
     }
 
     // 目标不存在：404，而且不留下审计——被拒的写入什么都没发生。

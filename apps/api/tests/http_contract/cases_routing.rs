@@ -632,7 +632,7 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
 ///
 /// 策略改变选路结果本身由应用层用例钉住（`least_cost_compares_discounted_estimates` /
 /// `user_tag_takes_the_mapped_candidate_and_falls_back_when_it_cannot_carry`）；这里验的是它们
-/// 的输入进得去、出得来，以及标签那条 401/404 的边界。
+/// 的输入进得去、出得来，以及标签那条 403/404 的边界。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn route_policy_inputs_round_trip_through_the_admin_api() {
@@ -641,7 +641,7 @@ async fn route_policy_inputs_round_trip_through_the_admin_api() {
     publish_bootstrap(&client, &harness.base_url, &harness.admin_token).await;
     let account_id = create_account(&client, &harness.base_url, &harness.admin_token).await;
 
-    // 设账户标签：写库；无凭证 401；不存在的账户 404。
+    // 设账户标签：写库；无凭证 403；不存在的账户 404。
     let response = client
         .put(format!(
             "{}/api/v1/accounts/{account_id}/tag",
@@ -670,7 +670,7 @@ async fn route_policy_inputs_round_trip_through_the_admin_api() {
         .send()
         .await
         .expect("set account tag without a token");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     let unknown = Uuid::new_v4();
     let response = client
@@ -844,13 +844,13 @@ async fn route_policies_are_runtime_configuration_and_do_not_touch_revisions() {
         .expect("unsupported strategy");
     assert_eq!(response.status(), StatusCode::BAD_REQUEST);
 
-    // 无管理员凭证：401。
+    // 无管理员凭证：403。
     let response = client
         .get(format!("{}/api/v1/route-policies", harness.base_url))
         .send()
         .await
         .expect("policy list without a token");
-    assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    assert_eq!(response.status(), StatusCode::FORBIDDEN);
 
     // **改策略不发修订**。
     let revisions_after: i64 =
