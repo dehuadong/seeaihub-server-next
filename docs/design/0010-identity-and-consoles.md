@@ -193,7 +193,7 @@
 | **U4 对客账务读** | §4.2 的 `account` / `ledger` / `usage` / `billing` 四条；按 `[since, until)` 取用量与扣费 | 同 U3 + 按账户聚合与分页的读 | 端到端：V-C6…V-C8（与账本 `capture` 逐笔对账） |
 | **U5 管理员登录界面** | 登录/退出/改口令页；**路由守卫**：未认证时不发起任何管理 API 取数请求，深链与未认证访问一律落在登录页；既有六页接上会话认证；把现有单入口拆成 `console.html` 与 `src/console/`（配置加第二个入口前先完成这一步） | `apps/web`（`console.html`、`src/console`、`vite.config.ts`） | 浏览器实测：V-D1、V-D3、V-D4 + 六页读夹具数据（V-D2） |
 | **U6 客户控制台与入口拆分** | 注册/登录/凭令牌重置口令；密钥自助；余额与充值记录；用量与账单；把现有单入口拆成 console.html 与 portal.html（两个入口与 vite 配置一次改到位） | `apps/web`（`portal.html`、`src/portal`） | 浏览器实测：V-D5、V-D6 + 与 U4 的接口数据一致 |
-| **U7 静态产物托管与文档** | §4.5 的两个入口产物与各自的兜底、构建说明、部署说明；`apps/web/README.md` 与 `vite.config.ts` 里"单入口 + 反代回 dist"的旧说法一并改掉 | `apps/api`、`apps/web/README.md` | 构建后打开两个主机名（V-D1）+ 未注册的 API 路径仍是 JSON 404 + 越出目录的路径取不到文件 + 客户入口的脚本不含管理端代码（V-D6） |
+| **U7 静态产物托管与文档** | §4.5 的两个入口产物与各自的兜底、构建说明、部署说明；`apps/web/README.md` 与 `vite.config.ts` 里"单入口 + 反代回 dist"的旧说法一并改掉 | `apps/api`、`apps/web/README.md` | 构建后打开两个主机名（V-D1）+ 未注册的 API 路径仍是 JSON 404 + 越出目录的路径取不到文件 + 客户入口的脚本不含管理端代码（V-D6）。本机没有域名可指时用 `CONSOLE_DEV_HOST`（缺省关闭）打开管理端 |
 
 ## 6. 前端结构（一个工程、两个入口）
 

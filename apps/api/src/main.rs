@@ -356,17 +356,28 @@ async fn main() -> Result<()> {
 struct StaticSpa {
     console: PathBuf,
     portal: PathBuf,
+    /// 本地开发/验收用的**临时出口**：这个主机（`Host` 头，不含端口）也回管理端那一份。
+    ///
+    /// 生产不设它——分发判据就是主机名 `admin.<domain>`。但本机起服务时往往没有域名可指（写 hosts
+    /// 要管理员权限，容器里也没有），没有这个出口就**根本打不开管理端**。它只是一次取值，运行期不改。
+    console_dev_host: Option<String>,
 }
 
 impl StaticSpa {
     async fn serve(&self, request: axum::extract::Request) -> axum::response::Response {
-        // 判据只看主机名的第一段是不是 `admin`：运营后台跑在 `admin.<domain>` 上。
-        let is_console = request
+        let host = request
             .headers()
             .get(header::HOST)
             .and_then(|value| value.to_str().ok())
-            .map(|host| host.split(':').next().unwrap_or(host).starts_with("admin"))
-            .unwrap_or(false);
+            .map(|host| host.split(':').next().unwrap_or(host).to_owned());
+        // 判据：主机名第一段是 `admin`（生产），或命中本地开发出口（默认无）。
+        let is_console = host.as_deref().is_some_and(|host| {
+            host.starts_with("admin")
+                || self
+                    .console_dev_host
+                    .as_deref()
+                    .is_some_and(|dev| dev.eq_ignore_ascii_case(host))
+        });
         let root = if is_console {
             &self.console
         } else {
@@ -453,6 +464,11 @@ fn static_spa() -> Result<Option<StaticSpa>> {
     Ok(Some(StaticSpa {
         console: dist.clone(),
         portal: dist,
+        // 缺省不设：分发只看主机名。本机没有域名可指时才显式打开这个出口。
+        console_dev_host: env::var("CONSOLE_DEV_HOST")
+            .ok()
+            .map(|value| value.trim().to_owned())
+            .filter(|value| !value.is_empty()),
     }))
 }
 

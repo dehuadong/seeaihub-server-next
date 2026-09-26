@@ -30,6 +30,17 @@ npm run dev
 开发期 Vite 把 `/api`、`/v1` 与 `/health` 代理到 `127.0.0.1:8081`，所以浏览器不需要跨域、API 也不必
 开 CORS。两个入口在同一个 dev 服务上：`/console.html` 与 `/portal.html`。
 
+### 不走 dev 服务时怎么看管理端
+
+生产由 API **按主机名**分发：`admin.<domain>` 回运营后台，其余主机回客户控制台。本机往往没有域名可指
+（写 hosts 要管理员权限，容器里更没有），那时设一个显式出口：
+
+```sh
+CONSOLE_DEV_HOST=localhost cargo run -p seeai-api   # 于是 http://localhost:8080/ 回管理端
+```
+
+缺省不设 —— 不设时分发只看主机名，`localhost` 拿到的是客户入口。**生产不要设它**。
+
 ## 构建
 
 ```sh
