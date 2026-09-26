@@ -69,6 +69,18 @@
 | GET | `/v1/account` | `read_own_account` | 持 Key 的账户（**只有自己的**余额与**持有中**，两者**分开给、不合成一个数**：余额是可用额，持有中是已预授权未结算的部分，合成"总资产"会让"这笔钱到底扣没扣"说不清。两个数都以**数据库**为准、不读缓存——缓存可能滞后、也可能刚被对账覆盖写回，而这条读的用途正是查看与核对） |
 | POST | `/v1/images/generations` | `generate_image` | 持 Key 的账户（JSON；`model` + 平铺的模型参数 + 参考图/遮罩；幂等键走 `Idempotency-Key` 头） |
 | POST | `/v1/images/edits` | `edit_image` | 同上（`multipart/form-data`；`image`/`mask` 是文件部件，文本部件也认、值按 URL/data URL 读；与上一条**同一个能力**） |
+| POST | `/api/v1/admin/sessions` | `login_admin` | 公开（邮箱 + 口令 → 会话；邮箱不存在与口令不对回同一个答复，两条路都走一次口令哈希） |
+| GET / DELETE | `/api/v1/admin/session`、`/api/v1/admin/sessions` | `read_admin_session`、`logout_admin` | **仅会话**（共享 `ADMIN_TOKEN` 不指向任何管理员，在这些端点上被拒） |
+| PUT | `/api/v1/admin/password` | `change_admin_password` | **仅会话**（需当前口令；成功后该管理员**全部**会话失效） |
+| POST | `/api/v1/admin/password-resets`、`…/redeem` | 签发 / 兑换重置令牌 | 前者认会话或共享令牌（运维自救入口），后者**无需凭据**——口令重置的意义就是"进不去了"；令牌一次性、只存摘要 |
+| POST / GET | `/api/v1/customers`、`/api/v1/customers/{…}` | `open_customer`、`list_customers` | 管理员（替客户开户：新建账户或给**已有账户**配登录身份；按邮箱找账户，给客户充值/签重置令牌都要那个标识） |
+| POST | `/api/v1/accounts/{account_id}/password-reset` | `issue_customer_password_reset` | 管理员（为客户账户签一次性重置令牌；该账户没有登录身份时 404） |
+| GET | `/api/v1/fx-rates` | `list_fx_rates` | 管理员（每个币种**当前生效**的那一行，供折算率页显示录入结果） |
+| POST | `/v1/customers`、`/v1/customer/sessions` | `register_customer`、`login_customer` | 公开（客户自助注册与登录） |
+| GET / DELETE | `/v1/customer/api-keys`、`/v1/customer/api-keys/{key_id}` | 客户自助密钥 | 客户会话（列：**不含明文**；建：明文只此一次；吊销：不属于自己的回 404） |
+| PUT | `/v1/customer/password` | `change_customer_password` | 客户会话（需当前口令；成功后该客户全部会话失效） |
+| POST | `/v1/customer/password-resets/redeem` | `redeem_customer_password_reset` | 无需凭据（**凭令牌**；对客面没有"提交邮箱就拿到令牌"的入口——不发邮件时那等于知道邮箱就能接管账户） |
+| GET | `/v1/customer/account`、`/ledger`、`/usage`、`/billing` | 对客账务读 | 客户会话（余额与持有**分开**；用量是执行记录的**对客投影**，不含 Job 标识与内部状态；账单按 `[since, until)` 全量算、扣费总额只计 `capture` 与 `adjustment`） |
 
 对客的**生成面只有这两条路径**，都是**同步**：一个请求把图交回，没有 202 受理、没有 job_id 轮询。**分支由请求内容决定**（有没有参考图/遮罩），不按端点断言——带图的 generations、不带图的 edits 都合法。参考图与遮罩用**公网 URL 或 `data:image/…;base64,…`** 给出（`image` 与 `image_urls` 同义、二选一）；平台**不落盘**：不下载归档、不解码存储，渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，原样放进 `data[]`，由客户端判断。成功响应 `{created, data:[{url|b64_json}]}`；内部受理后等 Job 到终态（上限 `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），等不到就按失败回超时错误。
 

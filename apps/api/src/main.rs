@@ -30,7 +30,7 @@ use seeai_domain::{
 use seeai_persistence::{PgHubRepository, max_declared_output_images};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
-use std::{collections::BTreeMap, env, net::SocketAddr, sync::Arc, time::Duration};
+use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
 use tracing_subscriber::EnvFilter;
@@ -317,12 +317,130 @@ async fn main() -> Result<()> {
         ))
         .layer(TraceLayer::new_for_http())
         .with_state(state);
+    // 两份前端产物（`apps/web/dist`）由这里托管，**按主机名分发**：管理主机回运营后台、客户主机回
+    // 客户控制台。它挂成 `fallback`，所以**路由表优先**——未注册的 `/api/v1/…` 与 `/v1/…` 仍然回
+    // 既有的 JSON 404，不会被兜底成一份 HTML（那会让调用方把"路径写错了"读成"调用成功"）。
+    let app = match static_spa()? {
+        Some(spa) => app.fallback(move |request: axum::extract::Request| {
+            let spa = spa.clone();
+            async move { spa.serve(request).await }
+        }),
+        None => app,
+    };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "api listening");
     axum::serve(listener, app)
         .with_graceful_shutdown(shutdown_signal())
         .await?;
     Ok(())
+}
+
+/// 托管的两个前端入口：管理主机回运营后台那一份、其余主机回客户那一份。
+///
+/// 自己按路径读文件而不是用 `ServeDir`：需要把"路径不能越出产物目录"这条防线的判定放在看得见的
+/// 地方（`ServeDir` 也做了这件事，但它把类型链和兜底语义一起带进来，这里两件都不需要）。
+#[derive(Clone)]
+struct StaticSpa {
+    console: PathBuf,
+    portal: PathBuf,
+}
+
+impl StaticSpa {
+    async fn serve(&self, request: axum::extract::Request) -> axum::response::Response {
+        // 判据只看主机名的第一段是不是 `admin`：运营后台跑在 `admin.<domain>` 上。
+        let is_console = request
+            .headers()
+            .get(header::HOST)
+            .and_then(|value| value.to_str().ok())
+            .map(|host| host.split(':').next().unwrap_or(host).starts_with("admin"))
+            .unwrap_or(false);
+        let root = if is_console {
+            &self.console
+        } else {
+            &self.portal
+        };
+        let entry = if is_console {
+            "console.html"
+        } else {
+            "portal.html"
+        };
+        serve_from(root, entry, request.uri().path()).await
+    }
+}
+
+/// 从产物目录里读一个文件回出去；找不到且路径不含 `.` 时回入口 HTML（深链）。
+///
+/// **只回产物目录下的文件**：请求路径里的 `..` 一律拒，不拼接、不规范化后再判——判在前比判在后可靠。
+///
+/// **`/api` 与 `/v1` 下面的路径不归它管**：那两个命名空间属于 API，未注册的路径必须回既有的 JSON
+/// 404。兜底成一份 HTML 会把"路径写错了"变成"调用成功"，对任何按状态码判成败的调用方都是坏消息。
+async fn serve_from(root: &std::path::Path, entry: &str, path: &str) -> axum::response::Response {
+    if path == "/api" || path.starts_with("/api/") || path == "/v1" || path.starts_with("/v1/") {
+        return not_found();
+    }
+    let relative = path.trim_start_matches('/');
+    // 只看**解码后**的路径里有没有 `..` 或空段：`%2e%2e%2f` 这类写法在拼接前就得挡住，
+    // 而不是拼完再规范化——判在前比判在后可靠。
+    if relative
+        .split('/')
+        .any(|segment| segment == ".." || segment == ".")
+    {
+        return not_found();
+    }
+    let candidate = if relative.is_empty() {
+        root.join(entry)
+    } else {
+        root.join(relative)
+    };
+    match tokio::fs::read(&candidate).await {
+        Ok(bytes) => file_response(&candidate, bytes),
+        Err(_) if !relative.contains('.') => match tokio::fs::read(root.join(entry)).await {
+            Ok(bytes) => file_response(&root.join(entry), bytes),
+            Err(_) => not_found(),
+        },
+        Err(_) => not_found(),
+    }
+}
+
+fn file_response(path: &std::path::Path, bytes: Vec<u8>) -> axum::response::Response {
+    let content_type = match path.extension().and_then(|value| value.to_str()) {
+        Some("html") => "text/html; charset=utf-8",
+        Some("js") | Some("mjs") => "text/javascript; charset=utf-8",
+        Some("css") => "text/css; charset=utf-8",
+        Some("json") | Some("map") => "application/json; charset=utf-8",
+        Some("svg") => "image/svg+xml",
+        Some("png") => "image/png",
+        Some("ico") => "image/x-icon",
+        Some("woff2") => "font/woff2",
+        _ => "application/octet-stream",
+    };
+    ([(header::CONTENT_TYPE, content_type)], bytes).into_response()
+}
+
+fn not_found() -> axum::response::Response {
+    ApiError {
+        status: StatusCode::NOT_FOUND,
+        code: "not_found",
+        message: "no such endpoint".to_owned(),
+        retry_after: None,
+    }
+    .into_response()
+}
+
+/// 找 `apps/web/dist` 并装配两个入口；没有构建产物时回 `None`（API 只服务 API，未命中仍是 JSON 404）。
+fn static_spa() -> Result<Option<StaticSpa>> {
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("web")
+        .join("dist");
+    if !dist.is_dir() {
+        tracing::warn!(path = %dist.display(), "no web build found; the API serves no front end");
+        return Ok(None);
+    }
+    Ok(Some(StaticSpa {
+        console: dist.clone(),
+        portal: dist,
+    }))
 }
 
 async fn shutdown_signal() {
