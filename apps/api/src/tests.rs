@@ -1,5 +1,6 @@
 use super::{
-    AdminSeed::*, ApiError, ApplicationError, admin_seed_decision, sanitize_provider_text,
+    AdminSeed::*, ApiError, ApplicationError, NO_ADMIN_ACCOUNT_WARNING, admin_seed_decision,
+    sanitize_provider_text,
 };
 use std::{
     io::{self, Write},
@@ -148,6 +149,9 @@ fn the_admin_bootstrap_branches_are_distinguishable() {
 fn the_missing_admin_account_warning_says_the_console_cannot_be_used() {
     // V-A8 要的"日志里看得出没有管理员账号"：文案必须点明**后果**（后台登不进去）与**原因**
     // （没有这两个变量），否则运维只会看到"什么都没发生"。
+    //
+    // 这里打的是**生产那句**（`seed_admin_account` 用的同一个常量），不是在测试里再抄一遍字面量：
+    // 抄一遍的话，把生产那句删掉或改写之后这条仍然通过，等于没验（复核抓到的正是这一点）。
     let logs = CapturedLogs::default();
     let subscriber = tracing_subscriber::fmt()
         .with_writer(logs.clone())
@@ -155,15 +159,7 @@ fn the_missing_admin_account_warning_says_the_console_cannot_be_used() {
         .finish();
     let _guard = tracing::subscriber::set_default(subscriber);
 
-    match admin_seed_decision(None, None) {
-        WarnNoAccount => {
-            tracing::warn!(
-                "no ADMIN_EMAIL/ADMIN_PASSWORD: no admin account was created, the admin console \
-                 cannot be logged into until one exists"
-            );
-        }
-        other => panic!("两个都不给时必须走「警告」那条分支，实际是 {other:?}"),
-    }
+    tracing::warn!("{}", NO_ADMIN_ACCOUNT_WARNING);
 
     let logged = logs.text();
     for needle in ["ADMIN_EMAIL", "ADMIN_PASSWORD", "cannot be logged into"] {

@@ -2384,6 +2384,14 @@ fn admin_seed_decision(email: Option<String>, password: Option<String>) -> Admin
     }
 }
 
+/// 没有管理员账号时的警告文案。
+///
+/// 抽成常量是为了让用例断言的是**生产那句**，而不是在测试里再抄一遍字面量——抄一遍的写法在"把生产
+/// 那句删掉"之后仍然通过，等于没验（复核抓到的就是这个）。文案本身要能让人直接改对：点明缺少哪两个
+/// 变量，以及后果（后台登不进去）。
+const NO_ADMIN_ACCOUNT_WARNING: &str = "no ADMIN_EMAIL/ADMIN_PASSWORD: no admin account was created, \
+     the admin console cannot be logged into until one exists";
+
 async fn seed_admin_account(state: &AppState) -> Result<()> {
     match admin_seed_decision(
         env::var("ADMIN_EMAIL").ok(),
@@ -2393,10 +2401,7 @@ async fn seed_admin_account(state: &AppState) -> Result<()> {
             state.identity.seed_admin(&email, &password).await?;
         }
         AdminSeed::WarnNoAccount => {
-            tracing::warn!(
-                "no ADMIN_EMAIL/ADMIN_PASSWORD: no admin account was created, the admin console \
-                 cannot be logged into until one exists"
-            );
+            tracing::warn!("{NO_ADMIN_ACCOUNT_WARNING}");
         }
         AdminSeed::Reject { present, missing } => {
             bail!("{present} is set but {missing} is missing");

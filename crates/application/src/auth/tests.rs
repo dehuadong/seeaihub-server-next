@@ -39,8 +39,11 @@ fn the_dummy_hash_is_a_real_hash_and_never_matches() {
         PasswordHash::new(dummy).is_ok(),
         "dummy must parse as a PHC hash"
     );
-    assert!(!verify_dummy_password("correct horse battery"));
-    assert!(!verify_dummy_password(""));
+    // 直接走 `verify_password` 而**不是** `verify_dummy_password`：后者的计数是进程级全局量，而这个
+    // 模块的用例会被 cargo 分摊到多个线程并行跑——多碰一次全局计数，就会让下面那条按"前后之差"断言的
+    // 用例偶发失败（复核指出过这一点）。计数只由那一条用例碰。
+    assert!(!verify_password("correct horse battery", dummy));
+    assert!(!verify_password("", dummy));
 }
 
 #[test]
@@ -53,8 +56,9 @@ fn an_unknown_account_still_pays_for_one_password_check() {
     // 别的分支能跳过它）与端到端用例 `a_wrong_password_and_an_unknown_email_are_indistinguishable`
     // 各承担一半。
     //
-    // 计数是进程级的，所以要按**调用前后之差**断言；本模块的用例不并发（cargo test 会把同一模块的
-    // 用例分摊到多个线程，所以这里只断言"至少加了一次"，不断言恰好一次）。
+    // 计数是**进程级全局量**：这个模块里的其他用例都不碰它（`the_dummy_hash_...` 直接走
+    // `verify_password`），所以这里的"前后之差"是可靠的。两条登录路径的对照校验都不在这里跑，也不会
+    // 影响它。
     let before = dummy_verifications();
     assert!(!verify_login_secret(None, "any-password"));
     assert!(

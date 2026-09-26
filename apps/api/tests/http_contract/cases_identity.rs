@@ -165,6 +165,21 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
     assert_eq!(me.status(), StatusCode::FORBIDDEN);
 
     // 重置令牌的兑换入口**不需要任何凭据**（口令重置的全部意义就是"进不去了"）。
+    //
+    // 兑换之前先证明**第二条会话确实可用**：否则"兑换后它被拒"什么也证明不了（它本来就不行）。
+    // 这是 V-A7 那条断言的前置。
+    let second_works = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth(&second)
+        .send()
+        .await
+        .expect("second session before redemption");
+    assert_eq!(
+        second_works.status(),
+        StatusCode::OK,
+        "兑换之前第二条会话必须是可用的，否则后面的断言恒真"
+    );
+
     let issued = client
         .post(format!("{base_url}/api/v1/admin/password-resets"))
         .bearer_auth(&admin_token)
@@ -193,32 +208,10 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
         .expect("second redeem request");
     assert_eq!(again.status(), StatusCode::BAD_REQUEST, "令牌是一次性的");
 
-    // **兑换重置令牌使此前的会话全部失效**（V-A7）：拿兑换之前那条会话答"我是谁"必须被拒。
-    // 读的是会话端点而不是"我还在不在"，所以这条恰好只能由会话身份来答——共享令牌答不了它。
-    let revoked = client
-        .get(format!("{base_url}/api/v1/admin/session"))
-        .bearer_auth(&token)
-        .send()
-        .await
-        .expect("identity request after redemption");
-    assert_eq!(
-        revoked.status(),
-        StatusCode::FORBIDDEN,
-        "重置之后旧会话必须失效"
-    );
-    // 而且答复与"凭据不对"**逐字相同**：调用方分不出自己是过期了还是拿错了（V-A6 的那条断言）。
-    let revoked_body = revoked.json::<Value>().await.expect("revoked body");
-    let bogus = client
-        .get(format!("{base_url}/api/v1/admin/session"))
-        .bearer_auth("not-a-real-token")
-        .send()
-        .await
-        .expect("bogus request");
-    assert_eq!(bogus.status(), StatusCode::FORBIDDEN);
-    let bogus_body = bogus.json::<Value>().await.expect("bogus body");
-    assert_eq!(revoked_body, bogus_body, "失效会话与错凭据必须同答复");
-
-    // **另一条**会话也失效了——这才是"全部"而不是"那一条"。
+    // **兑换重置令牌使此前的会话全部失效**（V-A7）。
+    //
+    // 判据用**第二条**会话（`second`）：它在兑换之前**被证明过可用**，所以"兑换后被拒"才是真的失效。
+    // 拿 `token` 去验是恒真的——它在上面退出登录时就已经失效了，它被拒什么也说明不了。
     let second_revoked = client
         .get(format!("{base_url}/api/v1/admin/session"))
         .bearer_auth(&second)
@@ -230,6 +223,17 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
         StatusCode::FORBIDDEN,
         "重置必须使**全部**旧会话失效，不只是发起兑换的那一条"
     );
+    // 而且答复与"凭据不对"**逐字相同**：调用方分不出自己是失效了还是拿错了（V-A6 的那条断言）。
+    let second_body = second_revoked.json::<Value>().await.expect("revoked body");
+    let bogus = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth("not-a-real-token")
+        .send()
+        .await
+        .expect("bogus request");
+    assert_eq!(bogus.status(), StatusCode::FORBIDDEN);
+    let bogus_body = bogus.json::<Value>().await.expect("bogus body");
+    assert_eq!(second_body, bogus_body, "失效会话与错凭据必须同答复");
 
     let old = client
         .post(format!("{base_url}/api/v1/admin/sessions"))
@@ -304,15 +308,24 @@ async fn an_expired_session_is_rejected() {
         .send()
         .await
         .expect("gateway models request");
-    assert_eq!(after.status(), StatusCode::FORBIDDEN, "过期会话必须被拒");
+    let after_status = after.status();
+    assert_eq!(after_status, StatusCode::FORBIDDEN, "过期会话必须被拒");
+    let after_body = after.json::<Value>().await.expect("expired body");
 
-    let wrong = client
+    // **答复体也要逐字相同**，不只是状态码：这条路径与"库里根本没有这一行"在实现里是两个分支
+    // （一个要顺手删掉过期行、一个直接拒），只比状态码会漏掉"过期"这条分支多说的话。
+    let absent = client
         .get(format!("{base_url}/api/v1/gateway-models"))
         .bearer_auth("not-a-real-token")
         .send()
         .await
-        .expect("gateway models request");
-    assert_eq!(after.status(), wrong.status(), "过期与凭据不对不可区分");
+        .expect("absent token request");
+    assert_eq!(absent.status(), after_status, "过期与凭据不对不可区分");
+    let absent_body = absent.json::<Value>().await.expect("absent body");
+    assert_eq!(
+        after_body, absent_body,
+        "过期与「库里没有这一行」必须逐字同答复"
+    );
 
     pool.close().await;
     drop_isolated_database(&database_name).await;
