@@ -68,5 +68,5 @@
 这些是 V-D7 之外各条验收条件的证据，人不用重做，只需知道它们已被覆盖：
 
 - **接口契约**（状态码、鉴权规则、口令链路、账务口径）：`cargo test -p seeai-api --test http_contract -- --ignored`（`cases_identity` / `cases_billing` / `cases_pricing` 等）。
-- **浏览器行为**（路由守卫不取数、刷新仍登录、两个入口的分发、密钥明文只出现一次、改口令与重置令牌）：`npm run e2e --prefix apps/web`。
-- **产物隔离**（客户产物里不含管理端代码）：`apps/web/README.md` 里那三条带引号的精确路径核对命令。
+- **浏览器行为**（路由守卫不取数、刷新仍登录且 URL 不含凭据、两个入口的分发、密钥明文只出现一次、改口令与重置令牌、页面读出库里的真实数据）：`npm run e2e --prefix apps/web`。
+- **产物隔离**（客户产物里不含管理端代码，反之亦然）：`npm run build --prefix apps/web` 末尾自带这条核对，也可单独跑 `npm run check:isolation --prefix apps/web`。
