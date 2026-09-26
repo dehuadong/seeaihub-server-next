@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import { Page } from '../ui';
+import { Page } from '../../shared/ui';
 
 /// 发布修订：运营在这里"加一个网关模型"——贴一份发布命令，带上定价与倍率。
 ///

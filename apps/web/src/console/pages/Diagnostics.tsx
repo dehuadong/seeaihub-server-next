@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import { Page, useLoadable } from '../ui';
-import { when } from '../routes';
+import { Page, useLoadable } from '../../shared/ui';
+import { when } from '../../shared/routes';
 
 /// 对账与诊断：三张运营清单——对账案例、平台侧失败、成本缺口。
 ///

@@ -1,6 +1,6 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import { Page } from '../ui';
+import { Page } from '../../shared/ui';
 
 /// 折算率：渠道币种 → CNY。**按币种维护、不进修订**，受理时取"受理时刻生效的那一行"。
 ///

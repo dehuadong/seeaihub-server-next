@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import type { RouteStrategy } from '../types';
-import { Page, useLoadable } from '../ui';
+import type { RouteStrategy } from '../../shared/types';
+import { Page, useLoadable } from '../../shared/ui';
 
 const STRATEGIES: { value: RouteStrategy; label: string }[] = [
   { value: 'priority_failover', label: '按档位顺序（默认）' },

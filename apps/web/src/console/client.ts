@@ -1,4 +1,4 @@
-import { apiFetch, type AdminToken } from './api';
+import { apiFetch, type AdminToken } from '../shared/api';
 import type {
   AccountBalance,
   AccountEntriesResponse,
@@ -11,7 +11,7 @@ import type {
   RoutePoliciesResponse,
   RoutePolicy,
   RouteStrategy,
-} from './types';
+} from '../shared/types';
 
 /// 管理 API 的每一个端点在这里各有一个函数：**页面不拼路径、不拼查询串**。
 ///

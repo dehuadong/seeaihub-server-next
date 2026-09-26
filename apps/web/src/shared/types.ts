@@ -162,3 +162,50 @@ export interface OwnAccount {
   held_microusd: number;
   updated_at: string;
 }
+
+/// 一次对客注册/登录的结果：会话令牌与自己的账户。
+export interface CustomerSession {
+  token: string;
+  expires_at: string;
+  email: string;
+  account_id: string;
+}
+
+/// 一把自己的 API Key。**没有明文**：创建那一次之后就再也拿不回来了。
+export interface CustomerKey {
+  key_id: string;
+  label: string;
+  created_at: string;
+  revoked_at: string | null;
+}
+
+export interface CustomerKeysResponse {
+  keys: CustomerKey[];
+}
+
+/// 用量里的一次生成请求：执行记录的**对客投影**，不含 Job 标识与内部状态。
+export interface CustomerUsageRow {
+  gateway_model: string;
+  /// 对客三值：`succeeded` / `failed` / `pending`。
+  status: 'succeeded' | 'failed' | 'pending';
+  /// `generation` / `edit`。
+  kind: 'generation' | 'edit';
+  created_at: string;
+  image_count: number;
+  charged_microusd: number;
+}
+
+export interface CustomerUsageResponse {
+  usage: CustomerUsageRow[];
+  count: number;
+  truncated: boolean;
+}
+
+/// 账单汇总：按区间**全量**算，不随明细条数上限变化。
+export interface CustomerBilling {
+  since: string | null;
+  until: string | null;
+  requests: number;
+  images: number;
+  charged_microusd: number;
+}

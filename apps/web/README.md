@@ -1,62 +1,61 @@
-# 运营后台（管理 API 的界面）
+# 前端：一个工程、两个入口
 
-这个前端是**管理 API 的界面**：运营在这里加网关模型、定价与倍率、排候选顺序与权重、维护折算率与
-路由策略、看账户与密钥、处理对账与成本缺口。它不新增后端能力——每个页面调用的端点都在
-`apps/api/src/main.rs` 的路由表里，页面只是把"运营要做的事"组织成能点的东西。
+这个工程产出**两个入口产物**，服务两拨人：
 
-对客那一侧（客户用自己的 API Key 调 `/v1/images/generations` 等）不在这个应用里：客户端是调用方
-自己的程序，不需要我们的界面。
+| 入口 | 源码 | 产物 | 给谁 |
+| --- | --- | --- | --- |
+| `console.html` | `src/console/` | `dist/console.html` | 运营后台（管理员） |
+| `portal.html` | `src/portal/` | `dist/portal.html` | 客户控制台（客户） |
+
+`src/shared/` 放两边共用的骨架：HTTP 调用与错误解析、金额与时间格式、加载三态与通用展示组件。
+**会话的存放不在共享层**：管理端用 `seeai.console.session`、客户端用 `seeai.portal.session`，各写各的，
+同一个浏览器同时开两个控制台不会串。
 
 ## 跑起来
 
-需要一个在跑的 API 进程（并准备好数据库与折算率）：
+需要一个在跑的 API 进程（并准备好数据库）：
 
 ```sh
-# 1) 后端（另一个终端）。DATABASE_URL 指向你自己的库；ADMIN_TOKEN 是这个后台要填的令牌。
+# 后端（另一个终端）。ADMIN_EMAIL/ADMIN_PASSWORD 给的是**引导**用的初始账号：只在账号不存在时写入。
 DATABASE_URL=postgres://seeai:seeai@127.0.0.1:54329/seeai_next \
-API_BIND=127.0.0.1:8081 ADMIN_TOKEN=... cargo run -p seeai-api
+API_BIND=127.0.0.1:8081 ADMIN_TOKEN=... \
+ADMIN_EMAIL=ops@example.com ADMIN_PASSWORD=... cargo run -p seeai-api
 
-# 2) 前端
+# 前端
 cd apps/web
 npm install
-npm run dev          # http://localhost:5173
+npm run dev
 ```
 
-开发期由 Vite 把 `/api` 与 `/health` 代理到 `127.0.0.1:8081`（见 `vite.config.ts`），所以浏览器
-不需要跨域、API 也不必开 CORS。后端不在 8081 时改代理目标即可。
+开发期 Vite 把 `/api`、`/v1` 与 `/health` 代理到 `127.0.0.1:8081`，所以浏览器不需要跨域、API 也不必
+开 CORS。两个入口在同一个 dev 服务上：`/console.html` 与 `/portal.html`。
 
-打开页面后填 `ADMIN_TOKEN`：它只存在这个标签页的 `sessionStorage` 里，关掉标签页就没了，也不进
-构建产物。
-
-## 页面与它调用的端点
-
-| 页面 | 端点 |
-| --- | --- |
-| 网关模型 | `GET /api/v1/gateway-models`；`PATCH /api/v1/gateway-models/{name}`（启停型号）；`PATCH /api/v1/offerings/{id}`（启停候选） |
-| 发布修订 | `POST /api/v1/runtime-revisions` |
-| 折算率 | `PUT /api/v1/fx-rates` |
-| 路由策略 | `GET/PUT /api/v1/route-policies` |
-| 账户与密钥 | `POST /api/v1/accounts`、`POST /api/v1/accounts/{id}/credits`、`PUT /api/v1/accounts/{id}/tag`、`GET /api/v1/accounts/{id}`、`GET /api/v1/accounts/{id}/entries`、`POST /api/v1/accounts/{id}/api-keys`、`DELETE /api/v1/api-keys/{id}` |
-| 对账与诊断 | `GET /api/v1/reconciliation-cases`、`POST /api/v1/reconciliation-cases/{job_id}/refund`、`GET /api/v1/provider-failures`、`GET /api/v1/provider-cost-gaps` |
-
-**发布修订**一页不做表单化改写：发布命令里的合同与候选是结构化数据，拆成几十个输入框会让人以为
-平台在替它做决定。这一页只负责提交、把平台的校验原话显示出来，并指向"网关模型"页核对结果。
-
-**账户一页没有"账户列表"**：管理 API 今天只有 `POST /api/v1/accounts`，没有"列出账户"这一条，
-所以这一页按 id 粘贴查询，不假装能列出来。
-
-## 构建与部署
+## 构建
 
 ```sh
-npm run build        # tsc --noEmit && vite build -> dist/
+npm run build     # tsc --noEmit && vite build -> dist/ 下的两份产物
 ```
 
-产物是静态文件。生产建议与 API **同源**：由反代把 `/api` 与 `/health` 转给 API 进程、其余路径回
-`dist/`（含一条"未知路径回 index.html"的规则，供 hash 路由之外的深链使用）。
+产物是静态文件，由 API 按**主机名**分发：管理主机回 `console.html` 那一份、客户主机回 `portal.html`
+那一份，未命中任何 API 路径的请求回各自的入口 HTML（深链）。**未注册的 `/api/...` 与 `/v1/...` 路径
+仍然回既有的 JSON 404**——兜底不吃 API 的 404。
+
+两份产物互不引用：`portal.html` 只引客户那一份脚本，管理端的代码不在里面（反之亦然）。这条是
+Spec D4 要的性质，改完 `vite.config.ts` 的入口或共享层之后值得用下面两条再核一次：
+
+```sh
+# 客户产物里不该出现管理端的端点名
+grep -c 'gateway-models' dist/assets/portal-*.js      # 期望 0
+# 管理产物里不该出现对客自助的路径
+grep -c '/v1/customer/' dist/assets/console-*.js      # 期望 0
+```
 
 ## 边界
 
-- 不带登录态：服务端今天只有 `ADMIN_TOKEN` 这一种管理员身份。真实登录（会话/口令）是一次独立的
-  后端工作，与这个界面无关。
-- 管理 API 今天没有"列账户""列密钥"这类读端点；界面如实反映这一点，不自己造数据。
-- 金额一律以**微单位**传输与判断，只在展示层换算成元（`src/routes.ts` 的 `yuan`）。
+- 管理端只调 `/api/v1/*`；客户端只调 `/v1/customer/*`。服务端按凭据判权，前端分包只解决"不该送到
+  浏览器的代码不送过去"。
+- 未登录时两个控制台都**只**渲染登录/注册页：账户与管理的取数组件在那之前不挂载，因此不会发出任何
+  取数请求。
+- 平台**没有**在线支付：充值由运营在后台完成，客户控制台只展示余额与充值记录。客户也**不能**自助
+  重置口令——由运营签发一次性重置令牌后转交。
+- 金额一律以**微单位**传输与判断，只在展示层换算成元（`src/shared/routes.ts` 的 `yuan`）。

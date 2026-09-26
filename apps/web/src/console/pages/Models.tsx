@@ -1,8 +1,8 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import type { GatewayModel, GatewayModelCandidate } from '../types';
-import { Page, useLoadable } from '../ui';
-import { when, yuan } from '../routes';
+import type { GatewayModel, GatewayModelCandidate } from '../../shared/types';
+import { Page, useLoadable } from '../../shared/ui';
+import { when, yuan } from '../../shared/routes';
 
 /// 网关模型清单：运营最常看的一页。
 ///

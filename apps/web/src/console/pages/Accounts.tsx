@@ -1,7 +1,7 @@
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import { Page } from '../ui';
-import { when, yuan } from '../routes';
+import { Page } from '../../shared/ui';
+import { when, yuan } from '../../shared/routes';
 
 /// 账户与密钥。建账户、充值、改标签、发/吊销密钥，以及看余额与流水。
 ///

@@ -1,7 +1,7 @@
 import { useCallback, useMemo, useState } from 'react';
 import { AdminClient } from './client';
 import { useAdminSession } from './session';
-import { useHashRoute, type Route } from './routes';
+import { useHashRoute, type Route } from '../shared/routes';
 import { AccountsPage } from './pages/Accounts';
 import { DiagnosticsPage } from './pages/Diagnostics';
 import { ChangePasswordPanel, LoginPage } from './pages/Login';

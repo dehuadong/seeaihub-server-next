@@ -1,7 +1,7 @@
 import { useState } from 'react';
-import { apiFetch } from '../api';
+import { apiFetch } from '../../shared/api';
 import { useAdminSession } from '../session';
-import { useLoadable } from '../ui';
+import { useLoadable } from '../../shared/ui';
 
 /// 登录页。管理员用**邮箱 + 口令**换一条会话；拿不到就不进后台。
 ///
