@@ -25,6 +25,51 @@ async fn health_reports_ok_when_the_database_is_reachable() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 同一个实例**跑着的时候**事实源没了 ⇒ 探活变红：`503 {"status":"unhealthy","database":"unreachable"}`。
+///
+/// 做法是把这个用例的**整个空库删掉**（探活连的就是它），而不是去动数据库服务：实例不必重启，
+/// 库确实不可达，这正是编排系统该看到的那个状态。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn health_reports_unhealthy_once_the_database_is_gone() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    // 先把库删掉：池里已有的连接大多是空闲的，第一次探活会撞上"库不存在"。
+    drop_isolated_database(&database_name).await;
+
+    // 探活是只读幂等的，所以"等它意识到"就是重复探——不等的话这条用例会去赌连接池的实现细节。
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let mut last_status = StatusCode::OK;
+    let mut last_body = Value::Null;
+    while std::time::Instant::now() < deadline {
+        let response = client
+            .get(format!("{base_url}/health"))
+            .send()
+            .await
+            .expect("health request");
+        last_status = response.status();
+        last_body = response.json::<Value>().await.expect("health body is JSON");
+        if last_status == StatusCode::SERVICE_UNAVAILABLE {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    assert_eq!(
+        last_status,
+        StatusCode::SERVICE_UNAVAILABLE,
+        "事实源不可达时探活必须变红，而不是一直说 ok：{last_body}"
+    );
+    assert_eq!(
+        last_body,
+        json!({"status": "unhealthy", "database": "unreachable"}),
+        "对客只报是哪一层不可达，不多说内部细节"
+    );
+}
+
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn public_surface_has_no_async_task_protocol() {

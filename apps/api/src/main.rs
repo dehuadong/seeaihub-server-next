@@ -1329,22 +1329,27 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::DailySpendLimitExceeded { retry_after } => Some(*retry_after),
             _ => None,
         };
-        let (status, code) = match error {
+        // 两条平台侧故障有自己的 warn（它们更常见、更值得被看见），5xx 的兜底日志因此要避开它们，
+        // 否则同一个错误会有两条日志、其中一条还说不清是哪一类。
+        let mut logged_as_warning = false;
+        let (status, code) = match &error {
             ApplicationError::Validation(_) => (StatusCode::BAD_REQUEST, "validation_error"),
             // 调用方这次请求在参数上不成立（例如合同没声明图片字段却带了图）：与一般校验失败分开，
             // 说得更具体，调用方才知道该去掉哪个字段或换模型。
             ApplicationError::InvalidParameter(_) => (StatusCode::BAD_REQUEST, "invalid_parameter"),
-            ApplicationError::NoEligibleOffering(ref reason) => {
+            ApplicationError::NoEligibleOffering(reason) => {
                 // 请求本身没违反合同，是平台的供给面承载不了它：对客说成平台侧故障，不是参数错。
                 // 它发生在受理之前、没有 Job 可以记录，所以这里留一条日志——平台侧的供给问题
                 // 必须能被运营发现（"一条候选都承载不了"往往意味着发布时少声明了一个字段）。
+                logged_as_warning = true;
                 tracing::warn!(reason = %reason, "no offering can carry the request");
                 (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
             }
-            ApplicationError::RequestCostCeilingExceeded(ref reason) => {
+            ApplicationError::RequestCostCeilingExceeded(reason) => {
                 // 平台自己划的成本护栏挡住了这次执行：客户的余额可能够、请求本身也没错，是这次
                 // 执行可能让平台付得太多。同样发生在受理之前、没有 Job 可记，因此在这里留日志
                 // ——这道护栏撞上的时候，运营要么调上限，要么改那条候选的定价。
+                logged_as_warning = true;
                 tracing::warn!(reason = %reason, "the request cost ceiling rejected an acceptance");
                 (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
             }
@@ -1373,6 +1378,16 @@ impl From<ApplicationError> for ApiError {
             }
         };
         let message = if status.is_server_error() {
+            // 5xx 的对客文案不泄漏内部细节，因此**日志是唯一能看见原因的地方**：配置错误、仓储
+            // 错误或对账错误在这里留下类别与完整错误内容，排障不必靠猜。4xx 不打这类日志——那是
+            // 调用方自己的问题，数量由调用方决定。
+            if status != StatusCode::SERVICE_UNAVAILABLE && !logged_as_warning {
+                tracing::error!(
+                    category = error_category(&error),
+                    error = %error,
+                    "request failed with a server error"
+                );
+            }
             "The server could not complete the request".to_owned()
         } else {
             error.to_string()
@@ -1383,6 +1398,25 @@ impl From<ApplicationError> for ApiError {
             message,
             retry_after,
         }
+    }
+}
+
+/// 这个错误属于哪一类：写进 5xx 的那条日志，让排障一眼看出该去哪一层找（配置、仓储还是对账）。
+fn error_category(error: &ApplicationError) -> &'static str {
+    match error {
+        ApplicationError::Configuration(_) => "configuration",
+        ApplicationError::Persistence(_) => "persistence",
+        ApplicationError::Reconciliation(_) => "reconciliation",
+        ApplicationError::Validation(_)
+        | ApplicationError::InvalidParameter(_)
+        | ApplicationError::NoEligibleOffering(_)
+        | ApplicationError::RequestCostCeilingExceeded(_)
+        | ApplicationError::NotFound(_)
+        | ApplicationError::Conflict(_)
+        | ApplicationError::InsufficientBalance
+        | ApplicationError::TooManyInFlight
+        | ApplicationError::RateLimitExceeded { .. }
+        | ApplicationError::DailySpendLimitExceeded { .. } => "request",
     }
 }
 
