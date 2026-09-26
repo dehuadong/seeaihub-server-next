@@ -2349,25 +2349,58 @@ fn duration_from_env(name: &str, default_seconds: i64) -> Result<ChronoDuration>
 /// 两个都没给 ⇒ **不建号**，只留一条 warn：后台登录不可用这件事要能被发现，但不该让 API 起不来
 /// （客户侧不受影响，客户自己注册）。只给一个 ⇒ 配置错误，启动失败并点名缺哪一个。账号已存在时
 /// 引导**不改口令**——否则运维改过的口令会在每次重启时被打回环境变量里的那个。
-async fn seed_admin_account(state: &AppState) -> Result<()> {
-    let email = env::var("ADMIN_EMAIL")
-        .ok()
-        .filter(|value| !value.trim().is_empty());
-    let password = env::var("ADMIN_PASSWORD")
-        .ok()
-        .filter(|value| !value.is_empty());
+/// 引导要做什么：读两个环境变量，判定三条分支里走哪一条。
+///
+/// 抽成纯函数是为了让三条分支**都能被断言**，而不是只能"起一个进程看它退不退出"——两条都给的日志、
+/// 两个都不给的警告文案，都属于难在子进程之外观察的东西。
+#[derive(Debug, PartialEq, Eq)]
+enum AdminSeed {
+    /// 两个都给：建账号（已存在则什么都不做）。
+    Create { email: String, password: String },
+    /// 两个都没给：明确警告，**不建号**，进程照起——后台登不进去这件事要能被发现，但不该让 API 起不来。
+    WarnNoAccount,
+    /// 只给一个：配置错了，启动失败并点名"谁在、谁缺"。
+    Reject {
+        present: &'static str,
+        missing: &'static str,
+    },
+}
+
+/// 判定走哪条分支。两个变量都按"非空才算给了"处理：空串与没配是一回事（部署里很常见）。
+fn admin_seed_decision(email: Option<String>, password: Option<String>) -> AdminSeed {
+    let email = email.filter(|value| !value.trim().is_empty());
+    let password = password.filter(|value| !value.is_empty());
     match (email, password) {
-        (Some(email), Some(password)) => {
+        (Some(email), Some(password)) => AdminSeed::Create { email, password },
+        (None, None) => AdminSeed::WarnNoAccount,
+        (Some(_), None) => AdminSeed::Reject {
+            present: "ADMIN_EMAIL",
+            missing: "ADMIN_PASSWORD",
+        },
+        (None, Some(_)) => AdminSeed::Reject {
+            present: "ADMIN_PASSWORD",
+            missing: "ADMIN_EMAIL",
+        },
+    }
+}
+
+async fn seed_admin_account(state: &AppState) -> Result<()> {
+    match admin_seed_decision(
+        env::var("ADMIN_EMAIL").ok(),
+        env::var("ADMIN_PASSWORD").ok(),
+    ) {
+        AdminSeed::Create { email, password } => {
             state.identity.seed_admin(&email, &password).await?;
         }
-        (None, None) => {
+        AdminSeed::WarnNoAccount => {
             tracing::warn!(
                 "no ADMIN_EMAIL/ADMIN_PASSWORD: no admin account was created, the admin console \
                  cannot be logged into until one exists"
             );
         }
-        (Some(_), None) => bail!("ADMIN_EMAIL is set but ADMIN_PASSWORD is missing"),
-        (None, Some(_)) => bail!("ADMIN_PASSWORD is set but ADMIN_EMAIL is missing"),
+        AdminSeed::Reject { present, missing } => {
+            bail!("{present} is set but {missing} is missing");
+        }
     }
     Ok(())
 }

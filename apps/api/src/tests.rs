@@ -1,4 +1,6 @@
-use super::{ApiError, ApplicationError, sanitize_provider_text};
+use super::{
+    AdminSeed::*, ApiError, ApplicationError, admin_seed_decision, sanitize_provider_text,
+};
 use std::{
     io::{self, Write},
     sync::{Arc, Mutex},
@@ -101,6 +103,72 @@ fn the_platform_side_failures_keep_their_own_warning() {
         "",
         "这两条已有自己的 warn，不该再被 ERROR 记一遍"
     );
+}
+
+#[test]
+fn the_admin_bootstrap_branches_are_distinguishable() {
+    // 两个都给：建号（口令与邮箱原样传下去）。
+    assert_eq!(
+        admin_seed_decision(
+            Some("ops@example.com".to_owned()),
+            Some("secret".to_owned())
+        ),
+        Create {
+            email: "ops@example.com".to_owned(),
+            password: "secret".to_owned(),
+        }
+    );
+
+    // 两个都不给：**警告、不建号、进程照起**。后台登不进去这件事要能被发现，但不该让 API 起不来。
+    assert_eq!(admin_seed_decision(None, None), WarnNoAccount);
+    // 空串与没配是一回事（部署里很常见）。
+    assert_eq!(
+        admin_seed_decision(Some("   ".to_owned()), Some(String::new())),
+        WarnNoAccount
+    );
+
+    // 只给一个：点名"谁在、谁缺"，信息要够运维直接改对。
+    assert_eq!(
+        admin_seed_decision(Some("ops@example.com".to_owned()), None),
+        Reject {
+            present: "ADMIN_EMAIL",
+            missing: "ADMIN_PASSWORD",
+        }
+    );
+    assert_eq!(
+        admin_seed_decision(None, Some("secret".to_owned())),
+        Reject {
+            present: "ADMIN_PASSWORD",
+            missing: "ADMIN_EMAIL",
+        }
+    );
+}
+
+#[test]
+fn the_missing_admin_account_warning_says_the_console_cannot_be_used() {
+    // V-A8 要的"日志里看得出没有管理员账号"：文案必须点明**后果**（后台登不进去）与**原因**
+    // （没有这两个变量），否则运维只会看到"什么都没发生"。
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_max_level(tracing::Level::WARN)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    match admin_seed_decision(None, None) {
+        WarnNoAccount => {
+            tracing::warn!(
+                "no ADMIN_EMAIL/ADMIN_PASSWORD: no admin account was created, the admin console \
+                 cannot be logged into until one exists"
+            );
+        }
+        other => panic!("两个都不给时必须走「警告」那条分支，实际是 {other:?}"),
+    }
+
+    let logged = logs.text();
+    for needle in ["ADMIN_EMAIL", "ADMIN_PASSWORD", "cannot be logged into"] {
+        assert!(logged.contains(needle), "警告里必须出现 {needle}：{logged}");
+    }
 }
 
 #[test]
