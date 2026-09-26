@@ -18,9 +18,39 @@ struct CapturedLogs {
 }
 
 impl CapturedLogs {
+    /// 收上来的日志文本，**把 ANSI 转义序列剥掉**。
+    ///
+    /// 剥掉是必须的：`tracing_subscriber` 在**支持颜色**的输出上会给级别与字段名套 SGR 序列
+    /// （`ESC[2mcategoryESC[0m="persistence"`），而在不支持的地方（本机重定向、被捕获的 writer）
+    /// 不带。断言里搜的是 `category="persistence"` 这种**纯文本片段**，不剥的话这条用例会**只在有颜色
+    /// 的环境上失败**——CI 就是这样红了很久，而本地一直是绿的。
     fn text(&self) -> String {
-        String::from_utf8(self.bytes.lock().expect("logs lock").clone()).expect("logs are utf-8")
+        let raw = String::from_utf8(self.bytes.lock().expect("logs lock").clone())
+            .expect("logs are utf-8");
+        strip_ansi(&raw)
     }
+}
+
+/// 去掉 `ESC[...m` 这类 SGR 序列。只处理 CSI 序列，够覆盖日志着色。
+fn strip_ansi(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character != '\u{1b}' {
+            out.push(character);
+            continue;
+        }
+        // `ESC` 之后若是 `[`，就一直吃到终止字节（ASCII 的 `@`..=`~`）。
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    out
 }
 
 impl Write for CapturedLogs {
@@ -103,6 +133,37 @@ fn the_platform_side_failures_keep_their_own_warning() {
         logs.text(),
         "",
         "这两条已有自己的 warn，不该再被 ERROR 记一遍"
+    );
+}
+
+#[test]
+fn ansi_colouring_does_not_break_log_assertions() {
+    // 这条是给 CI 的回归护栏：`tracing_subscriber` 在支持颜色的输出上会给级别与字段名套 SGR 序列，
+    // 而在本机（重定向、被捕获的 writer）通常不带。断言搜的是纯文本片段，所以**不剥 ANSI 的写法只在
+    // 有颜色的环境上失败**——本仓库的 CI 就是这样红了很久而本地一直绿。
+    //
+    // 这里显式开颜色造出 CI 那个条件，验证 `text()` 剥掉之后断言仍然成立。
+    let logs = CapturedLogs::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(logs.clone())
+        .with_ansi(true)
+        .with_max_level(tracing::Level::ERROR)
+        .finish();
+    let _guard = tracing::subscriber::set_default(subscriber);
+
+    let api_error: ApiError =
+        ApplicationError::Persistence("sum over a malformed numeric column failed".to_owned())
+            .into();
+    assert_eq!(api_error.status, 500);
+
+    let logged = logs.text();
+    assert!(
+        !logged.contains('\u{1b}'),
+        "剥完之后不该还有转义字符：{logged:?}"
+    );
+    assert!(
+        logged.contains("category=\"persistence\""),
+        "带颜色的输出剥掉之后也必须能断言：{logged}"
     );
 }
 
