@@ -2810,6 +2810,243 @@ impl HubRepository for PgHubRepository {
         transaction.commit().await.map_err(database_error)?;
         balance_change(&released, account_id)
     }
+
+    async fn find_admin_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<(Uuid, String)>, ApplicationError> {
+        // 邮箱判据大小写不敏感：库里存小写，表达式索引也建在 `lower(email)` 上，所以这里直接比。
+        sqlx::query_as::<_, (Uuid, String)>(
+            r#"SELECT id, password_hash FROM identity.admin_users WHERE lower(email) = lower($1)"#,
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn upsert_admin_password(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<Uuid, ApplicationError> {
+        // 按邮箱 upsert：首次引导建号，之后运维改口令走同一条路径。`last_login_at` **不动**——
+        // 改口令不是一次登录。
+        let id: Uuid = sqlx::query_scalar(
+            r#"
+            INSERT INTO identity.admin_users (id, email, password_hash)
+            VALUES ($1, $2, $3)
+            ON CONFLICT (lower(email)) DO UPDATE
+                SET password_hash = EXCLUDED.password_hash, updated_at = now()
+            RETURNING id
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(email)
+        .bind(password_hash)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(id)
+    }
+
+    async fn touch_admin_login(&self, admin_id: Uuid) -> Result<(), ApplicationError> {
+        sqlx::query("UPDATE identity.admin_users SET last_login_at = now() WHERE id = $1")
+            .bind(admin_id)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn create_admin_session(
+        &self,
+        admin_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO identity.admin_sessions (id, admin_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(id)
+        .bind(admin_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(id)
+    }
+
+    async fn find_admin_session(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(Uuid, String, DateTime<Utc>)>, ApplicationError> {
+        sqlx::query_as::<_, (Uuid, String, DateTime<Utc>)>(
+            r#"
+            SELECT s.admin_id, u.email, s.expires_at
+            FROM identity.admin_sessions s
+            JOIN identity.admin_users u ON u.id = s.admin_id
+            WHERE s.token_hash = $1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn delete_admin_session(&self, token_hash: &str) -> Result<(), ApplicationError> {
+        sqlx::query("DELETE FROM identity.admin_sessions WHERE token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn create_customer(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        let customer_id = Uuid::new_v4();
+        let account_id = Uuid::new_v4();
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 撞邮箱是调用方能自己改的事：回 Conflict，让对客那一层说"这个邮箱已经注册过了"。
+        let existing: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM identity.customers WHERE lower(email) = lower($1)",
+        )
+        .bind(email)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if existing.is_some() {
+            return Err(ApplicationError::Conflict(format!(
+                "email {email} is already registered"
+            )));
+        }
+        // 账户与身份同一个事务：注册出来的账户必须能立刻用，不能出现"有账户没身份"的半截状态。
+        sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 0)")
+            .bind(account_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO identity.customers (id, email, password_hash, account_id)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(customer_id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            "self-service",
+            "customer.register",
+            "account",
+            &account_id.to_string(),
+            &serde_json::json!({"email": email}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok((customer_id, account_id))
+    }
+
+    async fn find_customer_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<(Uuid, Uuid, String)>, ApplicationError> {
+        sqlx::query_as::<_, (Uuid, Uuid, String)>(
+            r#"
+            SELECT id, account_id, password_hash FROM identity.customers
+            WHERE lower(email) = lower($1)
+            "#,
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn find_customer_account(
+        &self,
+        customer_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        sqlx::query_scalar::<_, Uuid>("SELECT account_id FROM identity.customers WHERE id = $1")
+            .bind(customer_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)
+    }
+
+    async fn touch_customer_login(&self, customer_id: Uuid) -> Result<(), ApplicationError> {
+        sqlx::query("UPDATE identity.customers SET last_login_at = now() WHERE id = $1")
+            .bind(customer_id)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn create_customer_session(
+        &self,
+        customer_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        let id = Uuid::new_v4();
+        sqlx::query(
+            r#"
+            INSERT INTO identity.customer_sessions (id, customer_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(id)
+        .bind(customer_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(id)
+    }
+
+    async fn find_customer_session(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(Uuid, Uuid, DateTime<Utc>)>, ApplicationError> {
+        sqlx::query_as::<_, (Uuid, Uuid, DateTime<Utc>)>(
+            r#"
+            SELECT c.id, c.account_id, s.expires_at
+            FROM identity.customer_sessions s
+            JOIN identity.customers c ON c.id = s.customer_id
+            WHERE s.token_hash = $1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn delete_customer_session(&self, token_hash: &str) -> Result<(), ApplicationError> {
+        sqlx::query("DELETE FROM identity.customer_sessions WHERE token_hash = $1")
+            .bind(token_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
 }
 
 /// 读一行的余额与写入时刻，配上调用方手上的账户。

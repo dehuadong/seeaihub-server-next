@@ -29,6 +29,92 @@ fn unused_repository<T>() -> Result<T, ApplicationError> {
 
 #[async_trait]
 impl HubRepository for WorkerRepository {
+    // 身份与会话那一组端口与 worker 的结算用例无关：它们只走领取、执行与落账。真被调到就是用例写错了。
+    async fn find_admin_by_email(
+        &self,
+        _email: &str,
+    ) -> Result<Option<(Uuid, String)>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn upsert_admin_password(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+    ) -> Result<Uuid, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn touch_admin_login(&self, _admin_id: Uuid) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn create_admin_session(
+        &self,
+        _admin_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_admin_session(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(Uuid, String, DateTime<Utc>)>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn delete_admin_session(&self, _token_hash: &str) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn create_customer(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_by_email(
+        &self,
+        _email: &str,
+    ) -> Result<Option<(Uuid, Uuid, String)>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_account(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn touch_customer_login(&self, _customer_id: Uuid) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn create_customer_session(
+        &self,
+        _customer_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_session(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(Uuid, Uuid, DateTime<Utc>)>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn delete_customer_session(&self, _token_hash: &str) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
     async fn publish_runtime(
         &self,
         _request: PublishRuntimeRequest,

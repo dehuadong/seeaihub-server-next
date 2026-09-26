@@ -21,6 +21,7 @@ license = "MIT"
 
 [workspace.dependencies]
 anyhow = "1.0.104"
+argon2 = { version = "0.6.0", features = ["password-hash"] }
 async-trait = "0.1.92"
 axum = { version = "0.8.9", features = ["http2", "json", "multipart", "tokio"] }
 base64 = "0.23.1"

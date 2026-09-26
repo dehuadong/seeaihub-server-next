@@ -38,6 +38,13 @@ pub use alerts::{
     PlatformAlertExit, PlatformAlerter, is_platform_event,
 };
 
+mod auth;
+pub use auth::{
+    AdminLogin, CustomerLogin, MIN_SECRET_LENGTH, check_secret, hash_password, invalid_credentials,
+    new_session_token, normalize_email, session_expiry, session_token_hash, verify_dummy_password,
+    verify_password,
+};
+
 mod ledger_audit;
 pub use ledger_audit::{
     LedgerAuditPolicy, LedgerAuditReport, LedgerAuditor, LedgerBalanceMismatch,
@@ -2050,6 +2057,83 @@ pub trait HubRepository: Send + Sync {
         &self,
         command: OpenLedgerCaseCommand,
     ) -> Result<bool, ApplicationError>;
+
+    /// 按邮箱找一个管理员账号：返回 `(id, 口令哈希)`；没有这个邮箱时 `None`。
+    ///
+    /// 邮箱判据**大小写不敏感**（库里存小写，见迁移 `0020`）：同一个邮箱不该因为大小写不同变成两个人。
+    async fn find_admin_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<(Uuid, String)>, ApplicationError>;
+
+    /// 写入（或覆盖）一个管理员账号的口令：按邮箱 upsert。用于首次引导与运维改口令。
+    async fn upsert_admin_password(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<Uuid, ApplicationError>;
+
+    /// 记一次管理员登录成功（`last_login_at`）。
+    async fn touch_admin_login(&self, admin_id: Uuid) -> Result<(), ApplicationError>;
+
+    /// 落一条管理员会话：`(会话 id, 管理员 id, 令牌摘要, 过期时刻)`。
+    async fn create_admin_session(
+        &self,
+        admin_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError>;
+
+    /// 按令牌摘要取一条管理员会话：返回 `(管理员 id, 邮箱, 过期时刻)`；没有这条会话时 `None`
+    /// （过期的判定与清理在用例层，那里才有时钟）。
+    async fn find_admin_session(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(Uuid, String, DateTime<Utc>)>, ApplicationError>;
+
+    /// 删掉一条管理员会话（退出）。不存在的摘要也算成功：调用方在意的是"它现在不可用"。
+    async fn delete_admin_session(&self, token_hash: &str) -> Result<(), ApplicationError>;
+
+    /// 建一个对客账户与它的登录身份，**一次事务里一起写**：`(客户 id, 账户 id)`。
+    ///
+    /// 邮箱已被占用时返回 [`ApplicationError::Conflict`]——注册撞邮箱是调用方能自己改的事。
+    async fn create_customer(
+        &self,
+        email: &str,
+        password_hash: &str,
+    ) -> Result<(Uuid, Uuid), ApplicationError>;
+
+    /// 按邮箱找一个客户：`(客户 id, 账户 id, 口令哈希)`；没有时 `None`。
+    async fn find_customer_by_email(
+        &self,
+        email: &str,
+    ) -> Result<Option<(Uuid, Uuid, String)>, ApplicationError>;
+
+    /// 按客户 id 取它的账户（对客会话每次请求都要换出账户来）：没有时 `None`。
+    async fn find_customer_account(
+        &self,
+        customer_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError>;
+
+    /// 记一次对客登录成功。
+    async fn touch_customer_login(&self, customer_id: Uuid) -> Result<(), ApplicationError>;
+
+    /// 落一条对客会话。
+    async fn create_customer_session(
+        &self,
+        customer_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError>;
+
+    /// 按令牌摘要取一条对客会话：返回 `(客户 id, 账户 id, 过期时刻)`。
+    async fn find_customer_session(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(Uuid, Uuid, DateTime<Utc>)>, ApplicationError>;
+
+    /// 删掉一条对客会话（退出）。
+    async fn delete_customer_session(&self, token_hash: &str) -> Result<(), ApplicationError>;
 }
 
 /// 平台侧失败清单不传类别时的默认集合：只列**平台侧事件**。
@@ -2280,6 +2364,163 @@ impl IdentityService {
     /// 要等。
     pub async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
         self.repository.revoke_api_key(key_id, actor).await
+    }
+
+    /// 引导管理员账号：按邮箱 upsert 口令。运维在部署时用它设初始邮箱与口令。
+    ///
+    /// **明文口令进得来、出不去**：只把哈希交给仓储。邮箱或口令不合形状时明确失败，不悄悄建一个
+    /// 登不进去的账号。
+    pub async fn seed_admin(&self, email: &str, password: &str) -> Result<Uuid, ApplicationError> {
+        let email = normalize_email(email)?;
+        check_secret(password, "admin password")?;
+        let hash = hash_password(password)?;
+        let admin_id = self.repository.upsert_admin_password(&email, &hash).await?;
+        tracing::info!(%email, %admin_id, "admin account is ready");
+        Ok(admin_id)
+    }
+
+    /// 管理员登录：邮箱 + 口令 → 一条会话令牌。
+    ///
+    /// 邮箱不存在与口令不对**回同一个错误**，而且两条路都走一遍 argon2 校验：分开说（或让快慢不同）
+    /// 等于把"这个邮箱是不是管理员"告诉任何来试的人。
+    pub async fn login_admin(
+        &self,
+        email: &str,
+        password: &str,
+        ttl: ChronoDuration,
+    ) -> Result<AdminLogin, ApplicationError> {
+        let email = normalize_email(email)?;
+        let found = self.repository.find_admin_by_email(&email).await?;
+        let Some((admin_id, stored)) = found else {
+            let _ = verify_dummy_password(password);
+            return Err(invalid_credentials());
+        };
+        if !verify_password(password, &stored) {
+            return Err(invalid_credentials());
+        }
+        let token = new_session_token();
+        let expires_at = session_expiry(Utc::now(), ttl);
+        self.repository
+            .create_admin_session(admin_id, &session_token_hash(&token), expires_at)
+            .await?;
+        self.repository.touch_admin_login(admin_id).await?;
+        Ok(AdminLogin {
+            admin_id,
+            email,
+            token,
+            expires_at,
+        })
+    }
+
+    /// 用会话令牌认一次管理员：有效则返回 `(admin_id, 邮箱)`。
+    ///
+    /// 过期会话按"没这条会话"处理——HTTP 层据此回 401，让浏览器重新登录；过期那一行顺手删掉，
+    /// 它已经没有任何用处。
+    pub async fn authenticate_admin_session(
+        &self,
+        token: &str,
+    ) -> Result<Option<(Uuid, String)>, ApplicationError> {
+        let hash = session_token_hash(token);
+        let Some((admin_id, email, expires_at)) = self.repository.find_admin_session(&hash).await?
+        else {
+            return Ok(None);
+        };
+        if expires_at <= Utc::now() {
+            self.repository.delete_admin_session(&hash).await?;
+            return Ok(None);
+        }
+        Ok(Some((admin_id, email)))
+    }
+
+    /// 退出：删掉这条会话。令牌无效/已删也算成功。
+    pub async fn logout_admin(&self, token: &str) -> Result<(), ApplicationError> {
+        self.repository
+            .delete_admin_session(&session_token_hash(token))
+            .await
+    }
+
+    /// 对客注册：邮箱 + 口令 → 一个新账户与一条会话。
+    ///
+    /// **账户与身份同一个事务**（仓储那一层保证）：注册出来的账户必须能立刻登录、立刻发 Key，
+    /// 不能出现"有账户没身份"或反过来的半截状态。
+    pub async fn register_customer(
+        &self,
+        email: &str,
+        password: &str,
+        ttl: ChronoDuration,
+    ) -> Result<CustomerLogin, ApplicationError> {
+        let email = normalize_email(email)?;
+        check_secret(password, "password")?;
+        let hash = hash_password(password)?;
+        let (customer_id, account_id) = self.repository.create_customer(&email, &hash).await?;
+        let token = new_session_token();
+        let expires_at = session_expiry(Utc::now(), ttl);
+        self.repository
+            .create_customer_session(customer_id, &session_token_hash(&token), expires_at)
+            .await?;
+        Ok(CustomerLogin {
+            customer_id,
+            account_id,
+            email,
+            token,
+            expires_at,
+        })
+    }
+
+    /// 对客登录：与管理员那条同一条判据（邮箱不存在与口令不对回同一个错误、都算一遍哈希）。
+    pub async fn login_customer(
+        &self,
+        email: &str,
+        password: &str,
+        ttl: ChronoDuration,
+    ) -> Result<CustomerLogin, ApplicationError> {
+        let email = normalize_email(email)?;
+        let found = self.repository.find_customer_by_email(&email).await?;
+        let Some((customer_id, account_id, stored)) = found else {
+            let _ = verify_dummy_password(password);
+            return Err(invalid_credentials());
+        };
+        if !verify_password(password, &stored) {
+            return Err(invalid_credentials());
+        }
+        let token = new_session_token();
+        let expires_at = session_expiry(Utc::now(), ttl);
+        self.repository
+            .create_customer_session(customer_id, &session_token_hash(&token), expires_at)
+            .await?;
+        self.repository.touch_customer_login(customer_id).await?;
+        Ok(CustomerLogin {
+            customer_id,
+            account_id,
+            email,
+            token,
+            expires_at,
+        })
+    }
+
+    /// 用会话令牌认一次客户：有效则返回 `(customer_id, account_id)`。
+    pub async fn authenticate_customer_session(
+        &self,
+        token: &str,
+    ) -> Result<Option<(Uuid, Uuid)>, ApplicationError> {
+        let hash = session_token_hash(token);
+        let Some((customer_id, account_id, expires_at)) =
+            self.repository.find_customer_session(&hash).await?
+        else {
+            return Ok(None);
+        };
+        if expires_at <= Utc::now() {
+            self.repository.delete_customer_session(&hash).await?;
+            return Ok(None);
+        }
+        Ok(Some((customer_id, account_id)))
+    }
+
+    /// 对客退出。
+    pub async fn logout_customer(&self, token: &str) -> Result<(), ApplicationError> {
+        self.repository
+            .delete_customer_session(&session_token_hash(token))
+            .await
     }
 
     /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里；读到了就为这把密钥占一个
