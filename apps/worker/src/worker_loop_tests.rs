@@ -22,6 +22,21 @@ struct EmptyQueueRepository {
 #[async_trait]
 impl HubRepository for EmptyQueueRepository {
     // 身份、会话与折算率那一组端口与"领任务 / 停机"这条用例无关，真被调到就是用例写错了。
+    async fn customer_usage(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerBillingQuery,
+    ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn customer_billing(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerBillingQuery,
+    ) -> Result<CustomerBillingSummary, ApplicationError> {
+        unimplemented!()
+    }
     async fn list_api_keys(
         &self,
         _account_id: AccountId,

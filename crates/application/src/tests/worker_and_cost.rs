@@ -37,6 +37,21 @@ fn unused_option<T>() -> Result<Option<T>, ApplicationError> {
 impl HubRepository for WorkerRepository {
     // 身份与会话那一组端口与 worker 的结算用例无关：它们只走领取、执行与落账。真被调到就是用例写错了，
     // 因此统一走 `unused_repository()`，不返回一个看起来合理的假值。
+    async fn customer_usage(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerBillingQuery,
+    ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn customer_billing(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerBillingQuery,
+    ) -> Result<CustomerBillingSummary, ApplicationError> {
+        unused_repository()
+    }
     async fn list_api_keys(
         &self,
         _account_id: AccountId,

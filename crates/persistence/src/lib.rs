@@ -2,11 +2,12 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     AcceptanceProbe, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange, ClaimedJob,
-    CompleteJob, CustomerView, GatewayModelCandidateView, GatewayModelView, HoldDisposition,
+    CompleteJob, CustomerBillingQuery, CustomerBillingSummary, CustomerUsageKind,
+    CustomerUsageView, CustomerView, GatewayModelCandidateView, GatewayModelView, HoldDisposition,
     HubRepository, JobView, LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand,
     ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
     PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
-    RoutingDecision, UnacceptedAttempt, declared_output_images,
+    RoutingDecision, UnacceptedAttempt, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -1041,6 +1042,100 @@ impl HubRepository for PgHubRepository {
                 ))
             })
             .collect()
+    }
+
+    async fn customer_usage(
+        &self,
+        account_id: AccountId,
+        query: CustomerBillingQuery,
+    ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                j.gateway_model,
+                j.state,
+                j.branch,
+                j.created_at,
+                COALESCE(jsonb_array_length(j.result_images), 0)::bigint AS image_count,
+                COALESCE(charged.total, 0)::bigint AS charged_microusd
+            FROM generation.jobs j
+            LEFT JOIN (
+                SELECT job_id, SUM(amount_microusd)::bigint AS total
+                FROM ledger.entries
+                WHERE account_id = $1 AND kind = 'capture' AND job_id IS NOT NULL
+                  AND ($2::timestamptz IS NULL OR created_at >= $2)
+                  AND ($3::timestamptz IS NULL OR created_at < $3)
+                GROUP BY job_id
+            ) charged ON charged.job_id = j.id
+            WHERE j.account_id = $1
+              AND ($2::timestamptz IS NULL OR j.created_at >= $2)
+              AND ($3::timestamptz IS NULL OR j.created_at < $3)
+            ORDER BY j.created_at DESC
+            LIMIT $4
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(query.since)
+        .bind(query.until)
+        .bind(i64::from(query.limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(|row| {
+                let state: String = row.try_get("state").map_err(database_error)?;
+                let branch: String = row.try_get("branch").map_err(database_error)?;
+                let image_count: i64 = row.try_get("image_count").map_err(database_error)?;
+                Ok(CustomerUsageView {
+                    gateway_model: row.try_get("gateway_model").map_err(database_error)?,
+                    status: customer_usage_status(parse_state(&state)?),
+                    kind: match branch.as_str() {
+                        "edit" => CustomerUsageKind::Edit,
+                        _ => CustomerUsageKind::Generation,
+                    },
+                    created_at: row.try_get("created_at").map_err(database_error)?,
+                    image_count: u32::try_from(image_count).unwrap_or(0),
+                    charged_microusd: row.try_get("charged_microusd").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn customer_billing(
+        &self,
+        account_id: AccountId,
+        query: CustomerBillingQuery,
+    ) -> Result<CustomerBillingSummary, ApplicationError> {
+        // 请求数与产出张数按**执行记录**数，扣费总额按账本条目：与逐笔明细说的是同一批事实。
+        let row = sqlx::query(
+            r#"
+            SELECT
+                (SELECT COUNT(*) FROM generation.jobs j
+                 WHERE j.account_id = $1
+                   AND ($2::timestamptz IS NULL OR j.created_at >= $2)
+                   AND ($3::timestamptz IS NULL OR j.created_at < $3)) AS requests,
+                (SELECT COALESCE(SUM(jsonb_array_length(j.result_images)), 0)::bigint
+                 FROM generation.jobs j
+                 WHERE j.account_id = $1
+                   AND ($2::timestamptz IS NULL OR j.created_at >= $2)
+                   AND ($3::timestamptz IS NULL OR j.created_at < $3)) AS images,
+                (SELECT COALESCE(SUM(e.amount_microusd), 0)::bigint FROM ledger.entries e
+                 WHERE e.account_id = $1 AND e.kind IN ('capture', 'adjustment')
+                   AND ($2::timestamptz IS NULL OR e.created_at >= $2)
+                   AND ($3::timestamptz IS NULL OR e.created_at < $3)) AS charged_microusd
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(query.since)
+        .bind(query.until)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(CustomerBillingSummary {
+            requests: row.try_get("requests").map_err(database_error)?,
+            images: row.try_get("images").map_err(database_error)?,
+            charged_microusd: row.try_get("charged_microusd").map_err(database_error)?,
+        })
     }
 
     async fn list_api_keys(

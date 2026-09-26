@@ -13,13 +13,14 @@ use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
-    CreateImageGenerationRequest, CustomerView, GatewayModelView, GeneratedImage,
-    GenerationDailySpendLimit, GenerationRateLimit, GenerationService, HubRepository,
-    IdentityService, JobView, LedgerAuditPolicy, LedgerAuditor, LedgerEntryView,
-    MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter,
-    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
-    RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService, RuntimeService,
+    CreateImageGenerationRequest, CustomerBillingQuery, CustomerUsageKind, CustomerUsageStatus,
+    CustomerView, GatewayModelView, GeneratedImage, GenerationDailySpendLimit, GenerationRateLimit,
+    GenerationService, HubRepository, IdentityService, JobView, LedgerAuditPolicy, LedgerAuditor,
+    LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate,
+    PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
+    RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService,
+    RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -262,6 +263,10 @@ async fn main() -> Result<()> {
             "/v1/customer/api-keys/{key_id}",
             delete(revoke_customer_api_key),
         )
+        .route("/v1/customer/account", get(read_customer_account))
+        .route("/v1/customer/ledger", get(read_customer_ledger))
+        .route("/v1/customer/usage", get(read_customer_usage))
+        .route("/v1/customer/billing", get(read_customer_billing))
         .route(
             "/api/v1/accounts/{account_id}/entries",
             get(list_account_entries),
@@ -1008,6 +1013,139 @@ async fn redeem_customer_password_reset(
         .redeem_password_reset(&body.reset_token, &body.new_password)
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+struct CustomerUsageRow {
+    gateway_model: String,
+    status: CustomerUsageStatus,
+    kind: CustomerUsageKind,
+    created_at: DateTime<Utc>,
+    image_count: u32,
+    charged_microusd: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomerUsageResponse {
+    usage: Vec<CustomerUsageRow>,
+    count: usize,
+    truncated: bool,
+}
+
+const DEFAULT_CUSTOMER_LEDGER_LIMIT: u32 = 100;
+
+/// 对客账务读的查询参数：`since` / `until` 是 RFC3339，区间**半开** `[since, until)`、按 UTC 解释。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerBillingQueryParams {
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    limit: Option<u32>,
+}
+
+impl CustomerBillingQueryParams {
+    /// 夹一次条数上限，并落成用例层的查询条件。
+    fn billing_query(&self) -> CustomerBillingQuery {
+        CustomerBillingQuery {
+            since: self.since,
+            until: self.until,
+            limit: self
+                .limit
+                .unwrap_or(DEFAULT_CUSTOMER_LEDGER_LIMIT)
+                .clamp(1, MAX_OPERATIONAL_LIMIT),
+        }
+    }
+}
+
+/// 对客读自己的余额与持有中（`GET /v1/customer/account`）。
+///
+/// 认的是**客户会话**（与 `/v1/account` 的 API Key 不是一回事）：客户控制台要能登录之后直接看账。
+/// 两个数分开给、不合成"总资产"——预授权不是扣款。
+async fn read_customer_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<OwnAccountResponse>, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let account_id = AccountId(account_id);
+    let change = state.accounts.read_balance(account_id).await?;
+    let held_microusd = state.accounts.read_held(account_id).await?;
+    Ok(Json(OwnAccountResponse {
+        balance_microusd: change.balance_microusd,
+        held_microusd,
+        updated_at: change.updated_at,
+    }))
+}
+
+/// 对客读自己的账目流水（`GET /v1/customer/ledger`）：充值与扣费都在这里，金额带符号。
+async fn read_customer_ledger(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CustomerBillingQueryParams>,
+) -> Result<Json<AccountEntriesResponse>, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let billing = query.billing_query();
+    let entries = state
+        .accounts
+        .read_entries(AccountId(account_id), billing.since, billing.limit)
+        .await?
+        .into_iter()
+        .map(LedgerEntryView::from)
+        .collect::<Vec<_>>();
+    Ok(Json(AccountEntriesResponse {
+        count: entries.len(),
+        truncated: entries.len() as u32 == billing.limit,
+        entries,
+    }))
+}
+
+/// 对客读自己的用量（`GET /v1/customer/usage`）：每一次生成请求一行，**不含任务标识与内部状态**。
+async fn read_customer_usage(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CustomerBillingQueryParams>,
+) -> Result<Json<CustomerUsageResponse>, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let billing = query.billing_query();
+    let usage = state
+        .accounts
+        .customer_usage(AccountId(account_id), billing)
+        .await?
+        .into_iter()
+        .map(|row| CustomerUsageRow {
+            gateway_model: row.gateway_model,
+            status: row.status,
+            kind: row.kind,
+            created_at: row.created_at,
+            image_count: row.image_count,
+            charged_microusd: row.charged_microusd,
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(CustomerUsageResponse {
+        count: usage.len(),
+        truncated: usage.len() as u32 == billing.limit,
+        usage,
+    }))
+}
+
+/// 对客读自己的账单汇总（`GET /v1/customer/billing`）：按区间**全量**算，与明细的条数上限无关。
+async fn read_customer_billing(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CustomerBillingQueryParams>,
+) -> Result<Json<Value>, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let billing = query.billing_query();
+    let summary = state
+        .accounts
+        .customer_billing(AccountId(account_id), billing)
+        .await?;
+    Ok(Json(json!({
+        "since": billing.since,
+        "until": billing.until,
+        "requests": summary.requests,
+        "images": summary.images,
+        "charged_microusd": summary.charged_microusd,
+    })))
 }
 
 #[derive(Debug, Serialize)]

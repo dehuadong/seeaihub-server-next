@@ -7,9 +7,10 @@
 use super::*;
 use crate::{
     AcceptanceProbe, AlertSink, ApiKeyView, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
-    CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate,
-    ProviderCostGapView, ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest,
-    ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
+    CustomerBillingQuery, CustomerBillingSummary, CustomerUsageView, CustomerView,
+    GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate, ProviderCostGapView,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest, ReconciliationCaseView,
+    RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -62,6 +63,21 @@ fn unused_option<T>() -> Result<Option<T>, ApplicationError> {
 #[async_trait]
 impl HubRepository for AuditRepository {
     // 身份与会话那一组端口与本用例无关：账实核对只读账本与余额。真被调到就是用例写错了。
+    async fn customer_usage(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerBillingQuery,
+    ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn customer_billing(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerBillingQuery,
+    ) -> Result<CustomerBillingSummary, ApplicationError> {
+        unused_repository()
+    }
     async fn list_api_keys(
         &self,
         _account_id: AccountId,

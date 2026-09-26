@@ -1519,6 +1519,83 @@ pub struct ApiKeyView {
     pub revoked_at: Option<DateTime<Utc>>,
 }
 
+/// 对客的**一次生成请求**（用量记录里的一行）。
+///
+/// 它是执行记录的**对客投影**，不是执行记录本身：[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job
+/// 定为"对客不可见、不投射成对客协议"，所以这里**没有任务号与内部状态**——客户要看的是"什么时候、
+/// 什么型号、几张、扣了多少"，不是平台内部的任务标识。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerUsageView {
+    /// K 平台型号名（对客的那个名字）。
+    pub gateway_model: String,
+    /// 对客状态：`succeeded` / `failed` / `pending`（内部 Job 状态收敛过的三值）。
+    pub status: CustomerUsageStatus,
+    /// 这一次是同步生成还是图片编辑（对客协议里本来就有的两类调用）。
+    pub kind: CustomerUsageKind,
+    pub created_at: DateTime<Utc>,
+    /// 产出张数；失败或未完成时是 0。
+    pub image_count: u32,
+    /// 这一次实际扣掉的钱（人民币微单位）。
+    pub charged_microusd: i64,
+}
+
+/// 对客状态：**收敛过的三值**，不是内部 `JobState` 的取值面。
+///
+/// 映射写在 [`customer_usage_status`] 上，与既有对客错误改写同一条纪律：内部状态取值不进对客响应。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomerUsageStatus {
+    Succeeded,
+    Failed,
+    Pending,
+}
+
+/// 对客的调用类别：同步生成 / 图片编辑。
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum CustomerUsageKind {
+    Generation,
+    Edit,
+}
+
+/// 把内部 Job 状态收敛成对客三值。
+#[must_use]
+pub fn customer_usage_status(state: seeai_domain::JobState) -> CustomerUsageStatus {
+    match state {
+        seeai_domain::JobState::Succeeded => CustomerUsageStatus::Succeeded,
+        // 失败与对账中：对客都是"这次没成"。对账终会走向失败或补回，不会对客可见地悬着。
+        seeai_domain::JobState::Failed | seeai_domain::JobState::ReconciliationRequired => {
+            CustomerUsageStatus::Failed
+        }
+        seeai_domain::JobState::Accepted
+        | seeai_domain::JobState::Leased
+        | seeai_domain::JobState::Submitting
+        | seeai_domain::JobState::Canceled => CustomerUsageStatus::Pending,
+    }
+}
+
+/// 对客的**账单汇总**：一段时间内发生了什么、花了多少。
+///
+/// 与逐笔用量**口径不同**：汇总按整段区间**全量**算，明细按条数上限截断——所以汇总不会随页大小
+/// 变化（否则"明细求和等于汇总"这条验收条件会随分页摇摆）。
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+pub struct CustomerBillingSummary {
+    pub requests: i64,
+    pub images: i64,
+    pub charged_microusd: i64,
+}
+
+/// 对客账务读的查询条件：**半开区间 `[since, until)`**，按 UTC 解释。
+///
+/// `since` 缺省为不限、`until` 缺省为"到此刻"；半开是为了相邻区间既不漏算也不重复算。
+/// `limit` 只作用于逐笔列表，不影响汇总。
+#[derive(Debug, Clone, Copy)]
+pub struct CustomerBillingQuery {
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub limit: u32,
+}
+
 /// 管理端看到的**一条客户**：邮箱身份与它指向的账户。
 ///
 /// 它回答的是"这个邮箱是哪个账户"——给客户充值、替客户签重置令牌都要先拿到 `account_id`。
@@ -2088,6 +2165,25 @@ pub trait HubRepository: Send + Sync {
         &self,
         account_id: AccountId,
     ) -> Result<Vec<ApiKeyView>, ApplicationError>;
+
+    /// 对客用量：该账户在 `[since, until)` 里的每一次生成请求，按时间倒序、最多 `limit` 条。
+    ///
+    /// 投影成对客事实（型号、对客状态、类别、产出张数、扣费金额），**不含 Job 标识与内部状态**。
+    async fn customer_usage(
+        &self,
+        account_id: AccountId,
+        query: CustomerBillingQuery,
+    ) -> Result<Vec<CustomerUsageView>, ApplicationError>;
+
+    /// 对客账单汇总：同一区间**全量**的请求数、产出张数与扣费总额。
+    ///
+    /// 扣费总额只算账本里的**扣费与调整**条目（`capture` / `adjustment`）：预授权 `hold` 与它的
+    /// 释放 `release` 是一进一出、加起来恒为零，计进来只会得到"平台占用过多少"，那不是扣费。
+    async fn customer_billing(
+        &self,
+        account_id: AccountId,
+        query: CustomerBillingQuery,
+    ) -> Result<CustomerBillingSummary, ApplicationError>;
 
     /// 每个币种**当前生效**的那一行折算率：`(币种, 每单位折多少 CNY 微单位, 生效时刻)`。
     async fn current_fx_rates(&self)
@@ -3035,6 +3131,24 @@ impl AccountsService {
     /// 合成一个"总资产"会让"这笔钱到底扣没扣"说不清，而这两条读的用途正是让人看清这件事。
     pub async fn read_held(&self, account_id: AccountId) -> Result<i64, ApplicationError> {
         self.repository.held_microusd(account_id).await
+    }
+
+    /// 对客用量：`[since, until)` 里的每一次生成请求（对客投影，不含 Job 标识与内部状态）。
+    pub async fn customer_usage(
+        &self,
+        account_id: AccountId,
+        query: CustomerBillingQuery,
+    ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        self.repository.customer_usage(account_id, query).await
+    }
+
+    /// 对客账单汇总：同一区间**全量**的请求数、产出张数与扣费总额（不随明细条数上限变化）。
+    pub async fn customer_billing(
+        &self,
+        account_id: AccountId,
+        query: CustomerBillingQuery,
+    ) -> Result<CustomerBillingSummary, ApplicationError> {
+        self.repository.customer_billing(account_id, query).await
     }
 
     /// 设账户标签（管理员面）：只有生效的 `user_tag` 策略消费它，没有那种策略时它不改变任何

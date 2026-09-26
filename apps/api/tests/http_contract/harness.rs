@@ -32,6 +32,8 @@ use uuid::Uuid;
 mod cases_aihubmix;
 #[path = "cases_apimart.rs"]
 mod cases_apimart;
+#[path = "cases_billing.rs"]
+mod cases_billing;
 #[path = "cases_cache.rs"]
 mod cases_cache;
 #[path = "cases_cost_ceiling.rs"]
