@@ -23,6 +23,33 @@ export function assetsOf(dist, entry) {
   return [...html.matchAll(/(?:src|href)="(\/assets\/[^"]+)"/g)].map((match) => match[1]);
 }
 
+/// 从入口出发，把**真正会被加载的**资源都收齐：先取 HTML 里的静态引用，再从每个脚本的内容里找它
+/// 引用到的产物文件名（`import(...)`、`from"./x.js"`、`new URL("./x.js")` 都算），递归下去。
+///
+/// 为什么要遍历而不能只看 HTML：**动态 `import()` 出来的分块不在入口 HTML 里**。只看 HTML 的话，
+/// 一个 `import('./portal-chunk.js')` 就能把另一份入口的代码挂到这一份上而核对发现不了。
+export function reachableAssets(dist, entry) {
+  const seen = new Set();
+  const queue = assetsOf(dist, entry);
+  while (queue.length > 0) {
+    const asset = queue.shift();
+    if (seen.has(asset)) continue;
+    const path = resolve(dist, asset.replace(/^\//, ''));
+    if (!existsSync(path)) continue;
+    seen.add(asset);
+    // 只从文本产物里找下一跳；图片与字体里不会有文件名引用。
+    if (!/\.(js|css|html)$/.test(asset)) continue;
+    const text = readFileSync(path, 'utf8');
+    // 产物文件名形如 `console-XXXXXXXX.js` / `styles-XXXXXXXX.css`：按目录清单匹配比猜正则可靠。
+    for (const name of readdirSync(resolve(dist, 'assets'))) {
+      if (name.endsWith('.map')) continue;
+      if (name === asset.replace(/^\/assets\//, '')) continue;
+      if (text.includes(name)) queue.push(`/assets/${name}`);
+    }
+  }
+  return [...seen];
+}
+
 function contentsOf(dist, assets) {
   return assets
     .map((asset) => readFileSync(resolve(dist, asset.replace(/^\//, '')), 'utf8'))
@@ -41,8 +68,8 @@ export function violations(dist) {
   }
   if (found.length > 0) return found;
 
-  const portal = contentsOf(dist, assetsOf(dist, 'portal.html'));
-  const consoleBundle = contentsOf(dist, assetsOf(dist, 'console.html'));
+  const portal = contentsOf(dist, reachableAssets(dist, 'portal.html'));
+  const consoleBundle = contentsOf(dist, reachableAssets(dist, 'console.html'));
 
   for (const needle of ADMIN_ONLY) {
     if (portal.includes(needle)) found.push(`客户产物里出现了管理端端点 ${needle}`);
