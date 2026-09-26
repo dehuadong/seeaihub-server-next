@@ -42,7 +42,51 @@ pub fn invalid_credentials() -> ApplicationError {
 /// 一次登录校验的**恒定耗时对照**：邮箱不存在时也走一遍 argon2 校验。
 #[must_use]
 pub fn verify_dummy_password(password: &str) -> bool {
+    record_dummy_verification();
     verify_password(password, dummy_password_hash())
+}
+
+/// 走对照校验的**次数**。
+///
+/// 它存在的理由只有一个：让"邮箱不存在时也真的校验了一遍"这件事**可断言**。没有这个可见性，
+/// 用例只能比对"两条错误的响应相同"——那在当前实现下成立，但把对照校验整个删掉也照样成立，等于没验。
+/// 所以这是一处**观测点**，不是给生产读的指标；进程内计数，测试按"调用前后之差"用。
+#[must_use]
+pub fn dummy_verifications() -> u64 {
+    DUMMY_VERIFICATIONS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+fn record_dummy_verification() {
+    DUMMY_VERIFICATIONS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+static DUMMY_VERIFICATIONS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+/// 一次登录校验：**找到账号**就校验它的口令哈希，**没找到**就走一遍对照哈希再拒。
+///
+/// 两条路收在同一个函数里，是为了让"没找到也校验一遍"跑不掉——调用方拿不到"跳过校验"的分支。
+/// 返回 `true` 只表示口令对**且**账号存在；账号不存在永远是 `false`。
+#[must_use]
+pub fn verify_login_secret(stored: Option<&str>, password: &str) -> bool {
+    match stored {
+        Some(stored) => verify_password(password, stored),
+        None => {
+            let _ = verify_dummy_password(password);
+            false
+        }
+    }
+}
+
+/// 一条会话**还算不算有效**：到点即失效，判据是"过期时刻晚于现在"。
+///
+/// 抽成纯函数是为了让这条规则**能被直接断言**（给出任意 `now` 即可构造过期与未过期两种输入），而不是
+/// 只能靠"在真库里把 `expires_at` 改到过去"这种端到端手法。管理员与客户两侧共用它，规则不会各自漂移。
+///
+/// 到点这一刻算**已过期**（`>` 而不是 `>=`）：会话有效期是半开区间 `[签发, 过期)`，与账单口径同一个
+/// 约定。返回 `false` 时调用方应当把那一行会话删掉——留着只会让之后每次请求都白查一次库。
+#[must_use]
+pub fn session_is_valid(expires_at: DateTime<Utc>, now: DateTime<Utc>) -> bool {
+    expires_at > now
 }
 
 /// 邮箱里必须有一个 `@`，且两侧都不空。完整的 RFC 校验不在这里做——那是投递时才知道的事，

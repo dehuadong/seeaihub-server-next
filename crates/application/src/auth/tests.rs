@@ -44,6 +44,33 @@ fn the_dummy_hash_is_a_real_hash_and_never_matches() {
 }
 
 #[test]
+fn an_unknown_account_still_pays_for_one_password_check() {
+    // 这条是 Spec 要的那个形式：**断言"账号不存在时也走了一次校验"**，而不是只比对两条错误响应相同
+    // ——后者把对照校验整个删掉也照样成立，等于没验。
+    //
+    // 它证明的是：`verify_login_secret` 在"没有存储哈希"这条路上确实调用了对照校验。
+    // 它**不**证明 `login_admin` 一定调了 `verify_login_secret`——那由类型上无路可绕（该方法体内没有
+    // 别的分支能跳过它）与端到端用例 `a_wrong_password_and_an_unknown_email_are_indistinguishable`
+    // 各承担一半。
+    //
+    // 计数是进程级的，所以要按**调用前后之差**断言；本模块的用例不并发（cargo test 会把同一模块的
+    // 用例分摊到多个线程，所以这里只断言"至少加了一次"，不断言恰好一次）。
+    let before = dummy_verifications();
+    assert!(!verify_login_secret(None, "any-password"));
+    assert!(
+        dummy_verifications() > before,
+        "账号不存在时必须也走一遍对照校验"
+    );
+
+    // 反方向：**有**存储哈希时不走对照校验（走的是那条真哈希）。
+    let real = hash_password("correct horse battery").expect("hashing must succeed");
+    let before = dummy_verifications();
+    assert!(verify_login_secret(Some(&real), "correct horse battery"));
+    assert!(!verify_login_secret(Some(&real), "wrong"));
+    assert_eq!(dummy_verifications(), before, "有真哈希时不该多走对照校验");
+}
+
+#[test]
 fn emails_are_normalized_to_lowercase_and_trimmed() {
     assert_eq!(
         normalize_email("  Ops@Example.COM ").expect("valid"),
@@ -95,4 +122,35 @@ fn expiry_is_now_plus_ttl() {
     let expires_at = session_expiry(now, ChronoDuration::minutes(30));
     assert_eq!(expires_at, now + ChronoDuration::minutes(30));
     assert!(expires_at > now);
+}
+
+#[test]
+fn a_session_is_valid_until_its_expiry_instant() {
+    // Spec 要的那个形式：**替身时钟**覆盖判定，而不是只能在真库里把 `expires_at` 改到过去。
+    // 判定是纯函数，所以任意 `now` 都能构造——过期、未过期、以及"正好到点"这个边界。
+    let expiry = Utc::now();
+
+    assert!(
+        session_is_valid(expiry, expiry - ChronoDuration::seconds(1)),
+        "到点之前仍然有效"
+    );
+    // **正好到点算已过期**：有效期是半开区间 `[签发, 过期)`，与账单口径同一个约定。
+    assert!(!session_is_valid(expiry, expiry), "到点这一刻必须算已过期");
+    assert!(
+        !session_is_valid(expiry, expiry + ChronoDuration::seconds(1)),
+        "过点之后必须失效"
+    );
+
+    // 签发出来的会话在它的整个有效期里有效、T​TL 走完之后失效——把两件事接起来看一次。
+    let issued_at = Utc::now();
+    let ttl = ChronoDuration::minutes(30);
+    let expires_at = session_expiry(issued_at, ttl);
+    assert!(session_is_valid(
+        expires_at,
+        issued_at + ChronoDuration::minutes(29)
+    ));
+    assert!(!session_is_valid(
+        expires_at,
+        issued_at + ChronoDuration::minutes(31)
+    ));
 }

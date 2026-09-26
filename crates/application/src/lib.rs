@@ -40,9 +40,10 @@ pub use alerts::{
 
 mod auth;
 pub use auth::{
-    AdminLogin, CustomerLogin, MIN_SECRET_LENGTH, check_secret, current_admin_id, hash_password,
-    invalid_credentials, new_session_token, normalize_email, session_expiry, session_token_hash,
-    verify_dummy_password, verify_password, with_admin_id,
+    AdminLogin, CustomerLogin, MIN_SECRET_LENGTH, check_secret, current_admin_id,
+    dummy_verifications, hash_password, invalid_credentials, new_session_token, normalize_email,
+    session_expiry, session_is_valid, session_token_hash, verify_dummy_password,
+    verify_login_secret, verify_password, with_admin_id,
 };
 
 mod ledger_audit;
@@ -2669,13 +2670,13 @@ impl IdentityService {
     ) -> Result<AdminLogin, ApplicationError> {
         let email = normalize_email(email)?;
         let found = self.repository.find_admin_by_email(&email).await?;
-        let Some((admin_id, stored)) = found else {
-            let _ = verify_dummy_password(password);
+        // 找到账号校验它的哈希，没找到校验对照哈希——**两条路都付一次 argon2**，所以"这个邮箱
+        // 是不是我们的账号"不能从响应快慢上看出来。分支收在 `verify_login_secret` 里，这里跳不掉。
+        let verified =
+            verify_login_secret(found.as_ref().map(|(_, stored)| stored.as_str()), password);
+        let Some((admin_id, _)) = found.filter(|_| verified) else {
             return Err(invalid_credentials());
         };
-        if !verify_password(password, &stored) {
-            return Err(invalid_credentials());
-        }
         let token = new_session_token();
         let expires_at = session_expiry(Utc::now(), ttl);
         self.repository
@@ -2703,7 +2704,8 @@ impl IdentityService {
         else {
             return Ok(None);
         };
-        if expires_at <= Utc::now() {
+        if !session_is_valid(expires_at, Utc::now()) {
+            // 顺手删掉：留一条已过期的行只会让之后每次请求都白查一次库。
             self.repository.delete_admin_session(&hash).await?;
             return Ok(None);
         }
@@ -2754,13 +2756,14 @@ impl IdentityService {
     ) -> Result<CustomerLogin, ApplicationError> {
         let email = normalize_email(email)?;
         let found = self.repository.find_customer_by_email(&email).await?;
-        let Some((customer_id, account_id, stored)) = found else {
-            let _ = verify_dummy_password(password);
+        // 同 `login_admin`：账号不存在也付一次 argon2 校验的代价，两条路不能从快慢上分开。
+        let verified = verify_login_secret(
+            found.as_ref().map(|(_, _, stored)| stored.as_str()),
+            password,
+        );
+        let Some((customer_id, account_id, _)) = found.filter(|_| verified) else {
             return Err(invalid_credentials());
         };
-        if !verify_password(password, &stored) {
-            return Err(invalid_credentials());
-        }
         let token = new_session_token();
         let expires_at = session_expiry(Utc::now(), ttl);
         self.repository
@@ -2787,7 +2790,7 @@ impl IdentityService {
         else {
             return Ok(None);
         };
-        if expires_at <= Utc::now() {
+        if !session_is_valid(expires_at, Utc::now()) {
             self.repository.delete_customer_session(&hash).await?;
             return Ok(None);
         }
