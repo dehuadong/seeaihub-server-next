@@ -10,7 +10,10 @@
 import { execFileSync } from 'node:child_process';
 
 /// 基础连接串：形如 `postgres://user:password@host:port/dbname`。
-const base = process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_next';
+///
+/// 默认库名是 **`seeai_e2e`**，不是别的用途的库：这个脚本每次都会把它**删掉重建**，指向正在用的开发库
+/// 或交付库就等于把它们清空（实际差点踩到——交付库是从另一个库克隆来的，而那个库正是这个脚本要重置的）。
+const base = process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_e2e';
 const url = new URL(base);
 const database = url.pathname.replace(/^\//, '');
 if (!database) {
