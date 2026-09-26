@@ -2990,12 +2990,24 @@ impl HubRepository for PgHubRepository {
         Ok(id)
     }
 
-    async fn touch_admin_login(&self, admin_id: Uuid) -> Result<(), ApplicationError> {
+    async fn record_admin_login(&self, admin_id: Uuid) -> Result<(), ApplicationError> {
+        // 登录成功留痕：谁在什么时候登进来了。写 `last_login_at` 与审计在同一个事务。
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("UPDATE identity.admin_users SET last_login_at = now() WHERE id = $1")
             .bind(admin_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            "admin-self",
+            "admin.login",
+            "admin_user",
+            &admin_id.to_string(),
+            &serde_json::json!({}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
         Ok(())
     }
 
@@ -3128,12 +3140,23 @@ impl HubRepository for PgHubRepository {
             .map_err(database_error)
     }
 
-    async fn touch_customer_login(&self, customer_id: Uuid) -> Result<(), ApplicationError> {
+    async fn record_customer_login(&self, customer_id: Uuid) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
         sqlx::query("UPDATE identity.customers SET last_login_at = now() WHERE id = $1")
             .bind(customer_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            "customer-self",
+            "customer.login",
+            "customer",
+            &customer_id.to_string(),
+            &serde_json::json!({}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
         Ok(())
     }
 
@@ -3187,22 +3210,6 @@ impl HubRepository for PgHubRepository {
         Ok(())
     }
 
-    async fn update_admin_password(
-        &self,
-        admin_id: Uuid,
-        password_hash: &str,
-    ) -> Result<(), ApplicationError> {
-        sqlx::query(
-            "UPDATE identity.admin_users SET password_hash = $2, updated_at = now() WHERE id = $1",
-        )
-        .bind(admin_id)
-        .bind(password_hash)
-        .execute(&self.pool)
-        .await
-        .map_err(database_error)?;
-        Ok(())
-    }
-
     async fn find_admin_password(
         &self,
         admin_id: Uuid,
@@ -3216,14 +3223,45 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)
     }
 
-    async fn delete_admin_sessions(&self, admin_id: Uuid) -> Result<u64, ApplicationError> {
-        // 改口令/重置口令之后要"旧凭据立刻不能再用"，所以按**身份**删，而不是删当前那一条。
-        let deleted = sqlx::query("DELETE FROM identity.admin_sessions WHERE admin_id = $1")
+    async fn set_admin_password(
+        &self,
+        admin_id: Uuid,
+        password_hash: &str,
+        actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        // 写哈希、吊销该管理员全部会话、写审计在**同一个事务**：只成一件会留下"新口令生效、
+        // 旧会话还能用"这类半截状态，而 Spec 要求改完旧凭据立刻不能再用。
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let written = sqlx::query(
+            "UPDATE identity.admin_users SET password_hash = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(admin_id)
+        .bind(password_hash)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .rows_affected()
+            == 1;
+        if !written {
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM identity.admin_sessions WHERE admin_id = $1")
             .bind(admin_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-        Ok(deleted.rows_affected())
+        insert_audit(
+            &mut transaction,
+            actor,
+            "admin.password_change",
+            "admin_user",
+            &admin_id.to_string(),
+            &serde_json::json!({}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(true)
     }
 
     async fn create_password_reset(
@@ -3315,46 +3353,54 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)
     }
 
-    async fn update_customer_password(
+    async fn set_customer_password(
         &self,
         customer_id: Uuid,
         password_hash: &str,
-    ) -> Result<(), ApplicationError> {
-        sqlx::query("UPDATE identity.customers SET password_hash = $2 WHERE id = $1")
+        actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        // 与管理员那条同一个理由：写哈希、吊销全部会话、写审计必须一起成功。
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let written = sqlx::query("UPDATE identity.customers SET password_hash = $2 WHERE id = $1")
             .bind(customer_id)
             .bind(password_hash)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
-            .map_err(database_error)?;
-        Ok(())
-    }
-
-    async fn delete_customer_sessions(&self, customer_id: Uuid) -> Result<u64, ApplicationError> {
-        let deleted = sqlx::query("DELETE FROM identity.customer_sessions WHERE customer_id = $1")
+            .map_err(database_error)?
+            .rows_affected()
+            == 1;
+        if !written {
+            transaction.rollback().await.map_err(database_error)?;
+            return Ok(false);
+        }
+        sqlx::query("DELETE FROM identity.customer_sessions WHERE customer_id = $1")
             .bind(customer_id)
-            .execute(&self.pool)
+            .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-        Ok(deleted.rows_affected())
+        insert_audit(
+            &mut transaction,
+            actor,
+            "customer.password_change",
+            "customer",
+            &customer_id.to_string(),
+            &serde_json::json!({}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(true)
     }
 
-    async fn update_customer_password_by_account(
+    /// 按**账户**找一个客户的 id（运营按账户签重置令牌时用）。
+    async fn find_customer_by_account(
         &self,
         account_id: Uuid,
-        password_hash: &str,
     ) -> Result<Option<Uuid>, ApplicationError> {
-        sqlx::query_scalar::<_, Uuid>(
-            r#"
-            UPDATE identity.customers SET password_hash = $2
-            WHERE account_id = $1
-            RETURNING id
-            "#,
-        )
-        .bind(account_id)
-        .bind(password_hash)
-        .fetch_optional(&self.pool)
-        .await
-        .map_err(database_error)
+        sqlx::query_scalar::<_, Uuid>("SELECT id FROM identity.customers WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_optional(&self.pool)
+            .await
+            .map_err(database_error)
     }
 
     async fn open_customer_account(

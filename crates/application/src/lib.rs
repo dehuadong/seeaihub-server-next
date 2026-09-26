@@ -2126,8 +2126,8 @@ pub trait HubRepository: Send + Sync {
         password_hash: &str,
     ) -> Result<Uuid, ApplicationError>;
 
-    /// 记一次管理员登录成功（`last_login_at`）。
-    async fn touch_admin_login(&self, admin_id: Uuid) -> Result<(), ApplicationError>;
+    /// 记一次登录成功：`last_login_at` 与一条审计（`admin.login`），同一个事务。
+    async fn record_admin_login(&self, admin_id: Uuid) -> Result<(), ApplicationError>;
 
     /// 落一条管理员会话：`(会话 id, 管理员 id, 令牌摘要, 过期时刻)`。
     async fn create_admin_session(
@@ -2147,21 +2147,27 @@ pub trait HubRepository: Send + Sync {
     /// 删掉一条管理员会话（退出）。不存在的摘要也算成功：调用方在意的是"它现在不可用"。
     async fn delete_admin_session(&self, token_hash: &str) -> Result<(), ApplicationError>;
 
-    /// 改口令：写新的哈希。
-    async fn update_admin_password(
+    /// 改口令：写新的哈希、吊销该身份全部会话、写一条审计（`admin.password_change`），
+    /// **同一个事务**。返回 `false` 表示没有这个管理员。
+    ///
+    /// 三件事必须一起成功：只成一件会留下"新口令生效、旧会话还能用"或"改了但查不到是谁改的"这类
+    /// 半截状态，而 Spec 要求改完旧凭据**立刻**不能再用、且改动留痕。
+    async fn set_admin_password(
         &self,
         admin_id: Uuid,
         password_hash: &str,
-    ) -> Result<(), ApplicationError>;
+        actor: &str,
+    ) -> Result<bool, ApplicationError>;
 
     /// 按 id 取管理员的口令哈希（改口令要先比对当前口令）。
     async fn find_admin_password(&self, admin_id: Uuid)
     -> Result<Option<String>, ApplicationError>;
 
-    /// 吊销一个管理员的**全部**会话（改口令、重置口令之后调用）。返回删掉几条。
-    ///
-    /// 语义是"旧凭据立刻不能再用"：改口令后别人的会话还在，等于改了也没改。
-    async fn delete_admin_sessions(&self, admin_id: Uuid) -> Result<u64, ApplicationError>;
+    /// 按**账户**找一个客户的 id（运营按账户签重置令牌时用）。
+    async fn find_customer_by_account(
+        &self,
+        account_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError>;
 
     /// 签发一枚口令重置令牌：先作废该身份此前**未兑换**的令牌，再落新的（同一事务）。
     async fn create_password_reset(
@@ -2204,8 +2210,8 @@ pub trait HubRepository: Send + Sync {
         customer_id: Uuid,
     ) -> Result<Option<Uuid>, ApplicationError>;
 
-    /// 记一次对客登录成功。
-    async fn touch_customer_login(&self, customer_id: Uuid) -> Result<(), ApplicationError>;
+    /// 记一次登录成功：`last_login_at` 与一条审计（`customer.login`），同一个事务。
+    async fn record_customer_login(&self, customer_id: Uuid) -> Result<(), ApplicationError>;
 
     /// 落一条对客会话。
     async fn create_customer_session(
@@ -2230,22 +2236,14 @@ pub trait HubRepository: Send + Sync {
         customer_id: Uuid,
     ) -> Result<Option<String>, ApplicationError>;
 
-    /// 改口令：写新的哈希。
-    async fn update_customer_password(
+    /// 改口令：写新的哈希、吊销该客户全部会话、写一条审计（`customer.password_change`），
+    /// **同一个事务**。返回 `false` 表示没有这个客户。
+    async fn set_customer_password(
         &self,
         customer_id: Uuid,
         password_hash: &str,
-    ) -> Result<(), ApplicationError>;
-
-    /// 吊销一个客户的全部会话（改口令、重置口令之后调用）。
-    async fn delete_customer_sessions(&self, customer_id: Uuid) -> Result<u64, ApplicationError>;
-
-    /// 更新客户口令：按**账户**定位（运营为已有账户配了身份之后，从账户那一侧改口令）。
-    async fn update_customer_password_by_account(
-        &self,
-        account_id: Uuid,
-        password_hash: &str,
-    ) -> Result<Option<Uuid>, ApplicationError>;
+        actor: &str,
+    ) -> Result<bool, ApplicationError>;
 
     /// 运营替客户开户：给 `email` 配一个登录身份。
     ///
@@ -2575,7 +2573,7 @@ impl IdentityService {
         self.repository
             .create_admin_session(admin_id, &session_token_hash(&token), expires_at)
             .await?;
-        self.repository.touch_admin_login(admin_id).await?;
+        self.repository.record_admin_login(admin_id).await?;
         Ok(AdminLogin {
             admin_id,
             email,
@@ -2660,7 +2658,7 @@ impl IdentityService {
         self.repository
             .create_customer_session(customer_id, &session_token_hash(&token), expires_at)
             .await?;
-        self.repository.touch_customer_login(customer_id).await?;
+        self.repository.record_customer_login(customer_id).await?;
         Ok(CustomerLogin {
             customer_id,
             account_id,
@@ -2714,10 +2712,15 @@ impl IdentityService {
         }
         check_secret(new, "new password")?;
         let hash = hash_password(new)?;
-        self.repository
-            .update_admin_password(admin_id, &hash)
-            .await?;
-        self.repository.delete_admin_sessions(admin_id).await?;
+        // 写哈希、吊销该身份全部会话、写审计在**同一个事务**里：只成一件会留下"新口令生效、
+        // 旧会话还能用"这类半截状态。
+        if !self
+            .repository
+            .set_admin_password(admin_id, &hash, "admin-self")
+            .await?
+        {
+            return Err(ApplicationError::NotFound("admin account".to_owned()));
+        }
         Ok(())
     }
 
@@ -2748,19 +2751,24 @@ impl IdentityService {
         check_secret(new_password, "new password")?;
         let (kind, subject_id) = self.consume_reset_token(token).await?;
         let hash = hash_password(new_password)?;
-        match kind.as_str() {
+        // 令牌已经烧掉了：到这里必须是"口令真的改了"。写不进去说明被重置者不在了，如实报错而不是
+        // 回一个成功的空操作——那会让调用方以为能用新口令登录。
+        let written = match kind.as_str() {
             "admin" => {
                 self.repository
-                    .update_admin_password(subject_id, &hash)
-                    .await?;
-                self.repository.delete_admin_sessions(subject_id).await?;
+                    .set_admin_password(subject_id, &hash, "password-reset")
+                    .await?
             }
             _ => {
                 self.repository
-                    .update_customer_password(subject_id, &hash)
-                    .await?;
-                self.repository.delete_customer_sessions(subject_id).await?;
+                    .set_customer_password(subject_id, &hash, "password-reset")
+                    .await?
             }
+        };
+        if !written {
+            return Err(ApplicationError::NotFound(format!(
+                "{kind} account of the reset token"
+            )));
         }
         Ok(())
     }
@@ -2782,12 +2790,13 @@ impl IdentityService {
         }
         check_secret(new, "new password")?;
         let hash = hash_password(new)?;
-        self.repository
-            .update_customer_password(customer_id, &hash)
-            .await?;
-        self.repository
-            .delete_customer_sessions(customer_id)
-            .await?;
+        if !self
+            .repository
+            .set_customer_password(customer_id, &hash, "customer-self")
+            .await?
+        {
+            return Err(ApplicationError::NotFound("customer".to_owned()));
+        }
         Ok(())
     }
 
@@ -2799,7 +2808,7 @@ impl IdentityService {
     ) -> Result<(Uuid, String, DateTime<Utc>), ApplicationError> {
         let customer_id = self
             .repository
-            .find_customer_account(account_id.0)
+            .find_customer_by_account(account_id.0)
             .await?
             .ok_or_else(|| {
                 ApplicationError::NotFound(format!(

@@ -703,10 +703,14 @@ async fn read_admin_session(
 }
 
 /// 退出（`DELETE /api/v1/admin/sessions`，**仅会话**）：删掉这条会话，幂等。
+///
+/// 先按[`AppState::require_admin_self`]认一遍：共享令牌不指向任何一条会话，拿它调这条端点等于
+/// "退一个不存在的登录"，只会让运维以为撤销了访问。认过之后再删当前这条凭据对应的会话。
 async fn logout_admin(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
+    state.require_admin_self(&headers).await?;
     let token = bearer_token(&headers)?;
     state.identity.logout_admin(token).await?;
     Ok(StatusCode::NO_CONTENT)

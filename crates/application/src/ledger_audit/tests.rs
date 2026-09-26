@@ -84,11 +84,13 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn update_admin_password(
+    async fn set_admin_password(
         &self,
         _admin_id: Uuid,
         _password_hash: &str,
-    ) -> Result<(), ApplicationError> {
+
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
         unused_repository()
     }
 
@@ -97,10 +99,6 @@ impl HubRepository for AuditRepository {
         _admin_id: Uuid,
     ) -> Result<Option<String>, ApplicationError> {
         unused_option()
-    }
-
-    async fn delete_admin_sessions(&self, _admin_id: Uuid) -> Result<u64, ApplicationError> {
-        unused_repository()
     }
 
     async fn create_password_reset(
@@ -132,24 +130,14 @@ impl HubRepository for AuditRepository {
         unused_option()
     }
 
-    async fn update_customer_password(
+    async fn set_customer_password(
         &self,
         _customer_id: Uuid,
         _password_hash: &str,
-    ) -> Result<(), ApplicationError> {
-        unused_repository()
-    }
 
-    async fn delete_customer_sessions(&self, _customer_id: Uuid) -> Result<u64, ApplicationError> {
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
         unused_repository()
-    }
-
-    async fn update_customer_password_by_account(
-        &self,
-        _account_id: Uuid,
-        _password_hash: &str,
-    ) -> Result<Option<Uuid>, ApplicationError> {
-        unused_option()
     }
 
     async fn open_customer_account(
@@ -195,7 +183,7 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn touch_admin_login(&self, _admin_id: Uuid) -> Result<(), ApplicationError> {
+    async fn record_admin_login(&self, _admin_id: Uuid) -> Result<(), ApplicationError> {
         unused_repository()
     }
 
@@ -234,6 +222,13 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
+    async fn find_customer_by_account(
+        &self,
+        _account_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unused_option()
+    }
+
     async fn find_customer_account(
         &self,
         _customer_id: Uuid,
@@ -241,7 +236,7 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn touch_customer_login(&self, _customer_id: Uuid) -> Result<(), ApplicationError> {
+    async fn record_customer_login(&self, _customer_id: Uuid) -> Result<(), ApplicationError> {
         unused_repository()
     }
 

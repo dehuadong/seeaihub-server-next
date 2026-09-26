@@ -67,7 +67,7 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
-    async fn touch_admin_login(&self, _admin_id: Uuid) -> Result<(), ApplicationError> {
+    async fn record_admin_login(&self, _admin_id: Uuid) -> Result<(), ApplicationError> {
         unimplemented!()
     }
 
@@ -91,11 +91,13 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
-    async fn update_admin_password(
+    async fn set_admin_password(
         &self,
         _admin_id: Uuid,
         _password_hash: &str,
-    ) -> Result<(), ApplicationError> {
+
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
         unimplemented!()
     }
 
@@ -103,10 +105,6 @@ impl HubRepository for EmptyQueueRepository {
         &self,
         _admin_id: Uuid,
     ) -> Result<Option<String>, ApplicationError> {
-        unimplemented!()
-    }
-
-    async fn delete_admin_sessions(&self, _admin_id: Uuid) -> Result<u64, ApplicationError> {
         unimplemented!()
     }
 
@@ -147,6 +145,13 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
+    async fn find_customer_by_account(
+        &self,
+        _account_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unimplemented!()
+    }
+
     async fn find_customer_account(
         &self,
         _customer_id: Uuid,
@@ -154,7 +159,7 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
-    async fn touch_customer_login(&self, _customer_id: Uuid) -> Result<(), ApplicationError> {
+    async fn record_customer_login(&self, _customer_id: Uuid) -> Result<(), ApplicationError> {
         unimplemented!()
     }
 
@@ -185,23 +190,13 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
-    async fn update_customer_password(
+    async fn set_customer_password(
         &self,
         _customer_id: Uuid,
         _password_hash: &str,
-    ) -> Result<(), ApplicationError> {
-        unimplemented!()
-    }
 
-    async fn delete_customer_sessions(&self, _customer_id: Uuid) -> Result<u64, ApplicationError> {
-        unimplemented!()
-    }
-
-    async fn update_customer_password_by_account(
-        &self,
-        _account_id: Uuid,
-        _password_hash: &str,
-    ) -> Result<Option<Uuid>, ApplicationError> {
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
         unimplemented!()
     }
 
