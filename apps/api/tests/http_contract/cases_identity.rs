@@ -196,6 +196,75 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
     drop_isolated_database(&database_name).await;
 }
 
+/// 过期的会话被拒（V-A3 的端到端那一半）。
+///
+/// 不靠 `sleep` 等 TTL：直接在真库里把这一行的 `expires_at` 推到过去，再用它调用。判据是"过期凭据
+/// 真的被拒"，与"过期判定与清理"（应用层用例）各验一半。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_expired_session_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let email = "ops@example.com";
+    let password = "a-long-enough-password";
+    let (base_url, admin_token, _process) =
+        start_api_with_admin(&database_url, email, password).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let token = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("token")
+        .to_owned();
+
+    let before = client
+        .get(format!("{base_url}/api/v1/gateway-models"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("gateway models request");
+    assert_eq!(before.status(), StatusCode::OK, "刚登录的会话必须能用");
+
+    // 把这一行推到过去（按摘要定位，与认证路径同一条读）。
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let updated = sqlx::query(
+        "UPDATE identity.admin_sessions SET expires_at = now() - interval '1 minute' \
+         WHERE token_hash = $1",
+    )
+    .bind(seeai_application::session_token_hash(&token))
+    .execute(&pool)
+    .await
+    .expect("expire the session")
+    .rows_affected();
+    assert_eq!(updated, 1, "夹具必须改到那一行");
+
+    let after = client
+        .get(format!("{base_url}/api/v1/gateway-models"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("gateway models request");
+    assert_eq!(after.status(), StatusCode::FORBIDDEN, "过期会话必须被拒");
+
+    let wrong = client
+        .get(format!("{base_url}/api/v1/gateway-models"))
+        .bearer_auth("not-a-real-token")
+        .send()
+        .await
+        .expect("gateway models request");
+    assert_eq!(after.status(), wrong.status(), "过期与凭据不对不可区分");
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
 /// 客户自助：注册 → 发密钥 → 列密钥（**没有明文**）→ 吊销 → 该密钥不能再调对客接口。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
