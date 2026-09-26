@@ -50,6 +50,7 @@ export function AuthPage() {
       <div className="panel">
         <div className="row">
           <button
+            data-testid="portal-mode-login"
             type="button"
             className={mode === 'login' ? 'active' : ''}
             onClick={() => setMode('login')}
@@ -57,6 +58,7 @@ export function AuthPage() {
             登录
           </button>
           <button
+            data-testid="portal-mode-register"
             type="button"
             className={mode === 'register' ? 'active' : ''}
             onClick={() => setMode('register')}
@@ -68,6 +70,7 @@ export function AuthPage() {
           <label className="field">
             <span>邮箱</span>
             <input
+              data-testid="portal-email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
               placeholder="you@example.com"
@@ -78,6 +81,7 @@ export function AuthPage() {
           <label className="field">
             <span>口令（至少 8 个字符）</span>
             <input
+              data-testid="portal-password"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -88,7 +92,12 @@ export function AuthPage() {
               }}
             />
           </label>
-          <button type="button" disabled={busy || !canSubmit} onClick={() => void submit()}>
+          <button
+            data-testid="portal-submit"
+            type="button"
+            disabled={busy || !canSubmit}
+            onClick={() => void submit()}
+          >
             {busy ? '提交中…' : mode === 'register' ? '注册并进入' : '登录'}
           </button>
         </div>
@@ -132,11 +141,17 @@ function ResetPanel() {
       <div className="row">
         <label className="field">
           <span>重置令牌</span>
-          <input value={token} onChange={(event) => setToken(event.target.value)} size={44} />
+          <input
+            data-testid="portal-reset-token"
+            value={token}
+            onChange={(event) => setToken(event.target.value)}
+            size={44}
+          />
         </label>
         <label className="field">
           <span>新口令（至少 8 个字符）</span>
           <input
+            data-testid="portal-reset-password"
             type="password"
             value={password}
             onChange={(event) => setPassword(event.target.value)}
@@ -145,6 +160,7 @@ function ResetPanel() {
           />
         </label>
         <button
+          data-testid="portal-reset-submit"
           type="button"
           disabled={busy || !token.trim() || !password}
           onClick={async () => {

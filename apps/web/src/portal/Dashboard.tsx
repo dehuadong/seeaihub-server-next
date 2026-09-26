@@ -48,6 +48,7 @@ function PasswordPanel({ client }: { client: CustomerClient }) {
         <label className="field">
           <span>当前口令</span>
           <input
+            data-testid="portal-current-password"
             type="password"
             value={current}
             onChange={(event) => setCurrent(event.target.value)}
@@ -58,6 +59,7 @@ function PasswordPanel({ client }: { client: CustomerClient }) {
         <label className="field">
           <span>新口令（至少 8 个字符）</span>
           <input
+            data-testid="portal-new-password"
             type="password"
             value={next}
             onChange={(event) => setNext(event.target.value)}
@@ -66,6 +68,7 @@ function PasswordPanel({ client }: { client: CustomerClient }) {
           />
         </label>
         <button
+          data-testid="portal-change-password"
           type="button"
           disabled={busy || !current || !next}
           onClick={async () => {
@@ -186,9 +189,15 @@ function KeysPanel({ client }: { client: CustomerClient }) {
       <div className="row">
         <label className="field">
           <span>标签（给自己认的，例如 "本地脚本"）</span>
-          <input value={label} onChange={(event) => setLabel(event.target.value)} size={24} />
+          <input
+            data-testid="portal-key-label"
+            value={label}
+            onChange={(event) => setLabel(event.target.value)}
+            size={24}
+          />
         </label>
         <button
+          data-testid="portal-key-create"
           type="button"
           disabled={busy || !label.trim()}
           onClick={() =>
@@ -207,7 +216,9 @@ function KeysPanel({ client }: { client: CustomerClient }) {
         <div className="panel" style={{ marginTop: 8 }}>
           <div className="field">
             <span>密钥明文——**只显示这一次**，现在就抄走</span>
-            <div className="mono">{issued.api_key}</div>
+            <div className="mono" data-testid="portal-key-plaintext">
+              {issued.api_key}
+            </div>
           </div>
           <p className="muted">密钥标识：<code>{issued.key_id}</code>（吊销用它）</p>
         </div>

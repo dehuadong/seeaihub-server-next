@@ -49,6 +49,7 @@ export function LoginPage() {
           <label className="field">
             <span>邮箱</span>
             <input
+              data-testid="admin-email"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
               placeholder="ops@example.com"
@@ -59,6 +60,7 @@ export function LoginPage() {
           <label className="field">
             <span>口令</span>
             <input
+              data-testid="admin-password"
               type="password"
               value={password}
               onChange={(event) => setPassword(event.target.value)}
@@ -70,6 +72,7 @@ export function LoginPage() {
             />
           </label>
           <button
+            data-testid="admin-sign-in"
             type="button"
             disabled={busy || !email.trim() || !password}
             onClick={() => void submit()}

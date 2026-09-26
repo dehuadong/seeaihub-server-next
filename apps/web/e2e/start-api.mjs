@@ -1,0 +1,63 @@
+#!/usr/bin/env node
+// 端到端测试要跑的那个 API 进程：把两份前端产物托管起来，并按主机名分发。
+//
+// 与生产同一份代码路径——只有配置不同（`CONSOLE_DEV_HOST` 不设：spec 走 `admin.localhost` 这个真
+// 主机名，正好命中 `admin.` 前缀那条判据；不靠任何只给测试用的分支）。
+//
+// 前置：`npm run build` 已经产出 `apps/web/dist`（Playwright 的 webServer 在起 API 之前先跑它）。
+// 用法：`node e2e/start-api.mjs`，由 `playwright.config.ts` 的 webServer 启动并在结束时收掉。
+import { spawn } from 'node:child_process';
+import { existsSync } from 'node:fs';
+import { dirname, resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+
+// 这个文件在 `apps/web/e2e/`：`..` 是 `apps/web`，再上两级才是仓库根（cargo 要在那里跑）。
+const web = resolve(dirname(fileURLToPath(import.meta.url)), '..');
+const repo = resolve(web, '..', '..');
+
+const dist = resolve(web, 'dist');
+if (!existsSync(dist)) {
+  console.error(`没有前端产物：${dist}（先跑 npm run build）`);
+  process.exit(1);
+}
+
+/// 找 cargo：先看 PATH，再看 Rust 的常规安装位置。
+///
+/// 不要求调用者先配好环境：仓库的 Rust 工具链在 `~/.cargo/bin`，而它默认不在 PATH 上（本机实测
+/// `cargo` 直接就是"不是内部或外部命令"）。找不到就明说，不猜第三个地方。
+function findCargo() {
+  const exe = process.platform === 'win32' ? 'cargo.exe' : 'cargo';
+  const candidates = [
+    process.env.CARGO,
+    resolve(process.env.USERPROFILE ?? process.env.HOME ?? '', '.cargo', 'bin', exe),
+    resolve(process.env.HOME ?? '', '.cargo', 'bin', exe),
+  ].filter(Boolean);
+  for (const candidate of candidates) {
+    if (candidate && existsSync(candidate)) return candidate;
+  }
+  return 'cargo';
+}
+
+/// 绑定 `0.0.0.0` 而不是 `127.0.0.1`：`admin.localhost` 可能解析到 ::1，只听 IPv4 回环会连不上。
+const env = {
+  ...process.env,
+  DATABASE_URL: process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_next',
+  API_BIND: process.env.SEEAI_E2E_API_BIND ?? '0.0.0.0:8090',
+  ADMIN_TOKEN: process.env.SEEAI_E2E_ADMIN_TOKEN ?? 'e2e-shared-token',
+  ADMIN_EMAIL: process.env.SEEAI_E2E_ADMIN_EMAIL ?? 'ops@example.com',
+  ADMIN_PASSWORD: process.env.SEEAI_E2E_ADMIN_PASSWORD ?? 'a-long-enough-password',
+  RUST_LOG: process.env.RUST_LOG ?? 'warn',
+};
+
+// 不走 `shell`：参数原样传给子进程（`shell: true` 会把参数拼成命令行，Windows 上有转义与弃用警告）。
+const child = spawn(findCargo(), ['run', '-p', 'seeai-api'], {
+  cwd: repo,
+  env,
+  stdio: 'inherit',
+});
+
+// Playwright 收服务时发的是这个进程的信号；把子进程一起带走，别留下抢端口的孤儿。
+for (const signal of ['SIGINT', 'SIGTERM']) {
+  process.on(signal, () => child.kill(signal));
+}
+child.on('exit', (code) => process.exit(code ?? 0));
