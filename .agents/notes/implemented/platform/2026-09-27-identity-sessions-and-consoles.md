@@ -47,6 +47,8 @@ verification: cases_identity 15 passed、cases_billing 4 passed（真库 + 真�
 
 **端到端夹具的库是"从模板克隆"而不是"空库"**（`apps/api/tests/http_contract/harness.rs` 的 `isolated_database_url` 用 `CREATE DATABASE "{name}"`，默认模板是 `template1`，而它那条 doc comment 写的是"创建独立的空库"）。所以**把 `HTTP_CONTRACT_DATABASE_URL` 指着的那个库当开发库用，会把行带进之后每一次夹具**：本轮就发生过，模板里一度有 1 个管理员、2 个客户、3 条管理会话、1 把密钥与 6 条审计。现有用例的断言几乎都按"本次刚建的账户"或"总数前后之差"写，所以没被打破；但这是偶然，不是设计。要长期可靠，应把该库重置成"只应用迁移、没有业务行"的状态再跑套件。
 
+浏览器那一层的端到端与上面那套**用不同的库**：`apps/web/e2e/ensure-database.mjs` 每次把 `seeai_e2e`（`SEEAI_E2E_DATABASE` 可覆盖）**删掉重建**再让 API 自己跑迁移。这两个默认值必须指着不同的库——`ensure-database.mjs` 的默认值一度是 `seeai_next`，而它同时又被人当作别的用途的克隆模板，跑一次就把那个库清空了。
+
 ## 验证
 
 - `cases_identity` **15 passed**、`cases_billing` **4 passed**（真库 + 真进程）：登录、四种失败同答复、退出即失效、过期会话被拒、重置令牌一次性、改口令使全部旧会话失效、引导幂等且不回写口令、引导变量三分支、越权与未认证的区别、客户口令两条出路、注册的取值与形状两种错法。
