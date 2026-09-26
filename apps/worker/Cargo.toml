@@ -22,3 +22,9 @@ tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+seeai-domain = { path = "../../crates/domain" }
+serde_json.workspace = true
+uuid.workspace = true

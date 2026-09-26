@@ -124,39 +124,95 @@ async fn main() -> Result<()> {
         None => worker,
     };
     info!(%worker_id, "worker started");
-    // 终止信号只决定"**不再领下一轮**"：正在跑的那一轮（上游调用 + 落账 + 结算）要让它跑完，
-    // 否则在飞调用被丢掉，Job 会留在提交中直到租约过期才被回收。因此信号不放在 select 的
-    // 分支里直接返回，而是先置位，再把手上这一轮的 future 等完。
-    let shutdown = tokio::signal::ctrl_c();
-    tokio::pin!(shutdown);
+    let (_drain_signal, drain_control) = tokio::sync::watch::channel(false);
+    let signals = ShutdownSignals {
+        drain_control,
+        interrupt: Box::pin(tokio::signal::ctrl_c()),
+    };
+    run_until_shutdown(&worker, signals, poll_interval).await
+}
+
+/// 停机输入：一个"停止领新任务"的开关，以及一个"进程要退了"的终止信号。
+struct ShutdownSignals {
+    /// 由别处置位（例如编排系统的排水接口）；置位之后不再领下一轮。`watch` 可以反复轮询。
+    drain_control: tokio::sync::watch::Receiver<bool>,
+    /// Ctrl+C。钉成 `Pin<Box<..>>` 是因为它只在**一个**地方被轮询：每轮现造一个会把"监听"
+    /// 反复注册一遍，而"等停机"这件事不需要它对每个轮次都重新就绪。
+    interrupt: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>,
+}
+
+/// 领任务的主循环：直到停机条件成立为止。
+///
+/// 停机分两级，**在飞的那一轮都不许丢**（丢了 Job 会留在提交中直到租约过期才被回收）：
+/// - `drain_control` 置位 = **排空**：不再领下一轮，手上这一轮跑完；
+/// - `interrupt` 就绪（Ctrl+C）= **终止**：同样不打断在飞的那一轮，等它跑完再退。
+///
+/// 两级都写成"先知道要停、再等完手上这一轮"，因为对上游的那一次调用一旦发出就可能已经计费。
+/// 停机输入当参数传进来，是为了让这条合同能在测试里**确定地**验：真信号没法在进程内精确投递，
+/// 而"什么时候停、停的时候在飞的那一轮怎么办"与信号从哪来无关。
+async fn run_until_shutdown(
+    worker: &WorkerService,
+    mut signals: ShutdownSignals,
+    poll_interval: Duration,
+) -> Result<()> {
+    let mut interrupted = false;
     loop {
-        let iteration = worker.run_once();
-        tokio::pin!(iteration);
-        let mut draining = false;
-        let result = loop {
-            tokio::select! {
-                signal = &mut shutdown => {
-                    signal.context("failed to listen for shutdown signal")?;
-                    if !draining {
-                        draining = true;
-                        info!("worker draining: finishing the in-flight iteration before exit");
-                    }
-                }
-                result = &mut iteration => break result,
-            }
-        };
-        match result {
-            Ok(true) => {}
-            Ok(false) => tokio::time::sleep(poll_interval).await,
-            Err(error) => {
-                error!(error = %error, "worker iteration failed");
-                tokio::time::sleep(poll_interval).await;
-            }
-        }
-        if draining {
+        // 已经在排空、或已经收到终止信号：一轮都不再领。
+        if interrupted || *signals.drain_control.borrow_and_update() {
             info!("worker stopped");
             return Ok(());
         }
+        match await_stop(&mut signals).await {
+            Some(is_interrupted) => interrupted = interrupted || is_interrupted,
+            None => {
+                info!("worker stopped");
+                return Ok(());
+            }
+        }
+        // 这一轮跑完才算数：停机条件一律在**领下一轮之前**生效，在飞的那一轮因此永远是完整的。
+        let idle = match worker.run_once().await {
+            Ok(handled) => !handled,
+            Err(error) => {
+                error!(error = %error, "worker iteration failed");
+                true
+            }
+        };
+        // 跑完先看要不要停，再谈退避：退避是"没活干、也没人要求停"时的事，把它排在停机判定之前
+        // 会让一次停机白等一个退避周期（运维取值可以是分钟级）。
+        if interrupted || *signals.drain_control.borrow_and_update() {
+            info!("worker stopped");
+            return Ok(());
+        }
+        if idle {
+            tokio::time::sleep(poll_interval).await;
+        }
+    }
+}
+
+/// 等一个停机条件成立。
+///
+/// 返回 `Some(true)` 是终止信号、`Some(false)` 是排空开关；`None` 表示排空开关的发送端没了——
+/// 那时没人再能要求排空，继续跑下去等于一个再也停不下来的进程，所以按停止处置。
+///
+/// 只在这两个信号上等：`watch` 的值变化会唤醒它，`ctrl_c` 就绪也会。**不设超时分支**，
+/// 因为"没人要求停机"本来就该一直等下去（真正的让步由每轮之后的退避负责）。
+async fn await_stop(signals: &mut ShutdownSignals) -> Option<bool> {
+    tokio::select! {
+        result = &mut signals.interrupt => {
+            if let Err(error) = result {
+                error!(error = %error, "failed to listen for the shutdown signal");
+            }
+            Some(true)
+        }
+        changed = signals.drain_control.changed() => match changed {
+            Ok(()) => {
+                if *signals.drain_control.borrow_and_update() {
+                    info!("worker draining: finishing the in-flight iteration before exit");
+                }
+                Some(false)
+            }
+            Err(_) => None,
+        },
     }
 }
 
@@ -187,3 +243,7 @@ fn init_tracing() {
         .json()
         .init();
 }
+
+#[cfg(test)]
+#[path = "worker_loop_tests.rs"]
+mod worker_loop_tests;

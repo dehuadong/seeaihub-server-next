@@ -2117,6 +2117,7 @@ name = "seeai-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "dotenvy",
  "seeai-adapter-aihubmix",
@@ -2125,10 +2126,13 @@ dependencies = [
  "seeai-alert-webhook",
  "seeai-application",
  "seeai-cache-redis",
+ "seeai-domain",
  "seeai-persistence",
+ "serde_json",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]
