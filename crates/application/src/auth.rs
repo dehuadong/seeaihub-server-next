@@ -91,7 +91,10 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
         .is_ok()
 }
 
-/// 新会话令牌的明文。32 字节随机数的十六进制，够长到不必再谈熵。
+/// 新会话令牌的明文：两个 UUIDv4 拼接的十六进制，约 244 位随机。
+///
+/// 不需要更多：它的强度只用来抵挡"猜一条有效令牌"，而令牌在库里以 SHA-256 存放、按摘要点查，
+/// 猜中一条相当于命中一条随机会话行。
 #[must_use]
 pub fn new_session_token() -> String {
     format!(

@@ -51,3 +51,34 @@ CREATE TABLE identity.customer_sessions (
 );
 
 CREATE INDEX customer_sessions_customer ON identity.customer_sessions (customer_id);
+
+-- 口令重置令牌：管理员与客户的结构完全一样，只有"被重置者属于哪个身份域"不同，因此一张表装下。
+--
+-- `subject_id` 指 `admin_users` 或 `customers` 之一，所以做不了外键——被重置者的存在性由用例层在
+-- 兑换时校验。令牌与会话一样只存 SHA-256；有效期短（默认 30 分钟）且**一次有效**：兑换时校验
+-- `expires_at > now()` 且 `redeemed_at IS NULL`，用过写 `redeemed_at`。
+--
+-- 行**不删**："什么时候申请过、什么时候用过"是要留的事实。同一身份签新令牌时，此前未兑换的那些
+-- 由下面的部分唯一索引挡住（一个 subject 同时只允许一条未兑换令牌），免得旧令牌在运营看不见的
+-- 地方继续可用。
+CREATE TABLE identity.password_resets (
+    id uuid PRIMARY KEY,
+    subject_kind text NOT NULL CHECK (subject_kind IN ('admin', 'customer')),
+    subject_id uuid NOT NULL,
+    token_hash text NOT NULL UNIQUE,
+    created_at timestamptz NOT NULL DEFAULT now(),
+    expires_at timestamptz NOT NULL,
+    redeemed_at timestamptz
+);
+
+CREATE INDEX password_resets_subject ON identity.password_resets (subject_kind, subject_id);
+
+CREATE UNIQUE INDEX password_resets_one_open
+    ON identity.password_resets (subject_kind, subject_id)
+    WHERE redeemed_at IS NULL;
+
+-- 审计补一列身份：既有 `actor text` 只能说明"经管理 API 做的"（十二处写死 `admin-api`），
+-- 回答不了"哪个管理员做的"。共享令牌触发的写操作在这一列留空、`actor` 仍是 `admin-api`，
+-- 因此既有取值与语义不变。
+ALTER TABLE operations.audit_events
+    ADD COLUMN admin_id uuid REFERENCES identity.admin_users(id);
