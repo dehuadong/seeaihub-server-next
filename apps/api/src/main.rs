@@ -333,12 +333,16 @@ async fn main() -> Result<()> {
     // 两份前端产物（`apps/web/dist`）由这里托管，**按主机名分发**：管理主机回运营后台、客户主机回
     // 客户控制台。它挂成 `fallback`，所以**路由表优先**——未注册的 `/api/v1/…` 与 `/v1/…` 仍然回
     // 既有的 JSON 404，不会被兜底成一份 HTML（那会让调用方把"路径写错了"读成"调用成功"）。
+    //
+    // **没有产物时也要挂这一个兜底**：什么都不挂的话，未注册路径会落到框架自带的 404（纯文本），
+    // 而不是本服务约定的 JSON 错误体——调用方按 `error.code` 分流就会读不到东西。没有产物时
+    // [`StaticSpa::serve`] 对任何路径都回同一个 JSON 404（实测踩到过：这一支只在没构建时暴露）。
     let app = match static_spa()? {
         Some(spa) => app.fallback(move |request: axum::extract::Request| {
             let spa = spa.clone();
             async move { spa.serve(request).await }
         }),
-        None => app,
+        None => app.fallback(|| async { not_found() }),
     };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "api listening");

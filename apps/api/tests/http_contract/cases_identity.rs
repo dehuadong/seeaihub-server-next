@@ -606,45 +606,69 @@ async fn the_api_serves_the_front_end_without_swallowing_api_404s() {
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
-    // 两份入口产物都在（先跑 `npm run build`；没构建时 API 不托管前端，这里会以 404 说明原因）。
+    // 两份入口产物：**先看这次运行有没有构建过**。
     //
-    // **按文件名直达**：两份产物在同一个目录里，只按主机名分发时，本机（开发出口开着）就只剩管理端
-    // 一条路。文件名优先让两个入口在任何主机上都各有一条明确地址。
-    for entry in ["/console.html", "/portal.html"] {
-        let response = client
-            .get(format!("{base_url}{entry}"))
+    // `apps/web/dist/` 在 `.gitignore` 里，所以 CI 的 `rust` job（只跑 cargo，不跑 npm）里没有它，
+    // 而 API 在没有产物时**本来就不托管前端**（`static_spa` 回 `None`）。那种情况下断言 200 会必挂，
+    // 而"没构建"本身不是缺陷——所以分两支：没产物时验"未注册路径仍回 JSON 404、且不吐 HTML"，
+    // 有产物时才验两个入口。产出物那一支的完整覆盖由 CI 的 `web-e2e` job 与 `apps/web/e2e/` 承担。
+    let dist = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+        .join("..")
+        .join("web")
+        .join("dist");
+    if dist.is_dir() {
+        // **按文件名直达**：两份产物在同一个目录里，只按主机名分发时，本机（开发出口开着）就只剩
+        // 管理端一条路。文件名优先让两个入口在任何主机上都各有一条明确地址。
+        for entry in ["/console.html", "/portal.html"] {
+            let response = client
+                .get(format!("{base_url}{entry}"))
+                .send()
+                .await
+                .expect("entry request");
+            assert_eq!(response.status(), StatusCode::OK, "入口产物取不到：{entry}");
+            let body = response.text().await.expect("entry body");
+            assert!(body.contains("<!doctype html"), "{entry} 应当是一份 HTML");
+        }
+        // 两个入口是**不同的**两份产物，不是同一个文件：各自的标题不一样。
+        let console = client
+            .get(format!("{base_url}/console.html"))
             .send()
             .await
-            .expect("entry request");
-        assert_eq!(
-            response.status(),
-            StatusCode::OK,
-            "入口产物必须能被取到（先跑 npm run build）：{entry}"
+            .expect("console request")
+            .text()
+            .await
+            .expect("console body");
+        let portal = client
+            .get(format!("{base_url}/portal.html"))
+            .send()
+            .await
+            .expect("portal request")
+            .text()
+            .await
+            .expect("portal body");
+        assert!(
+            console.contains("运营后台") && portal.contains("seeai 控制台") && console != portal,
+            "两个入口必须是各自那一份产物"
         );
-        let body = response.text().await.expect("entry body");
-        assert!(body.contains("<!doctype html"), "{entry} 应当是一份 HTML");
+    } else {
+        // 没有产物：入口路径也得是 JSON 404，**不许**回 HTML——否则调用方会把"这次没部署前端"
+        // 读成"前端在这儿"。
+        for entry in ["/console.html", "/portal.html"] {
+            let response = client
+                .get(format!("{base_url}{entry}"))
+                .send()
+                .await
+                .expect("entry request");
+            assert_eq!(
+                response.status(),
+                StatusCode::NOT_FOUND,
+                "没有构建产物时 {entry} 必须是 404"
+            );
+        }
+        eprintln!(
+            "没有 apps/web/dist：本次只验\"未托管前端\"那一支，产物那一支由 CI 的 web-e2e job 覆盖"
+        );
     }
-    // 两个入口是**不同的**两份产物，不是同一个文件：各自的标题不一样。
-    let console = client
-        .get(format!("{base_url}/console.html"))
-        .send()
-        .await
-        .expect("console request")
-        .text()
-        .await
-        .expect("console body");
-    let portal = client
-        .get(format!("{base_url}/portal.html"))
-        .send()
-        .await
-        .expect("portal request")
-        .text()
-        .await
-        .expect("portal body");
-    assert!(
-        console.contains("运营后台") && portal.contains("seeai 控制台") && console != portal,
-        "两个入口必须是各自那一份产物"
-    );
 
     // 未注册的 API 路径：**JSON 404**，不是 HTML。
     for path in ["/api/v1/nope", "/v1/nope"] {

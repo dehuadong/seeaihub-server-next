@@ -42,6 +42,7 @@ export function AccountsPage({ client }: { client: AdminClient }) {
         <h3>查一个账户</h3>
         <div className="row">
           <input
+            data-testid="accounts-lookup-id"
             value={accountId}
             onChange={(event) => setAccountId(event.target.value)}
             placeholder="账户 id（UUID）"
