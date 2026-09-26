@@ -1,29 +1,45 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
 
-/// 管理员凭证的存放位置。
+/// 管理端会话的存放位置。
 ///
-/// 它是**运维自己填的一个共享令牌**（服务端只有 `ADMIN_TOKEN` 这一种管理员身份，见
-/// `apps/api/src/main.rs` 的 `require_admin`）。控制台不引入登录态：令牌只存在这个标签页的
-/// `sessionStorage` 里，关掉标签页就没了，也**不写进任何请求日志或构建产物**。
-const TOKEN_KEY = 'seeai.adminToken';
+/// 服务端的 `identity.*_sessions` 每次都读库判有效性（吊销与过期立刻生效），所以这里的令牌对客户端
+/// 来说是**不透明**的：拿到就用，过期了会被拒，届时清掉它回到登录页。
+///
+/// 键名带 `console` 前缀：客户控制台将来用同一个浏览器时各存各的，不会串。
+const TOKEN_KEY = 'seeai.console.session';
 
 interface AdminSession {
+  /// 会话令牌；`null` 表示未登录。
   token: string | null;
-  setToken: (value: string | null) => void;
+  /// 当前登录的管理员邮箱（登录响应给的，用于界面显示）。
+  email: string | null;
+  signIn: (token: string, email: string) => void;
+  signOut: () => void;
 }
 
 const AdminSessionContext = createContext<AdminSession | null>(null);
 
 export function AdminSessionProvider({ children }: { children: ReactNode }) {
-  const [token, setTokenState] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
+  const [token, setToken] = useState<string | null>(() => sessionStorage.getItem(TOKEN_KEY));
+  const [email, setEmail] = useState<string | null>(() =>
+    sessionStorage.getItem(`${TOKEN_KEY}.email`),
+  );
 
-  const setToken = useCallback((value: string | null) => {
-    if (value) sessionStorage.setItem(TOKEN_KEY, value);
-    else sessionStorage.removeItem(TOKEN_KEY);
-    setTokenState(value);
+  const signIn = useCallback((next: string, nextEmail: string) => {
+    sessionStorage.setItem(TOKEN_KEY, next);
+    sessionStorage.setItem(`${TOKEN_KEY}.email`, nextEmail);
+    setToken(next);
+    setEmail(nextEmail);
   }, []);
 
-  const value = useMemo(() => ({ token, setToken }), [token, setToken]);
+  const signOut = useCallback(() => {
+    sessionStorage.removeItem(TOKEN_KEY);
+    sessionStorage.removeItem(`${TOKEN_KEY}.email`);
+    setToken(null);
+    setEmail(null);
+  }, []);
+
+  const value = useMemo(() => ({ token, email, signIn, signOut }), [token, email, signIn, signOut]);
   return <AdminSessionContext.Provider value={value}>{children}</AdminSessionContext.Provider>;
 }
 

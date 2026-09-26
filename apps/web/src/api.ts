@@ -53,11 +53,14 @@ export async function apiFetch<T>(
   const payload: unknown = text ? JSON.parse(text) : null;
   if (!response.ok) {
     const failure = payload as ApiErrorBody | null;
-    throw new ApiError(
-      response.status,
-      failure?.error?.code ?? 'unknown',
-      failure?.error?.message ?? `请求失败（HTTP ${response.status}）`,
-    );
+    // 403 在管理面只有一个含义：**这次凭据不被接受**（会话过期、被吊销，或拿的是共享令牌而这条
+    // 端点只认会话）。原文案是英文的 `admin authorization failed`，对运营没有可操作性——换成
+    // "重新登录"，因为那是唯一能解决它的动作。
+    const message =
+      response.status === 403
+        ? '登录已过期或不被接受，请重新登录（退出登录后重新输入邮箱与口令）'
+        : (failure?.error?.message ?? `请求失败（HTTP ${response.status}）`);
+    throw new ApiError(response.status, failure?.error?.code ?? 'unknown', message);
   }
   return payload as T;
 }
