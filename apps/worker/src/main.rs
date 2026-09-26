@@ -147,7 +147,10 @@ struct ShutdownSignals {
 /// - `drain_control` 置位 = **排空**：不再领下一轮，手上这一轮跑完；
 /// - `interrupt` 就绪（Ctrl+C）= **终止**：同样不打断在飞的那一轮，等它跑完再退。
 ///
-/// 两级都写成"先知道要停、再等完手上这一轮"，因为对上游的那一次调用一旦发出就可能已经计费。
+/// 领任务与"等停机"**同时**推进：停机请求不必等到某一轮结束才被看见，而停机一旦成立也不再领
+/// 下一轮——手上那一轮仍旧完整跑完（`select!` 只让停机**先被看见**，取消的是"再领一轮"，
+/// 不是那次上游调用）。
+///
 /// 停机输入当参数传进来，是为了让这条合同能在测试里**确定地**验：真信号没法在进程内精确投递，
 /// 而"什么时候停、停的时候在飞的那一轮怎么办"与信号从哪来无关。
 async fn run_until_shutdown(
@@ -162,24 +165,30 @@ async fn run_until_shutdown(
             info!("worker stopped");
             return Ok(());
         }
-        match await_stop(&mut signals).await {
-            Some(is_interrupted) => interrupted = interrupted || is_interrupted,
-            None => {
-                info!("worker stopped");
-                return Ok(());
+        let iteration = worker.run_once();
+        tokio::pin!(iteration);
+        let mut draining = false;
+        let handled = loop {
+            tokio::select! {
+                stop = await_stop(&mut signals) => {
+                    if let Some(is_interrupted) = stop {
+                        interrupted = interrupted || is_interrupted;
+                    }
+                    draining = true;
+                }
+                result = &mut iteration => break result,
             }
-        }
-        // 这一轮跑完才算数：停机条件一律在**领下一轮之前**生效，在飞的那一轮因此永远是完整的。
-        let idle = match worker.run_once().await {
+        };
+        let idle = match handled {
             Ok(handled) => !handled,
             Err(error) => {
                 error!(error = %error, "worker iteration failed");
                 true
             }
         };
-        // 跑完先看要不要停，再谈退避：退避是"没活干、也没人要求停"时的事，把它排在停机判定之前
+        // 跑完先看要不要停，再谈退避：退避是"没活干、也没人要求停"时的事，排在停机判定之前
         // 会让一次停机白等一个退避周期（运维取值可以是分钟级）。
-        if interrupted || *signals.drain_control.borrow_and_update() {
+        if draining || interrupted || *signals.drain_control.borrow_and_update() {
             info!("worker stopped");
             return Ok(());
         }

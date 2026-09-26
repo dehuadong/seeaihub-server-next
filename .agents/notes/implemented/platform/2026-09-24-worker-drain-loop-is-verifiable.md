@@ -4,7 +4,7 @@ status: implemented
 created: 2026-09-24
 updated: 2026-09-24
 approval: 工单 #24 的验收条件要求"给 worker 发终止信号后 Job 不滞留提交中"；原实现已排空，但无法确定验证。本次按该验收把停机输入改为参数化并补齐用例。
-verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信号都不打断在飞那一轮、已在排空态不领新任务、没有停机请求时不退出）；`cargo clippy -p seeai-worker --all-targets --all-features -- -D warnings` 通过；`cargo fmt --all -- --check` 通过。
+verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信号都不打断在飞那一轮、已在排空态不领新任务、没有停机请求时不退出）；既有定价端到端全套 `cargo test -p seeai-api --test http_contract cases_pricing -- --ignored`（9 passed，其中两条正是被本轮回归打红、修复后转绿的用例）；`cargo clippy -p seeai-worker -p seeai-api --all-targets --all-features -- -D warnings` 通过；`cargo fmt --all -- --check` 通过。
 ---
 
 # Agent Note：worker 排空逻辑改为可确定验证的循环
@@ -17,7 +17,8 @@ verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信
 
 ## 决定
 
-- 停机输入收进一个结构（排空开关 `watch` + 终止信号），当**参数**传给主循环：主循环在**领下一轮之前**看停机条件，手上那一轮跑完再看一次。停机因此从不与在飞调用竞争，判据不再依赖 `select!` 的乱序。
+- 停机输入收进一个结构（排空开关 `watch` + 终止信号），当**参数**传给主循环：领任务与 `await_stop` **同时**推进，停机在**每一轮结束时**生效，而在飞的那一轮永远是完整的。
+- 停机请求不必等到某一轮结束才被看见，也不会成为"能不能领任务"的前置条件——**领任务不依赖任何停机输入**（这一条是回归的直接教训，见下）。
 - 终止信号是"立即不再领"，排空开关是将来"排水"接口的入口——今天只有测试会置位它，还没有对外端点。
 - 跑完先判停机、再退避：退避是"没活干、也没人要求停"时的事（运维取值可能是分钟级），排在停机判定之前会让一次停机白等一个退避周期。
 - 真信号（`ctrl_c`）与排空开关都从 `main` 装上；用例用可控的同类输入验同一段循环。
@@ -26,12 +27,12 @@ verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信
 
 - **在端到端装置里给 worker 子进程投一个真 Ctrl+C**（`GenerateConsoleCtrlEvent` + 新进程组）：落选。要为测试给 workspace 开 `unsafe` 的口子（`forbid` 不允许 `allow` 局部放宽），而得到的好处只是"信号确实能被操作系统送进去"——那与仓库自己的循环逻辑无关。
 - **只走人工验证**（在能发信号的部署里手工验一次）：落选。它把一条会回归的合同压在"记得手工跑"上；改成参数化之后，同一段循环可以在进程内确定地验。
-- **保留原来的 `select!` 形状，只补注释**：落选。那样"信号不打断在飞调用"仍然依赖运行期乱序，用例也没法写成确定的断言。
+- **先等停机再领任务**（把 `await_stop` 放在 `run_once` 之前）：**落选，而且第一版就是这么写的**。它把"停机"变成了领任务的前置条件：没有排空端点、也没有信号的部署里，worker 一轮都不会领——Job 停在 `accepted`、`attempts` 一行都不写。这个错由**既有**的定价端到端用例当场抓住（同步入口 504、Job 状态可查），修复后才转绿；本件因此把"领任务不依赖停机输入"写成上面那条决定。
 
 ## 后果
 
 - 停机判定与在飞调用彻底分开：`run_once` 一旦开始就一定跑完，排空与终止都只在它前后生效。
-- 终止信号是**一次性**的（Ctrl+C 就绪之后一直就绪）：主循环用它时不再重新注册监听，因此不会反复唤醒。
+- 终止信号是**可重复轮询**的：`select!` 会在已就绪的分支上再轮询一次，所以停机源必须能安全地"再问一遍"。用例里的替身因此也用可重复轮询的形状（裸 `oneshot` 会在第二次轮询时 panic）。
 - 两条新用例把合同钉死：停机请求投在"这一轮已经在飞"时，返回前那一轮必须跑完；已经在排空态时一轮都不领；没有停机请求时循环不退出。
 - 停机的**操作系统侧**（SIGTERM/Ctrl+C 真的送到进程）仍由部署验证：本件验的是"送到之后循环怎么做"，不是信号投递本身。
 
@@ -43,7 +44,8 @@ verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信
 | 终止信号同样等手上那一轮跑完 | `an_interrupt_waits_for_the_in_flight_iteration`（同文件） |
 | 已经在排空态时一轮都不领（重复的停机请求不会各领一轮） | `an_already_draining_worker_does_not_claim_another_iteration`（同文件） |
 | 没有停机请求时循环不退出 | `the_loop_keeps_working_while_no_stop_is_requested`（同文件） |
-| 门禁（本改动面） | `cargo fmt --all -- --check`、`cargo clippy -p seeai-worker --all-targets --all-features -- -D warnings`、`cargo test -p seeai-worker` |
+| **领任务不依赖停机输入**（回归） | 定价端到端全套 `cargo test -p seeai-api --test http_contract cases_pricing -- --ignored`（9 passed）——首版"先等停机再领"在这里被当场抓住 |
+| 门禁（本改动面） | `cargo fmt --all -- --check`、`cargo clippy -p seeai-worker -p seeai-api --all-targets --all-features -- -D warnings`、`cargo test -p seeai-worker` |
 
 ## 依据与关联
 

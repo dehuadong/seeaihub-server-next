@@ -345,23 +345,30 @@ impl CredentialProvider for NoCredentials {
     }
 }
 
-/// 一条用例自己的终止信号：可以自己投递一次；`install` 给出主循环要的那份 future。
+/// 一条用例自己的终止信号：可以自己投递一次；[`Self::signal`] 给出主循环要的那份 future。
+///
+/// 形状与生产里的 `ctrl_c` 一致：**可重复轮询**，触发之后一直就绪。用裸 `oneshot` 不行——
+/// `select!` 会在已就绪的分支上再轮询一次，而"已完成又被轮询"的 future 会 panic。
 #[derive(Default)]
 struct TestInterrupt {
-    sender: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    fired: Arc<tokio::sync::Notify>,
 }
 
 impl TestInterrupt {
-    fn install(&mut self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
-        let (sender, receiver) = tokio::sync::oneshot::channel();
-        self.sender = Some(sender);
-        Box::pin(async move { receiver.await.expect("the interrupt is sent") })
+    fn signal(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
+        let fired = self.fired.clone();
+        Box::pin(std::future::poll_fn(move |context| {
+            let notified = fired.notified();
+            tokio::pin!(notified);
+            match notified.poll(context) {
+                std::task::Poll::Ready(()) => std::task::Poll::Ready(Ok(())),
+                std::task::Poll::Pending => std::task::Poll::Pending,
+            }
+        }))
     }
 
-    fn send(&mut self) {
-        if let Some(sender) = self.sender.take() {
-            let _ = sender.send(Ok(()));
-        }
+    fn send(&self) {
+        self.fired.notify_one();
     }
 }
 
@@ -387,18 +394,19 @@ fn drain_worker(repository: Arc<EmptyQueueRepository>) -> WorkerService {
 }
 
 /// 一份"还没人要求停机"的输入：排空开关是关的，终止信号由用例自己决定什么时候投。
+///
+/// 返回的第三个值是**共享的**终止信号：用例留一份用来投递，给主循环的那份只是它的一个 future。
 fn quiet_signals() -> (
     ShutdownSignals,
     tokio::sync::watch::Sender<bool>,
-    TestInterrupt,
+    Arc<TestInterrupt>,
 ) {
     let (control, drain_control) = tokio::sync::watch::channel(false);
-    let mut interrupt = TestInterrupt::default();
-    let interrupt_future = interrupt.install();
+    let interrupt = Arc::new(TestInterrupt::default());
     (
         ShutdownSignals {
             drain_control,
-            interrupt: interrupt_future,
+            interrupt: interrupt.signal(),
         },
         control,
         interrupt,
@@ -407,8 +415,8 @@ fn quiet_signals() -> (
 
 /// 排空请求**不打断在飞的那一轮**：不再领下一轮，手上这一轮跑完才退。
 ///
-/// 判据是"那一轮真的跑完了"：请求投在 `claim_next_job` 正按住的时候（这一轮已经在飞），
-/// 循环必须等它返回之后才收工——而不是在半路把它丢掉。
+/// 判据是"那一轮真的跑完了"：请求投在那一轮已经在飞的时候，循环必须等它返回之后才收工——
+/// 而不是在半路把它丢掉。
 #[tokio::test]
 async fn a_drain_request_waits_for_the_in_flight_iteration() {
     let repository = Arc::new(EmptyQueueRepository::default());
@@ -416,7 +424,6 @@ async fn a_drain_request_waits_for_the_in_flight_iteration() {
     let worker = drain_worker(repository);
     let (signals, control, _interrupt) = quiet_signals();
 
-    // 主循环先在"等停机"上停住，这一投递把它放行；随后那一轮要跑满 600ms。
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
         let _ = control.send(true);
@@ -438,7 +445,7 @@ async fn an_interrupt_waits_for_the_in_flight_iteration() {
     let repository = Arc::new(EmptyQueueRepository::default());
     let finished_flag = repository.iteration_finished.clone();
     let worker = drain_worker(repository);
-    let (signals, _control, mut interrupt) = quiet_signals();
+    let (signals, _control, interrupt) = quiet_signals();
 
     tokio::spawn(async move {
         tokio::time::sleep(Duration::from_millis(50)).await;
