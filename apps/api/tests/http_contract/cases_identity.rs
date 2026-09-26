@@ -649,6 +649,86 @@ async fn the_api_serves_the_front_end_without_swallowing_api_404s() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 越权与未认证（V-C5、V-C10）：**没有凭据**与**凭据无效**访问对客账务/密钥端点，一律未认证；
+/// 而**有凭据但目标不属于自己**的，一律"不存在"。
+///
+/// 两者不是一回事：前者是"我还没证明我是谁"，后者是"我证明了，但这不是我的东西"。混在一起会让
+/// 调用方分不清该去登录还是该去核对账户。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn customer_endpoints_distinguish_unauthenticated_from_not_yours() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let reads = [
+        "/v1/customer/account",
+        "/v1/customer/ledger",
+        "/v1/customer/usage",
+        "/v1/customer/billing",
+        "/v1/customer/api-keys",
+    ];
+
+    // 没凭据：未认证。
+    for path in reads {
+        let response = client
+            .get(format!("{base_url}{path}"))
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} 没凭据时必须未认证"
+        );
+    }
+
+    // 凭据无效：同样未认证（会话不存在与过期不可区分）。
+    for path in reads {
+        let response = client
+            .get(format!("{base_url}{path}"))
+            .bearer_auth("not-a-real-session")
+            .send()
+            .await
+            .expect("request");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "{path} 凭据无效时必须未认证"
+        );
+    }
+
+    // 有凭据但目标不属于自己：按"不存在"回，而不是 403。
+    let registered = client
+        .post(format!("{base_url}/v1/customers"))
+        .json(&json!({"email": "owner@example.com", "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("register request")
+        .json::<Value>()
+        .await
+        .expect("register body");
+    let session = registered["token"].as_str().expect("token").to_owned();
+
+    let stolen = client
+        .delete(format!(
+            "{base_url}/v1/customer/api-keys/{}",
+            Uuid::new_v4()
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("revoke request");
+    assert_eq!(
+        stolen.status(),
+        StatusCode::NOT_FOUND,
+        "不属于自己的密钥标识必须按'不存在'回，而不是 403"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 客户自助：注册 → 发密钥 → 列密钥（**没有明文**）→ 吊销 → 该密钥不能再调对客接口。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
