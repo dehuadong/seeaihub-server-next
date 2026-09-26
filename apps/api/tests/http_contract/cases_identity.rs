@@ -111,6 +111,21 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
         .expect("token")
         .to_owned();
 
+    // **第二条会话**（同一个人的第二次登录，比如另一台机器）：下面验"重置使**全部**会话失效"。
+    let second = client
+        .post(format!("{base_url}/api/v1/admin/sessions"))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("second login request")
+        .json::<Value>()
+        .await
+        .expect("second login body")["token"]
+        .as_str()
+        .expect("second token")
+        .to_owned();
+    assert_ne!(token, second, "两次登录必须是两条不同的会话");
+
     let logout = client
         .delete(format!("{base_url}/api/v1/admin/sessions"))
         .bearer_auth(&token)
@@ -177,6 +192,44 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
         .await
         .expect("second redeem request");
     assert_eq!(again.status(), StatusCode::BAD_REQUEST, "令牌是一次性的");
+
+    // **兑换重置令牌使此前的会话全部失效**（V-A7）：拿兑换之前那条会话答"我是谁"必须被拒。
+    // 读的是会话端点而不是"我还在不在"，所以这条恰好只能由会话身份来答——共享令牌答不了它。
+    let revoked = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth(&token)
+        .send()
+        .await
+        .expect("identity request after redemption");
+    assert_eq!(
+        revoked.status(),
+        StatusCode::FORBIDDEN,
+        "重置之后旧会话必须失效"
+    );
+    // 而且答复与"凭据不对"**逐字相同**：调用方分不出自己是过期了还是拿错了（V-A6 的那条断言）。
+    let revoked_body = revoked.json::<Value>().await.expect("revoked body");
+    let bogus = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth("not-a-real-token")
+        .send()
+        .await
+        .expect("bogus request");
+    assert_eq!(bogus.status(), StatusCode::FORBIDDEN);
+    let bogus_body = bogus.json::<Value>().await.expect("bogus body");
+    assert_eq!(revoked_body, bogus_body, "失效会话与错凭据必须同答复");
+
+    // **另一条**会话也失效了——这才是"全部"而不是"那一条"。
+    let second_revoked = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth(&second)
+        .send()
+        .await
+        .expect("second identity request after redemption");
+    assert_eq!(
+        second_revoked.status(),
+        StatusCode::FORBIDDEN,
+        "重置必须使**全部**旧会话失效，不只是发起兑换的那一条"
+    );
 
     let old = client
         .post(format!("{base_url}/api/v1/admin/sessions"))
@@ -1138,6 +1191,134 @@ async fn a_customer_cannot_touch_another_customers_keys() {
         .await
         .expect("own account request");
     assert_eq!(still_usable.status(), StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 对客的四条账务读**按调用者自己的账户收窄**（V-C5 的账务那一半）。
+///
+/// 光断言"B 读到空"是不够的——空库也会给空。所以先给 A 造**真实**的余额与流水（由管理端充值），
+/// 再断言 B 读到的是空、而 A 读到的就是那些数。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn accounting_reads_are_scoped_to_the_caller() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let mut sessions = Vec::new();
+    for email in ["rich@example.com", "poor@example.com"] {
+        let registered = client
+            .post(format!("{base_url}/v1/customers"))
+            .json(&json!({"email": email, "password": "a-long-enough-password"}))
+            .send()
+            .await
+            .expect("register request")
+            .json::<Value>()
+            .await
+            .expect("register body");
+        sessions.push((
+            registered["token"].as_str().expect("token").to_owned(),
+            registered["account_id"]
+                .as_str()
+                .expect("account id")
+                .to_owned(),
+        ));
+    }
+
+    // 给 A 充 25 元：这样它的余额与流水都**非空**，B 读到空才有意义。
+    let credited = client
+        .post(format!(
+            "{base_url}/api/v1/accounts/{}/credits",
+            sessions[0].1
+        ))
+        .bearer_auth(&admin_token)
+        .json(&json!({"amount_microusd": 25_000_000, "business_key": "scoping-test"}))
+        .send()
+        .await
+        .expect("credit request");
+    assert!(
+        credited.status().is_success(),
+        "充值必须成功：{}",
+        credited.status()
+    );
+
+    // A 读到自己的钱。
+    let a_account = client
+        .get(format!("{base_url}/v1/customer/account"))
+        .bearer_auth(&sessions[0].0)
+        .send()
+        .await
+        .expect("account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(a_account["balance_microusd"], json!(25_000_000));
+    let a_ledger = client
+        .get(format!("{base_url}/v1/customer/ledger"))
+        .bearer_auth(&sessions[0].0)
+        .send()
+        .await
+        .expect("ledger request")
+        .json::<Value>()
+        .await
+        .expect("ledger body");
+    assert_eq!(
+        a_ledger["entries"].as_array().expect("entries").len(),
+        1,
+        "A 应当看到自己那一条充值：{a_ledger}"
+    );
+
+    // B 看同样的四条：余额与流水都**空**，而且看不到 A 的那一条。
+    let b_account = client
+        .get(format!("{base_url}/v1/customer/account"))
+        .bearer_auth(&sessions[1].0)
+        .send()
+        .await
+        .expect("account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(
+        b_account["balance_microusd"],
+        json!(0),
+        "B 不该看到 A 的余额：{b_account}"
+    );
+    let b_ledger = client
+        .get(format!("{base_url}/v1/customer/ledger"))
+        .bearer_auth(&sessions[1].0)
+        .send()
+        .await
+        .expect("ledger request")
+        .json::<Value>()
+        .await
+        .expect("ledger body");
+    assert_eq!(b_ledger["entries"], json!([]), "B 不该看到 A 的流水");
+    let b_usage = client
+        .get(format!("{base_url}/v1/customer/usage"))
+        .bearer_auth(&sessions[1].0)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    assert_eq!(b_usage["usage"], json!([]), "B 不该看到 A 的用量");
+    let b_billing = client
+        .get(format!("{base_url}/v1/customer/billing"))
+        .bearer_auth(&sessions[1].0)
+        .send()
+        .await
+        .expect("billing request")
+        .json::<Value>()
+        .await
+        .expect("billing body");
+    assert_eq!(
+        b_billing["charged_microusd"],
+        json!(0),
+        "B 的账单不该带上 A 的钱：{b_billing}"
+    );
 
     drop_isolated_database(&database_name).await;
 }

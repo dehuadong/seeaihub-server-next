@@ -48,13 +48,22 @@ test('登录后进后台，刷新之后仍是登录态', async ({ page }) => {
     await expect(page.getByRole('button', { name: label })).toBeVisible();
   }
   // 会话令牌在 sessionStorage 里（不是 cookie）：这是刷新后仍登录的原因。
-  expect(await page.evaluate(() => sessionStorage.getItem('seeai.console.session'))).toBeTruthy();
+  const stored = await page.evaluate(() => sessionStorage.getItem('seeai.console.session'));
+  expect(stored).toBeTruthy();
   expect(await page.evaluate(() => document.cookie)).not.toContain('seeai.console.session');
+
+  // **URL 里不出现会话凭据**（V-D3）：路由用的是 hash，别哪天顺手把令牌拼进去。
+  const url = page.url();
+  expect(url).not.toContain(stored as string);
+  expect(url).not.toContain('token');
+  expect(url).not.toContain('session=');
 
   await page.reload();
   for (const label of NAV_LABELS) {
     await expect(page.getByRole('button', { name: label })).toBeVisible();
   }
+  // 刷新之后 URL 仍然干净。
+  expect(page.url()).not.toContain(stored as string);
 });
 
 test('口令不对时留在登录页并说明原因', async ({ page }) => {
