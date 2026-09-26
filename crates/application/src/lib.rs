@@ -1507,6 +1507,31 @@ pub struct ProviderFailureView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 一条 API Key 的**只读视图**（对客自助列表用）。
+///
+/// **没有明文**：密钥在库里只有摘要，创建那一次之后就再也拿不回来，所以这里只有标签、创建时间与
+/// 吊销时间。`revoked_at` 有值表示这把已经停用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ApiKeyView {
+    pub key_id: Uuid,
+    pub label: String,
+    pub created_at: DateTime<Utc>,
+    pub revoked_at: Option<DateTime<Utc>>,
+}
+
+/// 管理端看到的**一条客户**：邮箱身份与它指向的账户。
+///
+/// 它回答的是"这个邮箱是哪个账户"——给客户充值、替客户签重置令牌都要先拿到 `account_id`。
+/// **不含口令哈希、会话与余额**：余额是账本的事实，按 `account_id` 走账户那条读。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct CustomerView {
+    pub customer_id: Uuid,
+    pub email: String,
+    pub account_id: AccountId,
+    pub created_at: DateTime<Utc>,
+    pub last_login_at: Option<DateTime<Utc>>,
+}
+
 /// 平台侧失败清单的筛选条件。
 #[derive(Debug, Clone)]
 pub struct ProviderFailureQuery {
@@ -2058,6 +2083,24 @@ pub trait HubRepository: Send + Sync {
         command: OpenLedgerCaseCommand,
     ) -> Result<bool, ApplicationError>;
 
+    /// 列一个账户下的密钥（对客自助；**不含明文**）。
+    async fn list_api_keys(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<ApiKeyView>, ApplicationError>;
+
+    /// 每个币种**当前生效**的那一行折算率：`(币种, 每单位折多少 CNY 微单位, 生效时刻)`。
+    async fn current_fx_rates(&self)
+    -> Result<Vec<(String, u64, DateTime<Utc>)>, ApplicationError>;
+
+    /// 吊销**属于这个账户**的一把密钥；返回 `false` 表示那个标识不在这个账户名下。
+    async fn revoke_api_key_of_account(
+        &self,
+        account_id: AccountId,
+        key_id: Uuid,
+        actor: &str,
+    ) -> Result<bool, ApplicationError>;
+
     /// 按邮箱找一个管理员账号：返回 `(id, 口令哈希)`；没有这个邮箱时 `None`。
     ///
     /// 邮箱判据**大小写不敏感**（库里存小写，见迁移 `0020`）：同一个邮箱不该因为大小写不同变成两个人。
@@ -2093,6 +2136,42 @@ pub trait HubRepository: Send + Sync {
 
     /// 删掉一条管理员会话（退出）。不存在的摘要也算成功：调用方在意的是"它现在不可用"。
     async fn delete_admin_session(&self, token_hash: &str) -> Result<(), ApplicationError>;
+
+    /// 改口令：写新的哈希。
+    async fn update_admin_password(
+        &self,
+        admin_id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), ApplicationError>;
+
+    /// 按 id 取管理员的口令哈希（改口令要先比对当前口令）。
+    async fn find_admin_password(&self, admin_id: Uuid)
+    -> Result<Option<String>, ApplicationError>;
+
+    /// 吊销一个管理员的**全部**会话（改口令、重置口令之后调用）。返回删掉几条。
+    ///
+    /// 语义是"旧凭据立刻不能再用"：改口令后别人的会话还在，等于改了也没改。
+    async fn delete_admin_sessions(&self, admin_id: Uuid) -> Result<u64, ApplicationError>;
+
+    /// 签发一枚口令重置令牌：先作废该身份此前**未兑换**的令牌，再落新的（同一事务）。
+    async fn create_password_reset(
+        &self,
+        subject_kind: &str,
+        subject_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError>;
+
+    /// 取一枚重置令牌：返回 `(subject_kind, subject_id, expires_at, redeemed_at)`；没有这条摘要时 `None`。
+    ///
+    /// 有效性与"用过没用过"由用例层判，这里只负责把事实取出来。
+    async fn find_password_reset(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>, ApplicationError>;
+
+    /// 把一枚重置令牌标记为已用（一次性）。影响 0 行说明它已被兑换过。
+    async fn redeem_password_reset(&self, token_hash: &str) -> Result<bool, ApplicationError>;
 
     /// 建一个对客账户与它的登录身份，**一次事务里一起写**：`(客户 id, 账户 id)`。
     ///
@@ -2134,6 +2213,49 @@ pub trait HubRepository: Send + Sync {
 
     /// 删掉一条对客会话（退出）。
     async fn delete_customer_session(&self, token_hash: &str) -> Result<(), ApplicationError>;
+
+    /// 客户改口令（需当前口令）：先按 id 取现有哈希来比对。
+    async fn find_customer_password(
+        &self,
+        customer_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError>;
+
+    /// 改口令：写新的哈希。
+    async fn update_customer_password(
+        &self,
+        customer_id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), ApplicationError>;
+
+    /// 吊销一个客户的全部会话（改口令、重置口令之后调用）。
+    async fn delete_customer_sessions(&self, customer_id: Uuid) -> Result<u64, ApplicationError>;
+
+    /// 更新客户口令：按**账户**定位（运营为已有账户配了身份之后，从账户那一侧改口令）。
+    async fn update_customer_password_by_account(
+        &self,
+        account_id: Uuid,
+        password_hash: &str,
+    ) -> Result<Option<Uuid>, ApplicationError>;
+
+    /// 运营替客户开户：给 `email` 配一个登录身份。
+    ///
+    /// `account_id` 为 `None` 时新建一个空账户；给了就把身份配到那个**已有账户**上（账户可以还没有身份）。
+    /// 邮箱已被占用、或该账户已被别的身份绑定时返回 [`ApplicationError::Conflict`]。
+    async fn open_customer_account(
+        &self,
+        email: &str,
+        password_hash: &str,
+        account_id: Option<Uuid>,
+    ) -> Result<(Uuid, Uuid), ApplicationError>;
+
+    /// 按邮箱找一个客户：`(customer_id, account_id, email, created_at, last_login_at)`；没有时 `None`。
+    async fn find_customer_view(
+        &self,
+        email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError>;
+
+    /// 列客户（按创建时间倒序，最近 `limit` 条）。
+    async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError>;
 }
 
 /// 平台侧失败清单不传类别时的默认集合：只列**平台侧事件**。
@@ -2279,6 +2401,16 @@ impl PricingService {
             )
             .await
     }
+
+    /// 每个币种**当前生效**的那一行折算率（折算率页显示录入结果用）。
+    ///
+    /// 与受理时同一条判据：取"此刻之前已生效、其中最新的一行"。页面因此看到的就是平台真正在用的
+    /// 那个数，而不是历史上录过的某一条。
+    pub async fn current_fx_rates(
+        &self,
+    ) -> Result<Vec<(String, u64, DateTime<Utc>)>, ApplicationError> {
+        self.repository.current_fx_rates().await
+    }
 }
 
 /// 认证成功后这个调用方是谁：**哪个账户**、以及**哪把密钥**。
@@ -2364,6 +2496,31 @@ impl IdentityService {
     /// 要等。
     pub async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
         self.repository.revoke_api_key(key_id, actor).await
+    }
+
+    /// 列一个账户下的密钥（对客自助）。
+    ///
+    /// **只回标签、创建时间与吊销状态**：明文在创建那一次之后就再也拿不回来了，这里没有可回的东西。
+    pub async fn list_api_keys(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<ApiKeyView>, ApplicationError> {
+        self.repository.list_api_keys(account_id).await
+    }
+
+    /// 吊销**属于这个账户**的一把密钥（对客自助）。返回 `false` 表示那个标识不在这个账户名下。
+    ///
+    /// 判据是"账户 + 密钥标识"一起收窄，而不是先查存在再判归属：后者会让"别人的密钥存在吗"
+    /// 从 403 与 404 的差异里读出来。
+    pub async fn revoke_api_key_of_account(
+        &self,
+        account_id: AccountId,
+        key_id: Uuid,
+        actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        self.repository
+            .revoke_api_key_of_account(account_id, key_id, actor)
+            .await
     }
 
     /// 引导管理员账号：按邮箱 upsert 口令。运维在部署时用它设初始邮箱与口令。
@@ -2521,6 +2678,215 @@ impl IdentityService {
         self.repository
             .delete_customer_session(&session_token_hash(token))
             .await
+    }
+
+    /// 管理员改自己的口令（需当前口令）。
+    ///
+    /// 改完**吊销该管理员的全部会话**（Spec A4）：新口令生效而旧凭据还能用，等于没改。
+    pub async fn change_admin_password(
+        &self,
+        admin_id: Uuid,
+        current: &str,
+        new: &str,
+    ) -> Result<(), ApplicationError> {
+        let stored = self
+            .repository
+            .find_admin_password(admin_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound("admin account".to_owned()))?;
+        if !verify_password(current, &stored) {
+            return Err(invalid_credentials());
+        }
+        check_secret(new, "new password")?;
+        let hash = hash_password(new)?;
+        self.repository
+            .update_admin_password(admin_id, &hash)
+            .await?;
+        self.repository.delete_admin_sessions(admin_id).await?;
+        Ok(())
+    }
+
+    /// 签发一枚管理员口令重置令牌（运维自救，或另一个管理员代办）。
+    ///
+    /// 返回 `(admin_id, 明文令牌, 过期时刻)`。明文只这一次；库里只有摘要。
+    pub async fn issue_admin_password_reset(
+        &self,
+        email: &str,
+        ttl: ChronoDuration,
+    ) -> Result<(Uuid, String, DateTime<Utc>), ApplicationError> {
+        let email = normalize_email(email)?;
+        let Some((admin_id, _)) = self.repository.find_admin_by_email(&email).await? else {
+            return Err(ApplicationError::NotFound("admin account".to_owned()));
+        };
+        let (token, expires_at) = self.issue_reset_token("admin", admin_id, ttl).await?;
+        Ok((admin_id, token, expires_at))
+    }
+
+    /// 凭重置令牌设置新口令（不需要旧口令、也不需要会话）。
+    ///
+    /// 令牌一次性、有独立过期；用过之后该身份全部会话失效。
+    pub async fn redeem_password_reset(
+        &self,
+        token: &str,
+        new_password: &str,
+    ) -> Result<(), ApplicationError> {
+        check_secret(new_password, "new password")?;
+        let (kind, subject_id) = self.consume_reset_token(token).await?;
+        let hash = hash_password(new_password)?;
+        match kind.as_str() {
+            "admin" => {
+                self.repository
+                    .update_admin_password(subject_id, &hash)
+                    .await?;
+                self.repository.delete_admin_sessions(subject_id).await?;
+            }
+            _ => {
+                self.repository
+                    .update_customer_password(subject_id, &hash)
+                    .await?;
+                self.repository.delete_customer_sessions(subject_id).await?;
+            }
+        }
+        Ok(())
+    }
+
+    /// 客户改自己的口令（需当前口令）。改完吊销该客户全部会话。
+    pub async fn change_customer_password(
+        &self,
+        customer_id: Uuid,
+        current: &str,
+        new: &str,
+    ) -> Result<(), ApplicationError> {
+        let stored = self
+            .repository
+            .find_customer_password(customer_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound("customer".to_owned()))?;
+        if !verify_password(current, &stored) {
+            return Err(invalid_credentials());
+        }
+        check_secret(new, "new password")?;
+        let hash = hash_password(new)?;
+        self.repository
+            .update_customer_password(customer_id, &hash)
+            .await?;
+        self.repository
+            .delete_customer_sessions(customer_id)
+            .await?;
+        Ok(())
+    }
+
+    /// 运营为某个客户账户签发重置令牌（Spec C12 的管理端一侧）。
+    pub async fn issue_customer_password_reset(
+        &self,
+        account_id: AccountId,
+        ttl: ChronoDuration,
+    ) -> Result<(Uuid, String, DateTime<Utc>), ApplicationError> {
+        let customer_id = self
+            .repository
+            .find_customer_account(account_id.0)
+            .await?
+            .ok_or_else(|| {
+                ApplicationError::NotFound(format!(
+                    "account {} has no email login identity",
+                    account_id.0
+                ))
+            })?;
+        let (token, expires_at) = self.issue_reset_token("customer", customer_id, ttl).await?;
+        Ok((customer_id, token, expires_at))
+    }
+
+    /// 运营替客户开户（Spec C13）：给邮箱配身份，账户可以是新的，也可以是已有的那个。
+    ///
+    /// `password` 为 `None` 时不设初始口令 —— 运营改用重置令牌让客户自己设（Spec C14）。
+    pub async fn open_customer_account(
+        &self,
+        email: &str,
+        password: Option<&str>,
+        account_id: Option<AccountId>,
+    ) -> Result<CustomerView, ApplicationError> {
+        let email = normalize_email(email)?;
+        let hash = match password {
+            Some(password) => {
+                check_secret(password, "initial password")?;
+                hash_password(password)?
+            }
+            // 没有初始口令时也要占住那一列：写一条**永远匹配不上**的口令，等重置令牌换掉它。
+            None => hash_password(&new_session_token())?,
+        };
+        let (customer_id, account_id) = self
+            .repository
+            .open_customer_account(&email, &hash, account_id.map(|id| id.0))
+            .await?;
+        self.customer_view(customer_id, account_id, &email).await
+    }
+
+    /// 按邮箱找客户账户（Spec M5）：运营为已有账户配身份、给客户充值都要先拿到账户标识。
+    pub async fn find_customer(
+        &self,
+        email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        let email = normalize_email(email)?;
+        self.repository.find_customer_view(&email).await
+    }
+
+    /// 列客户。
+    pub async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
+        self.repository.list_customers(limit).await
+    }
+
+    /// 签发一枚重置令牌：作废该身份此前未兑换的那些，再落新的。
+    async fn issue_reset_token(
+        &self,
+        subject_kind: &str,
+        subject_id: Uuid,
+        ttl: ChronoDuration,
+    ) -> Result<(String, DateTime<Utc>), ApplicationError> {
+        let token = new_session_token();
+        let expires_at = session_expiry(Utc::now(), ttl);
+        self.repository
+            .create_password_reset(
+                subject_kind,
+                subject_id,
+                &session_token_hash(&token),
+                expires_at,
+            )
+            .await?;
+        Ok((token, expires_at))
+    }
+
+    /// 兑换一枚重置令牌：判过期、判用过，然后标记为已用。返回 `(身份域, 被重置者 id)`。
+    async fn consume_reset_token(&self, token: &str) -> Result<(String, Uuid), ApplicationError> {
+        let hash = session_token_hash(token);
+        let Some((kind, subject_id, expires_at, redeemed_at)) =
+            self.repository.find_password_reset(&hash).await?
+        else {
+            return Err(invalid_credentials());
+        };
+        if redeemed_at.is_some() || expires_at <= Utc::now() {
+            return Err(invalid_credentials());
+        }
+        if !self.repository.redeem_password_reset(&hash).await? {
+            // 竞态：两个请求同时兑换，另一个先标记成功。一次性就是一次性。
+            return Err(invalid_credentials());
+        }
+        Ok((kind, subject_id))
+    }
+
+    /// 拼一条管理端视图（开户之后要把它回给运营）。
+    async fn customer_view(
+        &self,
+        customer_id: Uuid,
+        account_id: Uuid,
+        email: &str,
+    ) -> Result<CustomerView, ApplicationError> {
+        match self.repository.find_customer_view(email).await? {
+            Some(view) => Ok(view),
+            // 刚写完就该读到；读不到说明落库与读的口径不一致，如实报错而不是编一条。
+            None => Err(ApplicationError::Persistence(format!(
+                "customer {customer_id} for account {account_id} was written but cannot be read back"
+            ))),
+        }
     }
 
     /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里；读到了就为这把密钥占一个

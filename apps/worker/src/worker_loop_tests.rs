@@ -1,5 +1,6 @@
 use super::*;
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use seeai_adapter_sdk::{AdapterDescriptor, ImageAdapter};
 use seeai_application::*;
 use seeai_domain::*;
@@ -20,6 +21,202 @@ struct EmptyQueueRepository {
 
 #[async_trait]
 impl HubRepository for EmptyQueueRepository {
+    // 身份、会话与折算率那一组端口与"领任务 / 停机"这条用例无关，真被调到就是用例写错了。
+    async fn list_api_keys(
+        &self,
+        _account_id: AccountId,
+    ) -> Result<Vec<ApiKeyView>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn revoke_api_key_of_account(
+        &self,
+        _account_id: AccountId,
+        _key_id: Uuid,
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn current_fx_rates(
+        &self,
+    ) -> Result<Vec<(String, u64, DateTime<Utc>)>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_admin_by_email(
+        &self,
+        _email: &str,
+    ) -> Result<Option<(Uuid, String)>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn upsert_admin_password(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+    ) -> Result<Uuid, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn touch_admin_login(&self, _admin_id: Uuid) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn create_admin_session(
+        &self,
+        _admin_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_admin_session(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(Uuid, String, DateTime<Utc>)>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn delete_admin_session(&self, _token_hash: &str) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn update_admin_password(
+        &self,
+        _admin_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_admin_password(
+        &self,
+        _admin_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn delete_admin_sessions(&self, _admin_id: Uuid) -> Result<u64, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn create_password_reset(
+        &self,
+        _subject_kind: &str,
+        _subject_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_password_reset(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>, ApplicationError>
+    {
+        unimplemented!()
+    }
+
+    async fn redeem_password_reset(&self, _token_hash: &str) -> Result<bool, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn create_customer(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_customer_by_email(
+        &self,
+        _email: &str,
+    ) -> Result<Option<(Uuid, Uuid, String)>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_customer_account(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn touch_customer_login(&self, _customer_id: Uuid) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn create_customer_session(
+        &self,
+        _customer_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_customer_session(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(Uuid, Uuid, DateTime<Utc>)>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn delete_customer_session(&self, _token_hash: &str) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_customer_password(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn update_customer_password(
+        &self,
+        _customer_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn delete_customer_sessions(&self, _customer_id: Uuid) -> Result<u64, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn update_customer_password_by_account(
+        &self,
+        _account_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn open_customer_account(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+        _account_id: Option<Uuid>,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn find_customer_view(
+        &self,
+        _email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn list_customers(&self, _limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
+        unimplemented!()
+    }
+
     async fn claim_next_job(
         &self,
         _worker_id: &str,

@@ -27,9 +27,126 @@ fn unused_repository<T>() -> Result<T, ApplicationError> {
     ))
 }
 
+/// 与 [`unused_repository`] 同一个意图，但给 `Option` / `Vec` 这类**推不出类型参数**的返回用：
+/// 显式标注 `None` / 空集合，真被调到就是用例写错了。
+fn unused_option<T>() -> Result<Option<T>, ApplicationError> {
+    unused_repository()
+}
+
 #[async_trait]
 impl HubRepository for WorkerRepository {
-    // 身份与会话那一组端口与 worker 的结算用例无关：它们只走领取、执行与落账。真被调到就是用例写错了。
+    // 身份与会话那一组端口与 worker 的结算用例无关：它们只走领取、执行与落账。真被调到就是用例写错了，
+    // 因此统一走 `unused_repository()`，不返回一个看起来合理的假值。
+    async fn list_api_keys(
+        &self,
+        _account_id: AccountId,
+    ) -> Result<Vec<ApiKeyView>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn revoke_api_key_of_account(
+        &self,
+        _account_id: AccountId,
+        _key_id: Uuid,
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn current_fx_rates(
+        &self,
+    ) -> Result<Vec<(String, u64, DateTime<Utc>)>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn update_admin_password(
+        &self,
+        _admin_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_admin_password(
+        &self,
+        _admin_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn delete_admin_sessions(&self, _admin_id: Uuid) -> Result<u64, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn create_password_reset(
+        &self,
+        _subject_kind: &str,
+        _subject_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_password_reset(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>, ApplicationError>
+    {
+        unused_option()
+    }
+
+    async fn redeem_password_reset(&self, _token_hash: &str) -> Result<bool, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_password(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn update_customer_password(
+        &self,
+        _customer_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn delete_customer_sessions(&self, _customer_id: Uuid) -> Result<u64, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn update_customer_password_by_account(
+        &self,
+        _account_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn open_customer_account(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+        _account_id: Option<Uuid>,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_view(
+        &self,
+        _email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn list_customers(&self, _limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn find_admin_by_email(
         &self,
         _email: &str,

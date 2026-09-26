@@ -1,4 +1,4 @@
-use anyhow::{Context, Result};
+use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
@@ -7,19 +7,19 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use chrono::{DateTime, Utc};
+use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
-    CreateImageGenerationRequest, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
-    GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
-    LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
-    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
-    RoutePolicyService, RuntimeService,
+    CreateImageGenerationRequest, CustomerView, GatewayModelView, GeneratedImage,
+    GenerationDailySpendLimit, GenerationRateLimit, GenerationService, HubRepository,
+    IdentityService, JobView, LedgerAuditPolicy, LedgerAuditor, LedgerEntryView,
+    MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter,
+    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand,
+    RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService, RuntimeService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -52,6 +52,53 @@ struct AppState {
     sync_wait: Duration,
     /// 健康探测的依赖判据：探一次事实源是否可达（只 `SELECT 1`）。
     repository: Arc<dyn HubRepository>,
+    /// 会话有效期（管理员与客户同一档）：部署期配置，缺省 12 小时。
+    session_ttl: ChronoDuration,
+    /// 口令重置令牌的有效期：比会话更短，缺省 30 分钟。
+    password_reset_ttl: ChronoDuration,
+}
+
+impl AppState {
+    /// 把 bearer 凭据认成一个管理员。
+    ///
+    /// 两条路：**共享令牌**（自动化、端到端测试与运维自救）与**会话令牌**（人在浏览器里登录）。
+    /// 两条都不命中时的答复与"共享令牌写错了"**完全一样**（同一个状态码与错误码）：调用方分不出
+    /// 自己拿的是哪种凭据，也分不出凭据是不存在还是过期。
+    async fn require_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+        let token = bearer_token(headers)?;
+        if constant_time_eq(token.as_bytes(), self.admin_token.as_bytes()) {
+            return Ok(());
+        }
+        match self.identity.authenticate_admin_session(token).await {
+            Ok(Some(_)) => Ok(()),
+            Ok(None) => Err(admin_forbidden()),
+            // 会话那一侧出错（库不可用等）是平台故障，不能伪装成"凭据不对"。
+            Err(error) => Err(ApiError::from(error)),
+        }
+    }
+
+    /// 只认**会话令牌**：用于"关于我自己"的三条端点（认身份、改口令、退出）。
+    ///
+    /// 共享令牌不指向任何一个管理员，用它回答"我是谁"只能编一个身份出来——所以这里不接受它，
+    /// 答复仍是同一个"未授权"。返回会话对应的 `(admin_id, 邮箱)`。
+    async fn require_admin_self(&self, headers: &HeaderMap) -> Result<(Uuid, String), ApiError> {
+        let token = bearer_token(headers)?;
+        match self.identity.authenticate_admin_session(token).await {
+            Ok(Some(identity)) => Ok(identity),
+            Ok(None) => Err(admin_forbidden()),
+            Err(error) => Err(ApiError::from(error)),
+        }
+    }
+
+    /// 把 bearer 凭据认成一个客户，返回 `(customer_id, account_id)`。
+    async fn require_customer(&self, headers: &HeaderMap) -> Result<(Uuid, Uuid), ApiError> {
+        let token = bearer_token(headers)?;
+        match self.identity.authenticate_customer_session(token).await {
+            Ok(Some(identity)) => Ok(identity),
+            Ok(None) => Err(unauthorized()),
+            Err(error) => Err(ApiError::from(error)),
+        }
+    }
 }
 
 #[tokio::main]
@@ -167,11 +214,54 @@ async fn main() -> Result<()> {
         // 成本护栏：发布期与受理期判的是同一个数（见 `RequestCostCeiling`）。
         .with_cost_ceiling(cost_ceiling()?)
         .with_acceleration(acceleration),
+        // 会话与重置令牌的有效期：部署期取值（缺省 12 小时 / 30 分钟）。
+        session_ttl: session_ttl()?,
+        password_reset_ttl: password_reset_ttl()?,
     };
+    // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
+    seed_admin_account(&state).await?;
     let app = Router::new()
         .route("/health", get(health))
         .route("/api/v1/accounts", post(create_account))
         .route("/api/v1/accounts/{account_id}", get(read_account_balance))
+        .route(
+            "/api/v1/accounts/{account_id}/password-reset",
+            post(issue_customer_password_reset),
+        )
+        .route("/api/v1/customers", get(list_customers).post(open_customer))
+        .route(
+            "/api/v1/admin/sessions",
+            post(login_admin).delete(logout_admin),
+        )
+        .route("/api/v1/admin/session", get(read_admin_session))
+        .route("/api/v1/admin/password", put(change_admin_password))
+        .route(
+            "/api/v1/admin/password-resets",
+            post(issue_admin_password_reset),
+        )
+        .route(
+            "/api/v1/admin/password-resets/redeem",
+            post(redeem_admin_password_reset),
+        )
+        .route("/api/v1/fx-rates", put(upsert_fx_rate).get(list_fx_rates))
+        .route("/v1/customers", post(register_customer))
+        .route(
+            "/v1/customer/sessions",
+            post(login_customer).delete(logout_customer),
+        )
+        .route("/v1/customer/password", put(change_customer_password))
+        .route(
+            "/v1/customer/password-resets/redeem",
+            post(redeem_customer_password_reset),
+        )
+        .route(
+            "/v1/customer/api-keys",
+            get(list_customer_api_keys).post(issue_customer_api_key),
+        )
+        .route(
+            "/v1/customer/api-keys/{key_id}",
+            delete(revoke_customer_api_key),
+        )
         .route(
             "/api/v1/accounts/{account_id}/entries",
             get(list_account_entries),
@@ -210,7 +300,6 @@ async fn main() -> Result<()> {
             post(refund_reconciliation),
         )
         .route("/api/v1/provider-failures", get(list_provider_failures))
-        .route("/api/v1/fx-rates", put(upsert_fx_rate))
         .route("/api/v1/provider-cost-gaps", get(list_provider_cost_gaps))
         .route("/v1/images/generations", post(generate_image))
         .route("/v1/images/edits", post(edit_image))
@@ -291,7 +380,7 @@ async fn create_account(
     headers: HeaderMap,
     Json(body): Json<CreateAccountBody>,
 ) -> Result<Json<CreateAccountResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let account_id = AccountId::new();
     state
         .accounts
@@ -312,7 +401,7 @@ async fn credit_account(
     headers: HeaderMap,
     Json(body): Json<CreditAccountBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .accounts
         .credit_account(
@@ -340,7 +429,7 @@ async fn read_account_balance(
     Path(account_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<Json<AccountBalanceResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let change = state.accounts.read_balance(AccountId(account_id)).await?;
     Ok(Json(AccountBalanceResponse {
         balance_microusd: change.balance_microusd,
@@ -381,7 +470,7 @@ async fn list_account_entries(
     headers: HeaderMap,
     Query(query): Query<AccountEntriesQuery>,
 ) -> Result<Json<AccountEntriesResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_ENTRIES_LIMIT)
@@ -459,7 +548,7 @@ async fn list_route_policies(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let policies = state.route_policies.list().await?;
     let views: Vec<Value> = policies.iter().map(route_policy_view).collect();
     Ok(Json(json!({"route_policies": views})))
@@ -474,7 +563,7 @@ async fn upsert_route_policy(
     headers: HeaderMap,
     Json(body): Json<UpsertRoutePolicyBody>,
 ) -> Result<Json<Value>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let strategy = RouteStrategy::parse(&body.strategy).ok_or_else(|| {
         ApplicationError::InvalidParameter(format!(
             "unknown route strategy {}; supported: priority_failover, weighted_random, least_cost, user_tag",
@@ -510,7 +599,7 @@ async fn set_account_tag(
     headers: HeaderMap,
     Json(body): Json<SetAccountTagBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .accounts
         .set_tag(AccountId(account_id), body.tag.as_deref(), "admin-api")
@@ -539,7 +628,7 @@ async fn issue_api_key(
     headers: HeaderMap,
     Json(body): Json<IssueApiKeyBody>,
 ) -> Result<Json<IssueApiKeyResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let (key_id, api_key) = state
         .identity
         .issue_api_key(AccountId(account_id), &body.label, "admin-api")
@@ -558,8 +647,437 @@ async fn revoke_api_key(
     Path(key_id): Path<Uuid>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state.identity.revoke_api_key(key_id, "admin-api").await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- 身份：登录、会话、口令 ----
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct LoginBody {
+    email: String,
+    password: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminLoginResponse {
+    token: String,
+    expires_at: DateTime<Utc>,
+    email: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminIdentityResponse {
+    admin_id: Uuid,
+    email: String,
+}
+
+/// 管理员登录（`POST /api/v1/admin/sessions`，无需凭据）。
+///
+/// 失败只有一种答复（`email or password is incorrect`）：邮箱不存在与口令不对不区分，两条路也都
+/// 走一遍口令校验，因此"这个邮箱是不是管理员"既不能从文案也不能从耗时上看出来。
+async fn login_admin(
+    State(state): State<AppState>,
+    Json(body): Json<LoginBody>,
+) -> Result<Json<AdminLoginResponse>, ApiError> {
+    let login = state
+        .identity
+        .login_admin(&body.email, &body.password, state.session_ttl)
+        .await?;
+    Ok(Json(AdminLoginResponse {
+        token: login.token,
+        expires_at: login.expires_at,
+        email: login.email,
+    }))
+}
+
+/// 认身份（`GET /api/v1/admin/session`，**仅会话**）：浏览器用它确认自己还是登录态。
+async fn read_admin_session(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<AdminIdentityResponse>, ApiError> {
+    let (admin_id, email) = state.require_admin_self(&headers).await?;
+    Ok(Json(AdminIdentityResponse { admin_id, email }))
+}
+
+/// 退出（`DELETE /api/v1/admin/sessions`，**仅会话**）：删掉这条会话，幂等。
+async fn logout_admin(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let token = bearer_token(&headers)?;
+    state.identity.logout_admin(token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct ChangePasswordBody {
+    current_password: String,
+    new_password: String,
+}
+
+/// 改自己的口令（`PUT /api/v1/admin/password`，**仅会话**）。
+///
+/// 成功后**该管理员的全部会话都失效**（含发起这次修改的这一条）：新口令生效而旧凭据还能用，
+/// 等于没改。所以客户端拿到 204 之后应当回到登录页。
+async fn change_admin_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChangePasswordBody>,
+) -> Result<StatusCode, ApiError> {
+    let (admin_id, _) = state.require_admin_self(&headers).await?;
+    state
+        .identity
+        .change_admin_password(admin_id, &body.current_password, &body.new_password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct IssuePasswordResetBody {
+    email: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PasswordResetResponse {
+    reset_token: String,
+    expires_at: DateTime<Utc>,
+}
+
+/// 签发一枚管理员口令重置令牌（`POST /api/v1/admin/password-resets`）。
+///
+/// 认管理与会话两种凭据：它指的是**别人**（路径/体里那个邮箱），不涉及"我是谁"；这条路径也是
+/// "所有管理员都进不去"时运维用共享令牌自救的入口。明文只这一次。
+async fn issue_admin_password_reset(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<IssuePasswordResetBody>,
+) -> Result<(StatusCode, Json<PasswordResetResponse>), ApiError> {
+    state.require_admin(&headers).await?;
+    let (_, token, expires_at) = state
+        .identity
+        .issue_admin_password_reset(&body.email, state.password_reset_ttl)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PasswordResetResponse {
+            reset_token: token,
+            expires_at,
+        }),
+    ))
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct RedeemPasswordResetBody {
+    reset_token: String,
+    new_password: String,
+}
+
+/// 凭重置令牌设置新口令（`POST /api/v1/admin/password-resets/redeem`，**无需凭据**）。
+///
+/// 口令重置的全部意义就是"进不去了"，所以兑换**只认令牌本身**：令牌是与会话同强度的凭据、
+/// 只存摘要、只活一次。兑换成功不发会话，调用方用新口令正常登录。
+async fn redeem_admin_password_reset(
+    State(state): State<AppState>,
+    Json(body): Json<RedeemPasswordResetBody>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .identity
+        .redeem_password_reset(&body.reset_token, &body.new_password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct OpenCustomerBody {
+    email: String,
+    /// 缺省时不设初始口令：运营改用重置令牌让客户自己设。
+    password: Option<String>,
+    /// 缺省时新建账户；给了就把登录身份配到这个**已有账户**上。
+    account_id: Option<Uuid>,
+}
+
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomersQuery {
+    email: Option<String>,
+    limit: Option<u32>,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomersResponse {
+    customers: Vec<CustomerView>,
+}
+
+/// 替客户开户（`POST /api/v1/customers`）：给一个邮箱配登录身份。
+///
+/// 账户可以是新建的，也可以是**今天已经存在的**（管理员建的账户此前只有账户没有身份）——
+/// 配身份不动账本、不动密钥、也不做账户间转账。
+async fn open_customer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<OpenCustomerBody>,
+) -> Result<(StatusCode, Json<CustomerView>), ApiError> {
+    state.require_admin(&headers).await?;
+    let view = state
+        .identity
+        .open_customer_account(
+            &body.email,
+            body.password.as_deref(),
+            body.account_id.map(AccountId),
+        )
+        .await?;
+    Ok((StatusCode::CREATED, Json(view)))
+}
+
+/// 找客户账户（`GET /api/v1/customers`）：给客户充值、替客户签重置令牌都要先拿到账户标识。
+async fn list_customers(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Query(query): Query<CustomersQuery>,
+) -> Result<Json<CustomersResponse>, ApiError> {
+    state.require_admin(&headers).await?;
+    let customers = match query.email.as_deref().map(str::trim) {
+        Some(email) if !email.is_empty() => state
+            .identity
+            .find_customer(email)
+            .await?
+            .into_iter()
+            .collect(),
+        _ => {
+            let limit = query
+                .limit
+                .unwrap_or(DEFAULT_CUSTOMERS_LIMIT)
+                .clamp(1, MAX_OPERATIONAL_LIMIT);
+            state.identity.list_customers(limit).await?
+        }
+    };
+    Ok(Json(CustomersResponse { customers }))
+}
+
+const DEFAULT_CUSTOMERS_LIMIT: u32 = 50;
+
+/// 为客户账户签发重置令牌（`POST /api/v1/accounts/{account_id}/password-reset`）。
+///
+/// 与管理员那条同一个理由：平台不发邮件，所以重置只能由**运营触发**再转交令牌；没有登录身份
+/// 的账户是 404（这条读只给已经配了身份的账户签）。
+async fn issue_customer_password_reset(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<(StatusCode, Json<PasswordResetResponse>), ApiError> {
+    state.require_admin(&headers).await?;
+    let (_, token, expires_at) = state
+        .identity
+        .issue_customer_password_reset(AccountId(account_id), state.password_reset_ttl)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(PasswordResetResponse {
+            reset_token: token,
+            expires_at,
+        }),
+    ))
+}
+
+#[derive(Debug, Serialize)]
+struct FxRatesResponse {
+    rates: Vec<FxRateView>,
+}
+
+#[derive(Debug, Serialize)]
+struct FxRateView {
+    currency: String,
+    rate_micros: u64,
+    effective_at: DateTime<Utc>,
+}
+
+/// 读当前生效的折算率（`GET /api/v1/fx-rates`）：折算率页要显示"当前录入结果"。
+///
+/// 每个币种只回**当前生效的那一行**（受理时取的就是它），按币种排序，免得页面自己去挑。
+async fn list_fx_rates(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<FxRatesResponse>, ApiError> {
+    state.require_admin(&headers).await?;
+    let rates = state
+        .pricing
+        .current_fx_rates()
+        .await?
+        .into_iter()
+        .map(|(currency, rate_micros, effective_at)| FxRateView {
+            currency,
+            rate_micros,
+            effective_at,
+        })
+        .collect();
+    Ok(Json(FxRatesResponse { rates }))
+}
+
+// ---- 对客身份与自助 ----
+
+#[derive(Debug, Serialize)]
+struct CustomerLoginResponse {
+    token: String,
+    expires_at: DateTime<Utc>,
+    email: String,
+    account_id: Uuid,
+}
+
+/// 对客注册（`POST /v1/customers`，无需凭据）：新建账户与身份，一步到位。
+async fn register_customer(
+    State(state): State<AppState>,
+    Json(body): Json<LoginBody>,
+) -> Result<(StatusCode, Json<CustomerLoginResponse>), ApiError> {
+    let login = state
+        .identity
+        .register_customer(&body.email, &body.password, state.session_ttl)
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(CustomerLoginResponse {
+            token: login.token,
+            expires_at: login.expires_at,
+            email: login.email,
+            account_id: login.account_id,
+        }),
+    ))
+}
+
+/// 对客登录（`POST /v1/customer/sessions`，无需凭据）。失败语义与管理员那条相同。
+async fn login_customer(
+    State(state): State<AppState>,
+    Json(body): Json<LoginBody>,
+) -> Result<Json<CustomerLoginResponse>, ApiError> {
+    let login = state
+        .identity
+        .login_customer(&body.email, &body.password, state.session_ttl)
+        .await?;
+    Ok(Json(CustomerLoginResponse {
+        token: login.token,
+        expires_at: login.expires_at,
+        email: login.email,
+        account_id: login.account_id,
+    }))
+}
+
+/// 对客退出（`DELETE /v1/customer/sessions`）。
+async fn logout_customer(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let token = bearer_token(&headers)?;
+    state.identity.logout_customer(token).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 客户改自己的口令（`PUT /v1/customer/password`）：成功后该客户全部会话失效。
+async fn change_customer_password(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<ChangePasswordBody>,
+) -> Result<StatusCode, ApiError> {
+    let (customer_id, _) = state.require_customer(&headers).await?;
+    state
+        .identity
+        .change_customer_password(customer_id, &body.current_password, &body.new_password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// 凭重置令牌设置新口令（`POST /v1/customer/password-resets/redeem`，无需凭据）。
+///
+/// 对客面**没有**"提交邮箱就拿到令牌"的入口：平台不发邮件、不做邮箱验证，那种入口等于
+/// "知道邮箱就能接管账户"。令牌只由运营在管理端签发后转交。
+async fn redeem_customer_password_reset(
+    State(state): State<AppState>,
+    Json(body): Json<RedeemPasswordResetBody>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .identity
+        .redeem_password_reset(&body.reset_token, &body.new_password)
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+#[derive(Debug, Serialize)]
+struct CustomerApiKeyView {
+    key_id: Uuid,
+    label: String,
+    created_at: DateTime<Utc>,
+    revoked_at: Option<DateTime<Utc>>,
+}
+
+#[derive(Debug, Serialize)]
+struct CustomerApiKeysResponse {
+    keys: Vec<CustomerApiKeyView>,
+}
+
+/// 列自己的密钥（`GET /v1/customer/api-keys`）：**绝不回显密钥本身**。
+///
+/// 明文只在创建那一次响应里出现；事后谁也拿不回来，所以列表只有标签、创建时间与吊销状态。
+async fn list_customer_api_keys(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+) -> Result<Json<CustomerApiKeysResponse>, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let keys = state
+        .identity
+        .list_api_keys(AccountId(account_id))
+        .await?
+        .into_iter()
+        .map(|key| CustomerApiKeyView {
+            key_id: key.key_id,
+            label: key.label,
+            created_at: key.created_at,
+            revoked_at: key.revoked_at,
+        })
+        .collect();
+    Ok(Json(CustomerApiKeysResponse { keys }))
+}
+
+/// 给自己发一把密钥（`POST /v1/customer/api-keys`）：明文只这一次。
+async fn issue_customer_api_key(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<IssueApiKeyBody>,
+) -> Result<(StatusCode, Json<IssueApiKeyResponse>), ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let (key_id, api_key) = state
+        .identity
+        .issue_api_key(AccountId(account_id), &body.label, "customer-self-service")
+        .await?;
+    Ok((
+        StatusCode::CREATED,
+        Json(IssueApiKeyResponse { api_key, key_id }),
+    ))
+}
+
+/// 吊销自己的一把密钥（`DELETE /v1/customer/api-keys/{key_id}`）。
+///
+/// **不属于自己的那把一律 404**：先按账户收窄再改，而不是先查存在再判归属——后者会让
+/// "别人的密钥存在吗"从 403/404 的差异里读出来。
+async fn revoke_customer_api_key(
+    State(state): State<AppState>,
+    Path(key_id): Path<Uuid>,
+    headers: HeaderMap,
+) -> Result<StatusCode, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    let revoked = state
+        .identity
+        .revoke_api_key_of_account(AccountId(account_id), key_id, "customer-self-service")
+        .await?;
+    if !revoked {
+        return Err(ApiError::from(ApplicationError::NotFound(
+            "api key".to_owned(),
+        )));
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -568,7 +1086,7 @@ async fn publish_runtime(
     headers: HeaderMap,
     Json(mut command): Json<PublishRuntimeCommand>,
 ) -> Result<Json<seeai_domain::PublishedRevision>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     command.actor = "admin-api".to_owned();
     Ok(Json(state.runtime.publish(command).await?))
 }
@@ -577,7 +1095,7 @@ async fn list_reconciliation_cases(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<Vec<seeai_application::ReconciliationCaseView>>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     Ok(Json(state.reconciliation.list_open().await?))
 }
 
@@ -610,7 +1128,7 @@ async fn list_provider_failures(
     headers: HeaderMap,
     Query(query): Query<ProviderFailuresQuery>,
 ) -> Result<Json<ProviderFailuresResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let kinds = match query.kind.as_deref().map(str::trim) {
         Some(raw) if !raw.is_empty() => raw
             .split(',')
@@ -685,7 +1203,7 @@ async fn refund_reconciliation(
     headers: HeaderMap,
     Json(body): Json<RefundReconciliationBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .reconciliation
         .refund(RefundReconciliationCommand {
@@ -722,7 +1240,7 @@ async fn upsert_fx_rate(
     headers: HeaderMap,
     Json(body): Json<UpsertFxRateBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .pricing
         .upsert_fx_rate(
@@ -763,7 +1281,7 @@ async fn list_provider_cost_gaps(
     headers: HeaderMap,
     Query(query): Query<ProviderCostGapsQuery>,
 ) -> Result<Json<ProviderCostGapsResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_FAILURE_LIMIT)
@@ -868,7 +1386,7 @@ async fn list_gateway_models(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<Json<GatewayModelsResponse>, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     Ok(Json(GatewayModelsResponse {
         gateway_models: state.runtime.gateway_models().await?,
     }))
@@ -894,7 +1412,7 @@ async fn set_gateway_model_enabled(
     headers: HeaderMap,
     Json(body): Json<SetGatewayModelEnabledBody>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .runtime
         .set_gateway_model_enabled(&gateway_model, body.enabled, "admin-api")
@@ -942,7 +1460,7 @@ async fn set_offering_enabled(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .runtime
         .set_offering_enabled(
@@ -962,7 +1480,7 @@ async fn set_channel_enabled(
     headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
-    require_admin(&state, &headers)?;
+    state.require_admin(&headers).await?;
     state
         .runtime
         .set_channel_enabled(ChannelId(channel_id), take_enabled_flag(body)?, "admin-api")
@@ -1271,18 +1789,38 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId
     }
 }
 
-fn require_admin(state: &AppState, headers: &HeaderMap) -> Result<(), ApiError> {
-    let token = bearer_token(headers)?;
-    if token.as_bytes() == state.admin_token.as_bytes() {
-        Ok(())
-    } else {
-        Err(ApiError {
-            status: StatusCode::FORBIDDEN,
-            code: "admin_forbidden",
-            message: "admin authorization failed".to_owned(),
-            retry_after: None,
-        })
+/// 管理端未授权：**共享令牌写错了、会话无效、会话过期都回这一个答复**。
+///
+/// 状态码与错误码沿用既有实现（引入会话不改变这条既有语义）；调用方因此分不出自己拿的是哪种凭据、
+/// 也分不出凭据是不存在还是过期。
+fn admin_forbidden() -> ApiError {
+    ApiError {
+        status: StatusCode::FORBIDDEN,
+        code: "admin_forbidden",
+        message: "admin authorization failed".to_owned(),
+        retry_after: None,
     }
+}
+
+/// 对客未认证：没凭据、会话过期、已退出都是它。
+fn unauthorized() -> ApiError {
+    ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "authorization_required",
+        message: "Bearer authorization is required".to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 常量时间比较：令牌判等不该因为"前几个字符对不对"而在耗时上泄漏信息。
+fn constant_time_eq(left: &[u8], right: &[u8]) -> bool {
+    if left.len() != right.len() {
+        return false;
+    }
+    left.iter()
+        .zip(right.iter())
+        .fold(0_u8, |diff, (a, b)| diff | (a ^ b))
+        == 0
 }
 
 fn bearer_token(headers: &HeaderMap) -> Result<&str, ApiError> {
@@ -1499,6 +2037,61 @@ fn generation_daily_spend_limit() -> Result<GenerationDailySpendLimit> {
 /// 同一个量**：那个是查不到供给封顶保底值时的兜底**保底额**。
 fn cost_ceiling() -> Result<RequestCostCeiling> {
     Ok(RequestCostCeiling::from_env()?)
+}
+
+/// 会话有效期：`SESSION_TTL_SECONDS`，缺省 12 小时。
+fn session_ttl() -> Result<ChronoDuration> {
+    duration_from_env("SESSION_TTL_SECONDS", 12 * 60 * 60)
+}
+
+/// 口令重置令牌的有效期：`PASSWORD_RESET_TTL_SECONDS`，缺省 30 分钟。
+///
+/// 比会话短得多：它能改口令，暴露窗口越小越好。
+fn password_reset_ttl() -> Result<ChronoDuration> {
+    duration_from_env("PASSWORD_RESET_TTL_SECONDS", 30 * 60)
+}
+
+/// 读一个"秒数"环境变量，缺省给 `default_seconds`；0 或不可解析都点名报错。
+fn duration_from_env(name: &str, default_seconds: i64) -> Result<ChronoDuration> {
+    let seconds = match env::var(name) {
+        Ok(raw) => raw
+            .trim()
+            .parse::<i64>()
+            .with_context(|| format!("{name} must be a whole number of seconds"))?,
+        Err(_) => default_seconds,
+    };
+    if seconds <= 0 {
+        bail!("{name} must be positive");
+    }
+    Ok(ChronoDuration::seconds(seconds))
+}
+
+/// 引导管理员账号（`ADMIN_EMAIL` + `ADMIN_PASSWORD`）。
+///
+/// 两个都没给 ⇒ **不建号**，只留一条 warn：后台登录不可用这件事要能被发现，但不该让 API 起不来
+/// （客户侧不受影响，客户自己注册）。只给一个 ⇒ 配置错误，启动失败并点名缺哪一个。账号已存在时
+/// 引导**不改口令**——否则运维改过的口令会在每次重启时被打回环境变量里的那个。
+async fn seed_admin_account(state: &AppState) -> Result<()> {
+    let email = env::var("ADMIN_EMAIL")
+        .ok()
+        .filter(|value| !value.trim().is_empty());
+    let password = env::var("ADMIN_PASSWORD")
+        .ok()
+        .filter(|value| !value.is_empty());
+    match (email, password) {
+        (Some(email), Some(password)) => {
+            state.identity.seed_admin(&email, &password).await?;
+        }
+        (None, None) => {
+            tracing::warn!(
+                "no ADMIN_EMAIL/ADMIN_PASSWORD: no admin account was created, the admin console \
+                 cannot be logged into until one exists"
+            );
+        }
+        (Some(_), None) => bail!("ADMIN_EMAIL is set but ADMIN_PASSWORD is missing"),
+        (None, Some(_)) => bail!("ADMIN_PASSWORD is set but ADMIN_EMAIL is missing"),
+    }
+    Ok(())
 }
 
 fn init_tracing() {

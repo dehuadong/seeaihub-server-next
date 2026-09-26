@@ -38,6 +38,8 @@ mod cases_cache;
 mod cases_cost_ceiling;
 #[path = "cases_cost_facts.rs"]
 mod cases_cost_facts;
+#[path = "cases_identity.rs"]
+mod cases_identity;
 #[path = "cases_lifecycle.rs"]
 mod cases_lifecycle;
 #[path = "cases_migrations.rs"]
@@ -704,6 +706,27 @@ async fn start_api(
     .await
 }
 
+/// 同 [`start_api`]，但这个进程**带一个引导出来的管理员账号**。
+///
+/// 登录那条链必须有账号才能跑：共享令牌验不了"邮箱 + 口令 → 会话"，所以这一组用例单独起一个
+/// 配了 `ADMIN_EMAIL`/`ADMIN_PASSWORD` 的进程。返回引导时用的邮箱与口令，供用例登录。
+async fn start_api_with_admin(
+    database_url: &str,
+    email: &str,
+    password: &str,
+) -> (String, String, ApiProcess) {
+    start_api_with(
+        database_url,
+        2,
+        64,
+        &ApiProcessSettings {
+            admin_credentials: Some((email.to_owned(), password.to_owned())),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await
+}
+
 /// 一次用例要给 API 进程配的**速率上限**（每把 API Key）。
 ///
 /// 默认那一套是每分钟 60 次，用例要观察"超限被拒"就得把它调到 1 次——按默认值跑，光是把上限
@@ -744,6 +767,12 @@ struct ApiProcessSettings {
     daily_spend_limit_microusd: Option<u64>,
     ledger_audit: Option<LedgerAudit>,
     cost_ceiling_microusd: Option<u64>,
+    /// 引导管理员账号用的邮箱与口令：给了就等价于运维在部署时配了 `ADMIN_EMAIL`/`ADMIN_PASSWORD`。
+    ///
+    /// 缺省**不配**——既有用例全都靠共享令牌，配了反而会多出一个账号；只有验登录那条链的用例才给。
+    admin_credentials: Option<(String, String)>,
+    /// 会话有效期（秒）：用例要验"过期凭据被拒"时把它压到等得起的量级。
+    session_ttl_seconds: Option<u64>,
 }
 
 /// 一次用例给 API 进程配的**账实核对**：周期，以及可选的一个告警接收器。
@@ -886,6 +915,14 @@ async fn start_api_with(
             if let Some(webhook) = &ledger_audit.webhook {
                 command.env("PROVIDER_ALERT_WEBHOOK", webhook);
             }
+        }
+        if let Some((email, password)) = &settings.admin_credentials {
+            command
+                .env("ADMIN_EMAIL", email)
+                .env("ADMIN_PASSWORD", password);
+        }
+        if let Some(seconds) = settings.session_ttl_seconds {
+            command.env("SESSION_TTL_SECONDS", seconds.to_string());
         }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。

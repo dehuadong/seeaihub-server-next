@@ -97,11 +97,7 @@ pub fn verify_password(password: &str, stored: &str) -> bool {
 /// 猜中一条相当于命中一条随机会话行。
 #[must_use]
 pub fn new_session_token() -> String {
-    format!(
-        "{}{}",
-        Uuid::new_v4().simple(),
-        Uuid::new_v4().simple()
-    )
+    format!("{}{}", Uuid::new_v4().simple(), Uuid::new_v4().simple())
 }
 
 /// 会话令牌在库里的样子：它的 SHA-256。明文只有调用方手里那一份。
@@ -135,3 +131,6 @@ pub struct CustomerLogin {
 pub fn session_expiry(now: DateTime<Utc>, ttl: ChronoDuration) -> DateTime<Utc> {
     now + ttl
 }
+
+#[cfg(test)]
+mod tests;

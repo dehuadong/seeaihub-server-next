@@ -1,12 +1,12 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
-    AcceptanceProbe, ApplicationError, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
-    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
-    PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
-    UnacceptedAttempt, declared_output_images,
+    AcceptanceProbe, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange, ClaimedJob,
+    CompleteJob, CustomerView, GatewayModelCandidateView, GatewayModelView, HoldDisposition,
+    HubRepository, JobView, LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand,
+    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
+    RoutingDecision, UnacceptedAttempt, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -1013,6 +1013,111 @@ impl HubRepository for PgHubRepository {
             })
         })
         .transpose()
+    }
+
+    async fn current_fx_rates(
+        &self,
+    ) -> Result<Vec<(String, u64, DateTime<Utc>)>, ApplicationError> {
+        // 每个币种取**当前生效**的那一行：与 `effective_fx_rate` 同一条取值规则（此刻之前已生效、
+        // 其中最新的一行），只是对全部币种各取一条。`DISTINCT ON` 让这件事一次查询做完，页面看到
+        // 的就是平台真正在用的数。
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT ON (currency) currency, rate_micros, effective_at
+            FROM pricing.fx_rates
+            WHERE effective_at <= now()
+            ORDER BY currency, effective_at DESC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok((
+                    row.try_get("currency").map_err(database_error)?,
+                    to_u64(row.try_get("rate_micros").map_err(database_error)?)?,
+                    row.try_get("effective_at").map_err(database_error)?,
+                ))
+            })
+            .collect()
+    }
+
+    async fn list_api_keys(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Vec<ApiKeyView>, ApplicationError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT id, label, created_at, revoked_at
+            FROM identity.api_keys
+            WHERE account_id = $1
+            ORDER BY created_at DESC
+            "#,
+        )
+        .bind(account_id.0)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.into_iter()
+            .map(|row| {
+                Ok(ApiKeyView {
+                    key_id: row.try_get("id").map_err(database_error)?,
+                    label: row.try_get("label").map_err(database_error)?,
+                    created_at: row.try_get("created_at").map_err(database_error)?,
+                    revoked_at: row.try_get("revoked_at").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn revoke_api_key_of_account(
+        &self,
+        account_id: AccountId,
+        key_id: Uuid,
+        actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        // 判据是"账户 + 密钥标识"一起收窄：不属于这个账户的那把改不到行，调用方据此回 404，
+        // 而不是先查存在再判归属（那样 403/404 的差异会泄露"别人的密钥存在吗"）。
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let revoked: Option<Uuid> = sqlx::query_scalar(
+            r#"
+            UPDATE identity.api_keys
+            SET revoked_at = now()
+            WHERE id = $1 AND account_id = $2 AND revoked_at IS NULL
+            RETURNING id
+            "#,
+        )
+        .bind(key_id)
+        .bind(account_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if revoked.is_none() {
+            // 还可能本来就是这个账户的、且**已经**吊销过：那是幂等成功，只写审计没必要，
+            // 直接告诉调用方"它现在不可用"。只有确实不属于这个账户才回 false。
+            let belongs: Option<Uuid> = sqlx::query_scalar(
+                "SELECT id FROM identity.api_keys WHERE id = $1 AND account_id = $2",
+            )
+            .bind(key_id)
+            .bind(account_id.0)
+            .fetch_optional(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(belongs.is_some());
+        }
+        insert_audit(
+            &mut transaction,
+            actor,
+            "api_key.revoke",
+            "account",
+            &account_id.to_string(),
+            &serde_json::json!({"key_id": key_id}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(true)
     }
 
     async fn provider_cost_gaps(
@@ -2918,13 +3023,12 @@ impl HubRepository for PgHubRepository {
         let account_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         // 撞邮箱是调用方能自己改的事：回 Conflict，让对客那一层说"这个邮箱已经注册过了"。
-        let existing: Option<Uuid> = sqlx::query_scalar(
-            "SELECT id FROM identity.customers WHERE lower(email) = lower($1)",
-        )
-        .bind(email)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?;
+        let existing: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM identity.customers WHERE lower(email) = lower($1)")
+                .bind(email)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?;
         if existing.is_some() {
             return Err(ApplicationError::Conflict(format!(
                 "email {email} is already registered"
@@ -3046,6 +3150,311 @@ impl HubRepository for PgHubRepository {
             .await
             .map_err(database_error)?;
         Ok(())
+    }
+
+    async fn update_admin_password(
+        &self,
+        admin_id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            "UPDATE identity.admin_users SET password_hash = $2, updated_at = now() WHERE id = $1",
+        )
+        .bind(admin_id)
+        .bind(password_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn find_admin_password(
+        &self,
+        admin_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT password_hash FROM identity.admin_users WHERE id = $1",
+        )
+        .bind(admin_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn delete_admin_sessions(&self, admin_id: Uuid) -> Result<u64, ApplicationError> {
+        // 改口令/重置口令之后要"旧凭据立刻不能再用"，所以按**身份**删，而不是删当前那一条。
+        let deleted = sqlx::query("DELETE FROM identity.admin_sessions WHERE admin_id = $1")
+            .bind(admin_id)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(deleted.rows_affected())
+    }
+
+    async fn create_password_reset(
+        &self,
+        subject_kind: &str,
+        subject_id: Uuid,
+        token_hash: &str,
+        expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        let id = Uuid::new_v4();
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 同一身份只留一条未兑换令牌（迁移 0020 的部分唯一索引）：签新的就作废旧的那些，
+        // 免得旧令牌在运营看不见的地方继续可用。
+        sqlx::query(
+            r#"
+            UPDATE identity.password_resets
+            SET redeemed_at = now()
+            WHERE subject_kind = $1 AND subject_id = $2 AND redeemed_at IS NULL
+            "#,
+        )
+        .bind(subject_kind)
+        .bind(subject_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        sqlx::query(
+            r#"
+            INSERT INTO identity.password_resets (id, subject_kind, subject_id, token_hash, expires_at)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(id)
+        .bind(subject_kind)
+        .bind(subject_id)
+        .bind(token_hash)
+        .bind(expires_at)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(id)
+    }
+
+    async fn find_password_reset(
+        &self,
+        token_hash: &str,
+    ) -> Result<Option<(String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>, ApplicationError>
+    {
+        sqlx::query_as::<_, (String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+            r#"
+            SELECT subject_kind, subject_id, expires_at, redeemed_at
+            FROM identity.password_resets
+            WHERE token_hash = $1
+            "#,
+        )
+        .bind(token_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn redeem_password_reset(&self, token_hash: &str) -> Result<bool, ApplicationError> {
+        // `redeemed_at IS NULL` 就在这一条语句里：并发的两次兑换只有一次能改到行，
+        // 另一次影响 0 行——"一次性"由数据库判定，不靠用例层的先读后写。
+        let updated = sqlx::query(
+            r#"
+            UPDATE identity.password_resets
+            SET redeemed_at = now()
+            WHERE token_hash = $1 AND redeemed_at IS NULL
+            "#,
+        )
+        .bind(token_hash)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn find_customer_password(
+        &self,
+        customer_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        sqlx::query_scalar::<_, String>(
+            "SELECT password_hash FROM identity.customers WHERE id = $1",
+        )
+        .bind(customer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn update_customer_password(
+        &self,
+        customer_id: Uuid,
+        password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query("UPDATE identity.customers SET password_hash = $2 WHERE id = $1")
+            .bind(customer_id)
+            .bind(password_hash)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn delete_customer_sessions(&self, customer_id: Uuid) -> Result<u64, ApplicationError> {
+        let deleted = sqlx::query("DELETE FROM identity.customer_sessions WHERE customer_id = $1")
+            .bind(customer_id)
+            .execute(&self.pool)
+            .await
+            .map_err(database_error)?;
+        Ok(deleted.rows_affected())
+    }
+
+    async fn update_customer_password_by_account(
+        &self,
+        account_id: Uuid,
+        password_hash: &str,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            UPDATE identity.customers SET password_hash = $2
+            WHERE account_id = $1
+            RETURNING id
+            "#,
+        )
+        .bind(account_id)
+        .bind(password_hash)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn open_customer_account(
+        &self,
+        email: &str,
+        password_hash: &str,
+        account_id: Option<Uuid>,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        let customer_id = Uuid::new_v4();
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 邮箱与账户各自唯一（迁移 0020 的两条唯一索引）：先查一次好给出说得清的冲突错误，
+        // 真正的兜底仍由那两条索引承担。
+        let taken: Option<Uuid> =
+            sqlx::query_scalar("SELECT id FROM identity.customers WHERE lower(email) = lower($1)")
+                .bind(email)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+        if taken.is_some() {
+            return Err(ApplicationError::Conflict(format!(
+                "email {email} already has a login identity"
+            )));
+        }
+        let account_id = match account_id {
+            Some(existing) => {
+                let bound: Option<Uuid> =
+                    sqlx::query_scalar("SELECT id FROM identity.customers WHERE account_id = $1")
+                        .bind(existing)
+                        .fetch_optional(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                if bound.is_some() {
+                    return Err(ApplicationError::Conflict(format!(
+                        "account {existing} already has a login identity"
+                    )));
+                }
+                // 账户行必须真的存在：配身份不创建账户，指一个不存在的账户是调用方搞错了。
+                let exists: Option<Uuid> =
+                    sqlx::query_scalar("SELECT id FROM ledger.accounts WHERE id = $1")
+                        .bind(existing)
+                        .fetch_optional(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                if exists.is_none() {
+                    return Err(ApplicationError::NotFound(format!("account {existing}")));
+                }
+                existing
+            }
+            None => {
+                let fresh = Uuid::new_v4();
+                sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 0)")
+                    .bind(fresh)
+                    .execute(&mut *transaction)
+                    .await
+                    .map_err(database_error)?;
+                fresh
+            }
+        };
+        sqlx::query(
+            r#"
+            INSERT INTO identity.customers (id, email, password_hash, account_id)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(customer_id)
+        .bind(email)
+        .bind(password_hash)
+        .bind(account_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            "admin-api",
+            "customer.open",
+            "account",
+            &account_id.to_string(),
+            &serde_json::json!({"email": email}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok((customer_id, account_id))
+    }
+
+    async fn find_customer_view(
+        &self,
+        email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        let row = sqlx::query_as::<_, (Uuid, String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+            r#"
+            SELECT id, email, account_id, created_at, last_login_at
+            FROM identity.customers
+            WHERE lower(email) = lower($1)
+            "#,
+        )
+        .bind(email)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(row.map(
+            |(customer_id, email, account_id, created_at, last_login_at)| CustomerView {
+                customer_id,
+                email,
+                account_id: AccountId(account_id),
+                created_at,
+                last_login_at,
+            },
+        ))
+    }
+
+    async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
+        let rows = sqlx::query_as::<_, (Uuid, String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+            r#"
+            SELECT id, email, account_id, created_at, last_login_at
+            FROM identity.customers
+            ORDER BY created_at DESC
+            LIMIT $1
+            "#,
+        )
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(rows
+            .into_iter()
+            .map(
+                |(customer_id, email, account_id, created_at, last_login_at)| CustomerView {
+                    customer_id,
+                    email,
+                    account_id: AccountId(account_id),
+                    created_at,
+                    last_login_at,
+                },
+            )
+            .collect())
     }
 }
 

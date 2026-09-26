@@ -6,10 +6,10 @@
 
 use super::*;
 use crate::{
-    AcceptanceProbe, AlertSink, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
-    GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate, ProviderCostGapView,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest, ReconciliationCaseView,
-    RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
+    AcceptanceProbe, AlertSink, ApiKeyView, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
+    CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate,
+    ProviderCostGapView, ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest,
+    ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -54,10 +54,124 @@ fn unused_repository<T>() -> Result<T, ApplicationError> {
     ))
 }
 
+/// 同 [`unused_repository`]，给 `Option` / `Vec` 这类推不出类型参数的返回用。
+fn unused_option<T>() -> Result<Option<T>, ApplicationError> {
+    unused_repository()
+}
+
 #[async_trait]
 impl HubRepository for AuditRepository {
-    // 身份与会话那一组端口与本用例无关：账实核对只读账本与余额。真被调到就是用例写错了，
-    // 因此统一走 `unused_repository()`，不返回一个看起来合理的假值。
+    // 身份与会话那一组端口与本用例无关：账实核对只读账本与余额。真被调到就是用例写错了。
+    async fn list_api_keys(
+        &self,
+        _account_id: AccountId,
+    ) -> Result<Vec<ApiKeyView>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn revoke_api_key_of_account(
+        &self,
+        _account_id: AccountId,
+        _key_id: Uuid,
+        _actor: &str,
+    ) -> Result<bool, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn current_fx_rates(
+        &self,
+    ) -> Result<Vec<(String, u64, DateTime<Utc>)>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn update_admin_password(
+        &self,
+        _admin_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_admin_password(
+        &self,
+        _admin_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn delete_admin_sessions(&self, _admin_id: Uuid) -> Result<u64, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn create_password_reset(
+        &self,
+        _subject_kind: &str,
+        _subject_id: Uuid,
+        _token_hash: &str,
+        _expires_at: DateTime<Utc>,
+    ) -> Result<Uuid, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_password_reset(
+        &self,
+        _token_hash: &str,
+    ) -> Result<Option<(String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>, ApplicationError>
+    {
+        unused_option()
+    }
+
+    async fn redeem_password_reset(&self, _token_hash: &str) -> Result<bool, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_password(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn update_customer_password(
+        &self,
+        _customer_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn delete_customer_sessions(&self, _customer_id: Uuid) -> Result<u64, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn update_customer_password_by_account(
+        &self,
+        _account_id: Uuid,
+        _password_hash: &str,
+    ) -> Result<Option<Uuid>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn open_customer_account(
+        &self,
+        _email: &str,
+        _password_hash: &str,
+        _account_id: Option<Uuid>,
+    ) -> Result<(Uuid, Uuid), ApplicationError> {
+        unused_repository()
+    }
+
+    async fn find_customer_view(
+        &self,
+        _email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        unused_option()
+    }
+
+    async fn list_customers(&self, _limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn find_admin_by_email(
         &self,
         _email: &str,
