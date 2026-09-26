@@ -20,7 +20,7 @@ use seeai_application::{
     PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
     ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
     RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService,
-    RuntimeService,
+    RuntimeService, with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -60,24 +60,26 @@ struct AppState {
 }
 
 impl AppState {
-    /// 把 bearer 凭据认成一个管理员。
+    /// 把 bearer 凭据认成一个管理员，返回**是哪个管理员**（共享令牌时为 `None`——它不指向具体的人）。
     ///
     /// 两条路：**共享令牌**（自动化、端到端测试与运维自救）与**会话令牌**（人在浏览器里登录）。
     /// 两条都不命中时的答复与"共享令牌写错了"**完全一样**（同一个状态码与错误码）：调用方分不出
     /// 自己拿的是哪种凭据，也分不出凭据是不存在还是过期。
-    async fn require_admin(&self, headers: &HeaderMap) -> Result<(), ApiError> {
+    async fn admin_identity(&self, headers: &HeaderMap) -> Result<Option<Uuid>, ApiError> {
         let token = bearer_token(headers)?;
         if constant_time_eq(token.as_bytes(), self.admin_token.as_bytes()) {
-            return Ok(());
+            return Ok(None);
         }
         match self.identity.authenticate_admin_session(token).await {
-            Ok(Some(_)) => Ok(()),
+            Ok(Some((admin_id, _))) => Ok(Some(admin_id)),
             Ok(None) => Err(admin_forbidden()),
             // 会话那一侧出错（库不可用等）是平台故障，不能伪装成"凭据不对"。
             Err(error) => Err(ApiError::from(error)),
         }
     }
 
+    /// 只认管理与会话两种凭据，并把身份放进这次请求的审计上下文。
+    ///
     /// 只认**会话令牌**：用于"关于我自己"的三条端点（认身份、改口令、退出）。
     ///
     /// 共享令牌不指向任何一个管理员，用它回答"我是谁"只能编一个身份出来——所以这里不接受它，
@@ -221,52 +223,12 @@ async fn main() -> Result<()> {
     };
     // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
     seed_admin_account(&state).await?;
-    let app = Router::new()
-        .route("/health", get(health))
+    // **管理面**挂一条认证中间件：一处认证、一处把"是哪个管理员"放进这次请求的审计上下文，因此所有
+    // 写操作的 `admin_id` 都能填对，而不必改十几个处理器的签名。它只作用于**已匹配**的路由，所以
+    // 未注册的 `/api/v1/…` 仍然走到 fallback（JSON 404），不会被这里拦成 403。
+    let admin = Router::new()
         .route("/api/v1/accounts", post(create_account))
         .route("/api/v1/accounts/{account_id}", get(read_account_balance))
-        .route(
-            "/api/v1/accounts/{account_id}/password-reset",
-            post(issue_customer_password_reset),
-        )
-        .route("/api/v1/customers", get(list_customers).post(open_customer))
-        .route(
-            "/api/v1/admin/sessions",
-            post(login_admin).delete(logout_admin),
-        )
-        .route("/api/v1/admin/session", get(read_admin_session))
-        .route("/api/v1/admin/password", put(change_admin_password))
-        .route(
-            "/api/v1/admin/password-resets",
-            post(issue_admin_password_reset),
-        )
-        .route(
-            "/api/v1/admin/password-resets/redeem",
-            post(redeem_admin_password_reset),
-        )
-        .route("/api/v1/fx-rates", put(upsert_fx_rate).get(list_fx_rates))
-        .route("/v1/customers", post(register_customer))
-        .route(
-            "/v1/customer/sessions",
-            post(login_customer).delete(logout_customer),
-        )
-        .route("/v1/customer/password", put(change_customer_password))
-        .route(
-            "/v1/customer/password-resets/redeem",
-            post(redeem_customer_password_reset),
-        )
-        .route(
-            "/v1/customer/api-keys",
-            get(list_customer_api_keys).post(issue_customer_api_key),
-        )
-        .route(
-            "/v1/customer/api-keys/{key_id}",
-            delete(revoke_customer_api_key),
-        )
-        .route("/v1/customer/account", get(read_customer_account))
-        .route("/v1/customer/ledger", get(read_customer_ledger))
-        .route("/v1/customer/usage", get(read_customer_usage))
-        .route("/v1/customer/billing", get(read_customer_billing))
         .route(
             "/api/v1/accounts/{account_id}/entries",
             get(list_account_entries),
@@ -280,7 +242,22 @@ async fn main() -> Result<()> {
             "/api/v1/accounts/{account_id}/api-keys",
             post(issue_api_key),
         )
-        .route("/api/v1/api-keys/{key_id}", delete(revoke_api_key))
+        .route(
+            "/api/v1/accounts/{account_id}/password-reset",
+            post(issue_customer_password_reset),
+        )
+        .route(
+            "/api/v1/api-keys/{key_id}",
+            delete(revoke_api_key),
+        )
+        .route("/api/v1/customers", get(list_customers).post(open_customer))
+        .route("/api/v1/admin/session", get(read_admin_session))
+        .route("/api/v1/admin/password", put(change_admin_password))
+        .route(
+            "/api/v1/admin/password-resets",
+            post(issue_admin_password_reset),
+        )
+        .route("/api/v1/fx-rates", put(upsert_fx_rate).get(list_fx_rates))
         .route("/api/v1/runtime-revisions", post(publish_runtime))
         .route("/api/v1/gateway-models", get(list_gateway_models))
         .route(
@@ -306,10 +283,49 @@ async fn main() -> Result<()> {
         )
         .route("/api/v1/provider-failures", get(list_provider_failures))
         .route("/api/v1/provider-cost-gaps", get(list_provider_cost_gaps))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_admin_middleware,
+        ));
+    // **公开与对客面**：不挂管理认证。登录、退出、凭令牌兑换各自认自己的凭据。
+    let public = Router::new()
+        .route("/health", get(health))
+        .route(
+            "/api/v1/admin/sessions",
+            post(login_admin).delete(logout_admin),
+        )
+        .route(
+            "/api/v1/admin/password-resets/redeem",
+            post(redeem_admin_password_reset),
+        )
+        .route("/v1/models", get(list_models))
+        .route("/v1/account", get(read_own_account))
         .route("/v1/images/generations", post(generate_image))
         .route("/v1/images/edits", post(edit_image))
-        .route("/v1/account", get(read_own_account))
-        .route("/v1/models", get(list_models))
+        .route("/v1/customers", post(register_customer))
+        .route(
+            "/v1/customer/sessions",
+            post(login_customer).delete(logout_customer),
+        )
+        .route("/v1/customer/password", put(change_customer_password))
+        .route(
+            "/v1/customer/password-resets/redeem",
+            post(redeem_customer_password_reset),
+        )
+        .route(
+            "/v1/customer/api-keys",
+            get(list_customer_api_keys).post(issue_customer_api_key),
+        )
+        .route(
+            "/v1/customer/api-keys/{key_id}",
+            delete(revoke_customer_api_key),
+        )
+        .route("/v1/customer/account", get(read_customer_account))
+        .route("/v1/customer/ledger", get(read_customer_ledger))
+        .route("/v1/customer/usage", get(read_customer_usage))
+        .route("/v1/customer/billing", get(read_customer_billing));
+    let app = admin
+        .merge(public)
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
         .layer(tower_http::request_id::SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
@@ -500,10 +516,8 @@ struct CreateAccountResponse {
 
 async fn create_account(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<CreateAccountBody>,
 ) -> Result<Json<CreateAccountResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let account_id = AccountId::new();
     state
         .accounts
@@ -521,10 +535,8 @@ struct CreditAccountBody {
 async fn credit_account(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<CreditAccountBody>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .accounts
         .credit_account(
@@ -550,9 +562,7 @@ struct AccountBalanceResponse {
 async fn read_account_balance(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<Json<AccountBalanceResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let change = state.accounts.read_balance(AccountId(account_id)).await?;
     Ok(Json(AccountBalanceResponse {
         balance_microusd: change.balance_microusd,
@@ -590,10 +600,8 @@ struct AccountEntriesResponse {
 async fn list_account_entries(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-    headers: HeaderMap,
     Query(query): Query<AccountEntriesQuery>,
 ) -> Result<Json<AccountEntriesResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_ENTRIES_LIMIT)
@@ -669,9 +677,7 @@ struct UpsertRoutePolicyBody {
 /// 管理员看策略清单：全局那条（若有）与各网关模型的覆盖。
 async fn list_route_policies(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<Value>, ApiError> {
-    state.require_admin(&headers).await?;
     let policies = state.route_policies.list().await?;
     let views: Vec<Value> = policies.iter().map(route_policy_view).collect();
     Ok(Json(json!({"route_policies": views})))
@@ -683,10 +689,8 @@ async fn list_route_policies(
 /// "配置生效了"，而选路正是靠它决定走哪家——所以这里直接拒绝，不悄悄落成默认。
 async fn upsert_route_policy(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<UpsertRoutePolicyBody>,
 ) -> Result<Json<Value>, ApiError> {
-    state.require_admin(&headers).await?;
     let strategy = RouteStrategy::parse(&body.strategy).ok_or_else(|| {
         ApplicationError::InvalidParameter(format!(
             "unknown route strategy {}; supported: priority_failover, weighted_random, least_cost, user_tag",
@@ -719,10 +723,8 @@ struct SetAccountTagBody {
 async fn set_account_tag(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<SetAccountTagBody>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .accounts
         .set_tag(AccountId(account_id), body.tag.as_deref(), "admin-api")
@@ -748,10 +750,8 @@ struct IssueApiKeyResponse {
 async fn issue_api_key(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<IssueApiKeyBody>,
 ) -> Result<Json<IssueApiKeyResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let (key_id, api_key) = state
         .identity
         .issue_api_key(AccountId(account_id), &body.label, "admin-api")
@@ -768,9 +768,7 @@ async fn issue_api_key(
 async fn revoke_api_key(
     State(state): State<AppState>,
     Path(key_id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state.identity.revoke_api_key(key_id, "admin-api").await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -881,10 +879,8 @@ struct PasswordResetResponse {
 /// "所有管理员都进不去"时运维用共享令牌自救的入口。明文只这一次。
 async fn issue_admin_password_reset(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<IssuePasswordResetBody>,
 ) -> Result<(StatusCode, Json<PasswordResetResponse>), ApiError> {
-    state.require_admin(&headers).await?;
     let (_, token, expires_at) = state
         .identity
         .issue_admin_password_reset(&body.email, state.password_reset_ttl)
@@ -948,10 +944,8 @@ struct CustomersResponse {
 /// 配身份不动账本、不动密钥、也不做账户间转账。
 async fn open_customer(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<OpenCustomerBody>,
 ) -> Result<(StatusCode, Json<CustomerView>), ApiError> {
-    state.require_admin(&headers).await?;
     let view = state
         .identity
         .open_customer_account(
@@ -966,10 +960,8 @@ async fn open_customer(
 /// 找客户账户（`GET /api/v1/customers`）：给客户充值、替客户签重置令牌都要先拿到账户标识。
 async fn list_customers(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<CustomersQuery>,
 ) -> Result<Json<CustomersResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let customers = match query.email.as_deref().map(str::trim) {
         Some(email) if !email.is_empty() => state
             .identity
@@ -997,9 +989,7 @@ const DEFAULT_CUSTOMERS_LIMIT: u32 = 50;
 async fn issue_customer_password_reset(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-    headers: HeaderMap,
 ) -> Result<(StatusCode, Json<PasswordResetResponse>), ApiError> {
-    state.require_admin(&headers).await?;
     let (_, token, expires_at) = state
         .identity
         .issue_customer_password_reset(AccountId(account_id), state.password_reset_ttl)
@@ -1030,9 +1020,7 @@ struct FxRateView {
 /// 每个币种只回**当前生效的那一行**（受理时取的就是它），按币种排序，免得页面自己去挑。
 async fn list_fx_rates(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<FxRatesResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let rates = state
         .pricing
         .current_fx_rates()
@@ -1343,19 +1331,15 @@ async fn revoke_customer_api_key(
 
 async fn publish_runtime(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(mut command): Json<PublishRuntimeCommand>,
 ) -> Result<Json<seeai_domain::PublishedRevision>, ApiError> {
-    state.require_admin(&headers).await?;
     command.actor = "admin-api".to_owned();
     Ok(Json(state.runtime.publish(command).await?))
 }
 
 async fn list_reconciliation_cases(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<Vec<seeai_application::ReconciliationCaseView>>, ApiError> {
-    state.require_admin(&headers).await?;
     Ok(Json(state.reconciliation.list_open().await?))
 }
 
@@ -1385,10 +1369,8 @@ struct ProviderFailuresResponse {
 /// 管理端的取值契约，改枚举名即改接口。不传 `kind` 时只列平台侧事件。
 async fn list_provider_failures(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<ProviderFailuresQuery>,
 ) -> Result<Json<ProviderFailuresResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let kinds = match query.kind.as_deref().map(str::trim) {
         Some(raw) if !raw.is_empty() => raw
             .split(',')
@@ -1460,10 +1442,8 @@ struct RefundReconciliationBody {
 async fn refund_reconciliation(
     State(state): State<AppState>,
     Path(job_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<RefundReconciliationBody>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .reconciliation
         .refund(RefundReconciliationCommand {
@@ -1497,10 +1477,8 @@ struct UpsertFxRateBody {
 /// ——受理时取不到汇率就等于算不出成本，而那时拒的是消费者的请求。
 async fn upsert_fx_rate(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Json(body): Json<UpsertFxRateBody>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .pricing
         .upsert_fx_rate(
@@ -1538,10 +1516,8 @@ struct ProviderCostGapsResponse {
 /// 完成，消费者的钱该扣的照扣；缺口是平台侧的账务缺口。
 async fn list_provider_cost_gaps(
     State(state): State<AppState>,
-    headers: HeaderMap,
     Query(query): Query<ProviderCostGapsQuery>,
 ) -> Result<Json<ProviderCostGapsResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     let limit = query
         .limit
         .unwrap_or(DEFAULT_FAILURE_LIMIT)
@@ -1644,9 +1620,7 @@ struct GatewayModelsResponse {
 /// 全部数据来自数据库（生效修订 + 运维开关），不读缓存、不需要直查库。
 async fn list_gateway_models(
     State(state): State<AppState>,
-    headers: HeaderMap,
 ) -> Result<Json<GatewayModelsResponse>, ApiError> {
-    state.require_admin(&headers).await?;
     Ok(Json(GatewayModelsResponse {
         gateway_models: state.runtime.gateway_models().await?,
     }))
@@ -1669,10 +1643,8 @@ struct SetGatewayModelEnabledBody {
 async fn set_gateway_model_enabled(
     State(state): State<AppState>,
     Path(gateway_model): Path<String>,
-    headers: HeaderMap,
     Json(body): Json<SetGatewayModelEnabledBody>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .runtime
         .set_gateway_model_enabled(&gateway_model, body.enabled, "admin-api")
@@ -1717,10 +1689,8 @@ fn take_enabled_flag(body: Value) -> Result<bool, ApiError> {
 async fn set_offering_enabled(
     State(state): State<AppState>,
     Path(offering_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .runtime
         .set_offering_enabled(
@@ -1737,10 +1707,8 @@ async fn set_offering_enabled(
 async fn set_channel_enabled(
     State(state): State<AppState>,
     Path(channel_id): Path<Uuid>,
-    headers: HeaderMap,
     Json(body): Json<Value>,
 ) -> Result<StatusCode, ApiError> {
-    state.require_admin(&headers).await?;
     state
         .runtime
         .set_channel_enabled(ChannelId(channel_id), take_enabled_flag(body)?, "admin-api")
@@ -2046,6 +2014,21 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId
             message: "API key is invalid or revoked".to_owned(),
             retry_after: None,
         }),
+    }
+}
+
+/// 管理员认证中间件：认凭据，并把"是哪个管理员"放进这次请求的审计上下文。
+///
+/// 一处认证、一处进入审计作用域，所以所有写操作的 `admin_id` 都能填对，而不必改十几个处理器的签名。
+/// 共享令牌不指向具体的人，作用域不进入、审计那一列留空——`actor` 仍然说明"经哪条路径做的"。
+async fn require_admin_middleware(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    match state.admin_identity(request.headers()).await? {
+        Some(admin_id) => Ok(with_admin_id(admin_id, next.run(request)).await),
+        None => Ok(next.run(request).await),
     }
 }
 

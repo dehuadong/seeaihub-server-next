@@ -134,3 +134,29 @@ pub fn session_expiry(now: DateTime<Utc>, ttl: ChronoDuration) -> DateTime<Utc> 
 
 #[cfg(test)]
 mod tests;
+
+// 当前请求的**管理员身份**。
+//
+// 会话认证认得"是哪个管理员"，而写操作的审计在仓储层落地——把身份顺着参数一层层传下去要改十几个
+// 调用点的签名，而它本来就是**请求级**的事实。所以放在任务局部里：认证时进入作用域，整个请求处理
+// 期间可读，请求结束自动消失。
+//
+// **共享令牌与机器自我操作不在作用域内**：那时候没有具体的人，那一列留空是对的——`actor` 仍然说明
+// "经哪条路径做的"。
+tokio::task_local! {
+    static ADMIN_ID: Uuid;
+}
+
+/// 在这个请求的处理期间记下"是哪个管理员"，作用域结束即消失。
+pub async fn with_admin_id<F, T>(admin_id: Uuid, future: F) -> T
+where
+    F: std::future::Future<Output = T>,
+{
+    ADMIN_ID.scope(admin_id, future).await
+}
+
+/// 读当前请求的管理员身份；不在作用域内（共享令牌、worker、机器操作）时返回 `None`。
+#[must_use]
+pub fn current_admin_id() -> Option<Uuid> {
+    ADMIN_ID.try_with(|id| *id).ok()
+}

@@ -40,9 +40,9 @@ pub use alerts::{
 
 mod auth;
 pub use auth::{
-    AdminLogin, CustomerLogin, MIN_SECRET_LENGTH, check_secret, hash_password, invalid_credentials,
-    new_session_token, normalize_email, session_expiry, session_token_hash, verify_dummy_password,
-    verify_password,
+    AdminLogin, CustomerLogin, MIN_SECRET_LENGTH, check_secret, current_admin_id, hash_password,
+    invalid_credentials, new_session_token, normalize_email, session_expiry, session_token_hash,
+    verify_dummy_password, verify_password, with_admin_id,
 };
 
 mod ledger_audit;

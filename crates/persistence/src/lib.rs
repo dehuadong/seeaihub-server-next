@@ -3747,11 +3747,14 @@ async fn insert_audit(
     subject_id: &str,
     payload: &Value,
 ) -> Result<(), ApplicationError> {
+    // `admin_id` 取自**当前请求的会话身份**（见 `seeai_application::with_admin_id`）：共享令牌与
+    // 机器自我操作没有具体的人，那一列留空——`actor` 仍然说明"经哪条路径做的"。
+    let admin_id = seeai_application::current_admin_id();
     sqlx::query(
         r#"
         INSERT INTO operations.audit_events
-            (id, actor, action, subject_type, subject_id, payload)
-        VALUES ($1,$2,$3,$4,$5,$6)
+            (id, actor, action, subject_type, subject_id, payload, admin_id)
+        VALUES ($1,$2,$3,$4,$5,$6,$7)
         "#,
     )
     .bind(Uuid::new_v4())
@@ -3760,6 +3763,7 @@ async fn insert_audit(
     .bind(subject_type)
     .bind(subject_id)
     .bind(payload)
+    .bind(admin_id)
     .execute(&mut **transaction)
     .await
     .map_err(database_error)?;
