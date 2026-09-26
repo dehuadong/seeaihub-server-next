@@ -1,11 +1,12 @@
 import { expect, test } from '@playwright/test';
+import { adminApiUrl, portalUrl, settings } from './settings';
 
 /// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、四块数据都渲染出来、
 /// 密钥明文只显示一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
 ///
 /// 这些行为的接口契约由 `apps/api/tests/http_contract/cases_identity.rs` 管；这里验的是"人在浏览器里
 /// 点下去会发生什么"。
-const PORTAL = 'http://app.localhost:8090/';
+const PORTAL = portalUrl;
 
 /// 每个用例一个客户：库是共享的，写死的邮箱会在第二次运行时撞上"已注册"。
 function uniqueEmail(): string {
@@ -102,8 +103,8 @@ test('凭运营签发的重置令牌设置新口令，之后能用新口令登�
   // 这里用 `127.0.0.1` 而不是 `admin.localhost`：**Node 的解析器不认 `.localhost`**（Chrome 认），
   // 而这条签发只认凭据、不认主机名，所以直连回环即可。
   const issued = await request.post(
-    `http://127.0.0.1:8090/api/v1/accounts/${accountId}/password-reset`,
-    { headers: { authorization: `Bearer ${process.env.SEEAI_E2E_ADMIN_TOKEN ?? 'e2e-shared-token'}` } },
+    `${adminApiUrl}/api/v1/accounts/${accountId}/password-reset`,
+    { headers: { authorization: `Bearer ${settings.adminToken}` } },
   );
   expect(issued.status()).toBe(201);
   const resetToken = (await issued.json()).reset_token as string;

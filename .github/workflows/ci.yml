@@ -32,3 +32,53 @@ jobs:
       - run: cargo test -p seeai-api --test http_contract -- --ignored
         env:
           HTTP_CONTRACT_DATABASE_URL: postgres://seeai:seeai@127.0.0.1:5432/seeai_contract
+
+  # 浏览器那一层：跑**构建产物**，验的是只有浏览器才观测得到的行为（路由守卫、会话存续、入口分发、
+  # 全栈串联）。用例与选择器规则见 `apps/web/e2e/` 与根 `AGENTS.md` 的「浏览器行为」一节。
+  web-e2e:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:17-alpine
+        env:
+          POSTGRES_USER: seeai
+          POSTGRES_PASSWORD: seeai
+          POSTGRES_DB: seeai_e2e
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd "pg_isready -U seeai -d seeai_e2e"
+          --health-interval 2s
+          --health-timeout 2s
+          --health-retries 30
+    steps:
+      - uses: actions/checkout@v7
+      # 要 Rust 工具链是因为 webServer 会 `cargo run -p seeai-api`：这一层验的是**真实后端**托管的
+      # **真实产物**，不是桩出来的响应。
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: apps/web/package-lock.json
+      - run: npm ci
+        working-directory: apps/web
+      # `--with-deps` 装 Linux 上跑 Chromium 需要的系统库；只要 headless shell（不装完整 Chromium）。
+      - run: npx playwright install --with-deps --only-shell chromium
+        working-directory: apps/web
+      # 库由 `e2e/ensure-database.mjs` 每次删掉重建，API 启动时自己跑迁移。
+      - run: npm run build
+        working-directory: apps/web
+      - run: npx playwright test
+        working-directory: apps/web
+        env:
+          CI: '1'
+          SEEAI_E2E_DATABASE: postgres://seeai:seeai@127.0.0.1:5432/seeai_e2e
+      - uses: actions/upload-artifact@v5
+        if: always()
+        with:
+          name: playwright-report
+          path: |
+            apps/web/playwright-report/
+            apps/web/test-results/
+          retention-days: 7

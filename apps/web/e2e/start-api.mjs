@@ -39,16 +39,20 @@ function findCargo() {
 }
 
 /// 绑定 `0.0.0.0` 而不是 `127.0.0.1`：`admin.localhost` 可能解析到 ::1，只听 IPv4 回环会连不上。
-const env = {
-  ...process.env,
-  DATABASE_URL:
-    process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_e2e',
+///
+/// 这里**先把继承来的 `DATABASE_URL` 删掉**：它是 API 真正读的那个变量，而调用方的 shell 里可能残留
+/// 指向别的库的值（本机实测踩到过——残留指向交付库，用例拿 e2e 的口令去登，必然失败）。子进程继承
+/// 环境是对的，但"这次该连哪个库"必须由这里决定，不能碰巧。
+const env = { ...process.env };
+delete env.DATABASE_URL;
+Object.assign(env, {
+  DATABASE_URL: process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_e2e',
   API_BIND: process.env.SEEAI_E2E_API_BIND ?? '0.0.0.0:8090',
   ADMIN_TOKEN: process.env.SEEAI_E2E_ADMIN_TOKEN ?? 'e2e-shared-token',
   ADMIN_EMAIL: process.env.SEEAI_E2E_ADMIN_EMAIL ?? 'ops@example.com',
   ADMIN_PASSWORD: process.env.SEEAI_E2E_ADMIN_PASSWORD ?? 'a-long-enough-password',
   RUST_LOG: process.env.RUST_LOG ?? 'warn',
-};
+});
 
 // 不走 `shell`：参数原样传给子进程（`shell: true` 会把参数拼成命令行，Windows 上有转义与弃用警告）。
 const child = spawn(findCargo(), ['run', '-p', 'seeai-api'], {

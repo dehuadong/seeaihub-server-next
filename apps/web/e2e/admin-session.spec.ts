@@ -1,14 +1,15 @@
 import { expect, test } from '@playwright/test';
+import { consoleUrl, portalUrl, settings } from './settings';
 
 /// 管理端会话：**只有浏览器才观测得到**的那一层——路由守卫在登录前不取数、登录后进后台、
 /// 刷新之后会话还在（会话存在 `sessionStorage` 而不是 cookie 里）。
 ///
 /// 接口契约、状态码与鉴权规则由 `apps/api/tests/http_contract` 的用例管，不在这里重验。
-const ADMIN_EMAIL = process.env.SEEAI_E2E_ADMIN_EMAIL ?? 'ops@example.com';
-const ADMIN_PASSWORD = process.env.SEEAI_E2E_ADMIN_PASSWORD ?? 'e2e-admin-password';
+const ADMIN_EMAIL = settings.adminEmail;
+const ADMIN_PASSWORD = settings.adminPassword;
 
-const CONSOLE = 'http://admin.localhost:8090/';
-const PORTAL = 'http://app.localhost:8090/';
+const CONSOLE = consoleUrl;
+const PORTAL = portalUrl;
 
 const NAV_LABELS = ['网关模型', '发布修订', '折算率', '路由策略', '账户与密钥', '对账与诊断'];
 
