@@ -4,7 +4,7 @@ status: implemented
 created: 2026-09-24
 updated: 2026-09-24
 approval: 用户 2026-09-24 裁定：请求的 `n` 在合同之内、超过该候选承载面声明的 `maximum` 时，按该上限发出去，不返回 503。
-verification: 模块单测四条（`crates/application/src/tests/request_preparation.rs` 两条：`the_requested_image_count_is_capped_at_the_carriers_declared_maximum`、`the_cap_follows_the_carriers_wire_name_for_the_image_count`；`crates/application/src/tests/routing.rs` 的 `a_count_above_the_carriers_maximum_does_not_disqualify_it`；`crates/application/src/declared_images/tests.rs` 的 `the_maximum_is_read_by_the_name_the_caller_asks_for`）+ 端到端一条（`apps/api/tests/http_contract/cases_parameters.rs` 的 `an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum`）；`cargo fmt --all`（crate 侧改动，收敛后 `--check` 通过）、`cargo clippy --workspace --all-targets --all-features -- -D warnings`（exit 0）、`cargo test -p seeai-application --all-features`（118 passed / 0 failed）、空库端到端本次改动用例与合同上界回归用例各 1 passed、`node scripts/decisions/check.mjs` 通过。
+verification: 本改动面的定向证据——模块单测四条（`crates/application/src/tests/request_preparation.rs` 的 `the_requested_image_count_is_capped_at_the_carriers_declared_maximum`、`the_cap_follows_the_carriers_wire_name_for_the_image_count`；`crates/application/src/tests/routing.rs` 的 `a_count_above_the_carriers_maximum_does_not_disqualify_it`；`crates/application/src/declared_images/tests.rs` 的 `the_maximum_is_read_by_the_name_the_caller_asks_for`）+ 对客端到端一条（`apps/api/tests/http_contract/cases_parameters.rs` 的 `an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum`）+ 同一路径的合同上界回归用例；`cargo fmt --all -- --check` 通过；`node scripts/decisions/check.mjs` 通过。Rust 全量门禁由 CI 承担。
 ---
 
 # Agent Note：输出张数按候选承载面的上界收敛
@@ -50,7 +50,7 @@ verification: 模块单测四条（`crates/application/src/tests/request_prepara
 | 合同之内、承载面之外的请求受理成功，上线文与 Job 冻结的都是上限 | `an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum`（`apps/api/tests/http_contract/cases_parameters.rs`，自带承载面与合同的夹具） |
 | 合同上界的行为不变：超过 10 张仍 400、恰好 10 张放行 | `a_requested_image_count_beyond_the_contracts_maximum_is_rejected_before_acceptance`（同目录 `cases_parameters.rs`，本件未改动它） |
 | 承载面没声明 `n` 时仍是"这条候选承载不了" | 同第一条用例的后半段 |
-| 门禁 | `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test -p seeai-application --all-features`（118 passed）、`node scripts/decisions/check.mjs` |
+| 本改动面的检查 | `cargo fmt --all -- --check` 通过；`node scripts/decisions/check.mjs` 通过。Rust 全量门禁（格式、Clippy、Workspace 测试与 ignored 合同测试）由 CI 承担 |
 
 ## 依据与关联
 
