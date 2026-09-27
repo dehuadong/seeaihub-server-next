@@ -67,6 +67,7 @@
 | 选厂商 → 勾供给 → 给价 → 发布成功 | `apps/web/e2e/platform-model-publish.spec.ts` |
 | 引用不存在的供给被拒并点名 / 引用已停用的被拒并点名 | 同文件的 `a_reference_to_an_offering_outside_the_supply_table_is_rejected_by_name`、`a_reference_to_a_disabled_offering_is_rejected_by_name` |
 | 多条供给各有各的对客费率，倍率是平台模型级一个 | `a_referenced_publication_freezes_the_offering_row_it_points_at` 与 e2e 里对发布结果的核对 |
+| 给了参考成本也能发出去，成本口径由渠道的计价形态推出来 | `a_referenced_publication_derives_the_cost_basis_from_the_channel_formula` |
 | 工程师改渠道地址后，**已发布修订**的受理取值逐位不变 | `a_published_revision_keeps_its_offering_definition_when_the_channel_changes`（先断言旧值不变，再断言重新发布取到新值） |
 | 停用平台模型后受理得到"模型不存在" | `cases_publication.rs` 的 `gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface`；被停用候选的选路见 `cases_cache.rs` 与 `cases_routing.rs` |
 
