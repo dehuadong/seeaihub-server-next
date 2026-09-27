@@ -82,14 +82,24 @@ pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
 /// 校验错误上（空数组另有一条），不是允许省略。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PublishRuntimeCommand {
-    pub vendor_id: String,
-    pub native_model_id: String,
+    /// 厂商标识。**引用式发布（`references`）里可以不给**：它由被引用的 Offering 所属的厂商模型决定，
+    /// 服务端从库里取。内联那条老路仍必填。
+    ///
+    /// 为什么是"可缺省、给了就校验一致"而不是随便给个默认值：厂商模型的身份本来就在素材里，让调用方
+    /// 再抄一遍，抄错了就会写进一次发布——而这是**运营不该提供的字段**。
+    #[serde(default)]
+    pub vendor_id: Option<String>,
+    /// 厂商原生名。与 `vendor_id` 同理，引用式发布里可以不给。
+    #[serde(default)]
+    pub native_model_id: Option<String>,
     /// **平台对客名**（网关模型名）：调用方提交 `model` 时用的那个名字，也是这次发布
     /// **原子替换**的对象。缺省时回退取 `native_model_id`——今天两者同值，老素材、老已发布
     /// 数据与老测试因此逐位不变。
     #[serde(default)]
     pub gateway_model: Option<String>,
-    pub native_revision: String,
+    /// 厂商的修订标识。与 `vendor_id` 同理，引用式发布里可以不给。
+    #[serde(default)]
+    pub native_revision: Option<String>,
     /// **Vendor Model Contract**：调用方合同的唯一一份，模型级。
     ///
     /// 顶层可以省略：省略时回退用候选自带的旧字段（承载面与合同还是同一份），
@@ -181,6 +191,12 @@ pub struct PublishRuntimeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferingDraft {
+    /// **引用式发布选中的那一行供给**（内联形状不给）。
+    ///
+    /// 引用式发布按它**直查**那行——不是按身份四元组反查：同一个厂商模型、同一条渠道下可能有多行供给，
+    /// 反查会挑错行或挑不到。`None` = 内联形状，按身份复用或新建。
+    #[serde(default)]
+    pub offering_id: Option<OfferingId>,
     /// 渠道身份的三个字段与驱动器：**可以整组省略**（见 `docs/design/0010` §4.1 的增量发布），
     /// 省略时由服务端从该型号当前生效的修订按 `provider_kind` + `provider_model_id` 复用。
     ///
@@ -318,6 +334,12 @@ impl PricePlanDraft {
 /// 归一后的单个供给：必填校验已完成，`routing_priority` 与 `weight` 已定好。
 #[derive(Debug, Clone)]
 pub struct NormalizedOffering {
+    /// **这次发布的候选指向哪一行现成的供给**（引用式发布才有）。
+    ///
+    /// 它是引用式发布的**身份**，与上面那组技术字段是两件事：技术字段是"这条供给长什么样"（发布时快照
+    /// 下来），而这个标识是"运营选的是哪一条"。按身份四元组去反查一条供给在这里是**不成立**的——同一个
+    /// 厂商模型下、同一条渠道上可能有多行供给，反查会挑错行或者挑不到。所以选中的那条由它自己带着。
+    pub offering_id: Option<OfferingId>,
     /// 这条供给**能承载**合同里的哪些字段。
     pub carrier_schema: Value,
     /// 这条供给自己的合同值 → 渠道包装声明。
@@ -380,16 +402,25 @@ impl PublishRuntimeCommand {
     ) -> PublishRuntimeRequest {
         // 平台对客名缺省回退取厂商原生名：今天两者同值，老素材不带这个字段也照常可发布。
         // 只写空白等于没写（名字是全空白的话，对客目录会列出一个调不动的名字）。
+        //
+        // 这三个身份字段在这里是 `Option`，而到这儿已经是"解析之后"：引用式发布的那条路会把它们从被
+        // 引用的 Offering 上填好再归一（见 `resolve_referenced_offerings`），内联那条路必须自己带。
+        // 所以到这里还是 `None` 只可能是内联形态漏了字段——那不是可以回退成空串的情况，回退会把
+        // "这次发布的是哪个厂商模型"变成一个查不出来的空身份，宁可在归一时就拒（见 `normalize_array`
+        // 之前的那条校验）。
+        let vendor_id = self.vendor_id.unwrap_or_default();
+        let native_model_id = self.native_model_id.unwrap_or_default();
+        let native_revision = self.native_revision.unwrap_or_default();
         let gateway_model = self
             .gateway_model
             .map(|name| name.trim().to_owned())
             .filter(|name| !name.is_empty())
-            .unwrap_or_else(|| self.native_model_id.clone());
+            .unwrap_or_else(|| native_model_id.clone());
         PublishRuntimeRequest {
-            vendor_id: self.vendor_id,
-            native_model_id: self.native_model_id,
+            vendor_id,
+            native_model_id,
             gateway_model,
-            native_revision: self.native_revision,
+            native_revision,
             actor: self.actor,
             capability_schema,
             markup_bps: self.markup_bps,
@@ -405,6 +436,22 @@ impl PublishRuntimeCommand {
     /// 这是发布接口唯一的入口校验点：`apps/api` 的 `Json<PublishRuntimeCommand>` 反序列化
     /// 之后，下游只处理 [`NormalizedPublication`]。
     pub fn normalize(&self) -> Result<NormalizedPublication, ApplicationError> {
+        // 厂商模型的身份要有一个来源：内联形态由调用方给，引用形态由被引用的 Offering 决定
+        // （`resolve_referenced_offerings` 已经把它们填进来了）。两条路都在这里会合，所以缺了就是
+        // 真的缺——**不拿空串往下走**：那会把"这次发布的是哪个厂商模型"变成查不出来的空身份，
+        // 而它决定合同、路由与 Job 固化。
+        for (field, value) in [
+            ("vendor_id", self.vendor_id.as_deref()),
+            ("native_model_id", self.native_model_id.as_deref()),
+            ("native_revision", self.native_revision.as_deref()),
+        ] {
+            if value.is_none_or(|text| text.trim().is_empty()) {
+                return Err(ApplicationError::Validation(format!(
+                    "{field} is required: give the vendor model identity, or publish by \
+                     referencing offerings whose vendor model is known"
+                )));
+            }
+        }
         let drafts = self.offerings.as_deref().ok_or_else(|| {
             ApplicationError::Validation(
                 "offerings is required: publish the model's complete, ordered offering list"
@@ -516,6 +563,9 @@ impl PublishRuntimeCommand {
                 let billing = normalize_billing(index, draft)?;
                 let pricing = normalize_candidate_pricing(index, draft)?;
                 Ok(NormalizedOffering {
+                    // 内联那条老路没有"选中的现成供给"这回事：它按身份去复用或新建一行（渠道字段在
+                    // 归一前已经补齐）。所以这里是 `None`，由零候选校验保持必填的语义不变。
+                    offering_id: draft.offering_id,
                     carrier_schema,
                     parameter_mapping: draft.parameter_mapping.clone(),
                     restrictions: draft.restrictions.clone(),
@@ -4288,33 +4338,30 @@ impl RuntimeService {
     /// 调用，但它们之间不会插进另一次发布——发布事务按网关模型取排他锁，同一型号的发布是串行的。
     pub async fn publish(
         &self,
-        command: PublishRuntimeCommand,
+        mut command: PublishRuntimeCommand,
     ) -> Result<PublishedRevision, ApplicationError> {
         // 引用式发布的技术定义由仓储从被引用的 Offering 行取；内联那条老路用请求里的值。
         let definitions_from_offerings = command.references.is_some();
-        for (name, value) in [
-            ("vendor_id", command.vendor_id.as_str()),
-            ("native_model_id", command.native_model_id.as_str()),
-            ("native_revision", command.native_revision.as_str()),
-            ("actor", command.actor.as_str()),
-        ] {
-            if value.trim().is_empty() {
-                return Err(ApplicationError::Validation(format!(
-                    "{name} must not be empty"
-                )));
-            }
+        if command.actor.trim().is_empty() {
+            return Err(ApplicationError::Validation(
+                "actor must not be empty".to_owned(),
+            ));
         }
+        // 身份三件（厂商、原生名、修订）的校验在 `normalize` 里：引用式发布的三件由被引用的 Offering
+        // 决定，**调用方给的那个 `command` 上本来就没有它们**，所以这里不能先查 `command`——那条路会被
+        // 自己拒掉。解析把它算出来，下面用**算出来的**那一个。
+        let (publication, native_model_id) = self.resolve_inheritance(&mut command).await?;
         let NormalizedPublication {
             contract,
             offerings,
-        } = self.resolve_inheritance(&command).await?;
-        validate_contract(&command.native_model_id, &contract)?;
+        } = publication;
+        validate_contract(&native_model_id, &contract)?;
         let mut normalized = Vec::with_capacity(offerings.len());
         for offering in offerings {
             normalized.push(self.validate_offering(&contract, offering)?);
         }
         validate_supply_identities(&normalized)?;
-        self.validate_cost_ceiling(&command.native_model_id, &contract, &normalized)
+        self.validate_cost_ceiling(&native_model_id, &contract, &normalized)
             .await?;
         let request = command.into_request(contract, normalized, definitions_from_offerings);
         validate_gateway_model_identity(&request)?;
@@ -4341,9 +4388,9 @@ impl RuntimeService {
     /// 引用必须落在同一个厂商模型上，否则拒绝——一个网关模型在一个时刻只属于一个厂商（`0012` §2.3）。
     async fn resolve_referenced_offerings(
         &self,
-        command: &PublishRuntimeCommand,
+        command: &mut PublishRuntimeCommand,
         references: &[OfferingReference],
-    ) -> Result<NormalizedPublication, ApplicationError> {
+    ) -> Result<(NormalizedPublication, String), ApplicationError> {
         if references.is_empty() {
             return Err(ApplicationError::Validation(
                 "references must not be empty: a gateway model needs at least one offering"
@@ -4408,6 +4455,8 @@ impl RuntimeService {
         let offerings = drafts
             .iter()
             .map(|(reference, found)| OfferingDraft {
+                // **选中的是哪一行**由引用自己带着：按身份四元组反查在同一渠道下多行供给时会挑错。
+                offering_id: Some(reference.offering_id),
                 // 技术定义原样取自被引用的 Offering 行：引用式发布里运营**不给**技术字段，而发布期的
                 // 校验（承载面 ⊆ 合同、adapter 兼容、计价形态与参数配套）与老形状走的是同一条路——
                 // 所以要把整份定义填回来，不能留空。留空会让引用形态被自己的校验拒掉。
@@ -4446,11 +4495,19 @@ impl RuntimeService {
                 floor_amounts: reference.floor_amounts.clone(),
             })
             .collect::<Vec<_>>();
+        // **回写到调用方的命令上**：身份是这次发布真正定义的东西，而 `publish` 随后要拿 `command`
+        // 去 `into_request` 产出请求。只在这里构造一个临时命令的话，落库的那份身份会是空的
+        // （`None` → 空串），于是会建出一行 vendor_id / native_model_id / native_revision 全空的
+        // 厂商模型——它连着一次看起来成功的发布，而谁都查不出这次发布的是哪个模型。
+        command.vendor_id = Some(first.vendor_id.clone());
+        command.native_model_id = Some(first.native_model_id.clone());
+        command.native_revision = Some(first.native_revision.clone());
+        command.capability_schema = Some(first.capability_schema.clone());
         PublishRuntimeCommand {
-            vendor_id: first.vendor_id.clone(),
-            native_model_id: first.native_model_id.clone(),
+            vendor_id: Some(first.vendor_id.clone()),
+            native_model_id: Some(first.native_model_id.clone()),
             gateway_model: command.gateway_model.clone(),
-            native_revision: first.native_revision.clone(),
+            native_revision: Some(first.native_revision.clone()),
             capability_schema: Some(first.capability_schema.clone()),
             offerings: Some(offerings),
             references: None,
@@ -4458,6 +4515,7 @@ impl RuntimeService {
             actor: command.actor.clone(),
         }
         .normalize()
+        .map(|publication| (publication, first.native_model_id.clone()))
     }
 
     /// 把命令里可省略的渠道字段补齐，再归一成一份合同与一个有序候选列表。
@@ -4467,11 +4525,19 @@ impl RuntimeService {
     /// `provider_kind` 在该型号下有多条候选时拒绝——不选"最便宜"或"下标最近"的那条顶替。
     async fn resolve_inheritance(
         &self,
-        command: &PublishRuntimeCommand,
-    ) -> Result<NormalizedPublication, ApplicationError> {
-        if let Some(references) = command.references.as_deref() {
-            return self.resolve_referenced_offerings(command, references).await;
+        command: &mut PublishRuntimeCommand,
+    ) -> Result<(NormalizedPublication, String), ApplicationError> {
+        // 引用先**取出来**再解析：解析要把算出的身份回写到 `command` 上，而借用中的 `command.references`
+        // 与那次可变借用冲突。`Vec` 的克隆成本在一次发布面前可以忽略，换来的是"解析只写一个地方"。
+        if let Some(references) = command.references.clone() {
+            return self
+                .resolve_referenced_offerings(command, &references)
+                .await;
         }
+        // 内联那条老路：身份由调用方给，`normalize` 会拒掉空的那种。
+        let native_model_id = command.native_model_id.clone().unwrap_or_default();
+        // 渠道三要素与驱动器可整组省略（改价那条路）：省略时从当前生效修订按身份沿用。一条都没省略
+        // 就不必读上一版。
         let drafts = command.offerings.as_deref().ok_or_else(|| {
             ApplicationError::Validation(
                 "offerings is required: publish the model's complete, ordered offering list"
@@ -4483,14 +4549,15 @@ impl RuntimeService {
             .any(|draft| command_omits_channel(draft) || command_omits_pricing(draft))
         {
             // 没有一条省略：不必读上一版，走原路径。
-            return command.normalize();
+            let publication = command.normalize()?;
+            return Ok((publication, native_model_id));
         }
         let gateway_model = command
             .gateway_model
             .as_deref()
             .map(str::trim)
             .filter(|name| !name.is_empty())
-            .unwrap_or(command.native_model_id.as_str());
+            .unwrap_or(native_model_id.as_str());
         let previous = self
             .repository
             .active_offering_channels(gateway_model)
@@ -4500,11 +4567,13 @@ impl RuntimeService {
             .enumerate()
             .map(|(index, draft)| inherit_offering(index, draft, &previous))
             .collect::<Result<Vec<_>, _>>()?;
-        PublishRuntimeCommand {
+        let native_model_id = command.native_model_id.clone().unwrap_or_default();
+        let publication = PublishRuntimeCommand {
             offerings: Some(completed),
             ..command.clone()
         }
-        .normalize()
+        .normalize()?;
+        Ok((publication, native_model_id))
     }
 
     /// 对客目录：当前真的能调的模型与它们的合同。

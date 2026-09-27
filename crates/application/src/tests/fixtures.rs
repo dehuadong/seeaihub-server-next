@@ -115,10 +115,10 @@ pub(super) fn schema(model: &str) -> Value {
 
 pub(super) fn base_command() -> PublishRuntimeCommand {
     PublishRuntimeCommand {
-        vendor_id: "OpenAI".to_owned(),
-        native_model_id: "gpt-image-2.5-flare".to_owned(),
+        vendor_id: Some("OpenAI".to_owned()),
+        native_model_id: Some("gpt-image-2.5-flare".to_owned()),
         gateway_model: None,
-        native_revision: "test-1".to_owned(),
+        native_revision: Some("test-1".to_owned()),
         capability_schema: None,
         offerings: None,
         references: None,
@@ -141,6 +141,7 @@ pub(super) fn price_plan() -> PricePlanDraft {
 /// 一个候选：**过渡期的老素材形状**——只给 offering 级旧字段，合同由它回退得来。
 pub(super) fn draft(provider_model_id: &str) -> OfferingDraft {
     OfferingDraft {
+        offering_id: None,
         provider_kind: Some("AIHubMix".to_owned()),
         adapter_key: Some("aihubmix-image-v1".to_owned()),
         provider_model_id: provider_model_id.to_owned(),
@@ -167,6 +168,7 @@ pub(super) fn draft(provider_model_id: &str) -> OfferingDraft {
 /// 一个候选：**新形状**——承载面用新名字声明，合同留给顶层。
 pub(super) fn carrier_draft(provider_model_id: &str, carrier: Value) -> OfferingDraft {
     OfferingDraft {
+        offering_id: None,
         carrier_schema: Some(carrier),
         capability_schema: None,
         ..draft(provider_model_id)
@@ -176,6 +178,7 @@ pub(super) fn carrier_draft(provider_model_id: &str, carrier: Value) -> Offering
 /// 造一个用于兼容性校验的候选：承载面只声明给定的字段。
 pub(super) fn offering_with(schema_properties: Value, restrictions: Value) -> NormalizedOffering {
     NormalizedOffering {
+        offering_id: None,
         carrier_schema: serde_json::json!({
             "type": "object",
             "additionalProperties": false,
@@ -238,6 +241,7 @@ pub(super) fn descriptor() -> AdapterDescriptor {
 /// "两条路取到的是同一个答案"。
 pub(super) fn priced_draft(provider_model_id: &str) -> OfferingDraft {
     OfferingDraft {
+        offering_id: None,
         reference_cost_microusd: Some(11_354),
         cost_currency: None,
         consumer_rates_cny: Some(ConsumerRatesCny {

@@ -27,6 +27,10 @@ function bootstrapMaterial(): {
 /// 这条判据只有在真浏览器里才成立：要证明的是"运营能用表单把它发出去"，而不是"代码里有个表单组件"。
 /// 所以这里从贴合同一路填到发布，最后核对**发布真的成功了**——用平台的答复与模型列表说话。
 ///
+/// **这条验的是工程师那条路**（贴整份技术定义：合同、承载面、渠道三要素）。它现在收在抽屉底部的折叠区里
+/// （运营的主路径是"选厂商、勾供给"，见 `platform-model-publish.spec.ts`），但过渡期仍然可用（`0012` §7），
+/// 所以这条 spec 保留，只是多一步把折叠区展开。
+///
 /// 渠道地址填回环上的桩：发布只校验形状与折算率，不真的调用渠道。
 test('用表单发布一个新型号，不写整份发布命令', async ({ page, request }) => {
   await page.goto(consoleUrl);
@@ -44,6 +48,8 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
 
   // 上架入口在「模型目录」页右上角，表单开在抽屉里（两页已合成一页）。
   await page.getByTestId('models-add').click();
+  // **展开工程师那条路**：运营的主路径不给技术字段，所以贴整份定义的表单默认收起。
+  await page.getByRole('button', { name: /工程师：贴整份发布定义/ }).click();
   await expect(page.getByTestId('publish-vendor')).toBeVisible();
   // 界面上要说明白"这里填的就是对外价"、而仓库里的素材只是夹具（Spec §6 的那条约束）：
   // 少了这句，读到 `config/bootstrap/*.json` 的人会以为生产价已经定好了。

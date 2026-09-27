@@ -334,7 +334,16 @@ impl HubRepository for PgHubRepository {
             // 内联式发布用请求里那份（顺带按身份 upsert 供给行）；引用式发布用被引用 Offering 行与它所属
             // 渠道行的**当前值**，一个字都不取自请求。两条来源经同一个类型返回，后面的写入因此只有一个形状。
             let frozen = if definitions_from_offerings {
-                referenced_definition(&mut transaction, vendor_model_id, offering).await?
+                // 引用式发布必须带"选中的是哪一行"。缺了就是一次说不清指向的发布——**按身份去猜**
+                // 会在同一渠道下多行供给时挑错，所以这里当场拒，不替调用方补一个默认。
+                let selected = offering.offering_id.ok_or_else(|| {
+                    ApplicationError::Validation(format!(
+                        "referenced offering {}/{} carries no offering_id: a referenced publish \
+                         must name the row it points at",
+                        offering.provider_kind, offering.provider_model_id
+                    ))
+                })?;
+                referenced_definition(&mut transaction, selected).await?
             } else {
                 inline_definition(&mut transaction, vendor_model_id, offering, &actor).await?
             };
@@ -4170,9 +4179,11 @@ async fn inline_definition(
 /// 新插一行会把运营记成 `approved_by`，还让同一份费率多出一个 id 供不同修订指向。
 async fn referenced_definition(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
-    vendor_model_id: VendorModelId,
-    offering: &NormalizedOffering,
+    offering_id: OfferingId,
 ) -> Result<FrozenDefinition, ApplicationError> {
+    // **按选中的那一行直查**，不按身份四元组反查：同一个厂商模型下、同一条渠道上可能有多行供给，
+    // 反查会挑错行，或挑不到——于是把一次正当的发布报成"选中的供给不存在"。运营选的是**哪一条**，
+    // 这件事只有 `offering_id` 知道。
     let row = sqlx::query(
         r#"
         SELECT o.id AS offering_id, o.channel_id, o.adapter_key, o.provider_model_id,
@@ -4180,22 +4191,17 @@ async fn referenced_definition(
                c.provider_kind, c.base_url, c.credential_env
         FROM supply.offerings o
         JOIN supply.channels c ON c.id = o.channel_id
-        WHERE o.vendor_model_id = $1 AND c.provider_kind = $2 AND c.base_url = $3
-              AND c.credential_env = $4
+        WHERE o.id = $1
         "#,
     )
-    .bind(vendor_model_id.0)
-    .bind(&offering.provider_kind)
-    .bind(&offering.base_url)
-    .bind(&offering.credential_env)
+    .bind(offering_id.0)
     .fetch_optional(&mut **transaction)
     .await
     .map_err(database_error)?
     .ok_or_else(|| {
         ApplicationError::Validation(format!(
-            "the referenced offering {}/{} on {} no longer exists: pick it again from the offering \
-             list",
-            offering.provider_kind, offering.provider_model_id, offering.base_url
+            "the referenced offering {} no longer exists: pick it again from the offering list",
+            offering_id.0
         ))
     })?;
     let offering_id: Uuid = row.try_get("offering_id").map_err(database_error)?;

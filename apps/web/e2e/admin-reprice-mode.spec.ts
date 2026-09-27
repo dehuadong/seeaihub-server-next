@@ -39,8 +39,10 @@ test('改价：界面不出现渠道地址与凭证变量名，发布后仍指�
   await page.getByTestId('admin-password').fill(settings.adminPassword);
   await page.getByTestId('admin-sign-in').click();
 
-  // 第一次：上架（技术入口，字段齐全）。
+  // 第一次：上架（技术入口，字段齐全）。**要先展开工程师那条折叠区**——运营的主路径不给技术字段，
+  // 所以贴整份定义的表单默认收起；改价本身仍然走运营那条路（下面第二步）。
   await page.getByTestId('models-add').click();
+  await page.getByRole('button', { name: /工程师：贴整份发布定义/ }).click();
   await expect(page.getByTestId('publish-vendor')).toBeVisible();
   await page.getByTestId('publish-vendor').fill('OpenAI');
   await page.getByTestId('publish-native-model').fill(model);
@@ -103,22 +105,32 @@ test('改价：界面不出现渠道地址与凭证变量名，发布后仍指�
   const reprice = page.getByTestId(`models-reprice-${model}`);
   await expect(reprice).toBeVisible({ timeout: 15_000 });
 
-  // 第二次：改价。界面上不该再有渠道地址与凭证变量名。
+  // 第二次：改价。**走运营那条路**（选厂商、勾供给、给价）——它的判据与上一条 spec 同一件事：
+  // 界面上不该出现渠道地址、凭证变量名、驱动器与渠道费率。这里断言的是**整页正文**（不是某几个输入框
+  // 不存在），因为"某个字段没渲染"与"它没从别处漏出来"是两件事。
   await reprice.click();
   await expect(page.getByText(`改价：${model}`)).toBeVisible({ timeout: 15_000 });
+  await expect(page.getByTestId('platform-publish')).toBeVisible();
+  const repriceBody = await page.locator('body').innerText();
+  for (const forbidden of [
+    'http://127.0.0.1:9/stub',
+    'E2E_DUMMY_KEY',
+    'publish-base-url',
+    'publish-credential-env',
+    'publish-adapter-key',
+    'publish-plan-text-input',
+  ]) {
+    expect(repriceBody, `改价界面不该出现 \`${forbidden}\``).not.toContain(forbidden);
+  }
+  // 老的那几个技术输入框一个都不该在（改价路径不渲染它们）。
   await expect(page.getByTestId('publish-base-url')).toHaveCount(0);
   await expect(page.getByTestId('publish-credential-env')).toHaveCount(0);
   await expect(page.getByTestId('publish-provider-kind')).toHaveCount(0);
-  // 驱动器同样不出现：渠道这一整组（供应商、驱动器、地址、凭证）都由服务端沿用。
   await expect(page.getByTestId('publish-adapter-key')).toHaveCount(0);
-  // 连渠道费率的四档与价目出处也不摆出来：它们与渠道地址是同一类东西，由服务端沿用。
   await expect(page.getByTestId('publish-plan-text-input')).toHaveCount(0);
-  await expect(page.getByTestId('publish-plan-source-url')).toHaveCount(0);
-  await expect(page.getByText(/沿用当前渠道/)).toBeVisible();
 
-  await page.getByTestId('publish-markup-bps').fill('3500');
-  await page.getByTestId('publish-native-revision').fill('e2e-reprice-1.1');
-  await page.getByTestId('publish-submit').click();
+  await page.getByTestId('platform-markup-bps').fill('3500');
+  await page.getByTestId('platform-publish').click();
   await expect(page.getByText(`已发布 ${model}`).first()).toBeVisible({ timeout: 15_000 });
 
   // 沿用真的发生了：倍率是新值，候选仍在，而**渠道价目没被改坏**。
