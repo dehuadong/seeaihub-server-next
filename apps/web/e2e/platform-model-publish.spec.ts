@@ -90,8 +90,14 @@ test('选厂商、勾供给、给价，发布一个平台模型', async ({ reque
   await page.getByTestId('admin-email').fill(settings.adminEmail);
   await page.getByTestId('admin-password').fill(settings.adminPassword);
   await page.getByTestId('admin-sign-in').click();
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).click();
 
+  // **先看折算率页**，记下这一行——发布页显示的那个数要与它一致。两处不一致会让运营按一个不存在的
+  // 汇率推价，而推出来的价会被发布期收下，所以这是断言，不是"好不好看"。
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '折算率' }).click();
+  const fxRow = page.locator('.ant-table-tbody').getByRole('row').filter({ hasText: 'USD' });
+  await expect(fxRow).toContainText('7.2');
+
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).click();
   await page.getByRole('button', { name: /发布新模型|上架新模型/ }).click();
 
   await page.getByTestId('platform-name').fill(platformName);
@@ -115,6 +121,11 @@ test('选厂商、勾供给、给价，发布一个平台模型', async ({ reque
 
   // 勾一条该厂商下的供给（夹具那条），给它四档对客价。
   await page.getByTestId('platform-pick-E2EChannel-e2e-upstream-model').check();
+
+  // 定价处显示的折算率与刚在折算率页看到的是同一个数。
+  const fxShown = await page.getByText(/当前折算率/).first().innerText();
+  expect(fxShown, `定价处应当显示 7.2 这个折算率：${fxShown}`).toContain('7.2');
+
   for (const [index, value] of [9_000_000, 14_000_000, 18_000_000, 54_000_000].entries()) {
     await page.getByTestId(`platform-cny-${index}`).fill(String(value));
   }
