@@ -18,6 +18,7 @@ import {
 import { DeleteOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
 import { useCallback, useEffect, useState } from 'react';
 import type { AdminClient } from '../client';
+import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel } from '../ui';
 
 /// 发布修订：运营"加一个网关模型"或"给已有型号发新修订"的地方。
@@ -267,6 +268,12 @@ export function PublishPage({ client }: { client: AdminClient }) {
   }
 
   const published = usePublishedModelNames(client);
+  // 算价算式要用当前生效的折算率：没有它就算不出 CNY 对客费率，界面上要如实说缺而不是拿 0 顶替。
+  const rates = useLoadable(() => client.fxRates(), [client]);
+  const currencies: Record<string, number> = { CNY: 1 };
+  for (const row of rates.data?.rates ?? []) {
+    currencies[row.currency.toUpperCase()] = row.rate_micros / 1_000_000;
+  }
 
   return (
     <ConsolePage
@@ -769,7 +776,11 @@ export function PublishPage({ client }: { client: AdminClient }) {
         </Flex>
       </Card>
 
-      <PublishedSummary offerings={offerings} markupBps={identity.markup_bps} />
+      <PublishedSummary
+        offerings={offerings}
+        markupBps={identity.markup_bps}
+        currencies={currencies}
+      />
     </ConsolePage>
   );
 }
@@ -794,33 +805,103 @@ function usePublishedModelNames(client: AdminClient): string[] {
   return names;
 }
 
-/// 把"倍率怎么影响对客价"摆出来给人核对。它是**展示**，不是决定：费率由运营填，平台不算。
+/// 把"倍率怎么影响对客价"摆出来给人核对（Spec M2：页面要能看出加价系数怎么影响对客价）。
+///
+/// 它是**展示**，不是决定：算式是"渠道费率 ×（1 + 倍率）"，平台只照着运营填的数算给他看，并把结果放在
+/// 一个只读位置供他抄进对客费率那一栏。**不产出任何合成数**（比如毛利）——成本是渠道币种、售价是 CNY，
+/// 两者不相减；谁更便宜是把输入连同用量放在一起才成立的判断，归结算与选路。
 function PublishedSummary({
   offerings,
   markupBps,
+  currencies,
 }: {
   offerings: OfferingForm[];
   markupBps: number;
+  currencies: Record<string, number>;
 }) {
   if (offerings.length === 0) return null;
+  const multiplier = 1 + markupBps / 10000;
   return (
     <Panel
       title="这次会发布什么"
-      description={`加价系数 ${markupBps} 基点，即倍数 ×${(1 + markupBps / 10000).toFixed(4)}。`}
+      description={`加价系数 ${markupBps} 基点，即倍数 ×${multiplier.toFixed(4)}。`}
     >
       <Descriptions size="small" column={1} bordered>
         {offerings.map((offering, index) => (
           <Descriptions.Item key={index} label={`候选 ${index + 1}`}>
             {offering.provider_kind || '（未填渠道）'} · {offering.provider_model_id || '（未填模型）'} ·{' '}
             {FORMULAS.find((item) => item.value === offering.formula)?.label}
-            {offering.formula === 'token_rates'
-              ? offering.margin_enabled
-                ? '（带对客价向量）'
-                : '（不带对客价向量，对客价由结算按成本 × 倍率算）'
-              : ''}
+            {offering.formula === 'token_rates' ? (
+              <Derivation offering={offering} markupBps={markupBps} currencies={currencies} />
+            ) : offering.formula === 'upstream_declared' ? (
+              // 上游直接给金额的候选没有费率可乘——它的对客价由结算按上游声明的那笔钱算。
+              <div>（对客价按上游这次声明的金额算）</div>
+            ) : (
+              <div>（对客价按成本单价 × 倍率 × 折算率算）</div>
+            )}
           </Descriptions.Item>
         ))}
       </Descriptions>
     </Panel>
+  );
+}
+
+/// 按 token 计量候选的推导算式：渠道费率 → 折成 CNY → 乘倍率 → 该填的对客费率。
+///
+/// 逐档算，因为四档（文入／图入／文出／图出）各乘同一个倍率。缺折算率时**如实说缺**，不拿 0 顶替——
+/// 折算率没录的话发布期本来就会被拒，这里看到 0 会以为价是 0。
+function Derivation({
+  offering,
+  markupBps,
+  currencies,
+}: {
+  offering: OfferingForm;
+  markupBps: number;
+  currencies: Record<string, number>;
+}) {
+  if (!offering.margin_enabled) {
+    return <div>（不带对客价向量，对客价由结算按成本 × 倍率算）</div>;
+  }
+  const code = offering.plan_currency.trim().toUpperCase();
+  const fx = code === 'CNY' ? 1 : currencies[code];
+  const rows: [string, number, number][] = [
+    ['文入', offering.plan_text_input, offering.cny_text_input],
+    ['图入', offering.plan_image_input, offering.cny_image_input],
+    ['文出', offering.plan_text_output, offering.cny_text_output],
+    ['图出', offering.plan_image_output, offering.cny_image_output],
+  ];
+  return (
+    <div style={{ marginTop: 6 }}>
+      {fx === undefined ? (
+        <Typography.Text type="warning">
+          还没有 {code} 的生效折算率——先到「折算率」页录一行，否则发布会被拒。
+        </Typography.Text>
+      ) : (
+        <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+          算式：渠道费率（{code}/百万 token）× {fx}（折算率）× {(1 + markupBps / 10000).toFixed(4)}
+          （倍率）= 应填的对客费率（CNY/百万 token）
+        </Typography.Text>
+      )}
+      <div style={{ marginTop: 4 }}>
+        {rows.map(([label, cost, filled]) => {
+          const expected = fx === undefined ? null : Math.round(cost * fx * (1 + markupBps / 10000));
+          const matches = expected !== null && expected === filled;
+          return (
+            <Typography.Text key={label} style={{ fontSize: 12, display: 'block' }}>
+              {label}：{cost} × {fx ?? '？'} × {(1 + markupBps / 10000).toFixed(4)} ={' '}
+              {expected ?? '？'}
+              {expected === null ? null : matches ? (
+                <Typography.Text type="success">　已按算式填好</Typography.Text>
+              ) : (
+                <Typography.Text type="warning">
+                  　当前填的是 {filled}
+                  {filled === 0 ? '（还没填）' : '（与算式不同——按你自己的判断来，平台不算价）'}
+                </Typography.Text>
+              )}
+            </Typography.Text>
+          );
+        })}
+      </div>
+    </div>
   );
 }

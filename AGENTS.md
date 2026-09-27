@@ -85,6 +85,20 @@ cargo test --workspace --all-features
 上列动作发生前必须加载对应技能。加载技能不等于满足该阶段的完成条件，也不替代该阶段要求的审查。
 Discuss 及阶段推进权限在此定义；Planning 之后的阶段编排、门禁、审查收敛和返回路径由 `docs/agents/engineering.md` 定义。
 
+### 开工前读合同
+
+工程任务的范围由**工作项**拥有，不在对话里。开工前先取回它，不能靠代码与对话猜：
+
+1. `gh issue view <n>` 读选定范围、实施步骤表与**明确排除项**（约定见 [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md)）；
+2. 读适用 Spec 的验收条件（`docs/specs/`）与 RFC（`docs/design/`）；
+3. 列本轮清单，逐条标注依据（issue 的哪一步、Spec 的哪一条）。**清单之外的事不做**。
+
+需求只能来自工作项或 Spec。自己认为"应该有"的东西写进工作项等裁决，**不直接实现**——那是范围外的设计，做得再多也是要返工的。
+
+范围有缺口或合同要改，回 `planning`（见 `docs/agents/engineering.md` §1），评审收敛后再动手；不在实现里补合同。改动 Spec 或 RFC 要同步工作项，不能改完即算生效。
+
+工作状态写回工作项（标签见 [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md)），实现进度与范围外的改动都记在那里，不留在对话里。
+
 ### Discuss
 
 理解问题，结合现有代码、文档、历史决策、已接受的 ADR/RFC 和项目约束形成解决方案，并消除足够的歧义，以判断下一阶段。
