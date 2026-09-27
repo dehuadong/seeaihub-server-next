@@ -376,7 +376,7 @@ fn legacy_offering_schemas_that_disagree_are_rejected() {
 /// 对客名缺省回退取厂商原生名：老素材、老已发布数据与老测试的形状因此逐位不变。
 #[test]
 fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
-    let request = base_command().into_request(schema("gpt-image-2.5-flare"), Vec::new());
+    let request = base_command().into_request(schema("gpt-image-2.5-flare"), Vec::new(), false);
     assert_eq!(request.gateway_model, "gpt-image-2.5-flare");
     assert_eq!(request.native_model_id, "gpt-image-2.5-flare");
 
@@ -385,7 +385,7 @@ fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
         gateway_model: Some("gpt-image-2.5-plus".to_owned()),
         ..base_command()
     };
-    let request = command.into_request(schema("gpt-image-2.5-flare"), Vec::new());
+    let request = command.into_request(schema("gpt-image-2.5-flare"), Vec::new(), false);
     assert_eq!(request.gateway_model, "gpt-image-2.5-plus");
     assert_eq!(request.native_model_id, "gpt-image-2.5-flare");
 
@@ -394,14 +394,14 @@ fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
         gateway_model: Some("   ".to_owned()),
         ..base_command()
     };
-    let request = command.into_request(schema("gpt-image-2.5-flare"), Vec::new());
+    let request = command.into_request(schema("gpt-image-2.5-flare"), Vec::new(), false);
     assert_eq!(request.gateway_model, "gpt-image-2.5-flare");
 }
 
 /// 一次发布定义的就是一个网关模型：名字不能是空白。
 #[test]
 fn a_publish_must_declare_a_gateway_name() {
-    let mut request = base_command().into_request(schema("gpt-image-2.5-flare"), Vec::new());
+    let mut request = base_command().into_request(schema("gpt-image-2.5-flare"), Vec::new(), false);
     assert!(validate_gateway_model_identity(&request).is_ok());
     request.gateway_model = "  ".to_owned();
     let error = validate_gateway_model_identity(&request)

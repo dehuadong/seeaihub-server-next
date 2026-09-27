@@ -5,10 +5,11 @@ use seeai_application::{
     AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery,
     CustomerBillingSummary, CustomerUsageKind, CustomerUsageView, CustomerView,
     GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, PricePlanRates,
-    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
-    RoutingDecision, UnacceptedAttempt, customer_usage_status, declared_output_images,
+    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
+    PricePlanRates, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
+    ReferencedOffering, RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
+    customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -23,6 +24,8 @@ use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
 use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 use uuid::Uuid;
+
+pub mod material_import;
 
 /// **唯一的账本区间谓词**：`$2` 是下界（不含），`$3` 是上界（不含）——即半开区间 `[since, until)`。
 ///
@@ -207,6 +210,7 @@ impl HubRepository for PgHubRepository {
             actor,
             capability_schema,
             markup_bps,
+            definitions_from_offerings,
             offerings,
         } = request;
         if offerings.is_empty() {
@@ -326,126 +330,34 @@ impl HubRepository for PgHubRepository {
         let mut tier_prices = Map::new();
         let mut floor_amounts = Map::new();
         for offering in &offerings {
-            // 渠道按**身份**复用：`provider_kind` + `base_url` + `credential_env` 决定"这是同一个
-            // 调用入口与凭证身份"。撞上既有行就回读它——渠道除了身份与 `enabled` 没有可变量，
-            // 而 `enabled` 是**运营设的停用状态**，发布不是它的写入方（写回 true 会把手工停用
-            // 无声顶掉）。因此这里不做 `DO UPDATE`：没有可更新的东西。
-            let channel_id = match sqlx::query_scalar::<_, Uuid>(
-                r#"
-                INSERT INTO supply.channels
-                    (id, provider_kind, base_url, credential_env, enabled)
-                VALUES ($1, $2, $3, $4, true)
-                ON CONFLICT (provider_kind, base_url, credential_env) DO NOTHING
-                RETURNING id
-                "#,
-            )
-            .bind(ChannelId::new().0)
-            .bind(&offering.provider_kind)
-            .bind(&offering.base_url)
-            .bind(&offering.credential_env)
-            .fetch_optional(&mut *transaction)
-            .await
-            .map_err(database_error)?
-            {
-                Some(id) => ChannelId(id),
-                None => ChannelId(
-                    sqlx::query_scalar(
-                        r#"
-                        SELECT id FROM supply.channels
-                        WHERE provider_kind = $1 AND base_url = $2 AND credential_env = $3
-                        "#,
-                    )
-                    .bind(&offering.provider_kind)
-                    .bind(&offering.base_url)
-                    .bind(&offering.credential_env)
-                    .fetch_one(&mut *transaction)
-                    .await
-                    .map_err(database_error)?,
-                ),
-            };
-            // 供给同理，按**它所属的 vendor model + channel** 复用。它的可变量（驱动、渠道侧模型名、
-            // 限制、承载面、映射、计价形态与单价）随这次发布更新，`enabled` **不在更新之列**：
-            // 那是运营设的停用状态，重发一次不该把它顶回启用。
-            let offering_id = OfferingId(
-                sqlx::query_scalar::<_, Uuid>(
-                    r#"
-                    INSERT INTO supply.offerings
-                        (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
-                         restrictions, carrier_schema, parameter_mapping, enabled,
-                         formula, cost_unit_price_microusd)
-                    VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
-                    ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
-                        adapter_key = EXCLUDED.adapter_key,
-                        provider_model_id = EXCLUDED.provider_model_id,
-                        restrictions = EXCLUDED.restrictions,
-                        carrier_schema = EXCLUDED.carrier_schema,
-                        parameter_mapping = EXCLUDED.parameter_mapping,
-                        formula = EXCLUDED.formula,
-                        cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd
-                    RETURNING id
-                    "#,
-                )
-                .bind(OfferingId::new().0)
-                .bind(vendor_model_id.0)
-                .bind(channel_id.0)
-                .bind(&offering.adapter_key)
-                .bind(&offering.provider_model_id)
-                .bind(&offering.restrictions)
-                .bind(&offering.carrier_schema)
-                .bind(&offering.parameter_mapping)
-                .bind(offering.formula.as_str())
-                .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
-                .fetch_one(&mut *transaction)
-                .await
-                .map_err(database_error)?,
-            );
-            let price_plan_id = match &offering.rates {
-                Some(rates) => {
-                    let price_plan_id = PricePlanId::new();
-                    sqlx::query(
-                        r#"
-                        INSERT INTO pricing.price_plans (
-                            id, offering_id, currency,
-                            text_input_microusd_per_million, image_input_microusd_per_million,
-                            text_output_microusd_per_million, image_output_microusd_per_million,
-                            source_url, approved_by
-                        ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
-                        "#,
-                    )
-                    .bind(price_plan_id.0)
-                    .bind(offering_id.0)
-                    .bind(&rates.currency)
-                    .bind(to_i64(rates.text_input_microusd_per_million)?)
-                    .bind(to_i64(rates.image_input_microusd_per_million)?)
-                    .bind(to_i64(rates.text_output_microusd_per_million)?)
-                    .bind(to_i64(rates.image_output_microusd_per_million)?)
-                    .bind(offering.price_source_url.as_deref().unwrap_or_default())
-                    .bind(&actor)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(database_error)?;
-                    Some(price_plan_id)
-                }
-                None => None,
+            // 这次发布把哪份技术定义冻结进条目有两条来源（见 `PublishRuntimeRequest::definitions_from_offerings`）：
+            // 内联式发布用请求里那份（顺带按身份 upsert 供给行）；引用式发布用被引用 Offering 行与它所属
+            // 渠道行的**当前值**，一个字都不取自请求。两条来源经同一个类型返回，后面的写入因此只有一个形状。
+            let frozen = if definitions_from_offerings {
+                referenced_definition(&mut transaction, vendor_model_id, offering).await?
+            } else {
+                inline_definition(&mut transaction, vendor_model_id, offering, &actor).await?
             };
             candidates.push(OfferingCandidate {
                 runtime_revision_id: revision_id,
                 vendor_model_id,
-                offering_id,
-                channel_id,
+                offering_id: frozen.offering_id,
+                channel_id: frozen.channel_id,
                 gateway_model: gateway_model.clone(),
                 native_revision: native_revision.clone(),
                 capability_schema: capability_schema.clone(),
-                carrier_schema: offering.carrier_schema.clone(),
-                parameter_mapping: offering.parameter_mapping.clone(),
-                restrictions: offering.restrictions.clone(),
-                adapter_key: offering.adapter_key.clone(),
-                provider_model_id: offering.provider_model_id.clone(),
-                provider_kind: offering.provider_kind.clone(),
-                base_url: offering.base_url.clone(),
-                credential_env: offering.credential_env.clone(),
+                // 八列技术定义取 `frozen`：引用式发布下它是被引用 Offering 行与渠道行的当前值，
+                // 内联式发布下它就是请求里那份（由 `inline_definition` 落库）。
+                carrier_schema: frozen.carrier_schema.clone(),
+                parameter_mapping: frozen.parameter_mapping.clone(),
+                restrictions: frozen.restrictions.clone(),
+                adapter_key: frozen.adapter_key.clone(),
+                provider_model_id: frozen.provider_model_id.clone(),
+                provider_kind: frozen.provider_kind.clone(),
+                base_url: frozen.base_url.clone(),
+                credential_env: frozen.credential_env.clone(),
                 price_snapshot: PriceSnapshot {
-                    price_plan_id,
+                    price_plan_id: frozen.price_plan_id,
                     rates: offering.rates.clone(),
                     formula: offering.formula,
                     cost_unit_price_microusd: offering.cost_unit_price_microusd,
@@ -453,9 +365,9 @@ impl HubRepository for PgHubRepository {
                     // 命中的候选就是这条候选本身：快照是**按候选**带下来的，选中哪条就把哪条
                     // 的快照固化进 Job，所以"这一笔的售价按谁算的"在快照里读得出来。
                     hit_candidate: Some(HitCandidate {
-                        offering_id,
-                        channel_id,
-                        provider_kind: offering.provider_kind.clone(),
+                        offering_id: frozen.offering_id,
+                        channel_id: frozen.channel_id,
+                        provider_kind: frozen.provider_kind.clone(),
                     }),
                     // 随修订发布的定价。保底额与汇率依赖这次请求（`(size, quality)` 与受理时刻），
                     // 发布侧算不出来，由受理用例算定后填。
@@ -490,18 +402,21 @@ impl HubRepository for PgHubRepository {
             });
             // 成本币种按候选键记进修订：它是成本平面的币种，与有没有定价无关。
             if let Some(currency) = offering.cost_currency() {
-                cost_currency.insert(offering_id.to_string(), Value::String(currency.to_owned()));
+                cost_currency.insert(
+                    frozen.offering_id.to_string(),
+                    Value::String(currency.to_owned()),
+                );
             }
             // 对客费率向量按候选键记进修订：它是这条供给的售价依据，与定价参考那组无关。
             if let Some(rates) = &offering.consumer_rates_cny {
                 consumer_rates_cny.insert(
-                    offering_id.to_string(),
+                    frozen.offering_id.to_string(),
                     serde_json::to_value(rates)
                         .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
                 );
             }
             if let Some(pricing) = &offering.pricing {
-                let key = offering_id.to_string();
+                let key = frozen.offering_id.to_string();
                 reference_cost_microusd
                     .insert(key.clone(), Value::from(pricing.reference_cost_microusd));
                 cost_basis.insert(
@@ -512,16 +427,16 @@ impl HubRepository for PgHubRepository {
                 floor_amounts.insert(key, pricing.floor_amounts.clone());
             }
             snapshot_entries.push(serde_json::json!({
-                "offering_id": offering_id,
+                "offering_id": frozen.offering_id,
                 "routing_priority": offering.routing_priority,
                 "weight": offering.weight,
-                "provider_kind": offering.provider_kind,
-                "adapter_key": offering.adapter_key,
-                "provider_model_id": offering.provider_model_id,
-                "base_url": offering.base_url,
-                "credential_env": offering.credential_env,
-                "restrictions": offering.restrictions,
-                "contract_carrier_hash": contract_carrier_hash(&capability_schema, &offering.carrier_schema)?,
+                "provider_kind": frozen.provider_kind,
+                "adapter_key": frozen.adapter_key,
+                "provider_model_id": frozen.provider_model_id,
+                "base_url": frozen.base_url,
+                "credential_env": frozen.credential_env,
+                "restrictions": frozen.restrictions,
+                "contract_carrier_hash": contract_carrier_hash(&capability_schema, &frozen.carrier_schema)?,
                 "formula": offering.formula.as_str(),
                 "cost_unit_price_microusd": offering.cost_unit_price_microusd,
                 "cost_currency": offering.cost_currency(),
@@ -832,6 +747,137 @@ impl HubRepository for PgHubRepository {
                     cost_basis: pricing.cost_basis.map(|basis| basis.as_str().to_owned()),
                     tier_prices: pricing.tier_prices,
                     floor_amounts: pricing.floor_amounts,
+                })
+            })
+            .collect()
+    }
+
+    async fn offerings_by_id(
+        &self,
+        offering_ids: &[OfferingId],
+    ) -> Result<Vec<ReferencedOffering>, ApplicationError> {
+        // 一次点读（`= ANY`），不逐条查：引用式发布一次要解析整组候选。
+        //
+        // **不过滤 `enabled`**（供给的与渠道的都不滤）：停用由逐候选校验按活表判、并给出可读的
+        // 理由；在这里按启用状态丢掉，会让"我选的那条停用了"表现为"这次发布少了一条候选"——
+        // 而调用方是按传入标识逐个核对的，少一条正是它要报出来的那件事。
+        //
+        // 渠道费率取该 Offering **当前那行**（按 `created_at DESC, id DESC` 取第一条，同一批写入
+        // 撞上同一时刻时用主键定序——与 `active_offering` 里"行序不保证稳定就得配一个稳定序"
+        // 同一条纪律）。`pricing.price_plans` 与 `supply.offerings` 之间没有 `price_plan_id` 列，
+        // 关联键是 `offering_id`（`0001` 的表形），且费率是**追加**形态：改费率写新行、旧行留着
+        // 给已在那个时刻发布过的修订引用。
+        //
+        // 成本币种**不在 `supply.offerings` 里**（`0013` 只加了 `formula` 与单价）：它是发布期按
+        // 候选声明的东西，落点是 Price Plan 的币种或修订的 `cost_currency` 映射。所以这里按
+        // "实际生效的那个"取：有 Price Plan 就是它的币种，否则取这条供给最近一次发布声明的币种。
+        // 按张 / 按次计价的供给两条都不能少——缺了它，引用式发布填不出草稿的成本币种，会被
+        // "必须显式声明成本币种"拒掉。
+        if offering_ids.is_empty() {
+            return Ok(Vec::new());
+        }
+        let ids: Vec<Uuid> = offering_ids
+            .iter()
+            .map(|offering_id| offering_id.0)
+            .collect();
+        let rows = sqlx::query(
+            r#"
+            SELECT
+                o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
+                o.carrier_schema, o.parameter_mapping, o.formula, o.cost_unit_price_microusd,
+                vm.vendor_id, vm.native_model_id, vm.native_revision, vm.capability_schema,
+                c.provider_kind, c.base_url, c.credential_env,
+                p.currency AS plan_currency,
+                p.text_input_microusd_per_million,
+                p.image_input_microusd_per_million,
+                p.text_output_microusd_per_million,
+                p.image_output_microusd_per_million,
+                p.source_url AS plan_source_url,
+                d.declared_currency
+            FROM supply.offerings o
+            JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+            JOIN supply.channels c ON c.id = o.channel_id
+            --  LEFT JOIN：渠道不按 token 计量量计价的供给没有 Price Plan。
+            LEFT JOIN pricing.price_plans p ON p.id = (
+                SELECT id FROM pricing.price_plans
+                WHERE offering_id = o.id
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            )
+            LEFT JOIN LATERAL (
+                SELECT rr.cost_currency ->> o.id::text AS declared_currency
+                FROM publication.runtime_entries re
+                JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+                WHERE re.offering_id = o.id
+                  AND rr.cost_currency IS NOT NULL
+                  AND jsonb_exists(rr.cost_currency, o.id::text)
+                ORDER BY rr.created_at DESC, rr.id DESC
+                LIMIT 1
+            ) d ON true
+            WHERE o.id = ANY($1)
+            "#,
+        )
+        .bind(&ids)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                let currency: Option<String> =
+                    row.try_get("plan_currency").map_err(database_error)?;
+                // 与其他读侧同一条口径：没有 Price Plan 的形态不造一份空费率出来——造了会被
+                // "形态与参数不配套"的校验拒掉（见 `active_offering_channels`）。
+                let plan = match currency {
+                    Some(currency) => Some(PricePlanRates {
+                        currency,
+                        text_input_microusd_per_million: to_u64(
+                            row.try_get("text_input_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        image_input_microusd_per_million: to_u64(
+                            row.try_get("image_input_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        text_output_microusd_per_million: to_u64(
+                            row.try_get("text_output_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        image_output_microusd_per_million: to_u64(
+                            row.try_get("image_output_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        source_url: row
+                            .try_get::<Option<String>, _>("plan_source_url")
+                            .map_err(database_error)?
+                            .unwrap_or_default(),
+                    }),
+                    None => None,
+                };
+                let cost_currency = plan.as_ref().map(|plan| plan.currency.clone()).or(row
+                    .try_get::<Option<String>, _>("declared_currency")
+                    .map_err(database_error)?);
+                Ok(ReferencedOffering {
+                    offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
+                    vendor_id: row.try_get("vendor_id").map_err(database_error)?,
+                    native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+                    native_revision: row.try_get("native_revision").map_err(database_error)?,
+                    capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+                    provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+                    base_url: row.try_get("base_url").map_err(database_error)?,
+                    credential_env: row.try_get("credential_env").map_err(database_error)?,
+                    adapter_key: row.try_get("adapter_key").map_err(database_error)?,
+                    provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
+                    carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
+                    parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
+                    restrictions: row.try_get("restrictions").map_err(database_error)?,
+                    formula: row.try_get("formula").map_err(database_error)?,
+                    plan,
+                    cost_currency,
+                    cost_unit_price_microusd: row
+                        .try_get::<Option<i64>, _>("cost_unit_price_microusd")
+                        .map_err(database_error)?
+                        .map(to_u64)
+                        .transpose()?,
                 })
             })
             .collect()
@@ -3856,6 +3902,226 @@ impl HubRepository for PgHubRepository {
             )
             .collect())
     }
+}
+
+/// 一次发布**冻结进条目**的那份技术定义：`runtime_entries` 的八列，加上它们指向的供给、渠道与
+/// Price Plan。
+///
+/// 两条来源（请求内联的值、被引用 Offering 行的当前值）收在同一个类型里，写入路径因此只有一个
+/// 形状；另外它保证发布响应里的候选与修订 `snapshot` 的候选用的是同一份值，不出现"条目记的是
+/// 行上的值、快照记的是请求里的值"这种同一份事实两个答案。
+struct FrozenDefinition {
+    offering_id: OfferingId,
+    channel_id: ChannelId,
+    adapter_key: String,
+    provider_model_id: String,
+    carrier_schema: Value,
+    parameter_mapping: Value,
+    restrictions: Value,
+    provider_kind: String,
+    base_url: String,
+    credential_env: String,
+    price_plan_id: Option<PricePlanId>,
+}
+
+/// **内联式**发布（老形状）的供给落库：请求自带技术定义，供给与渠道按身份 upsert，返回冻结的那份。
+///
+/// 渠道按 `provider_kind` + `base_url` + `credential_env` 复用：撞上既有行就回读它——渠道除了身份与
+/// `enabled` 没有可变量，而 `enabled` 是**运营设的停用状态**，发布不是它的写入方（写回 `true` 会把
+/// 手工停用无声顶掉）。因此这里不做 `DO UPDATE`：没有可更新的东西。
+///
+/// 供给按**它所属的 vendor model + channel** 复用。它的可变量（驱动、渠道侧模型名、限制、承载面、
+/// 映射、计价形态与单价）随这次发布更新，`enabled` **不在更新之列**：那是运营设的停用状态，重发一次
+/// 不该把它顶回启用。
+async fn inline_definition(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    vendor_model_id: VendorModelId,
+    offering: &NormalizedOffering,
+    actor: &str,
+) -> Result<FrozenDefinition, ApplicationError> {
+    let channel_id = match sqlx::query_scalar::<_, Uuid>(
+        r#"
+        INSERT INTO supply.channels
+            (id, provider_kind, base_url, credential_env, enabled)
+        VALUES ($1, $2, $3, $4, true)
+        ON CONFLICT (provider_kind, base_url, credential_env) DO NOTHING
+        RETURNING id
+        "#,
+    )
+    .bind(ChannelId::new().0)
+    .bind(&offering.provider_kind)
+    .bind(&offering.base_url)
+    .bind(&offering.credential_env)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    {
+        Some(id) => ChannelId(id),
+        None => ChannelId(
+            sqlx::query_scalar(
+                r#"
+                SELECT id FROM supply.channels
+                WHERE provider_kind = $1 AND base_url = $2 AND credential_env = $3
+                "#,
+            )
+            .bind(&offering.provider_kind)
+            .bind(&offering.base_url)
+            .bind(&offering.credential_env)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(database_error)?,
+        ),
+    };
+    let offering_id = OfferingId(
+        sqlx::query_scalar::<_, Uuid>(
+            r#"
+            INSERT INTO supply.offerings
+                (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
+                 restrictions, carrier_schema, parameter_mapping, enabled,
+                 formula, cost_unit_price_microusd)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
+            ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
+                adapter_key = EXCLUDED.adapter_key,
+                provider_model_id = EXCLUDED.provider_model_id,
+                restrictions = EXCLUDED.restrictions,
+                carrier_schema = EXCLUDED.carrier_schema,
+                parameter_mapping = EXCLUDED.parameter_mapping,
+                formula = EXCLUDED.formula,
+                cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd
+            RETURNING id
+            "#,
+        )
+        .bind(OfferingId::new().0)
+        .bind(vendor_model_id.0)
+        .bind(channel_id.0)
+        .bind(&offering.adapter_key)
+        .bind(&offering.provider_model_id)
+        .bind(&offering.restrictions)
+        .bind(&offering.carrier_schema)
+        .bind(&offering.parameter_mapping)
+        .bind(offering.formula.as_str())
+        .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
+        .fetch_one(&mut **transaction)
+        .await
+        .map_err(database_error)?,
+    );
+    // 渠道费率是**追加**形态：改费率写新的一行，旧行留着给已在那个时刻发布过的修订引用。
+    let price_plan_id = match &offering.rates {
+        Some(rates) => {
+            let price_plan_id = PricePlanId::new();
+            sqlx::query(
+                r#"
+                INSERT INTO pricing.price_plans (
+                    id, offering_id, currency,
+                    text_input_microusd_per_million, image_input_microusd_per_million,
+                    text_output_microusd_per_million, image_output_microusd_per_million,
+                    source_url, approved_by
+                ) VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9)
+                "#,
+            )
+            .bind(price_plan_id.0)
+            .bind(offering_id.0)
+            .bind(&rates.currency)
+            .bind(to_i64(rates.text_input_microusd_per_million)?)
+            .bind(to_i64(rates.image_input_microusd_per_million)?)
+            .bind(to_i64(rates.text_output_microusd_per_million)?)
+            .bind(to_i64(rates.image_output_microusd_per_million)?)
+            .bind(offering.price_source_url.as_deref().unwrap_or_default())
+            .bind(actor)
+            .execute(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+            Some(price_plan_id)
+        }
+        None => None,
+    };
+    Ok(FrozenDefinition {
+        offering_id,
+        channel_id,
+        adapter_key: offering.adapter_key.clone(),
+        provider_model_id: offering.provider_model_id.clone(),
+        carrier_schema: offering.carrier_schema.clone(),
+        parameter_mapping: offering.parameter_mapping.clone(),
+        restrictions: offering.restrictions.clone(),
+        provider_kind: offering.provider_kind.clone(),
+        base_url: offering.base_url.clone(),
+        credential_env: offering.credential_env.clone(),
+        price_plan_id,
+    })
+}
+
+/// **引用式**发布的技术定义来源：被引用 Offering 行与它所属渠道行的**当前值**。
+///
+/// 为什么不继续走 upsert：`supply.offerings` 是**工程师配好的资产**，运营的发布只引用它
+/// （`docs/design/0012-platform-model-publishing.md` §3）。继续 upsert 就等于"运营每发一次货就把
+/// 工程师的技术定义按请求重写一遍"——那正是这次改动要收掉的那件事，而请求里根本没有这些字段。
+///
+/// 定位用的是供给的**身份键** `(vendor_model_id, channel_id)`（`offerings_identity` 索引，`0014`）：
+/// 草稿带着从被引用行取回的渠道三要素，因此能唯一定位到那条既有行，不必新建、也不改动它。
+/// **渠道行不新建**（引用式发布不引入新的调用入口）。
+///
+/// 查不到行说明"运营选中的那条资产在这次发布落库之前变了或没了"（例如工程师把它挪到了另一个
+/// 渠道）：这是发布期错误，点名是哪条候选，不静默少一条候选、也不落一条空壳供给。
+///
+/// 费率取该 Offering 当前那行并**复用它**，不为这次发布插新行：费率是渠道事实（导入写新行），
+/// 新插一行会把运营记成 `approved_by`，还让同一份费率多出一个 id 供不同修订指向。
+async fn referenced_definition(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    vendor_model_id: VendorModelId,
+    offering: &NormalizedOffering,
+) -> Result<FrozenDefinition, ApplicationError> {
+    let row = sqlx::query(
+        r#"
+        SELECT o.id AS offering_id, o.channel_id, o.adapter_key, o.provider_model_id,
+               o.carrier_schema, o.parameter_mapping, o.restrictions,
+               c.provider_kind, c.base_url, c.credential_env
+        FROM supply.offerings o
+        JOIN supply.channels c ON c.id = o.channel_id
+        WHERE o.vendor_model_id = $1 AND c.provider_kind = $2 AND c.base_url = $3
+              AND c.credential_env = $4
+        "#,
+    )
+    .bind(vendor_model_id.0)
+    .bind(&offering.provider_kind)
+    .bind(&offering.base_url)
+    .bind(&offering.credential_env)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or_else(|| {
+        ApplicationError::Validation(format!(
+            "the referenced offering {}/{} on {} no longer exists: pick it again from the offering \
+             list",
+            offering.provider_kind, offering.provider_model_id, offering.base_url
+        ))
+    })?;
+    let offering_id: Uuid = row.try_get("offering_id").map_err(database_error)?;
+    let price_plan_id = sqlx::query_scalar::<_, Uuid>(
+        r#"
+        SELECT id FROM pricing.price_plans
+        WHERE offering_id = $1
+        ORDER BY created_at DESC, id DESC
+        LIMIT 1
+        "#,
+    )
+    .bind(offering_id)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .map(PricePlanId);
+    Ok(FrozenDefinition {
+        offering_id: OfferingId(offering_id),
+        channel_id: ChannelId(row.try_get("channel_id").map_err(database_error)?),
+        adapter_key: row.try_get("adapter_key").map_err(database_error)?,
+        provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
+        carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
+        parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
+        restrictions: row.try_get("restrictions").map_err(database_error)?,
+        provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+        base_url: row.try_get("base_url").map_err(database_error)?,
+        credential_env: row.try_get("credential_env").map_err(database_error)?,
+        price_plan_id,
+    })
 }
 
 /// 读一行的余额与写入时刻，配上调用方手上的账户。

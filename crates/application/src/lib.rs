@@ -113,7 +113,44 @@ pub struct PublishRuntimeCommand {
     /// 上游给金额的候选没有对客价载体，**必须给**——它们的对客价由结算按冻结的这份倍率算出来。
     #[serde(default)]
     pub markup_bps: Option<i32>,
+    /// **引用式候选**：运营给的是"选中的 Offering + 这条候选的价"，技术定义由被引用的 Offering 决定
+    /// （见 `docs/design/0012-platform-model-publishing.md` §4）。与 `offerings` **二选一**。
+    ///
+    /// 给了它的时候，`vendor_id` / `native_model_id` / `native_revision` / `capability_schema` 都不必给：
+    /// 它们由被引用的 Offering 所属的厂商模型决定，服务端从库里取。这与内联那条老路（`offerings`）的
+    /// 区别正是这一件事——那条路要运营把工程师做过的技术定义再写一遍。
+    #[serde(default)]
+    pub references: Option<Vec<OfferingReference>>,
     pub actor: String,
+}
+
+/// 一条**引用式**候选：引用哪条 Offering、放在哪一档、以及**这条候选的价**。
+///
+/// 它不带任何技术字段：驱动器、供应商模型名、渠道三要素、承载面、参数映射、限制都由被引用的
+/// Offering 决定（`docs/design/0012-platform-model-publishing.md` §2）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct OfferingReference {
+    pub offering_id: OfferingId,
+    /// 档位：数字小者优先。缺省取它在数组里的下标，与内联那条路同一口径。
+    #[serde(default)]
+    pub routing_priority: Option<i32>,
+    /// 档内分流比（正整数，缺省 1）。
+    #[serde(default)]
+    pub weight: Option<u32>,
+    /// 按 token 计量量时的对客四档 CNY 费率向量（`0007` §2）。
+    #[serde(default)]
+    pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 成本币种；缺省取该 Offering 实际生效的成本币种。
+    #[serde(default)]
+    pub cost_currency: Option<String>,
+    #[serde(default)]
+    pub reference_cost_microusd: Option<u64>,
+    #[serde(default)]
+    pub cost_basis: Option<String>,
+    #[serde(default)]
+    pub tier_prices: Option<Value>,
+    #[serde(default)]
+    pub floor_amounts: Option<Value>,
 }
 
 /// 发布请求的**已校验**形态：由 [`PublishRuntimeCommand::into_request`] 产出
@@ -135,6 +172,9 @@ pub struct PublishRuntimeRequest {
     pub capability_schema: Value,
     /// 加价系数（基点）：随修订发布、随 Job 快照冻结；没有候选带定价时为 `None`。
     pub markup_bps: Option<i32>,
+    /// 候选的**技术定义**从哪里取：`true` = 由被引用的 Offering 行决定（引用式发布），`false` = 用
+    /// 请求里内联的那些值（老形状）。仓储据此决定发布时写进条目快照的是哪一份。
+    pub definitions_from_offerings: bool,
     /// 候选集：档位与档内权重都已在归一阶段定好（见 [`NormalizedOffering`]）。
     pub offerings: Vec<NormalizedOffering>,
 }
@@ -336,6 +376,7 @@ impl PublishRuntimeCommand {
         self,
         capability_schema: Value,
         offerings: Vec<NormalizedOffering>,
+        definitions_from_offerings: bool,
     ) -> PublishRuntimeRequest {
         // 平台对客名缺省回退取厂商原生名：今天两者同值，老素材不带这个字段也照常可发布。
         // 只写空白等于没写（名字是全空白的话，对客目录会列出一个调不动的名字）。
@@ -352,6 +393,9 @@ impl PublishRuntimeCommand {
             actor: self.actor,
             capability_schema,
             markup_bps: self.markup_bps,
+            // 引用式发布的技术定义由仓储从被引用的 Offering 行取：草稿里根本没有它们（那是这次改动的
+            // 要点——运营不给技术字段）。内联那条老路自带定义，仓储用请求里的值。
+            definitions_from_offerings,
             offerings,
         }
     }
@@ -1818,6 +1862,16 @@ pub trait HubRepository: Send + Sync {
         &self,
         gateway_model: &str,
     ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError>;
+
+    /// 按标识取一组 Offering 连同它们所属的厂商模型与渠道——引用式发布的解析依据。
+    ///
+    /// 返回的顺序与传入的 `offering_ids` 一致，且**漏掉取不到的**标识：调用方要按标识逐个核对，
+    /// 缺了哪条就在错误里点名（见 [`RuntimeService::resolve_referenced_offerings`]）。
+    /// 不过滤 `enabled`：停用由逐候选校验按活表判并给出可读的理由，不在这里默默丢掉。
+    async fn offerings_by_id(
+        &self,
+        offering_ids: &[OfferingId],
+    ) -> Result<Vec<ReferencedOffering>, ApplicationError>;
 
     /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
     ///
@@ -4227,6 +4281,8 @@ impl RuntimeService {
         &self,
         command: PublishRuntimeCommand,
     ) -> Result<PublishedRevision, ApplicationError> {
+        // 引用式发布的技术定义由仓储从被引用的 Offering 行取；内联那条老路用请求里的值。
+        let definitions_from_offerings = command.references.is_some();
         for (name, value) in [
             ("vendor_id", command.vendor_id.as_str()),
             ("native_model_id", command.native_model_id.as_str()),
@@ -4251,7 +4307,7 @@ impl RuntimeService {
         validate_supply_identities(&normalized)?;
         self.validate_cost_ceiling(&command.native_model_id, &contract, &normalized)
             .await?;
-        let request = command.into_request(contract, normalized);
+        let request = command.into_request(contract, normalized, definitions_from_offerings);
         validate_gateway_model_identity(&request)?;
         let gateway_model = request.gateway_model.clone();
         let revision = self.repository.publish_runtime(request).await?;
@@ -4259,6 +4315,119 @@ impl RuntimeService {
         // 受理时的比对必然不一致（见 `AccelerationService::candidates`）。
         self.acceleration.invalidate_route(&gateway_model).await;
         Ok(revision)
+    }
+
+    /// 把**引用式**候选解析成一次发布：技术定义与合同都从被引用的 Offering 取。
+    ///
+    /// 这是运营那条路（`docs/design/0012-platform-model-publishing.md` §4）：他给的是"选中的 Offering +
+    /// 这条候选的价"，驱动器、供应商模型名、渠道三要素、承载面、参数映射、限制与合同一律由服务端从库里
+    /// 取——所以**引用一条不存在的 Offering 要在发布期拒绝并点它的标识**，不能默默少一条候选：少一条
+    /// 就意味着这次发布出来的模型少一条路，而那正是运营以为自己选上的那条。
+    ///
+    /// 契约只在"这次发布第一次引用这个厂商模型"时用到：同一个厂商模型的合同是同一份（模型级唯一）。
+    /// 引用必须落在同一个厂商模型上，否则拒绝——一个网关模型在一个时刻只属于一个厂商（`0012` §2.3）。
+    async fn resolve_referenced_offerings(
+        &self,
+        command: &PublishRuntimeCommand,
+        references: &[OfferingReference],
+    ) -> Result<NormalizedPublication, ApplicationError> {
+        if references.is_empty() {
+            return Err(ApplicationError::Validation(
+                "references must not be empty: a gateway model needs at least one offering"
+                    .to_owned(),
+            ));
+        }
+        if command.offerings.is_some() {
+            return Err(ApplicationError::Validation(
+                "offerings and references are mutually exclusive: give the referenced offerings, \
+                 not the inline technical definitions"
+                    .to_owned(),
+            ));
+        }
+        let ids: Vec<OfferingId> = references.iter().map(|item| item.offering_id).collect();
+        let resolved = self.repository.offerings_by_id(&ids).await?;
+        let drafts = references
+            .iter()
+            .map(|reference| {
+                let found = resolved
+                    .iter()
+                    .find(|row| row.offering_id == reference.offering_id)
+                    .ok_or_else(|| {
+                        ApplicationError::Validation(format!(
+                            "offering {} does not exist: pick it from the selectable offering list",
+                            reference.offering_id.0
+                        ))
+                    })?;
+                Ok((reference, found))
+            })
+            .collect::<Result<Vec<_>, ApplicationError>>()?;
+        // 一次发布只属于一个厂商模型：同一个网关模型在一次发布里跨厂商会让"它按谁的语义调用"没有答案。
+        let first = drafts[0].1;
+        for (_, found) in &drafts {
+            if found.native_model_id != first.native_model_id
+                || found.vendor_id != first.vendor_id
+                || found.native_revision != first.native_revision
+            {
+                return Err(ApplicationError::Validation(
+                    "referenced offerings belong to different vendor models: a gateway model \
+                     points at one vendor model revision at a time"
+                        .to_owned(),
+                ));
+            }
+        }
+        let offerings = drafts
+            .iter()
+            .map(|(reference, found)| OfferingDraft {
+                // 技术定义原样取自被引用的 Offering 行：引用式发布里运营**不给**技术字段，而发布期的
+                // 校验（承载面 ⊆ 合同、adapter 兼容、计价形态与参数配套）与老形状走的是同一条路——
+                // 所以要把整份定义填回来，不能留空。留空会让引用形态被自己的校验拒掉。
+                provider_kind: Some(found.provider_kind.clone()),
+                adapter_key: Some(found.adapter_key.clone()),
+                provider_model_id: found.provider_model_id.clone(),
+                base_url: Some(found.base_url.clone()),
+                credential_env: Some(found.credential_env.clone()),
+                routing_priority: reference.routing_priority,
+                weight: reference.weight,
+                restrictions: found.restrictions.clone(),
+                carrier_schema: Some(found.carrier_schema.clone()),
+                parameter_mapping: found.parameter_mapping.clone(),
+                capability_schema: None,
+                formula: Some(found.formula.clone()),
+                // 渠道费率也取自那一行：它是**渠道怎么结算**的事实，不是运营这次要改的东西。
+                price_plan: found.plan.as_ref().map(|plan| PricePlanDraft {
+                    currency: plan.currency.clone(),
+                    text_input_microusd_per_million: plan.text_input_microusd_per_million,
+                    image_input_microusd_per_million: plan.image_input_microusd_per_million,
+                    text_output_microusd_per_million: plan.text_output_microusd_per_million,
+                    image_output_microusd_per_million: plan.image_output_microusd_per_million,
+                    source_url: plan.source_url.clone(),
+                }),
+                // 按张 / 按次的成本单价与成本币种同样是渠道事实，缺省取行上的值：运营只决定对客卖多少。
+                cost_unit_price_microusd: found.cost_unit_price_microusd,
+                cost_currency: reference
+                    .cost_currency
+                    .clone()
+                    .or_else(|| found.cost_currency.clone())
+                    .or_else(|| found.plan.as_ref().map(|plan| plan.currency.clone())),
+                reference_cost_microusd: reference.reference_cost_microusd,
+                consumer_rates_cny: reference.consumer_rates_cny.clone(),
+                cost_basis: reference.cost_basis.clone(),
+                tier_prices: reference.tier_prices.clone(),
+                floor_amounts: reference.floor_amounts.clone(),
+            })
+            .collect::<Vec<_>>();
+        PublishRuntimeCommand {
+            vendor_id: first.vendor_id.clone(),
+            native_model_id: first.native_model_id.clone(),
+            gateway_model: command.gateway_model.clone(),
+            native_revision: first.native_revision.clone(),
+            capability_schema: Some(first.capability_schema.clone()),
+            offerings: Some(offerings),
+            references: None,
+            markup_bps: command.markup_bps,
+            actor: command.actor.clone(),
+        }
+        .normalize()
     }
 
     /// 把命令里可省略的渠道字段补齐，再归一成一份合同与一个有序候选列表。
@@ -4270,6 +4439,9 @@ impl RuntimeService {
         &self,
         command: &PublishRuntimeCommand,
     ) -> Result<NormalizedPublication, ApplicationError> {
+        if let Some(references) = command.references.as_deref() {
+            return self.resolve_referenced_offerings(command, references).await;
+        }
         let drafts = command.offerings.as_deref().ok_or_else(|| {
             ApplicationError::Validation(
                 "offerings is required: publish the model's complete, ordered offering list"
@@ -4690,8 +4862,78 @@ pub struct ActiveOfferingChannel {
     pub floor_amounts: Option<Value>,
 }
 
-/// 生效修订里一条候选的渠道费率（`token_rates` 的参数）。
+/// 一条**被引用**的 Offering：它的标识、它所属的厂商模型（身份与合同）、渠道与它的技术定义。
+///
+/// 它是引用式发布的解析结果：运营给一个 `offering_id`，服务端据此取出"这条候选是谁、技术定义是什么"，
+/// 技术定义本身由仓库在发布时快照进条目（见 `docs/design/0012-platform-model-publishing.md` §5）。
+///
+/// 技术定义与计价形态在这里**读回来**，是为了让引用式候选能走内联那条老路的同一套校验与归一：
+/// 草稿里只有运营给的那几样（档位、权重、价），承载面、参数映射、限制、渠道三要素、驱动器与形态
+/// 都必须由这一行补齐，否则引用形态会在 `normalize` 里被"承载面缺失 / 渠道身份不完整"拒掉。
 #[derive(Debug, Clone)]
+pub struct ReferencedOffering {
+    pub offering_id: OfferingId,
+    pub vendor_id: String,
+    pub native_model_id: String,
+    pub native_revision: String,
+    /// 该厂商模型的调用方合同（模型级唯一一份）。
+    pub capability_schema: Value,
+    /// 渠道三要素：这次发布要按它把候选落到既有的那条供给行上。
+    pub provider_kind: String,
+    pub base_url: String,
+    pub credential_env: String,
+    /// 驱动器。
+    pub adapter_key: String,
+    /// 渠道侧的模型名。
+    pub provider_model_id: String,
+    /// 这条供给**能承载**合同里的哪些字段。
+    pub carrier_schema: Value,
+    pub parameter_mapping: Value,
+    pub restrictions: Value,
+    /// 计价形态（`token_rates` / `per_image` / `per_call` / `upstream_declared`）。
+    pub formula: String,
+    /// 该 Offering 当前那行渠道费率（`token_rates` 才有）；别的形态是 `None`。
+    /// 存平铺的数字而不是 [`PricePlanDraft`]：它是**读回来**的事实，不是一次发布的输入。
+    pub plan: Option<PricePlanRates>,
+    /// 该 Offering **实际生效的**成本币种（有 Price Plan 时是它的币种，否则是这条供给最近一次发布
+    /// 声明的那个）：运营不给币种时由它兜底。按张 / 按次计价的供给没有 Price Plan，缺了它就会被
+    /// "必须显式声明成本币种"拒掉——而币种是渠道事实，不该要运营每条候选重报一遍。
+    pub cost_currency: Option<String>,
+    /// 按张 / 按次的渠道成本单价（`per_image` / `per_call` 才有；别的形态是 `None`）。
+    ///
+    /// 它是**渠道怎么结算**的事实，不是运营的决定——运营给的是对客卖多少钱。所以引用式发布里它缺省取
+    /// 行上的值，不由 `OfferingReference` 携带（携带就等于允许运营改渠道成本，毛利口径会跟着漂）。
+    pub cost_unit_price_microusd: Option<u64>,
+}
+
+/// 一条**可被运营选中**的 Offering：引用式发布里那个 `offering_id` 指向的东西。
+///
+/// 它与 [`GatewayModelCandidateView`] 不是同一个读模型：后者是"**某个已发布型号**的候选长什么样"，
+/// 而这一条是"库里有哪些现成的供给可以选"——它在发布**之前**就要看得到，按厂商分组，所以要带厂商身份。
+///
+/// 它**不含渠道地址与凭证变量名**：那是渠道部署事实，运营选一条供给不需要它们（`0012` §2.1）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct SelectableOfferingView {
+    pub offering_id: OfferingId,
+    /// 厂商（例如 OpenAI）与它的模型身份——运营先选厂商，再在这个分组里选供给。
+    pub vendor_id: String,
+    pub native_model_id: String,
+    pub native_revision: String,
+    /// 渠道与渠道侧模型名。
+    pub provider_kind: String,
+    pub provider_model_id: String,
+    pub adapter_key: String,
+    /// 这条供给按什么计价（`token_rates` / `per_image` / `per_call` / `upstream_declared`）。
+    pub formula: String,
+    /// 渠道成本币种与 `token_rates` 的四档费率（别的形态没有费率）。
+    pub cost_currency: Option<String>,
+    pub cost_rates: Option<PricePlanRates>,
+    /// 能不能选：供给自己启用、且它所属渠道启用。停用的仍列出来并标明，运营要能看出"为什么它选不了"。
+    pub enabled: bool,
+}
+
+/// 生效修订里一条候选的渠道费率（`token_rates` 的参数）。
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct PricePlanRates {
     pub currency: String,
     pub text_input_microusd_per_million: u64,

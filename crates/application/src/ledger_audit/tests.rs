@@ -10,8 +10,8 @@ use crate::{
     BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary,
     CustomerUsageView, CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry,
     NewFxRate, ProviderCostGapView, ProviderFailureQuery, ProviderFailureView,
-    PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
-    UnacceptedAttempt,
+    PublishRuntimeRequest, ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand,
+    RoutingDecision, UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -305,6 +305,13 @@ impl HubRepository for AuditRepository {
         &self,
         _gateway_model: &str,
     ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn offerings_by_id(
+        &self,
+        _offering_ids: &[OfferingId],
+    ) -> Result<Vec<ReferencedOffering>, ApplicationError> {
         unused_repository()
     }
 

@@ -39,7 +39,7 @@
 | **① Model Protocol** | 对外路由、请求/响应外壳、对外生命周期 | `apps/api/src/main.rs`（路由与 handler）、`crates/application` 的 `CreateImageGeneration`、`crates/domain` 的 `JobState`（Job 视图只在内部与管理员面） |
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、证据提取、错误分类、轮询与取图（**渠道差异只此一处**） | `crates/adapter-sdk`（接口）、`crates/adapter-aihubmix`、`crates/adapter-apimart` |
 | **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份）与某 Offering 能**承载**的面（能力子集）：支持参数、值域、默认值、组合规则 | 运行时发布物 `catalog.vendor_models.capability_schema`；素材在 `config/bootstrap/*.json`。**当前实现仍是"每候选各带一份"——合同与能力子集尚未拆开，见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G5** |
-| **④ Offering** | 渠道、上游模型名、用哪个 Driver、渠道限制、路由档位与**档内权重** | `supply.offerings` + `publication.runtime_entries`；发布逻辑在 `crates/application` 的 `RuntimeService` |
+| **④ Offering** | 渠道、上游模型名、用哪个 Driver、渠道限制、路由档位与**档内权重** | `supply.offerings` + `publication.runtime_entries`；渠道与 Offering 行由服务启动时的**素材导入**写成（`crates/persistence/src/material_import.rs`，素材目录由 `SUPPLY_MATERIAL_DIR` 给，匹配键见 [`docs/design/0012`](design/0012-platform-model-publishing.md) §3）；发布逻辑在 `crates/application` 的 `RuntimeService` |
 | **⑤ Price** | 渠道**计价形态**（按 token 计量量 / 按产出张数 / 按调用次数 / 上游直接给金额）、费率与单价、币种、汇率、保底与结算口径 | `supply.offerings.formula` 与 `cost_unit_price_microusd`（渠道计价事实）+ `pricing.price_plans`（**按 token 计量量计价时**的渠道成本费率）+ `publication.runtime_revisions` 的定价列（**按候选**的对客费率向量、参考成本、成本来源、价目表、保底表）+ `pricing.fx_rates`（按币种的折算率）；公式在 `crates/domain` 的 `PriceSnapshot` |
 
 ## 3. 对外接口

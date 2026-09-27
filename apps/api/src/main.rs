@@ -27,7 +27,9 @@ use seeai_domain::{
     AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, OfferingId, PublishedModel,
     RoutePolicy, RouteStrategy, contract_image_parameter_kind, replace_contract_model_identity,
 };
-use seeai_persistence::{PgHubRepository, max_declared_output_images};
+use seeai_persistence::{
+    PgHubRepository, material_import::import_supply_materials_from_env, max_declared_output_images,
+};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
@@ -116,6 +118,19 @@ async fn main() -> Result<()> {
     let admin_token: Arc<str> = Arc::from(required_env("ADMIN_TOKEN")?);
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
+    // 供给素材的幂等导入（**工程侧**的动作）：渠道与 Offering 的来源是工程师写的素材，目录由
+    // `SUPPLY_MATERIAL_DIR` 给。没设、没这个目录、目录里没有素材——都静默跳过：开发库与测试库
+    // 本来就没有素材，导入不该让服务起不来。它排在迁移之后、装配之前：导入写的是供给目录，
+    // 不发布修订、也不应答请求，因此与下面的超时校验（读已发布修订的合同）互不影响。
+    let imported = import_supply_materials_from_env(repository.pool()).await?;
+    if imported.materials > 0 {
+        info!(
+            materials = imported.materials,
+            offerings = imported.offerings,
+            price_plans = imported.price_plans,
+            "supply materials imported"
+        );
+    }
     // 超时链整条校验：输出张数上限取自**合同自己声明的取值面**（读库，所以要连库之后才知道），
     // 两条链的比较因此比的是"合同允许的最大一档请求"。这一进程持有**对客同步等待窗口**——窗口
     // 短于上游超时就是"消费者拿到 504、而上游还在生成、照样计费"那条路；租约在 Worker 上，但两个

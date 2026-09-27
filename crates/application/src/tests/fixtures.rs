@@ -121,6 +121,7 @@ pub(super) fn base_command() -> PublishRuntimeCommand {
         native_revision: "test-1".to_owned(),
         capability_schema: None,
         offerings: None,
+        references: None,
         markup_bps: None,
         actor: "tester".to_owned(),
     }

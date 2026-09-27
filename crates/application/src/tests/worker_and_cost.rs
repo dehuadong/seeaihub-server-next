@@ -281,6 +281,13 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn offerings_by_id(
+        &self,
+        _offering_ids: &[OfferingId],
+    ) -> Result<Vec<ReferencedOffering>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn enabled_offerings(
         &self,
         _offering_ids: &[OfferingId],

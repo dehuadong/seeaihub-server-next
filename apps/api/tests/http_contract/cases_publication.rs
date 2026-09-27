@@ -227,6 +227,193 @@ async fn a_published_revision_keeps_its_offering_definition_when_the_channel_cha
     drop_isolated_database(&database_name).await;
 }
 
+/// 引用式发布的条目快照取**被引用的那条 Offering 行**：八列技术定义与渠道三要素都不来自请求
+/// （引用形态里根本没有它们），而是发布那一刻活行上的值。
+///
+/// 判据分两半，缺一不可：
+/// - 引用形态发出来的条目八列**逐位等于**那条 Offering 行与它所属渠道行，且条目指向的就是它；
+/// - 直接改行上的 `carrier_schema` 之后再引用一次，新条目取到的是**新值**——否则把值写死在发布
+///   路径里也能让前一半通过（引用一条供给就是引用它的当前值，不是引用发布那一刻的拷贝）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_referenced_publication_freezes_the_offering_row_it_points_at() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // 工程师那一侧：先按内联形态发布一次，库里因此有一条**可被引用**的 Offering。
+    let model = "referenced-freeze-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let mut full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    full["base_url"] = json!("https://referenced.example.com");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract),
+            vec![full]
+        )
+        .await,
+        StatusCode::OK,
+        "第一次发布应当成功"
+    );
+
+    let offering_id: Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM supply.offerings o
+         JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+         WHERE vm.native_model_id = $1 AND vm.native_revision = 'route-test-1'",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("the offering the operators will reference");
+
+    // 引用形态：只给"选了哪条 Offering"与这条候选的价，一个技术字段都不给（渠道币种也由服务端
+    // 从该供给当前那行费率取，所以这里连 `cost_currency` 都不提）。
+    let gateway = "referenced-freeze-gateway";
+    let reference_body = json!({
+        "vendor_id": "OpenAI",
+        "native_model_id": model,
+        "native_revision": "route-test-1",
+        "gateway_model": gateway,
+        "actor": "contract-test",
+        "markup_bps": 2_400,
+        "references": [{
+            "offering_id": offering_id,
+            "consumer_rates_cny": priced_consumer_rates()
+        }]
+    });
+
+    // 条目八列 + 它们指向的那条活行，用同一个形状读回来：判据是"逐位相等"，不是"某个字段像"。
+    type Snapshot = (String, String, Value, Value, Value, String, String, String);
+    let referenced_row = |pool: &PgPool, offering_id: Uuid| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_as::<_, Snapshot>(
+                "SELECT o.adapter_key, o.provider_model_id, o.carrier_schema, o.parameter_mapping,
+                        o.restrictions, c.provider_kind, c.base_url, c.credential_env
+                 FROM supply.offerings o
+                 JOIN supply.channels c ON c.id = o.channel_id
+                 WHERE o.id = $1",
+            )
+            .bind(offering_id)
+            .fetch_one(&pool)
+            .await
+            .expect("the referenced offering row")
+        }
+    };
+    let entry_of = |pool: &PgPool, gateway: &str| {
+        let pool = pool.clone();
+        let gateway = gateway.to_owned();
+        async move {
+            sqlx::query_as::<_, Snapshot>(
+                "SELECT re.adapter_key, re.provider_model_id, re.carrier_schema,
+                        re.parameter_mapping, re.restrictions, re.provider_kind, re.base_url,
+                        re.credential_env
+                 FROM publication.runtime_entries re
+                 WHERE re.active AND re.gateway_model = $1",
+            )
+            .bind(gateway)
+            .fetch_one(&pool)
+            .await
+            .expect("the frozen entry")
+        }
+    };
+
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&reference_body)
+        .send()
+        .await
+        .expect("referenced publication");
+    let status = response.status();
+    let text = response.text().await.expect("referenced body");
+    assert_eq!(status, StatusCode::OK, "引用式发布应当成功：{text}");
+
+    let entry = entry_of(&pool, gateway).await;
+    assert_eq!(
+        entry,
+        referenced_row(&pool, offering_id).await,
+        "引用式发布的条目八列必须逐位等于被引用的那条供给行"
+    );
+    // 引用的是**既有那条**供给：引用式发布不新建供给行（技术定义是工程师的资产）。
+    let (entry_offering, supply_rows): (Uuid, i64) = (
+        sqlx::query_scalar(
+            "SELECT offering_id FROM publication.runtime_entries
+             WHERE active AND gateway_model = $1",
+        )
+        .bind(gateway)
+        .fetch_one(&pool)
+        .await
+        .expect("the entry's offering"),
+        sqlx::query_scalar(
+            "SELECT count(*) FROM supply.offerings o
+             JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+             WHERE vm.native_model_id = $1",
+        )
+        .bind(model)
+        .fetch_one(&pool)
+        .await
+        .expect("supply rows of the vendor model"),
+    );
+    assert_eq!(
+        entry_offering, offering_id,
+        "条目必须指向运营选中的那条供给"
+    );
+    assert_eq!(supply_rows, 1, "引用式发布不该为这个厂商模型新建供给行");
+
+    // 直接改活表：模拟"工程师事后改了这条供给的承载面"。改的是一个不改变受理口径的注记
+    // （`description` 是 JSON Schema 的注解关键字），所以这次发布该走通、且必须取到改后的那一份。
+    let rewritten = "rewritten by the engineer";
+    let updated = sqlx::query(
+        "UPDATE supply.offerings
+         SET carrier_schema = carrier_schema || jsonb_build_object('description', $2::text)
+         WHERE id = $1",
+    )
+    .bind(offering_id)
+    .bind(rewritten)
+    .execute(&pool)
+    .await
+    .expect("rewrite the carrier")
+    .rows_affected();
+    assert_eq!(updated, 1, "夹具必须改到那条供给");
+
+    let republished = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&reference_body)
+        .send()
+        .await
+        .expect("second referenced publication");
+    let status = republished.status();
+    let text = republished.text().await.expect("second referenced body");
+    assert_eq!(status, StatusCode::OK, "重新用引用形态发布应当成功：{text}");
+
+    let fresh = entry_of(&pool, gateway).await;
+    assert_eq!(
+        fresh,
+        referenced_row(&pool, offering_id).await,
+        "重新发布必须取到改后的那行"
+    );
+    assert_eq!(
+        fresh.2["description"],
+        json!(rewritten),
+        "新条目的承载面必须取到行上改后的值，而不是上一次发布的那一份"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 省略渠道但上一版里没有同身份的候选：拒绝并点名，不用"最近的那条"顶替。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
