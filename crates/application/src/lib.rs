@@ -1508,6 +1508,21 @@ pub struct ProviderFailureView {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 管理端看到的**一个账户**：账户标识、余额、标签与两个时刻。
+///
+/// 它是"先找到再操作"那条路径上的列表项，所以只带**用来挑出目标账户**的字段，不带流水与密钥——
+/// 那些等选中之后按账户读。**没有持有中**：那是"这笔钱扣没扣"的第二个数，与余额并列才有意义，
+/// 列表里放不下这个对比，放进详情读。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct AccountSummary {
+    pub account_id: AccountId,
+    pub balance_microusd: i64,
+    /// 运营设的标签；没设过就是 `None`。
+    pub tag: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 一条 API Key 的**只读视图**（对客自助列表用）。
 ///
 /// **没有明文**：密钥在库里只有摘要，创建那一次之后就再也拿不回来，所以这里只有标签、创建时间与
@@ -1936,6 +1951,20 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError>;
 
+    /// 列出账户，供运营**先找到再操作**：按 `created_at` 倒序，`email` 与 `tag` 都是精确匹配。
+    ///
+    /// `email` 走 `identity.customers` 的绑定关系（一个邮箱指向一个账户），`tag` 走
+    /// `ledger.accounts.tag`。两个条件都给时是**与**的关系。没有条件时就是"最近创建的若干条"——
+    /// 运营打开账户页先看到的应是最近动过的账户，而不是一个要他先知道 id 的空表单。
+    ///
+    /// 只读、不写审计。返回条数由调用方夹过上限，这里不再二次截断。
+    async fn list_accounts(
+        &self,
+        email: Option<&str>,
+        tag: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AccountSummary>, ApplicationError>;
+
     /// 按账户读账本流水：**时间倒序**、只取 `since` 之后的、最多 `limit` 条。
     ///
     /// 权威是 `ledger.entries` 本身，这条读不改写任何东西、也不写审计。`since` 是**开区间**：
@@ -1943,12 +1972,28 @@ pub trait HubRepository: Send + Sync {
     /// 是事务时间），所以分页**只保证时间倒序**，同一时刻内部的先后不承诺——调用方要按整段
     /// 事务去理解它们。账户不存在时返回 [`ApplicationError::NotFound`]，让 404 与"没有流水"
     /// 分得开。
+    ///
+    /// `until` 是**闭区间**的上界：翻页要"上一页最后一条的时刻"作为下一页的起点，而同一时刻可能
+    /// 有多条，所以翻页用 `offset` 而不是靠 `since`/`until` 去切——那两个参数是给"按区间看"用的。
     async fn read_ledger_entries(
         &self,
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        offset: u32,
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError>;
+
+    /// 该账户在 `[since, until]` 内的流水**总条数**，供调用方判断还有没有下一页。
+    ///
+    /// 与 `read_ledger_entries` 同一套区间语义，所以"翻到最后一页"这个判断不会因为两处口径不同
+    /// 而错位。账户不存在时返回 [`ApplicationError::NotFound`]。
+    async fn count_ledger_entries(
+        &self,
+        account_id: AccountId,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<u64, ApplicationError>;
 
     /// 该账户**当前持有中**的金额（人民币微单位）：`ledger.holds` 里还没结算的那些预授权之和。
     ///
@@ -3137,18 +3182,45 @@ impl AccountsService {
         self.repository.read_account_balance(account_id).await
     }
 
+    /// 列出账户（按创建时间倒序，可按邮箱或标签收窄）。
+    ///
+    /// 这是"先找到再操作"的入口：没有它，运营必须已经知道账户标识才能做事。只读、不读缓存——
+    /// 列表里的余额要能与详情里的余额对得上。
+    pub async fn list_accounts(
+        &self,
+        email: Option<&str>,
+        tag: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AccountSummary>, ApplicationError> {
+        self.repository.list_accounts(email, tag, limit).await
+    }
+
     /// 读账户**账目流水**（权威在账本；管理员面与对客面共用这条读）。
     ///
     /// 与 [`Self::read_balance`] 同一条口径：走仓库、不读缓存——流水的用途也是查看与核对。
-    /// 它**只读**：不改状态，也不写审计。
+    /// 它**只读**：不改状态，也不写审计。`until` 是闭区间上界，`offset` 供翻页。
     pub async fn read_entries(
         &self,
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        offset: u32,
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
         self.repository
-            .read_ledger_entries(account_id, since, limit)
+            .read_ledger_entries(account_id, since, until, offset, limit)
+            .await
+    }
+
+    /// 读账户在 `[since, until]` 内的流水总条数，与 [`Self::read_entries`] 同一套区间语义。
+    pub async fn count_entries(
+        &self,
+        account_id: AccountId,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<u64, ApplicationError> {
+        self.repository
+            .count_ledger_entries(account_id, since, until)
             .await
     }
 

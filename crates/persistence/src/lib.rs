@@ -1,8 +1,8 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
-    AcceptanceProbe, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange, ClaimedJob,
-    CompleteJob, CustomerBillingQuery, CustomerBillingSummary, CustomerUsageKind,
+    AcceptanceProbe, AccountSummary, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange,
+    ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary, CustomerUsageKind,
     CustomerUsageView, CustomerView, GatewayModelCandidateView, GatewayModelView, HoldDisposition,
     HubRepository, JobView, LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand,
     ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
@@ -1264,7 +1264,50 @@ impl HubRepository for PgHubRepository {
         self.account_balance(account_id).await
     }
 
-    /// 按账户读账本流水：时间**倒序**、`since` 开区间、`limit` 截断。
+    /// 列出账户：按创建时间倒序，可按邮箱（走 `identity.customers` 的绑定）或标签（走账户那一列）
+    /// 精确收窄，两个条件同时给时是**与**。
+    ///
+    /// 用 `LEFT JOIN` 而不是 `JOIN`：没有登录身份的账户（运营直接建的、还没绑邮箱的那些）也必须
+    /// 出现在列表里——按邮箱筛时它们自然落选，但不筛时必须看得见。邮箱比对大小写不敏感，与
+    /// "登录用的那个邮箱"一致。
+    async fn list_accounts(
+        &self,
+        email: Option<&str>,
+        tag: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<AccountSummary>, ApplicationError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT a.id, a.balance_microusd, a.tag, a.created_at, a.updated_at
+            FROM ledger.accounts a
+            LEFT JOIN identity.customers c ON c.account_id = a.id
+            WHERE ($1::text IS NULL OR lower(c.email) = lower($1))
+              AND ($2::text IS NULL OR a.tag = $2)
+            ORDER BY a.created_at DESC, a.id DESC
+            LIMIT $3
+            "#,
+        )
+        .bind(email)
+        .bind(tag)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                use sqlx::Row as _;
+                Ok(AccountSummary {
+                    account_id: AccountId(row.try_get("id").map_err(database_error)?),
+                    balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+                    tag: row.try_get("tag").map_err(database_error)?,
+                    created_at: row.try_get("created_at").map_err(database_error)?,
+                    updated_at: row.try_get("updated_at").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
+    /// 按账户读账本流水：时间**倒序**、`since` 开区间、`until` 闭区间、`offset` 翻页、`limit` 截断。
     ///
     /// 先判账户在不在，再取分录：一条不存在的账户与"这个账户还没有任何流水"必须分得开，否则
     /// 管理员面会把 404 说成"没有账目"。判据是 `ledger.accounts` 那一行——账本的账户事实只有
@@ -1274,28 +1317,64 @@ impl HubRepository for PgHubRepository {
         &self,
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+        offset: u32,
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
         if !self.account_exists(account_id).await? {
             return Err(ApplicationError::NotFound(format!("account {account_id}")));
         }
+        // 排序键带 `id`：同一事务写的多条共用 `created_at`，只按时间排会让翻页在边界上重复或漏条。
+        // `since` 是开区间（增量拉取不该重复上一次的位置），`until` 是闭区间（按区间看时含端点）。
         let rows = sqlx::query(
             r#"
             SELECT account_id, job_id, kind, amount_microusd, created_at
             FROM ledger.entries
             WHERE account_id = $1
               AND ($2::timestamptz IS NULL OR created_at > $2)
+              AND ($3::timestamptz IS NULL OR created_at <= $3)
             ORDER BY created_at DESC, id DESC
-            LIMIT $3
+            OFFSET $4 LIMIT $5
             "#,
         )
         .bind(account_id.0)
         .bind(since)
+        .bind(until)
+        .bind(i64::from(offset))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
         rows.iter().map(ledger_entry_from_row).collect()
+    }
+
+    /// 该账户在 `[since, until]` 内的流水条数。区间语义与 `read_ledger_entries` 逐字相同——
+    /// 两处口径不一致的话，"还有没有下一页"的判断就会错位。
+    async fn count_ledger_entries(
+        &self,
+        account_id: AccountId,
+        since: Option<DateTime<Utc>>,
+        until: Option<DateTime<Utc>>,
+    ) -> Result<u64, ApplicationError> {
+        if !self.account_exists(account_id).await? {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        let count: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*)::bigint
+            FROM ledger.entries
+            WHERE account_id = $1
+              AND ($2::timestamptz IS NULL OR created_at > $2)
+              AND ($3::timestamptz IS NULL OR created_at <= $3)
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(since)
+        .bind(until)
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(count.max(0) as u64)
     }
 
     /// 该账户当前持有中的金额：`ledger.holds` 里还没结算的预授权之和。

@@ -6,11 +6,11 @@
 
 use super::*;
 use crate::{
-    AcceptanceProbe, AlertSink, ApiKeyView, AttemptFailure, BalanceChange, ClaimedJob, CompleteJob,
-    CustomerBillingQuery, CustomerBillingSummary, CustomerUsageView, CustomerView,
-    GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate, ProviderCostGapView,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest, ReconciliationCaseView,
-    RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
+    AcceptanceProbe, AccountSummary, AlertSink, ApiKeyView, AttemptFailure, BalanceChange,
+    ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary, CustomerUsageView,
+    CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate,
+    ProviderCostGapView, ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest,
+    ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -410,12 +410,32 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
+    async fn list_accounts(
+        &self,
+        _email: Option<&str>,
+        _tag: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<AccountSummary>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn read_ledger_entries(
         &self,
         _account_id: AccountId,
         _since: Option<chrono::DateTime<chrono::Utc>>,
+        _until: Option<chrono::DateTime<chrono::Utc>>,
+        _offset: u32,
         _limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn count_ledger_entries(
+        &self,
+        _account_id: AccountId,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+        _until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<u64, ApplicationError> {
         unused_repository()
     }
 

@@ -369,12 +369,30 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<BalanceChange, ApplicationError> {
         unimplemented!()
     }
+    async fn list_accounts(
+        &self,
+        _email: Option<&str>,
+        _tag: Option<&str>,
+        _limit: u32,
+    ) -> Result<Vec<AccountSummary>, ApplicationError> {
+        unimplemented!()
+    }
     async fn read_ledger_entries(
         &self,
         _account_id: AccountId,
         _since: Option<chrono::DateTime<chrono::Utc>>,
+        _until: Option<chrono::DateTime<chrono::Utc>>,
+        _offset: u32,
         _limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
+        unimplemented!()
+    }
+    async fn count_ledger_entries(
+        &self,
+        _account_id: AccountId,
+        _since: Option<chrono::DateTime<chrono::Utc>>,
+        _until: Option<chrono::DateTime<chrono::Utc>>,
+    ) -> Result<u64, ApplicationError> {
         unimplemented!()
     }
     async fn held_microusd(&self, _account_id: AccountId) -> Result<i64, ApplicationError> {

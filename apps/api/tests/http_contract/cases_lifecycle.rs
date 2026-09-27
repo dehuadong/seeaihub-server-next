@@ -770,6 +770,11 @@ async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
         "最新那条自己不算之后，所以一条都不剩：{empty}"
     );
     assert_eq!(empty["truncated"], json!(false), "空结果不算截断：{empty}");
+    assert_eq!(
+        empty["total"].as_u64(),
+        Some(0),
+        "区间内一条都没有时 total 是 0，不是全表的条数：{empty}"
+    );
 
     // 分界取在**未来**：没有比它更新的东西，给空数组而不是报错。
     let future = read("?since=2100-01-01T00:00:00Z".to_owned()).await;
@@ -782,6 +787,65 @@ async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
         future["truncated"],
         json!(false),
         "空结果不算截断：{future}"
+    );
+
+    // `total` 是**同一套区间条件**下的总条数，与 `count`（本页条数）不同：翻页靠它判断还有没有下一页。
+    assert_eq!(
+        all["total"].as_u64(),
+        Some(4),
+        "四条都在时 total 也是 4：{all}"
+    );
+    assert_eq!(
+        limited["total"].as_u64(),
+        Some(4),
+        "limit=2 时本页 2 条、总数仍是 4——只看 count 会以为翻完了：{limited}"
+    );
+
+    // `until` 是**闭区间**上界：取最旧那条自己的时刻，它要被含进来（与 `since` 的开区间相对）。
+    let oldest_boundary = wire_time(oldest);
+    let up_to_oldest = read(format!("?until={oldest_boundary}")).await;
+    assert_eq!(
+        kinds(&up_to_oldest),
+        vec!["adjustment"],
+        "闭区间含端点，只该剩最旧那一条：{up_to_oldest}"
+    );
+
+    // `offset` 翻页：第 2 页留下第 3、4 条，且与不翻页时的顺序**接得上**（不重不漏）。
+    let second_page = read("?limit=2&offset=2".to_owned()).await;
+    assert_eq!(
+        second_page["count"].as_u64(),
+        Some(2),
+        "第 2 页：{second_page}"
+    );
+    assert_eq!(
+        second_page["total"].as_u64(),
+        Some(4),
+        "翻到第 2 页时总数不变：{second_page}"
+    );
+    assert_eq!(
+        second_page["truncated"],
+        json!(false),
+        "第 2 页已经是最后一页，后面没有更多了：{second_page}"
+    );
+    assert_eq!(
+        second_page["entries"].as_array().expect("entries"),
+        &all_entries[2..],
+        "offset=2 取到的正是全量里的后两条（不重不漏）：{second_page}"
+    );
+
+    // `offset` 超出总数：给空数组而不是报错。`truncated` 是 false——"后面还有更多"问的是**这个位置
+    // 之后**还有没有，99 已经越过末尾，没有了。总数不受 `offset` 影响，仍是 4。
+    let past_end = read("?offset=99".to_owned()).await;
+    assert!(kinds(&past_end).is_empty(), "越过末尾给空数组：{past_end}");
+    assert_eq!(
+        past_end["truncated"],
+        json!(false),
+        "越过末尾之后没有更多了：{past_end}"
+    );
+    assert_eq!(
+        past_end["total"].as_u64(),
+        Some(4),
+        "越过末尾时 total 不受 offset 影响：{past_end}"
     );
 
     // 边界：没有管理员凭证 403；账户不存在 404（与"没有流水"分开）；消费者的 Key 不是管理员凭证。

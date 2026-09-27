@@ -12,15 +12,15 @@ use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
-    AccelerationService, AccountsService, AdapterRegistry, ApplicationError, CachePolicy,
-    CreateImageGenerationRequest, CustomerBillingQuery, CustomerUsageKind, CustomerUsageStatus,
-    CustomerView, GatewayModelView, GeneratedImage, GenerationDailySpendLimit, GenerationRateLimit,
-    GenerationService, HubRepository, IdentityService, JobView, LedgerAuditPolicy, LedgerAuditor,
-    LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate,
-    PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
-    RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService,
-    RuntimeService, with_admin_id,
+    AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
+    CachePolicy, CreateImageGenerationRequest, CustomerBillingQuery, CustomerUsageKind,
+    CustomerUsageStatus, CustomerView, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
+    GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
+    LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
+    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
+    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
+    RoutePolicyService, RuntimeService, with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -227,7 +227,7 @@ async fn main() -> Result<()> {
     // 写操作的 `admin_id` 都能填对，而不必改十几个处理器的签名。它只作用于**已匹配**的路由，所以
     // 未注册的 `/api/v1/…` 仍然走到 fallback（JSON 404），不会被这里拦成 403。
     let admin = Router::new()
-        .route("/api/v1/accounts", post(create_account))
+        .route("/api/v1/accounts", post(create_account).get(list_accounts))
         .route("/api/v1/accounts/{account_id}", get(read_account_balance))
         .route(
             "/api/v1/accounts/{account_id}/entries",
@@ -600,11 +600,14 @@ async fn read_account_balance(
     }))
 }
 
-/// 管理员看账目流水的查询参数：`since` 是 RFC3339 的增量起点（开区间），`limit` 是条数上限。
+/// 管理员看账目流水的查询参数：`since` 是 RFC3339 的增量起点（开区间），`until` 是闭区间上界，
+/// `offset` 供翻页，`limit` 是条数上限。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct AccountEntriesQuery {
     since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    offset: Option<u32>,
     limit: Option<u32>,
 }
 
@@ -615,14 +618,18 @@ const DEFAULT_ENTRIES_LIMIT: u32 = 100;
 /// 倒序 + 截断时被截掉的是**更旧**的那一段，调用方要接着往下翻；`truncated` 就是那个信号
 /// ——判别据是 `limit` 满了。要刷新的人则应该用**最新一条**的 `created_at` 作下次的 `since`，
 /// 不去碰旧的尾巴。
+///
+/// `total` 是**同一套区间条件**下的总条数，与 `count`（本页条数）不同：翻页要靠它判断还有没有
+/// 下一页，而"这一页满没满"在正好整除时会骗人。
 #[derive(Debug, Serialize)]
 struct AccountEntriesResponse {
     entries: Vec<LedgerEntryView>,
     count: usize,
+    total: u64,
     truncated: bool,
 }
 
-/// 管理员看某个账户的**账目流水**（时间倒序，`since` 增量拉、`limit` 分页）。
+/// 管理员看某个账户的**账目流水**（时间倒序，`since` 增量拉、`until` 收上界、`offset` 翻页、`limit` 截断）。
 ///
 /// 读的是 `ledger.entries`，**不读缓存**：这条读的用途是运营查看与核对，缓存里的值可能滞后、
 /// 也可能刚被对账覆盖写回，拿它当答案就把"账实不符"读成了"账实相符"。它**只读**——不改状态，
@@ -636,16 +643,32 @@ async fn list_account_entries(
         .limit
         .unwrap_or(DEFAULT_ENTRIES_LIMIT)
         .clamp(1, MAX_OPERATIONAL_LIMIT);
+    let account = AccountId(account_id);
     let entries = state
         .accounts
-        .read_entries(AccountId(account_id), query.since, limit)
+        .read_entries(
+            account,
+            query.since,
+            query.until,
+            query.offset.unwrap_or(0),
+            limit,
+        )
         .await?
         .into_iter()
         .map(LedgerEntryView::from)
         .collect::<Vec<_>>();
+    let total = state
+        .accounts
+        .count_entries(account, query.since, query.until)
+        .await?;
+    let offset = query.offset.unwrap_or(0);
     Ok(Json(AccountEntriesResponse {
         count: entries.len(),
-        truncated: entries.len() as u32 == limit,
+        total,
+        // "后面还有更多"：本页最后一条的位置还没够到总数。它同时覆盖两种被截掉的情形——`limit`
+        // 截断了这一页，以及 `offset` 落在中间。`offset + count >= total` 在恰好整除时会误判成
+        // "还有更多"，而那时下一页其实是空的。
+        truncated: (offset as u64) + (entries.len() as u64) < total,
         entries,
     }))
 }
@@ -1010,6 +1033,50 @@ async fn list_customers(
 
 const DEFAULT_CUSTOMERS_LIMIT: u32 = 50;
 
+/// 列账户的查询参数：`email` 与 `tag` 都是精确匹配，两个都给时是**与**；都不给即"最近创建的若干条"。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct AccountsQuery {
+    email: Option<String>,
+    tag: Option<String>,
+    limit: Option<u32>,
+}
+
+const DEFAULT_ACCOUNTS_LIMIT: u32 = 50;
+
+#[derive(Debug, Serialize)]
+struct AccountsResponse {
+    accounts: Vec<AccountSummary>,
+}
+
+/// 列账户（`GET /api/v1/accounts`）：运营**先找到再操作**的入口。
+///
+/// 没有它，运营必须已经知道账户标识才能充值或看流水——而账户标识是 UUID，运营手上没有，他们有的是
+/// 客户的邮箱或自己设的标签。这条读只读、不写审计，也不读缓存：列表里的余额要能与详情里的对上。
+async fn list_accounts(
+    State(state): State<AppState>,
+    Query(query): Query<AccountsQuery>,
+) -> Result<Json<AccountsResponse>, ApiError> {
+    let limit = query
+        .limit
+        .unwrap_or(DEFAULT_ACCOUNTS_LIMIT)
+        .clamp(1, MAX_OPERATIONAL_LIMIT);
+    // 空串按"没给"处理：查询串里 `?email=` 与不带这个参数应当是同一件事，否则运营清空输入框再搜
+    // 会得到一个永远为空的列表，而看起来什么都没错。
+    let email = query
+        .email
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let tag = query
+        .tag
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let accounts = state.accounts.list_accounts(email, tag, limit).await?;
+    Ok(Json(AccountsResponse { accounts }))
+}
+
 /// 为客户账户签发重置令牌（`POST /api/v1/accounts/{account_id}/password-reset`）。
 ///
 /// 与管理员那条同一个理由：平台不发邮件，所以重置只能由**运营触发**再转交令牌；没有登录身份
@@ -1216,16 +1283,23 @@ async fn read_customer_ledger(
 ) -> Result<Json<AccountEntriesResponse>, ApiError> {
     let (_, account_id) = state.require_customer(&headers).await?;
     let billing = query.billing_query();
+    let account = AccountId(account_id);
     let entries = state
         .accounts
-        .read_entries(AccountId(account_id), billing.since, billing.limit)
+        .read_entries(account, billing.since, billing.until, 0, billing.limit)
         .await?
         .into_iter()
         .map(LedgerEntryView::from)
         .collect::<Vec<_>>();
+    let total = state
+        .accounts
+        .count_entries(account, billing.since, billing.until)
+        .await?;
     Ok(Json(AccountEntriesResponse {
         count: entries.len(),
-        truncated: entries.len() as u32 == billing.limit,
+        total,
+        // 对客这条读不带 `offset`，所以"还有更多"只可能是被 `limit` 截断。
+        truncated: (entries.len() as u64) < total,
         entries,
     }))
 }
