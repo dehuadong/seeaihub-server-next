@@ -2,6 +2,7 @@ import { apiFetch, type AdminToken } from '../shared/api';
 import type {
   AccountBalance,
   AccountEntriesResponse,
+  AccountsResponse,
   CreateAccountResponse,
   CustomerView,
   GatewayModelsResponse,
@@ -106,6 +107,15 @@ export class AdminClient {
 
   accountBalance(accountId: string): Promise<AccountBalance> {
     return this.get(`/api/v1/accounts/${encodeURIComponent(accountId)}`);
+  }
+
+  /// 列账户：运营**先找到再操作**的入口。`email` 与 `tag` 都是精确匹配（服务端按"与"处理）。
+  listAccounts(filter: { email?: string; tag?: string; limit?: number } = {}): Promise<AccountsResponse> {
+    const query = new URLSearchParams();
+    if (filter.email?.trim()) query.set('email', filter.email.trim());
+    if (filter.tag?.trim()) query.set('tag', filter.tag.trim());
+    query.set('limit', String(filter.limit ?? 50));
+    return this.get(`/api/v1/accounts?${query}`);
   }
 
   accountEntries(accountId: string, limit = 50): Promise<AccountEntriesResponse> {

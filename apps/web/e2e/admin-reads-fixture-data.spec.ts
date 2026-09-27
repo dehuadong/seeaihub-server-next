@@ -56,17 +56,16 @@ test.describe('管理页面读的是库里的数据', () => {
     expect(accountId).toBeTruthy();
 
     await signIn(page);
-    await goTo(page, '账户与密钥');
+    await goTo(page, '账户');
 
     // 在这一页上按刚建的账户标识去读余额：读出来的必须正是那个数（12.34 元）。
+    // 余额现在在**详情抽屉**里（账户页是"先搜到再操作"：列表 → 详情），所以先打开。
     await page.getByTestId('accounts-lookup-id').fill(accountId);
-    await page.getByRole('button', { name: '读余额与流水' }).click();
+    await page.getByTestId('accounts-open-by-id').click();
 
-    // 余额与微单位分两行显示，所以按**那一块描述列表**断言，不用裸文本（会命中两处）。
     // antd 会把文本切成多个节点，`getByText('12.34 元')` 匹配不到——按容器 + 归一化文本断言。
-    const balanceBlock = page.locator('.ant-descriptions').first();
+    const balanceBlock = page.locator('.ant-drawer').locator('.ant-descriptions').first();
     await expect(balanceBlock).toContainText('12.34');
-    await expect(balanceBlock).toContainText('12340000');
-    await expect(balanceBlock).toContainText('微单位');
+    await expect(balanceBlock).toContainText('元');
   });
 });

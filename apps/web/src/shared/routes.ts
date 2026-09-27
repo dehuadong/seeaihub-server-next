@@ -5,15 +5,17 @@ import { useEffect, useState } from 'react';
 /// 用 hash 而不是路径：产物是静态文件，部署时不必为前端配一条"所有路径都回 index.html"的规则。
 ///
 /// 金额与时间的展示规则不在这里——它们在 `shared/format.ts`，因为客户控制台也要用同一套。
-export type Route =
-  | 'models'
-  | 'publish'
-  | 'rates'
-  | 'routing'
-  | 'accounts'
-  | 'diagnostics';
+export type Route = 'models' | 'publish' | 'rates' | 'routing' | 'accounts' | 'customers' | 'diagnostics';
 
-const ROUTES: Route[] = ['models', 'publish', 'rates', 'routing', 'accounts', 'diagnostics'];
+const ROUTES: Route[] = [
+  'models',
+  'publish',
+  'rates',
+  'routing',
+  'accounts',
+  'customers',
+  'diagnostics',
+];
 
 function parse(hash: string): Route {
   const value = hash.replace(/^#\/?/, '');

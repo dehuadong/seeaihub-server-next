@@ -9,6 +9,7 @@ import {
   MenuFoldOutlined,
   MenuUnfoldOutlined,
   SwapOutlined,
+  TeamOutlined,
   UserOutlined,
 } from '@ant-design/icons';
 import { useCallback, useMemo, useState } from 'react';
@@ -16,6 +17,7 @@ import { AdminClient } from './client';
 import { useAdminSession } from './session';
 import { useHashRoute, type Route } from '../shared/routes';
 import { AccountsPage } from './pages/Accounts';
+import { CustomersPage } from './pages/Customers';
 import { DiagnosticsPage } from './pages/Diagnostics';
 import { ChangePasswordPanel, LoginPage } from './pages/Login';
 import { ModelsPage } from './pages/Models';
@@ -26,10 +28,11 @@ import { RoutingPage } from './pages/Routing';
 const NAV: { route: Route; label: string; icon: React.ReactNode }[] = [
   { route: 'models', label: '网关模型', icon: <DeploymentUnitOutlined /> },
   { route: 'publish', label: '发布修订', icon: <ApiOutlined /> },
+  { route: 'accounts', label: '账户', icon: <KeyOutlined /> },
+  { route: 'customers', label: '客户', icon: <TeamOutlined /> },
+  { route: 'diagnostics', label: '对账与诊断', icon: <AuditOutlined /> },
   { route: 'rates', label: '折算率', icon: <DollarOutlined /> },
   { route: 'routing', label: '路由策略', icon: <SwapOutlined /> },
-  { route: 'accounts', label: '账户与密钥', icon: <KeyOutlined /> },
-  { route: 'diagnostics', label: '对账与诊断', icon: <AuditOutlined /> },
 ];
 
 /// 管理端外壳。
@@ -154,6 +157,7 @@ function Console() {
           {route === 'rates' ? <RatesPage client={client} /> : null}
           {route === 'routing' ? <RoutingPage client={client} /> : null}
           {route === 'accounts' ? <AccountsPage client={client} /> : null}
+          {route === 'customers' ? <CustomersPage client={client} /> : null}
           {route === 'diagnostics' ? <DiagnosticsPage client={client} /> : null}
         </Layout.Content>
       </Layout>

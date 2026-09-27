@@ -6,6 +6,7 @@ import {
   Col,
   Descriptions,
   Divider,
+  Drawer,
   Flex,
   Form,
   Input,
@@ -15,547 +16,459 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import {
-  CreditCardOutlined,
-  KeyOutlined,
-  PlusOutlined,
-  SearchOutlined,
-  TagOutlined,
-} from '@ant-design/icons';
+import { CreditCardOutlined, KeyOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import type {
-  AccountBalance,
-  CustomerView,
-  IssueApiKeyResponse,
-  LedgerEntry,
-} from '../../shared/types';
+import type { AccountSummary, IssueApiKeyResponse, LedgerEntry } from '../../shared/types';
+import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel, whenText, yuanText } from '../ui';
 
-/// 账户与密钥。建账户、充值、改标签、发/吊销密钥，看余额与流水，以及客户的登录身份。
+/// 账户：**先搜到，再操作**。
 ///
-/// 这一页的每一块都**先要有账户标识**：运营的活都是围着某个账户做的。标识来自三种地方——新建账户、
-/// 按邮箱找到客户、或从别处抄过来，所以顶部那条"查一个账户"是这一页的入口，下面的操作都取它的值。
+/// 组织依据是运营的工作顺序，不是端点：列表回答"有哪些账户、各自多少余额"，详情回答"这个账户能做
+/// 什么"（充值、标签、密钥、流水）。原来把六件事堆在一页长滚动里，运营读完余额要滚下去充值、再滚
+/// 上来核对；而"查账户"只收一个 UUID——运营手上没有 UUID，他们有的是客户邮箱或自己设的标签。
+///
+/// 口径见 `docs/design/0011-console-information-architecture.md` §1.2 与 §3.2。
 export function AccountsPage({ client }: { client: AdminClient }) {
   const { message } = AntApp.useApp();
-  const [accountId, setAccountId] = useState('');
-  const [balance, setBalance] = useState<AccountBalance | null>(null);
-  const [entries, setEntries] = useState<LedgerEntry[]>([]);
-  const [truncated, setTruncated] = useState(false);
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [issued, setIssued] = useState<IssueApiKeyResponse | null>(null);
-  const [revokeId, setRevokeId] = useState('');
+  const [directId, setDirectId] = useState('');
+  const [filter, setFilter] = useState<{ email?: string; tag?: string }>({});
+  const [selected, setSelected] = useState<string | null>(null);
+  const [creating, setCreating] = useState(false);
 
-  async function read(id: string) {
-    setBusy(true);
-    setError(null);
+  const accounts = useLoadable(() => client.listAccounts({ ...filter, limit: 100 }), [client, filter]);
+
+  async function createAccount(initialMicros: number) {
+    setCreating(true);
     try {
-      const [next, ledger] = await Promise.all([
-        client.accountBalance(id),
-        client.accountEntries(id, 50),
-      ]);
-      setBalance(next);
-      setEntries(ledger.entries);
-      setTruncated(ledger.truncated);
+      const created = await client.createAccount(initialMicros);
+      message.success(`已建账户 ${created.account_id}`);
+      setSelected(created.account_id);
+      accounts.reload();
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      message.error(failure instanceof Error ? failure.message : String(failure));
     } finally {
-      setBusy(false);
+      setCreating(false);
     }
   }
 
   return (
-    <ConsolePage title="账户与密钥" error={error}>
-      <Panel title="查一个账户" description="读的是账本那一行，不读缓存——运营对账看的就是它。">
-        <Space.Compact style={{ width: '100%', maxWidth: 640 }}>
+    <ConsolePage
+      title="账户"
+      hint="按邮箱或标签找到账户，再在详情里充值、看流水、管密钥"
+      error={accounts.error}
+      loading={accounts.loading}
+      onReload={accounts.reload}
+      extra={
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          loading={creating}
+          onClick={() => void createAccount(0)}
+        >
+          建空账户
+        </Button>
+      }
+    >
+      <Panel title="找账户" description="两个条件都填时是「与」的关系。标签是运营自己设的，邮箱来自客户登录身份。">
+        <Form
+          layout="inline"
+          onFinish={(values: { email?: string; tag?: string }) => {
+            // 存进 state 的是**提交时**的取值：输入框每敲一个字就重取一次列表既慢又吵。
+            setFilter({ email: values.email, tag: values.tag });
+          }}
+        >
+          <Form.Item name="email" label="客户邮箱">
+            <Input
+              data-testid="accounts-lookup-email"
+              prefix={<SearchOutlined />}
+              placeholder="customer@example.com"
+              style={{ width: 240 }}
+              allowClear
+            />
+          </Form.Item>
+          <Form.Item name="tag" label="标签">
+            <Input
+              data-testid="accounts-lookup-tag"
+              placeholder="vip"
+              style={{ width: 160 }}
+              allowClear
+            />
+          </Form.Item>
+          <Form.Item>
+            <Space>
+              <Button type="primary" htmlType="submit">
+                查找
+              </Button>
+              <Button
+                onClick={() => {
+                  setFilter({});
+                  accounts.reload();
+                }}
+              >
+                清空
+              </Button>
+            </Space>
+          </Form.Item>
+        </Form>
+        {/* 收着旧的按 id 直达：列表不可用时（例如刚拿到一个 id）仍要能查。 */}
+        <Divider plain style={{ marginBlock: 16 }}>
+          或按账户标识直达
+        </Divider>
+        <Space.Compact style={{ maxWidth: 560, width: '100%' }}>
           <Input
             data-testid="accounts-lookup-id"
-            value={accountId}
-            onChange={(event) => setAccountId(event.target.value)}
+            value={directId}
+            onChange={(event) => setDirectId(event.target.value)}
             placeholder="账户 id（UUID）"
-            prefix={<SearchOutlined />}
             allowClear
           />
           <Button
-            type="primary"
-            loading={busy}
-            disabled={!accountId.trim()}
-            onClick={() => void read(accountId.trim())}
+            data-testid="accounts-open-by-id"
+            disabled={!directId.trim()}
+            onClick={() => setSelected(directId.trim())}
           >
-            读余额与流水
+            打开
           </Button>
         </Space.Compact>
-
-        {balance ? (
-          <Descriptions
-            style={{ marginTop: 16 }}
-            size="small"
-            bordered
-            column={{ xs: 1, sm: 2 }}
-            items={[
-              {
-                key: 'balance',
-                label: '余额',
-                children: (
-                  <Flex vertical>
-                    <Typography.Text strong style={{ fontSize: 16 }}>
-                      {yuanText(balance.balance_microusd)}
-                    </Typography.Text>
-                    <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                      {balance.balance_microusd} 微单位
-                    </Typography.Text>
-                  </Flex>
-                ),
-              },
-              {
-                key: 'updated',
-                label: '写入时刻',
-                children: whenText(balance.updated_at),
-              },
-            ]}
-          />
-        ) : null}
-
-        {entries.length > 0 ? (
-          <>
-            <Table
-              style={{ marginTop: 16 }}
-              size="small"
-              rowKey={(entry, index) => `${entry.created_at}-${index ?? 0}`}
-              pagination={false}
-              dataSource={entries}
-              columns={[
-                {
-                  title: '时刻',
-                  dataIndex: 'created_at',
-                  render: (value: string) => whenText(value),
-                },
-                {
-                  title: '类别',
-                  dataIndex: 'kind',
-                  render: (value: string) => <EntryKindTag kind={value} />,
-                },
-                {
-                  title: '金额（元）',
-                  dataIndex: 'amount_microusd',
-                  align: 'right',
-                  render: (value: number) => (
-                    <Typography.Text type={value < 0 ? 'danger' : undefined}>
-                      {yuanText(value)}
-                    </Typography.Text>
-                  ),
-                },
-                {
-                  title: 'Job',
-                  dataIndex: 'job_id',
-                  render: (value: string | null) =>
-                    value ? <Typography.Text code>{value}</Typography.Text> : '—',
-                },
-              ]}
-            />
-            {truncated ? (
-              <Typography.Text type="secondary">只显示最近 50 条（按时间倒序）。</Typography.Text>
-            ) : null}
-          </>
-        ) : null}
-      </Panel>
-
-      <Panel title="建账户 / 充值 / 标签">
-        <Row gutter={[24, 24]}>
-          <Col xs={24} lg={8}>
-            <CreateAccount
-              client={client}
-              onCreated={(id) => {
-                setAccountId(id);
-                message.success(`已建账户 ${id}`);
-              }}
-            />
-          </Col>
-          <Col xs={24} lg={8}>
-            <Credit client={client} accountId={accountId} />
-          </Col>
-          <Col xs={24} lg={8}>
-            <SetTag client={client} accountId={accountId} />
-          </Col>
-        </Row>
       </Panel>
 
       <Panel
-        title="API Key"
-        description="明文只在这一次响应里出现，事后谁也拿不回来。吊销立刻生效（不删行）。"
+        title="账户列表"
+        description={`共 ${accounts.data?.accounts.length ?? 0} 个（最多显示最近 100 个）。`}
+        extra={<Button onClick={accounts.reload}>重取</Button>}
       >
-        <Space wrap>
-          <Button
-            icon={<KeyOutlined />}
-            disabled={!accountId.trim()}
-            onClick={async () => {
-              setError(null);
-              try {
-                setIssued(await client.issueApiKey(accountId.trim(), 'admin-console'));
-                message.success('密钥已签发');
-              } catch (failure) {
-                setError(failure instanceof Error ? failure.message : String(failure));
-              }
-            }}
-          >
-            给该账户发一把密钥
-          </Button>
-          <Space.Compact>
-            <Input
-              value={revokeId}
-              onChange={(event) => setRevokeId(event.target.value)}
-              placeholder="要吊销的密钥标识"
-              style={{ width: 320 }}
-              allowClear
-            />
-            <Button
-              danger
-              disabled={!revokeId.trim()}
-              onClick={async () => {
-                setError(null);
-                try {
-                  await client.revokeApiKey(revokeId.trim());
-                  message.success('已吊销；吊销立刻生效（不删行）。');
-                  setRevokeId('');
-                } catch (failure) {
-                  setError(failure instanceof Error ? failure.message : String(failure));
+        <Table<AccountSummary>
+          size="small"
+          rowKey="account_id"
+          loading={accounts.loading}
+          pagination={false}
+          dataSource={accounts.data?.accounts ?? []}
+          locale={{
+            emptyText: (
+              <Alert
+                type="info"
+                showIcon
+                message={
+                  filter.email || filter.tag
+                    ? '没有符合条件的账户。清空筛选看看全部账户。'
+                    : '还没有任何账户。点右上角「建空账户」，或让客户自己注册。'
                 }
-              }}
-            >
-              吊销
-            </Button>
-          </Space.Compact>
-        </Space>
-
-        {issued ? (
-          <Alert
-            style={{ marginTop: 16 }}
-            type="warning"
-            showIcon
-            message="密钥明文——现在抄走，页面刷新之后就没了"
-            description={
-              <Flex vertical gap={4}>
-                <Typography.Text code copyable style={{ fontSize: 14 }}>
-                  {issued.api_key}
+              />
+            ),
+          }}
+          columns={[
+            {
+              title: '账户',
+              dataIndex: 'account_id',
+              render: (value: string) => (
+                <Typography.Text code copyable style={{ fontSize: 12 }}>
+                  {value}
                 </Typography.Text>
-                <Typography.Text type="secondary">
-                  密钥标识（吊销用它）：
-                  <Typography.Text code copyable>
-                    {issued.key_id}
-                  </Typography.Text>
-                </Typography.Text>
-              </Flex>
-            }
-          />
-        ) : null}
+              ),
+            },
+            {
+              title: '标签',
+              dataIndex: 'tag',
+              width: 140,
+              render: (value: string | null) => (value ? <Tag color="blue">{value}</Tag> : '—'),
+            },
+            {
+              title: '余额',
+              dataIndex: 'balance_microusd',
+              align: 'right',
+              width: 160,
+              render: (value: number) => (
+                <Typography.Text strong>{yuanText(value)}</Typography.Text>
+              ),
+            },
+            {
+              title: '创建时间',
+              dataIndex: 'created_at',
+              width: 200,
+              render: (value: string) => whenText(value),
+            },
+            {
+              title: '',
+              width: 90,
+              render: (_value: unknown, account: AccountSummary) => (
+                <Button size="small" onClick={() => setSelected(account.account_id)}>
+                  打开
+                </Button>
+              ),
+            },
+          ]}
+        />
       </Panel>
 
-      <CustomersPanel
+      <AccountDrawer
         client={client}
-        onFoundAccount={(id) => setAccountId(id)}
-        onError={setError}
+        accountId={selected}
+        onClose={() => setSelected(null)}
+        onChanged={accounts.reload}
       />
     </ConsolePage>
   );
 }
 
-/// 账本条目的类别，用颜色区分"进钱"与"出钱"：运营扫一眼就该看出方向。
-function EntryKindTag({ kind }: { kind: string }) {
-  const color =
-    kind === 'credit' ? 'green' : kind === 'capture' || kind === 'cost' ? 'red' : 'default';
-  return <Tag color={color}>{kind}</Tag>;
-}
-
-function CreateAccount(props: { client: AdminClient; onCreated: (id: string) => void }) {
-  const [busy, setBusy] = useState(false);
-  const [form] = Form.useForm<{ micros: string }>();
-
-  return (
-    <Card size="small" title="建账户" styles={{ body: { paddingTop: 12 } }}>
-      <Form
-        form={form}
-        layout="vertical"
-        initialValues={{ micros: '0' }}
-        onFinish={async (values) => {
-          setBusy(true);
-          try {
-            const micros = Math.round(Number(values.micros));
-            if (!Number.isFinite(micros) || micros < 0) throw new Error('初始余额必须是非负数');
-            const created = await props.client.createAccount(micros);
-            props.onCreated(created.account_id);
-            form.resetFields();
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Form.Item
-          name="micros"
-          label="初始余额（微单位；1 元 = 1000000）"
-          rules={[{ required: true, message: '请填初始余额' }]}
-        >
-          <Input suffix="微单位" />
-        </Form.Item>
-        <Button type="primary" icon={<PlusOutlined />} htmlType="submit" loading={busy} block>
-          建账户
-        </Button>
-      </Form>
-    </Card>
-  );
-}
-
-function Credit(props: { client: AdminClient; accountId: string }) {
-  const { message } = AntApp.useApp();
-  const [busy, setBusy] = useState(false);
-  const [form] = Form.useForm<{ micros: string; businessKey: string }>();
-
-  return (
-    <Card size="small" title="充值" styles={{ body: { paddingTop: 12 } }}>
-      <Form
-        form={form}
-        layout="vertical"
-        onFinish={async (values) => {
-          setBusy(true);
-          try {
-            const micros = Math.round(Number(values.micros));
-            if (!Number.isFinite(micros) || micros <= 0) throw new Error('充值金额必须是正数');
-            await props.client.creditAccount(props.accountId.trim(), micros, values.businessKey);
-            message.success(`已充值 ${yuanText(micros)}`);
-            form.resetFields();
-          } catch (failure) {
-            message.error(failure instanceof Error ? failure.message : String(failure));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Form.Item
-          name="micros"
-          label="金额（微单位）"
-          rules={[{ required: true, message: '请填金额' }]}
-        >
-          <Input suffix="微单位" />
-        </Form.Item>
-        <Form.Item
-          name="businessKey"
-          label="业务键（幂等：同一键只充一次）"
-          rules={[{ required: true, message: '请填业务键' }]}
-        >
-          <Input placeholder="topup-2026-09-001" />
-        </Form.Item>
-        <Button
-          type="primary"
-          icon={<CreditCardOutlined />}
-          htmlType="submit"
-          loading={busy}
-          disabled={!props.accountId.trim()}
-          block
-        >
-          充值
-        </Button>
-      </Form>
-    </Card>
-  );
-}
-
-function SetTag(props: { client: AdminClient; accountId: string }) {
-  const { message } = AntApp.useApp();
-  const [busy, setBusy] = useState(false);
-  const [form] = Form.useForm<{ tag: string }>();
-
-  return (
-    <Card size="small" title="账户标签" styles={{ body: { paddingTop: 12 } }}>
-      <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-        标签只被生效的 <code>user_tag</code> 策略消费；没有那条策略时不改变任何选路结果。
-      </Typography.Paragraph>
-      <Form
-        form={form}
-        layout="vertical"
-        onFinish={async (values) => {
-          setBusy(true);
-          try {
-            await props.client.setAccountTag(props.accountId.trim(), values.tag.trim() || null);
-            message.success(values.tag.trim() ? '标签已设置' : '标签已清除');
-            form.resetFields();
-          } catch (failure) {
-            message.error(failure instanceof Error ? failure.message : String(failure));
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Form.Item name="tag" label="标签（留空即清除）">
-          <Input prefix={<TagOutlined />} placeholder="vip" allowClear />
-        </Form.Item>
-        <Button
-          htmlType="submit"
-          loading={busy}
-          disabled={!props.accountId.trim()}
-          block
-        >
-          写入标签
-        </Button>
-      </Form>
-    </Card>
-  );
-}
-
-/// 客户登录身份：替客户开户、按邮箱找账户、签一次性重置令牌。
-///
-/// 三件事都要先有账户标识：客户自助注册出来的账户只存在于客户表里，运营不查就找不到它——没有这一块，
-/// "给新客户充值""帮忘了口令的客户重置"都没有入口。
-function CustomersPanel(props: {
+/// 一个账户的详情与可做的动作，按**频次**排序：余额与持有在最上，充值其次，其余在后。
+function AccountDrawer(props: {
   client: AdminClient;
-  onFoundAccount: (id: string) => void;
-  onError: (message: string) => void;
+  accountId: string | null;
+  onClose: () => void;
+  onChanged: () => void;
+}) {
+  const { accountId } = props;
+  const open = accountId !== null;
+
+  return (
+    <Drawer
+      open={open}
+      onClose={props.onClose}
+      width={720}
+      title={accountId ? `账户 ${accountId}` : ''}
+      destroyOnHidden
+    >
+      {accountId ? (
+        <AccountDetail
+          key={accountId}
+          client={props.client}
+          accountId={accountId}
+          onChanged={props.onChanged}
+        />
+      ) : null}
+    </Drawer>
+  );
+}
+
+function AccountDetail({
+  client,
+  accountId,
+  onChanged,
+}: {
+  client: AdminClient;
+  accountId: string;
+  onChanged: () => void;
 }) {
   const { message } = AntApp.useApp();
   const [busy, setBusy] = useState(false);
-  const [found, setFound] = useState<CustomerView | null>(null);
-  const [issued, setIssued] = useState<{ reset_token: string; expires_at: string } | null>(null);
-  const [form] = Form.useForm<{ email: string; password?: string; accountId?: string }>();
+  const [error, setError] = useState<string | null>(null);
+  const [issued, setIssued] = useState<IssueApiKeyResponse | null>(null);
+  const balance = useLoadable(() => client.accountBalance(accountId), [client, accountId]);
+  const entries = useLoadable(() => client.accountEntries(accountId, 50), [client, accountId]);
 
   return (
-    <Panel
-      title="客户登录身份"
-      description="一个客户邮箱对应一个账户。不填账户标识就新建一个空账户；填了就把它配到那个已有账户上（配身份不动余额、密钥与历史）。不填口令时运营改用重置令牌让客户自己设。"
-    >
-      <Form form={form} layout="vertical" onFinish={async (values) => {
-        setBusy(true);
-        try {
-          const created = await props.client.openCustomer(
-            values.email.trim(),
-            values.password || undefined,
-            values.accountId?.trim() || undefined,
-          );
-          setFound(created);
-          props.onFoundAccount(created.account_id);
-          message.success(`已开户：${created.email}`);
-          form.resetFields(['password', 'accountId']);
-        } catch (failure) {
-          props.onError(failure instanceof Error ? failure.message : String(failure));
-        } finally {
-          setBusy(false);
+    <Flex vertical gap={16}>
+      {error ? <Alert type="error" showIcon message={error} /> : null}
+      {balance.error ? <Alert type="error" showIcon message={balance.error} /> : null}
+
+      <Descriptions
+        size="small"
+        bordered
+        column={1}
+        items={[
+          {
+            key: 'balance',
+            label: '余额',
+            children: balance.data ? yuanText(balance.data.balance_microusd) : '—',
+          },
+          {
+            key: 'updated',
+            label: '写入时刻',
+            children: balance.data ? whenText(balance.data.updated_at) : '—',
+          },
+        ]}
+      />
+
+      <Card
+        size="small"
+        title={
+          <Space size={8}>
+            <CreditCardOutlined />
+            充值
+          </Space>
         }
-      }}>
-        <Row gutter={16}>
-          <Col xs={24} md={8}>
-            <Form.Item
-              name="email"
-              label="客户邮箱"
-              rules={[{ required: true, message: '请填客户邮箱' }]}
-            >
-              <Input placeholder="customer@example.com" />
-            </Form.Item>
-          </Col>
-          <Col xs={24} md={8}>
-            <Form.Item name="password" label="初始口令（可空）">
-              <Input.Password placeholder="至少 8 个字符" autoComplete="new-password" />
-            </Form.Item>
-          </Col>
-          <Col xs={24} md={8}>
-            <Form.Item name="accountId" label="已有账户标识（可空）">
-              <Input placeholder="留空即新建空账户" allowClear />
-            </Form.Item>
-          </Col>
-        </Row>
-        <Space wrap>
-          <Button type="primary" htmlType="submit" loading={busy} icon={<PlusOutlined />}>
-            开户
-          </Button>
-          <Button
-            icon={<SearchOutlined />}
-            onClick={async () => {
-              const email = form.getFieldValue('email') as string | undefined;
-              if (!email?.trim()) {
-                message.warning('先填客户邮箱');
-                return;
-              }
-              setBusy(true);
-              try {
-                const result = await props.client.findCustomer(email.trim());
-                const first = result.customers[0];
-                if (!first) {
-                  setFound(null);
-                  message.info(`没有找到 ${email.trim()} 的登录身份`);
-                  return;
-                }
-                setFound(first);
-                props.onFoundAccount(first.account_id);
-                form.setFieldValue('accountId', first.account_id);
-              } catch (failure) {
-                props.onError(failure instanceof Error ? failure.message : String(failure));
-              } finally {
-                setBusy(false);
-              }
-            }}
+      >
+        <Form
+          layout="inline"
+          onFinish={async (values: { yuan: string; businessKey: string }) => {
+            setBusy(true);
+            setError(null);
+            try {
+              // 运营按元填、请求收微单位。四舍五入到整数微单位，避免浮点尾巴。
+              const micros = Math.round(Number(values.yuan) * 1_000_000);
+              if (!Number.isFinite(micros) || micros <= 0) throw new Error('充值金额必须是正数');
+              await client.creditAccount(accountId, micros, values.businessKey);
+              message.success(`已充值 ${yuanText(micros)}`);
+              balance.reload();
+              entries.reload();
+              onChanged();
+            } catch (failure) {
+              setError(failure instanceof Error ? failure.message : String(failure));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <Form.Item
+            name="yuan"
+            label="金额（元）"
+            rules={[{ required: true, message: '请填金额' }]}
           >
-            按邮箱找账户
-          </Button>
-        </Space>
-      </Form>
-
-      {found ? (
-        <>
-          <Divider />
-          <Descriptions
-            size="small"
-            bordered
-            column={{ xs: 1, sm: 3 }}
-            items={[
-              { key: 'email', label: '客户', children: found.email },
-              {
-                key: 'account',
-                label: '账户',
-                children: (
-                  <Typography.Text code copyable>
-                    {found.account_id}
-                  </Typography.Text>
-                ),
-              },
-              { key: 'last', label: '上次登录', children: whenText(found.last_login_at) },
-            ]}
-          />
-          <Button
-            style={{ marginTop: 12 }}
-            icon={<KeyOutlined />}
-            onClick={async () => {
-              setBusy(true);
-              try {
-                const token = await props.client.issueCustomerPasswordReset(found.account_id);
-                setIssued(token);
-                message.success('已签发一次性重置令牌——请当面或经既有渠道转交客户');
-              } catch (failure) {
-                props.onError(failure instanceof Error ? failure.message : String(failure));
-              } finally {
-                setBusy(false);
-              }
-            }}
+            <Input data-testid="accounts-credit-yuan" style={{ width: 140 }} placeholder="100" />
+          </Form.Item>
+          <Form.Item
+            name="businessKey"
+            label="业务键"
+            tooltip="幂等：同一个键只会充一次，误点两下不会充两次"
+            rules={[{ required: true, message: '请填业务键' }]}
           >
-            签发重置令牌
-          </Button>
-        </>
-      ) : null}
+            <Input style={{ width: 200 }} placeholder="topup-2026-09-001" />
+          </Form.Item>
+          <Form.Item>
+            <Button type="primary" htmlType="submit" loading={busy}>
+              充值
+            </Button>
+          </Form.Item>
+        </Form>
+      </Card>
 
-      {issued ? (
-        <Alert
-          style={{ marginTop: 12 }}
-          type="warning"
-          showIcon
-          message="重置令牌（只显示这一次，转交客户后由他设置新口令）"
-          description={
-            <Flex vertical gap={4}>
-              <Typography.Text code copyable style={{ fontSize: 14 }}>
-                {issued.reset_token}
-              </Typography.Text>
-              <Typography.Text type="secondary">
-                有效期至 {whenText(issued.expires_at)}；用过一次即失效。
-              </Typography.Text>
-            </Flex>
-          }
+      <Card size="small" title="账目流水" extra={<Button onClick={entries.reload}>重取</Button>}>
+        {entries.error ? <Alert type="error" showIcon message={entries.error} /> : null}
+        <Table<LedgerEntry>
+          size="small"
+          rowKey={(entry, index) => `${entry.created_at}-${index ?? 0}`}
+          loading={entries.loading}
+          pagination={false}
+          dataSource={entries.data?.entries ?? []}
+          locale={{ emptyText: <Alert type="info" showIcon message="这个账户还没有任何账目。" /> }}
+          columns={[
+            { title: '时刻', dataIndex: 'created_at', render: (value: string) => whenText(value) },
+            {
+              title: '类别',
+              dataIndex: 'kind',
+              render: (value: string) => (
+                <Tag color={value === 'credit' ? 'green' : 'default'}>{value}</Tag>
+              ),
+            },
+            {
+              title: '金额（元）',
+              dataIndex: 'amount_microusd',
+              align: 'right',
+              render: (value: number) => (
+                <Typography.Text type={value < 0 ? 'danger' : undefined}>
+                  {yuanText(value)}
+                </Typography.Text>
+              ),
+            },
+          ]}
         />
-      ) : null}
-    </Panel>
+      </Card>
+
+      <Card size="small" title="标签">
+        <Form
+          layout="inline"
+          onFinish={async (values: { tag?: string }) => {
+            setBusy(true);
+            try {
+              await client.setAccountTag(accountId, values.tag?.trim() || null);
+              message.success(values.tag?.trim() ? '标签已设置' : '标签已清除');
+              onChanged();
+            } catch (failure) {
+              setError(failure instanceof Error ? failure.message : String(failure));
+            } finally {
+              setBusy(false);
+            }
+          }}
+        >
+          <Form.Item name="tag" tooltip="只被生效的 user_tag 策略消费；没有那条策略时不改变任何选路结果">
+            <Input style={{ width: 200 }} placeholder="vip" allowClear />
+          </Form.Item>
+          <Form.Item>
+            <Button htmlType="submit" loading={busy}>
+              写入标签
+            </Button>
+          </Form.Item>
+        </Form>
+      </Card>
+
+      <Card
+        size="small"
+        title={
+          <Space size={8}>
+            <KeyOutlined />
+            API Key
+          </Space>
+        }
+      >
+        <Flex vertical gap={12}>
+          <Row gutter={8}>
+            <Col>
+              <Button
+                disabled={busy}
+                onClick={async () => {
+                  setBusy(true);
+                  setError(null);
+                  try {
+                    setIssued(await client.issueApiKey(accountId, 'admin-console'));
+                    message.success('密钥已签发');
+                  } catch (failure) {
+                    setError(failure instanceof Error ? failure.message : String(failure));
+                  } finally {
+                    setBusy(false);
+                  }
+                }}
+              >
+                签发一把密钥
+              </Button>
+            </Col>
+          </Row>
+          {issued ? (
+            <Alert
+              type="warning"
+              showIcon
+              message="密钥明文——现在抄走，关掉这个抽屉就没了"
+              description={
+                <Flex vertical gap={4}>
+                  <Typography.Text code copyable style={{ fontSize: 14 }}>
+                    {issued.api_key}
+                  </Typography.Text>
+                  <Typography.Text type="secondary">
+                    密钥标识（吊销用它）：
+                    <Typography.Text code copyable>
+                      {issued.key_id}
+                    </Typography.Text>
+                  </Typography.Text>
+                </Flex>
+              }
+            />
+          ) : null}
+          <Form
+            layout="inline"
+            onFinish={async (values: { keyId: string }) => {
+              setBusy(true);
+              try {
+                await client.revokeApiKey(values.keyId.trim());
+                message.success('已吊销；吊销立刻生效（不删行）');
+              } catch (failure) {
+                setError(failure instanceof Error ? failure.message : String(failure));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            <Form.Item name="keyId" rules={[{ required: true, message: '请填密钥标识' }]}>
+              <Input style={{ width: 320 }} placeholder="要吊销的密钥标识" allowClear />
+            </Form.Item>
+            <Form.Item>
+              <Button danger htmlType="submit" loading={busy}>
+                吊销
+              </Button>
+            </Form.Item>
+          </Form>
+        </Flex>
+      </Card>
+    </Flex>
   );
 }

@@ -8,7 +8,15 @@ import { adminApiUrl, consoleUrl, portalUrl, settings } from './settings';
 ///
 /// 它与 e2e 分开配置（`playwright.capture.config.ts`）：`npm run e2e` 只跑断言，`npm run capture`
 /// 只抓图。合成一份的话抓图会混进常规运行、白花时间还把用例总数搞乱。
-const CONSOLE_PAGES = ['网关模型', '发布修订', '折算率', '路由策略', '账户与密钥', '对账与诊断'] as const;
+const CONSOLE_PAGES = [
+  '网关模型',
+  '发布修订',
+  '账户',
+  '客户',
+  '对账与诊断',
+  '折算率',
+  '路由策略',
+] as const;
 
 test('运营后台六个页面各抓一张截图', async ({ page, request }) => {
   // 先造一点数据，免得每页都是空态：一个币种的折算率 + 一个带余额的账户。

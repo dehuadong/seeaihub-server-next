@@ -112,6 +112,21 @@ export interface RoutePoliciesResponse {
 }
 
 /// 管理员读余额的形状（`AccountBalanceResponse`）。对客那条是另一个形状（多一个持有中）。
+/// 管理端看到的一个账户（账户列表的一项）。**不含持有中**：那是与余额并列才有意义的第二个数，
+/// 放进详情读。
+export interface AccountSummary {
+  account_id: string;
+  balance_microusd: number;
+  /// 运营设的标签；没设过就是 null。
+  tag: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AccountsResponse {
+  accounts: AccountSummary[];
+}
+
 export interface AccountBalance {
   balance_microusd: number;
   updated_at: string;
