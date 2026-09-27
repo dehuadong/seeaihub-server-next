@@ -2769,8 +2769,8 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
     let channel = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO catalog.vendor_models
-             (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash)
-         VALUES ($1, 'AIHubMix', $2, 'route-test-1', '{}'::jsonb, 'per-image-fixture')",
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1, 'AIHubMix', $2, 'route-test-1', '{}'::jsonb)",
     )
     .bind(vendor_model)
     .bind(per_image_model)
@@ -2831,9 +2831,22 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
         .clone();
     assert_eq!(
         offerings.len(),
-        2,
-        "两条供给都要在清单里，停用的也不例外：{text}"
+        3,
+        "三条供给都要在清单里，停用的与没被发布过的也不例外：{text}"
     );
+    // 整份答复里不该出现任何渠道部署事实：键不出现，值也不出现。
+    for leaked in [
+        "base_url",
+        "credential_env",
+        "AIHUBMIX_API_KEY",
+        "per-image.example.com",
+        "zebra.example.com",
+    ] {
+        assert!(
+            !text.contains(leaked),
+            "清单泄出了渠道部署事实 `{leaked}`：{text}"
+        );
+    }
 
     for offering in &offerings {
         let object = offering.as_object().expect("an offering object");
@@ -2861,13 +2874,30 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
                 "清单不回显渠道部署事实 `{forbidden}`：{offering}"
             );
         }
-        assert_eq!(offering["cost_currency"], json!("USD"));
-        assert_eq!(offering["cost_rates"]["currency"], json!("USD"));
-        assert_eq!(
-            offering["cost_rates"]["text_input_microusd_per_million"],
-            json!(5_000_000),
-            "渠道费率取该供给当前那行 Price Plan：{offering}"
-        );
+        match offering["formula"].as_str().expect("formula") {
+            // 按 token 量计价：币种与四档费率都来自供给当前那行 Price Plan。
+            "token_rates" => {
+                assert_eq!(offering["cost_currency"], json!("USD"));
+                assert_eq!(offering["cost_rates"]["currency"], json!("USD"));
+                assert_eq!(
+                    offering["cost_rates"]["text_input_microusd_per_million"],
+                    json!(5_000_000),
+                    "渠道费率取该供给当前那行 Price Plan：{offering}"
+                );
+            }
+            // 没有 Price Plan、也没有发布物声明过币种：读侧给 `null`，不是报错。
+            "per_image" => {
+                assert!(
+                    offering["cost_currency"].is_null(),
+                    "没有币种来源时成本币种是 null：{offering}"
+                );
+                assert!(
+                    offering["cost_rates"].is_null(),
+                    "按张计价的供给没有四档费率：{offering}"
+                );
+            }
+            other => panic!("清单里出现了没见过的计价形态 `{other}`：{offering}"),
+        }
     }
 
     let order = offerings
@@ -2889,6 +2919,7 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
         order,
         vec![
             ("AIHubMix".to_owned(), "alpha-model".to_owned()),
+            ("AIHubMix".to_owned(), per_image_model.to_owned()),
             ("OpenAI".to_owned(), "zebra-model".to_owned()),
         ],
         "清单按 vendor_id → native_model_id 排序，发布页据此分组：{text}"
