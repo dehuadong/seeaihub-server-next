@@ -13,6 +13,7 @@ import type {
   RoutePoliciesResponse,
   RoutePolicy,
   RouteStrategy,
+  SelectableOfferingsResponse,
 } from '../shared/types';
 
 /// 管理 API 的每一个端点在这里各有一个函数：**页面不拼路径、不拼查询串**。
@@ -39,6 +40,13 @@ export class AdminClient {
 
   setOfferingEnabled(offeringId: string, enabled: boolean): Promise<void> {
     return this.send(`/api/v1/offerings/${offeringId}`, 'PATCH', { enabled });
+  }
+
+  /// **可被选中的 Offering 清单**：发布平台模型时"选 vendor → 选供给"用的那一份。
+  ///
+  /// 它不含渠道地址与凭证变量名——那是渠道部署事实，选择用不到（`docs/design/0012` §2.1）。
+  selectableOfferings(): Promise<SelectableOfferingsResponse> {
+    return this.get('/api/v1/offerings');
   }
 
   publishRevision(command: unknown): Promise<{ runtime_revision_id: string; gateway_model: string }> {

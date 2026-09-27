@@ -8,8 +8,8 @@ use seeai_application::{
     LeaseRecovery, LedgerBalanceMismatch, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
     PricePlanRates, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
     ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
-    ReferencedOffering, RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
-    customer_usage_status, declared_output_images,
+    ReferencedOffering, RefundReconciliationCommand, RoutingDecision, SelectableOfferingView,
+    UnacceptedAttempt, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -878,6 +878,109 @@ impl HubRepository for PgHubRepository {
                         .map_err(database_error)?
                         .map(to_u64)
                         .transpose()?,
+                })
+            })
+            .collect()
+    }
+
+    async fn selectable_offerings(&self) -> Result<Vec<SelectableOfferingView>, ApplicationError> {
+        // 一条供给一项，排序键就是调用方的分组口径：`vendor_id` → `native_model_id` →
+        // `provider_kind`，最后拿主键定序——行序不保证稳定，清单每刷一次就跳的话分组也跟着跳。
+        //
+        // 渠道费率取该 Offering **当前那行** Price Plan，关联方式与 [`HubRepository::offerings_by_id`]
+        // 逐字相同：按 `created_at DESC, id DESC` 取第一条，费率是追加形态、旧行留给引用过它的修订。
+        // 成本币种同样按"实际生效的那个"取：有 Price Plan 就是它的币种，否则取这条供给最近一次发布
+        // 声明的币种——按张 / 按次的供给没有 Price Plan，缺了它清单上就只有一片空。
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            r#"
+            SELECT
+                o.id AS offering_id, o.adapter_key, o.provider_model_id, o.formula,
+                vm.vendor_id, vm.native_model_id, vm.native_revision,
+                c.provider_kind,
+                ({CANDIDATE_AVAILABLE_SQL}) AS enabled,
+                p.currency AS plan_currency,
+                p.text_input_microusd_per_million,
+                p.image_input_microusd_per_million,
+                p.text_output_microusd_per_million,
+                p.image_output_microusd_per_million,
+                p.source_url AS plan_source_url,
+                d.declared_currency
+            FROM supply.offerings o
+            JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+            JOIN supply.channels c ON c.id = o.channel_id
+            --  LEFT JOIN：渠道不按 token 计量量计价的供给没有 Price Plan。
+            LEFT JOIN pricing.price_plans p ON p.id = (
+                SELECT id FROM pricing.price_plans
+                WHERE offering_id = o.id
+                ORDER BY created_at DESC, id DESC
+                LIMIT 1
+            )
+            LEFT JOIN LATERAL (
+                SELECT rr.cost_currency ->> o.id::text AS declared_currency
+                FROM publication.runtime_entries re
+                JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+                WHERE re.offering_id = o.id
+                  AND rr.cost_currency IS NOT NULL
+                  AND jsonb_exists(rr.cost_currency, o.id::text)
+                ORDER BY rr.created_at DESC, rr.id DESC
+                LIMIT 1
+            ) d ON true
+            ORDER BY vm.vendor_id ASC, vm.native_model_id ASC, c.provider_kind ASC, o.id ASC
+            "#
+        )))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                let currency: Option<String> =
+                    row.try_get("plan_currency").map_err(database_error)?;
+                // 与其他读侧同一条口径：没有 Price Plan 的形态不造一份空费率出来——造了会被
+                // "形态与参数不配套"的校验拒掉（见 `active_offering_channels`）。
+                let cost_rates = match currency {
+                    Some(currency) => Some(PricePlanRates {
+                        currency,
+                        text_input_microusd_per_million: to_u64(
+                            row.try_get("text_input_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        image_input_microusd_per_million: to_u64(
+                            row.try_get("image_input_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        text_output_microusd_per_million: to_u64(
+                            row.try_get("text_output_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        image_output_microusd_per_million: to_u64(
+                            row.try_get("image_output_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        source_url: row
+                            .try_get::<Option<String>, _>("plan_source_url")
+                            .map_err(database_error)?
+                            .unwrap_or_default(),
+                    }),
+                    None => None,
+                };
+                let cost_currency = cost_rates
+                    .as_ref()
+                    .map(|rates| rates.currency.clone())
+                    .or(row
+                        .try_get::<Option<String>, _>("declared_currency")
+                        .map_err(database_error)?);
+                Ok(SelectableOfferingView {
+                    offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
+                    vendor_id: row.try_get("vendor_id").map_err(database_error)?,
+                    native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+                    native_revision: row.try_get("native_revision").map_err(database_error)?,
+                    provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+                    provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
+                    adapter_key: row.try_get("adapter_key").map_err(database_error)?,
+                    formula: row.try_get("formula").map_err(database_error)?,
+                    cost_currency,
+                    cost_rates,
+                    enabled: row.try_get("enabled").map_err(database_error)?,
                 })
             })
             .collect()

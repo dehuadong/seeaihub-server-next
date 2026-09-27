@@ -11,7 +11,7 @@ use crate::{
     CustomerUsageView, CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry,
     NewFxRate, ProviderCostGapView, ProviderFailureQuery, ProviderFailureView,
     PublishRuntimeRequest, ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand,
-    RoutingDecision, UnacceptedAttempt,
+    RoutingDecision, SelectableOfferingView, UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -319,6 +319,10 @@ impl HubRepository for AuditRepository {
         &self,
         _offering_ids: &[OfferingId],
     ) -> Result<HashSet<OfferingId>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn selectable_offerings(&self) -> Result<Vec<SelectableOfferingView>, ApplicationError> {
         unused_repository()
     }
 

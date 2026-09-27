@@ -292,6 +292,9 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<std::collections::HashSet<OfferingId>, ApplicationError> {
         unimplemented!()
     }
+    async fn selectable_offerings(&self) -> Result<Vec<SelectableOfferingView>, ApplicationError> {
+        unimplemented!()
+    }
     async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
         unimplemented!()
     }

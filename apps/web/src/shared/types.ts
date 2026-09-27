@@ -51,6 +51,39 @@ export interface GatewayModelsResponse {
   gateway_models: GatewayModel[];
 }
 
+/// 一条**可被运营选中**的供给：发布平台模型时那个 `offering_id` 指向的东西。
+///
+/// 它**不含**渠道地址与凭证变量名——那是渠道部署事实，选择用不到它们（`docs/design/0012` §2.1）。
+export interface SelectableOffering {
+  offering_id: string;
+  /// 厂商（先选它，再在它的分组里选供给）。
+  vendor_id: string;
+  native_model_id: string;
+  native_revision: string;
+  /// 渠道与渠道侧模型名。
+  provider_kind: string;
+  provider_model_id: string;
+  adapter_key: string;
+  /// 这条供给按什么计价。
+  formula: string;
+  /// 渠道成本币种与四档费率（`token_rates` 才有费率）。
+  cost_currency: string | null;
+  cost_rates: {
+    currency: string;
+    text_input_microusd_per_million: number;
+    image_input_microusd_per_million: number;
+    text_output_microusd_per_million: number;
+    image_output_microusd_per_million: number;
+    source_url: string;
+  } | null;
+  /// 能不能选：供给自己启用、且它所属渠道启用。停用的仍列出来并标明。
+  enabled: boolean;
+}
+
+export interface SelectableOfferingsResponse {
+  offerings: SelectableOffering[];
+}
+
 export interface ProviderCostGap {
   job_id: string;
   attempt_id: string;

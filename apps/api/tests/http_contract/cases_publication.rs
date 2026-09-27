@@ -2532,3 +2532,382 @@ async fn the_supply_switches_take_only_enabled_and_need_admin_credentials() {
 
     harness.cleanup().await;
 }
+
+/// 发布命令引用一条**库里没有**的 Offering：400，且答复里必须出现那个标识本身（P3）。
+///
+/// 判据只有这一条：运营照着清单勾了一条、而清单与库不同步时，他要能立刻知道是**哪一条**不见了。
+/// 少一条候选而照样发布成功，等于这次发布的模型少一条路，而运营以为自己选上了。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_reference_to_an_offering_outside_the_supply_table_is_rejected_by_name() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let missing = Uuid::new_v4();
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "vendor_id": "OpenAI",
+            "native_model_id": "missing-reference-model",
+            "native_revision": "route-test-1",
+            "gateway_model": "missing-reference-gateway",
+            "actor": "contract-test",
+            "references": [{
+                "offering_id": missing,
+                "consumer_rates_cny": priced_consumer_rates()
+            }]
+        }))
+        .send()
+        .await
+        .expect("referenced publication");
+    let status = response.status();
+    let text = response.text().await.expect("rejection body");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "引用一条不存在的供给必须被拒：{text}"
+    );
+    assert!(
+        text.contains(&missing.to_string()),
+        "答复必须点名那条取不到的供给：{text}"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 引用一条**已停用**的 Offering：被拒并点名（P3）。停用是"这条现在选不了"，不是"它不存在"。
+///
+/// 三件事一起验：那条供给在清单里照样列着（停用不是删除，所以"不存在"那种答复在这里是错的）、
+/// 拿它去发布被拒、答复能读出是停用/不可用。少一条不拒就是真缺陷：运营能在界面上勾一条停用的
+/// 供给、发布成功，而那个模型从发布那一刻起就有一条路是死的。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_reference_to_a_disabled_offering_is_rejected_by_name() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "disabled-reference-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let mut full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    full["base_url"] = json!("https://disabled.example.com");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract),
+            vec![full]
+        )
+        .await,
+        StatusCode::OK,
+        "夹具那条供给要先发出来，才有东西可停用"
+    );
+
+    let offering_id: Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM supply.offerings o
+         JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+         WHERE vm.native_model_id = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("the offering to disable");
+
+    assert_eq!(
+        patch_offering(&client, &base_url, &admin_token, offering_id, false).await,
+        StatusCode::NO_CONTENT,
+        "停用那条供给"
+    );
+    let still_listed = client
+        .get(format!("{base_url}/api/v1/offerings"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("selectable offerings");
+    let listed: Value = serde_json::from_str(
+        &still_listed
+            .text()
+            .await
+            .expect("selectable offerings body"),
+    )
+    .expect("selectable offerings json");
+    assert!(
+        listed["offerings"]
+            .as_array()
+            .expect("an offerings array")
+            .iter()
+            .any(|offering| offering["offering_id"] == json!(offering_id)
+                && offering["enabled"] == json!(false)),
+        "停用的供给仍然在清单里（停用不是删除）：{listed}"
+    );
+
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "vendor_id": "OpenAI",
+            "native_model_id": model,
+            "native_revision": "route-test-1",
+            "gateway_model": "disabled-reference-gateway",
+            "actor": "contract-test",
+            "references": [{
+                "offering_id": offering_id,
+                "consumer_rates_cny": priced_consumer_rates()
+            }]
+        }))
+        .send()
+        .await
+        .expect("referenced publication");
+    let status = response.status();
+    let text = response.text().await.expect("rejection body");
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "引用一条已停用的供给必须被拒：{text}"
+    );
+    assert!(
+        text.contains(&offering_id.to_string()),
+        "答复必须点名那条选不了的供给：{text}"
+    );
+    // 措辞不指定，但这几个词是"停用/不可用"绕不开的说法：答复必须让人看出为什么选不了，
+    // 而不是笼统的"发布不成立"。
+    let lowered = text.to_lowercase();
+    assert!(
+        ["disabled", "not enabled", "unavailable"]
+            .iter()
+            .any(|hint| lowered.contains(hint)),
+        "答复要能看出是停用/不可用：{text}"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 管理员读可选 Offering 清单（`0012` §2.1、P1）：字段齐全、带 `offering_id`、按厂商与厂商模型名
+/// 稳定排序，且**不含渠道地址与凭证变量名**。
+///
+/// 三个判据不是显然的，各验一条：
+/// - 顺序按 `vendor_id` → `native_model_id` → `provider_kind`，而且**不是插入顺序**（后发布的那台
+///   厂商排在前面）——发布页据此分组，顺序不稳清单就会跳；
+/// - 停用的供给照样列出来并带 `enabled: false`——藏起来等于"关掉之后再也找不到怎么打开"；
+/// - 无管理员凭证是 403，它与网关模型清单在同一层鉴权。
+///
+/// 另外挂一条**没有 Price Plan、也还没被发布过**的按张计价供给（R2 的素材导入就产出这种行）：
+/// 它的成本币种无从谈起，清单读侧该给 `null`，不是报错（`0012` §3 末段：`supply.offerings` 里没有
+/// 成本币种这一列，币种只在 Price Plan 或发布物里）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_selectable_offering_list_carries_the_selection_key_without_deployment_facts() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    // 两台厂商模型各一条供给：厂商标识与模型名故意让"排序结果"与"插入顺序"相反。
+    for (vendor_id, model, channel_url) in [
+        ("OpenAI", "zebra-model", "https://zebra.example.com"),
+        ("AIHubMix", "alpha-model", "https://alpha.example.com"),
+    ] {
+        let contract = surface_schema(json!({
+            "model": {"const": model},
+            "prompt": {"type": "string", "minLength": 1}
+        }));
+        let mut full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+        full["base_url"] = json!(channel_url);
+        full["provider_model_id"] = json!(model);
+        full["capability_schema"]["properties"]["model"]["const"] = json!(model);
+        let response = client
+            .post(format!("{base_url}/api/v1/runtime-revisions"))
+            .bearer_auth(&admin_token)
+            .json(&json!({
+                "vendor_id": vendor_id,
+                "native_model_id": model,
+                "native_revision": "route-test-1",
+                "actor": "contract-test",
+                "capability_schema": contract,
+                "offerings": [full]
+            }))
+            .send()
+            .await
+            .expect("inline publication");
+        let status = response.status();
+        let text = response.text().await.expect("inline publication body");
+        assert_eq!(status, StatusCode::OK, "{model} 应当发布成功：{text}");
+    }
+
+    let anonymous = client
+        .get(format!("{base_url}/api/v1/offerings"))
+        .send()
+        .await
+        .expect("anonymous list");
+    assert_eq!(
+        anonymous.status(),
+        StatusCode::FORBIDDEN,
+        "清单是运营视图，必须管理员凭证"
+    );
+
+    // 一条**按张计价、没有 Price Plan、也还没被发布过**的供给：素材导入产出的就是这种行（R2）。
+    // 直接写在库里，是因为它要验的正是"没有那两处币种来源时读侧怎么办"——走发布路径反而会补上
+    // 发布物里那份成本币种，把这个用例要问的东西遮掉。
+    let per_image_model = "per-image-model";
+    let per_image_offering = Uuid::new_v4();
+    let vendor_model = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema, schema_hash)
+         VALUES ($1, 'AIHubMix', $2, 'route-test-1', '{}'::jsonb, 'per-image-fixture')",
+    )
+    .bind(vendor_model)
+    .bind(per_image_model)
+    .execute(&pool)
+    .await
+    .expect("the per-image vendor model");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1, 'AIHubMix', 'https://per-image.example.com', 'AIHUBMIX_API_KEY')",
+    )
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("the per-image channel");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
+              carrier_schema, parameter_mapping, formula, cost_unit_price_microusd)
+         VALUES ($1, $2, $3, 'aihubmix-image-v1', $4,
+                 '{\"allowed_branches\": [\"prompt_only\"], \"max_reference_images\": 0}'::jsonb,
+                 '{}'::jsonb, '{}'::jsonb, 'per_image', 12345)",
+    )
+    .bind(per_image_offering)
+    .bind(vendor_model)
+    .bind(channel)
+    .bind(per_image_model)
+    .execute(&pool)
+    .await
+    .expect("the per-image offering");
+
+    // 停用其中一条：它仍要在清单里，并把状态带出来。
+    let disabled_offering: Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM supply.offerings o
+         JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+         WHERE vm.vendor_id = 'OpenAI'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the offering to disable");
+    assert_eq!(
+        patch_offering(&client, &base_url, &admin_token, disabled_offering, false).await,
+        StatusCode::NO_CONTENT
+    );
+
+    let response = client
+        .get(format!("{base_url}/api/v1/offerings"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("selectable offerings");
+    let status = response.status();
+    let text = response.text().await.expect("selectable offerings body");
+    assert_eq!(status, StatusCode::OK, "{text}");
+    let body: Value = serde_json::from_str(&text).expect("selectable offerings json");
+    let offerings = body["offerings"]
+        .as_array()
+        .expect("an offerings array")
+        .clone();
+    assert_eq!(
+        offerings.len(),
+        2,
+        "两条供给都要在清单里，停用的也不例外：{text}"
+    );
+
+    for offering in &offerings {
+        let object = offering.as_object().expect("an offering object");
+        for key in [
+            "offering_id",
+            "vendor_id",
+            "native_model_id",
+            "native_revision",
+            "provider_kind",
+            "provider_model_id",
+            "adapter_key",
+            "formula",
+            "cost_currency",
+            "cost_rates",
+            "enabled",
+        ] {
+            assert!(object.contains_key(key), "清单缺 `{key}`：{offering}");
+        }
+        Uuid::parse_str(offering["offering_id"].as_str().expect("offering_id"))
+            .expect("offering_id 是一个 UUID");
+        // 选择的键之外，清单不回显任何渠道部署事实。
+        for forbidden in ["base_url", "credential_env"] {
+            assert!(
+                !object.contains_key(forbidden),
+                "清单不回显渠道部署事实 `{forbidden}`：{offering}"
+            );
+        }
+        assert_eq!(offering["cost_currency"], json!("USD"));
+        assert_eq!(offering["cost_rates"]["currency"], json!("USD"));
+        assert_eq!(
+            offering["cost_rates"]["text_input_microusd_per_million"],
+            json!(5_000_000),
+            "渠道费率取该供给当前那行 Price Plan：{offering}"
+        );
+    }
+
+    let order = offerings
+        .iter()
+        .map(|offering| {
+            (
+                offering["vendor_id"]
+                    .as_str()
+                    .expect("vendor_id")
+                    .to_owned(),
+                offering["native_model_id"]
+                    .as_str()
+                    .expect("native_model_id")
+                    .to_owned(),
+            )
+        })
+        .collect::<Vec<_>>();
+    assert_eq!(
+        order,
+        vec![
+            ("AIHubMix".to_owned(), "alpha-model".to_owned()),
+            ("OpenAI".to_owned(), "zebra-model".to_owned()),
+        ],
+        "清单按 vendor_id → native_model_id 排序，发布页据此分组：{text}"
+    );
+    assert_eq!(
+        offerings
+            .iter()
+            .find(|offering| offering["vendor_id"] == json!("OpenAI"))
+            .expect("停用的那条仍在清单里")["enabled"],
+        json!(false),
+        "停用的供给要标明它选不了：{text}"
+    );
+    assert_eq!(
+        offerings
+            .iter()
+            .find(|offering| offering["vendor_id"] == json!("AIHubMix"))
+            .expect("启用那条")["enabled"],
+        json!(true)
+    );
+
+    drop_isolated_database(&database_name).await;
+}

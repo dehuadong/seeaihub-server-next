@@ -1873,6 +1873,13 @@ pub trait HubRepository: Send + Sync {
         offering_ids: &[OfferingId],
     ) -> Result<Vec<ReferencedOffering>, ApplicationError>;
 
+    /// 管理员读：可被运营选中的 Offering 清单——发布页"选 vendor → 勾 Offering"的数据来源。
+    ///
+    /// 一条供给一项，按厂商、厂商模型名与渠道稳定排序（调用方据此分组）。**不含渠道地址与凭证变量名**：
+    /// 那是渠道部署事实，选择用不到（`docs/design/0012-platform-model-publishing.md` §2.1）。
+    ///
+    /// **不过滤 `enabled`**：停用的照样列出来并带上它的状态，运营才看得出"为什么这条选不了"——藏起来
+    /// 等于"关掉之后再也找不到怎么打开"。库里一条供给都没有时返回空 `Vec`，不是错误。
     async fn selectable_offerings(&self) -> Result<Vec<SelectableOfferingView>, ApplicationError>;
 
     /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
@@ -4326,6 +4333,10 @@ impl RuntimeService {
     /// 取——所以**引用一条不存在的 Offering 要在发布期拒绝并点它的标识**，不能默默少一条候选：少一条
     /// 就意味着这次发布出来的模型少一条路，而那正是运营以为自己选上的那条。
     ///
+    /// 同样拒绝**已停用/不可用**的那条（判据见 [`HubRepository::enabled_offerings`]，与受理期同一处）：
+    /// 受理期会把停用候选筛掉，放过它等于发出去一个当场就有一条路走不通的模型；要复现一条曾被停用的
+    /// 候选，该由运营先把供给启用回来。
+    ///
     /// 契约只在"这次发布第一次引用这个厂商模型"时用到：同一个厂商模型的合同是同一份（模型级唯一）。
     /// 引用必须落在同一个厂商模型上，否则拒绝——一个网关模型在一个时刻只属于一个厂商（`0012` §2.3）。
     async fn resolve_referenced_offerings(
@@ -4348,6 +4359,14 @@ impl RuntimeService {
         }
         let ids: Vec<OfferingId> = references.iter().map(|item| item.offering_id).collect();
         let resolved = self.repository.offerings_by_id(&ids).await?;
+        // **可用性复核**：取到行不等于能选。判据与受理期同一处（供给自己启用、且它所属渠道启用，
+        // 见 [`HubRepository::enabled_offerings`]）——发布出来的候选必须真的能受理，否则"发布成功、
+        // 一条路都走不通"是个要查半天的状态，而引用式发布是最好的拒绝时机：那一刻运营正指着这条供给。
+        //
+        // 要复现一条**曾被停用**的候选，先把供给启用回来再发：停用是运营设的运行状态，不该由发布
+        // 替他悄悄翻回去。所以这里不把 `enabled` 塞进草稿（`0012` §5：技术定义进快照，两个开关不进），
+        // 只当场拒绝。
+        let enabled = self.repository.enabled_offerings(&ids).await?;
         let drafts = references
             .iter()
             .map(|reference| {
@@ -4360,6 +4379,15 @@ impl RuntimeService {
                             reference.offering_id.0
                         ))
                     })?;
+                // 顺序是刻意的：先报**取不到**（不存在），再报**取到了但不可用**。停用不是不存在，
+                // 运营该做的事也不同——去把哪一条启用回来，而不是重选一条。
+                if !enabled.contains(&reference.offering_id) {
+                    return Err(ApplicationError::Validation(format!(
+                        "offering {} is disabled or unavailable: enable this supply (and its \
+                         channel) again before publishing it",
+                        reference.offering_id.0
+                    )));
+                }
                 Ok((reference, found))
             })
             .collect::<Result<Vec<_>, ApplicationError>>()?;
@@ -4490,6 +4518,17 @@ impl RuntimeService {
     /// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。
     pub async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError> {
         self.repository.gateway_models().await
+    }
+
+    /// 管理员读：可被运营选中的 Offering 清单，按厂商与厂商模型名稳定排序。
+    ///
+    /// 它是发布页"选 vendor → 勾 Offering"的数据来源（`docs/design/0012-platform-model-publishing.md`
+    /// §2.1）。**不含渠道地址与凭证变量名**——那是渠道部署事实，选择用不到。停用的供给照样列出来并
+    /// 带上 `enabled: false`，运营要能看出"为什么它选不了"，而不是在清单里凭空少一条。
+    pub async fn selectable_offerings(
+        &self,
+    ) -> Result<Vec<SelectableOfferingView>, ApplicationError> {
+        self.repository.selectable_offerings().await
     }
 
     /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。

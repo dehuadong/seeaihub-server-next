@@ -20,7 +20,7 @@ use seeai_application::{
     NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
     ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
     ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
-    RoutePolicyService, RuntimeService, with_admin_id,
+    RoutePolicyService, RuntimeService, SelectableOfferingView, with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -276,6 +276,7 @@ async fn main() -> Result<()> {
             "/api/v1/gateway-models/{gateway_model}",
             patch(set_gateway_model_enabled),
         )
+        .route("/api/v1/offerings", get(list_selectable_offerings))
         .route(
             "/api/v1/offerings/{offering_id}",
             patch(set_offering_enabled),
@@ -1778,6 +1779,28 @@ async fn set_gateway_model_enabled(
         .set_gateway_model_enabled(&gateway_model, body.enabled, "admin-api")
         .await?;
     Ok(StatusCode::NO_CONTENT)
+}
+
+/// 管理员读：可选 Offering 清单的响应。
+///
+/// 与 [`GatewayModelsResponse`] 同一个理由用 `offerings` 包一层：这条视图只增字段，有外层对象才
+/// 不会每加一样就改一次响应的顶层形状。
+#[derive(Debug, Serialize)]
+struct SelectableOfferingsResponse {
+    offerings: Vec<SelectableOfferingView>,
+}
+
+/// 管理员读：工程师配好的供给清单，发布页"选 vendor → 勾 Offering"的数据来源。
+///
+/// **需要管理员凭证**：它是运营视图。**不回显渠道地址与凭证变量名**——那是渠道部署事实，选择用不到
+/// （`docs/design/0012-platform-model-publishing.md` §2.1）。停用的供给照样列出来并带
+/// `enabled: false`，运营要能看出"为什么它选不了"。全部数据来自数据库，不读缓存。
+async fn list_selectable_offerings(
+    State(state): State<AppState>,
+) -> Result<Json<SelectableOfferingsResponse>, ApiError> {
+    Ok(Json(SelectableOfferingsResponse {
+        offerings: state.runtime.selectable_offerings().await?,
+    }))
 }
 
 /// 供给级启停的请求体：**唯一可变位**就是 `enabled`。
