@@ -21,8 +21,12 @@ _Avoid_: Provider Schema、渠道请求格式、跨厂商统一图片参数
 _Avoid_: Vendor
 
 **Offering**:
-Provider 通过特定 Adapter 和 Channel 提供某个 Vendor Model Revision 的可调用供给。
-_Avoid_: 模型、渠道
+Provider 通过特定 Adapter 和 Channel 提供某个 Vendor Model Revision 的可调用供给。它是**工程师配好的资产**，不随每次发布重写；一个 Gateway Model 由一组有序的 Offering 供应，运营选的是这些 Offering。
+_Avoid_: 模型、渠道、把 Offering 说成"渠道模型"
+
+**供应商模型名**（Provider Model）:
+平台向**某个 Provider 的某个 Channel** 请求时用的那个模型标识（库里是 `supply.offerings.provider_model_id`）。它由 Provider 的命名习惯决定，可能等于厂商原生名，也可能是别名——它与 Vendor 原生名、与 Gateway Model 名都是分开的角色。
+_Avoid_: 渠道模型、把供应商模型名当成厂商原生名、把它当成对外的 `model`
 
 **Offering Parameter Mapping**:
 把 Vendor Model Contract 里的参数转换成某个 Offering **实际要求的渠道包装**的那一层（改名、位置、枚举、单位、默认值、字段的拆分与合并、能力子集的声明）。粒度是 **Vendor Model × Offering**，不是全局 Vendor 或全局 Provider。它属于平台内部，不是调用方契约，也不是 Provider Adapter 的职责（Adapter 只做渠道级传输与归一）。归属见 `docs/adr/0015`。
@@ -65,8 +69,16 @@ _Avoid_: 费用、估算值
 _Avoid_: Metered Usage、费用
 
 **Provider Cost**（渠道成本事实）:
-一次执行留下的**成本平面**事实：**成本从哪来**，取值只有三个（`computed` = 渠道不给金额字段，平台按该条 Offering 的[计价形态](#pricing-formula计价形态)自算；`declared` = 渠道终态**直接给了金额**，比自算权威，直接取它；`unavailable` = 本该有金额却拿不到、或按登记的形态算不出来——**不得猜测**），以及金额与**该渠道声明的币种**（不假定 USD）。它与 [Pricing Formula](#pricing-formula计价形态) 是两个层级：**计价形态说这个渠道按什么单位算钱**（渠道事实，随发布冻结），**来源三态说这一笔的钱实际从哪来**（执行事实）。它与 `Metering Evidence` 并列但**不是计量证据**：金额不替代分项 token，也**不参与对客金额**（对客只有一个币种 CNY），只进 [Gross Margin](#gross-margin毛利) 口径。只有请求根本没交到渠道的执行才没有成本事实，那时的空值是"根本没采"，不是"成本是 0"；`unavailable` 那笔**不进对账态**（对客结算照常完成），缺口由运营核上游账单后补录。成本事实的采集、折算与缺口处置见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §7。
-_Avoid_: 把渠道报的金额当成计量证据或对客售价、用"金额对不对"代替来源判定、拿不到金额时用自算或 0 顶替、把成本缺口推进对账态、把计价形态与来源三态混成一个量
+一次执行留下的**成本平面**事实。它由两个**分开的量**说清：**成本怎么算**（[Cost Basis](#cost-basis成本口径)，两态）与**这一笔的金额实际从哪来**（[Provider Cost Source](#provider-cost-source成本来源)，三态），加上金额与**该渠道声明的币种**（不假定 USD）。两个量不能互相顶替：只问"怎么算"会把"本该有金额却拿不到"和"根本不用算"混成一件事，只问"从哪来"则说不出自算时的口径。它与 [Pricing Formula](#pricing-formula计价形态) 也分层：计价形态说这个渠道按什么单位算钱（渠道事实，随发布冻结），成本口径说这条 Offering 的成本由谁定，成本来源说这一笔实际发生了什么。它与 `Metering Evidence` 并列但**不是计量证据**：金额不替代分项 token，也**不参与对客金额**（对客只有一个币种 CNY），只进 [Gross Margin](#gross-margin毛利) 口径。只有请求根本没交到渠道的执行才没有成本事实，那时的空值是"根本没采"，不是"成本是 0"；`unavailable` 那笔**不进对账态**（对客结算照常完成），缺口由运营核上游账单后补录。成本事实的采集、折算与缺口处置见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §7。
+_Avoid_: 把渠道报的金额当成计量证据或对客售价、用"金额对不对"代替来源判定、拿不到金额时用自算或 0 顶替、把成本缺口推进对账态、把成本口径与成本来源混成一个量
+
+**Cost Basis**（成本口径）:
+这条 Offering 的**成本由谁定**，随发布冻结：`computed` = 渠道不给金额字段，平台按该条 Offering 的计价形态与实际用量自算；`declared` = 渠道终态直接给金额，直接取它、不自己算。
+_Avoid_: 把它与成本来源混成一个量、把计价形态当成成本口径
+
+**Provider Cost Source**（成本来源）:
+**某一笔执行**的金额实际从哪来，三态：`computed`（自算得到）、`declared`（渠道直接给了）、`unavailable`（本该有金额却拿不到，或按登记的形态算不出来——**不得猜测**）。它是执行事实，不随发布冻结。
+_Avoid_: 拿它当发布物、缺金额时用自算或 0 顶替
 
 **Routing Priority**:
 同一 Vendor Model 的候选 Offering 之间的**档位**，随 Runtime Revision 发布；数字小者优先，受理时在合格候选里取档位最小的那一档。它是**发布决定**，不由请求参数或 Adapter 决定，也不由价格自动推导。发布时也可以给多条候选同一个档位，让它们**落在同一档**（同档再按 [Routing Weight](#routing-weight档内权重) 分摊）。档位怎么表达、怎么取见 [路由策略与缓存](docs/design/0008-routing-strategy-and-caching.md) §1–§2。
@@ -125,8 +137,8 @@ _Avoid_: 与 Platform Funding Failure 混用；把平台在渠道侧的额度问
 _Avoid_: 把渠道的状态码或错误码当对客码、用 `insufficient_user_quota`/`payment_required` 这类渠道标识符对客、把平台欠费说成消费者余额不足
 
 **Gateway Model**（对外的模型字段 `model`）:
-运营发布时给某个 Vendor Model Revision 的那个**平台型号名**；对客接口里它就是对外的 `model`。它与 **Vendor Model**（厂商的模型产品）、以及真正发给渠道的 **Provider Model** 是三个分开的角色：同一次调用里，调用方只认 `model`，落到哪个厂商模型、换成什么渠道模型名，由平台内部决定。
-_Avoid_: 把 `model` 当成厂商原生模型名、让调用方按渠道改写模型名、把三个角色合并成一个字段
+平台**自己的那个模型**：运营给它起名、选它指向哪个 Vendor Model Revision、配它由哪些 Offering 供应、定它的价，并启用或停用它。它是对客面唯一存在的模型身份——调用方提交的 `model` 就是它的名字，也是被受理、被定价、被启停的那个对象。它与 **Vendor Model**（厂商的模型产品）以及真正发给渠道的 **供应商模型名** 是三个分开的角色：同一次调用里，调用方只认 `model`，落到哪个厂商模型、换成什么供应商模型名，由平台内部决定。
+_Avoid_: 平台模型、网关模型、把 `model` 当成厂商原生模型名、把这三个角色合并成一个字段
 
 **Acceleration Cache**（加速层）:
 路由候选集与账户余额的缓存，**只做加速、不是事实源**：金额判定与选路结果的正确性不依赖它，扣减与余额事实只在 PostgreSQL 事务里发生。缓存写入一律发生在**数据库提交之后**、写的是**提交后的值**（不是增量命令），与数据库不一致时以数据库为准。这一层没配置时不构造，行为与没有它时相同；配了但连不上、超时或命令报错，一律当"这次没命中"，回源数据库。键与值见 [路由策略与缓存](docs/design/0008-routing-strategy-and-caching.md) §7.2。

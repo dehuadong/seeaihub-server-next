@@ -133,11 +133,13 @@
 }
 ```
 
-它是**只读投影**：数据源是生效修订（`runtime_entries` + `runtime_revisions` + `catalog.vendor_models`）加运维开关（`publication.gateway_models`）。不新增"编辑态"，也不回显渠道凭证（`credential_env` 只记变量名，本来就不进响应）。**示例里的 `weight` 归路由策略层，P3 落地后才出现**：本切片（P1）的管理端响应里没有它，示例保留该字段只为标出将来的位置。示例里的 `pricing` 各项只占字段位，并标出**币种平面**（[`0007`](./0007-pricing-floor-and-settlement.md) §8）：每个候选各带**该候选的渠道成本**（`reference_cost_microusd`，**原币种**微单位，**只作定价参考**）、**它的成本币种**（`cost_currency`）、**按候选的对客费率向量**（`consumer_rates_cny`，**四档 CNY**，管理员设定/推导）与**它的成本来源**（`cost_basis`），`markup_bps` 是**加价系数**（**每网关模型一个**）；汇率是**全局按币种维护**的折算率（`pricing.fx_rates`，渠道币种 → CNY），不随修订发布、**受理时按该候选的 `cost_currency` 取"受理时刻生效的那一行"并快照进 Price Snapshot**（[`0007`](./0007-pricing-floor-and-settlement.md) §2）。**对客费率向量由管理员按"该候选的成本单价 × 倍率 × 该币种 → CNY 的折算率"设定/推导（倍率 = 1 + `markup_bps` / 10000），随修订发布、随 Job 快照冻结**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §4），**因此同一网关模型的不同候选价格不同**；`reference_cost_microusd` 只作定价参考、**不是售价的被乘数**；**加价系数由管理员创建网关模型时录入、汇率由管理员在后台维护，数值本身不属设计决策**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §10）。按张 / 按次 / 上游给金额的候选没有这份向量，它们的对客价由结算按冻结的成本单价 × 倍率 × 折算率算出（[`0007`](./0007-pricing-floor-and-settlement.md) §2）。
+它是**只读投影**：数据源是生效修订（`runtime_entries` + `runtime_revisions` + `catalog.vendor_models`）加运维开关（`publication.gateway_models`）。不新增"编辑态"，也不回显渠道凭证（`credential_env` 只记变量名，本来就不进响应）。响应回显每条候选的 `routing_priority` 与 `weight`（路由策略层见 [`0008`](./0008-routing-strategy-and-caching.md)）。示例里的 `pricing` 各项只占字段位，并标出**币种平面**（[`0007`](./0007-pricing-floor-and-settlement.md) §8）：每个候选各带**该候选的渠道成本**（`reference_cost_microusd`，**原币种**微单位，**只作定价参考**）、**它的成本币种**（`cost_currency`）、**按候选的对客费率向量**（`consumer_rates_cny`，**四档 CNY**，管理员设定/推导）与**它的成本口径**（`cost_basis`），`markup_bps` 是**加价系数**（**每网关模型一个**）；汇率是**全局按币种维护**的折算率（`pricing.fx_rates`，渠道币种 → CNY），不随修订发布、**受理时按该候选的 `cost_currency` 取"受理时刻生效的那一行"并快照进 Price Snapshot**（[`0007`](./0007-pricing-floor-and-settlement.md) §2）。**对客费率向量由管理员按"该候选的成本单价 × 倍率 × 该币种 → CNY 的折算率"设定/推导（倍率 = 1 + `markup_bps` / 10000），随修订发布、随 Job 快照冻结**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §4），**因此同一网关模型的不同候选价格不同**；`reference_cost_microusd` 只作定价参考、**不是售价的被乘数**；**加价系数由管理员创建网关模型时录入、汇率由管理员在后台维护，数值本身不属设计决策**（[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §10）。按张 / 按次 / 上游给金额的候选没有这份向量，它们的对客价由结算按冻结的成本单价 × 倍率 × 折算率算出（[`0007`](./0007-pricing-floor-and-settlement.md) §2）。
 
-### 2.3 写路径：沿用整份发布，新增一个字段
+### 2.3 写路径：发布一次，原子替换
 
-`POST /api/v1/runtime-revisions`（管理员，已有）新增 `gateway_model`；其余形状不变——一次请求 = 一个网关模型的**完整定义**（合同引用、候选数组、顺序、权重、定价），**原子替换**该名字的生效条目，落一份**不可变修订**。
+`POST /api/v1/runtime-revisions`（管理员，已有）接受 `gateway_model` 与这次要的候选集合；一次请求 = 一个网关模型的**完整定义**（它指向哪个 Vendor Model Revision、由哪组 Offering 供应、顺序与权重、定价），**原子替换**该名字的生效条目，落一份**不可变修订**。
+
+**候选怎么给，见 [`0012`](./0012-platform-model-publishing.md)**：运营给的是"选中的 Offering + 这条候选的价"，渠道三要素、驱动器、承载面与参数映射由 Offering 决定、从库里取；不在命令里内联。
 
 ### 2.4 为什么不做分步 CRUD / 草稿态
 
