@@ -1176,11 +1176,24 @@ async fn login_customer(
 }
 
 /// 对客退出（`DELETE /v1/customer/sessions`）。
+/// 对客退出（`DELETE /v1/customer/sessions`）。成功后这一行会话就没了。
+///
+/// **先鉴别、再删**，与管理员那条（`logout_admin` 走 `require_admin_self`）同一形状：无凭据或凭据已经
+/// 不作数时回答"未认证"，而不是回一个 204。少了这一步，随便递一个没用的令牌都能"退出成功"——调用方
+/// 于是以为自己的会话还好好地在那儿（它并不知道对方已经把什么都当成功了），而这条答复什么都不说。
 async fn logout_customer(
     State(state): State<AppState>,
     headers: HeaderMap,
 ) -> Result<StatusCode, ApiError> {
     let token = bearer_token(&headers)?;
+    if state
+        .identity
+        .authenticate_customer_session(token)
+        .await?
+        .is_none()
+    {
+        return Err(unauthorized());
+    }
     state.identity.logout_customer(token).await?;
     Ok(StatusCode::NO_CONTENT)
 }

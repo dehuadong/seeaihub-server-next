@@ -504,6 +504,135 @@ async fn the_bootstrap_never_overwrites_a_changed_password() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 对客面"未认证"的三种来源都回同一个答复（V-C10）：没带凭据、会话已退出、会话已过期。
+///
+/// 判据点名的是这三种都要回**未认证**，而不是"不存在"或"无权"——三者合成一个答复，调用方才知道该做
+/// 的事是重新登录，而不是去查"这个账户是不是没了"。
+///
+/// 退出与过期都必须**真的**拒绝，所以要各造一次：退出走 `DELETE /v1/customer/sessions`（判据里那句
+/// "已退出"就是它），过期不靠等待，直接在真库里把这一行推到过去（与管理员那条 `an_expired_session_is_rejected`
+/// 同一套夹具做法）。
+///
+/// 两处账务读都问一遍：只验一个端点的话，"某一个处理器忘了过鉴权"照样过。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_customer_is_unauthenticated_without_a_credential_or_after_logout_or_expiry() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let email = "customer-unauthenticated@example.com";
+    let password = "a-long-enough-password";
+    let opened = client
+        .post(format!("{base_url}/api/v1/customers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("open customer request");
+    assert_eq!(opened.status(), StatusCode::CREATED);
+
+    let login = || {
+        let client = client.clone();
+        let url = format!("{base_url}/v1/customer/sessions");
+        async move {
+            client
+                .post(url)
+                .json(&json!({"email": email, "password": password}))
+                .send()
+                .await
+                .expect("customer login request")
+                .json::<Value>()
+                .await
+                .expect("login body")["token"]
+                .as_str()
+                .expect("token")
+                .to_owned()
+        }
+    };
+
+    // 两个账务读：判据说的是"客户账务与密钥端点"，所以要各问一遍。
+    let reads = ["/v1/customer/ledger?limit=1", "/v1/customer/usage?limit=1"];
+
+    let refused = |token: Option<String>| {
+        let client = client.clone();
+        let base = base_url.clone();
+        async move {
+            let mut answers = Vec::new();
+            for path in reads {
+                let mut request = client.get(format!("{base}{path}"));
+                if let Some(token) = &token {
+                    request = request.bearer_auth(token);
+                }
+                let response = request.send().await.expect("customer read");
+                let status = response.status();
+                let body = response.text().await.expect("refused body");
+                answers.push((path, status, body));
+            }
+            answers
+        }
+    };
+
+    // 一、没带凭据。
+    for (path, status, body) in refused(None).await {
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 不带凭据要回未认证：{body}");
+        assert!(
+            body.contains("authorization_required"),
+            "{path} 的答复要说清是缺凭据：{body}"
+        );
+    }
+
+    // 二、会话已退出。先确认它能用，否则下面的 401 证明不了"退出把它废了"。
+    let after_logout = login().await;
+    let usable = client
+        .get(format!("{base_url}/v1/customer/ledger?limit=1"))
+        .bearer_auth(&after_logout)
+        .send()
+        .await
+        .expect("usable read");
+    assert_eq!(usable.status(), StatusCode::OK, "刚登录的会话必须能用");
+
+    let logged_out = client
+        .delete(format!("{base_url}/v1/customer/sessions"))
+        .bearer_auth(&after_logout)
+        .send()
+        .await
+        .expect("logout request");
+    assert_eq!(logged_out.status(), StatusCode::NO_CONTENT);
+    for (path, status, body) in refused(Some(after_logout.clone())).await {
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 退出后要回未认证：{body}");
+    }
+    // 再退一次：这一行已经没了，仍然只能回未认证（不能回 500 或 404）。
+    let again = client
+        .delete(format!("{base_url}/v1/customer/sessions"))
+        .bearer_auth(&after_logout)
+        .send()
+        .await
+        .expect("second logout request");
+    assert_eq!(again.status(), StatusCode::UNAUTHORIZED, "重复退出要回未认证");
+
+    // 三、会话已过期：把这一行推到过去，不靠等待。
+    let expired = login().await;
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let updated = sqlx::query(
+        "UPDATE identity.customer_sessions SET expires_at = now() - interval '1 minute' \
+         WHERE token_hash = $1",
+    )
+    .bind(seeai_application::session_token_hash(&expired))
+    .execute(&pool)
+    .await
+    .expect("expire the customer session")
+    .rows_affected();
+    assert_eq!(updated, 1, "夹具必须改到那一行");
+    for (path, status, body) in refused(Some(expired)).await {
+        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 过期后要回未认证：{body}");
+    }
+
+    pool.close().await;
+    drop_isolated_database(&database_name).await;
+}
+
 /// 客户口令出路整条链（V-C9/C12/C14）：运营开户给初始口令 → 客户改口令 → 旧会话失效；
 /// 另一条：运营只签重置令牌 → 客户凭它设口令 → 能登录，且**签发留了痕**。
 #[tokio::test]
