@@ -274,6 +274,12 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
         unimplemented!()
     }
+    async fn active_offering_channels(
+        &self,
+        _gateway_model: &str,
+    ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
+        unimplemented!()
+    }
     async fn enabled_offerings(
         &self,
         _offering_ids: &[OfferingId],

@@ -1,13 +1,14 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
-    AcceptanceProbe, AccountSummary, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange,
-    ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary, CustomerUsageKind,
-    CustomerUsageView, CustomerView, GatewayModelCandidateView, GatewayModelView, HoldDisposition,
-    HubRepository, JobView, LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand,
-    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
-    RoutingDecision, UnacceptedAttempt, customer_usage_status, declared_output_images,
+    AcceptanceProbe, AccountSummary, ActiveOfferingChannel, ApiKeyView, ApplicationError,
+    AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery,
+    CustomerBillingSummary, CustomerUsageKind, CustomerUsageView, CustomerView,
+    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
+    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
+    UnacceptedAttempt, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -719,6 +720,43 @@ impl HubRepository for PgHubRepository {
             }
         }
         Ok(candidates)
+    }
+
+    /// 该型号当前生效修订里可被沿用的候选：供应商、渠道模型名与渠道三要素。
+    ///
+    /// 与 [`Self::active_offering`] 的差别只有一处：**不过滤 `enabled`**。停用的候选也要能被沿用——
+    /// "改价之后重新启用"是常见动作，按启用状态过滤会让它在改价时突然找不到，而那种失败看起来像
+    /// "这个候选不存在"。其余判据（取当前生效修订、按网关模型名）与那条读一致。
+    async fn active_offering_channels(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
+        let rows = sqlx::query(
+            r#"
+            SELECT o.provider_model_id, o.adapter_key, c.provider_kind, c.base_url, c.credential_env
+            FROM publication.runtime_entries re
+            JOIN supply.offerings o ON o.id = re.offering_id
+            JOIN supply.channels c ON c.id = o.channel_id
+            WHERE re.active AND re.gateway_model = $1
+            ORDER BY c.provider_kind, o.provider_model_id, o.id
+            "#,
+        )
+        .bind(gateway_model)
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                use sqlx::Row as _;
+                Ok(ActiveOfferingChannel {
+                    provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
+                    adapter_key: row.try_get("adapter_key").map_err(database_error)?,
+                    provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+                    base_url: row.try_get("base_url").map_err(database_error)?,
+                    credential_env: row.try_get("credential_env").map_err(database_error)?,
+                })
+            })
+            .collect()
     }
 
     async fn enabled_offerings(

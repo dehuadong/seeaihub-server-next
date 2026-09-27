@@ -274,6 +274,13 @@ impl HubRepository for WorkerRepository {
         unused_repository()
     }
 
+    async fn active_offering_channels(
+        &self,
+        _gateway_model: &str,
+    ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
+        unused_repository()
+    }
+
     async fn enabled_offerings(
         &self,
         _offering_ids: &[OfferingId],

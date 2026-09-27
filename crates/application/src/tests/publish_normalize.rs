@@ -1,5 +1,135 @@
 use super::*;
 
+/// 省略渠道的候选（渠道三要素与驱动器留空），用来验增量发布的沿用规则。
+fn draft_without_channel(provider_model_id: &str) -> OfferingDraft {
+    OfferingDraft {
+        base_url: None,
+        credential_env: None,
+        adapter_key: None,
+        ..draft(provider_model_id)
+    }
+}
+
+/// 上一版里可被沿用的一条候选。
+fn previous_offering(
+    provider_kind: &str,
+    provider_model_id: &str,
+    base_url: &str,
+) -> ActiveOfferingChannel {
+    ActiveOfferingChannel {
+        provider_kind: provider_kind.to_owned(),
+        provider_model_id: provider_model_id.to_owned(),
+        adapter_key: "aihubmix-image-v1".to_owned(),
+        base_url: base_url.to_owned(),
+        credential_env: "AIHUBMIX_API_KEY".to_owned(),
+    }
+}
+
+/// 省略渠道的候选，渠道三要素与驱动器从上一版同 `provider_kind` + `provider_model_id` 的那条取。
+#[test]
+fn an_omitted_channel_is_inherited_from_the_current_revision() {
+    let previous = vec![previous_offering(
+        "AIHubMix",
+        "gpt-image-2.5-flare",
+        "https://api.example.com",
+    )];
+    let inherited = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &previous)
+        .expect("the channel is inheritable");
+    assert_eq!(
+        inherited.base_url.as_deref(),
+        Some("https://api.example.com")
+    );
+    assert_eq!(
+        inherited.credential_env.as_deref(),
+        Some("AIHUBMIX_API_KEY")
+    );
+    assert_eq!(inherited.adapter_key.as_deref(), Some("aihubmix-image-v1"));
+    assert_eq!(inherited.provider_kind.as_deref(), Some("AIHubMix"));
+}
+
+/// 整组给了渠道就不沿用：**这条**发布声明的渠道优先于上一版。
+#[test]
+fn a_declared_channel_is_not_overwritten_by_the_previous_revision() {
+    let previous = vec![previous_offering(
+        "AIHubMix",
+        "gpt-image-2.5-flare",
+        "https://old.example.com",
+    )];
+    let declared = OfferingDraft {
+        base_url: Some("https://new.example.com".to_owned()),
+        ..draft("gpt-image-2.5-flare")
+    };
+    let kept = inherit_channel(&declared, &previous).expect("a declared channel passes through");
+    assert_eq!(kept.base_url.as_deref(), Some("https://new.example.com"));
+}
+
+/// 上一版里没有同身份的候选（例如新加的候选）：拒绝并点名，不用"最近的那条"顶替。
+#[test]
+fn an_omitted_channel_without_a_matching_previous_offering_is_rejected() {
+    let previous = vec![previous_offering(
+        "AIHubMix",
+        "another-model",
+        "https://api.example.com",
+    )];
+    let error = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &previous)
+        .expect_err("no match must be rejected");
+    let text = error.to_string();
+    assert!(text.contains("no offering with that identity"), "{text}");
+    assert!(text.contains("give the channel explicitly"), "{text}");
+}
+
+/// 同一 `provider_kind` 与渠道模型名在上一版有多条候选：**歧义，拒绝**。
+///
+/// 两条不同渠道（地址或凭证身份不同）可以提供同一个渠道模型名，那时"沿用哪一条"没有唯一答案。
+#[test]
+fn an_ambiguous_omitted_channel_is_rejected() {
+    let previous = vec![
+        previous_offering("AIHubMix", "gpt-image-2.5-flare", "https://a.example.com"),
+        previous_offering("AIHubMix", "gpt-image-2.5-flare", "https://b.example.com"),
+    ];
+    let error = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &previous)
+        .expect_err("ambiguity must be rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("more than one offering with that identity"),
+        "{error}"
+    );
+}
+
+/// 省略了渠道，却连"这条候选是谁"都没说（缺 `provider_kind` 或渠道模型名）：拒绝。
+#[test]
+fn an_omitted_channel_without_an_identity_is_rejected() {
+    let previous = vec![previous_offering(
+        "AIHubMix",
+        "gpt-image-2.5-flare",
+        "https://a.example.com",
+    )];
+    let anonymous = OfferingDraft {
+        provider_kind: None,
+        ..draft_without_channel("gpt-image-2.5-flare")
+    };
+    let error =
+        inherit_channel(&anonymous, &previous).expect_err("an anonymous candidate is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("does not say which offering it continues"),
+        "{error}"
+    );
+}
+
+/// 型号还没有任何生效修订（沿用来源为空）：拒绝。
+#[test]
+fn an_omitted_channel_is_rejected_when_the_model_has_no_revision() {
+    let error = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &[])
+        .expect_err("an empty previous revision cannot be inherited from");
+    assert!(
+        error.to_string().contains("no offering with that identity"),
+        "{error}"
+    );
+}
+
 #[test]
 fn normalize_rejects_an_empty_offering_array() {
     let command = PublishRuntimeCommand {

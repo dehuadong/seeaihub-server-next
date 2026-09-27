@@ -140,11 +140,11 @@ pub(super) fn price_plan() -> PricePlanDraft {
 /// 一个候选：**过渡期的老素材形状**——只给 offering 级旧字段，合同由它回退得来。
 pub(super) fn draft(provider_model_id: &str) -> OfferingDraft {
     OfferingDraft {
-        provider_kind: "AIHubMix".to_owned(),
-        adapter_key: "aihubmix-image-v1".to_owned(),
+        provider_kind: Some("AIHubMix".to_owned()),
+        adapter_key: Some("aihubmix-image-v1".to_owned()),
         provider_model_id: provider_model_id.to_owned(),
-        base_url: "https://api.inferera.com".to_owned(),
-        credential_env: "AIHUBMIX_API_KEY".to_owned(),
+        base_url: Some("https://api.inferera.com".to_owned()),
+        credential_env: Some("AIHUBMIX_API_KEY".to_owned()),
         routing_priority: None,
         weight: None,
         restrictions: serde_json::json!({}),

@@ -141,11 +141,22 @@ pub struct PublishRuntimeRequest {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct OfferingDraft {
-    pub provider_kind: String,
-    pub adapter_key: String,
+    /// 渠道身份的三个字段与驱动器：**可以整组省略**（见 `docs/design/0010` §4.1 的增量发布），
+    /// 省略时由服务端从该型号当前生效的修订按 `provider_kind` + `provider_model_id` 复用。
+    ///
+    /// 用 `Option` 而不是空串：这样"没给"与"给了空串"分得开——前者是沿用，后者是发布者显式声明了
+    /// 一个空值，按参数错误拒绝。
+    #[serde(default)]
+    pub provider_kind: Option<String>,
+    #[serde(default)]
+    pub adapter_key: Option<String>,
+    /// 认同一条候选用的另一半身份；**不可省略**（省略它连"这条候选是谁"都说不清）。
+    #[serde(default)]
     pub provider_model_id: String,
-    pub base_url: String,
-    pub credential_env: String,
+    #[serde(default)]
+    pub base_url: Option<String>,
+    #[serde(default)]
+    pub credential_env: Option<String>,
     /// **这条候选的档位**：数字小者优先。
     ///
     /// 缺省时取它在 `offerings` 数组里的**下标**——这是今天的口径，也是"顺序即优先级"的
@@ -464,11 +475,13 @@ impl PublishRuntimeCommand {
                     carrier_schema,
                     parameter_mapping: draft.parameter_mapping.clone(),
                     restrictions: draft.restrictions.clone(),
-                    provider_kind: draft.provider_kind.clone(),
-                    adapter_key: draft.adapter_key.clone(),
+                    // 渠道字段在这之前已经补齐（增量发布），所以这里按"必填"取；取不到就是空串，
+                    // 由逐候选校验按"渠道身份不完整"拒绝。
+                    provider_kind: draft.provider_kind.clone().unwrap_or_default(),
+                    adapter_key: draft.adapter_key.clone().unwrap_or_default(),
                     provider_model_id: draft.provider_model_id.clone(),
-                    base_url: draft.base_url.clone(),
-                    credential_env: draft.credential_env.clone(),
+                    base_url: draft.base_url.clone().unwrap_or_default(),
+                    credential_env: draft.credential_env.clone().unwrap_or_default(),
                     formula: billing.formula,
                     rates: billing.rates,
                     price_source_url: billing.price_source_url,
@@ -1789,6 +1802,16 @@ pub trait HubRepository: Send + Sync {
         &self,
         request: PublishRuntimeRequest,
     ) -> Result<PublishedRevision, ApplicationError>;
+
+    /// 该型号**当前生效**的修订里，可以按身份被沿用的候选：按 `provider_kind` 给出候选与其渠道三要素。
+    ///
+    /// 它是增量发布的依据（见 `docs/design/0010` §4.1）：发布命令省略渠道三要素时，服务端要能从上一版
+    /// 取回它们。**不过滤 `enabled`**——停用的候选也可能要被"沿用之后重新启用"，按启用状态过滤会让它
+    /// 在改价时突然找不到。型号无从查起（没有生效修订）时返回空 `Vec`。
+    async fn active_offering_channels(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError>;
 
     /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
     ///
@@ -4187,9 +4210,13 @@ impl RuntimeService {
 
     /// 发布一个 Vendor Model 的供给（完整候选集合）。
     ///
-    /// 顺序：形状归一到 [`NormalizedPublication`] → 命令级字段校验 → **合同**校验 →
-    /// **逐候选**校验（承载面落在合同与 Driver 之内、base_url、计价、Adapter 兼容性）→
+    /// 顺序：**补齐可省略的渠道字段**（见下）→ 形状归一到 [`NormalizedPublication`] → 命令级字段校验 →
+    /// **合同**校验 → **逐候选**校验（承载面落在合同与 Driver 之内、base_url、计价、Adapter 兼容性）→
     /// 交给仓库逐项写入。校验不通过时不产生任何 revision 行。
+    ///
+    /// **增量发布**（`docs/design/0010` §4.1）：候选的渠道三要素与驱动器可以整组省略，从该型号当前生效
+    /// 的修订按 `provider_kind` + `provider_model_id` 复用同一条候选的值。读上一版与写新修订是两次仓库
+    /// 调用，但它们之间不会插进另一次发布——发布事务按网关模型取排他锁，同一型号的发布是串行的。
     pub async fn publish(
         &self,
         command: PublishRuntimeCommand,
@@ -4209,7 +4236,7 @@ impl RuntimeService {
         let NormalizedPublication {
             contract,
             offerings,
-        } = command.normalize()?;
+        } = self.resolve_inheritance(&command).await?;
         validate_contract(&command.native_model_id, &contract)?;
         let mut normalized = Vec::with_capacity(offerings.len());
         for offering in offerings {
@@ -4226,6 +4253,46 @@ impl RuntimeService {
         // 受理时的比对必然不一致（见 `AccelerationService::candidates`）。
         self.acceleration.invalidate_route(&gateway_model).await;
         Ok(revision)
+    }
+
+    /// 把命令里可省略的渠道字段补齐，再归一成一份合同与一个有序候选列表。
+    ///
+    /// 省略的判定在 [`command_omits_channel`] 的文档里：**渠道三要素与驱动器要么整组给、要么整组省**。
+    /// 补的来源是该型号当前生效的修订，按 `provider_kind` + `provider_model_id` 认同一条候选；同一
+    /// `provider_kind` 在该型号下有多条候选时拒绝——不选"最便宜"或"下标最近"的那条顶替。
+    async fn resolve_inheritance(
+        &self,
+        command: &PublishRuntimeCommand,
+    ) -> Result<NormalizedPublication, ApplicationError> {
+        let drafts = command.offerings.as_deref().ok_or_else(|| {
+            ApplicationError::Validation(
+                "offerings is required: publish the model's complete, ordered offering list"
+                    .to_owned(),
+            )
+        })?;
+        if !drafts.iter().any(command_omits_channel) {
+            // 没有一条省略：不必读上一版，走原路径。
+            return command.normalize();
+        }
+        let gateway_model = command
+            .gateway_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(command.native_model_id.as_str());
+        let previous = self
+            .repository
+            .active_offering_channels(gateway_model)
+            .await?;
+        let completed = drafts
+            .iter()
+            .map(|draft| inherit_channel(draft, &previous))
+            .collect::<Result<Vec<_>, _>>()?;
+        PublishRuntimeCommand {
+            offerings: Some(completed),
+            ..command.clone()
+        }
+        .normalize()
     }
 
     /// 对客目录：当前真的能调的模型与它们的合同。
@@ -4581,6 +4648,81 @@ fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), Appl
         ));
     }
     Ok(())
+}
+
+/// 该型号当前生效修订里**可以按身份被沿用**的一条候选：供应商、渠道模型名与它的渠道三要素。
+///
+/// 它不带 `enabled`：停用的候选也要能被沿用（"改价之后重新启用"是常见动作），按启用状态过滤会让它
+/// 在改价时突然找不到。
+#[derive(Debug, Clone)]
+pub struct ActiveOfferingChannel {
+    pub provider_kind: String,
+    pub provider_model_id: String,
+    pub adapter_key: String,
+    pub base_url: String,
+    pub credential_env: String,
+}
+
+/// 这条候选是否**省略**了渠道字段。
+///
+/// 判据是渠道三要素里**任一个**为空：合同要求它们**整组给或整组省**（见 `docs/design/0010` §4.1），
+/// 所以"有一个空"就按"整组省略"处理，再由沿用补齐；补齐后若渠道身份仍不完整，由既有的逐候选校验
+/// 拒绝。这样"半新半旧"的渠道（地址沿用旧账号、凭证换了新账号）不会落库。
+#[must_use]
+fn command_omits_channel(draft: &OfferingDraft) -> bool {
+    let blank = |value: &Option<String>| value.as_deref().is_none_or(|text| text.trim().is_empty());
+    blank(&draft.provider_kind) || blank(&draft.base_url) || blank(&draft.credential_env)
+}
+
+/// 补齐一条候选省略掉的渠道字段：渠道三要素与驱动器。
+///
+/// 按 `provider_kind` + `provider_model_id` 在上一版里认同一条候选。**同名多条时拒绝**——两条不同渠道
+/// 可以提供同一个渠道模型名，那时"沿用哪一条"没有唯一答案，由发布者显式给出渠道三要素。
+///
+/// 省略了渠道字段却给不出 `provider_kind` 或 `provider_model_id` 时拒绝：那时连"这条候选是谁"都说不清，
+/// 无从判断沿用是否得当。型号还没有生效修订时同样拒绝，理由相同。
+fn inherit_channel(
+    draft: &OfferingDraft,
+    previous: &[ActiveOfferingChannel],
+) -> Result<OfferingDraft, ApplicationError> {
+    if !command_omits_channel(draft) {
+        return Ok(draft.clone());
+    }
+    let provider_kind = draft.provider_kind.as_deref().unwrap_or_default().trim();
+    let provider_model_id = draft.provider_model_id.trim();
+    if provider_kind.is_empty() || provider_model_id.is_empty() {
+        return Err(ApplicationError::Validation(format!(
+            "offering {} omits the channel (provider_kind / base_url / credential_env) and does not \
+             say which offering it continues: provider_kind and provider_model_id are required when \
+             the channel is omitted",
+            draft.provider_model_id
+        )));
+    }
+    let mut matched = previous.iter().filter(|row| {
+        row.provider_kind == provider_kind && row.provider_model_id == provider_model_id
+    });
+    let Some(first) = matched.next() else {
+        return Err(ApplicationError::Validation(format!(
+            "offering {provider_kind}/{provider_model_id} omits the channel (base_url / \
+             credential_env), and the model's current revision has no offering with that identity: \
+             give the channel explicitly"
+        )));
+    };
+    if matched.next().is_some() {
+        return Err(ApplicationError::Validation(format!(
+            "offering {provider_kind}/{provider_model_id} omits the channel, and the model's current \
+             revision has more than one offering with that identity: give base_url and credential_env \
+             explicitly so the right channel is inherited"
+        )));
+    }
+    Ok(OfferingDraft {
+        provider_kind: Some(first.provider_kind.clone()),
+        adapter_key: Some(first.adapter_key.clone()),
+        provider_model_id: first.provider_model_id.clone(),
+        base_url: Some(first.base_url.clone()),
+        credential_env: Some(first.credential_env.clone()),
+        ..draft.clone()
+    })
 }
 
 /// 一次发布里不能出现两条**同一条供给**的候选。

@@ -6,11 +6,12 @@
 
 use super::*;
 use crate::{
-    AcceptanceProbe, AccountSummary, AlertSink, ApiKeyView, AttemptFailure, BalanceChange,
-    ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary, CustomerUsageView,
-    CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry, NewFxRate,
-    ProviderCostGapView, ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest,
-    ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision, UnacceptedAttempt,
+    AcceptanceProbe, AccountSummary, ActiveOfferingChannel, AlertSink, ApiKeyView, AttemptFailure,
+    BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary,
+    CustomerUsageView, CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry,
+    NewFxRate, ProviderCostGapView, ProviderFailureQuery, ProviderFailureView,
+    PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
+    UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -297,6 +298,13 @@ impl HubRepository for AuditRepository {
         &self,
         _native_model_id: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn active_offering_channels(
+        &self,
+        _gateway_model: &str,
+    ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
         unused_repository()
     }
 

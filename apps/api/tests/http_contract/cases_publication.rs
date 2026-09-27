@@ -1,5 +1,164 @@
 use super::*;
 
+/// 发布命令支持**增量**：候选省略渠道三要素与驱动器时，从该型号当前生效的修订按
+/// `provider_kind` + `provider_model_id` 复用（`docs/design/0010` §4.1）。
+///
+/// 这条要证明的是"改价不用重填技术字段"能成立：先整份发布一次，再只带着新的加价系数与对客费率发一次，
+/// **候选里不出现 `base_url` / `credential_env` / `adapter_key`**，而落库的候选仍然指向同一个渠道、
+/// 同一把凭证身份——沿用真的发生了，不是被当成了空值。
+///
+/// 反例一起验：同一 `provider_kind` 与渠道模型名在上一版有多条候选时按歧义拒绝，不猜。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_publication_may_omit_the_channel_and_inherit_it_from_the_current_revision() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "inherited-channel-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+
+    // 第一次：整份发布，候选自带渠道三要素（`candidate()` 已经带了一个地址占位）。
+    let full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract.clone()),
+            vec![full]
+        )
+        .await,
+        StatusCode::OK,
+        "整份发布应当成功"
+    );
+
+    // 第二次：**省略**渠道三要素与驱动器，只带新的加价系数与对客费率。
+    let mut lean = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    {
+        let object = lean.as_object_mut().expect("candidate is an object");
+        object.remove("base_url");
+        object.remove("credential_env");
+        object.remove("adapter_key");
+    }
+    lean["consumer_rates_cny"] = json!({
+        "text_input_micros_per_million": 42_600_000u64,
+        "image_input_micros_per_million": 68_160_000u64,
+        "text_output_micros_per_million": 85_200_000u64,
+        "image_output_micros_per_million": 255_600_000u64
+    });
+    let lean_body = publication_body(
+        model,
+        "route-test-1",
+        Some(contract),
+        vec![lean],
+        Some(2_400),
+    );
+    let lean_response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&lean_body)
+        .send()
+        .await
+        .expect("incremental publication");
+    let lean_status = lean_response.status();
+    let lean_text = lean_response.text().await.expect("incremental body");
+    assert_eq!(
+        lean_status,
+        StatusCode::OK,
+        "省略渠道的增量发布应当成功：{lean_text}"
+    );
+
+    // 沿用真的发生了：当前生效的候选只有一条，且它的渠道三要素与驱动器都还在。
+    let rows: Vec<(String, String, String, String)> = sqlx::query_as(
+        "SELECT c.provider_kind, c.base_url, c.credential_env, o.adapter_key
+         FROM publication.runtime_entries re
+         JOIN supply.offerings o ON o.id = re.offering_id
+         JOIN supply.channels c ON c.id = o.channel_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_all(&pool)
+    .await
+    .expect("inherited candidate");
+    assert_eq!(rows.len(), 1, "只该有一条生效候选：{rows:?}");
+    let (provider_kind, upstream, credential_env, adapter_key) = &rows[0];
+    assert_eq!(provider_kind, "AIHubMix");
+    assert!(!upstream.is_empty(), "渠道地址必须被沿用了回来");
+    assert_eq!(credential_env, "AIHUBMIX_API_KEY");
+    assert_eq!(adapter_key, "aihubmix-image-v1");
+
+    // 新的加价系数真的落库（这次发布改变的东西必须改变）。
+    let markup: Option<i32> = sqlx::query_scalar(
+        "SELECT markup_bps FROM publication.runtime_revisions
+         WHERE id = (SELECT runtime_revision_id FROM publication.runtime_entries
+                     WHERE active AND gateway_model = $1)",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("markup of the active revision");
+    assert_eq!(markup, Some(2_400), "加价系数应当是这次发布给的值");
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 省略渠道但上一版里没有同身份的候选：拒绝并点名，不用"最近的那条"顶替。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_incremental_publication_without_a_matching_previous_offering_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let model = "no-previous-offering-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+
+    // 一次都没发布过：型号还没有生效修订可沿用。
+    // 用真的删掉字段来表达"省略"：给 `null` 是另一回事（当前形状下会先被反序列化拒掉）。
+    let mut lean = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    lean["provider_model_id"] = json!("a-model-this-revision-never-had");
+    {
+        let object = lean.as_object_mut().expect("candidate is an object");
+        object.remove("base_url");
+        object.remove("credential_env");
+        object.remove("adapter_key");
+    }
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&publication_body(
+            model,
+            "route-test-1",
+            Some(contract),
+            vec![lean],
+            None,
+        ))
+        .send()
+        .await
+        .expect("incremental publication");
+    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    let body = response.text().await.expect("body");
+    assert!(
+        body.contains("no offering with that identity"),
+        "拒绝的理由要点名沿用不到：{body}"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 同一个网关模型的**并发发布**：替换必须真的是一次替换——两份修订的 active 条目不得并存。
 ///
 /// 为什么单独验这一条：唯一索引从"每型号每档一条"换成"每型号每条供给一行"之后，它不再能拦住
