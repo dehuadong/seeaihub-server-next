@@ -81,4 +81,3 @@ npm --prefix apps/web run e2e
 它们**都不调用真实上游**：假上游在进程内监听 `127.0.0.1`；只有显式授权的受控实测才会发真实计费调用（见 [`docs/verification/`](docs/verification/)）。
 
 投产前该做什么演练、每条判据是什么，见 [`docs/operations/production.md`](docs/operations/production.md) §7。
-
