@@ -38,6 +38,8 @@ export interface GatewayModel {
   /// 厂商原生名：只在管理端出现，对客面看不到。
   native_model_id: string;
   native_revision: string;
+  /// 这次生效发布的**厂商模型合同**。管理端需要它在改价时重发同一份——合同不属于"这次要改变的东西"。
+  capability_schema: Record<string, unknown>;
   runtime_revision_id: string;
   published_at: string;
   /// 加价系数（基点）：每个网关模型一个，随修订发布；没有带定价的候选时为 `null`。

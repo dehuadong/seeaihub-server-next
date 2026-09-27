@@ -839,7 +839,7 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT
                 re.gateway_model, gm.enabled,
-                vm.vendor_id, vm.native_model_id, vm.native_revision,
+                vm.vendor_id, vm.native_model_id, vm.native_revision, vm.capability_schema,
                 rr.id AS runtime_revision_id, rr.created_at AS published_at,
                 o.id AS offering_id, o.adapter_key, o.provider_model_id,
                 o.carrier_schema, o.parameter_mapping,
@@ -4216,6 +4216,7 @@ fn row_to_gateway_model(
         vendor_id: row.try_get("vendor_id").map_err(database_error)?,
         native_model_id: row.try_get("native_model_id").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,
+        capability_schema: row.try_get("capability_schema").map_err(database_error)?,
         runtime_revision_id: RuntimeRevisionId(
             row.try_get("runtime_revision_id").map_err(database_error)?,
         ),

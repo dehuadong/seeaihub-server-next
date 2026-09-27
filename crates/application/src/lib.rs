@@ -1710,6 +1710,12 @@ pub struct GatewayModelView {
     pub native_model_id: String,
     /// 合同修订。
     pub native_revision: String,
+    /// 这次生效发布的**厂商模型合同**（Vendor Model Contract）。
+    ///
+    /// 回显它不是回显渠道配置：合同是厂商给的结构声明，调用方本来就按它提交参数、对客目录也发布它。
+    /// 管理端需要它才能在**改价**时重发同一份合同——合同不属于"发布者这次要改变的东西"，让运营重贴
+    /// 一遍只会引入抄错的机会。
+    pub capability_schema: Value,
     /// 当前生效的那一次发布。
     pub runtime_revision_id: RuntimeRevisionId,
     pub published_at: DateTime<Utc>,

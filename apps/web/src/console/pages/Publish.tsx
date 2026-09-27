@@ -137,6 +137,10 @@ export function PublishPage({ client }: { client: AdminClient }) {
 
   /// 按表单拼出发布命令。**只做翻译**：不做本地校验（形状对不对由发布期的校验答复负责），
   /// 也不替运营算费率（那是运营填的，平台只原样保存与冻结）。
+  ///
+  /// 改价模式（`loaded !== null`）下**不带渠道三要素与驱动器**：服务端按 `provider_kind` +
+  /// `provider_model_id` 从该型号当前生效的修订沿用（合同见 `docs/design/0010` §4.1）。这样运营改价
+  /// 时不必碰渠道地址与凭证变量名——它们这次一个字都没变。
   function buildCommand(): Record<string, unknown> {
     const parsed = parseJson(identity.capability_schema, '合同（capability_schema）');
     const command: Record<string, unknown> = {
@@ -148,15 +152,17 @@ export function PublishPage({ client }: { client: AdminClient }) {
       offerings: offerings.map((offering, index) => {
         const item: Record<string, unknown> = {
           provider_kind: offering.provider_kind.trim(),
-          adapter_key: offering.adapter_key.trim(),
           provider_model_id: offering.provider_model_id.trim(),
-          base_url: offering.base_url.trim(),
-          credential_env: offering.credential_env.trim(),
           formula: offering.formula,
           // 档位缺省即下标，这里显式给出来让人能同档分摊。
           routing_priority: index,
           weight: offering.weight,
         };
+        if (!repricing) {
+          item.adapter_key = offering.adapter_key.trim();
+          item.base_url = offering.base_url.trim();
+          item.credential_env = offering.credential_env.trim();
+        }
         if (parsed !== undefined) item.capability_schema = parsed;
         const carrier = parseJson(offering.carrier_schema, '承载面（carrier_schema）');
         if (carrier !== undefined) item.carrier_schema = carrier;
@@ -236,8 +242,11 @@ export function PublishPage({ client }: { client: AdminClient }) {
         gateway_model: model.gateway_model,
         native_revision: model.native_revision,
         markup_bps: model.markup_bps ?? 2000,
-        capability_schema: '',
+        // 合同随模型视图一起给（它不是渠道配置）：改价要重发同一份，不让运营重贴一遍。
+        capability_schema: JSON.stringify(model.capability_schema, null, 2),
       });
+      // 身份载入完成 = 进改价模式：命令里不再带渠道三要素，由服务端从当前生效修订沿用。
+      setLoaded(gatewayModel);
       setOfferings(
         model.candidates.map((candidate) => ({
           ...EMPTY_OFFERING,
@@ -258,7 +267,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
         })),
       );
       message.info(
-        `已载入 ${gatewayModel} 的身份与商务字段。渠道地址与凭证变量名要自己补齐——管理端不回显它们。`,
+        `已载入 ${gatewayModel}。改价只需要改倍率与对客费率——渠道地址、凭证变量名与驱动器由服务端从当前生效的修订沿用。`,
       );
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
@@ -268,6 +277,9 @@ export function PublishPage({ client }: { client: AdminClient }) {
   }
 
   const published = usePublishedModelNames(client);
+  /// 改价模式的判据：已经从某个已发布型号载入了身份。非空时 buildCommand 不带渠道字段。
+  const [loaded, setLoaded] = useState<string | null>(null);
+  const repricing = loaded !== null;
   // 算价算式要用当前生效的折算率：没有它就算不出 CNY 对客费率，界面上要如实说缺而不是拿 0 顶替。
   const rates = useLoadable(() => client.fxRates(), [client]);
   const currencies: Record<string, number> = { CNY: 1 };
@@ -284,8 +296,9 @@ export function PublishPage({ client }: { client: AdminClient }) {
         published.length > 0 ? (
           <Select
             data-testid="publish-load-model"
-            placeholder="从已发布型号载入"
-            style={{ width: 220 }}
+            showSearch
+            placeholder="改价：选一个已发布型号"
+            style={{ width: 260 }}
             options={published.map((name) => ({ value: name, label: name }))}
             onChange={(value: string) => void loadFromPublished(value)}
           />
@@ -319,54 +332,90 @@ export function PublishPage({ client }: { client: AdminClient }) {
         title="这个型号是什么"
         description="`gateway_model` 是平台对客名（调用方提交 model 时用的那个）；留空时取原生型号名。改价必须换合同修订号。"
       >
-        <Form layout="vertical">
-          <Row gutter={16}>
-            <Col xs={24} md={6}>
-              <Form.Item label="厂商" required>
-                <Input
-                  data-testid="publish-vendor"
-                  value={identity.vendor_id}
-                  onChange={(event) => setIdentity({ ...identity, vendor_id: event.target.value })}
-                  placeholder="OpenAI"
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={6}>
-              <Form.Item label="原生型号名" required>
-                <Input
-                  data-testid="publish-native-model"
-                  value={identity.native_model_id}
-                  onChange={(event) =>
-                    setIdentity({ ...identity, native_model_id: event.target.value })
-                  }
-                  placeholder="gpt-image-2.5-flare"
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={6}>
-              <Form.Item label="平台对客名（可空）">
-                <Input
-                  value={identity.gateway_model}
-                  onChange={(event) =>
-                    setIdentity({ ...identity, gateway_model: event.target.value })
-                  }
-                  placeholder="留空即取原生名"
-                />
-              </Form.Item>
-            </Col>
-            <Col xs={24} md={6}>
-              <Form.Item label="合同修订号" required>
-                <Input
-                  data-testid="publish-native-revision"
-                  value={identity.native_revision}
-                  onChange={(event) =>
-                    setIdentity({ ...identity, native_revision: event.target.value })
-                  }
-                  placeholder="2026-10-01-contract-1.1"
-                />
-              </Form.Item>
-            </Col>
-          </Row>
+        {repricing ? (
+          <>
+            <Descriptions
+              size="small"
+              bordered
+              column={{ xs: 1, sm: 2, lg: 3 }}
+              items={[
+                { key: 'vendor', label: '厂商', children: identity.vendor_id },
+                { key: 'native', label: '原生型号名', children: identity.native_model_id },
+                { key: 'gateway', label: '平台对客名', children: identity.gateway_model },
+              ]}
+            />
+            <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
+              这几项与合同一起沿用当前生效的那一份，只有合同修订号要换——改价必须换修订号，否则平台的
+              校验结论会说"这份合同已经发过"。
+            </Typography.Paragraph>
+          </>
+        ) : null}
+        <Form layout="vertical" style={{ marginTop: repricing ? 16 : 0 }}>
+          {repricing ? null : (
+            <Row gutter={16}>
+              <Col xs={24} md={6}>
+                <Form.Item label="厂商" required>
+                  <Input
+                    data-testid="publish-vendor"
+                    value={identity.vendor_id}
+                    onChange={(event) => setIdentity({ ...identity, vendor_id: event.target.value })}
+                    placeholder="OpenAI"
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={6}>
+                <Form.Item label="原生型号名" required>
+                  <Input
+                    data-testid="publish-native-model"
+                    value={identity.native_model_id}
+                    onChange={(event) =>
+                      setIdentity({ ...identity, native_model_id: event.target.value })
+                    }
+                    placeholder="gpt-image-2.5-flare"
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={6}>
+                <Form.Item label="平台对客名（可空）">
+                  <Input
+                    value={identity.gateway_model}
+                    onChange={(event) =>
+                      setIdentity({ ...identity, gateway_model: event.target.value })
+                    }
+                    placeholder="留空即取原生名"
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={6}>
+                <Form.Item label="合同修订号" required>
+                  <Input
+                    data-testid="publish-native-revision"
+                    value={identity.native_revision}
+                    onChange={(event) =>
+                      setIdentity({ ...identity, native_revision: event.target.value })
+                    }
+                    placeholder="2026-10-01-contract-1.1"
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+          )}
+          {repricing ? (
+            <Row gutter={16}>
+              <Col xs={24} md={6}>
+                <Form.Item label="合同修订号" required tooltip="改价必须换修订号">
+                  <Input
+                    data-testid="publish-native-revision"
+                    value={identity.native_revision}
+                    onChange={(event) =>
+                      setIdentity({ ...identity, native_revision: event.target.value })
+                    }
+                    placeholder="2026-10-01-contract-1.1"
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+          ) : null}
           <Row gutter={16}>
             <Col xs={24} md={6}>
               <Form.Item
@@ -408,15 +457,6 @@ export function PublishPage({ client }: { client: AdminClient }) {
           <Form layout="vertical">
             <Row gutter={16}>
               <Col xs={24} md={6}>
-                <Form.Item label="渠道" required tooltip="渠道类别，例如 AIHubMix / APIMart">
-                  <Input
-                    data-testid="publish-provider-kind"
-                    value={offering.provider_kind}
-                    onChange={(event) => patchOffering(index, { provider_kind: event.target.value })}
-                  />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={6}>
                 <Form.Item label="渠道模型名" required>
                   <Input
                     data-testid="publish-provider-model"
@@ -427,59 +467,81 @@ export function PublishPage({ client }: { client: AdminClient }) {
                   />
                 </Form.Item>
               </Col>
-              <Col xs={24} md={6}>
-                <Form.Item label="驱动器" required tooltip="用哪个 Driver 发出去，例如 aihubmix-image-v1">
-                  <Input
-                    data-testid="publish-adapter-key"
-                    value={offering.adapter_key}
-                    onChange={(event) => patchOffering(index, { adapter_key: event.target.value })}
-                  />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={6}>
-                <Form.Item label="档位内权重" tooltip="同一档有多条合格候选时按它分摊">
-                  <Input
-                    type="number"
-                    value={offering.weight}
-                    onChange={(event) =>
-                      patchOffering(index, { weight: Number(event.target.value) })
-                    }
-                  />
-                </Form.Item>
-              </Col>
             </Row>
-            <Row gutter={16}>
-              <Col xs={24} md={12}>
-                <Form.Item
-                  label="渠道地址"
-                  required
-                  tooltip="管理端不回显它——从已发布型号载入时要自己补齐"
-                >
-                  <Input
-                    data-testid="publish-base-url"
-                    value={offering.base_url}
-                    onChange={(event) => patchOffering(index, { base_url: event.target.value })}
-                    placeholder="https://api.example.com"
-                  />
-                </Form.Item>
-              </Col>
-              <Col xs={24} md={12}>
-                <Form.Item
-                  label="凭证环境变量名"
-                  required
-                  tooltip="只填变量名（例如 AIHUBMIX_API_KEY），不填密钥本身；密钥只从进程环境读"
-                >
-                  <Input
-                    data-testid="publish-credential-env"
-                    value={offering.credential_env}
-                    onChange={(event) =>
-                      patchOffering(index, { credential_env: event.target.value })
-                    }
-                    placeholder="AIHUBMIX_API_KEY"
-                  />
-                </Form.Item>
-              </Col>
-            </Row>
+            {repricing ? (
+              // 改价模式：渠道地址、凭证变量名与驱动器这次一个字都没变，服务端从当前生效的修订沿用
+              // （`docs/design/0010` §4.1）。不摆出来是为了不让运营以为需要重填。
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message={`沿用当前渠道：${offering.provider_kind || '（未载入）'} · ${offering.adapter_key || '（未载入）'}`}
+                description="渠道地址与凭证变量名由服务端从当前生效的修订取；换渠道请用「新增型号 / 重签合同」。"
+              />
+            ) : (
+              <>
+                <Row gutter={16}>
+                  <Col xs={24} md={6}>
+                    <Form.Item label="渠道" required tooltip="渠道类别，例如 AIHubMix / APIMart">
+                      <Input
+                        data-testid="publish-provider-kind"
+                        value={offering.provider_kind}
+                        onChange={(event) =>
+                          patchOffering(index, { provider_kind: event.target.value })
+                        }
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={6}>
+                    <Form.Item
+                      label="驱动器"
+                      required
+                      tooltip="用哪个 Driver 发出去，例如 aihubmix-image-v1"
+                    >
+                      <Input
+                        data-testid="publish-adapter-key"
+                        value={offering.adapter_key}
+                        onChange={(event) =>
+                          patchOffering(index, { adapter_key: event.target.value })
+                        }
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={12}>
+                    <Form.Item
+                      label="渠道地址"
+                      required
+                      tooltip="这个渠道的调用入口；同一入口与凭证身份只算一个渠道"
+                    >
+                      <Input
+                        data-testid="publish-base-url"
+                        value={offering.base_url}
+                        onChange={(event) => patchOffering(index, { base_url: event.target.value })}
+                        placeholder="https://api.example.com"
+                      />
+                    </Form.Item>
+                  </Col>
+                </Row>
+                <Row gutter={16}>
+                  <Col xs={24} md={12}>
+                    <Form.Item
+                      label="凭证环境变量名"
+                      required
+                      tooltip="只填变量名（例如 AIHUBMIX_API_KEY），不填密钥本身；密钥只从进程环境读"
+                    >
+                      <Input
+                        data-testid="publish-credential-env"
+                        value={offering.credential_env}
+                        onChange={(event) =>
+                          patchOffering(index, { credential_env: event.target.value })
+                        }
+                        placeholder="AIHUBMIX_API_KEY"
+                      />
+                    </Form.Item>
+                  </Col>
+                </Row>
+              </>
+            )}
 
             <Divider plain>成本与对客价</Divider>
             <Row gutter={16}>
@@ -512,6 +574,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
                     >
                       <Space.Compact block>
                         <Input
+                          data-testid="publish-plan-text-input"
                           type="number"
                           addonBefore="文入"
                           value={offering.plan_text_input}
@@ -520,6 +583,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
                           }
                         />
                         <Input
+                          data-testid="publish-plan-image-input"
                           type="number"
                           addonBefore="图入"
                           value={offering.plan_image_input}
@@ -528,6 +592,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
                           }
                         />
                         <Input
+                          data-testid="publish-plan-text-output"
                           type="number"
                           addonBefore="文出"
                           value={offering.plan_text_output}
@@ -536,6 +601,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
                           }
                         />
                         <Input
+                          data-testid="publish-plan-image-output"
                           type="number"
                           addonBefore="图出"
                           value={offering.plan_image_output}
