@@ -8,15 +8,7 @@ import { adminApiUrl, consoleUrl, portalUrl, settings } from './settings';
 ///
 /// 它与 e2e 分开配置（`playwright.capture.config.ts`）：`npm run e2e` 只跑断言，`npm run capture`
 /// 只抓图。合成一份的话抓图会混进常规运行、白花时间还把用例总数搞乱。
-const CONSOLE_PAGES = [
-  '模型目录',
-  '上架与改价',
-  '账户',
-  '客户',
-  '对账与诊断',
-  '折算率',
-  '路由策略',
-] as const;
+const CONSOLE_PAGES = ['模型目录', '账户', '客户', '对账与诊断', '折算率', '路由策略'] as const;
 
 test('运营后台六个页面各抓一张截图', async ({ page, request }) => {
   // 先造一点数据，免得每页都是空态：一个币种的折算率 + 一个带余额的账户。
@@ -44,6 +36,12 @@ test('运营后台六个页面各抓一张截图', async ({ page, request }) => 
       fullPage: true,
     });
   }
+
+  // 「上架新模型」的表单开在模型目录的抽屉里，它也是要给人看的一屏。
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).click();
+  await page.getByTestId('models-add').click();
+  await page.waitForTimeout(700);
+  await page.screenshot({ path: 'screenshots/07-运营后台-上架新模型.png', fullPage: true });
 });
 
 test('客户控制台的登录页与控制台各抓一张截图', async ({ page }) => {
