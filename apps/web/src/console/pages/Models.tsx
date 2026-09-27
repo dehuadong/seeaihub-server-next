@@ -17,7 +17,7 @@ import type { GatewayModel, GatewayModelCandidate } from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel, whenText, yuanText } from '../ui';
 
-/// 网关模型清单：运营最常看的一页。
+/// 模型目录：在售的模型与它们的价目，运营最常看的一页。
 ///
 /// 它回答"这个平台型号现在是什么状态"：生效修订、加价系数、候选顺序与权重、每条候选能不能走，
 /// 以及**这条候选承载得了哪些字段**——"目录里为什么没有它"要在这里看得见。
@@ -46,22 +46,32 @@ export function ModelsPage({ client }: { client: AdminClient }) {
 
   return (
     <ConsolePage
-      title="网关模型"
-      hint={list.length > 0 ? `${list.length} 个型号` : '还没有发布过任何网关模型'}
+      title="模型目录"
+      hint={
+        list.length > 0
+          ? `${list.length} 个型号在售`
+          : '还没有上架过任何模型——这一页看在售的模型与价目，要上架或改价去「上架与改价」'
+      }
       error={failure ?? models.error}
       loading={models.loading}
       onReload={models.reload}
     >
+      <Alert
+        type="info"
+        showIcon
+        message="这一页看什么"
+        description="在售的模型、各自的价目与候选渠道。要上架一个新模型或改价，去「上架与改价」——那边写的就是这一页显示的内容。"
+      />
       {list.length === 0 && !models.loading ? (
-        <Panel title="还没有发布过任何网关模型">
+        <Panel title="还没有上架过任何模型">
           <Alert
             type="info"
             showIcon
             message="空库时这里什么都没有"
             description={
               <>
-                去「发布修订」贴一份发布素材（<code>config/bootstrap/*.json</code>）。发布之后这一页会列出
-                每个型号的生效修订、加价系数与候选。
+                去「上架与改价」贴一份发布素材（<code>config/bootstrap/*.json</code>），或直接在表单里填。
+                上架之后这一页会列出每个型号的生效修订、加价系数与候选。
               </>
             }
           />
@@ -92,7 +102,7 @@ export function ModelsPage({ client }: { client: AdminClient }) {
                   候选（{model.candidates.length}）
                 </Button>
                 <Popconfirm
-                  title={model.enabled ? '停用这个网关模型？' : '启用这个网关模型？'}
+                  title={model.enabled ? '停用这个模型？' : '启用这个模型？'}
                   description={
                     model.enabled
                       ? '停用后对客目录里不再出现它；已受理的 Job 不受影响。'

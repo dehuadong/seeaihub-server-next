@@ -33,8 +33,8 @@ test('运营后台的外壳与六个页面都渲染 Ant Design 组件', async ({
 
   const sidebar = page.locator('.ant-layout-sider');
   const pages: { label: string; markers: string[] }[] = [
-    { label: '网关模型', markers: ['.ant-card', '.ant-alert'] },
-    { label: '发布修订', markers: ['.ant-card', '.ant-input', '.ant-btn'] },
+    { label: '模型目录', markers: ['.ant-card', '.ant-alert'] },
+    { label: '上架与改价', markers: ['.ant-card', '.ant-input', '.ant-btn'] },
     { label: '账户', markers: ['.ant-card', '.ant-table', '.ant-form'] },
     { label: '客户', markers: ['.ant-card', '.ant-table', '.ant-form'] },
     { label: '对账与诊断', markers: ['.ant-card', '.ant-tabs'] },

@@ -9,8 +9,8 @@ import { adminApiUrl, consoleUrl, portalUrl, settings } from './settings';
 /// 它与 e2e 分开配置（`playwright.capture.config.ts`）：`npm run e2e` 只跑断言，`npm run capture`
 /// 只抓图。合成一份的话抓图会混进常规运行、白花时间还把用例总数搞乱。
 const CONSOLE_PAGES = [
-  '网关模型',
-  '发布修订',
+  '模型目录',
+  '上架与改价',
   '账户',
   '客户',
   '对账与诊断',
@@ -34,7 +34,7 @@ test('运营后台六个页面各抓一张截图', async ({ page, request }) => 
   await page.getByTestId('admin-email').fill(settings.adminEmail);
   await page.getByTestId('admin-password').fill(settings.adminPassword);
   await page.getByTestId('admin-sign-in').click();
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '网关模型' }).waitFor();
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).waitFor();
 
   for (const [index, label] of CONSOLE_PAGES.entries()) {
     await page.locator('.ant-layout-sider').getByRole('menuitem', { name: label }).click();

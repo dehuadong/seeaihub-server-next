@@ -16,7 +16,7 @@ test.describe('管理页面读的是库里的数据', () => {
     await page.getByTestId('admin-password').fill(settings.adminPassword);
     await page.getByTestId('admin-sign-in').click();
     // 侧栏出现即已进后台；限定在侧栏里，页头另有一份"当前在哪一页"的指示。
-    await expect(sidebar(page, '网关模型')).toBeVisible();
+    await expect(sidebar(page, '模型目录')).toBeVisible();
   }
 
   /// 切到某一页。导航项不是 button，是按角色的 menuitem；限定在侧栏内避免与页头重复。

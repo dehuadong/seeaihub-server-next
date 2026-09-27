@@ -17,7 +17,7 @@ test.skip('改价模式下不出现渠道地址与凭证变量名', async ({ pag
   await page.getByTestId('admin-email').fill(settings.adminEmail);
   await page.getByTestId('admin-password').fill(settings.adminPassword);
   await page.getByTestId('admin-sign-in').click();
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '发布修订' }).click();
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '上架与改价' }).click();
 
   // 新增型号模式：技术字段都在（这一步本来就是技术入口）。
   await expect(page.getByTestId('publish-base-url')).toBeVisible();

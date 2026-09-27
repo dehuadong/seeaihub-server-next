@@ -21,7 +21,7 @@ import type { AdminClient } from '../client';
 import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel } from '../ui';
 
-/// 发布修订：运营"加一个网关模型"或"给已有型号发新修订"的地方。
+/// 上架与改价：运营让一个型号可售、或改它的价的地方（写的就是发布修订这件事）。
 ///
 /// **表单收集商业条款，技术字段贴入**。发布命令里绝大多数内容是运营不做决定的样板：
 /// `capability_schema` 与 `carrier_schema` 是厂商给的 JSON Schema，`parameter_mapping` 是渠道包装声明；
@@ -289,8 +289,8 @@ export function PublishPage({ client }: { client: AdminClient }) {
 
   return (
     <ConsolePage
-      title="发布修订"
-      hint="发布即原子替换该型号的全部候选"
+      title="上架与改价"
+      hint="这一页是写：让一个型号可售，或改它的价。写完之后「模型目录」显示的就是这里提交的东西。"
       error={error}
       extra={
         published.length > 0 ? (
@@ -316,7 +316,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
                 生效修订：<Typography.Text code>{done.runtime_revision_id}</Typography.Text>
               </Typography.Text>
               <Typography.Text type="secondary">
-                去「网关模型」核对候选与定价是否就是你要的那一份。
+                去「模型目录」核对候选与定价是否就是你要的那一份。
               </Typography.Text>
             </Flex>
           }
@@ -795,8 +795,8 @@ export function PublishPage({ client }: { client: AdminClient }) {
 
       <Panel title="模型的合同（capability_schema）">
         <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-          厂商给的 JSON Schema：调用方能用哪些字段、各自什么形状。**模型级一份**，所有候选共用。
-          贴进来的原文会被原样保存与冻结。
+          厂商给的 JSON Schema：调用方能用哪些字段、各自什么形状。模型级一份，所有候选共用。贴进来的
+          原文会被原样保存与冻结。
         </Typography.Paragraph>
         <Input.TextArea
           rows={8}

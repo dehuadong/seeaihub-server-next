@@ -26,8 +26,10 @@ import { RatesPage } from './pages/Rates';
 import { RoutingPage } from './pages/Routing';
 
 const NAV: { route: Route; label: string; icon: React.ReactNode }[] = [
-  { route: 'models', label: '网关模型', icon: <DeploymentUnitOutlined /> },
-  { route: 'publish', label: '发布修订', icon: <ApiOutlined /> },
+  // 「模型目录」是运营的说法（列在售的模型与它们的价目）；`Gateway Model` 是平台内部名。
+  { route: 'models', label: '模型目录', icon: <DeploymentUnitOutlined /> },
+  // 「上架与改价」是这一页对运营的用途：让一个型号可售、改它的价。它写的就是发布修订这件事。
+  { route: 'publish', label: '上架与改价', icon: <ApiOutlined /> },
   { route: 'accounts', label: '账户', icon: <KeyOutlined /> },
   { route: 'customers', label: '客户', icon: <TeamOutlined /> },
   { route: 'diagnostics', label: '对账与诊断', icon: <AuditOutlined /> },

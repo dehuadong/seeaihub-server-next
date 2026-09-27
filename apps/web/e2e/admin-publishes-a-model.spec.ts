@@ -33,7 +33,7 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
   await page.getByTestId('admin-email').fill(settings.adminEmail);
   await page.getByTestId('admin-password').fill(settings.adminPassword);
   await page.getByTestId('admin-sign-in').click();
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '网关模型' }).waitFor();
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).waitFor();
 
   // 发布要用的折算率先录好：没有它，按 token 计量的候选会在校验期被拒。
   const rate = await request.put(`${adminApiUrl}/api/v1/fx-rates`, {
@@ -42,7 +42,7 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
   });
   expect(rate.status()).toBe(204);
 
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '发布修订' }).click();
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '上架与改价' }).click();
 
   const model = `e2e-form-${Date.now()}`;
   await page.getByTestId('publish-vendor').fill('OpenAI');
@@ -108,6 +108,6 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
   await expect(page.getByText('生效修订：')).toBeVisible();
 
   // 去模型列表核对它真的在（发布不是只弹了个提示）。
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '网关模型' }).click();
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).click();
   await expect(page.getByText(model).first()).toBeVisible();
 });

@@ -11,7 +11,7 @@ const ADMIN_PASSWORD = settings.adminPassword;
 const CONSOLE = consoleUrl;
 const PORTAL = portalUrl;
 
-const NAV_LABELS = ['网关模型', '发布修订', '账户', '客户', '对账与诊断', '折算率', '路由策略'];
+const NAV_LABELS = ['模型目录', '上架与改价', '账户', '客户', '对账与诊断', '折算率', '路由策略'];
 
 /// 侧栏导航项。Ant Design 的 `Menu` 把每项渲染成 `role=menuitem`，不是 button——换 UI 库时
 /// 选择器要跟着实现走，但**断言的性质不变**（那六项在 / 不在）。
@@ -85,7 +85,7 @@ test('口令不对时留在登录页并说明原因', async ({ page }) => {
   // 提示现在是 Ant Design 的 `Alert`；它的 role 有嵌套（同名元素两处），登录页上另有一条
   // "API 探活"的提示，所以先按文案筛出错误那一条，再取第一个。
   await expect(page.getByRole('alert').filter({ hasText: '邮箱或口令' }).first()).toBeVisible();
-  await expect(navItem(page, '网关模型')).toHaveCount(0);
+  await expect(navItem(page, '模型目录')).toHaveCount(0);
 });
 
 test('客户入口在任何主机上都能按文件名直达，且拿到的是客户那一份', async ({ page }) => {
