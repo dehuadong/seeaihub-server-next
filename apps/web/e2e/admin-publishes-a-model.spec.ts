@@ -45,6 +45,9 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
   // 上架入口在「模型目录」页右上角，表单开在抽屉里（两页已合成一页）。
   await page.getByTestId('models-add').click();
   await expect(page.getByTestId('publish-vendor')).toBeVisible();
+  // 界面上要说明白"这里填的就是对外价"、而仓库里的素材只是夹具（Spec §6 的那条约束）：
+  // 少了这句，读到 `config/bootstrap/*.json` 的人会以为生产价已经定好了。
+  await expect(page.getByText(/夹具值，不是生产价/)).toBeVisible();
 
   const model = `e2e-form-${Date.now()}`;
   await page.getByTestId('publish-vendor').fill('OpenAI');

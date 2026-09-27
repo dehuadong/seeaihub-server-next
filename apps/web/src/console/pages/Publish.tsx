@@ -728,8 +728,9 @@ export function PublishPanel({
                       {offering.margin_enabled ? '移除对客价向量' : '带上对客价向量'}
                     </Button>
                     <Typography.Text type="secondary">
-                      按 token 计量的候选随修订带一份四档 CNY 费率；由运营按"成本单价 × 倍率 ×
-                      折算率"推导后填入，平台只原样保存与冻结、不在服务端替算。
+                      按 token 计量的候选随修订带一份四档 CNY 费率，由运营按"成本单价 × 倍率 ×
+                      折算率"推导后填入；平台只原样保存与冻结、不在服务端替算。这里填的就是对外价，
+                      而 <code>config/bootstrap/*.json</code> 里的对客费率只是夹具值，不是生产价。
                     </Typography.Text>
                   </Space>
                 </Form.Item>

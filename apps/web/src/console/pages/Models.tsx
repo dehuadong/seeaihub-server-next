@@ -95,8 +95,9 @@ export function ModelsPage({
             message="空库时这里什么都没有"
             description={
               <>
-                点右上角「上架新模型」，或贴一份发布素材（<code>config/bootstrap/*.json</code>）。
-                上架之后这一页会列出每个型号的生效修订、加价系数与候选。
+                点右上角「上架新模型」，或贴一份发布素材（<code>config/bootstrap/*.json</code>——
+                那是夹具，其中的对客费率不是生产价）。上架之后这一页会列出每个型号的生效修订、加价
+                系数与候选。
               </>
             }
           />
