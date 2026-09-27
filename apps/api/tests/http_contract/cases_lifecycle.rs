@@ -801,13 +801,41 @@ async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
         "limit=2 时本页 2 条、总数仍是 4——只看 count 会以为翻完了：{limited}"
     );
 
-    // `until` 是**闭区间**上界：取最旧那条自己的时刻，它要被含进来（与 `since` 的开区间相对）。
+    // `until` 是**半开**上界：取最旧那条自己的时刻，它**不该**被含进来（与对客账单汇总同一条口径，
+    // 见 Spec §4.3——同一区间下明细与汇总必须对得上）。
     let oldest_boundary = wire_time(oldest);
     let up_to_oldest = read(format!("?until={oldest_boundary}")).await;
+    assert!(
+        kinds(&up_to_oldest).is_empty(),
+        "半开上界不含端点，最旧那条也在界外：{up_to_oldest}"
+    );
+
+    // 上界放在最旧那条与它上一条**之间**（往最新方向挪 5 秒）：这时它该被含进来，且只剩它。
+    let after_oldest_gap = read(format!("?until={}", offset_seconds(oldest, 5))).await;
     assert_eq!(
-        kinds(&up_to_oldest),
+        kinds(&after_oldest_gap),
         vec!["adjustment"],
-        "闭区间含端点，只该剩最旧那一条：{up_to_oldest}"
+        "界内只剩最旧那一条：{after_oldest_gap}"
+    );
+
+    // `truncated` 的判别据是"**这个位置之后还有没有更多**"，不是"这一页满没满"——两者只在条数**恰好
+    // 整除**时给出不同答案，所以这里专门取 `limit` 正好等于总数的那一格：旧定义（`len == limit`）会说
+    // "还有更多"，而实际上一条都不剩了。翻页的调用方靠这个信号决定要不要再请求一次。
+    let exact = read("?limit=4".to_owned()).await;
+    assert_eq!(
+        exact["count"].as_u64(),
+        Some(4),
+        "limit 正好等于总数：{exact}"
+    );
+    assert_eq!(
+        exact["truncated"],
+        json!(false),
+        "条数恰好等于 limit 时后面没有更多了——按'页满了'判会说反：{exact}"
+    );
+    assert_eq!(
+        exact["total"].as_u64(),
+        Some(4),
+        "总数与 limit 无关：{exact}"
     );
 
     // `offset` 翻页：第 2 页留下第 3、4 条，且与不翻页时的顺序**接得上**（不重不漏）。

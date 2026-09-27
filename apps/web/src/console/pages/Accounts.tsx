@@ -26,10 +26,10 @@ import { ConsolePage, Panel, whenText, yuanText } from '../ui';
 /// 账户：**先搜到，再操作**。
 ///
 /// 组织依据是运营的工作顺序，不是端点：列表回答"有哪些账户、各自多少余额"，详情回答"这个账户能做
-/// 什么"（充值、标签、密钥、流水）。原来把六件事堆在一页长滚动里，运营读完余额要滚下去充值、再滚
-/// 上来核对；而"查账户"只收一个 UUID——运营手上没有 UUID，他们有的是客户邮箱或自己设的标签。
+/// 什么"（充值、标签、密钥、流水）。运营入口是**客户邮箱与标签**，不是账户标识——标识是 UUID，
+/// 运营手上没有它。
 ///
-/// 口径见 `docs/design/0011-console-information-architecture.md` §1.2 与 §3.2。
+/// 口径见 `docs/design/0011-console-information-architecture.md` §3.2。
 export function AccountsPage({ client }: { client: AdminClient }) {
   const { message } = AntApp.useApp();
   const [email, setEmail] = useState('');
@@ -224,7 +224,11 @@ export function AccountsPage({ client }: { client: AdminClient }) {
               title: '',
               width: 90,
               render: (_value: unknown, account: AccountSummary) => (
-                <Button size="small" onClick={() => setSelected(account.account_id)}>
+                <Button
+                  data-testid="accounts-open-row"
+                  size="small"
+                  onClick={() => setSelected(account.account_id)}
+                >
                   打开
                 </Button>
               ),

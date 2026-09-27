@@ -26,13 +26,11 @@ import { useLoadable } from '../shared/ui';
 
 /// 客户控制台的主体。
 ///
-/// **首屏只回答三件事**（可用余额、持有中、扣费总额）——那是客户打开这一页的唯一动机；其余按
-/// 标签页收起来：用量与账单（明细）、API Key、账户设置（改口令等低频动作）。
+/// **首屏只回答三件事**（可用余额、持有中、扣费总额）——那是客户打开这一页的动机；其余按标签页收起
+/// 来：用量与账单（明细）、API Key、账户设置（改口令等低频动作）。分组依据是**使用频次**，不是端点
+/// 归属：改口令是一次性动作，与余额并列会把两件常看的事切开。
 ///
-/// 为什么不是把四块竖着排一页（原样）：客户最常看的是余额与用量，而"改口令"是一次性动作，排在中间
-/// 就把两件常看的事切开了；用量多起来也没法定位。分组依据是**使用频次**，不是端点归属。
-///
-/// 口径见 `docs/design/0011-console-information-architecture.md` §2.2 与 §3.4。
+/// 口径见 `docs/design/0011-console-information-architecture.md` §3.4。
 export function Dashboard({ client }: { client: CustomerClient }) {
   const { email, accountId, signOut } = useCustomerSession();
   const account = useLoadable(() => client.account(), [client]);

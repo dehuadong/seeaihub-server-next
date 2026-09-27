@@ -122,7 +122,7 @@
 | `POST` | `/v1/customer/api-keys` | 客户会话 | `{label}` | `201 {key_id, api_key}`（明文只此一次） |
 | `DELETE` | `/v1/customer/api-keys/{key_id}` | 客户会话 | — | `204`；不属于自己 ⇒ `404` |
 | `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, updated_at}` |
-| `GET` | `/v1/customer/ledger` | 客户会话 | `?since=&until=&limit=` | `200 {entries:[{kind, amount_microusd, job_id, created_at}], count, truncated}`（充值与扣费都在这里；金额带符号，符号是语义的一部分） |
+| `GET` | `/v1/customer/ledger` | 客户会话 | `?since=&until=&limit=` | `200 {entries:[{kind, amount_microusd, job_id, created_at}], count, total, truncated}`（充值与扣费都在这里；金额带符号，符号是语义的一部分。`[since, until)` 是半开区间，与 `billing` 同一条口径——同一区间下明细与汇总必须对得上） |
 | `GET` | `/v1/customer/usage` | 客户会话 | `?since=&until=&limit=` | `200 {usage:[{gateway_model, kind, status, created_at, image_count, charged_microusd}], count, truncated}` |
 | `GET` | `/v1/customer/billing` | 客户会话 | `?since=&until=` | `200 {since, until, requests, images, charged_microusd}`（**汇总按区间全量**，与 `usage` 的 `limit` 无关） |
 
@@ -142,7 +142,7 @@
 
 ### 4.3 复用（不改形状）
 
-`GET /api/v1/accounts/{id}/entries`（管理员流水）保持原样；对客流水在 §4.2 的 `ledger` 里给**只读**的同一份事实，但按 `WHERE account_id = <会话账户>` 收窄。既有 `/v1/account`（对客读自己的余额与持有中）也不改形状——Spec §6 要求既有对客协议逐字保持；本次新增的对客读走 `/v1/customer/*`，与它并存。
+`GET /api/v1/accounts/{id}/entries`（管理员流水）保持既有参数与字段的含义；后续只**增加**了可选的 `until`/`offset` 与响应的 `total`（见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；对客流水在 §4.2 的 `ledger` 里给**只读**的同一份事实，但按 `WHERE account_id = <会话账户>` 收窄。既有 `/v1/account`（对客读自己的余额与持有中）不改形状——Spec §6 要求既有对客协议逐字保持；本次新增的对客读走 `/v1/customer/*`，与它并存。
 
 ### 4.4 页面 → 端点（逐页承接 Spec M1–M6、C5–C12）
 
@@ -152,7 +152,7 @@
 | M2 发布修订 | `POST /api/v1/runtime-revisions` |
 | M3 折算率 | `GET/PUT /api/v1/fx-rates`（`GET` 为本次新增） |
 | M4 路由策略 | `GET/PUT /api/v1/route-policies` |
-| M5 账户与密钥 | `POST /api/v1/accounts`；`GET /api/v1/accounts/{id}`；`GET /api/v1/accounts/{id}/entries`；`POST /api/v1/accounts/{id}/credits`；`PUT /api/v1/accounts/{id}/tag`；`POST /api/v1/accounts/{id}/api-keys`；`DELETE /api/v1/api-keys/{key_id}`；`POST /api/v1/customers`（替客户开户）；`GET /api/v1/customers`（按邮箱找客户账户）；`POST /api/v1/accounts/{id}/password-reset`（为客户账户签发重置令牌） |
+| M5 账户与密钥 | `POST /api/v1/accounts`；`GET /api/v1/accounts`（列账户，供"先搜到再操作"——见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；`GET /api/v1/accounts/{id}`；`GET /api/v1/accounts/{id}/entries`；`POST /api/v1/accounts/{id}/credits`；`PUT /api/v1/accounts/{id}/tag`；`POST /api/v1/accounts/{id}/api-keys`；`DELETE /api/v1/api-keys/{key_id}`；`POST /api/v1/customers`（替客户开户）；`GET /api/v1/customers`（按邮箱找客户账户）；`POST /api/v1/accounts/{id}/password-reset`（为客户账户签发重置令牌） |
 | M6 对账与诊断 | `GET /api/v1/reconciliation-cases`；`POST /api/v1/reconciliation-cases/{job_id}/refund`；`GET /api/v1/provider-failures`；`GET /api/v1/provider-cost-gaps` |
 | 管理员登录/退出/改口令/重置 | §4.1 的六条 |
 | C5 密钥自助 | §4.2 的 `api-keys` 三条 |

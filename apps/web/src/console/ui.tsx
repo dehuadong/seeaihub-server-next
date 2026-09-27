@@ -66,14 +66,5 @@ export function Panel(props: {
   );
 }
 
-/// 表里"没有数据"的统一空态文案：区分"还没做过"与"做过了但没数据"，避免只显示一个空表格。
-export function EmptyHint({ children }: { children: ReactNode }) {
-  return (
-    <Typography.Text type="secondary" italic>
-      {children}
-    </Typography.Text>
-  );
-}
-
 // 金额与时间的展示规则在共享层（`shared/format.ts`）：两个入口都要用同一套，而它不含 antd。
 export { whenText, yuan, yuanText } from '../shared/format';

@@ -1973,8 +1973,9 @@ pub trait HubRepository: Send + Sync {
     /// 事务去理解它们。账户不存在时返回 [`ApplicationError::NotFound`]，让 404 与"没有流水"
     /// 分得开。
     ///
-    /// `until` 是**闭区间**的上界：翻页要"上一页最后一条的时刻"作为下一页的起点，而同一时刻可能
-    /// 有多条，所以翻页用 `offset` 而不是靠 `since`/`until` 去切——那两个参数是给"按区间看"用的。
+    /// `until` 是**半开**上界（不含）。与对客账单汇总同一条口径：同一区间下明细与汇总必须对得上，
+    /// 否则边界那一笔会被一边算进去、另一边不算。翻页用 `offset` 而不是靠 `since`/`until` 去切——
+    /// 那两个参数是给"按区间看"用的，同一时刻可能有多条。
     async fn read_ledger_entries(
         &self,
         account_id: AccountId,
@@ -1984,9 +1985,9 @@ pub trait HubRepository: Send + Sync {
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError>;
 
-    /// 该账户在 `[since, until]` 内的流水**总条数**，供调用方判断还有没有下一页。
+    /// 该账户在 `[since, until)` 内的流水**总条数**，供调用方判断还有没有下一页。
     ///
-    /// 与 `read_ledger_entries` 同一套区间语义，所以"翻到最后一页"这个判断不会因为两处口径不同
+    /// 区间语义与 `read_ledger_entries` 相同，所以"翻到最后一页"这个判断不会因为两处口径不同
     /// 而错位。账户不存在时返回 [`ApplicationError::NotFound`]。
     async fn count_ledger_entries(
         &self,

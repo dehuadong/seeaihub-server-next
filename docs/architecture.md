@@ -50,9 +50,10 @@
 | --- | --- | --- | --- |
 | GET | `/health` | `health` | 任何人（探一次事实源是否可达：只做一次 `SELECT 1`，**缓存不可用只算降级、不算不健康**——缓存不可用时系统按"没有缓存"继续服务，把它算不健康会让编排系统重启一个本来能服务的实例。探测超时由 `HEALTH_PROBE_TIMEOUT_MS` 配，缺省 2000ms；超时按不可用处理。可达回 200，不可达回 503） |
 | POST | `/api/v1/accounts` | `create_account` | 管理员（`ADMIN_TOKEN`） |
+| GET | `/api/v1/accounts` | `list_accounts` | 管理员（**列账户**：按创建时间倒序，可按 `tag` 精确或 `email`（大小写不敏感）收窄，两个条件是「与」。**列表项不含客户邮箱**；没有登录身份的账户也在列表里。只读、不写审计、不读缓存） |
 | GET | `/api/v1/accounts/{account_id}` | `read_account_balance` | 管理员（读余额与写入时刻；**读数据库那一行，不读缓存**：缓存可能滞后、也可能来自对账覆盖，用它当答案会把账实不符读成账实相符。账户不存在是 404） |
 | POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
-| GET | `/api/v1/accounts/{account_id}/entries` | `list_account_entries` | 管理员（账目流水：**时间倒序**，`since` 是 RFC3339 的增量起点（开区间）、`limit` 分页（缺省 100）；每条带 `kind`（`credit` / `hold` / `capture` / `release` / `adjustment` / `cost`，与账本存储取值同名）与金额（人民币微单位，**正负号有语义**）。读 `ledger.entries`、**不读缓存**；**只读**——不改状态、不写审计。账户不存在 404，与"还没有流水"（空数组）分开） |
+| GET | `/api/v1/accounts/{account_id}/entries` | `list_account_entries` | 管理员（账目流水：**时间倒序**，`since` 是 RFC3339 的增量起点（不含）、`until` 是上界（不含）、`offset` 翻页、`limit` 截断（缺省 100）；响应带 `count`（本页条数）与 `total`（同一区间条件下的总条数），`truncated` 表示"这个位置之后还有没有更多"。每条带 `kind`（`credit` / `hold` / `capture` / `release` / `adjustment` / `cost`，与账本存储取值同名）与金额（人民币微单位，**正负号有语义**）。读 `ledger.entries`、**不读缓存**；**只读**——不改状态、不写审计。账户不存在 404，与"还没有流水"（空数组）分开） |
 | POST | `/api/v1/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
 | POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；每个候选带**计价形态**（`formula`：`token_rates` / `per_image` / `per_call` / `upstream_declared`）与它的参数——按 token 计量量要那份四档费率（`price_plan`），按张 / 按次要单价（`cost_unit_price_microusd`），上游直接给金额两种参数都不要；另可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：形态必填且与参数配套、每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
 | GET | `/api/v1/gateway-models` | `list_gateway_models` | 管理员（网关模型清单：对客名、运维开关、候选与承载面、**每个候选的定价**与修订级加价系数；**不回显渠道凭证**。对客名由管理员发布时自己填，平台不预设任何名字） |

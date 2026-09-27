@@ -1,11 +1,14 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
+import { portalUrl } from './settings';
 
 /// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、首屏三个数、密钥明文只显示
 /// 一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
 ///
 /// 这些行为的接口契约由 `apps/api/tests/http_contract/cases_identity.rs` 管；这里验的是"人在浏览器里
 /// 点下去会发生什么"。
-const PORTAL = 'http://app.localhost:8090/';
+///
+/// 地址从 `settings` 取（与 `playwright.config.ts` 同源）：端口写死在这里的话 `SEEAI_E2E_PORT` 就失效了。
+const PORTAL = portalUrl;
 
 /// 每个用例一个客户：库是共享的，写死的邮箱会在第二次运行时撞上"已注册"。
 function uniqueEmail(): string {

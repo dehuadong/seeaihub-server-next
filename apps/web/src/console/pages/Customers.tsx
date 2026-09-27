@@ -23,10 +23,10 @@ import { ConsolePage, Panel, whenText } from '../ui';
 /// 客户：登录身份的开立与找回口令。
 ///
 /// 它与"账户"是两件事：账户是账本上的一行（余额、流水、密钥），客户是**登录身份**（邮箱 → 账户）。
-/// 一个账户可以没有登录身份（运营直接建的），一个身份只指向一个账户。原来把这一块塞在账户页最下面，
-/// 两边都不完整——Spec M5 要求"按邮箱找到客户账户"，那是客户区的主入口，不是账户页的附属。
+/// 一个账户可以没有登录身份（运营直接建的），一个身份只指向一个账户。**按邮箱找到客户账户**是这一区
+/// 的主入口（Spec M5）：给客户充值、替他签重置令牌都要先拿到账户。
 ///
-/// 口径见 `docs/design/0011-console-information-architecture.md` §1.2 与 §3.3。
+/// 口径见 `docs/design/0011-console-information-architecture.md` §3.3。
 export function CustomersPage({ client }: { client: AdminClient }) {
   const { message } = AntApp.useApp();
   const [searchEmail, setSearchEmail] = useState('');

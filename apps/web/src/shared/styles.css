@@ -1,15 +1,12 @@
-// 两个入口的**基础样式**。
-//
-// 界面不再由这里定义：组件全部来自 Ant Design，颜色、间距、圆角由它的主题（各入口的
-// `ConfigProvider`）管。这里只留三件它与组件都不负责的事：
-//
-//   1. 清掉浏览器默认的 body 边距与字体；
-//   2. 给整页一个底色（antd 的 `Layout` 自带，但 `#root` 之外的区域需要它）；
-//   3. 让根容器撑满高度，`min-height: 100vh` 的居中布局才成立。
-//
-// 刻意**不**在这里写 `input` / `button` / `table` 的规则：那是另一套设计系统，会与 antd 的组件样式
-// 冲突（比如给 `button` 加边框会让 antd 的 `Button` 多出一圈）。要把界面改成什么样，改的是组件的
-// 用法与 `ConfigProvider` 的主题，不是这个文件。
+/*
+ * 两个入口的基础样式。
+ *
+ * 界面不由这里定义：组件全部来自 Ant Design，颜色、间距、圆角由各入口的 `ConfigProvider` 管。
+ * 这里只有它不负责的三件事：清掉浏览器默认的 body 边距与字体、给整页一个底色、让根容器撑满高度。
+ *
+ * 刻意不在这里写 `input` / `button` / `table` 的规则：那是另一套设计系统，会与 antd 的组件样式冲突。
+ * 界面怎么改见 `apps/web/README.md`。
+ */
 
 body {
   margin: 0;
@@ -24,7 +21,7 @@ body {
   min-height: 100vh;
 }
 
-// 代码块与标识用等宽字体。antd 的 `Typography.Text code` 自带，这里兜住其他位置的 `<code>`。
+/* 代码块与标识用等宽字体。antd 的 `Typography.Text code` 自带，这里兜住其他位置的 `<code>`。 */
 code,
 pre {
   font-family: ui-monospace, 'Cascadia Mono', Consolas, monospace;

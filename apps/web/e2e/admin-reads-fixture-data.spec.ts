@@ -46,7 +46,30 @@ test.describe('管理页面读的是库里的数据', () => {
     await expect(row).toContainText('7.15');
   });
 
-  test('账户与密钥页显示刚建的账户与刚充的余额', async ({ page, request }) => {
+  test('路由策略页显示刚写入的那一条', async ({ page, request }) => {
+    // 作用域用一个唯一的型号名，免得与别的用例写下的全局那条互相看见。
+    const scope = `e2e-scope-${Date.now()}`;
+    const written = await request.put(`${adminApiUrl}/api/v1/route-policies`, {
+      headers: { authorization: `Bearer ${settings.adminToken}` },
+      data: {
+        gateway_model: scope,
+        strategy: 'least_cost',
+        discount_rates: { 'offering-e2e': 8000 },
+      },
+    });
+    expect(written.ok(), await written.text()).toBeTruthy();
+
+    await signIn(page);
+    await goTo(page, '路由策略');
+
+    // 页面上要出现**刚写的那一条**：作用域、策略的中文标签、折扣率都从库里来。
+    const row = page.getByRole('row', { name: new RegExp(scope) });
+    await expect(row).toBeVisible();
+    await expect(row).toContainText('按折后成本最小');
+    await expect(row).toContainText('offering-e2e=8000');
+  });
+
+  test('账户页的详情里显示刚建的账户与它的余额', async ({ page, request }) => {
     const opened = await request.post(`${adminApiUrl}/api/v1/accounts`, {
       headers: { authorization: `Bearer ${settings.adminToken}` },
       data: { initial_credit_microusd: 12_340_000 },

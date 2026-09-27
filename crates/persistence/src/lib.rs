@@ -23,6 +23,16 @@ use std::collections::HashSet;
 use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
+/// **唯一的账本区间谓词**：`$2` 是下界（不含），`$3` 是上界（不含）——即半开区间 `[since, until)`。
+///
+/// 抽取它是为了"明细与计数口径一致"这件事**在结构上**成立：两处各写一遍 SQL 时，一旦有人只改一处，
+/// "还有没有下一页"就会在边界上错位，而那种错位只在条数恰好落在边界上才显形。
+///
+/// 上界不含与对客账单汇总同一条口径（Spec §4.3）：同一区间下明细与汇总必须对得上，否则边界上那一笔
+/// 会被一边算进去、另一边不算。
+const LEDGER_RANGE_PREDICATE: &str =
+    "($2::timestamptz IS NULL OR created_at > $2) AND ($3::timestamptz IS NULL OR created_at < $3)";
+
 /// **唯一的候选可用性判据**：这条候选现在真的能走吗——它自己启用，且它所在的渠道也启用。
 ///
 /// 四处都判它：对客目录（列哪些模型）、受理（取哪些候选）、管理员视图（每个候选的 `enabled`
@@ -1307,7 +1317,7 @@ impl HubRepository for PgHubRepository {
             .collect()
     }
 
-    /// 按账户读账本流水：时间**倒序**、`since` 开区间、`until` 闭区间、`offset` 翻页、`limit` 截断。
+    /// 按账户读账本流水：时间**倒序**、`[since, until)` 半开区间、`offset` 翻页、`limit` 截断。
     ///
     /// 先判账户在不在，再取分录：一条不存在的账户与"这个账户还没有任何流水"必须分得开，否则
     /// 管理员面会把 404 说成"没有账目"。判据是 `ledger.accounts` 那一行——账本的账户事实只有
@@ -1324,19 +1334,15 @@ impl HubRepository for PgHubRepository {
         if !self.account_exists(account_id).await? {
             return Err(ApplicationError::NotFound(format!("account {account_id}")));
         }
-        // 排序键带 `id`：同一事务写的多条共用 `created_at`，只按时间排会让翻页在边界上重复或漏条。
-        // `since` 是开区间（增量拉取不该重复上一次的位置），`until` 是闭区间（按区间看时含端点）。
-        let rows = sqlx::query(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT account_id, job_id, kind, amount_microusd, created_at
             FROM ledger.entries
-            WHERE account_id = $1
-              AND ($2::timestamptz IS NULL OR created_at > $2)
-              AND ($3::timestamptz IS NULL OR created_at <= $3)
+            WHERE account_id = $1 AND {LEDGER_RANGE_PREDICATE}
             ORDER BY created_at DESC, id DESC
             OFFSET $4 LIMIT $5
-            "#,
-        )
+            "#
+        )))
         .bind(account_id.0)
         .bind(since)
         .bind(until)
@@ -1348,8 +1354,10 @@ impl HubRepository for PgHubRepository {
         rows.iter().map(ledger_entry_from_row).collect()
     }
 
-    /// 该账户在 `[since, until]` 内的流水条数。区间语义与 `read_ledger_entries` 逐字相同——
-    /// 两处口径不一致的话，"还有没有下一页"的判断就会错位。
+    /// 该账户在 `[since, until)` 内的流水条数。
+    ///
+    /// 区间谓词与 `read_ledger_entries` **共用一处常量**：两处口径不一致的话，"还有没有下一页"的判断
+    /// 就会错位，而那种错位在条数恰好落在边界上时才显形。
     async fn count_ledger_entries(
         &self,
         account_id: AccountId,
@@ -1359,15 +1367,13 @@ impl HubRepository for PgHubRepository {
         if !self.account_exists(account_id).await? {
             return Err(ApplicationError::NotFound(format!("account {account_id}")));
         }
-        let count: i64 = sqlx::query_scalar(
+        let count: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
             r#"
             SELECT count(*)::bigint
             FROM ledger.entries
-            WHERE account_id = $1
-              AND ($2::timestamptz IS NULL OR created_at > $2)
-              AND ($3::timestamptz IS NULL OR created_at <= $3)
-            "#,
-        )
+            WHERE account_id = $1 AND {LEDGER_RANGE_PREDICATE}
+            "#
+        )))
         .bind(account_id.0)
         .bind(since)
         .bind(until)
