@@ -32,12 +32,18 @@ import { ConsolePage, Panel, whenText, yuanText } from '../ui';
 /// 口径见 `docs/design/0011-console-information-architecture.md` §1.2 与 §3.2。
 export function AccountsPage({ client }: { client: AdminClient }) {
   const { message } = AntApp.useApp();
+  const [email, setEmail] = useState('');
+  const [tag, setTag] = useState('');
   const [directId, setDirectId] = useState('');
   const [filter, setFilter] = useState<{ email?: string; tag?: string }>({});
   const [selected, setSelected] = useState<string | null>(null);
   const [creating, setCreating] = useState(false);
 
   const accounts = useLoadable(() => client.listAccounts({ ...filter, limit: 100 }), [client, filter]);
+  // 邮箱在客户身份那边。列表要能显示它：运营是**按邮箱**找账户的，搜出来的行必须能确认是谁。
+  const customers = useLoadable(() => client.listCustomers(200), [client]);
+  const emailOf = (accountId: string): string | null =>
+    customers.data?.customers.find((item) => item.account_id === accountId)?.email ?? null;
 
   async function createAccount(initialMicros: number) {
     setCreating(true);
@@ -72,46 +78,57 @@ export function AccountsPage({ client }: { client: AdminClient }) {
       }
     >
       <Panel title="找账户" description="两个条件都填时是「与」的关系。标签是运营自己设的，邮箱来自客户登录身份。">
-        <Form
-          layout="inline"
-          onFinish={(values: { email?: string; tag?: string }) => {
-            // 存进 state 的是**提交时**的取值：输入框每敲一个字就重取一次列表既慢又吵。
-            setFilter({ email: values.email, tag: values.tag });
-          }}
-        >
-          <Form.Item name="email" label="客户邮箱">
+        {/* 用普通表单而不是 antd 的 `Form`：这一处只需要"两个输入框 + 一个动作"，
+            取的是**点击那一刻**的值，不需要校验、不需要受控字段。少一层托管就少一处说不清。 */}
+        <Flex gap={12} wrap align="flex-end">
+          <Flex vertical gap={4}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              客户邮箱
+            </Typography.Text>
             <Input
               data-testid="accounts-lookup-email"
               prefix={<SearchOutlined />}
               placeholder="customer@example.com"
+              value={email}
+              onChange={(event) => setEmail(event.target.value)}
+              onPressEnter={() => setFilter({ email, tag })}
               style={{ width: 240 }}
               allowClear
             />
-          </Form.Item>
-          <Form.Item name="tag" label="标签">
+          </Flex>
+          <Flex vertical gap={4}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              标签
+            </Typography.Text>
             <Input
               data-testid="accounts-lookup-tag"
               placeholder="vip"
+              value={tag}
+              onChange={(event) => setTag(event.target.value)}
+              onPressEnter={() => setFilter({ email, tag })}
               style={{ width: 160 }}
               allowClear
             />
-          </Form.Item>
-          <Form.Item>
-            <Space>
-              <Button type="primary" htmlType="submit">
-                查找
-              </Button>
-              <Button
-                onClick={() => {
-                  setFilter({});
-                  accounts.reload();
-                }}
-              >
-                清空
-              </Button>
-            </Space>
-          </Form.Item>
-        </Form>
+          </Flex>
+          <Space>
+            <Button
+              data-testid="accounts-search"
+              type="primary"
+              onClick={() => setFilter({ email, tag })}
+            >
+              查找
+            </Button>
+            <Button
+              onClick={() => {
+                setEmail('');
+                setTag('');
+                setFilter({});
+              }}
+            >
+              清空
+            </Button>
+          </Space>
+        </Flex>
         {/* 收着旧的按 id 直达：列表不可用时（例如刚拿到一个 id）仍要能查。 */}
         <Divider plain style={{ marginBlock: 16 }}>
           或按账户标识直达
@@ -159,6 +176,20 @@ export function AccountsPage({ client }: { client: AdminClient }) {
             ),
           }}
           columns={[
+            {
+              title: '客户邮箱',
+              key: 'email',
+              width: 220,
+              render: (_value: unknown, account: AccountSummary) => {
+                const email = emailOf(account.account_id);
+                // 运营直接建的账户还没有登录身份——如实说"没有"，不显示空白让人以为是加载失败。
+                return email ? (
+                  <Typography.Text>{email}</Typography.Text>
+                ) : (
+                  <Typography.Text type="secondary">（没有登录身份）</Typography.Text>
+                );
+              },
+            },
             {
               title: '账户',
               dataIndex: 'account_id',
@@ -324,10 +355,19 @@ function AccountDetail({
             tooltip="幂等：同一个键只会充一次，误点两下不会充两次"
             rules={[{ required: true, message: '请填业务键' }]}
           >
-            <Input style={{ width: 200 }} placeholder="topup-2026-09-001" />
+            <Input
+              data-testid="accounts-credit-key"
+              style={{ width: 200 }}
+              placeholder="topup-2026-09-001"
+            />
           </Form.Item>
           <Form.Item>
-            <Button type="primary" htmlType="submit" loading={busy}>
+            <Button
+              data-testid="accounts-credit-submit"
+              type="primary"
+              htmlType="submit"
+              loading={busy}
+            >
               充值
             </Button>
           </Form.Item>
