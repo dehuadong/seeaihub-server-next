@@ -1,3 +1,5 @@
+import { Alert, App as AntApp, Button, Card, Flex, Form, Input, Segmented, Typography } from 'antd';
+import { LockOutlined, MailOutlined, SafetyOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import { apiFetch } from '../shared/api';
 import { CustomerClient } from './client';
@@ -9,18 +11,18 @@ import { useLoadable } from '../shared/ui';
 /// 未登录时只调公开端点：`/health`、注册、登录。账户数据在登录成功之前**一个请求都不发**。
 export function AuthPage() {
   const { signIn } = useCustomerSession();
+  const { message } = AntApp.useApp();
   const [mode, setMode] = useState<'login' | 'register'>('login');
-  const [email, setEmail] = useState('');
-  const [password, setPassword] = useState('');
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  const [form] = Form.useForm<{ email: string; password: string }>();
 
   const health = useLoadable(async () => {
     const response = await fetch('/health');
     return { ok: response.ok, status: response.status };
   }, []);
 
-  async function submit() {
+  async function submit(values: { email: string; password: string }) {
     setBusy(true);
     setError(null);
     try {
@@ -28,94 +30,109 @@ export function AuthPage() {
       const session = await apiFetch<{ token: string; email: string; account_id: string }>(
         path,
         () => null,
-        { method: 'POST', body: { email: email.trim(), password }, admin: false },
+        { method: 'POST', body: { email: values.email.trim(), password: values.password }, admin: false },
       );
       signIn(session);
     } catch (failure) {
-      setError(failure instanceof Error ? failure.message : String(failure));
+      const text = failure instanceof Error ? failure.message : String(failure);
+      setError(text);
+      message.error(text);
     } finally {
       setBusy(false);
     }
   }
 
-  const canSubmit = email.trim().length > 0 && password.length > 0;
-
   return (
-    <div className="main">
-      <h2>seeai 控制台</h2>
-      <p className="muted">
-        用邮箱与口令{mode === 'register' ? '注册' : '登录'}。口令只在这一次请求里用，服务端存的是
-        argon2 哈希；会话令牌只存在这个标签页的 sessionStorage 里。
-      </p>
-      <div className="panel">
-        <div className="row">
-          <button
-            data-testid="portal-mode-login"
-            type="button"
-            className={mode === 'login' ? 'active' : ''}
-            onClick={() => setMode('login')}
+    <Flex
+      align="center"
+      justify="center"
+      style={{ minHeight: '100vh', background: '#f5f5f5', padding: 24 }}
+    >
+      <Flex vertical gap={16} style={{ width: '100%', maxWidth: 460 }}>
+        <Card styles={{ body: { padding: 32 } }}>
+          <Flex vertical gap={4} style={{ marginBottom: 20 }}>
+            <Typography.Title level={3} style={{ margin: 0 }}>
+              seeai 控制台
+            </Typography.Title>
+            <Typography.Text type="secondary">
+              用邮箱与口令{mode === 'register' ? '注册' : '登录'}
+            </Typography.Text>
+          </Flex>
+
+          <Segmented
+            block
+            value={mode}
+            onChange={(value) => setMode(value as 'login' | 'register')}
+            options={[
+              { label: <span data-testid="portal-mode-login">登录</span>, value: 'login' },
+              { label: <span data-testid="portal-mode-register">注册</span>, value: 'register' },
+            ]}
+            style={{ marginBottom: 20 }}
+          />
+
+          <Form form={form} layout="vertical" onFinish={submit} requiredMark={false}>
+            <Form.Item
+              name="email"
+              label="邮箱"
+              rules={[{ required: true, message: '请输入邮箱' }]}
+            >
+              <Input
+                data-testid="portal-email"
+                prefix={<MailOutlined />}
+                placeholder="you@example.com"
+                size="large"
+                autoComplete="username"
+              />
+            </Form.Item>
+            <Form.Item
+              name="password"
+              label="口令（至少 8 个字符）"
+              rules={[
+                { required: true, message: '请输入口令' },
+                { min: 8, message: '至少 8 个字符' },
+              ]}
+            >
+              <Input.Password
+                data-testid="portal-password"
+                prefix={<LockOutlined />}
+                size="large"
+                autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
+                onPressEnter={() => form.submit()}
+              />
+            </Form.Item>
+            <Button
+              data-testid="portal-submit"
+              type="primary"
+              size="large"
+              block
+              htmlType="submit"
+              loading={busy}
+            >
+              {mode === 'register' ? '注册并进入' : '登录'}
+            </Button>
+          </Form>
+
+          {error ? <Alert style={{ marginTop: 16 }} type="error" showIcon message={error} /> : null}
+
+          <Typography.Text
+            type={health.data?.ok ? 'secondary' : 'danger'}
+            style={{ display: 'block', marginTop: 16 }}
           >
-            登录
-          </button>
-          <button
-            data-testid="portal-mode-register"
-            type="button"
-            className={mode === 'register' ? 'active' : ''}
-            onClick={() => setMode('register')}
-          >
-            注册
-          </button>
-        </div>
-        <div className="row" style={{ marginTop: 10 }}>
-          <label className="field">
-            <span>邮箱</span>
-            <input
-              data-testid="portal-email"
-              value={email}
-              onChange={(event) => setEmail(event.target.value)}
-              placeholder="you@example.com"
-              size={26}
-              autoComplete="username"
-            />
-          </label>
-          <label className="field">
-            <span>口令（至少 8 个字符）</span>
-            <input
-              data-testid="portal-password"
-              type="password"
-              value={password}
-              onChange={(event) => setPassword(event.target.value)}
-              size={26}
-              autoComplete={mode === 'register' ? 'new-password' : 'current-password'}
-              onKeyDown={(event) => {
-                if (event.key === 'Enter' && canSubmit) void submit();
-              }}
-            />
-          </label>
-          <button
-            data-testid="portal-submit"
-            type="button"
-            disabled={busy || !canSubmit}
-            onClick={() => void submit()}
-          >
-            {busy ? '提交中…' : mode === 'register' ? '注册并进入' : '登录'}
-          </button>
-        </div>
-        {error ? <p className="error">{error}</p> : null}
-        <p className={health.data?.ok ? 'muted' : 'error'}>
-          服务探活：
-          {health.loading ? '检查中…' : health.data?.ok ? '正常' : `不健康（HTTP ${health.data?.status ?? '无响应'}）`}
-        </p>
-      </div>
-      <div className="panel">
-        <h3>关于充值</h3>
-        <p className="muted">
-          平台目前**没有**在线支付：充值由运营在后台完成，这里只**展示**充值记录与余额。
-          忘了口令也**不能自助重置**——请找运营，由他们签发一枚一次性重置令牌给你，你再用它设置新口令。
-        </p>
-      </div>
-      <ResetPanel />
-    </div>
+            服务探活：
+            {health.loading ? '检查中…' : health.data?.ok ? '正常' : `不健康（HTTP ${health.data?.status ?? '无响应'}）`}
+          </Typography.Text>
+        </Card>
+
+        <ResetPanel />
+
+        <Card size="small">
+          <Typography.Paragraph type="secondary" style={{ margin: 0, fontSize: 12 }}>
+            平台目前没有在线支付：充值由运营在后台完成，这里只展示充值记录与余额。忘了口令也不能自助
+            重置——请找运营签发一枚一次性重置令牌，用它设置新口令。
+          </Typography.Paragraph>
+        </Card>
+      </Flex>
+    </Flex>
   );
 }
 
@@ -125,65 +142,82 @@ export function AuthPage() {
 /// 接管账户"。所以这里只收**运营转交过来的令牌**。
 function ResetPanel() {
   const client = new CustomerClient(() => null);
-  const [token, setToken] = useState('');
-  const [password, setPassword] = useState('');
+  const { message } = AntApp.useApp();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [done, setDone] = useState(false);
+  const [form] = Form.useForm<{ token: string; password: string }>();
 
   return (
-    <div className="panel">
-      <h3>用重置令牌设置新口令</h3>
-      <p className="muted">
-        口令忘了就找运营要一枚**一次性重置令牌**（平台不发邮件）。拿到之后填在这里，设置新口令即可登录。
-        重置成功会使此前所有登录会话失效。
-      </p>
-      <div className="row">
-        <label className="field">
-          <span>重置令牌</span>
-          <input
-            data-testid="portal-reset-token"
-            value={token}
-            onChange={(event) => setToken(event.target.value)}
-            size={44}
-          />
-        </label>
-        <label className="field">
-          <span>新口令（至少 8 个字符）</span>
-          <input
-            data-testid="portal-reset-password"
-            type="password"
-            value={password}
-            onChange={(event) => setPassword(event.target.value)}
-            size={22}
-            autoComplete="new-password"
-          />
-        </label>
-        <button
-          data-testid="portal-reset-submit"
-          type="button"
-          disabled={busy || !token.trim() || !password}
-          onClick={async () => {
-            setBusy(true);
-            setError(null);
-            setDone(false);
-            try {
-              await client.redeemPasswordReset(token.trim(), password);
-              setDone(true);
-              setToken('');
-              setPassword('');
-            } catch (failure) {
-              setError(failure instanceof Error ? failure.message : String(failure));
-            } finally {
-              setBusy(false);
-            }
-          }}
+    <Card
+      size="small"
+      title={
+        <Flex align="center" gap={8}>
+          <SafetyOutlined />
+          用重置令牌设置新口令
+        </Flex>
+      }
+    >
+      <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+        口令忘了就找运营要一枚一次性重置令牌（平台不发邮件）。重置成功会使此前所有登录会话失效。
+      </Typography.Paragraph>
+      <Form
+        form={form}
+        layout="vertical"
+        disabled={done}
+        onFinish={async (values) => {
+          setBusy(true);
+          setError(null);
+          try {
+            await client.redeemPasswordReset(values.token.trim(), values.password);
+            setDone(true);
+            form.resetFields();
+            message.success('口令已重置，回到上面用新口令登录');
+          } catch (failure) {
+            const text = failure instanceof Error ? failure.message : String(failure);
+            setError(text);
+            message.error(text);
+          } finally {
+            setBusy(false);
+          }
+        }}
+      >
+        <Form.Item
+          name="token"
+          label="重置令牌"
+          rules={[{ required: true, message: '请填运营给你的重置令牌' }]}
         >
-          {busy ? '提交中…' : '设置新口令'}
-        </button>
-      </div>
-      {error ? <p className="error">{error}</p> : null}
-      {done ? <p style={{ color: 'var(--ok)' }}>口令已重置，回到上面用新口令登录。</p> : null}
-    </div>
+          <Input data-testid="portal-reset-token" placeholder="粘贴令牌" />
+        </Form.Item>
+        <Form.Item
+          name="password"
+          label="新口令（至少 8 个字符）"
+          rules={[
+            { required: true, message: '请输入新口令' },
+            { min: 8, message: '至少 8 个字符' },
+          ]}
+        >
+          <Input.Password data-testid="portal-reset-password" autoComplete="new-password" />
+        </Form.Item>
+        <Button
+          data-testid="portal-reset-submit"
+          type="primary"
+          htmlType="submit"
+          loading={busy}
+          block
+        >
+          设置新口令
+        </Button>
+      </Form>
+      {error ? <Alert style={{ marginTop: 12 }} type="error" showIcon message={error} /> : null}
+      {done ? (
+        <Alert
+          style={{ marginTop: 12 }}
+          type="success"
+          showIcon
+          message="口令已重置，回到上面用新口令登录。"
+        />
+      ) : null}
+    </Card>
   );
 }

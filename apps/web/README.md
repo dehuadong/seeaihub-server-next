@@ -7,9 +7,24 @@
 | `console.html` | `src/console/` | `dist/console.html` | 运营后台（管理员） |
 | `portal.html` | `src/portal/` | `dist/portal.html` | 客户控制台（客户） |
 
-`src/shared/` 放两边共用的骨架：HTTP 调用与错误解析、金额与时间格式、加载三态与通用展示组件。
-**会话的存放不在共享层**：管理端用 `seeai.console.session`、客户端用 `seeai.portal.session`，各写各的，
-同一个浏览器同时开两个控制台不会串。
+`src/shared/` 放两边共用的**与界面无关**的东西：HTTP 调用与错误解析（`api.ts`）、金额与时间格式
+（`format.ts`）、取数的加载三态（`ui.tsx` 的 `useLoadable`）。**会话的存放不在共享层**：管理端用
+`seeai.console.session`、客户端用 `seeai.portal.session`，各写各的，同一个浏览器同时开两个控制台不会串。
+
+## 界面
+
+两套界面都用 **Ant Design**（`antd` 6）。约定：
+
+- 组件、主题、操作反馈统一走 antd：颜色与圆角由各入口的 `ConfigProvider` 一处配，提示走 `App` 提供的
+  `message` 上下文；`src/shared/styles.css` 只留基础重置（body 边距、底色、根容器高度），**不写**
+  `input`/`button`/`table` 的规则——那是另一套设计系统，会和 antd 冲突。
+- 每页的外框用 `console/ui.tsx` 的 `ConsolePage` 与 `Panel`（管理端）或 `Card`（客户端），
+  表格用 `Table`、表单用 `Form`、状态用 `Tag`/`Switch`、空态用 `Alert` 写清下一步该做什么。
+- `e2e/ui-uses-antd.spec.ts` 按**渲染产物**（`.ant-layout-sider`、`.ant-menu`、`.ant-card` 等）
+  断言这件事——不是按源码里有没有 import，否则被换回裸 HTML 时页面还能用、接口还通，只有人眼会发现。
+
+`npm run capture` 给两套界面的各个页面抓整页截图到 `screenshots/`（它用单独的
+`playwright.capture.config.ts`，不混进 e2e）。"好不好看、间距对不对"归人眼，这份就是给那类判断准备材料。
 
 ## 跑起来
 

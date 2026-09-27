@@ -75,17 +75,5 @@ export function EmptyHint({ children }: { children: ReactNode }) {
   );
 }
 
-/// 微单位人民币 → 展示用的元。**只在展示层换算**：传输与判断都保持整数微单位。
-///
-/// 与 `shared/routes.ts` 的 `yuan` 是同一条规则；这里再导出一次是为了让管理端页面不必从共享层
-/// 拉那个同时还带着 `useHashRoute` 的模块（那样会把路由钩子也带进每一页的依赖图）。
-export function yuanText(micros: number): string {
-  return `${(micros / 1_000_000).toFixed(6).replace(/0+$/, '').replace(/\.$/, '')} 元`;
-}
-
-/// 时间戳按本地时区展示；空值原样显示为 `—`，不猜。
-export function whenText(value: string | null | undefined): string {
-  if (!value) return '—';
-  const at = new Date(value);
-  return Number.isNaN(at.getTime()) ? value : at.toLocaleString();
-}
+// 金额与时间的展示规则在共享层（`shared/format.ts`）：两个入口都要用同一套，而它不含 antd。
+export { whenText, yuan, yuanText } from '../shared/format';

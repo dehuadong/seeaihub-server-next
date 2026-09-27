@@ -151,7 +151,7 @@ export function ChangePasswordPanel({ onClose }: { onClose?: () => void }) {
       }
     >
       <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-        当前登录：{email}。改完之后该管理员的**全部会话都会失效**，包括当前这条。
+        当前登录：{email}。改完之后该管理员的全部会话都会失效，包括当前这条。
       </Typography.Paragraph>
       <Form form={form} layout="inline" onFinish={submit} disabled={done}>
         <Form.Item
