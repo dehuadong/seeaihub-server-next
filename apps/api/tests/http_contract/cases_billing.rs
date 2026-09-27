@@ -461,5 +461,73 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
         "扣费总额必须等于 capture 的求和，不能把 hold/release 算进来"
     );
 
+    // **明细与汇总必须同一条区间口径**：同一个 `[since, until)` 下，`ledger` 里落在这个窗口内的
+    // 扣费条目之和，要等于 `billing` 报的扣费总额。两处口径一旦分叉（一处含端点、一处不含），
+    // 边界上那一笔就会被一边算进去、另一边不算——而那种分叉只在条目恰好落在边界上时才显形。
+    let upper = stamp(after + chrono::Duration::seconds(1));
+    let ledger = client
+        .get(format!(
+            "{}/v1/customer/ledger?since={}&until={}&limit=100",
+            harness.base_url,
+            stamp(before),
+            upper
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("ledger request")
+        .json::<Value>()
+        .await
+        .expect("ledger body");
+    let ledger_charges: i64 = ledger["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|entry| matches!(entry["kind"].as_str(), Some("capture") | Some("adjustment")))
+        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .sum();
+    assert_eq!(
+        json!(ledger_charges),
+        included["charged_microusd"],
+        "同一区间下明细里扣费条目之和必须等于汇总报的扣费总额：ledger={ledger} billing={included}"
+    );
+
+    // 上界**不含**：把它压到请求**之后**、但早于"再往后一点"的位置时，那笔扣费已经在界内；
+    // 而压到请求**之前**时它必须在界外——`ledger` 与 `billing` 要同时给出 0。
+    let ledger_before = client
+        .get(format!(
+            "{}/v1/customer/ledger?until={}&limit=100",
+            harness.base_url,
+            stamp(before)
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("ledger request")
+        .json::<Value>()
+        .await
+        .expect("ledger body");
+    let charges_before: i64 = ledger_before["entries"]
+        .as_array()
+        .expect("entries")
+        .iter()
+        .filter(|entry| matches!(entry["kind"].as_str(), Some("capture") | Some("adjustment")))
+        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .sum();
+    assert_eq!(
+        charges_before, 0,
+        "界外的扣费不该出现在明细里：{ledger_before}"
+    );
+    assert_eq!(
+        excluded["charged_microusd"],
+        json!(0),
+        "汇总同一条口径：{excluded}"
+    );
+    assert_eq!(
+        ledger_before["total"].as_u64(),
+        Some(ledger_before["count"].as_u64().expect("count")),
+        "空结果时 total 与 count 一致（都是 0）：{ledger_before}"
+    );
+
     harness.cleanup().await;
 }
