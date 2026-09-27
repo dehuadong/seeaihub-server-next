@@ -1873,6 +1873,8 @@ pub trait HubRepository: Send + Sync {
         offering_ids: &[OfferingId],
     ) -> Result<Vec<ReferencedOffering>, ApplicationError>;
 
+    async fn selectable_offerings(&self) -> Result<Vec<SelectableOfferingView>, ApplicationError>;
+
     /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
     ///
     /// 同一模型的 active 候选集**永远来自同一个 Revision**（发布即原子替换）。

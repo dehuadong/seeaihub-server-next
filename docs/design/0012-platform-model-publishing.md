@@ -70,14 +70,16 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 
 | 目标行 | 匹配键 | 命中时 |
 | --- | --- | --- |
-| `catalog.vendor_models` | `(vendor_id, native_model_id, native_revision, schema_hash)` | 复用该行（合同行不可变，内容不同就是新一行） |
-| `supply.channels` | `(provider_kind, base_url, credential_env)` | 复用该行，只更新 `enabled` |
-| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`） |
-| `pricing.price_plans` | 该 Offering 在当前时刻的那一行 | 费率或出处变了就写新的一行（`pricing.fx_rates` 的既有形态是带生效时刻的追加，费率沿用同一形态） |
+| `catalog.vendor_models` | `(vendor_id, native_model_id, native_revision)` | 复用该行。**合同行不可变**，所以同一三元组下的内容必须一致；不一致则报错要求**换 `native_revision`**——"内容不同就新写一行"这条做不到，因为 `schema_hash` 已被迁移 `0006` 删除，唯一键就是这三元组 |
+| `supply.channels` | `(provider_kind, base_url, credential_env)` | 复用该行，**只更新 `enabled` 里的"新建时默认 true"**：启停是运营状态，导入不该把它顶回启用，所以实际是 `ON CONFLICT DO NOTHING` |
+| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`）。**不动 `enabled`** |
+| `pricing.price_plans` | `(offering_id, currency, source_url)` 且四档费率全同 | 复用；**费率变了才追加一行**（不是"每个时刻一行"——表上只有 `created_at`，没有生效时刻这一列） |
+
+**成本币种在这四张表里没有落点**：`supply.offerings` 没有 `cost_currency` 列（`0013` 只加了 `formula` 与 `cost_unit_price_microusd`），所以素材里"直接由上游给金额"那条（APIMart）声明的币种今天**不入库**，它只能由 Price Plan 的币种、或该供给最近一次发布在修订上声明的币种承接。引用式发布因此按"Price Plan 币种 → 最近一次发布声明的币种"兜底（见 §4）。
 
 **`base_url` 或 `credential_env` 变了就是换了一个渠道身份**——按上表会落到**新的** `supply.channels` 行，旧行留着（它可能还被别的 Offering 或已发布修订引用）。导入**绝不修改**渠道身份三要素中的任何一个来"就地改名"。
 
-**导入是工程侧的动作**：它随服务启动时已有的迁移步骤一起跑，不新增运营入口、也不新增工程端点。素材是权威输入、库是事实权威，两者的关系与今天一致：素材写"应该有什么"，库记录"实际是什么"。
+**导入是工程侧的动作**：它随服务启动时已有的迁移步骤一起跑，不新增运营入口、也不新增工程端点。素材是权威输入、库是事实权威，两者的关系与今天一致：素材写"应该有什么"，库记录"实际是什么"。入口读环境变量 `SUPPLY_MATERIAL_DIR`；**不设、为空、目录不存在或没有 json 文件时静默跳过**——开发库与测试库没有素材是正常的，不能因此启动失败；素材本身坏（形状不对）则报错并点名文件与候选下标。
 
 **运营创建 Gateway Model 时至少选一条 Offering**：一条调不动的模型不是商品，没有任何入口能让它先占个名字。名字在首次发布时建立（`publication.gateway_models` 由发布事务插入），与 `0006` §1.6 的写入方一致。
 
