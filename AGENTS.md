@@ -41,23 +41,7 @@ cargo test --workspace --all-features
 
 ### 浏览器行为：跑 `npx playwright test`
 
-**判断标准一句话：这个改动的正确性，是不是只有真实浏览器才观测得到？** 答"是"才写 spec——路由守卫、表单校验与联动、
-会话存续（cookie / `sessionStorage`）、构建产物级的静态资源与分发、全栈串联的主路径、重构后的回归护栏。
-接口契约、状态码、鉴权规则归 `apps/api/tests/http_contract`；纯函数与后端逻辑归各自的单元测试；
-"好不好看、间距对不对"归人眼，列成清单交给人验，不假装脚本能替人判断。
-
-1. 配置与用例在 `apps/web`：`playwright.config.ts` 与 `e2e/*.spec.ts`。**一条命令自己拉起环境**——
-   `ensure-database.mjs` 把库重置成空库、`npm run build` 出两份产物、`start-api.mjs` 起 API（启动时自己跑迁移），
-   跑完即收。不需要先开终端准备任何东西。
-2. 跑 `npm run e2e --prefix apps/web`（或在该目录下 `npx playwright test`）；只跑一条就 `npx playwright test e2e/xxx.spec.ts`。
-3. 每个新的界面行为或界面 bugfix 都带一个能复现它的 spec，和业务代码一起提交。修 bug 先红后绿：先让 spec 复现问题，再改代码。
-4. 选择器用 `getByTestId` / `getByRole`；缺稳定锚点就在组件上补 `data-testid`，不用脆弱的 CSS 层级或文案。
-5. 不写界面单元测试（按钮渲染、className、快照）；界面行为由 spec 覆盖。
-6. 红的处理顺序：先看产物（`npx playwright show-trace`、失败截图、`npx playwright show-report`）→ 给关键请求与状态加日志或把用例拆小 →
-   改业务代码 → 重跑**同一条命令**。交付判据是同一条命令连跑两次都绿，不靠 retries 兜底。
-7. 主机名用 `*.localhost`（`admin.localhost` 回运营后台、`app.localhost` 回客户控制台）：Chrome 把它们解析到回环，
-   所以不用改 hosts，而 `admin.` 前缀正好命中生产的分发判据。**Node 的解析器不认 `.localhost`**——spec 里用
-   `request` 这类走 Node 的调用要直连 `127.0.0.1`。
+playwright test e2e 参阅 `apps/web/AGENTS.md`
 
 ## 通用约定
 - 未经批准不发起任何计费调用
@@ -90,8 +74,11 @@ Discuss 及阶段推进权限在此定义；Planning 之后的阶段编排、门
 工程任务的范围由**工作项**拥有，不在对话里。开工前先取回它，不能靠代码与对话猜：
 
 1. `gh issue view <n>` 读选定范围、实施步骤表与**明确排除项**（约定见 [`docs/agents/issue-tracker.md`](docs/agents/issue-tracker.md)）；
-2. 读适用 Spec 的验收条件（`docs/specs/`）与 RFC（`docs/design/`）；
-3. 列本轮清单，逐条标注依据（issue 的哪一步、Spec 的哪一条）。**清单之外的事不做**。
+2. **沿引用链往上读到提案、往下读到承接这条需求的实施工单**（"没有提案"要作为明确事实记下，不能当成没看过）。要能说出：我这次做的那条需求**写在哪**、**由哪个工单承接**、**那个工单是否已关闭**；
+3. 读适用 Spec 的验收条件（`docs/specs/`）与 RFC（`docs/design/`）；
+4. 列本轮清单，逐条标注依据（issue 的哪一步、Spec 的哪一条）。**清单之外的事不做**。
+
+**需求本体没被设计过的东西不做。** 只读到"某个工作项说了要它"不够：提案 `#13` 范围里的"**选择** vendor → **选择**渠道模型"，被承接它的切片工单窄化成了"管理员用整份发布定义它"；提案随后按"切片全部关闭"结案，而那半条需求从未交付，最后是靠用户复述才发现。判断方法是第 2 步那三个问题；答不上来，或答案是"工单没覆盖这一条"，就**停下来把它写进工作项**，别用实现去补。
 
 需求只能来自工作项或 Spec。自己认为"应该有"的东西写进工作项等裁决，**不直接实现**——那是范围外的设计，做得再多也是要返工的。
 
