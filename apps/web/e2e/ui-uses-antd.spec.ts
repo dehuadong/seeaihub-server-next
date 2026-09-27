@@ -61,17 +61,22 @@ test('客户控制台的登录页与控制台都渲染 Ant Design 组件', async
   await expect(page.locator('.ant-segmented')).toBeVisible();
   await expect(page.locator('.ant-input').first()).toBeVisible();
 
-  // 注册一个客户，看控制台那几块面板。
+  // 注册一个客户，看控制台那几块面板。控制台按**使用频次**分组：首屏三个数，其余在标签页里。
   await page.getByTestId('portal-mode-register').click();
   await page.getByTestId('portal-email').fill(`antd-${Date.now()}@example.com`);
   await page.getByTestId('portal-password').fill('e2e-customer-password');
   await page.getByTestId('portal-submit').click();
 
-  for (const title of ['余额与持有', '改口令', 'API Key', '用量与账单']) {
-    const card = page.locator('.ant-card').filter({ has: page.getByText(title, { exact: true }) });
-    await expect(card).toBeVisible();
-  }
-  // 控制台里有统计卡与表格（空库时表格也在，只是显示空态）。
+  // 首屏的概览与标签页都是 antd 组件。
   await expect(page.locator('.ant-statistic').first()).toBeVisible();
+  await expect(page.locator('.ant-tabs')).toBeVisible();
+
+  for (const title of ['用量与账单', 'API Key', '账户设置']) {
+    await expect(page.getByRole('tab', { name: title })).toBeVisible();
+  }
+  // 默认停在"用量与账单"，里面有汇总卡与表格（空库时表格也在，只是显示空态）。
+  await expect(
+    page.locator('.ant-card').filter({ has: page.getByText('账单汇总', { exact: true }) }),
+  ).toBeVisible();
   await expect(page.locator('.ant-table').first()).toBeVisible();
 });

@@ -9,23 +9,34 @@ import {
   Form,
   Input,
   Row,
+  Space,
   Statistic,
   Table,
+  Tabs,
   Tag,
+  Tooltip,
   Typography,
 } from 'antd';
-import { KeyOutlined, LockOutlined, PlusOutlined } from '@ant-design/icons';
+import { InfoCircleOutlined, KeyOutlined, LockOutlined, PlusOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { CustomerClient } from './client';
 import { useCustomerSession } from './session';
 import { whenText, yuanText } from '../shared/format';
 import { useLoadable } from '../shared/ui';
 
-/// 客户控制台的主体：余额与持有、改口令、密钥自助、用量与账单（Spec C5、C7–C10）。
+/// 客户控制台的主体。
 ///
-/// 每个板块各取各的数据，一个板块失败不影响别的；金额与时间只在展示层换算，判断都用服务端给的数。
+/// **首屏只回答三件事**（可用余额、持有中、扣费总额）——那是客户打开这一页的唯一动机；其余按
+/// 标签页收起来：用量与账单（明细）、API Key、账户设置（改口令等低频动作）。
+///
+/// 为什么不是把四块竖着排一页（原样）：客户最常看的是余额与用量，而"改口令"是一次性动作，排在中间
+/// 就把两件常看的事切开了；用量多起来也没法定位。分组依据是**使用频次**，不是端点归属。
+///
+/// 口径见 `docs/design/0011-console-information-architecture.md` §2.2 与 §3.4。
 export function Dashboard({ client }: { client: CustomerClient }) {
   const { email, accountId, signOut } = useCustomerSession();
+  const account = useLoadable(() => client.account(), [client]);
+  const billing = useLoadable(() => client.billing(), [client]);
 
   return (
     <Flex vertical gap={16} style={{ maxWidth: 1100, margin: '0 auto', padding: 24 }}>
@@ -38,145 +49,98 @@ export function Dashboard({ client }: { client: CustomerClient }) {
             {email}　账户 <Typography.Text code>{accountId}</Typography.Text>
           </Typography.Text>
         </div>
-        <Button onClick={signOut}>退出登录</Button>
+        <Space>
+          <Button
+            onClick={() => {
+              account.reload();
+              billing.reload();
+            }}
+            loading={account.loading || billing.loading}
+          >
+            刷新
+          </Button>
+          <Button onClick={signOut}>退出登录</Button>
+        </Space>
       </Flex>
 
-      <AccountPanel client={client} />
-      <PasswordPanel client={client} />
-      <KeysPanel client={client} />
-      <UsagePanel client={client} />
+      {/* 概览：三个数，一屏可见，不需要滚动也不需要切标签页。 */}
+      <Card styles={{ body: { paddingTop: 20 } }}>
+        {account.error ? (
+          <Alert style={{ marginBottom: 8 }} type="error" showIcon message={account.error} />
+        ) : null}
+        {billing.error ? <Alert type="error" showIcon message={billing.error} /> : null}
+        <Row gutter={[24, 16]}>
+          <Col xs={24} sm={8}>
+            <Statistic
+              title="可用余额"
+              value={account.data ? yuanText(account.data.balance_microusd) : '—'}
+              loading={account.loading}
+            />
+          </Col>
+          <Col xs={24} sm={8}>
+            <Statistic
+              title={
+                <Space size={4}>
+                  持有中
+                  <Tooltip title="已预授权、还没结算的部分。它不是可用额的一部分——这笔钱到底扣没扣，看这个数。">
+                    <InfoCircleOutlined style={{ color: 'rgba(0,0,0,0.45)' }} />
+                  </Tooltip>
+                </Space>
+              }
+              value={account.data ? yuanText(account.data.held_microusd) : '—'}
+              loading={account.loading}
+            />
+          </Col>
+          <Col xs={24} sm={8}>
+            <Statistic
+              title={
+                <Space size={4}>
+                  扣费总额（全部）
+                  <Tooltip title="账本里扣费与调整条目的合计。明细与账单汇总在下面的「用量与账单」里。">
+                    <InfoCircleOutlined style={{ color: 'rgba(0,0,0,0.45)' }} />
+                  </Tooltip>
+                </Space>
+              }
+              value={billing.data ? yuanText(billing.data.charged_microusd) : '—'}
+              loading={billing.loading}
+            />
+          </Col>
+        </Row>
+        {account.data ? (
+          <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+            余额写入时刻：{whenText(account.data.updated_at)}
+          </Typography.Text>
+        ) : null}
+      </Card>
+
+      <Tabs
+        defaultActiveKey="usage"
+        items={[
+          { key: 'usage', label: '用量与账单', children: <UsagePanel client={client} /> },
+          { key: 'keys', label: 'API Key', children: <KeysPanel client={client} /> },
+          {
+            key: 'account',
+            label: '账户设置',
+            children: <AccountSettingsPanel client={client} />,
+          },
+        ]}
+      />
     </Flex>
   );
 }
 
-/// 改自己的口令（Spec C4）。改完**该客户此前所有会话都失效**，所以只能回到登录页重新登录。
-function PasswordPanel({ client }: { client: CustomerClient }) {
-  const { signOut } = useCustomerSession();
-  const { message } = AntApp.useApp();
-  const [busy, setBusy] = useState(false);
-  const [error, setError] = useState<string | null>(null);
-  const [done, setDone] = useState(false);
-  const [form] = Form.useForm<{ current: string; next: string }>();
-
-  return (
-    <Card title="改口令">
-      <Form
-        form={form}
-        layout="inline"
-        disabled={done}
-        onFinish={async (values) => {
-          setBusy(true);
-          setError(null);
-          try {
-            await client.changePassword(values.current, values.next);
-            setDone(true);
-            form.resetFields();
-            message.success('口令已改，请用新口令重新登录');
-          } catch (failure) {
-            const text = failure instanceof Error ? failure.message : String(failure);
-            setError(text);
-            message.error(text);
-          } finally {
-            setBusy(false);
-          }
-        }}
-      >
-        <Form.Item
-          name="current"
-          label="当前口令"
-          rules={[{ required: true, message: '请输入当前口令' }]}
-        >
-          <Input.Password
-            data-testid="portal-current-password"
-            prefix={<LockOutlined />}
-            style={{ width: 200 }}
-            autoComplete="current-password"
-          />
-        </Form.Item>
-        <Form.Item
-          name="next"
-          label="新口令"
-          rules={[
-            { required: true, message: '请输入新口令' },
-            { min: 8, message: '至少 8 个字符' },
-          ]}
-        >
-          <Input.Password
-            data-testid="portal-new-password"
-            style={{ width: 200 }}
-            autoComplete="new-password"
-          />
-        </Form.Item>
-        <Form.Item>
-          <Button data-testid="portal-change-password" type="primary" htmlType="submit" loading={busy}>
-            改口令
-          </Button>
-        </Form.Item>
-      </Form>
-      {error ? <Alert style={{ marginTop: 8 }} type="error" showIcon message={error} /> : null}
-      {done ? (
-        <Alert
-          style={{ marginTop: 8 }}
-          type="success"
-          showIcon
-          message="口令已改。此前所有登录会话都已失效。"
-          action={
-            <Button size="small" onClick={signOut}>
-              回登录页
-            </Button>
-          }
-        />
-      ) : null}
-    </Card>
-  );
-}
-
-/// 余额与持有中。**两个数分开**：持有中是已预授权、还没扣的部分，不是可用额的一部分。
-function AccountPanel({ client }: { client: CustomerClient }) {
-  const account = useLoadable(() => client.account(), [client]);
-  const ledger = useLoadable(() => client.ledger(20), [client]);
+/// 账目流水（充值记录在这里）。金额的**符号是语义的一部分**，所以负的显红。
+function LedgerPanel({ client }: { client: CustomerClient }) {
+  const ledger = useLoadable(() => client.ledger(50), [client]);
 
   return (
     <Card
-      title="余额与持有"
-      extra={
-        <Button
-          onClick={() => {
-            account.reload();
-            ledger.reload();
-          }}
-        >
-          重取
-        </Button>
-      }
+      title="充值记录与账目流水"
+      extra={<Button onClick={ledger.reload}>重取</Button>}
     >
-      {account.error ? <Alert type="error" showIcon message={account.error} /> : null}
-      {account.data ? (
-        <Row gutter={[24, 16]}>
-          <Col xs={12} md={8}>
-            <Statistic title="可用余额" value={yuanText(account.data.balance_microusd)} />
-          </Col>
-          <Col xs={12} md={8}>
-            <Statistic
-              title="持有中（已预授权、还没结算）"
-              value={yuanText(account.data.held_microusd)}
-            />
-          </Col>
-          <Col xs={24} md={8}>
-            <Descriptions
-              size="small"
-              column={1}
-              items={[
-                { key: 'updated', label: '写入时刻', children: whenText(account.data.updated_at) },
-              ]}
-            />
-          </Col>
-        </Row>
-      ) : null}
-
-      <Typography.Title level={5} style={{ marginTop: 24 }}>
-        充值记录与账目流水
-      </Typography.Title>
+      <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+        充值由运营在后台完成；扣费在生成请求结算后出现在这里。
+      </Typography.Paragraph>
       {ledger.error ? <Alert type="error" showIcon message={ledger.error} /> : null}
       <Table
         size="small"
@@ -194,11 +158,7 @@ function AccountPanel({ client }: { client: CustomerClient }) {
           ),
         }}
         columns={[
-          {
-            title: '时刻',
-            dataIndex: 'created_at',
-            render: (value: string) => whenText(value),
-          },
+          { title: '时刻', dataIndex: 'created_at', render: (value: string) => whenText(value) },
           {
             title: '类别',
             dataIndex: 'kind',
@@ -218,7 +178,127 @@ function AccountPanel({ client }: { client: CustomerClient }) {
           },
         ]}
       />
+      {ledger.data?.truncated ? (
+        <Typography.Text type="secondary">
+          只显示最近 50 条（按时间倒序）。
+        </Typography.Text>
+      ) : null}
     </Card>
+  );
+}
+
+/// 对客状态的展示文案。取值由服务端收敛，界面只翻译，不自己判断含义。
+function statusLabel(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
+  switch (status) {
+    case 'succeeded':
+      return '成功';
+    case 'failed':
+      return '未产出';
+    case 'canceled':
+      return '已取消';
+    default:
+      return '处理中';
+  }
+}
+
+function statusColor(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
+  switch (status) {
+    case 'succeeded':
+      return 'green';
+    case 'failed':
+      return 'red';
+    case 'canceled':
+      return 'default';
+    default:
+      return 'processing';
+  }
+}
+
+/// 用量与账单：汇总是**区间全量**，明细按上限截断——两者的口径不同，所以汇总独立于明细的条数。
+function UsagePanel({ client }: { client: CustomerClient }) {
+  const usage = useLoadable(() => client.usage(50), [client]);
+  const billing = useLoadable(() => client.billing(), [client]);
+
+  return (
+    <Flex vertical gap={16}>
+      <Card
+        title="账单汇总"
+        extra={<Button onClick={billing.reload}>重取</Button>}
+      >
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          按整段区间全量计算，不随下面明细的条数变化。
+        </Typography.Paragraph>
+        {billing.error ? <Alert type="error" showIcon message={billing.error} /> : null}
+        <Row gutter={[24, 16]}>
+          <Col xs={8}>
+            <Statistic
+              title="请求数"
+              value={billing.data?.requests ?? 0}
+              loading={billing.loading}
+            />
+          </Col>
+          <Col xs={8}>
+            <Statistic
+              title="产出图片数"
+              value={billing.data?.images ?? 0}
+              loading={billing.loading}
+            />
+          </Col>
+          <Col xs={8}>
+            <Statistic
+              title="平均每次扣费"
+              value={
+                billing.data && billing.data.requests > 0
+                  ? yuanText(Math.round(billing.data.charged_microusd / billing.data.requests))
+                  : '—'
+              }
+              loading={billing.loading}
+            />
+          </Col>
+        </Row>
+      </Card>
+
+      <Card title="逐笔明细" extra={<Button onClick={usage.reload}>重取</Button>}>
+        {usage.error ? <Alert type="error" showIcon message={usage.error} /> : null}
+        <Table
+          size="small"
+          rowKey={(row, index) => `${row.created_at}-${index ?? 0}`}
+          loading={usage.loading}
+          pagination={false}
+          scroll={{ x: 'max-content' }}
+          dataSource={usage.data?.usage ?? []}
+          locale={{ emptyText: <Alert type="info" showIcon message="还没有任何调用记录。" /> }}
+          columns={[
+            { title: '时刻', dataIndex: 'created_at', render: (value: string) => whenText(value) },
+            { title: '型号', dataIndex: 'gateway_model' },
+            {
+              title: '类别',
+              dataIndex: 'kind',
+              render: (value: string) => (value === 'edit' ? '图片编辑' : '同步生成'),
+            },
+            {
+              title: '状态',
+              dataIndex: 'status',
+              render: (value: 'succeeded' | 'failed' | 'pending' | 'canceled') => (
+                <Tag color={statusColor(value)}>{statusLabel(value)}</Tag>
+              ),
+            },
+            { title: '张数', dataIndex: 'image_count', align: 'right' },
+            {
+              title: '扣费（元）',
+              dataIndex: 'charged_microusd',
+              align: 'right',
+              render: (value: number) => yuanText(value),
+            },
+          ]}
+        />
+        {usage.data?.truncated ? (
+          <Typography.Text type="secondary">只显示最近 50 条。</Typography.Text>
+        ) : null}
+      </Card>
+
+      <LedgerPanel client={client} />
+    </Flex>
   );
 }
 
@@ -236,6 +316,9 @@ function KeysPanel({ client }: { client: CustomerClient }) {
       title="API Key"
       extra={<Button onClick={keys.reload}>重取</Button>}
     >
+      <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+        明文只在创建那一次出现，之后谁也拿不回来。吊销立刻生效（不删行）。
+      </Typography.Paragraph>
       {error ? <Alert type="error" showIcon message={error} /> : null}
       {keys.error ? <Alert type="error" showIcon message={keys.error} /> : null}
       <Form
@@ -294,7 +377,10 @@ function KeysPanel({ client }: { client: CustomerClient }) {
                 {issued.api_key}
               </Typography.Text>
               <Typography.Text type="secondary">
-                密钥标识：<Typography.Text code copyable>{issued.key_id}</Typography.Text>
+                密钥标识：
+                <Typography.Text code copyable>
+                  {issued.key_id}
+                </Typography.Text>
               </Typography.Text>
             </Flex>
           }
@@ -309,17 +395,11 @@ function KeysPanel({ client }: { client: CustomerClient }) {
         pagination={false}
         dataSource={keys.data?.keys ?? []}
         locale={{
-          emptyText: (
-            <Alert type="info" showIcon message="还没有密钥。建一把之后才能调用生成接口。" />
-          ),
+          emptyText: <Alert type="info" showIcon message="还没有密钥。建一把之后才能调用生成接口。" />,
         }}
         columns={[
           { title: '标签', dataIndex: 'label' },
-          {
-            title: '创建时间',
-            dataIndex: 'created_at',
-            render: (value: string) => whenText(value),
-          },
+          { title: '创建时间', dataIndex: 'created_at', render: (value: string) => whenText(value) },
           {
             title: '状态',
             dataIndex: 'revoked_at',
@@ -358,114 +438,131 @@ function KeysPanel({ client }: { client: CustomerClient }) {
   );
 }
 
-/// 对客状态的展示文案。取值由服务端收敛，界面只翻译，不自己判断含义。
-function statusLabel(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
-  switch (status) {
-    case 'succeeded':
-      return '成功';
-    case 'failed':
-      return '未产出';
-    case 'canceled':
-      return '已取消';
-    default:
-      return '处理中';
-  }
-}
-
-function statusColor(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
-  switch (status) {
-    case 'succeeded':
-      return 'green';
-    case 'failed':
-      return 'red';
-    case 'canceled':
-      return 'default';
-    default:
-      return 'processing';
-  }
-}
-
-/// 用量与账单：逐笔明细按时间倒序、汇总按区间全量。
-function UsagePanel({ client }: { client: CustomerClient }) {
-  const usage = useLoadable(() => client.usage(50), [client]);
-  const billing = useLoadable(() => client.billing(), [client]);
+/// 账户设置：改口令与账号信息。低频动作收在这里，不占首屏。
+function AccountSettingsPanel({ client }: { client: CustomerClient }) {
+  const { email, accountId, signOut } = useCustomerSession();
+  const { message } = AntApp.useApp();
+  const [busy, setBusy] = useState(false);
+  const [error, setError] = useState<string | null>(null);
+  const [done, setDone] = useState(false);
+  const [form] = Form.useForm<{ current: string; next: string }>();
 
   return (
-    <Card
-      title="用量与账单"
-      extra={
-        <Button
-          onClick={() => {
-            usage.reload();
-            billing.reload();
+    <Flex vertical gap={16}>
+      <Card title="账号">
+        <Descriptions
+          size="small"
+          column={1}
+          bordered
+          items={[
+            { key: 'email', label: '登录邮箱', children: email },
+            {
+              key: 'account',
+              label: '账户',
+              children: (
+                <Typography.Text code copyable>
+                  {accountId}
+                </Typography.Text>
+              ),
+            },
+          ]}
+        />
+        <Button style={{ marginTop: 16 }} onClick={signOut}>
+          退出登录
+        </Button>
+      </Card>
+
+      <Card
+        title={
+          <Space size={8}>
+            <LockOutlined />
+            改口令
+          </Space>
+        }
+      >
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          改完之后此前所有登录会话都会失效，需要用新口令重新登录。
+        </Typography.Paragraph>
+        <Form
+          form={form}
+          layout="vertical"
+          disabled={done}
+          style={{ maxWidth: 420 }}
+          onFinish={async (values) => {
+            setBusy(true);
+            setError(null);
+            try {
+              await client.changePassword(values.current, values.next);
+              setDone(true);
+              form.resetFields();
+              message.success('口令已改，请用新口令重新登录');
+            } catch (failure) {
+              const text = failure instanceof Error ? failure.message : String(failure);
+              setError(text);
+              message.error(text);
+            } finally {
+              setBusy(false);
+            }
           }}
         >
-          重取
-        </Button>
-      }
-    >
-      {billing.error ? <Alert type="error" showIcon message={billing.error} /> : null}
-      {usage.error ? <Alert type="error" showIcon message={usage.error} /> : null}
-      {billing.data ? (
-        <Row gutter={[24, 16]}>
-          <Col xs={8}>
-            <Statistic title="请求数（全部）" value={billing.data.requests} />
-          </Col>
-          <Col xs={8}>
-            <Statistic title="产出图片数" value={billing.data.images} />
-          </Col>
-          <Col xs={8}>
-            <Statistic title="扣费总额" value={yuanText(billing.data.charged_microusd)} />
-          </Col>
-        </Row>
-      ) : null}
-      <Typography.Paragraph type="secondary" style={{ marginTop: 12, marginBottom: 0 }}>
-        汇总按整段区间全量计算，不随下面明细的条数变化。
-      </Typography.Paragraph>
+          <Form.Item
+            name="current"
+            label="当前口令"
+            rules={[{ required: true, message: '请输入当前口令' }]}
+          >
+            <Input.Password
+              data-testid="portal-current-password"
+              prefix={<LockOutlined />}
+              autoComplete="current-password"
+            />
+          </Form.Item>
+          <Form.Item
+            name="next"
+            label="新口令"
+            rules={[
+              { required: true, message: '请输入新口令' },
+              { min: 8, message: '至少 8 个字符' },
+            ]}
+          >
+            <Input.Password
+              data-testid="portal-new-password"
+              autoComplete="new-password"
+            />
+          </Form.Item>
+          <Form.Item style={{ marginBottom: 0 }}>
+            <Button
+              data-testid="portal-change-password"
+              type="primary"
+              htmlType="submit"
+              loading={busy}
+            >
+              改口令
+            </Button>
+          </Form.Item>
+        </Form>
+        {error ? <Alert style={{ marginTop: 12 }} type="error" showIcon message={error} /> : null}
+        {done ? (
+          <Alert
+            style={{ marginTop: 12 }}
+            type="success"
+            showIcon
+            message="口令已改。此前所有登录会话都已失效。"
+            action={
+              <Button size="small" onClick={signOut}>
+                回登录页
+              </Button>
+            }
+          />
+        ) : null}
+      </Card>
 
-      <Table
-        style={{ marginTop: 16 }}
-        size="small"
-        rowKey={(row, index) => `${row.created_at}-${index ?? 0}`}
-        loading={usage.loading}
-        pagination={false}
-        scroll={{ x: 'max-content' }}
-        dataSource={usage.data?.usage ?? []}
-        locale={{
-          emptyText: <Alert type="info" showIcon message="还没有任何调用记录。" />,
-        }}
-        columns={[
-          {
-            title: '时刻',
-            dataIndex: 'created_at',
-            render: (value: string) => whenText(value),
-          },
-          { title: '型号', dataIndex: 'gateway_model' },
-          {
-            title: '类别',
-            dataIndex: 'kind',
-            render: (value: string) => (value === 'edit' ? '图片编辑' : '同步生成'),
-          },
-          {
-            title: '状态',
-            dataIndex: 'status',
-            render: (value: 'succeeded' | 'failed' | 'pending' | 'canceled') => (
-              <Tag color={statusColor(value)}>{statusLabel(value)}</Tag>
-            ),
-          },
-          { title: '张数', dataIndex: 'image_count', align: 'right' },
-          {
-            title: '扣费（元）',
-            dataIndex: 'charged_microusd',
-            align: 'right',
-            render: (value: number) => yuanText(value),
-          },
-        ]}
-      />
-      {usage.data?.truncated ? (
-        <Typography.Text type="secondary">只显示最近 50 条。</Typography.Text>
-      ) : null}
-    </Card>
+      <Card title="关于充值">
+        <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
+          平台目前没有在线支付：充值由运营在后台完成，这里只展示充值记录与余额。忘了口令也不能自助
+          重置——请找运营签发一枚一次性重置令牌，用它设置新口令。
+        </Typography.Paragraph>
+      </Card>
+    </Flex>
   );
 }
 

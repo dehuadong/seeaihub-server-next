@@ -46,7 +46,8 @@ test('客户控制台的登录页与控制台各抓一张截图', async ({ page 
   await page.getByTestId('portal-email').fill(`shot-${Date.now()}@example.com`);
   await page.getByTestId('portal-password').fill('a-long-enough-password');
   await page.getByTestId('portal-submit').click();
-  await page.getByText('余额与持有').first().waitFor();
+  // 控制台渲染出来的标志是首屏那三个数（不依赖当前停在哪个标签页）。
+  await page.locator('.ant-statistic').first().waitFor();
   await page.waitForTimeout(700);
   await page.screenshot({ path: 'screenshots/11-客户控制台-控制台.png', fullPage: true });
 });

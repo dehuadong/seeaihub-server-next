@@ -1,7 +1,7 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 
-/// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、四块数据都渲染出来、
-/// 密钥明文只显示一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
+/// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、首屏三个数、密钥明文只显示
+/// 一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
 ///
 /// 这些行为的接口契约由 `apps/api/tests/http_contract/cases_identity.rs` 管；这里验的是"人在浏览器里
 /// 点下去会发生什么"。
@@ -16,43 +16,67 @@ const PASSWORD = 'e2e-customer-password';
 
 /// 一块面板。界面用的是 Ant Design 的 `Card`，它的标题渲染成 `div`（不是 heading），所以按
 /// **卡片容器 + 标题文本**定位，而不是按 `getByRole('heading')`——换 UI 库时选择器跟着实现走，
-/// 但断言的性质不变（这几块面板在不在）。
+/// 但断言的性质不变。
 function panel(page: Page, title: string): Locator {
   return page.locator('.ant-card').filter({ has: page.getByText(title, { exact: true }) });
+}
+
+/// 切标签页。控制台的分组依据是**使用频次**：首屏只放三个数，其余按标签页收起来。
+async function tab(page: Page, label: string): Promise<void> {
+  await page.getByRole('tab', { name: label }).click();
+}
+
+/// 控制台是否已经渲染出来。用首屏那三个统计数判断——**它们不依赖任何标签页**，
+/// 所以"登录后看到控制台"这件事与"当前停在哪个标签页"无关。
+function overview(page: Page): Locator {
+  return page.locator('.ant-statistic');
 }
 
 async function register(page: Page, email: string): Promise<void> {
   await page.goto(PORTAL);
   // 未登录：只有登录/注册页，没有账户数据。
   await expect(page.getByTestId('portal-submit')).toBeVisible();
-  await expect(panel(page, '余额与持有')).toHaveCount(0);
+  await expect(overview(page)).toHaveCount(0);
 
   await page.getByTestId('portal-mode-register').click();
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(PASSWORD);
   await page.getByTestId('portal-submit').click();
 
-  await expect(panel(page, '余额与持有')).toBeVisible();
+  await expect(overview(page).first()).toBeVisible();
 }
 
-test('注册后进控制台，四块数据都渲染出来', async ({ page }) => {
+test('注册后进控制台：首屏三个数 + 三个标签页', async ({ page }) => {
   await register(page, uniqueEmail());
 
-  for (const title of ['余额与持有', 'API Key', '改口令', '用量与账单']) {
-    await expect(panel(page, title)).toBeVisible();
-  }
-
-  // 余额与持有必须**分开**给（合成"总资产"会说清不了一笔钱扣没扣）。
+  // **首屏**（不切标签页、不滚动）就该看到三个数：可用余额、持有中、扣费总额。
   await expect(page.getByText('可用余额')).toBeVisible();
-  await expect(page.getByText('持有中（已预授权、还没结算）')).toBeVisible();
+  await expect(page.getByText('持有中')).toBeVisible();
+  await expect(page.getByText('扣费总额（全部）')).toBeVisible();
+  expect(await overview(page).count()).toBeGreaterThanOrEqual(3);
+
+  // 三个标签页都在；明细收在后面，不占首屏。
+  for (const label of ['用量与账单', 'API Key', '账户设置']) {
+    await expect(page.getByRole('tab', { name: label })).toBeVisible();
+  }
 
   // 会话存在客户自己的键下，不会串到管理端。
   expect(await page.evaluate(() => sessionStorage.getItem('seeai.portal.session'))).toBeTruthy();
   expect(await page.evaluate(() => sessionStorage.getItem('seeai.console.session'))).toBeNull();
 });
 
+test('用量与账单页给出汇总与逐笔明细，且有账目流水', async ({ page }) => {
+  await register(page, uniqueEmail());
+  await tab(page, '用量与账单');
+
+  await expect(panel(page, '账单汇总')).toBeVisible();
+  await expect(panel(page, '逐笔明细')).toBeVisible();
+  await expect(panel(page, '充值记录与账目流水')).toBeVisible();
+});
+
 test('新建密钥时明文只出现一次，列表里之后再也拿不到', async ({ page }) => {
   await register(page, uniqueEmail());
+  await tab(page, 'API Key');
   await expect(panel(page, 'API Key')).toBeVisible();
 
   await page.getByTestId('portal-key-label').fill('e2e 脚本');
@@ -65,6 +89,7 @@ test('新建密钥时明文只出现一次，列表里之后再也拿不到', as
 
   // **只此一次**：刷新之后明文那一块不再出现，列表里也只有标签/时间/状态。
   await page.reload();
+  await tab(page, 'API Key');
   await expect(panel(page, 'API Key')).toBeVisible();
   await expect(page.getByText('e2e 脚本')).toBeVisible();
   await expect(page.getByTestId('portal-key-plaintext')).toHaveCount(0);
@@ -73,7 +98,11 @@ test('新建密钥时明文只出现一次，列表里之后再也拿不到', as
 
 test('改口令成功后旧会话立即失效，回到登录页', async ({ page }) => {
   await register(page, uniqueEmail());
-  await expect(panel(page, '改口令')).toBeVisible();
+  // 改口令是低频动作，收在"账户设置"里——这正是它不该占首屏的原因。
+  await tab(page, '账户设置');
+  // 改口令是低频动作，收在"账户设置"里——这正是它不该占首屏的原因。
+  // 用按钮的 `data-testid` 而不是文案：卡片标题也叫"改口令"，按文案会命中两处。
+  await expect(page.getByTestId('portal-change-password')).toBeVisible();
 
   const next = 'e2e-customer-password-changed';
   await page.getByTestId('portal-current-password').fill(PASSWORD);
@@ -83,9 +112,9 @@ test('改口令成功后旧会话立即失效，回到登录页', async ({ page 
   // antd 的 `Alert` 会把消息渲染在两层同名元素里，所以取第一个。
   await expect(page.getByText('口令已改').first()).toBeVisible();
   // 该客户的**全部**会话都失效了，包括刚发起这次改动的那一条：回登录页。
-  await page.getByRole('button', { name: '回登录页' }).click();
+  await page.getByRole('button', { name: '回登录页' }).first().click();
   await expect(page.getByTestId('portal-submit')).toBeVisible();
-  await expect(panel(page, '余额与持有')).toHaveCount(0);
+  await expect(overview(page)).toHaveCount(0);
 });
 
 test('凭运营签发的重置令牌设置新口令，之后能用新口令登录', async ({ page, request }) => {
@@ -121,5 +150,5 @@ test('凭运营签发的重置令牌设置新口令，之后能用新口令登�
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(next);
   await page.getByTestId('portal-submit').click();
-  await expect(panel(page, '余额与持有')).toBeVisible();
+  await expect(overview(page).first()).toBeVisible();
 });
