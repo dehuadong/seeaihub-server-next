@@ -2,18 +2,16 @@
 status: accepted
 ---
 
-# `SafeBeforeAcceptance` 暂不产生重试，映射为失败并释放预授权
+# `SafeBeforeAcceptance` 在额度内重投；`AcceptanceUnknown` 与 `NotRetryable` 不重投
 
-`RetrySafety` 保持三态，Adapter 必须如实区分"可证明未受理""确定性拒绝""无法证明是否受理"——这是 Adapter 的对外语义，属于平台能力的一部分，不因为暂时不用就砍掉其中一态。本阶段 `SafeBeforeAcceptance` 与 `NotRetryable` 映射到同一处置：Job 进入 `failed` 并释放预授权，区别只保留在该 Attempt 的 `provider_error_code` 上，供将来启用重试时使用。
+`RetrySafety` 保持三态，Adapter 必须如实区分"可证明未受理""确定性拒绝""无法证明是否受理"——这是 Adapter 的对外语义，属于平台能力的一部分。处置按三态分流：
 
-**为什么不是保守而是结构性的**：`generation.attempts` 有 `UNIQUE (job_id)`（一个 Job 只能容纳一个 Attempt），`JobState` 也没有从 `submitting` 回到 `accepted`/`leased` 的边，因此"同一 Job 内的安全重试"在当前数据模型里**不可表达**；启用它需要先改造 Attempt 模型（多 Attempt、租约与退避、取消语义、预授权是否跨 Attempt 保留）。这与 [0007](./0007-reconciliation-instead-of-automatic-retry.md) 一致：0007 允许连接前失败重试，本条只是在本阶段收窄，不推翻其安全原则。
+- **`SafeBeforeAcceptance`**（可证明上游没有受理、还没开始计费）**重投**：同一 Job 内新起一次执行（`attempt_no` 递增），两次之间按指数退避等待，退避基与执行次数上限是**运维取值**（`GENERATION_RETRY_MAX_ATTEMPTS`、`GENERATION_RETRY_BACKOFF_BASE_MS`，单次退避有封顶）。预授权在重投期间原样保留，到成功结算或用尽额度失败时才释放；一次请求只结算一次。
+- **`AcceptanceUnknown`**（超时、`5xx`、响应读不出）**绝不重投**：进 `reconciliation_required` 并保留预授权。提交阶段的"连不上"同样按这一态处理——传输层不能严格证明上游没有收到请求（超时与连接中断都可能发生在请求已经发出之后）。
+- **`NotRetryable`**（参数/凭证类确定性拒绝）不重投：Job 失败并释放预授权——重投同一份请求只会得到同一个答复。
 
-**代价**：可证明未受理的失败也会终止 Job，可用性略降；换来的是不引入未经验证的重试状态机、不因重试重复产生上游成本。
+判据只有一条：能不能重投只由 Driver 报出的那一态决定，编排层不按状态码另猜一遍；**宁可进对账也不重投**，"不会为同一个请求付两次上游成本"这条纪律不变。这与 [ADR-0007](./0007-reconciliation-instead-of-automatic-retry.md) 一致。
 
-**2026-09-24 修订（结论翻转：`SafeBeforeAcceptance` 现在产生重投）**：上文结论**整体被本节取代**——只有"`RetrySafety` 保持三态、Adapter 必须如实区分"这一条继续成立。当前处置按三态分流：`SafeBeforeAcceptance`（可证明上游没有受理、还没开始计费）**重投**，两次之间按指数退避等待，退避基与执行次数上限是**运维取值**，预授权在重投期间原样保留、到成功结算或用尽额度失败时才释放；`AcceptanceUnknown`（超时、`5xx`、响应读不出）**绝不重投**，进 `reconciliation_required` 并保留预授权；`NotRetryable`（参数/凭证类确定性拒绝）不重投，Job 失败并释放预授权——重投同一份请求只会得到同一个答复。
+**代价**：重投把可证明未受理的失败救回来，但一次请求占用对客同步窗口更久——次数与退避因此交给运营按上游抖动与窗口自定。
 
-改这一段的理由：原判定的结构性理由**已不成立**——"一个 Job 只能容纳一个 Attempt"这条唯一约束已去掉，同一 Job 内"这是第几次执行"改由 `attempt_no` 唯一确定，于是"这一次没被受理、重投一次"在当前数据模型里**可表达**。判据本身没有放松：能不能重投仍然只由 Driver 报出的那一态决定，**宁可进对账也不重投**，"不会为同一个请求付两次上游成本"这条纪律不变。代价仍在：重投把可证明未受理的失败救回来，但也让一次请求占用对客同步窗口更久，所以次数与退避交给运营按上游抖动与窗口自定。
-
-**本次一并确认的边界**：**提交阶段的"连不上"仍按 `AcceptanceUnknown` 处理、不纳入可重投**——传输层不能严格证明上游没有收到请求（超时与连接中断都可能发生在请求已经发出之后）。将来运营若要把它纳入可重投，那是**独立的一次判定变更、需要显式授权**，不是本条的延伸。
-
-**修订依据**：本次变更的提交 `4ecd36b`。
+**修订史**：本条翻转掉的旧结论、它失效的原因与依据提交见 [`.agents/notes/implemented/platform/2026-09-27-adr-0011-retry-reversal.md`](../../.agents/notes/implemented/platform/2026-09-27-adr-0011-retry-reversal.md)。

@@ -64,11 +64,24 @@ publication.runtime_revisions.vendor_model_id   uuid NOT NULL
 
 ## 3. 可选择的 Offering 从哪来：由工程师的素材导入
 
-Offering 是**工程师配好的资产**，不是运营的输入。它由**已经存在的发布素材**（`config/bootstrap/*.json`，这正是工程师今天写渠道与供给的地方）导入而来，导入是**幂等**的：按 `(vendors 身份, 渠道身份)` 匹配既有行，有就更新技术定义、没有就新建。它随服务启动时已有的迁移步骤一起跑，不新增运营入口、也不新增工程端点。
+Offering 是**工程师配好的资产**。它由**已经存在的发布素材**（`config/bootstrap/*.json`，这正是工程师今天写渠道与供给的地方）导入而来。
 
-因此运营在主路径上**没有任何配置渠道的动作**：渠道、Offering、合同、驱动器、承载面、参数映射、渠道成本费率全部在素材里由工程师写一次。
+**导入是幂等的，匹配键是既有的身份键**，不是"按名字找"：
+
+| 目标行 | 匹配键 | 命中时 |
+| --- | --- | --- |
+| `catalog.vendor_models` | `(vendor_id, native_model_id, native_revision, schema_hash)` | 复用该行（合同行不可变，内容不同就是新一行） |
+| `supply.channels` | `(provider_kind, base_url, credential_env)` | 复用该行，只更新 `enabled` |
+| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`） |
+| `pricing.price_plans` | 该 Offering 在当前时刻的那一行 | 费率或出处变了就写新的一行（`pricing.fx_rates` 的既有形态是带生效时刻的追加，费率沿用同一形态） |
+
+**`base_url` 或 `credential_env` 变了就是换了一个渠道身份**——按上表会落到**新的** `supply.channels` 行，旧行留着（它可能还被别的 Offering 或已发布修订引用）。导入**绝不修改**渠道身份三要素中的任何一个来"就地改名"。
+
+**导入是工程侧的动作**：它随服务启动时已有的迁移步骤一起跑，不新增运营入口、也不新增工程端点。素材是权威输入、库是事实权威，两者的关系与今天一致：素材写"应该有什么"，库记录"实际是什么"。
 
 **运营创建 Gateway Model 时至少选一条 Offering**：一条调不动的模型不是商品，没有任何入口能让它先占个名字。名字在首次发布时建立（`publication.gateway_models` 由发布事务插入），与 `0006` §1.6 的写入方一致。
+
+**这一条与 `CONTEXT.md` 的 Offering 词条有一处张力**：词条写"不随每次发布重写"，而这里允许导入更新它的技术定义。两者不冲突——**重写它的是工程师的导入，不是运营的发布**；运营的发布只引用。词条那句话的用意（运营不该在每次发布里重写技术定义）仍然成立，这里把"谁可以改它"写清。
 
 ## 4. 发布：选 + 给价
 
@@ -78,7 +91,7 @@ Offering 是**工程师配好的资产**，不是运营的输入。它由**已�
 | --- | --- |
 | 引用 | `offering_id`（选择的结果） |
 | 路由 | `routing_priority`、`weight` |
-| 定价 | `consumer_rates_cny`、`cost_basis`、`reference_cost_microusd`、`tier_prices`、`floor_amounts`（`0007` §2） |
+| 定价 | `consumer_rates_cny`、`cost_basis`、`reference_cost_microusd`、`tier_prices`、`floor_amounts`（`0007` §2；`markup_bps` **不在这里**——它是 Gateway Model 级的一个值，见 §6） |
 
 渠道三要素、驱动器、供应商模型名、承载面、参数映射、限制**不再出现在命令里**：由被引用的 Offering 决定，发布期从库里取，取不到或被停用就拒绝并点名是哪一条。
 
@@ -86,15 +99,31 @@ Offering 是**工程师配好的资产**，不是运营的输入。它由**已�
 
 ## 5. 已发布修订不受 Offering 后续改动影响
 
-`publish_runtime` 今天对 `(vendor_model_id, channel_id)` 走 `DO UPDATE`，而受理读的是**活表**（`supply.offerings` 与 `supply.channels` 的当前值）。因此共享同一个 Vendor Model 的两个 Gateway Model 会互相改活候选，工程师后来改渠道地址也会影响已发布修订的受理取值。
+`publish_runtime` 今天对 `(vendor_model_id, channel_id)` 走 `DO UPDATE`，而受理读的是**活表**（`supply.offerings` 与 `supply.channels` 的当前值）。因此共享同一个 Vendor Model 的两个 Gateway Model 会互相改活候选，工程师后来改渠道地址也会影响已发布修订的受理取值——`0006` §1.2 那句"候选自身的定义不改"与这句话合起来是读不通的。
 
-**引用式发布必须把这件事定死**：发布时把被引用 Offering 的**技术定义快照进这次修订**（与"随 Job 快照冻结"同一条纪律），受理读快照，不读活表。否则"发布即冻结"这句话是假的。这是本文要求的行为改变，改的是受理取数，不改定价口径。
+**要改的是受理读谁**：发布时把被引用 Offering 的**技术定义**写进这次修订的**条目**（`publication.runtime_entries`，它今天已经带着 `provider_kind` / `base_url` / `credential_env` 这类快照列），受理从条目读，不从活表读。
+
+**快照含什么、不含什么，分清楚**：
+
+| 事实 | 进不进快照 | 为什么 |
+| --- | --- | --- |
+| `adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、渠道三要素、运营选择的档位与权重 | **进** | 它们是"这次发布定义了什么"，改了就等于另一次发布 |
+| `supply.offerings.enabled`、`supply.channels.enabled` | **不进** | 它们是运行状态：停用一条供给或一条渠道要**立刻**对之后的受理生效，不能被某次发布的快照钉住（`0006` 已定的"供给级与渠道级启停写入即生效"） |
+| `pricing.price_plans` 的四档渠道费率 | **进**（修订已有定价列） | 它决定成本怎么算，随发布冻结 |
+
+两个开关与快照**不冲突**：受理先按快照拿到候选与它的技术定义，再按活表的两个 `enabled` 判"这条现在还让不让走"；关掉一条渠道，用它的所有候选立刻不可用，但**不必重新发布**。
+
+**连带的必改项**：`active_offering_channels`（改价沿用渠道字段时读的那个查询）今天从活表取渠道三要素，快照化之后它要改成从该型号当前生效修订的条目取——否则"改价"这条路上的沿用来源与受理读的不是同一份事实。
+
+**这一条改的是"受理取数"，不是定价口径**：`0007` 的算式、成本两态、快照冻结与结算一字不动。它要落进 `0006` §1.6/§2.3 的存储与受理取数小节，并由 `ADR-0009` 补一句"原子替换的是条目及其快照"——**这一处 ADR 修订需要你确认**（按项目的 ADR 规则）。
 
 ## 6. 定价与折算率
 
 沿用 `0007` §2，本文不改：`markup_bps` 每个 Gateway Model 一个；`consumer_rates_cny` **按候选**（多条 Offering 成本不同，各有各的价）；`cost_basis` 与 `reference_cost_microusd` 按候选；`tier_prices` / `floor_amounts` 按候选。
 
-折算率是 `币种 → CNY` 的全局事实（`0007` §2），同币种也录一行、率恒为 1。它**不是**某条 Offering 的属性，所以它**不占运营的一个导航项**：运营给某条候选定价时要在意的只是"这个渠道币种有没有生效的折算率、是多少"，所以它出现在**发布页那条候选的定价处**——缺就当场录、有就显示当前生效的那一行。管理端的独立折算率页面撤掉，它的读接口保留给运维与排障。
+折算率是 `币种 → CNY` 的全局事实（`0007` §2），同币种也录一行、率恒为 1。它**不是**某条 Offering 的属性。运营给某条候选定价时要在意的只是"这个渠道币种有没有生效的折算率、是多少"，所以**发布页那条候选的定价处要就地显示它、并在缺的时候能就地录入**（缺了发布期会拒，就地录入省一次跳页）。
+
+**Spec M3 要求的那个按币种录入页仍然保留**（M3 的判据是"能录入、能看出当前录入结果"，并没有说它必须是唯一入口；它也是运维与排障的落点）。两处入口写同一个事实，不存在第二份权威。
 
 ## 7. 迁移
 

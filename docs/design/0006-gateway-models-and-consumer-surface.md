@@ -1,5 +1,4 @@
 主题: 平台网关模型、对客定价与运营后台（总览：网关模型与对客面）
-当前修订: v1
 状态: 待评审（原单文件 `0006-gateway-models-pricing-and-admin-console.md` 已按切片拆为本份与 `0007`/`0008`）
 来源: 工作项「运营后台：平台网关模型、对客定价与路由权重」与提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)；原单文件的 §1、§2、§8 与 §10 的总览部分
 依赖: [`docs/design/0005`](./0005-vendor-model-contract-and-offering-mapping.md)（合同/承载面/映射分层）；`ADR-0003`、`ADR-0009`、`ADR-0015`、`ADR-0017`、`ADR-0020`
@@ -33,7 +32,7 @@
 | 现有对象 | 它拥有什么 | 与网关模型的关系 |
 | --- | --- | --- |
 | `catalog.vendor_models` | Vendor Model 身份（`vendor_id` + `native_model_id` + `native_revision`）+ **调用方合同**（模型级唯一一份、行不可变，`ADR-0015`） | 网关模型**指向**其中一行；合同**不复制**，多个网关模型可共享同一行 |
-| `supply.offerings` | 一条候选供给：渠道、驱动、`provider_model_id`、承载面、参数映射、限制（`ADR-0015`） | 网关模型候选集的元素；候选自身的定义不改 |
+| `supply.offerings` | 一条候选供给：渠道、驱动、`provider_model_id`、承载面、参数映射、限制（`ADR-0015`） | 网关模型候选集的元素。**发布时它的技术定义被快照进这次修订的条目**（`publication.runtime_entries`），受理从条目读、不从活表读——否则共享同一个厂商模型的两个网关模型会互相改活候选。改价时沿用渠道字段的那个查询同样从条目取。见 [`0012`](./0012-platform-model-publishing.md) §5 |
 | `publication.runtime_revisions` / `runtime_entries` | 一次发布的不可变修订；生效条目、`routing_priority`、`active` | 网关模型的**身份与候选集只由发布产生**（`ADR-0009`：一次发布携带完整有序候选集合，原子替换） |
 | `pricing.price_plans` | 现状：四档 token 费率 + 来源 URL；现在它同时是对客结算基数 | 角色**收窄为渠道成本费率**，而且**只是"按 token 计量量计价"这一种计价形态的参数**（供给上的 `formula` 说这个渠道按什么计价，按张 / 按次或由上游直接给金额的供给**没有** Price Plan）：**费率表按渠道各自记、币种按该渠道的 `currency` 标注**（当前记的四档 `$5 / $10 / $8 / $30` 每 1M tokens 是 **AIHubMix** 的费率表、币种 **USD**；APIMart 的成本由上游 `cost` 直接给出，币种以渠道声明为准——**不是"全平台统一美元"**），定价时的参考与毛利核算用，不再是对客结算基数（[`0007`](./0007-pricing-floor-and-settlement.md) §1） |
 | `generation.jobs` | 受理时的请求事实 + 被选中的 `PublishedOffering` + Price Snapshot | 受理时固化的 `gateway_model` 就是对外的那个名字 |
@@ -167,7 +166,7 @@
 - **失败后改道（换候选）**：上游请求一旦失败就改选另一条候选，仍不做（`ADR-0009`/`ADR-0011`，属 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)）——"可证明未受理"的失败重投的是同一份请求、同一个候选，不属本项；
 - **成本进账本与账实核对**（[`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11) 的成本进账本与账实核对那部分）；
 - **对外价策略本身与具体数值**（[`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)）；
-- **把 `config/bootstrap/*.json` 当后台**（用户明确：只作初始化种子与测试夹具）。
+- **把 `config/bootstrap/*.json` 当后台**（用户明确：它是初始化种子与测试夹具，不是运营的去处）。**它不是后台，但它是工程师写渠道与 Offering 的地方**：这些技术定义由素材**导入**到库里，之后运营在后台**选**它们，而不是在素材里配价（[`0012`](./0012-platform-model-publishing.md) §3）。
 
 ## 4. 决策归属与 ADR
 

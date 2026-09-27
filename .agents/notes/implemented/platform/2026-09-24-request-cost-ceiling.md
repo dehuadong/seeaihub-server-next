@@ -54,5 +54,5 @@ verification: 端到端两条（`a_candidate_that_could_cost_more_than_the_ceili
 ## 依据与关联
 
 - 机制与判据的边界见 [`docs/design/0009`](../../../../docs/design/0009-operational-baseline.md) §7；受理闸门的原口径见 [`docs/design/0007`](../../../../docs/design/0007-pricing-floor-and-settlement.md) §6。
-- "受理的唯一上限是客户余额"这句话与后加的护栏之间的关系，已就地标注在 [`ADR-0009`](../../../../docs/adr/0009-multiple-active-offerings-and-routing.md) 的 2026-09-24 修订段。
+- "受理的唯一上限是客户余额"这句话与后加的护栏之间的关系，已搬进 [`ADR-0009 的修订史`](./2026-09-27-adr-0009-revision-history.md)；现行条款见 [`ADR-0009`](../../../../docs/adr/0009-multiple-active-offerings-and-routing.md)。
 - 参考成本是发布者按"费率 × 参考用量"给出的单次成本声明，见 [`docs/design/0007`](../../../../docs/design/0007-pricing-floor-and-settlement.md) §2；成本事实本身见[渠道成本事实采集](./2026-09-22-provider-cost-facts.md)。

@@ -12,6 +12,8 @@ status: accepted
 
 **币种：对客只有 CNY 单币种，成本按渠道声明的币种记原值。** 余额、充值、售价、保底额与扣费一律 CNY；成本记原币种原值，可能是 USD、CNY 或别的。汇率只用于把成本折算成 CNY 做毛利核算，不参与对客金额——对客金额只由受理时冻结的 CNY 费率快照决定。
 
-**编号存根**：本条合并了原 `0010` 与 `0016`，两个编号保留以便旧链接可解析。
+**编号存根**：本条合并了 ADR-0010 与 ADR-0016，两个编号保留以便旧链接可解析。
 
 机制（计费形态落在哪、汇率表与快照位、各形态的算式）见 [`../design/0007-pricing-floor-and-settlement.md`](../design/0007-pricing-floor-and-settlement.md)；"上游声明的金额能否作为第二类计量证据"这一候选问题已由实测回答并否决，依据见 [`.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`](../../.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md)。
+
+**反悔成本**：改它要放开结算路径上的证据校验与库层约束，并把已发布的 Offering、已产生的 `ledger.entries` 与已进对账的案例按新口径重新处置——对账的处置口径（只能退款、不得仅凭运营判断确认扣款）也要一起改。
