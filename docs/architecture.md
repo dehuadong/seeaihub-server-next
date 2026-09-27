@@ -59,6 +59,7 @@
 | GET | `/api/v1/gateway-models` | `list_gateway_models` | 管理员（网关模型清单：对客名、运维开关、候选与承载面、**每个候选的定价**与修订级加价系数；**不回显渠道凭证**。对客名由管理员发布时自己填，平台不预设任何名字） |
 | PATCH | `/api/v1/gateway-models/{gateway_model}` | `set_gateway_model_enabled` | 管理员（**只改启用开关**；没发布过的名字是 404，定义只能由发布产生） |
 | GET | `/api/v1/route-policies` | `list_route_policies` | 管理员（路由策略清单：全局那条与各网关模型的覆盖；策略是**运行期配置**，不进不可变修订） |
+| GET | `/api/v1/offerings` | `list_selectable_offerings` | 管理员（**可被运营选中的 Offering 清单**：按厂商分组用，给 `offering_id` 作选择键，带渠道与渠道侧模型名、驱动器、计价形态、渠道币种与费率、以及"能不能选"。**不回显渠道地址与凭证变量名**——那是渠道部署事实；**不过滤停用的**：停用的照样在列并标 `enabled: false`，运营要能看出"为什么它选不了"，见 [`0012`](design/0012-platform-model-publishing.md) §2.1） |
 | PUT | `/api/v1/route-policies` | `upsert_route_policy` | 管理员（写入或覆盖一条策略：`gateway_model` 不传即全局；`strategy` 取 `priority_failover` / `weighted_random` / `least_cost` / `user_tag`，其余返回 400——落成默认会把"配置没生效"伪装成生效；`discount_rates`（候选 → 万分比）只作 `least_cost` 的比较输入、**不进成本**，`tag_channel_map`（标签 → 候选）供 `user_tag` 用。每次写入换版本标识） |
 | PUT | `/api/v1/accounts/{account_id}/tag` | `set_account_tag` | 管理员（设账户标签：标签只被生效的 `user_tag` 策略消费，没有那条策略时不改变任何选路结果；账户不存在 404。**不动** `updated_at`——那列是余额最后一次变动的时刻） |
 | PUT | `/api/v1/fx-rates` | `upsert_fx_rate` | 管理员（按币种录入**折算率**（渠道币种 → CNY，定点整数，分母 1e6）与生效时间，写审计；同一币种同一生效时刻只有一行，重录即改那一行。**汇率不进不可变修订**：同一时刻同一币种全平台必须是同一个数才对账得起来） |
