@@ -153,7 +153,11 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
         .send()
         .await
         .expect("set tag");
-    assert!(put_tag.status().is_success(), "设标签：{}", put_tag.status());
+    assert!(
+        put_tag.status().is_success(),
+        "设标签：{}",
+        put_tag.status()
+    );
 
     // 另一个账户带上邮箱登录身份：用来验"按邮箱找"。
     let email = format!("find-{}@example.com", Uuid::new_v4());
@@ -230,8 +234,14 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
         .iter()
         .map(|row| row["account_id"].as_str().expect("account_id"))
         .collect();
-    assert!(ids.contains(&tagged_id.as_str()), "没有登录身份的账户也要在：{all}");
-    assert!(ids.contains(&bound_id.as_str()), "带登录身份的账户要在：{all}");
+    assert!(
+        ids.contains(&tagged_id.as_str()),
+        "没有登录身份的账户也要在：{all}"
+    );
+    assert!(
+        ids.contains(&bound_id.as_str()),
+        "带登录身份的账户要在：{all}"
+    );
 
     // 空串按"没给"处理：`?email=` 不该被当成"找一个邮箱为空字符串的账户"（那会永远空）。
     let blank = client
@@ -249,7 +259,10 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
 
     // 不存在的标签：给空数组而不是报错。
     let missing = client
-        .get(format!("{base_url}/api/v1/accounts?tag=no-such-tag-{}", Uuid::new_v4()))
+        .get(format!(
+            "{base_url}/api/v1/accounts?tag=no-such-tag-{}",
+            Uuid::new_v4()
+        ))
         .bearer_auth(&admin_token)
         .send()
         .await
