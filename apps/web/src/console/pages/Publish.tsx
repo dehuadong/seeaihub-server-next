@@ -1,14 +1,102 @@
-import { Alert, App as AntApp, Button, Descriptions, Form, Input, Typography } from 'antd';
-import { SendOutlined } from '@ant-design/icons';
-import { useState } from 'react';
+import {
+  Alert,
+  App as AntApp,
+  Button,
+  Card,
+  Col,
+  Collapse,
+  Descriptions,
+  Divider,
+  Flex,
+  Form,
+  Input,
+  Row,
+  Select,
+  Space,
+  Typography,
+} from 'antd';
+import { DeleteOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
+import { useCallback, useEffect, useState } from 'react';
 import type { AdminClient } from '../client';
 import { ConsolePage, Panel } from '../ui';
 
-/// 发布修订：运营在这里"加一个网关模型"——贴一份发布命令，带上定价与倍率。
+/// 发布修订：运营"加一个网关模型"或"给已有型号发新修订"的地方。
 ///
-/// 素材就是发布命令本身（`config/bootstrap/*.json` 的形状），所以这一页不做表单化改写：
-/// 合同与候选是**结构化数据**，把它拆成几十个输入框只会让人以为平台在替它做决定。这里只负责
-/// 提交、把平台的原话（校验错误逐条）显示出来，并如实说明这一次发布做了什么、没做什么。
+/// **表单收集商业条款，技术字段贴入**。发布命令里绝大多数内容是运营不做决定的样板：
+/// `capability_schema` 与 `carrier_schema` 是厂商给的 JSON Schema，`parameter_mapping` 是渠道包装声明；
+/// 运营真正决定的是几个数——型号、倍率、候选的供应商与成本、对客费率。
+///
+/// 为什么不做成"只改倍率就能发"：发布命令的 `offerings` 要求**完整、有序**的候选集合（每次给全），
+/// 而其中的 `base_url`、`credential_env` 是渠道部署事实、管理端视图不回显——前端拼不出完整命令。
+/// 界面上留了"从已发布型号载入"把能拿到的字段填回来，剩下的一次性贴入。
+///
+/// 口径见 `docs/design/0011-console-information-architecture.md` §3.1（含三条可选路径）。
+const FORMULAS = [
+  { value: 'token_rates', label: '按 token 计量（渠道给四档费率）' },
+  { value: 'per_image', label: '按张计价（给单价）' },
+  { value: 'per_call', label: '按次计价（给单价）' },
+  { value: 'upstream_declared', label: '上游直接给金额' },
+];
+
+interface OfferingForm {
+  provider_kind: string;
+  adapter_key: string;
+  provider_model_id: string;
+  base_url: string;
+  credential_env: string;
+  formula: string;
+  weight: number;
+  /** Price Plan（渠道币种）：`token_rates` 才有。 */
+  plan_currency: string;
+  plan_source_url: string;
+  plan_text_input: number;
+  plan_image_input: number;
+  plan_text_output: number;
+  plan_image_output: number;
+  /** 按张 / 按次的成本单价。 */
+  cost_unit_price_microusd: number;
+  cost_currency: string;
+  /** `upstream_declared` 的参考成本。 */
+  reference_cost_microusd: number;
+  /** 技术字段：贴 JSON。 */
+  carrier_schema: string;
+  parameter_mapping: string;
+  restrictions: string;
+  /** 对客四档 CNY 费率（按 token 计量的候选随修订带一份）。 */
+  margin_enabled: boolean;
+  cny_text_input: number;
+  cny_image_input: number;
+  cny_text_output: number;
+  cny_image_output: number;
+}
+
+const EMPTY_OFFERING: OfferingForm = {
+  provider_kind: '',
+  adapter_key: '',
+  provider_model_id: '',
+  base_url: '',
+  credential_env: '',
+  formula: 'token_rates',
+  weight: 1,
+  plan_currency: 'USD',
+  plan_source_url: '',
+  plan_text_input: 0,
+  plan_image_input: 0,
+  plan_text_output: 0,
+  plan_image_output: 0,
+  cost_unit_price_microusd: 0,
+  cost_currency: 'USD',
+  reference_cost_microusd: 0,
+  carrier_schema: '',
+  parameter_mapping: '',
+  restrictions: '',
+  margin_enabled: false,
+  cny_text_input: 0,
+  cny_image_input: 0,
+  cny_text_output: 0,
+  cny_image_output: 0,
+};
+
 export function PublishPage({ client }: { client: AdminClient }) {
   const { message } = AntApp.useApp();
   const [busy, setBusy] = useState(false);
@@ -16,17 +104,113 @@ export function PublishPage({ client }: { client: AdminClient }) {
   const [done, setDone] = useState<{ gateway_model: string; runtime_revision_id: string } | null>(
     null,
   );
-  const [form] = Form.useForm<{ command: string }>();
 
-  async function submit(values: { command: string }) {
+  const [identity, setIdentity] = useState({
+    vendor_id: '',
+    native_model_id: '',
+    gateway_model: '',
+    native_revision: '',
+    markup_bps: 2000,
+    capability_schema: '',
+  });
+  const [offerings, setOfferings] = useState<OfferingForm[]>([{ ...EMPTY_OFFERING }]);
+
+  function patchOffering(index: number, patch: Partial<OfferingForm>) {
+    setOfferings((list) =>
+      list.map((item, at) => (at === index ? { ...item, ...patch } : item)),
+    );
+  }
+
+  /// 把技术字段从 JSON 文本变成对象。空串按"没给"处理（这些字段在命令里都可缺省）。
+  function parseJson(text: string, what: string): unknown {
+    const trimmed = text.trim();
+    if (!trimmed) return undefined;
+    try {
+      return JSON.parse(trimmed);
+    } catch (failure) {
+      throw new Error(
+        `${what}不是合法 JSON：${failure instanceof Error ? failure.message : failure}`,
+      );
+    }
+  }
+
+  /// 按表单拼出发布命令。**只做翻译**：不做本地校验（形状对不对由发布期的校验答复负责），
+  /// 也不替运营算费率（那是运营填的，平台只原样保存与冻结）。
+  function buildCommand(): Record<string, unknown> {
+    const parsed = parseJson(identity.capability_schema, '合同（capability_schema）');
+    const command: Record<string, unknown> = {
+      vendor_id: identity.vendor_id.trim(),
+      native_model_id: identity.native_model_id.trim(),
+      native_revision: identity.native_revision.trim(),
+      markup_bps: identity.markup_bps,
+      actor: 'admin-console',
+      offerings: offerings.map((offering, index) => {
+        const item: Record<string, unknown> = {
+          provider_kind: offering.provider_kind.trim(),
+          adapter_key: offering.adapter_key.trim(),
+          provider_model_id: offering.provider_model_id.trim(),
+          base_url: offering.base_url.trim(),
+          credential_env: offering.credential_env.trim(),
+          formula: offering.formula,
+          // 档位缺省即下标，这里显式给出来让人能同档分摊。
+          routing_priority: index,
+          weight: offering.weight,
+        };
+        if (parsed !== undefined) item.capability_schema = parsed;
+        const carrier = parseJson(offering.carrier_schema, '承载面（carrier_schema）');
+        if (carrier !== undefined) item.carrier_schema = carrier;
+        const mapping = parseJson(offering.parameter_mapping, '参数映射（parameter_mapping）');
+        if (mapping !== undefined) item.parameter_mapping = mapping;
+        const restrictions = parseJson(offering.restrictions, '限制（restrictions）');
+        if (restrictions !== undefined) item.restrictions = restrictions;
+
+        if (offering.formula === 'token_rates') {
+          item.price_plan = {
+            currency: offering.plan_currency.trim().toUpperCase(),
+            text_input_microusd_per_million: offering.plan_text_input,
+            image_input_microusd_per_million: offering.plan_image_input,
+            text_output_microusd_per_million: offering.plan_text_output,
+            image_output_microusd_per_million: offering.plan_image_output,
+            // 出处是必填：渠道费率对账时要能回去看当初是从哪一页抄的。
+            source_url: offering.plan_source_url.trim(),
+          };
+          item.cost_currency = offering.plan_currency.trim().toUpperCase();
+          if (offering.margin_enabled) {
+            item.consumer_rates_cny = {
+              text_input_micros_per_million: offering.cny_text_input,
+              image_input_micros_per_million: offering.cny_image_input,
+              text_output_micros_per_million: offering.cny_text_output,
+              image_output_micros_per_million: offering.cny_image_output,
+            };
+          }
+        } else if (offering.formula === 'per_image' || offering.formula === 'per_call') {
+          // 单价是这两种形态唯一的成本参数。
+          item.cost_unit_price_microusd = offering.cost_unit_price_microusd;
+          item.cost_currency = offering.cost_currency.trim().toUpperCase();
+          if (offering.reference_cost_microusd > 0) {
+            item.reference_cost_microusd = offering.reference_cost_microusd;
+          }
+        } else {
+          item.cost_currency = offering.cost_currency.trim().toUpperCase();
+          if (offering.reference_cost_microusd > 0) {
+            item.reference_cost_microusd = offering.reference_cost_microusd;
+          }
+        }
+        return item;
+      }),
+    };
+    if (identity.gateway_model.trim()) command.gateway_model = identity.gateway_model.trim();
+    return command;
+  }
+
+  async function publish() {
     setBusy(true);
     setError(null);
     setDone(null);
     try {
-      const command: unknown = JSON.parse(values.command);
+      const command = buildCommand();
       const published = await client.publishRevision(command);
       setDone(published);
-      form.resetFields();
       message.success(`已发布 ${published.gateway_model}`);
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
@@ -35,80 +219,608 @@ export function PublishPage({ client }: { client: AdminClient }) {
     }
   }
 
-  return (
-    <ConsolePage title="发布修订" hint="发布即原子替换该型号的全部候选" error={error}>
-      <Panel title="发布命令的字段">
-        <Typography.Paragraph type="secondary" style={{ marginBottom: 8 }}>
-          <code>vendor_id</code>、<code>native_model_id</code>、<code>gateway_model</code>
-          （平台对客名，省略时取原生名）、<code>native_revision</code>（改价必须换修订号）、
-          <code>capability_schema</code>（合同）、<code>offerings</code>（候选数组）、
-          <code>markup_bps</code>（加价系数，基点）、<code>actor</code>。
-        </Typography.Paragraph>
-        <Typography.Paragraph type="secondary" style={{ marginBottom: 0 }}>
-          按候选的钱是 <code>consumer_rates_cny</code>（四档 CNY 费率向量）、
-          <code>cost_unit_price_microusd</code>（按张/按次的成本单价）、
-          <code>reference_cost_microusd</code>（定价参考）、<code>floor_amounts</code>（保底表）。
-          渠道币种的折算率要先录（见「折算率」页），否则发布期会以"没有生效折算率"拒绝。
-        </Typography.Paragraph>
-      </Panel>
+  /// 从已发布型号载入：把管理端视图**拿得到**的字段填回来（身份、倍率、候选的渠道/驱动器/成本/
+  /// 费率）。拿不到的（`base_url`、`credential_env`、承载面）留空，由运营补齐——视图不回显渠道
+  /// 部署事实。
+  async function loadFromPublished(gatewayModel: string) {
+    setBusy(true);
+    setError(null);
+    try {
+      const models = await client.gatewayModels();
+      const model = models.gateway_models.find((item) => item.gateway_model === gatewayModel);
+      if (!model) throw new Error(`没有找到已发布型号 ${gatewayModel}`);
+      setIdentity({
+        vendor_id: model.vendor_id,
+        native_model_id: model.native_model_id,
+        gateway_model: model.gateway_model,
+        native_revision: model.native_revision,
+        markup_bps: model.markup_bps ?? 2000,
+        capability_schema: '',
+      });
+      setOfferings(
+        model.candidates.map((candidate) => ({
+          ...EMPTY_OFFERING,
+          provider_kind: candidate.provider_kind,
+          adapter_key: candidate.adapter_key,
+          provider_model_id: candidate.provider_model_id,
+          weight: candidate.weight,
+          plan_currency: candidate.cost_currency ?? 'USD',
+          cost_currency: candidate.cost_currency ?? 'USD',
+          reference_cost_microusd: candidate.reference_cost_microusd ?? 0,
+          carrier_schema: JSON.stringify(candidate.carrier_schema ?? {}, null, 2),
+          parameter_mapping: JSON.stringify(candidate.parameter_mapping ?? {}, null, 2),
+          margin_enabled: candidate.consumer_rates_cny !== null,
+          cny_text_input: candidate.consumer_rates_cny?.text_input_micros_per_million ?? 0,
+          cny_image_input: candidate.consumer_rates_cny?.image_input_micros_per_million ?? 0,
+          cny_text_output: candidate.consumer_rates_cny?.text_output_micros_per_million ?? 0,
+          cny_image_output: candidate.consumer_rates_cny?.image_output_micros_per_million ?? 0,
+        })),
+      );
+      message.info(
+        `已载入 ${gatewayModel} 的身份与商务字段。渠道地址与凭证变量名要自己补齐——管理端不回显它们。`,
+      );
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setBusy(false);
+    }
+  }
 
-      <Panel title="发布素材">
-        <Form form={form} layout="vertical" onFinish={submit}>
-          <Form.Item
-            name="command"
-            rules={[
-              { required: true, message: '请贴上发布命令的 JSON' },
-              {
-                validator: (_rule, value: string) => {
-                  if (!value || !value.trim()) return Promise.resolve();
-                  try {
-                    JSON.parse(value);
-                    return Promise.resolve();
-                  } catch (failure) {
-                    return Promise.reject(
-                      new Error(`不是合法 JSON：${failure instanceof Error ? failure.message : failure}`),
-                    );
-                  }
-                },
-              },
-            ]}
-          >
-            <Input.TextArea
-              rows={16}
-              style={{ fontFamily: 'ui-monospace, SFMono-Regular, Menlo, monospace' }}
-              placeholder='{"vendor_id":"OpenAI","native_model_id":"gpt-image-2.5-flare","native_revision":"...","markup_bps":2000,"actor":"ops","offerings":[...]}'
-            />
-          </Form.Item>
-          <Form.Item style={{ marginBottom: 0 }}>
-            <Button type="primary" icon={<SendOutlined />} htmlType="submit" loading={busy}>
-              发布
+  const published = usePublishedModelNames(client);
+
+  return (
+    <ConsolePage
+      title="发布修订"
+      hint="发布即原子替换该型号的全部候选"
+      error={error}
+      extra={
+        published.length > 0 ? (
+          <Select
+            data-testid="publish-load-model"
+            placeholder="从已发布型号载入"
+            style={{ width: 220 }}
+            options={published.map((name) => ({ value: name, label: name }))}
+            onChange={(value: string) => void loadFromPublished(value)}
+          />
+        ) : null
+      }
+    >
+      {done ? (
+        <Alert
+          type="success"
+          showIcon
+          message={`已发布 ${done.gateway_model}`}
+          description={
+            <Flex vertical gap={4}>
+              <Typography.Text>
+                生效修订：<Typography.Text code>{done.runtime_revision_id}</Typography.Text>
+              </Typography.Text>
+              <Typography.Text type="secondary">
+                去「网关模型」核对候选与定价是否就是你要的那一份。
+              </Typography.Text>
+            </Flex>
+          }
+          action={
+            <Button size="small" onClick={() => setDone(null)}>
+              再发一份
             </Button>
-            <Typography.Text type="secondary" style={{ marginInlineStart: 12 }}>
-              提交前请先确认合同里的 <code>model.const</code> 等于 <code>native_model_id</code>
-              （发布期会校验）。
-            </Typography.Text>
-          </Form.Item>
+          }
+        />
+      ) : null}
+
+      <Panel
+        title="这个型号是什么"
+        description="`gateway_model` 是平台对客名（调用方提交 model 时用的那个）；留空时取原生型号名。改价必须换合同修订号。"
+      >
+        <Form layout="vertical">
+          <Row gutter={16}>
+            <Col xs={24} md={6}>
+              <Form.Item label="厂商" required>
+                <Input
+                  data-testid="publish-vendor"
+                  value={identity.vendor_id}
+                  onChange={(event) => setIdentity({ ...identity, vendor_id: event.target.value })}
+                  placeholder="OpenAI"
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} md={6}>
+              <Form.Item label="原生型号名" required>
+                <Input
+                  data-testid="publish-native-model"
+                  value={identity.native_model_id}
+                  onChange={(event) =>
+                    setIdentity({ ...identity, native_model_id: event.target.value })
+                  }
+                  placeholder="gpt-image-2.5-flare"
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} md={6}>
+              <Form.Item label="平台对客名（可空）">
+                <Input
+                  value={identity.gateway_model}
+                  onChange={(event) =>
+                    setIdentity({ ...identity, gateway_model: event.target.value })
+                  }
+                  placeholder="留空即取原生名"
+                />
+              </Form.Item>
+            </Col>
+            <Col xs={24} md={6}>
+              <Form.Item label="合同修订号" required>
+                <Input
+                  data-testid="publish-native-revision"
+                  value={identity.native_revision}
+                  onChange={(event) =>
+                    setIdentity({ ...identity, native_revision: event.target.value })
+                  }
+                  placeholder="2026-10-01-contract-1.1"
+                />
+              </Form.Item>
+            </Col>
+          </Row>
+          <Row gutter={16}>
+            <Col xs={24} md={6}>
+              <Form.Item
+                label="加价系数（基点）"
+                tooltip="倍数 = 1 + 基点/10000。2000 基点即 ×1.2。按张/按次/上游给金额的候选缺它会被拒。"
+                required
+              >
+                <Input
+                  data-testid="publish-markup-bps"
+                  type="number"
+                  value={identity.markup_bps}
+                  onChange={(event) =>
+                    setIdentity({ ...identity, markup_bps: Number(event.target.value) })
+                  }
+                />
+              </Form.Item>
+            </Col>
+          </Row>
         </Form>
       </Panel>
 
-      {done ? (
-        <Panel title="已发布">
-          <Descriptions column={1} size="small" bordered>
-            <Descriptions.Item label="网关模型">{done.gateway_model}</Descriptions.Item>
-            <Descriptions.Item label="生效修订">
-              <Typography.Text code copyable>
-                {done.runtime_revision_id}
-              </Typography.Text>
-            </Descriptions.Item>
-          </Descriptions>
+      {offerings.map((offering, index) => (
+        <Panel
+          key={index}
+          title={`候选 ${index + 1}`}
+          extra={
+            offerings.length > 1 ? (
+              <Button
+                danger
+                size="small"
+                icon={<DeleteOutlined />}
+                onClick={() => setOfferings((list) => list.filter((_item, at) => at !== index))}
+              >
+                移除
+              </Button>
+            ) : null
+          }
+        >
+          <Form layout="vertical">
+            <Row gutter={16}>
+              <Col xs={24} md={6}>
+                <Form.Item label="渠道" required tooltip="渠道类别，例如 AIHubMix / APIMart">
+                  <Input
+                    data-testid="publish-provider-kind"
+                    value={offering.provider_kind}
+                    onChange={(event) => patchOffering(index, { provider_kind: event.target.value })}
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={6}>
+                <Form.Item label="渠道模型名" required>
+                  <Input
+                    data-testid="publish-provider-model"
+                    value={offering.provider_model_id}
+                    onChange={(event) =>
+                      patchOffering(index, { provider_model_id: event.target.value })
+                    }
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={6}>
+                <Form.Item label="驱动器" required tooltip="用哪个 Driver 发出去，例如 aihubmix-image-v1">
+                  <Input
+                    data-testid="publish-adapter-key"
+                    value={offering.adapter_key}
+                    onChange={(event) => patchOffering(index, { adapter_key: event.target.value })}
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={6}>
+                <Form.Item label="档位内权重" tooltip="同一档有多条合格候选时按它分摊">
+                  <Input
+                    type="number"
+                    value={offering.weight}
+                    onChange={(event) =>
+                      patchOffering(index, { weight: Number(event.target.value) })
+                    }
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+            <Row gutter={16}>
+              <Col xs={24} md={12}>
+                <Form.Item
+                  label="渠道地址"
+                  required
+                  tooltip="管理端不回显它——从已发布型号载入时要自己补齐"
+                >
+                  <Input
+                    data-testid="publish-base-url"
+                    value={offering.base_url}
+                    onChange={(event) => patchOffering(index, { base_url: event.target.value })}
+                    placeholder="https://api.example.com"
+                  />
+                </Form.Item>
+              </Col>
+              <Col xs={24} md={12}>
+                <Form.Item
+                  label="凭证环境变量名"
+                  required
+                  tooltip="只填变量名（例如 AIHUBMIX_API_KEY），不填密钥本身；密钥只从进程环境读"
+                >
+                  <Input
+                    data-testid="publish-credential-env"
+                    value={offering.credential_env}
+                    onChange={(event) =>
+                      patchOffering(index, { credential_env: event.target.value })
+                    }
+                    placeholder="AIHUBMIX_API_KEY"
+                  />
+                </Form.Item>
+              </Col>
+            </Row>
+
+            <Divider plain>成本与对客价</Divider>
+            <Row gutter={16}>
+              <Col xs={24} md={8}>
+                <Form.Item label="计价形态" required>
+                  <Select
+                    value={offering.formula}
+                    options={FORMULAS}
+                    onChange={(value: string) => patchOffering(index, { formula: value })}
+                  />
+                </Form.Item>
+              </Col>
+              {offering.formula === 'token_rates' ? (
+                <>
+                  <Col xs={24} md={4}>
+                    <Form.Item label="成本币种">
+                      <Input
+                        data-testid="publish-plan-currency"
+                        value={offering.plan_currency}
+                        onChange={(event) =>
+                          patchOffering(index, { plan_currency: event.target.value })
+                        }
+                      />
+                    </Form.Item>
+                  </Col>
+                  <Col xs={24} md={12}>
+                    <Form.Item
+                      label="渠道费率（每百万 token，成本币种微单位）"
+                      tooltip="文入 / 图入 / 文出 / 图出，四个数"
+                    >
+                      <Space.Compact block>
+                        <Input
+                          type="number"
+                          addonBefore="文入"
+                          value={offering.plan_text_input}
+                          onChange={(event) =>
+                            patchOffering(index, { plan_text_input: Number(event.target.value) })
+                          }
+                        />
+                        <Input
+                          type="number"
+                          addonBefore="图入"
+                          value={offering.plan_image_input}
+                          onChange={(event) =>
+                            patchOffering(index, { plan_image_input: Number(event.target.value) })
+                          }
+                        />
+                        <Input
+                          type="number"
+                          addonBefore="文出"
+                          value={offering.plan_text_output}
+                          onChange={(event) =>
+                            patchOffering(index, { plan_text_output: Number(event.target.value) })
+                          }
+                        />
+                        <Input
+                          type="number"
+                          addonBefore="图出"
+                          value={offering.plan_image_output}
+                          onChange={(event) =>
+                            patchOffering(index, { plan_image_output: Number(event.target.value) })
+                          }
+                        />
+                      </Space.Compact>
+                    </Form.Item>
+                  </Col>
+                </>
+              ) : (
+                <>
+                  <Col xs={24} md={4}>
+                    <Form.Item label="成本币种">
+                      <Input
+                        value={offering.cost_currency}
+                        onChange={(event) =>
+                          patchOffering(index, { cost_currency: event.target.value })
+                        }
+                      />
+                    </Form.Item>
+                  </Col>
+                  {offering.formula === 'per_image' || offering.formula === 'per_call' ? (
+                    <Col xs={24} md={4}>
+                      <Form.Item label="成本单价（微单位）">
+                        <Input
+                          type="number"
+                          value={offering.cost_unit_price_microusd}
+                          onChange={(event) =>
+                            patchOffering(index, {
+                              cost_unit_price_microusd: Number(event.target.value),
+                            })
+                          }
+                        />
+                      </Form.Item>
+                    </Col>
+                  ) : null}
+                  <Col xs={24} md={4}>
+                    <Form.Item label="定价参考（微单位）" tooltip="成本原币种的参考值，不是售价的被乘数">
+                      <Input
+                        type="number"
+                        value={offering.reference_cost_microusd}
+                        onChange={(event) =>
+                          patchOffering(index, {
+                            reference_cost_microusd: Number(event.target.value),
+                          })
+                        }
+                      />
+                    </Form.Item>
+                  </Col>
+                </>
+              )}
+            </Row>
+
+            {offering.formula === 'token_rates' ? (
+              <Row gutter={16}>
+                <Col xs={24}>
+                  <Form.Item
+                    label="费率出处（source_url）"
+                    required
+                    tooltip="这一组渠道费率是从哪一页抄的。对账时要能回去核对，所以它是必填。"
+                  >
+                    <Input
+                      data-testid="publish-plan-source-url"
+                      value={offering.plan_source_url}
+                      onChange={(event) =>
+                        patchOffering(index, { plan_source_url: event.target.value })
+                      }
+                      placeholder="https://vendor.example.com/pricing"
+                    />
+                  </Form.Item>
+                </Col>
+              </Row>
+            ) : null}
+
+            {offering.formula === 'token_rates' ? (
+              <>
+                <Form.Item style={{ marginBottom: 8 }}>
+                  <Space>
+                    <Button
+                      size="small"
+                      onClick={() => patchOffering(index, { margin_enabled: !offering.margin_enabled })}
+                    >
+                      {offering.margin_enabled ? '移除对客价向量' : '带上对客价向量'}
+                    </Button>
+                    <Typography.Text type="secondary">
+                      按 token 计量的候选随修订带一份四档 CNY 费率；由运营按"成本单价 × 倍率 ×
+                      折算率"推导后填入，平台只原样保存与冻结、不在服务端替算。
+                    </Typography.Text>
+                  </Space>
+                </Form.Item>
+                {offering.margin_enabled ? (
+                  <Row gutter={16}>
+                    <Col xs={24}>
+                      <Form.Item label="对客费率（每百万 token，CNY 微单位）">
+                        <Space.Compact block>
+                          <Input
+                            data-testid="publish-cny-text-input"
+                            type="number"
+                            addonBefore="文入"
+                            value={offering.cny_text_input}
+                            onChange={(event) =>
+                              patchOffering(index, { cny_text_input: Number(event.target.value) })
+                            }
+                          />
+                          <Input
+                            data-testid="publish-cny-image-input"
+                            type="number"
+                            addonBefore="图入"
+                            value={offering.cny_image_input}
+                            onChange={(event) =>
+                              patchOffering(index, { cny_image_input: Number(event.target.value) })
+                            }
+                          />
+                          <Input
+                            data-testid="publish-cny-text-output"
+                            type="number"
+                            addonBefore="文出"
+                            value={offering.cny_text_output}
+                            onChange={(event) =>
+                              patchOffering(index, { cny_text_output: Number(event.target.value) })
+                            }
+                          />
+                          <Input
+                            data-testid="publish-cny-image-output"
+                            type="number"
+                            addonBefore="图出"
+                            value={offering.cny_image_output}
+                            onChange={(event) =>
+                              patchOffering(index, { cny_image_output: Number(event.target.value) })
+                            }
+                          />
+                        </Space.Compact>
+                      </Form.Item>
+                    </Col>
+                  </Row>
+                ) : null}
+              </>
+            ) : null}
+
+            <Collapse
+              ghost
+              items={[
+                {
+                  key: 'technical',
+                  label: '技术字段（贴 JSON；留空即不带）',
+                  children: (
+                    <Flex vertical gap={12}>
+                      <Typography.Text type="secondary">
+                        这些是厂商与渠道给的结构声明，表单收集不了，从渠道文档或上一版贴过来。
+                      </Typography.Text>
+                      <Form.Item label="承载面 carrier_schema" style={{ marginBottom: 0 }}>
+                        <Input.TextArea
+                          rows={4}
+                          value={offering.carrier_schema}
+                          onChange={(event) =>
+                            patchOffering(index, { carrier_schema: event.target.value })
+                          }
+                          style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12 }}
+                        />
+                      </Form.Item>
+                      <Form.Item label="参数映射 parameter_mapping" style={{ marginBottom: 0 }}>
+                        <Input.TextArea
+                          rows={3}
+                          value={offering.parameter_mapping}
+                          onChange={(event) =>
+                            patchOffering(index, { parameter_mapping: event.target.value })
+                          }
+                          style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12 }}
+                        />
+                      </Form.Item>
+                      <Form.Item label="限制 restrictions" style={{ marginBottom: 0 }}>
+                        <Input.TextArea
+                          rows={3}
+                          value={offering.restrictions}
+                          onChange={(event) =>
+                            patchOffering(index, { restrictions: event.target.value })
+                          }
+                          style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12 }}
+                        />
+                      </Form.Item>
+                    </Flex>
+                  ),
+                },
+              ]}
+            />
+          </Form>
+        </Panel>
+      ))}
+
+      <Panel title="模型的合同（capability_schema）">
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          厂商给的 JSON Schema：调用方能用哪些字段、各自什么形状。**模型级一份**，所有候选共用。
+          贴进来的原文会被原样保存与冻结。
+        </Typography.Paragraph>
+        <Input.TextArea
+          rows={8}
+          value={identity.capability_schema}
+          onChange={(event) =>
+            setIdentity({ ...identity, capability_schema: event.target.value })
+          }
+          placeholder='{"$schema":"...","type":"object","properties":{...}}'
+          style={{ fontFamily: 'ui-monospace, Consolas, monospace', fontSize: 12 }}
+        />
+        {identity.capability_schema.trim() ? (
           <Alert
-            style={{ marginTop: 12 }}
+            style={{ marginTop: 8 }}
             type="info"
             showIcon
-            message="去「网关模型」页核对候选与定价是否就是你要的那一份。"
+            message="合同里 model.const 要等于原生型号名（发布期会校验）。"
           />
-        </Panel>
-      ) : null}
+        ) : null}
+      </Panel>
+
+      <Card>
+        <Flex justify="space-between" align="center" wrap gap={12}>
+          <Space>
+            <Button
+              icon={<PlusOutlined />}
+              onClick={() => setOfferings((list) => [...list, { ...EMPTY_OFFERING }])}
+            >
+              加一条候选
+            </Button>
+            <Button
+              data-testid="publish-submit"
+              onClick={() => void publish()}
+              type="primary"
+              icon={<SendOutlined />}
+              loading={busy}
+            >
+              发布
+            </Button>
+          </Space>
+          <Typography.Text type="secondary">
+            形状对不对由发布期的校验答复负责；这里不做本地预校验，免得出现两套判定。
+          </Typography.Text>
+        </Flex>
+      </Card>
+
+      <PublishedSummary offerings={offerings} markupBps={identity.markup_bps} />
     </ConsolePage>
+  );
+}
+
+/// 已发布型号的名字，给"从…载入"那个下拉用。取不到就是空列表——它是辅助信息，失败不影响发布。
+function usePublishedModelNames(client: AdminClient): string[] {
+  const [names, setNames] = useState<string[]>([]);
+  const load = useCallback(() => client.gatewayModels(), [client]);
+  useEffect(() => {
+    let cancelled = false;
+    load()
+      .then((result) => {
+        if (!cancelled) setNames(result.gateway_models.map((item) => item.gateway_model));
+      })
+      .catch(() => {
+        if (!cancelled) setNames([]);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [load]);
+  return names;
+}
+
+/// 把"倍率怎么影响对客价"摆出来给人核对。它是**展示**，不是决定：费率由运营填，平台不算。
+function PublishedSummary({
+  offerings,
+  markupBps,
+}: {
+  offerings: OfferingForm[];
+  markupBps: number;
+}) {
+  if (offerings.length === 0) return null;
+  return (
+    <Panel
+      title="这次会发布什么"
+      description={`加价系数 ${markupBps} 基点，即倍数 ×${(1 + markupBps / 10000).toFixed(4)}。`}
+    >
+      <Descriptions size="small" column={1} bordered>
+        {offerings.map((offering, index) => (
+          <Descriptions.Item key={index} label={`候选 ${index + 1}`}>
+            {offering.provider_kind || '（未填渠道）'} · {offering.provider_model_id || '（未填模型）'} ·{' '}
+            {FORMULAS.find((item) => item.value === offering.formula)?.label}
+            {offering.formula === 'token_rates'
+              ? offering.margin_enabled
+                ? '（带对客价向量）'
+                : '（不带对客价向量，对客价由结算按成本 × 倍率算）'
+              : ''}
+          </Descriptions.Item>
+        ))}
+      </Descriptions>
+    </Panel>
   );
 }
