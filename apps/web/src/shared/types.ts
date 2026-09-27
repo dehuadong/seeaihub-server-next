@@ -119,6 +119,8 @@ export interface AccountSummary {
   balance_microusd: number;
   /// 运营设的标签；没设过就是 null。
   tag: string | null;
+  /// 绑定的登录邮箱；这个账户还没有登录身份时为 null（那是"运营直接建的账户"，不是"取不到"）。
+  email: string | null;
   created_at: string;
   updated_at: string;
 }

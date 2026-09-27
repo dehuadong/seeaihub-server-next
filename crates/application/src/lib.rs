@@ -1508,17 +1508,22 @@ pub struct ProviderFailureView {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 管理端看到的**一个账户**：账户标识、余额、标签与两个时刻。
+/// 管理端看到的**一个账户**：账户标识、余额、标签、绑定的登录邮箱与两个时刻。
 ///
 /// 它是"先找到再操作"那条路径上的列表项，所以只带**用来挑出目标账户**的字段，不带流水与密钥——
 /// 那些等选中之后按账户读。**没有持有中**：那是"这笔钱扣没扣"的第二个数，与余额并列才有意义，
 /// 列表里放不下这个对比，放进详情读。
+///
+/// `email` 是**登录身份**那一侧的事实（一个账户最多一个邮箱）：运营按邮箱找账户，列表里就得能看见
+/// 它，否则搜出来的行认不出是谁。没有登录身份时为 `None`——那是"运营直接建的账户"，不是"取不到"。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSummary {
     pub account_id: AccountId,
     pub balance_microusd: i64,
     /// 运营设的标签；没设过就是 `None`。
     pub tag: Option<String>,
+    /// 绑定的登录邮箱；这个账户还没有登录身份时为 `None`。
+    pub email: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }

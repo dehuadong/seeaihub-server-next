@@ -188,6 +188,12 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
     assert_eq!(rows[0]["account_id"].as_str(), Some(tagged_id.as_str()));
     assert_eq!(rows[0]["tag"].as_str(), Some("vip-e2e"));
     assert_eq!(rows[0]["balance_microusd"].as_i64(), Some(1_000_000));
+    // 这个账户没有登录身份，所以邮箱是 `null`——它是"运营直接建的账户"这个事实，不是"没取到"。
+    assert_eq!(
+        rows[0]["email"],
+        Value::Null,
+        "没有登录身份的账户，邮箱应当是 null：{by_tag}"
+    );
 
     // 按邮箱找：邮箱比对大小写不敏感（登录用的那个邮箱也不敏感，两处必须一致）。
     let by_email = client
@@ -204,6 +210,12 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
     let rows = by_email["accounts"].as_array().expect("accounts array");
     assert_eq!(rows.len(), 1, "按邮箱只该命中一个：{by_email}");
     assert_eq!(rows[0]["account_id"].as_str(), Some(bound_id.as_str()));
+    // 列表项要带上邮箱：运营是**按邮箱**找账户的，搜出来的行必须能确认是谁。
+    assert_eq!(
+        rows[0]["email"].as_str(),
+        Some(email.as_str()),
+        "绑定了登录身份的账户，列表项要回传邮箱：{by_email}"
+    );
 
     // 邮箱与标签同时给：**与**的关系，两条各命中一个不同的账户，所以结果为空。
     let both = client

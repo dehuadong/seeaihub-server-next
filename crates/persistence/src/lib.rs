@@ -1288,7 +1288,7 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
         let rows = sqlx::query(
             r#"
-            SELECT a.id, a.balance_microusd, a.tag, a.created_at, a.updated_at
+            SELECT a.id, a.balance_microusd, a.tag, c.email, a.created_at, a.updated_at
             FROM ledger.accounts a
             LEFT JOIN identity.customers c ON c.account_id = a.id
             WHERE ($1::text IS NULL OR lower(c.email) = lower($1))
@@ -1310,6 +1310,8 @@ impl HubRepository for PgHubRepository {
                     account_id: AccountId(row.try_get("id").map_err(database_error)?),
                     balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
                     tag: row.try_get("tag").map_err(database_error)?,
+                    // 一个账户最多一个登录身份，所以 LEFT JOIN 至多带出一行、不会重复账户。
+                    email: row.try_get("email").map_err(database_error)?,
                     created_at: row.try_get("created_at").map_err(database_error)?,
                     updated_at: row.try_get("updated_at").map_err(database_error)?,
                 })

@@ -40,10 +40,6 @@ export function AccountsPage({ client }: { client: AdminClient }) {
   const [creating, setCreating] = useState(false);
 
   const accounts = useLoadable(() => client.listAccounts({ ...filter, limit: 100 }), [client, filter]);
-  // 邮箱在客户身份那边。列表要能显示它：运营是**按邮箱**找账户的，搜出来的行必须能确认是谁。
-  const customers = useLoadable(() => client.listCustomers(200), [client]);
-  const emailOf = (accountId: string): string | null =>
-    customers.data?.customers.find((item) => item.account_id === accountId)?.email ?? null;
 
   async function createAccount(initialMicros: number) {
     setCreating(true);
@@ -178,17 +174,15 @@ export function AccountsPage({ client }: { client: AdminClient }) {
           columns={[
             {
               title: '客户邮箱',
-              key: 'email',
+              dataIndex: 'email',
               width: 220,
-              render: (_value: unknown, account: AccountSummary) => {
-                const email = emailOf(account.account_id);
+              render: (value: string | null) =>
                 // 运营直接建的账户还没有登录身份——如实说"没有"，不显示空白让人以为是加载失败。
-                return email ? (
-                  <Typography.Text>{email}</Typography.Text>
+                value ? (
+                  <Typography.Text>{value}</Typography.Text>
                 ) : (
                   <Typography.Text type="secondary">（没有登录身份）</Typography.Text>
-                );
-              },
+                ),
             },
             {
               title: '账户',
