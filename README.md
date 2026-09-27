@@ -18,12 +18,14 @@
 
 | 想知道什么 | 看哪 |
 | --- | --- |
+| **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
+| **怎么上生产**（构建顺序、反代与主机分发、全部配置项、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
 | **代码结构**：哪个 crate / 文件 / 表负责什么 | [`docs/architecture.md`](docs/architecture.md) |
 | 分层的**职责与规则**（①–⑤、R1–R4、接入清单） | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
 | 持久决定 | [`docs/adr/`](docs/adr/) |
 | 领域词汇表 | [`CONTEXT.md`](CONTEXT.md) |
 | 各渠道的事实（端点、参数、计量与成本口径、实测记录） | [`docs/facts/channel-facts.md`](docs/facts/channel-facts.md) |
-| 受控验证清单（步骤、停止条件、留档要求） | [`docs/verification/`](docs/verification/) |
+| 受控验证与人工验收清单（步骤、停止条件、留档要求） | [`docs/verification/`](docs/verification/) |
 | 工程变更与交付记录 | [`.agents/notes/`](.agents/notes/) |
 | 上游原始材料（文档、Schema 快照、实测响应） | [`out-reference/`](out-reference/) |
 | 后续提案与进度 | [seeaihub-server-next#1](https://github.com/dehuadong/seeaihub-server-next/issues/1)、[seeaihub-server-next#5](https://github.com/dehuadong/seeaihub-server-next/issues/5) |
@@ -31,15 +33,29 @@
 ## 本地启动
 
 ```sh
-docker compose up -d
-copy .env.example .env
+docker compose up -d                 # Postgres 54329、Redis 63799
+copy .env.example .env               # Linux / macOS：cp
+npm --prefix apps/web ci && npm --prefix apps/web run build   # 前端产物，API 要托管它
 cargo run -p seeai-api
-cargo run -p seeai-worker
+cargo run -p seeai-worker            # 另开一个终端
 ```
+
+进程**不自己读 `.env`**：要么 `set -a; . ./.env; set +a` 载入，要么由启动脚本注入。两个进程都要设 `DATABASE_URL`；API 还要 `ADMIN_TOKEN`（**必填，为空起不来**）与 `ADMIN_EMAIL` / `ADMIN_PASSWORD`（用来建/更新那个管理员账号）。
+
+前端产物那一步**不能省**：API 只在 `apps/web/dist` 存在时才托管界面（它按编译期路径找），否则 API 与 `/v1/*` 都正常、但浏览器打不开界面。
 
 启动前把渠道凭证放进环境变量（变量名由发布素材的 `credential_env` 指定，例如 `AIHUBMIX_API_KEY`、`APIMART_API_KEY`）。密钥不会写入数据库；Channel 只保存环境变量名称。
 
+| 入口 | 地址 |
+| --- | --- |
+| 运营后台 | `http://admin.localhost:8081/` |
+| 客户控制台 | `http://app.localhost:8081/` |
+
+本机 `*.localhost` 由浏览器解析到回环，**不用改 hosts**；但 **Node 的解析器不认 `.localhost`**，脚本里要直连 `127.0.0.1:8081`。可选的供给清单来自 `SUPPLY_MATERIAL_DIR`（开发时可设 `config/bootstrap`），不设就是空的。
+
 参考图与遮罩是**参数值**：公网 URL 或 `data:image/…;base64,…`（遮罩用 PNG data URL）。平台不落盘、不校验其内容——上游不接受就会报错。
+
+**逐项说明与常见坑见 [`docs/operations/development.md`](docs/operations/development.md)；生产部署见 [`docs/operations/production.md`](docs/operations/production.md)。**
 
 ## 验证
 
@@ -49,11 +65,20 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-端到端合同测试默认被 `#[ignore]`，需要一个可连接的空库：
+端到端合同测试默认被 `#[ignore]`，需要一个可连接的空库（它会自己派生独立库，**别指向开发库**）：
 
 ```sh
 HTTP_CONTRACT_DATABASE_URL=postgres://postgres:postgres@127.0.0.1:5432/seeai_contract \
   cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1
 ```
 
-它们**不调用真实上游**：假上游在进程内监听 `127.0.0.1`；只有显式授权的受控实测才会发真实计费调用（见 `docs/verification/`）。
+浏览器行为在 `apps/web` 下跑，命令自己拉起空库、产物与 API：
+
+```sh
+npm --prefix apps/web run e2e
+```
+
+它们**都不调用真实上游**：假上游在进程内监听 `127.0.0.1`；只有显式授权的受控实测才会发真实计费调用（见 [`docs/verification/`](docs/verification/)）。
+
+投产前该做什么演练、每条判据是什么，见 [`docs/operations/production.md`](docs/operations/production.md) §7。
+
