@@ -576,7 +576,11 @@ async fn a_customer_is_unauthenticated_without_a_credential_or_after_logout_or_e
 
     // 一、没带凭据。
     for (path, status, body) in refused(None).await {
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 不带凭据要回未认证：{body}");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} 不带凭据要回未认证：{body}"
+        );
         assert!(
             body.contains("authorization_required"),
             "{path} 的答复要说清是缺凭据：{body}"
@@ -601,7 +605,11 @@ async fn a_customer_is_unauthenticated_without_a_credential_or_after_logout_or_e
         .expect("logout request");
     assert_eq!(logged_out.status(), StatusCode::NO_CONTENT);
     for (path, status, body) in refused(Some(after_logout.clone())).await {
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 退出后要回未认证：{body}");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} 退出后要回未认证：{body}"
+        );
     }
     // 再退一次：这一行已经没了，仍然只能回未认证（不能回 500 或 404）。
     let again = client
@@ -610,7 +618,11 @@ async fn a_customer_is_unauthenticated_without_a_credential_or_after_logout_or_e
         .send()
         .await
         .expect("second logout request");
-    assert_eq!(again.status(), StatusCode::UNAUTHORIZED, "重复退出要回未认证");
+    assert_eq!(
+        again.status(),
+        StatusCode::UNAUTHORIZED,
+        "重复退出要回未认证"
+    );
 
     // 三、会话已过期：把这一行推到过去，不靠等待。
     let expired = login().await;
@@ -626,7 +638,11 @@ async fn a_customer_is_unauthenticated_without_a_credential_or_after_logout_or_e
     .rows_affected();
     assert_eq!(updated, 1, "夹具必须改到那一行");
     for (path, status, body) in refused(Some(expired)).await {
-        assert_eq!(status, StatusCode::UNAUTHORIZED, "{path} 过期后要回未认证：{body}");
+        assert_eq!(
+            status,
+            StatusCode::UNAUTHORIZED,
+            "{path} 过期后要回未认证：{body}"
+        );
     }
 
     pool.close().await;
@@ -784,6 +800,137 @@ async fn a_customer_can_change_or_reset_its_password() {
     .expect("audit count");
     assert_eq!(audited, 1, "签发重置令牌必须写审计");
     pool.close().await;
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 运营签发的重置令牌兑换之后：**重置前发出的会话立刻全部失效**、旧口令登不进来、新口令登得进来、
+/// 同一枚令牌第二次使用被拒（V-C9）。
+///
+/// 与 `a_customer_can_change_or_reset_its_password` 分开：那条用例里的会话在**改口令**那一步就已经
+/// 被作废了，拿它验"重置使旧会话失效"是恒真的（它本来就不行了）。这里的会话全部在兑换**之前**签发、
+/// 并在兑换前逐一证明过可用，所以兑换后它们被拒才真说明是重置废掉了它们。
+///
+/// 两条会话而不是一条：判据说的是旧会话**全部**失效，只有一条时"全部"与"这一条"分不开。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn redeeming_a_reset_token_revokes_the_sessions_issued_before_it() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let email = "reset-revokes-sessions@example.com";
+    let initial = "a-long-enough-password";
+    let opened = client
+        .post(format!("{base_url}/api/v1/customers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({"email": email, "password": initial}))
+        .send()
+        .await
+        .expect("open customer request");
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    let account_id = opened.json::<Value>().await.expect("open body")["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    let login = || {
+        let client = client.clone();
+        let url = format!("{base_url}/v1/customer/sessions");
+        async move {
+            client
+                .post(url)
+                .json(&json!({"email": email, "password": initial}))
+                .send()
+                .await
+                .expect("customer login request")
+                .json::<Value>()
+                .await
+                .expect("login body")["token"]
+                .as_str()
+                .expect("token")
+                .to_owned()
+        }
+    };
+    let first = login().await;
+    let second = login().await;
+    assert_ne!(first, second, "两次登录必须是两条不同的会话");
+
+    let account = format!("{base_url}/v1/customer/account");
+    for token in [&first, &second] {
+        let usable = client
+            .get(account.as_str())
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("account request");
+        assert_eq!(
+            usable.status(),
+            StatusCode::OK,
+            "兑换之前这两条会话必须可用，否则后面那句'它们被拒'什么也证明不了"
+        );
+    }
+
+    let issued = client
+        .post(format!(
+            "{base_url}/api/v1/accounts/{account_id}/password-reset"
+        ))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("issue reset request");
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let reset_token = issued.json::<Value>().await.expect("reset body")["reset_token"]
+        .as_str()
+        .expect("reset token")
+        .to_owned();
+
+    let redeemed = client
+        .post(format!("{base_url}/v1/customer/password-resets/redeem"))
+        .json(&json!({"reset_token": reset_token, "new_password": "another-long-password"}))
+        .send()
+        .await
+        .expect("redeem request");
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+
+    for token in [&first, &second] {
+        let revoked = client
+            .get(account.as_str())
+            .bearer_auth(token)
+            .send()
+            .await
+            .expect("account request");
+        assert_eq!(
+            revoked.status(),
+            StatusCode::UNAUTHORIZED,
+            "重置前发出的会话必须在兑换之后立刻失效"
+        );
+    }
+
+    let old = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": initial}))
+        .send()
+        .await
+        .expect("old password login");
+    assert_eq!(old.status(), StatusCode::BAD_REQUEST, "旧口令必须失效");
+
+    let fresh = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": "another-long-password"}))
+        .send()
+        .await
+        .expect("new password login");
+    assert_eq!(fresh.status(), StatusCode::OK, "凭令牌设的新口令必须能登录");
+
+    let again = client
+        .post(format!("{base_url}/v1/customer/password-resets/redeem"))
+        .json(&json!({"reset_token": reset_token, "new_password": "third-long-password"}))
+        .send()
+        .await
+        .expect("second redeem request");
+    assert_eq!(again.status(), StatusCode::BAD_REQUEST, "令牌是一次性的");
 
     drop_isolated_database(&database_name).await;
 }
@@ -1551,9 +1698,245 @@ async fn accounting_reads_are_scoped_to_the_caller() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 对客面**没有**"提交邮箱就拿到重置令牌"的入口：那条路等于"知道邮箱就能接管账户"。
+/// V-C11 数的那三个**自助动作**：注册、登录、凭令牌兑换。
+const SELF_SERVICE_ROUTES: [(&str, &str); 3] = [
+    ("POST", "/v1/customers"),
+    ("POST", "/v1/customer/sessions"),
+    ("POST", "/v1/customer/password-resets/redeem"),
+];
+
+/// 对客目录（`GET /v1/models`）：**既有对客协议**里就公开的那一条，只列发布过的型号身份与合同，
+/// 发不出任何凭据、也不改状态。V-C11 数的"三个"是自助动作，不含它；它在这里出现是因为枚举必须
+/// 把"未认证可达"的全部列出来，白名单里少写它会让这条用例红，写它则要说明为什么它不是缺口。
+const PUBLIC_CATALOGUE_ROUTE: (&str, &str) = ("GET", "/v1/models");
+
+/// 路径参数换成的具体值：占位符原样打过去会落成 404/405，那时验的就不是鉴权了。
+const PROBE_ID: &str = "00000000-0000-4000-8000-000000000000";
+
+/// 一次探针带的请求体。
+enum ProbeBody {
+    None,
+    Json(Value),
+    Multipart,
+}
+
+/// 把路由表里的路径参数换成具体值。
+fn concrete_path(path: &str) -> String {
+    let mut rendered = String::new();
+    let mut rest = path;
+    while let Some(open) = rest.find('{') {
+        let Some(close) = rest[open..].find('}') else {
+            break;
+        };
+        rendered.push_str(&rest[..open]);
+        rendered.push_str(PROBE_ID);
+        rest = &rest[open + close + 1..];
+    }
+    rendered.push_str(rest);
+    rendered
+}
+
+/// 从**路由表源码**里读出 `/v1/…` 下的每一条 `(方法, 路径)`。
 ///
-/// 这不是漏做——平台不发邮件、不做邮箱验证，所以重置只能由运营在管理端签发后转交。
+/// 手抄一份清单会随路由表腐坏：新增一条忘了挂鉴权的端点时，手抄的清单照样全绿。所以这里直接读
+/// `apps/api/src/main.rs`（`include_str!` 在编译期内联），解析只认这个文件当前的写法；写法变了会在
+/// 这里炸掉，而不是静默少列几条。
+fn customer_routes_in_the_route_table() -> Vec<(String, String)> {
+    const SOURCE: &str = include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/src/main.rs"));
+    const METHODS: [&str; 5] = ["get", "post", "put", "patch", "delete"];
+
+    let mut routes = Vec::new();
+    let mut rest = SOURCE;
+    while let Some(index) = rest.find(".route(") {
+        rest = &rest[index..];
+        let after_open = &rest[".route(".len()..];
+        let literal = after_open
+            .find('"')
+            .map(|open| &after_open[open + 1..])
+            .expect("路由表的路径是字符串字面量");
+        let close = literal.find('"').expect("路径字面量要有收尾引号");
+        let path = &literal[..close];
+        // 处理器表达式：从路径之后配平括号到这条 `.route(` 的收尾。
+        let handlers = &literal[close + 1..];
+        let mut depth = 1_usize;
+        let mut end = handlers.len();
+        for (offset, character) in handlers.char_indices() {
+            match character {
+                '(' => depth += 1,
+                ')' => {
+                    depth -= 1;
+                    if depth == 0 {
+                        end = offset;
+                        break;
+                    }
+                }
+                _ => {}
+            }
+        }
+        let handlers = &handlers[..end];
+        let mut found = Vec::new();
+        for method in METHODS {
+            let needle = format!("{method}(");
+            let mut from = 0;
+            while let Some(offset) = handlers[from..].find(&needle) {
+                let at = from + offset;
+                // 方法名前面必须是分隔符：`budget(` 这类处理器名不能算成 `get(`。
+                let preceded_by_separator = !handlers[..at]
+                    .ends_with(|previous: char| previous.is_alphanumeric() || previous == '_');
+                if preceded_by_separator {
+                    found.push(method.to_uppercase());
+                    break;
+                }
+                from = at + needle.len();
+            }
+        }
+        assert!(
+            !found.is_empty(),
+            ".route(\"{path}\", …) 没认出任何 HTTP 方法，解析没跟上写法"
+        );
+        if path.starts_with("/v1/") {
+            for method in found {
+                routes.push((method, path.to_owned()));
+            }
+        }
+        rest = &rest[".route(".len()..];
+    }
+    routes
+}
+
+/// 给某条路由配一个**能被解析**的请求体。
+///
+/// 处理器里的鉴权在提取器**之后**才跑：空体或不合形状的体会先被 422/400 拦在前面，那时"不是 401"
+/// 验的是解析器而不是鉴权。所以每条写路由都要有体；新增一条没登记的路由会在这里炸掉，逼着补一个。
+fn probe_body(method: &str, path: &str) -> ProbeBody {
+    if method == "GET" || method == "DELETE" {
+        return ProbeBody::None;
+    }
+    match path {
+        "/v1/images/generations" => ProbeBody::Json(json!({})),
+        "/v1/images/edits" => ProbeBody::Multipart,
+        "/v1/customers" => ProbeBody::Json(json!({
+            "email": "credential-free-probe@example.com",
+            "password": "a-long-enough-password",
+        })),
+        // 邮箱不存在：这条端点本来就该在**没有凭据**的情况下被走通到"登录失败"，而不是"未认证"。
+        "/v1/customer/sessions" => ProbeBody::Json(json!({
+            "email": "nobody@example.com",
+            "password": "a-long-enough-password",
+        })),
+        "/v1/customer/password" => ProbeBody::Json(json!({
+            "current_password": "a-long-enough-password",
+            "new_password": "another-long-password",
+        })),
+        "/v1/customer/password-resets/redeem" => ProbeBody::Json(json!({
+            "reset_token": "not-a-real-reset-token",
+            "new_password": "another-long-password",
+        })),
+        "/v1/customer/api-keys" => ProbeBody::Json(json!({"label": "probe"})),
+        other => panic!(
+            "对客面新增了 {method} {other}：给它配一个能被解析的请求体，否则这里只能证明请求体没过解析，证不了鉴权。"
+        ),
+    }
+}
+
+/// 对客面**未认证即可访问的端点**只有那三个自助动作（V-C11 的前半）。
+///
+/// 做法是从路由表源码里把 `/v1/…` 的每一条读出来、逐个**不带任何凭据**打一遍，断言未认证可达的恰好
+/// 是注册、登录、凭令牌兑换（外加只读的公开目录，理由见 [`PUBLIC_CATALOGUE_ROUTE`]）。手抄清单会把
+/// "新增一条忘了挂鉴权的端点"放过去，而这条用例的失败面正是路由表多出一条。
+///
+/// 三条自助动作断言的是**具体状态码**而不是"不是 401"：201/400 说明请求真的走进了处理器，若某条改回
+/// 401（被误挂上鉴权），这条用例也会红。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_credential_free_customer_surface_is_exactly_the_three_self_service_endpoints() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let routes = customer_routes_in_the_route_table();
+    assert!(
+        routes.len() >= 16,
+        "路由表里解析出的对客端点太少（{}），多半是解析没跟上写法：{routes:?}",
+        routes.len()
+    );
+    for expected in SELF_SERVICE_ROUTES {
+        assert!(
+            routes.contains(&(expected.0.to_owned(), expected.1.to_owned())),
+            "路由表里找不到 {} {}：这条判据是拿它作基准的",
+            expected.0,
+            expected.1
+        );
+    }
+
+    let mut reached = Vec::new();
+    for (method, path) in &routes {
+        let path = concrete_path(path);
+        let request = client.request(
+            method.parse().expect("HTTP method"),
+            format!("{base_url}{path}"),
+        );
+        let request = match probe_body(method, &path) {
+            ProbeBody::None => request,
+            ProbeBody::Json(body) => request.json(&body),
+            ProbeBody::Multipart => request
+                .multipart(reqwest::multipart::Form::new().text("prompt", "credential-free probe")),
+        };
+        let response = request.send().await.expect("credential-free probe");
+        let status = response.status();
+        let body = response.text().await.expect("probe body");
+        match (method.as_str(), path.as_str()) {
+            ("POST", "/v1/customers") => assert_eq!(
+                status,
+                StatusCode::CREATED,
+                "注册本来就不需要凭据，必须走通到建号：{body}"
+            ),
+            ("POST", "/v1/customer/sessions") => assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "登录不需要凭据，邮箱不存在该是登录失败而不是未认证：{body}"
+            ),
+            ("POST", "/v1/customer/password-resets/redeem") => assert_eq!(
+                status,
+                StatusCode::BAD_REQUEST,
+                "兑换只认令牌本身、不需要会话：令牌不对该是参数错而不是未认证：{body}"
+            ),
+            ("GET", "/v1/models") => {
+                assert_eq!(status, StatusCode::OK, "公开目录不需要凭据：{body}")
+            }
+            _ => assert_eq!(
+                status,
+                StatusCode::UNAUTHORIZED,
+                "{method} {path} 不带凭据时必须未认证，实际 {status}：{body}"
+            ),
+        }
+        if status != StatusCode::UNAUTHORIZED {
+            reached.push(format!("{method} {path}"));
+        }
+    }
+
+    let mut expected: Vec<String> = SELF_SERVICE_ROUTES
+        .iter()
+        .copied()
+        .chain([PUBLIC_CATALOGUE_ROUTE])
+        .map(|(method, path)| format!("{method} {path}"))
+        .collect();
+    expected.sort();
+    reached.sort();
+    assert_eq!(
+        reached, expected,
+        "未认证可达的对客端点变了：多出来的那条要么该挂上鉴权，要么得说明它为什么是公开的"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 对客面**没有**"提交邮箱就拿到重置令牌"的入口（V-C11 的后半）：那条路等于"知道邮箱就能接管账户"。
+///
+/// 这不是漏做——平台不发邮件、不做邮箱验证，所以重置只能由运营在管理端签发后转交。所以候选路径要
+/// **不存在**（404，不是 2xx、也不是参数错），而且一圈试完之后库里**一条重置令牌都没有**：只看状态码
+/// 的话，"某个候选悄悄建了一行、再把答复改成 404"照样过。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn there_is_no_self_service_password_reset_entry() {
@@ -1562,17 +1945,54 @@ async fn there_is_no_self_service_password_reset_entry() {
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
-    let response = client
-        .post(format!("{base_url}/v1/customer/password-resets"))
-        .json(&json!({"email": "anyone@example.com"}))
-        .send()
+    // 名字都是"提交邮箱就发令牌"这类入口的常见写法，含对客前缀与误挂到管理前缀下的那种。
+    let candidates = [
+        ("POST", "/v1/customer/password-resets"),
+        ("POST", "/v1/customer/password-reset"),
+        ("POST", "/v1/customer/password/forgot"),
+        ("POST", "/v1/customer/forgot-password"),
+        ("POST", "/v1/customer/password-resets/request"),
+        ("POST", "/v1/customers/password-resets"),
+        ("POST", "/v1/password-resets"),
+        ("POST", "/v1/password-reset"),
+        ("GET", "/v1/customer/password-resets"),
+        ("POST", "/api/v1/customer/password-resets"),
+    ];
+    let body = json!({
+        "email": "anyone@example.com",
+        "new_password": "a-long-enough-password",
+    });
+    for (method, path) in candidates {
+        let request = client.request(
+            method.parse().expect("HTTP method"),
+            format!("{base_url}{path}"),
+        );
+        let request = if method == "GET" {
+            request
+        } else {
+            request.json(&body)
+        };
+        let response = request.send().await.expect("probe request");
+        let status = response.status();
+        let answer = response.text().await.expect("probe body");
+        assert_eq!(
+            status,
+            StatusCode::NOT_FOUND,
+            "{method} {path} 不该存在：{answer}"
+        );
+        assert!(
+            !answer.contains("reset_token"),
+            "{method} {path} 回了令牌：{answer}"
+        );
+    }
+
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let issued: i64 = sqlx::query_scalar("SELECT COUNT(*) FROM identity.password_resets")
+        .fetch_one(&pool)
         .await
-        .expect("probe request");
-    assert_eq!(
-        response.status(),
-        StatusCode::NOT_FOUND,
-        "对客面不该存在这个端点"
-    );
+        .expect("reset token count");
+    pool.close().await;
+    assert_eq!(issued, 0, "没有任何一条提交邮箱的路径该发出重置令牌");
 
     drop_isolated_database(&database_name).await;
 }

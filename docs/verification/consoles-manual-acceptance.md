@@ -40,7 +40,9 @@
 
 「上架新模型」与「改价」不是两个页面，它们开在「模型目录」的抽屉里：一页看、一页写会让人看不出两者的联系，所以合成了一页。
 
-页面读的若是**空库**，大部分会显示"还没有…"的空态——那也算通过。**"页面读的是库里的真实数据"这条有自动化证据**：`apps/web/e2e/admin-reads-fixture-data.spec.ts` 先用管理 API 造事实（一个币种的折算率、一个带初始余额的账户），再让页面去读并断言出现的是**刚造的那组值**；整套跑在每次重建的空库上，所以"读到旧库的状态"不可能蒙对。六个页面里已按这条验的是**折算率**与**账户与密钥**两页，其余四页仍属人工那一半。
+页面读的若是**空库**，大部分会显示"还没有…"的空态——那也算通过。**"页面读的是库里的真实数据"这条在大多数页面上有自动化证据**：`apps/web/e2e/admin-reads-fixture-data.spec.ts` 先用管理 API 造事实（一个币种的折算率、一条作用域唯一的策略、一个带初始余额的账户），再让页面去读并断言出现的是**刚造的那组值**；`admin-publishes-a-model.spec.ts` 用表单发布之后断言模型列表里出现该型号；`admin-opens-a-customer.spec.ts` 开户之后断言客户列表与详情里出现该邮箱。这套跑在每次重建的空库上，所以"读到旧库的状态"不可能蒙对。
+
+**对账与诊断页没有这条浏览器证据，也不假装它有**：它的三块事实要真跑一笔生成才出得来（上游给不出确定终态），浏览器用例里造不起；`admin-reads-fixture-data.spec.ts` 里那一条只断言三块都渲染出来、空库时给空态而不是报错。三块事实由接口层用例覆盖，都是真库真进程：对账案例（执行级）`cases_parameters::post_acceptance_failure_keeps_the_task_id_for_reconciliation`、对账案例（账户级）`cases_lifecycle::the_ledger_audit_reports_a_balance_that_disagrees_with_its_entries`、平台侧失败清单 `cases_lifecycle::channel_rejections_reach_consumers_as_platform_problems`、成本缺口 `cases_cost_facts::a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconciliation`。V-D2 在对账页那一半的证据因此在接口层，页面这一层按上表核对。
 
 ## 3. 客户控制台（V-D5、V-C1…V-C14 的人工那一半）
 

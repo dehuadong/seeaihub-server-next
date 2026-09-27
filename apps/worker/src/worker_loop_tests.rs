@@ -600,14 +600,24 @@ impl CredentialProvider for NoCredentials {
 /// `select!` 会在已就绪的分支上再轮询一次，而"已完成又被轮询"的 future 会 panic。
 #[derive(Default)]
 struct TestInterrupt {
-    fired: Arc<tokio::sync::Notify>,
+    /// **已经触发过**。它必须是一个能被反复读到的状态，不能只用 [`tokio::sync::Notify`]：
+    /// `notify_one` 的额度会被第一个 `notified()` 用掉，第二次 `notified()` 又变成未就绪——
+    /// 于是"触发之后一直就绪"这条性质不成立，而主循环的 `select!` 会把这条腿反复轮询。
+    fired: Arc<std::sync::atomic::AtomicBool>,
+    wake: Arc<tokio::sync::Notify>,
 }
 
 impl TestInterrupt {
     fn signal(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
         let fired = self.fired.clone();
+        let wake = self.wake.clone();
         Box::pin(std::future::poll_fn(move |context| {
-            let notified = fired.notified();
+            // 先看状态：触发过就一直就绪，与被通知了几次无关。这一条不成立时，`select!` 里那条腿
+            // 会在触发之后回到 pending，内层循环于是等一个不会再来事件——实测表现为用例挂住。
+            if fired.load(std::sync::atomic::Ordering::SeqCst) {
+                return std::task::Poll::Ready(Ok(()));
+            }
+            let notified = wake.notified();
             tokio::pin!(notified);
             match notified.poll(context) {
                 std::task::Poll::Ready(()) => std::task::Poll::Ready(Ok(())),
@@ -617,7 +627,8 @@ impl TestInterrupt {
     }
 
     fn send(&self) {
-        self.fired.notify_one();
+        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
+        self.wake.notify_waiters();
     }
 }
 
