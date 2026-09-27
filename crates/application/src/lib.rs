@@ -4276,7 +4276,10 @@ impl RuntimeService {
                     .to_owned(),
             )
         })?;
-        if !drafts.iter().any(command_omits_channel) {
+        if !drafts
+            .iter()
+            .any(|draft| command_omits_channel(draft) || command_omits_pricing(draft))
+        {
             // 没有一条省略：不必读上一版，走原路径。
             return command.normalize();
         }
@@ -4292,7 +4295,8 @@ impl RuntimeService {
             .await?;
         let completed = drafts
             .iter()
-            .map(|draft| inherit_channel(draft, &previous))
+            .enumerate()
+            .map(|(index, draft)| inherit_offering(index, draft, &previous))
             .collect::<Result<Vec<_>, _>>()?;
         PublishRuntimeCommand {
             offerings: Some(completed),
@@ -4656,7 +4660,11 @@ fn validate_contract(native_model_id: &str, contract: &Value) -> Result<(), Appl
     Ok(())
 }
 
-/// 该型号当前生效修订里**可以按身份被沿用**的一条候选：供应商、渠道模型名与它的渠道三要素。
+/// 该型号当前生效修订里**可以按身份被沿用**的一条候选：渠道三要素、驱动器，以及**计价依据**。
+///
+/// 计价依据一并带上，是因为改价场景下它与渠道地址是同一类东西：它们都是"渠道怎么结算"的事实，
+/// 这次发布一个字都没变，而管理端视图也不回显它们（视图给的是对客价与参考成本）。少了这一半，
+/// 运营改一个倍率就会把渠道的四档费率与价目出处写成空值——**看起来改了价，其实改坏了渠道价目**。
 ///
 /// 它不带 `enabled`：停用的候选也要能被沿用（"改价之后重新启用"是常见动作），按启用状态过滤会让它
 /// 在改价时突然找不到。
@@ -4667,6 +4675,30 @@ pub struct ActiveOfferingChannel {
     pub adapter_key: String,
     pub base_url: String,
     pub credential_env: String,
+    /// 计价形态（`token_rates` / `per_image` / `per_call` / `upstream_declared`）。
+    pub formula: String,
+    /// `token_rates` 的那份四档渠道费率与价目出处；别的形态是 `None`。
+    /// 存平铺的数字而不是 [`PricePlanDraft`]：这个结构是**读回来**的事实，不是一次发布的输入。
+    pub plan: Option<PricePlanRates>,
+    /// `per_image` / `per_call` 的单价。
+    pub cost_unit_price_microusd: Option<u64>,
+    pub cost_currency: Option<String>,
+    /// 定价参考成本与它的口径。
+    pub reference_cost_microusd: Option<u64>,
+    pub cost_basis: Option<String>,
+    pub tier_prices: Option<Value>,
+    pub floor_amounts: Option<Value>,
+}
+
+/// 生效修订里一条候选的渠道费率（`token_rates` 的参数）。
+#[derive(Debug, Clone)]
+pub struct PricePlanRates {
+    pub currency: String,
+    pub text_input_microusd_per_million: u64,
+    pub image_input_microusd_per_million: u64,
+    pub text_output_microusd_per_million: u64,
+    pub image_output_microusd_per_million: u64,
+    pub source_url: String,
 }
 
 /// 这条候选是否**省略**了渠道字段。
@@ -4680,23 +4712,42 @@ fn command_omits_channel(draft: &OfferingDraft) -> bool {
     blank(&draft.provider_kind) || blank(&draft.base_url) || blank(&draft.credential_env)
 }
 
-/// 补齐一条候选省略掉的渠道字段：渠道三要素与驱动器。
+/// 这条候选是否**省略**了计价依据（形态）。
 ///
-/// 按 `provider_kind` + `provider_model_id` 在上一版里认同一条候选。**同名多条时拒绝**——两条不同渠道
-/// 可以提供同一个渠道模型名，那时"沿用哪一条"没有唯一答案，由发布者显式给出渠道三要素。
+/// 判据只是 `formula` 有没有给：形态是计价参数的**判别式**——不知道形态就不知道那份四档费率、单价与
+/// 成本币种该不该在这儿，所以"形态没给"就是"整套计价依据都沿用上一版"。反过来，给了形态就必须把它
+/// 配套的参数一起给（那条配套校验在 [`normalize_billing`] 里）——**改价要改的就是这些**。
+#[must_use]
+fn command_omits_pricing(draft: &OfferingDraft) -> bool {
+    draft
+        .formula
+        .as_deref()
+        .is_none_or(|value| value.trim().is_empty())
+}
+
+/// 补齐一条候选省略掉的**渠道字段与计价依据**，来源是该型号当前生效修订里的同一条候选。
 ///
-/// 省略了渠道字段却给不出 `provider_kind` 或 `provider_model_id` 时拒绝：那时连"这条候选是谁"都说不清，
-/// 无从判断沿用是否得当。型号还没有生效修订时同样拒绝，理由相同。
-fn inherit_channel(
+/// 按 `provider_kind` + `provider_model_id` 认同一条候选。**同名多条时拒绝**——两条不同渠道可以提供
+/// 同一个渠道模型名，那时"沿用哪一条"没有唯一答案，由发布者显式给出渠道三要素。
+///
+/// 两组字段**各自独立**判断：只省渠道、却显式给了新的计价形态时，计价用新的、渠道沿用旧的。少了这条
+/// 独立判断，"重签渠道价目但不动渠道地址"会被旧价目覆盖掉。
+///
+/// 省略了东西却给不出 `provider_kind` 或 `provider_model_id` 时拒绝：那时连"这条候选是谁"都说不清，
+/// 无从判断沿用是否得当。型号还没有生效修订、或上一版没有同身份的候选时同样拒绝，理由相同。
+fn inherit_offering(
+    index: usize,
     draft: &OfferingDraft,
     previous: &[ActiveOfferingChannel],
 ) -> Result<OfferingDraft, ApplicationError> {
-    if !command_omits_channel(draft) {
+    let omits_channel = command_omits_channel(draft);
+    let omits_pricing = command_omits_pricing(draft);
+    if !omits_channel && !omits_pricing {
         return Ok(draft.clone());
     }
     let provider_kind = draft.provider_kind.as_deref().unwrap_or_default().trim();
     let provider_model_id = draft.provider_model_id.trim();
-    if provider_kind.is_empty() || provider_model_id.is_empty() {
+    if omits_channel && (provider_kind.is_empty() || provider_model_id.is_empty()) {
         return Err(ApplicationError::Validation(format!(
             "offering {} omits the channel (provider_kind / base_url / credential_env) and does not \
              say which offering it continues: provider_kind and provider_model_id are required when \
@@ -4704,31 +4755,62 @@ fn inherit_channel(
             draft.provider_model_id
         )));
     }
+    // 只省计价时也要认同一条候选，但身份由修订自己给（`provider_model_id` + 上一版里唯一的那条）。
     let mut matched = previous.iter().filter(|row| {
-        row.provider_kind == provider_kind && row.provider_model_id == provider_model_id
+        row.provider_model_id == provider_model_id
+            && (!omits_channel || row.provider_kind == provider_kind)
     });
     let Some(first) = matched.next() else {
+        // 沿用不到时**说回"必填"**而不是"沿用不到"：那种情形下没有可沿用的来源，发布者要做的事就是
+        // 把字段给全，所以要点名缺的是哪个字段（既有合同用例按这条措辞判定）。
+        if omits_pricing {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].formula is required: state how this supply is priced \
+                 (token_rates / per_image / per_call / upstream_declared)"
+            )));
+        }
         return Err(ApplicationError::Validation(format!(
-            "offering {provider_kind}/{provider_model_id} omits the channel (base_url / \
-             credential_env), and the model's current revision has no offering with that identity: \
-             give the channel explicitly"
+            "offering {provider_kind}/{provider_model_id} omits the channel and the model's current \
+             revision has no offering with that identity: give base_url and credential_env explicitly"
         )));
     };
     if matched.next().is_some() {
         return Err(ApplicationError::Validation(format!(
-            "offering {provider_kind}/{provider_model_id} omits the channel, and the model's current \
-             revision has more than one offering with that identity: give base_url and credential_env \
-             explicitly so the right channel is inherited"
+            "offering {provider_kind}/{provider_model_id} omits {}, and the model's current revision \
+             has more than one offering with that identity: give base_url and credential_env \
+             explicitly so the right one is inherited",
+            if omits_channel {
+                "the channel"
+            } else {
+                "its pricing"
+            }
         )));
     }
-    Ok(OfferingDraft {
-        provider_kind: Some(first.provider_kind.clone()),
-        adapter_key: Some(first.adapter_key.clone()),
-        provider_model_id: first.provider_model_id.clone(),
-        base_url: Some(first.base_url.clone()),
-        credential_env: Some(first.credential_env.clone()),
-        ..draft.clone()
-    })
+    let mut inherited = draft.clone();
+    if omits_channel {
+        inherited.provider_kind = Some(first.provider_kind.clone());
+        inherited.adapter_key = Some(first.adapter_key.clone());
+        inherited.base_url = Some(first.base_url.clone());
+        inherited.credential_env = Some(first.credential_env.clone());
+    }
+    if omits_pricing {
+        inherited.formula = Some(first.formula.clone());
+        inherited.price_plan = first.plan.as_ref().map(|plan| PricePlanDraft {
+            currency: plan.currency.clone(),
+            text_input_microusd_per_million: plan.text_input_microusd_per_million,
+            image_input_microusd_per_million: plan.image_input_microusd_per_million,
+            text_output_microusd_per_million: plan.text_output_microusd_per_million,
+            image_output_microusd_per_million: plan.image_output_microusd_per_million,
+            source_url: plan.source_url.clone(),
+        });
+        inherited.cost_unit_price_microusd = first.cost_unit_price_microusd;
+        inherited.cost_currency = first.cost_currency.clone();
+        inherited.reference_cost_microusd = first.reference_cost_microusd;
+        inherited.cost_basis = first.cost_basis.clone();
+        inherited.tier_prices = first.tier_prices.clone();
+        inherited.floor_amounts = first.floor_amounts.clone();
+    }
+    Ok(inherited)
 }
 
 /// 一次发布里不能出现两条**同一条供给**的候选。

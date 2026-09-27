@@ -3,6 +3,7 @@ import {
   App as AntApp,
   Button,
   Descriptions,
+  Drawer,
   Flex,
   Popconfirm,
   Switch,
@@ -10,23 +11,47 @@ import {
   Tag,
   Typography,
 } from 'antd';
-import { DownOutlined, RightOutlined } from '@ant-design/icons';
-import { useState } from 'react';
+import { DownOutlined, PlusOutlined, RightOutlined } from '@ant-design/icons';
+import { useEffect, useState } from 'react';
 import type { AdminClient } from '../client';
 import type { GatewayModel, GatewayModelCandidate } from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel, whenText, yuanText } from '../ui';
+import { PublishPanel } from './Publish';
 
 /// 模型目录：在售的模型与它们的价目，运营最常看的一页。
 ///
 /// 它回答"这个平台型号现在是什么状态"：生效修订、加价系数、候选顺序与权重、每条候选能不能走，
 /// 以及**这条候选承载得了哪些字段**——"目录里为什么没有它"要在这里看得见。
-export function ModelsPage({ client }: { client: AdminClient }) {
+///
+/// **它同时是"看"和"写"的入口**：右上角"上架新模型"与每行的"改价"都把 [`PublishPanel`] 开在抽屉里。
+/// 一页看、一页写会让人看不出两者的联系（用户原话："和网关模型的区别是什么"），所以合并在这里。
+///
+/// `editRequest` 是容器（`App`）给的"要改哪个型号"：给 `null` 时抽屉里是新增表单，给型号名时先载入它
+/// 再进改价模式。`#/publish` 这个旧地址仍然可用，它落到本页并把要改的型号带进来。
+export function ModelsPage({
+  client,
+  editRequest,
+  onEditRequestHandled,
+}: {
+  client: AdminClient;
+  editRequest?: string | null;
+  onEditRequestHandled?: () => void;
+}) {
   const { message } = AntApp.useApp();
   const models = useLoadable(() => client.gatewayModels(), [client]);
   const [busy, setBusy] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
+  /// 抽屉里的表单：`null` 表示抽屉关着；`{ editing: null }` 表示新增；`{ editing: '名' }` 表示改价。
+  const [form, setForm] = useState<{ editing: string | null } | null>(null);
+
+  // 容器把"要改这个型号"传进来：开抽屉并交给表单去载入。处理完就清掉，避免下次进本页又自动打开。
+  useEffect(() => {
+    if (editRequest === undefined) return;
+    setForm({ editing: editRequest });
+    onEditRequestHandled?.();
+  }, [editRequest, onEditRequestHandled]);
 
   async function toggleModel(model: GatewayModel) {
     setBusy(model.gateway_model);
@@ -47,21 +72,21 @@ export function ModelsPage({ client }: { client: AdminClient }) {
   return (
     <ConsolePage
       title="模型目录"
-      hint={
-        list.length > 0
-          ? `${list.length} 个型号在售`
-          : '还没有上架过任何模型——这一页看在售的模型与价目，要上架或改价去「上架与改价」'
-      }
+      hint="在售的模型与它们的价目。上架新模型、改价，都在这一页完成。"
       error={failure ?? models.error}
       loading={models.loading}
       onReload={models.reload}
+      extra={
+        <Button
+          type="primary"
+          icon={<PlusOutlined />}
+          data-testid="models-add"
+          onClick={() => setForm({ editing: null })}
+        >
+          上架新模型
+        </Button>
+      }
     >
-      <Alert
-        type="info"
-        showIcon
-        message="这一页看什么"
-        description="在售的模型、各自的价目与候选渠道。要上架一个新模型或改价，去「上架与改价」——那边写的就是这一页显示的内容。"
-      />
       {list.length === 0 && !models.loading ? (
         <Panel title="还没有上架过任何模型">
           <Alert
@@ -70,7 +95,7 @@ export function ModelsPage({ client }: { client: AdminClient }) {
             message="空库时这里什么都没有"
             description={
               <>
-                去「上架与改价」贴一份发布素材（<code>config/bootstrap/*.json</code>），或直接在表单里填。
+                点右上角「上架新模型」，或贴一份发布素材（<code>config/bootstrap/*.json</code>）。
                 上架之后这一页会列出每个型号的生效修订、加价系数与候选。
               </>
             }
@@ -95,6 +120,12 @@ export function ModelsPage({ client }: { client: AdminClient }) {
             }
             extra={
               <Flex gap={8}>
+                <Button
+                  data-testid={`models-reprice-${model.gateway_model}`}
+                  onClick={() => setForm({ editing: model.gateway_model })}
+                >
+                  改价
+                </Button>
                 <Button
                   icon={expanded ? <DownOutlined /> : <RightOutlined />}
                   onClick={() => setOpen(expanded ? null : model.gateway_model)}
@@ -210,6 +241,25 @@ export function ModelsPage({ client }: { client: AdminClient }) {
           </Panel>
         );
       })}
+
+      <Drawer
+        title={form?.editing ? `改价：${form.editing}` : '上架新模型'}
+        width="min(960px, 100vw)"
+        open={form !== null}
+        onClose={() => setForm(null)}
+        destroyOnHidden
+        styles={{ body: { background: '#f5f5f5' } }}
+      >
+        {form ? (
+          // `key` 让换型号（或从改价切到新增）时表单重新挂载：不清空就会把上一个型号的字段带过来。
+          <PublishPanel
+            key={form.editing ?? '__new__'}
+            client={client}
+            editing={form.editing}
+            onPublished={models.reload}
+          />
+        ) : null}
+      </Drawer>
     </ConsolePage>
   );
 }

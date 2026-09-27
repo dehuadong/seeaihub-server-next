@@ -5,10 +5,10 @@ use seeai_application::{
     AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery,
     CustomerBillingSummary, CustomerUsageKind, CustomerUsageView, CustomerView,
     GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
-    PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand, RoutingDecision,
-    UnacceptedAttempt, customer_usage_status, declared_output_images,
+    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, OpenLedgerCaseCommand, PricePlanRates,
+    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RefundReconciliationCommand,
+    RoutingDecision, UnacceptedAttempt, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -733,10 +733,22 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
         let rows = sqlx::query(
             r#"
-            SELECT o.provider_model_id, o.adapter_key, c.provider_kind, c.base_url, c.credential_env
+            SELECT o.provider_model_id, o.adapter_key, c.provider_kind, c.base_url, c.credential_env,
+                   o.id AS offering_id,
+                   o.formula, o.cost_unit_price_microusd,
+                   p.currency AS plan_currency,
+                   p.text_input_microusd_per_million,
+                   p.image_input_microusd_per_million,
+                   p.text_output_microusd_per_million,
+                   p.image_output_microusd_per_million,
+                   p.source_url AS plan_source_url,
+                   r.cost_currency, r.reference_cost_microusd, r.cost_basis,
+                   r.tier_prices, r.floor_amounts, r.consumer_rates_cny
             FROM publication.runtime_entries re
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
+            JOIN publication.runtime_revisions r ON r.id = re.runtime_revision_id
+            LEFT JOIN pricing.price_plans p ON p.id = re.price_plan_id
             WHERE re.active AND re.gateway_model = $1
             ORDER BY c.provider_kind, o.provider_model_id, o.id
             "#,
@@ -748,12 +760,58 @@ impl HubRepository for PgHubRepository {
         rows.iter()
             .map(|row| {
                 use sqlx::Row as _;
+                let currency: Option<String> =
+                    row.try_get("plan_currency").map_err(database_error)?;
+                // 没有 Price Plan 的形态（按张 / 按次 / 上游给金额）不该造一份空费率出来：
+                // 造了会被"形态与参数不配套"的校验拒掉。
+                let plan = match currency {
+                    Some(currency) => Some(PricePlanRates {
+                        currency,
+                        text_input_microusd_per_million: to_u64(
+                            row.try_get("text_input_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        image_input_microusd_per_million: to_u64(
+                            row.try_get("image_input_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        text_output_microusd_per_million: to_u64(
+                            row.try_get("text_output_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        image_output_microusd_per_million: to_u64(
+                            row.try_get("image_output_microusd_per_million")
+                                .map_err(database_error)?,
+                        )?,
+                        source_url: row
+                            .try_get::<Option<String>, _>("plan_source_url")
+                            .map_err(database_error)?
+                            .unwrap_or_default(),
+                    }),
+                    None => None,
+                };
+                // 修订上那几列是**按候选键的 jsonb 映射**，不是文本列——用 `row_candidate_pricing`
+                // 的同一套读法（`candidate_pricing_entry` 按 offering 取那一格）。
+                let offering_id: Uuid = row.try_get("offering_id").map_err(database_error)?;
+                let pricing = row_candidate_pricing(row, offering_id)?;
                 Ok(ActiveOfferingChannel {
                     provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
                     adapter_key: row.try_get("adapter_key").map_err(database_error)?,
                     provider_kind: row.try_get("provider_kind").map_err(database_error)?,
                     base_url: row.try_get("base_url").map_err(database_error)?,
                     credential_env: row.try_get("credential_env").map_err(database_error)?,
+                    formula: row.try_get("formula").map_err(database_error)?,
+                    plan,
+                    cost_unit_price_microusd: row
+                        .try_get::<Option<i64>, _>("cost_unit_price_microusd")
+                        .map_err(database_error)?
+                        .map(to_u64)
+                        .transpose()?,
+                    cost_currency: pricing.cost_currency,
+                    reference_cost_microusd: pricing.reference_cost_microusd,
+                    cost_basis: pricing.cost_basis.map(|basis| basis.as_str().to_owned()),
+                    tier_prices: pricing.tier_prices,
+                    floor_amounts: pricing.floor_amounts,
                 })
             })
             .collect()

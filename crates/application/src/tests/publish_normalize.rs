@@ -1,6 +1,7 @@
 use super::*;
 
 /// 省略渠道的候选（渠道三要素与驱动器留空），用来验增量发布的沿用规则。
+/// 计价形态**显式给出**，这样这条只验渠道沿用，不牵扯计价沿用。
 fn draft_without_channel(provider_model_id: &str) -> OfferingDraft {
     OfferingDraft {
         base_url: None,
@@ -10,7 +11,22 @@ fn draft_without_channel(provider_model_id: &str) -> OfferingDraft {
     }
 }
 
-/// 上一版里可被沿用的一条候选。
+/// 省略**计价依据**的候选（形态留空），其余照给。
+fn draft_without_pricing(provider_model_id: &str) -> OfferingDraft {
+    OfferingDraft {
+        formula: None,
+        price_plan: None,
+        cost_unit_price_microusd: None,
+        cost_currency: None,
+        reference_cost_microusd: None,
+        cost_basis: None,
+        tier_prices: None,
+        floor_amounts: None,
+        ..draft(provider_model_id)
+    }
+}
+
+/// 上一版里可被沿用的一条候选：渠道三要素 + 一份四档渠道费率。
 fn previous_offering(
     provider_kind: &str,
     provider_model_id: &str,
@@ -22,6 +38,21 @@ fn previous_offering(
         adapter_key: "aihubmix-image-v1".to_owned(),
         base_url: base_url.to_owned(),
         credential_env: "AIHUBMIX_API_KEY".to_owned(),
+        formula: "token_rates".to_owned(),
+        plan: Some(PricePlanRates {
+            currency: "USD".to_owned(),
+            text_input_microusd_per_million: 5_000_000,
+            image_input_microusd_per_million: 8_000_000,
+            text_output_microusd_per_million: 10_000_000,
+            image_output_microusd_per_million: 30_000_000,
+            source_url: "https://vendor.example.com/pricing".to_owned(),
+        }),
+        cost_unit_price_microusd: None,
+        cost_currency: Some("USD".to_owned()),
+        reference_cost_microusd: Some(5_950),
+        cost_basis: Some("computed".to_owned()),
+        tier_prices: None,
+        floor_amounts: None,
     }
 }
 
@@ -33,7 +64,7 @@ fn an_omitted_channel_is_inherited_from_the_current_revision() {
         "gpt-image-2.5-flare",
         "https://api.example.com",
     )];
-    let inherited = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &previous)
+    let inherited = inherit_offering(0, &draft_without_channel("gpt-image-2.5-flare"), &previous)
         .expect("the channel is inheritable");
     assert_eq!(
         inherited.base_url.as_deref(),
@@ -59,7 +90,8 @@ fn a_declared_channel_is_not_overwritten_by_the_previous_revision() {
         base_url: Some("https://new.example.com".to_owned()),
         ..draft("gpt-image-2.5-flare")
     };
-    let kept = inherit_channel(&declared, &previous).expect("a declared channel passes through");
+    let kept =
+        inherit_offering(0, &declared, &previous).expect("a declared channel passes through");
     assert_eq!(kept.base_url.as_deref(), Some("https://new.example.com"));
 }
 
@@ -71,11 +103,17 @@ fn an_omitted_channel_without_a_matching_previous_offering_is_rejected() {
         "another-model",
         "https://api.example.com",
     )];
-    let error = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &previous)
+    let error = inherit_offering(0, &draft_without_channel("gpt-image-2.5-flare"), &previous)
         .expect_err("no match must be rejected");
     let text = error.to_string();
-    assert!(text.contains("no offering with that identity"), "{text}");
-    assert!(text.contains("give the channel explicitly"), "{text}");
+    assert!(
+        text.contains("the model's current revision has no offering with that identity"),
+        "{text}"
+    );
+    assert!(
+        text.contains("give base_url and credential_env explicitly"),
+        "{text}"
+    );
 }
 
 /// 同一 `provider_kind` 与渠道模型名在上一版有多条候选：**歧义，拒绝**。
@@ -87,7 +125,7 @@ fn an_ambiguous_omitted_channel_is_rejected() {
         previous_offering("AIHubMix", "gpt-image-2.5-flare", "https://a.example.com"),
         previous_offering("AIHubMix", "gpt-image-2.5-flare", "https://b.example.com"),
     ];
-    let error = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &previous)
+    let error = inherit_offering(0, &draft_without_channel("gpt-image-2.5-flare"), &previous)
         .expect_err("ambiguity must be rejected");
     assert!(
         error
@@ -110,7 +148,7 @@ fn an_omitted_channel_without_an_identity_is_rejected() {
         ..draft_without_channel("gpt-image-2.5-flare")
     };
     let error =
-        inherit_channel(&anonymous, &previous).expect_err("an anonymous candidate is rejected");
+        inherit_offering(0, &anonymous, &previous).expect_err("an anonymous candidate is rejected");
     assert!(
         error
             .to_string()
@@ -122,12 +160,56 @@ fn an_omitted_channel_without_an_identity_is_rejected() {
 /// 型号还没有任何生效修订（沿用来源为空）：拒绝。
 #[test]
 fn an_omitted_channel_is_rejected_when_the_model_has_no_revision() {
-    let error = inherit_channel(&draft_without_channel("gpt-image-2.5-flare"), &[])
+    let error = inherit_offering(0, &draft_without_channel("gpt-image-2.5-flare"), &[])
         .expect_err("an empty previous revision cannot be inherited from");
     assert!(
         error.to_string().contains("no offering with that identity"),
         "{error}"
     );
+}
+
+/// 省略计价依据的候选：形态、四档渠道费率与价目出处都从上一版取。
+///
+/// 这条守的是"改价不会顺手把渠道价目改坏"：管理端视图不回显渠道费率，运营改一个倍率时那些字段只能是
+/// 沿用来的；沿用不到就该拒，而不是落成空值。
+#[test]
+fn omitted_pricing_is_inherited_from_the_current_revision() {
+    let previous = vec![previous_offering(
+        "AIHubMix",
+        "gpt-image-2.5-flare",
+        "https://api.example.com",
+    )];
+    let inherited = inherit_offering(0, &draft_without_pricing("gpt-image-2.5-flare"), &previous)
+        .expect("the pricing is inheritable");
+    assert_eq!(inherited.formula.as_deref(), Some("token_rates"));
+    let plan = inherited.price_plan.expect("the four rates come back");
+    assert_eq!(plan.text_input_microusd_per_million, 5_000_000);
+    assert_eq!(plan.source_url, "https://vendor.example.com/pricing");
+    assert_eq!(inherited.cost_currency.as_deref(), Some("USD"));
+    assert_eq!(inherited.reference_cost_microusd, Some(5_950));
+    assert_eq!(inherited.cost_basis.as_deref(), Some("computed"));
+}
+
+/// **只省渠道、却显式给了新计价**时，计价用新的——两组字段各自独立判断。
+///
+/// 少了这条独立判断，"重签渠道价目但不动渠道地址"会被上一版的旧价目覆盖掉。
+#[test]
+fn a_declared_pricing_is_not_overwritten_when_only_the_channel_is_omitted() {
+    let previous = vec![previous_offering(
+        "AIHubMix",
+        "gpt-image-2.5-flare",
+        "https://api.example.com",
+    )];
+    let mut declared = draft_without_channel("gpt-image-2.5-flare");
+    declared.formula = Some("per_call".to_owned());
+    declared.price_plan = None;
+    declared.cost_unit_price_microusd = Some(7_000);
+    let kept = inherit_offering(0, &declared, &previous).expect("the declared pricing wins");
+    assert_eq!(kept.formula.as_deref(), Some("per_call"));
+    assert_eq!(kept.cost_unit_price_microusd, Some(7_000));
+    assert!(kept.price_plan.is_none(), "旧的四档费率不该被带过来");
+    // 渠道三要素仍然沿用。
+    assert_eq!(kept.base_url.as_deref(), Some("https://api.example.com"));
 }
 
 #[test]

@@ -1,6 +1,5 @@
 import { App as AntApp, ConfigProvider, Layout, Menu, Typography, theme } from 'antd';
 import {
-  ApiOutlined,
   AuditOutlined,
   DeploymentUnitOutlined,
   DollarOutlined,
@@ -21,15 +20,13 @@ import { CustomersPage } from './pages/Customers';
 import { DiagnosticsPage } from './pages/Diagnostics';
 import { ChangePasswordPanel, LoginPage } from './pages/Login';
 import { ModelsPage } from './pages/Models';
-import { PublishPage } from './pages/Publish';
 import { RatesPage } from './pages/Rates';
 import { RoutingPage } from './pages/Routing';
 
 const NAV: { route: Route; label: string; icon: React.ReactNode }[] = [
-  // 「模型目录」是运营的说法（列在售的模型与它们的价目）；`Gateway Model` 是平台内部名。
+  // 一页看、一页写会让人看不出两者的联系，所以「上架与改价」并进了「模型目录」：那一页右上角
+  // 就是"上架新模型"，每行有一个"改价"。`#/publish` 仍作为旧地址落到同一页。
   { route: 'models', label: '模型目录', icon: <DeploymentUnitOutlined /> },
-  // 「上架与改价」是这一页对运营的用途：让一个型号可售、改它的价。它写的就是发布修订这件事。
-  { route: 'publish', label: '上架与改价', icon: <ApiOutlined /> },
   { route: 'accounts', label: '账户', icon: <KeyOutlined /> },
   { route: 'customers', label: '客户', icon: <TeamOutlined /> },
   { route: 'diagnostics', label: '对账与诊断', icon: <AuditOutlined /> },
@@ -154,8 +151,16 @@ function Console() {
               <ChangePasswordPanel onClose={() => setShowPassword(false)} />
             </div>
           ) : null}
-          {route === 'models' ? <ModelsPage client={client} /> : null}
-          {route === 'publish' ? <PublishPage client={client} /> : null}
+          {route === 'models' || route === 'publish' ? (
+            <ModelsPage
+              client={client}
+              // `#/publish` 是合并之前的旧地址：它现在落到本页并把"改价"抽屉带上，旧链接与书签不废。
+              editRequest={route === 'publish' ? '' : undefined}
+              onEditRequestHandled={
+                route === 'publish' ? () => navigate('models') : undefined
+              }
+            />
+          ) : null}
           {route === 'rates' ? <RatesPage client={client} /> : null}
           {route === 'routing' ? <RoutingPage client={client} /> : null}
           {route === 'accounts' ? <AccountsPage client={client} /> : null}

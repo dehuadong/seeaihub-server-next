@@ -16,10 +16,10 @@ import {
   Typography,
 } from 'antd';
 import { DeleteOutlined, PlusOutlined, SendOutlined } from '@ant-design/icons';
-import { useCallback, useEffect, useState } from 'react';
+import { useEffect, useRef, useState } from 'react';
 import type { AdminClient } from '../client';
 import { useLoadable } from '../../shared/ui';
-import { ConsolePage, Panel } from '../ui';
+import { Panel } from '../ui';
 
 /// 上架与改价：运营让一个型号可售、或改它的价的地方（写的就是发布修订这件事）。
 ///
@@ -98,7 +98,22 @@ const EMPTY_OFFERING: OfferingForm = {
   cny_image_output: 0,
 };
 
-export function PublishPage({ client }: { client: AdminClient }) {
+/// 上架与改价的**表单**：运营让一个型号可售、或改它的价的地方。
+///
+/// 它是「模型目录」页右上角那个动作的内容，由那一页放进抽屉渲染——不是独立一页。两个页面的关系就是
+/// "一页看、一页写"，分在两个导航项里会让人看不出它们的联系（用户原话："和网关模型的区别是什么"）。
+///
+/// `editing` 给一个已发布型号名时，表单先载入它的身份与商务字段，然后进**改价模式**：命令里不带渠道
+/// 三要素与驱动器，由服务端从当前生效的修订沿用（合同见 `docs/design/0010` §4.1）。
+export function PublishPanel({
+  client,
+  editing,
+  onPublished,
+}: {
+  client: AdminClient;
+  editing?: string | null;
+  onPublished?: () => void;
+}) {
   const { message } = AntApp.useApp();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -153,7 +168,6 @@ export function PublishPage({ client }: { client: AdminClient }) {
         const item: Record<string, unknown> = {
           provider_kind: offering.provider_kind.trim(),
           provider_model_id: offering.provider_model_id.trim(),
-          formula: offering.formula,
           // 档位缺省即下标，这里显式给出来让人能同档分摊。
           routing_priority: index,
           weight: offering.weight,
@@ -162,6 +176,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
           item.adapter_key = offering.adapter_key.trim();
           item.base_url = offering.base_url.trim();
           item.credential_env = offering.credential_env.trim();
+          item.formula = offering.formula;
         }
         if (parsed !== undefined) item.capability_schema = parsed;
         const carrier = parseJson(offering.carrier_schema, '承载面（carrier_schema）');
@@ -170,6 +185,20 @@ export function PublishPage({ client }: { client: AdminClient }) {
         if (mapping !== undefined) item.parameter_mapping = mapping;
         const restrictions = parseJson(offering.restrictions, '限制（restrictions）');
         if (restrictions !== undefined) item.restrictions = restrictions;
+
+        if (repricing) {
+          // 改价：渠道价目与价目出处**一并省略**，由服务端从当前生效的修订沿用——它们与渠道地址
+          // 是同一类东西（渠道怎么结算），这次没变，而管理端视图也不回显它们。这里只发对客费率。
+          if (offering.margin_enabled) {
+            item.consumer_rates_cny = {
+              text_input_micros_per_million: offering.cny_text_input,
+              image_input_micros_per_million: offering.cny_image_input,
+              text_output_micros_per_million: offering.cny_text_output,
+              image_output_micros_per_million: offering.cny_image_output,
+            };
+          }
+          return item;
+        }
 
         if (offering.formula === 'token_rates') {
           item.price_plan = {
@@ -213,12 +242,15 @@ export function PublishPage({ client }: { client: AdminClient }) {
   async function publish() {
     setBusy(true);
     setError(null);
+    // 上一次的**成功**答复必须先清掉：留着它，这次失败时屏幕上还挂着"已发布"，看的人会以为成了。
     setDone(null);
     try {
       const command = buildCommand();
       const published = await client.publishRevision(command);
       setDone(published);
       message.success(`已发布 ${published.gateway_model}`);
+      // 让容器（模型目录）重取列表：刚刚改的价要立刻显示在那一页上。
+      onPublished?.();
     } catch (failure) {
       setError(failure instanceof Error ? failure.message : String(failure));
     } finally {
@@ -232,6 +264,8 @@ export function PublishPage({ client }: { client: AdminClient }) {
   async function loadFromPublished(gatewayModel: string) {
     setBusy(true);
     setError(null);
+    // 载入另一个型号时同样要清掉上一次的答复：它说的是别的型号。
+    setDone(null);
     try {
       const models = await client.gatewayModels();
       const model = models.gateway_models.find((item) => item.gateway_model === gatewayModel);
@@ -276,10 +310,17 @@ export function PublishPage({ client }: { client: AdminClient }) {
     }
   }
 
-  const published = usePublishedModelNames(client);
   /// 改价模式的判据：已经从某个已发布型号载入了身份。非空时 buildCommand 不带渠道字段。
   const [loaded, setLoaded] = useState<string | null>(null);
   const repricing = loaded !== null;
+
+  // 容器给了"要改哪个型号"就载入它。放进依赖数组的只能是 `editing`：`loadFromPublished` 每次渲染都是
+  // 新的函数值，把它算进去会无限重载。
+  const loadRef = useRef(loadFromPublished);
+  loadRef.current = loadFromPublished;
+  useEffect(() => {
+    if (editing) void loadRef.current(editing);
+  }, [editing]);
   // 算价算式要用当前生效的折算率：没有它就算不出 CNY 对客费率，界面上要如实说缺而不是拿 0 顶替。
   const rates = useLoadable(() => client.fxRates(), [client]);
   const currencies: Record<string, number> = { CNY: 1 };
@@ -288,23 +329,8 @@ export function PublishPage({ client }: { client: AdminClient }) {
   }
 
   return (
-    <ConsolePage
-      title="上架与改价"
-      hint="这一页是写：让一个型号可售，或改它的价。写完之后「模型目录」显示的就是这里提交的东西。"
-      error={error}
-      extra={
-        published.length > 0 ? (
-          <Select
-            data-testid="publish-load-model"
-            showSearch
-            placeholder="改价：选一个已发布型号"
-            style={{ width: 260 }}
-            options={published.map((name) => ({ value: name, label: name }))}
-            onChange={(value: string) => void loadFromPublished(value)}
-          />
-        ) : null
-      }
-    >
+    <Flex vertical gap={16}>
+      {error ? <Alert type="error" showIcon message={error} /> : null}
       {done ? (
         <Alert
           type="success"
@@ -544,17 +570,30 @@ export function PublishPage({ client }: { client: AdminClient }) {
             )}
 
             <Divider plain>成本与对客价</Divider>
+            {repricing ? (
+              // 改价：渠道怎么结算（计价形态、四档渠道费率、价目出处、成本币种）这次没变，由服务端从
+              // 当前生效的修订沿用。摆出来却不随命令发出，等于让人"改了个不生效的数"。
+              <Alert
+                type="info"
+                showIcon
+                style={{ marginBottom: 16 }}
+                message="渠道成本与计价形态沿用当前生效的那一份"
+                description="这一页只改对客价：倍率与下面那四档 CNY 费率。要换计价形态或改渠道费率，请用「上架新模型」重发一份，或去渠道那边重签。"
+              />
+            ) : null}
             <Row gutter={16}>
-              <Col xs={24} md={8}>
-                <Form.Item label="计价形态" required>
-                  <Select
-                    value={offering.formula}
-                    options={FORMULAS}
-                    onChange={(value: string) => patchOffering(index, { formula: value })}
-                  />
-                </Form.Item>
-              </Col>
-              {offering.formula === 'token_rates' ? (
+              {repricing ? null : (
+                <Col xs={24} md={8}>
+                  <Form.Item label="计价形态" required>
+                    <Select
+                      value={offering.formula}
+                      options={FORMULAS}
+                      onChange={(value: string) => patchOffering(index, { formula: value })}
+                    />
+                  </Form.Item>
+                </Col>
+              )}
+              {!repricing && offering.formula === 'token_rates' ? (
                 <>
                   <Col xs={24} md={4}>
                     <Form.Item label="成本币种">
@@ -657,7 +696,7 @@ export function PublishPage({ client }: { client: AdminClient }) {
               )}
             </Row>
 
-            {offering.formula === 'token_rates' ? (
+            {!repricing && offering.formula === 'token_rates' ? (
               <Row gutter={16}>
                 <Col xs={24}>
                   <Form.Item
@@ -847,29 +886,11 @@ export function PublishPage({ client }: { client: AdminClient }) {
         markupBps={identity.markup_bps}
         currencies={currencies}
       />
-    </ConsolePage>
+    </Flex>
   );
 }
 
 /// 已发布型号的名字，给"从…载入"那个下拉用。取不到就是空列表——它是辅助信息，失败不影响发布。
-function usePublishedModelNames(client: AdminClient): string[] {
-  const [names, setNames] = useState<string[]>([]);
-  const load = useCallback(() => client.gatewayModels(), [client]);
-  useEffect(() => {
-    let cancelled = false;
-    load()
-      .then((result) => {
-        if (!cancelled) setNames(result.gateway_models.map((item) => item.gateway_model));
-      })
-      .catch(() => {
-        if (!cancelled) setNames([]);
-      });
-    return () => {
-      cancelled = true;
-    };
-  }, [load]);
-  return names;
-}
 
 /// 把"倍率怎么影响对客价"摆出来给人核对（Spec M2：页面要能看出加价系数怎么影响对客价）。
 ///

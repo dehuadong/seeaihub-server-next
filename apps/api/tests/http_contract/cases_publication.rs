@@ -108,6 +108,24 @@ async fn a_publication_may_omit_the_channel_and_inherit_it_from_the_current_revi
     .expect("markup of the active revision");
     assert_eq!(markup, Some(2_400), "加价系数应当是这次发布给的值");
 
+    // 渠道价目**原样沿用**：这次发布一个字都没提它，所以四档费率与价目出处都得是上一版那一份——
+    // 落成空值的效果是"改价顺手改坏了渠道结算依据"，而它在结算之前不会有人发现。
+    let (text_input, source_url): (i64, String) = sqlx::query_as(
+        "SELECT p.text_input_microusd_per_million, p.source_url
+         FROM publication.runtime_entries re
+         JOIN pricing.price_plans p ON p.id = re.price_plan_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("inherited price plan");
+    assert_eq!(text_input, 5_000_000, "四档渠道费率必须原样沿用");
+    assert_eq!(
+        source_url, "https://example.invalid/price",
+        "价目出处必须原样沿用"
+    );
+
     drop_isolated_database(&database_name).await;
 }
 

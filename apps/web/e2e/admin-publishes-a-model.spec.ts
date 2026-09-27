@@ -42,7 +42,9 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
   });
   expect(rate.status()).toBe(204);
 
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '上架与改价' }).click();
+  // 上架入口在「模型目录」页右上角，表单开在抽屉里（两页已合成一页）。
+  await page.getByTestId('models-add').click();
+  await expect(page.getByTestId('publish-vendor')).toBeVisible();
 
   const model = `e2e-form-${Date.now()}`;
   await page.getByTestId('publish-vendor').fill('OpenAI');
@@ -107,7 +109,8 @@ test('用表单发布一个新型号，不写整份发布命令', async ({ page,
   await expect(page.getByText(`已发布 ${model}`).first()).toBeVisible({ timeout: 15_000 });
   await expect(page.getByText('生效修订：')).toBeVisible();
 
-  // 去模型列表核对它真的在（发布不是只弹了个提示）。
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '模型目录' }).click();
-  await expect(page.getByText(model).first()).toBeVisible();
+  // 发布成功后关掉抽屉，列表上应当立刻有它（列表在发布成功时重取过）。
+  await page.keyboard.press('Escape');
+  await expect(page.getByTestId('models-add')).toBeVisible();
+  await expect(page.getByText(model).first()).toBeVisible({ timeout: 15_000 });
 });
