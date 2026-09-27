@@ -6,6 +6,8 @@ status: accepted
 
 同一 Vendor Model 可以由多个 Offering 供应（不同 Provider、Channel 或执行策略）。`publication.runtime_entries` 允许同一型号存在多条 active 记录，各带一个 `routing_priority`；**一次发布携带该型号完整有序的候选集合，发布即原子替换该型号既有 active 条目**，因此候选集永远来自同一个 Revision。
 
+**原子替换的是条目及其技术定义快照**：发布时把被引用 Offering 的技术定义（驱动器、供应商模型名、承载面、参数映射、限制）与渠道三要素写进这次修订的条目，受理从条目读、不从 `supply.offerings` / `supply.channels` 的当前值读。少了这条"发布即冻结"是假的——两个指向同一 Vendor Model Revision 的网关模型会互相改活候选，工程师事后改渠道地址也会改到已发布修订的受理取值。**两个 `enabled` 开关不进快照**：`supply.offerings.enabled` 与 `supply.channels.enabled` 是运行状态，停用要立刻对之后的受理生效，所以受理先按条目的快照拿到候选与它的技术定义、再按活表的这两个开关判"现在还让不让走"。
+
 受理时先按该型号取候选集，再按**合取**判据筛出**合格候选**：该候选的 `restrictions` 允许本次分支与输入图张数，**且**请求满足该候选自己已发布的 Schema。两项都只用受理前已知的事实——不做上游探测，不让 Adapter 参与选路；没有合格候选时在**调用上游之前**失败。在一批**合格候选**里挑哪一条由**运营配置的路由策略**决定——未配置策略时是 `priority_failover`：按 `routing_priority` 数字小者优先、该档没有合格候选时依次降级，同一档内按 `weight` 分摊。策略层本身归 [ADR-0020](./0020-routing-strategy-layer-configured-by-operations.md)，权重语义见 [`docs/design/0008`](../design/0008-routing-strategy-and-caching.md) §2。
 
 决定的操作性条款：

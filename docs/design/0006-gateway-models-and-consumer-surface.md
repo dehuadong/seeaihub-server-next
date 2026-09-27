@@ -61,7 +61,7 @@
 | 改动 | 内容 | 理由 |
 | --- | --- | --- |
 | `publication.runtime_revisions` 增列 | `gateway_model text NOT NULL`、`vendor_model_id uuid NOT NULL`（**P1 落**）、`markup_bps integer`、`reference_cost_microusd jsonb`（**按候选键**：该候选的渠道成本，**原币种**微单位，列名里的 `usd` 是历史命名；**只作定价参考**）、`cost_currency jsonb`（**按候选键**：该候选的成本币种，[`0007`](./0007-pricing-floor-and-settlement.md) §8）、`consumer_rates_cny jsonb`（**按候选键**：该候选的**对客四档 CNY 费率向量**，管理员设定/推导，[`0007`](./0007-pricing-floor-and-settlement.md) §2 与本文 §4）、`cost_basis jsonb`（**按候选键**：该候选的成本来源两态，与 `cost_currency` 同处，[`0007`](./0007-pricing-floor-and-settlement.md) §7）、`tier_prices jsonb`（**CNY**，展示用）、`floor_amounts jsonb`（**CNY**，保底表）（**P2b 落**；后七列**可空**：只有新发布的修订带定价，见下） | 让"这次发布定义的是哪个网关模型、指向哪个 Vendor Model、**每个候选的渠道成本是多少（什么币种）**、**每个候选的对客费率是多少**、**成本按哪个来源算**、**预授权保底额从哪查**"在修订上可读，不必从条目反推 |
-| `publication.runtime_entries` | 已有 `gateway_model`（迁移 0004 改名而来），不改 | 路由索引已经按它建好 |
+| `publication.runtime_entries` | 已有 `gateway_model`（迁移 0004 改名而来）、`routing_priority`、`weight`；**增列技术定义快照**：`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`，以及渠道三要素 `provider_kind` / `base_url` / `credential_env` | 路由索引已经按 `gateway_model` 建好。快照列让"发布即冻结"成立：受理从条目读技术定义，不从 `supply.offerings` / `supply.channels` 的当前值读（`ADR-0009`）。两个 `enabled` 开关**不进快照**，受理仍按活表判定 |
 | 新表 `publication.gateway_models` | `gateway_model text PRIMARY KEY`、`enabled boolean NOT NULL DEFAULT true`、`created_at`、`updated_at`、`updated_by` | **只放运维开关**，不放定义（定义只在不可变修订里） |
 | 唯一性 | 沿用"同一名字同时只有一个生效修订"，由发布原子替换保证 | `ADR-0009` |
 
