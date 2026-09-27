@@ -798,10 +798,10 @@ fn normalize_candidate_pricing(
     index: usize,
     draft: &OfferingDraft,
 ) -> Result<Option<CandidatePricing>, ApplicationError> {
-    let carries_pricing = draft.reference_cost_microusd.is_some()
-        || draft.cost_basis.is_some()
-        || draft.tier_prices.is_some()
-        || draft.floor_amounts.is_some();
+    // "这条候选带定价"的判据是**调用方声明了成本侧的定价**。`cost_basis` 与 `floor_amounts` 不算声明：
+    // 它们两态/空表都能从渠道与计价形态推出来（引用式发布就是服务端填的），把它们算进来会让"只给对客
+    // 费率、不给参考成本"的正当发布被要求补一个它根本不需要的成本。
+    let carries_pricing = draft.reference_cost_microusd.is_some() || draft.tier_prices.is_some();
     if !carries_pricing {
         return Ok(None);
     }
@@ -4490,9 +4490,27 @@ impl RuntimeService {
                     .or_else(|| found.plan.as_ref().map(|plan| plan.currency.clone())),
                 reference_cost_microusd: reference.reference_cost_microusd,
                 consumer_rates_cny: reference.consumer_rates_cny.clone(),
-                cost_basis: reference.cost_basis.clone(),
+                // **成本口径与保底表也由服务端定**，不要运营给：这两样是渠道与结算的事实，而且
+                // 它们不是"运营的选择"——`cost_basis` 两态由计价形态唯一决定（渠道终态给金额就是
+                // `declared`，否则平台按用量自算就是 `computed`）；保底表缺省是空表（没声明保底）。
+                //
+                // 为什么不能留给"没给就报错"：运营给参考成本只是给一个**定价参考**，而报错会把他挡在
+                // 门外去猜一个他无从知道的枚举值——那正是这次改动要收掉的东西。
+                cost_basis: Some(
+                    if found.formula == "upstream_declared" {
+                        "declared"
+                    } else {
+                        "computed"
+                    }
+                    .to_owned(),
+                ),
                 tier_prices: reference.tier_prices.clone(),
-                floor_amounts: reference.floor_amounts.clone(),
+                floor_amounts: Some(
+                    reference
+                        .floor_amounts
+                        .clone()
+                        .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
+                ),
             })
             .collect::<Vec<_>>();
         // **回写到调用方的命令上**：身份是这次发布真正定义的东西，而 `publish` 随后要拿 `command`

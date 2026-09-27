@@ -414,6 +414,100 @@ async fn a_referenced_publication_freezes_the_offering_row_it_points_at() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 引用式发布**给参考成本**时，成本口径与保底表由服务端定，不要运营给。
+///
+/// 这条守的是一个只有真给参考成本才会走到的分支：`carries_pricing` 在"给了 `reference_cost_microusd`"
+/// 时为真，而那之后旧代码会要求调用方**同时**给出 `cost_basis` 与 `floor_amounts`。这两样都不是运营的
+/// 选择——`cost_basis` 两态由计价形态唯一决定（渠道终态给金额就是 `declared`，否则平台按用量自算就是
+/// `computed`），保底表缺省是空表。要运营填它们，等于让他去猜一个他无从知道的枚举值。
+///
+/// 既有用例从没给过 `reference_cost_microusd`，所以这个分支一直没被走到——是真机上走一遍运营路径才
+/// 撞出来的（400 `cost_basis is required when the candidate carries pricing`）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_referenced_publication_derives_the_cost_basis_from_the_channel_formula() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "referenced-cost-basis-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let mut full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    full["base_url"] = json!("https://cost-basis.example.com");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract),
+            vec![full]
+        )
+        .await,
+        StatusCode::OK,
+        "先把那条可被引用的 Offering 造出来"
+    );
+    let offering_id: Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM supply.offerings o
+         JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+         WHERE vm.native_model_id = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("the offering the operators will reference");
+
+    // 只给"选了哪条"与这条候选的价——**包括参考成本**，但一个技术字段都不给。
+    let gateway = "referenced-cost-basis-gateway";
+    let body = json!({
+        "gateway_model": gateway,
+        "actor": "contract-test",
+        "markup_bps": 2_400,
+        "references": [{
+            "offering_id": offering_id,
+            "consumer_rates_cny": priced_consumer_rates(),
+            // 给一个小值：这条要验的是"成本口径由服务端推出来"，不是单请求成本上限
+            // （那条上限由 `GENERATION_MAX_REQUEST_COST_MICROUSD` 兜着，另有用例管它）。
+            "reference_cost_microusd": 120_000_u64
+        }]
+    });
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("referenced publication");
+    let status = response.status();
+    let text = response.text().await.expect("referenced body");
+    assert_eq!(status, StatusCode::OK, "给了参考成本也要能发出去：{text}");
+
+    // 成本口径由该渠道的计价形态决定：`token_rates` 是"平台按用量自算"，所以是 `computed`。
+    let basis: String = sqlx::query_scalar(
+        "SELECT rr.cost_basis ->> re.offering_id::text
+         FROM publication.runtime_entries re
+         JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(gateway)
+    .fetch_one(&pool)
+    .await
+    .expect("the cost basis of the published candidate");
+    assert_eq!(
+        basis, "computed",
+        "渠道不给金额字段时成本由平台自算，运营不必声明"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 省略渠道但上一版里没有同身份的候选：拒绝并点名，不用"最近的那条"顶替。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
