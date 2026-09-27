@@ -885,8 +885,14 @@ async fn the_routing_weight_migration_keeps_existing_entries_and_allows_shared_t
     sqlx::query(
         "INSERT INTO publication.runtime_entries
              (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model,
-              active, routing_priority, weight)
-         VALUES ($1,$2,$3,$4,'weighted-legacy',true,0,3)",
+              active, routing_priority, weight,
+              adapter_key, provider_model_id, carrier_schema, parameter_mapping, restrictions,
+              provider_kind, base_url, credential_env)
+         SELECT $1,$2,$3,$4,'weighted-legacy',true,0,3,
+                o.adapter_key, o.provider_model_id, o.carrier_schema, o.parameter_mapping, o.restrictions,
+                c.provider_kind, c.base_url, c.credential_env
+         FROM supply.offerings o JOIN supply.channels c ON c.id = o.channel_id
+         WHERE o.id = $3",
     )
     .bind(revision)
     .bind(vendor_model)
@@ -900,8 +906,14 @@ async fn the_routing_weight_migration_keeps_existing_entries_and_allows_shared_t
     let zero_weight = sqlx::query(
         "INSERT INTO publication.runtime_entries
              (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model,
-              active, routing_priority, weight)
-         VALUES ($1,$2,$3,$4,'weighted-legacy',true,1,0)",
+              active, routing_priority, weight,
+              adapter_key, provider_model_id, carrier_schema, parameter_mapping, restrictions,
+              provider_kind, base_url, credential_env)
+         SELECT $1,$2,$3,$4,'weighted-legacy',true,1,0,
+                o.adapter_key, o.provider_model_id, o.carrier_schema, o.parameter_mapping, o.restrictions,
+                c.provider_kind, c.base_url, c.credential_env
+         FROM supply.offerings o JOIN supply.channels c ON c.id = o.channel_id
+         WHERE o.id = $3",
     )
     .bind(revision)
     .bind(vendor_model)
@@ -913,8 +925,14 @@ async fn the_routing_weight_migration_keeps_existing_entries_and_allows_shared_t
     let duplicate = sqlx::query(
         "INSERT INTO publication.runtime_entries
              (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model,
-              active, routing_priority, weight)
-         VALUES ($1,$2,$3,$4,'weighted-legacy',true,1,1)",
+              active, routing_priority, weight,
+              adapter_key, provider_model_id, carrier_schema, parameter_mapping, restrictions,
+              provider_kind, base_url, credential_env)
+         SELECT $1,$2,$3,$4,'weighted-legacy',true,1,1,
+                o.adapter_key, o.provider_model_id, o.carrier_schema, o.parameter_mapping, o.restrictions,
+                c.provider_kind, c.base_url, c.credential_env
+         FROM supply.offerings o JOIN supply.channels c ON c.id = o.channel_id
+         WHERE o.id = $3",
     )
     .bind(revision)
     .bind(vendor_model)

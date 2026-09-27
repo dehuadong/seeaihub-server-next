@@ -691,8 +691,14 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
     .expect("runtime revision fixture");
     sqlx::query(
         "INSERT INTO publication.runtime_entries
-             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active)
-         VALUES ($1,$2,$3,$4,'cost-path',true)",
+             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active,
+              adapter_key, provider_model_id, carrier_schema, parameter_mapping, restrictions,
+              provider_kind, base_url, credential_env)
+         SELECT $1, $2, $3, $4, 'cost-path', true,
+                o.adapter_key, o.provider_model_id, o.carrier_schema, o.parameter_mapping, o.restrictions,
+                c.provider_kind, c.base_url, c.credential_env
+         FROM supply.offerings o JOIN supply.channels c ON c.id = o.channel_id
+         WHERE o.id = $3",
     )
     .bind(revision)
     .bind(vendor_model)
