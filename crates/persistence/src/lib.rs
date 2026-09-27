@@ -592,12 +592,19 @@ impl HubRepository for PgHubRepository {
         .await
         .map_err(database_error)?;
         for candidate in &candidates {
+            // 技术定义八列是**这次发布冻结下来的那一份**（驱动器、供应商模型名、承载面、参数映射、
+            // 限制与渠道三要素），受理装配候选只读条目、不再现场 JOIN 活表：否则工程师事后改一条
+            // 供给的承载面、或改一条渠道的地址，**已发布修订**的候选会跟着变，"这次发布定义了什么"
+            // 就不由这次发布决定了。供给与渠道上那两个 `enabled` 开关**不进快照**——它们是运行状态，
+            // 停用要立刻对之后的受理生效，不能被某次发布钉住，所以受理仍按活表这两个开关复核。
             sqlx::query(
                 r#"
                 INSERT INTO publication.runtime_entries
                     (runtime_revision_id, vendor_model_id, offering_id, price_plan_id,
-                     gateway_model, active, routing_priority, weight)
-                VALUES ($1, $2, $3, $4, $5, true, $6, $7)
+                     gateway_model, active, routing_priority, weight,
+                     adapter_key, provider_model_id, carrier_schema, parameter_mapping,
+                     restrictions, provider_kind, base_url, credential_env)
+                VALUES ($1, $2, $3, $4, $5, true, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15)
                 "#,
             )
             .bind(revision_id.0)
@@ -610,6 +617,14 @@ impl HubRepository for PgHubRepository {
             .bind(i32::try_from(candidate.weight).map_err(|_| {
                 ApplicationError::Validation("offering weight is out of range".to_owned())
             })?)
+            .bind(&candidate.adapter_key)
+            .bind(&candidate.provider_model_id)
+            .bind(&candidate.carrier_schema)
+            .bind(&candidate.parameter_mapping)
+            .bind(&candidate.restrictions)
+            .bind(&candidate.provider_kind)
+            .bind(&candidate.base_url)
+            .bind(&candidate.credential_env)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -650,8 +665,13 @@ impl HubRepository for PgHubRepository {
         gateway_model: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
         // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它所属的那一行
-        // vendor_models 取**合同**（模型级唯一一份），并从它自己的 offering 行取**承载面**——
-        // 同一型号的候选共享一份合同，各自带自己的承载面。
+        // vendor_models 取**合同**（模型级唯一一份），技术定义（承载面、参数映射、限制、驱动器、
+        // 供应商模型名与渠道三要素）读**条目自己那八列**——它是这次发布冻结下来的那一份，供给与
+        // 渠道事后的改动不该改到已发布修订的受理口径。
+        //
+        // `supply.offerings` 与 `supply.channels` 的 JOIN 仍然要留：它们的两个 `enabled` 开关不在
+        // 快照里（[`CANDIDATE_AVAILABLE_SQL`]），停用必须立刻对之后的受理生效。`formula` 与
+        // `cost_unit_price_microusd` 也不在快照里：它们是**渠道怎么结算**的事实，继续读活表。
         //
         // 参数名是**平台对客名**（网关模型名），不是厂商原生名：调用方提交的 `model` 就是它。
         // 判据与对客目录**逐条一致**，其中多一条"网关模型开着"——关掉的模型必须真的调不动，
@@ -665,10 +685,10 @@ impl HubRepository for PgHubRepository {
             SELECT
                 rr.id AS runtime_revision_id,
                 vm.id AS vendor_model_id, re.gateway_model, vm.native_revision,
-                vm.capability_schema, o.carrier_schema, o.parameter_mapping,
-                o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
+                vm.capability_schema, re.carrier_schema, re.parameter_mapping,
+                o.id AS offering_id, re.adapter_key, re.provider_model_id, re.restrictions,
                 o.formula, o.cost_unit_price_microusd,
-                c.id AS channel_id, c.provider_kind, c.base_url, c.credential_env,
+                c.id AS channel_id, re.provider_kind, re.base_url, re.credential_env,
                 p.id AS price_plan_id, p.currency,
                 p.text_input_microusd_per_million,
                 p.image_input_microusd_per_million,

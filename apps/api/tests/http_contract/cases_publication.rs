@@ -129,6 +129,104 @@ async fn a_publication_may_omit_the_channel_and_inherit_it_from_the_current_revi
     drop_isolated_database(&database_name).await;
 }
 
+/// 已发布修订的技术定义**冻结在条目上**：改活表（渠道地址）不改已发修订的受理口径（`#33` 的 P6）。
+///
+/// 这条要证明的是"发布即冻结"这句话对**候选**也成立。`0016` 已经把执行入口冻到 Job 上，但在它之前
+/// 那一段——装配候选读的驱动器、承载面与渠道三要素——一直是现场 JOIN 活表读的。于是工程师事后改一条
+/// 渠道的地址，**已发布修订**的候选跟着变；两条指向同一个厂商模型的网关模型还会互相改活对方的候选。
+///
+/// 判据分两半，缺一不可：
+/// - 改活表之后，**同一份已发修订**的受理口径逐位不变（旧值）；
+/// - 而**重新发布**出来的新修订取到的是**新值**——否则把值写死在代码里也能让前一半通过。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_published_revision_keeps_its_offering_definition_when_the_channel_changes() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "frozen-supply-definition-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let mut full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    full["base_url"] = json!("https://frozen.example.com");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract.clone()),
+            vec![full]
+        )
+        .await,
+        StatusCode::OK,
+        "第一次发布应当成功"
+    );
+
+    // 直接改活表：模拟"工程师事后换了这个渠道的入口"。
+    let updated = sqlx::query(
+        "UPDATE supply.channels SET base_url = 'https://moved.example.com'
+         WHERE provider_kind = 'AIHubMix' AND base_url = 'https://frozen.example.com'",
+    )
+    .execute(&pool)
+    .await
+    .expect("move the channel")
+    .rows_affected();
+    assert_eq!(updated, 1, "夹具必须改到那条渠道");
+
+    // 已发修订那次发布的条目**仍是旧值**：受理读的是它，不是活表。
+    let frozen: String = sqlx::query_scalar(
+        "SELECT base_url FROM publication.runtime_entries
+         WHERE active AND gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("frozen entry");
+    assert_eq!(
+        frozen, "https://frozen.example.com",
+        "已发布修订的条目必须留着发布那一刻的渠道地址"
+    );
+
+    // 反向确认：重新发布出来的新修订取到的是**新值**——否则上面那条断言靠写死也能过。
+    let mut republished = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    republished["base_url"] = json!("https://moved.example.com");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract),
+            vec![republished]
+        )
+        .await,
+        StatusCode::OK,
+        "重新发布应当成功"
+    );
+    let fresh: String = sqlx::query_scalar(
+        "SELECT base_url FROM publication.runtime_entries
+         WHERE active AND gateway_model = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("fresh entry");
+    assert_eq!(
+        fresh, "https://moved.example.com",
+        "新发布的修订要取到新的渠道地址"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 省略渠道但上一版里没有同身份的候选：拒绝并点名，不用"最近的那条"顶替。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
