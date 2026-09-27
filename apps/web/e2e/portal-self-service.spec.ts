@@ -1,5 +1,5 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
-import { portalUrl } from './settings';
+import { portalUrl, settings } from './settings';
 
 /// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、首屏三个数、密钥明文只显示
 /// 一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
@@ -66,6 +66,52 @@ test('注册后进控制台：首屏三个数 + 三个标签页', async ({ page 
   // 会话存在客户自己的键下，不会串到管理端。
   expect(await page.evaluate(() => sessionStorage.getItem('seeai.portal.session'))).toBeTruthy();
   expect(await page.evaluate(() => sessionStorage.getItem('seeai.console.session'))).toBeNull();
+});
+
+/// 客户凭据拿不去管理面（Spec V-D6 的后半）。
+///
+/// 前半（产物里不含管理端代码）由构建末尾的隔离核对与 `bundles-are-isolated.spec.ts` 守着；这里守的是
+/// 另一半：**客户会话调管理端点一律被拒**。两个页面的令牌都在 `sessionStorage` 里，但键与受众不同——
+/// 少了这条，一个把两套令牌当同一个东西的实现也能让前面所有用例通过。
+test('客户会话令牌调管理 API 一律被拒', async ({ page, request }) => {
+  await register(page, uniqueEmail());
+
+  const customerToken = await page.evaluate(() =>
+    sessionStorage.getItem('seeai.portal.session'),
+  );
+  expect(customerToken).toBeTruthy();
+
+  // 从**真正的浏览器页面**里发这次请求：要证的是"浏览器拿着客户令牌打管理面"这件事。
+  const refused = await page.evaluate(async () => {
+    const call = async (path: string) => {
+      const response = await fetch(path, {
+        headers: { authorization: `Bearer ${sessionStorage.getItem('seeai.portal.session') ?? ''}` },
+      });
+      const body = await response.text();
+      return { status: response.status, code: JSON.parse(body)?.error?.code ?? null };
+    };
+    return {
+      models: await call('/api/v1/gateway-models'),
+      accounts: await call('/api/v1/accounts'),
+      session: await call('/api/v1/admin/session'),
+    };
+  });
+
+  // 一律拒，且拒得能被机器认出来。**不是 401**：管理面把"凭据不对"统一回 `admin_forbidden` 403
+  // （`apps/api/src/main.rs` 的 `admin_bearer_token`），客户令牌对管理面来说就是一把无效凭据；
+  // 判据要的是"调不通"，不是某一个具体状态码。
+  for (const [what, answer] of Object.entries(refused)) {
+    expect(answer.status, `${what} 不该接受客户令牌，实际 ${answer.status}`).toBe(403);
+    expect(answer.code, `${what} 的拒绝要带机器可读的错误码`).toBe('admin_forbidden');
+  }
+
+  // 反向确认这把令牌本身是好的：它对客面能用（否则上面的 403 证明不了"受众不同"）。
+  // 用回环地址而不是 `portalUrl`：Node 的解析器不认 `.localhost`（那两个主机名只在浏览器里可用）。
+  const own = await request.get(
+    `http://127.0.0.1:${settings.port}/v1/customer/ledger?limit=1`,
+    { headers: { authorization: `Bearer ${customerToken}` } },
+  );
+  expect(own.ok(), '客户令牌在对客面必须是好的').toBeTruthy();
 });
 
 test('用量与账单页给出汇总与逐笔明细，且有账目流水', async ({ page }) => {

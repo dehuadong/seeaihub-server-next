@@ -208,6 +208,26 @@ async fn a_session_is_revoked_on_logout_and_shared_token_cannot_act_as_a_person(
         .expect("second redeem request");
     assert_eq!(again.status(), StatusCode::BAD_REQUEST, "令牌是一次性的");
 
+    // 签发事件要在审计里可查（V-A7），而且指向的必须是**被重置的那个管理员**：
+    // 只查 action 有没有落库的话，"记在了别人头上"照样过。
+    let pool = PgPool::connect(&database_url).await.expect("test pool");
+    let admin_id: Uuid = sqlx::query_scalar("SELECT id FROM identity.admin_users WHERE email = $1")
+        .bind(email)
+        .fetch_one(&pool)
+        .await
+        .expect("admin id");
+    let (actor, subject_type, subject_id): (String, String, String) = sqlx::query_as(
+        "SELECT actor, subject_type, subject_id FROM operations.audit_events \
+         WHERE action = 'admin.password_reset'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("管理员签发重置令牌必须写审计");
+    assert_eq!(actor, "admin-self");
+    assert_eq!(subject_type, "admin_user");
+    assert_eq!(subject_id, admin_id.to_string());
+    pool.close().await;
+
     // **兑换重置令牌使此前的会话全部失效**（V-A7）。
     //
     // 判据用**第二条**会话（`second`）：它在兑换之前**被证明过可用**，所以"兑换后被拒"才是真的失效。
@@ -521,6 +541,41 @@ async fn a_customer_can_change_or_reset_its_password() {
         .as_str()
         .expect("token")
         .to_owned();
+    // 当前口令不对：被拒，而且**什么都不改**。
+    //
+    // "不改动"要落在旧口令仍然可用上，不能只看状态码：改口令与吊销会话在实现里是同一件事的两半，
+    // 只判 400 的话，"被拒了但会话已经清掉"照样过。
+    let wrong = client
+        .put(format!("{base_url}/v1/customer/password"))
+        .bearer_auth(&session)
+        .json(&json!({"current_password": "not-the-password", "new_password": "another-long-password"}))
+        .send()
+        .await
+        .expect("change request");
+    assert_eq!(wrong.status(), StatusCode::BAD_REQUEST);
+    let still_works = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": initial}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(
+        still_works.status(),
+        StatusCode::OK,
+        "被拒的改口令不该动任何东西：旧口令必须还在"
+    );
+    let session_survives = client
+        .get(format!("{base_url}/v1/customer/account"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("account request");
+    assert_eq!(
+        session_survives.status(),
+        StatusCode::OK,
+        "被拒的改口令不该把这个人的会话也吊销掉"
+    );
+
     let changed = client
         .put(format!("{base_url}/v1/customer/password"))
         .bearer_auth(&session)
@@ -914,6 +969,31 @@ async fn a_customer_registers_manages_its_own_keys() {
         .expect("account id")
         .to_owned();
 
+    // 判据要求"注册成功后，用该邮箱与口令能登录"：注册响应里那条会话是**注册顺带发的**，
+    // 拿它当"能登录"等于没验登录这条路。
+    let login = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("customer login request");
+    assert_eq!(login.status(), StatusCode::OK, "注册后必须能用邮箱口令登录");
+    let login = login.json::<Value>().await.expect("login body");
+    assert_eq!(login["account_id"], json!(account_id));
+    let fresh_session = login["token"].as_str().expect("session token").to_owned();
+
+    // 账户余额为 0：新开的账户还没被充过值。
+    let fresh = client
+        .get(format!("{base_url}/v1/customer/account"))
+        .bearer_auth(&fresh_session)
+        .send()
+        .await
+        .expect("account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(fresh["balance_microusd"], json!(0), "新账户余额必须是 0");
+
     // 同一邮箱再注册一次是冲突。
     let duplicate = client
         .post(format!("{base_url}/v1/customers"))
@@ -994,6 +1074,12 @@ async fn a_customer_registers_manages_its_own_keys() {
     assert_eq!(keys.len(), 1);
     assert_eq!(keys[0]["label"], json!("my-first-key"));
     assert_eq!(keys[0]["revoked_at"], json!(null));
+    // 判据要求列表里能看到**创建时间**（V-C3）：少了它，"这把密钥是什么时候发的"就查不到。
+    let created_at = keys[0]["created_at"].as_str().expect("列表要给出创建时间");
+    assert!(
+        chrono::DateTime::parse_from_rfc3339(created_at).is_ok(),
+        "创建时间要是 RFC 3339：{created_at}"
+    );
     let rendered = listed.to_string();
     assert!(!rendered.contains(&api_key), "密钥明文绝不能在列表里出现");
 
@@ -1357,6 +1443,211 @@ async fn there_is_no_self_service_password_reset_entry() {
         response.status(),
         StatusCode::NOT_FOUND,
         "对客面不该存在这个端点"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 运营可以不给初始口令开户，改签一枚重置令牌让客户自己设口令（V-C14 的后半条）。
+///
+/// 不给口令与"口令那一列是空的"只差一个实现细节，而后者等于谁都能登录。所以先证明不给口令时
+/// **谁都进不来**，再证明令牌能把口令换成客户自己选的、且换完就能登录。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_account_opened_without_a_password_is_entered_via_a_reset_token() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let email = "no-initial-password@example.com";
+    let opened = client
+        .post(format!("{base_url}/api/v1/customers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({"email": email}))
+        .send()
+        .await
+        .expect("open customer request");
+    assert_eq!(
+        opened.status(),
+        StatusCode::CREATED,
+        "不给初始口令也要能开户"
+    );
+    let account_id = opened.json::<Value>().await.expect("open body")["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    // 口令还没设：随便拿一个口令都进不来。
+    let before = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(
+        before.status(),
+        StatusCode::BAD_REQUEST,
+        "没设口令之前不该有人进得来"
+    );
+
+    let issued = client
+        .post(format!(
+            "{base_url}/api/v1/accounts/{account_id}/password-reset"
+        ))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("issue reset request");
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let reset_token = issued.json::<Value>().await.expect("reset body")["reset_token"]
+        .as_str()
+        .expect("reset token")
+        .to_owned();
+
+    let redeemed = client
+        .post(format!("{base_url}/v1/customer/password-resets/redeem"))
+        .json(&json!({"reset_token": reset_token, "new_password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("redeem request");
+    assert_eq!(redeemed.status(), StatusCode::NO_CONTENT);
+
+    let login = client
+        .post(format!("{base_url}/v1/customer/sessions"))
+        .json(&json!({"email": email, "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("login request");
+    assert_eq!(login.status(), StatusCode::OK, "凭令牌设完口令必须能登录");
+    let login = login.json::<Value>().await.expect("login body");
+    assert_eq!(
+        login["account_id"],
+        json!(account_id),
+        "登录上的必须就是刚才开户的那个账户"
+    );
+    let session = login["token"].as_str().expect("session token").to_owned();
+    let account = client
+        .get(format!("{base_url}/v1/customer/account"))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(
+        account["balance_microusd"],
+        json!(0),
+        "这是个新开的空账户：{account}"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 共享 `ADMIN_TOKEN` 调不通"只认会话"的三条端点，答复与"凭据不对"逐字相同；而本次新增的
+/// 管理读端点仍然认它（V-A6）。
+///
+/// 三条各自验一次，不能只验认身份：共享令牌不指向任何一个人，用它改口令或退出，做出来的是
+/// "改了某个不存在的人"和"退了一个不存在的登录"——两种都会让运维以为动作生效了。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_shared_token_cannot_answer_the_three_session_only_endpoints() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    // 用一把不存在的会话令牌当"凭据不对"的对照。
+    let bogus = "not-a-real-session";
+
+    // 认身份。
+    let shared = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("shared identity request");
+    let wrong = client
+        .get(format!("{base_url}/api/v1/admin/session"))
+        .bearer_auth(bogus)
+        .send()
+        .await
+        .expect("bogus identity request");
+    assert_eq!(shared.status(), StatusCode::FORBIDDEN);
+    assert_eq!(shared.status(), wrong.status());
+    assert_eq!(
+        shared.json::<Value>().await.expect("identity body"),
+        wrong.json::<Value>().await.expect("identity body"),
+        "共享令牌与错凭据必须回同一个答复"
+    );
+
+    // 改口令。
+    let change = json!({
+        "current_password": "a-long-enough-password",
+        "new_password": "another-long-enough-password",
+    });
+    let shared = client
+        .put(format!("{base_url}/api/v1/admin/password"))
+        .bearer_auth(&admin_token)
+        .json(&change)
+        .send()
+        .await
+        .expect("shared change request");
+    let wrong = client
+        .put(format!("{base_url}/api/v1/admin/password"))
+        .bearer_auth(bogus)
+        .json(&change)
+        .send()
+        .await
+        .expect("bogus change request");
+    assert_eq!(shared.status(), StatusCode::FORBIDDEN);
+    assert_eq!(shared.status(), wrong.status());
+    assert_eq!(
+        shared.json::<Value>().await.expect("change body"),
+        wrong.json::<Value>().await.expect("change body"),
+        "共享令牌与错凭据必须回同一个答复"
+    );
+
+    // 退出。
+    let shared = client
+        .delete(format!("{base_url}/api/v1/admin/sessions"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("shared logout request");
+    let wrong = client
+        .delete(format!("{base_url}/api/v1/admin/sessions"))
+        .bearer_auth(bogus)
+        .send()
+        .await
+        .expect("bogus logout request");
+    assert_eq!(shared.status(), StatusCode::FORBIDDEN);
+    assert_eq!(shared.status(), wrong.status());
+    assert_eq!(
+        shared.json::<Value>().await.expect("logout body"),
+        wrong.json::<Value>().await.expect("logout body"),
+        "共享令牌与错凭据必须回同一个答复"
+    );
+
+    // 新增的管理读端点仍然认共享令牌——它是自动化与运维自救的凭据，不能被会话这条改动顺手废掉。
+    let rates = client
+        .get(format!("{base_url}/api/v1/fx-rates"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("fx rates request");
+    assert_eq!(
+        rates.status(),
+        StatusCode::OK,
+        "共享令牌必须能调新增的管理读端点"
+    );
+    let rates = rates.json::<Value>().await.expect("fx rates body");
+    assert!(
+        rates["rates"]
+            .as_array()
+            .is_some_and(|rates| !rates.is_empty()),
+        "读端点必须真的取到夹具那几条折算率：{rates}"
     );
 
     drop_isolated_database(&database_name).await;

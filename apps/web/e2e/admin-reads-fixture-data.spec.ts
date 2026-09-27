@@ -91,4 +91,31 @@ test.describe('管理页面读的是库里的数据', () => {
     await expect(balanceBlock).toContainText('12.34');
     await expect(balanceBlock).toContainText('元');
   });
+
+  test('对账与诊断页把三块读出来，空库时显示空态而不是报错', async ({ page }) => {
+    // 对账案例要真跑一笔 Job（上游给不出确定的终态）才出得来，那要起 Worker 与 Provider 桩，在浏览器
+    // 用例里造不起；接口层那半边由 `cases_lifecycle` 与 `cases_cost_facts` 覆盖。
+    //
+    // 这里能证的是另一半：这一页的三个读都真的发出去了、都拿到了答复，且**空库时显示空态而不是报错**
+    // （Spec §4.4 与 V-D2 的"不是空白或报错"）。写死样例的页面不会同时满足"读出数"与"空态不报错"。
+    await signIn(page);
+
+    const requests: string[] = [];
+    page.on('response', (response) => {
+      const url = response.url();
+      if (url.includes('/api/v1/') && response.status() >= 500) {
+        requests.push(`${response.status()} ${url}`);
+      }
+    });
+
+    await goTo(page, '对账与诊断');
+
+    // 三个区块的标题都在（页面结构没塌）。
+    for (const block of ['对账案例', '平台侧失败', '成本缺口']) {
+      await expect(page.getByText(block).first()).toBeVisible();
+    }
+    // 空库时给的是空态，不是错误提示；服务端 5xx 也不该出现。
+    await expect(page.locator('.ant-alert-error')).toHaveCount(0);
+    expect(requests, `不该有 5xx：${requests.join(' | ')}`).toEqual([]);
+  });
 });

@@ -109,6 +109,8 @@ test('改价：界面不出现渠道地址与凭证变量名，发布后仍指�
   await expect(page.getByTestId('publish-base-url')).toHaveCount(0);
   await expect(page.getByTestId('publish-credential-env')).toHaveCount(0);
   await expect(page.getByTestId('publish-provider-kind')).toHaveCount(0);
+  // 驱动器同样不出现：渠道这一整组（供应商、驱动器、地址、凭证）都由服务端沿用。
+  await expect(page.getByTestId('publish-adapter-key')).toHaveCount(0);
   // 连渠道费率的四档与价目出处也不摆出来：它们与渠道地址是同一类东西，由服务端沿用。
   await expect(page.getByTestId('publish-plan-text-input')).toHaveCount(0);
   await expect(page.getByTestId('publish-plan-source-url')).toHaveCount(0);

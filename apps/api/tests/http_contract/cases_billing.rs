@@ -116,6 +116,25 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
         "用量里的扣费必须来自账本"
     );
 
+    // 判据要求用量里出现这一笔的**时间**：它是这一笔受理的时刻（执行记录的 `created_at`），不是
+    // 这次查询的时刻——所以断言它与库里那条执行记录逐位相同，"看起来像最近"证明不了是同一笔。
+    let job_created_at: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT created_at FROM generation.jobs WHERE account_id = $1")
+            .bind(Uuid::parse_str(&account_id).expect("account id"))
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job created_at");
+    let created_at = row["created_at"]
+        .as_str()
+        .expect("用量要给出时间，否则「什么时候发生的」就查不到");
+    assert_eq!(
+        chrono::DateTime::parse_from_rfc3339(created_at)
+            .expect("时间要是 RFC 3339")
+            .with_timezone(&chrono::Utc),
+        job_created_at,
+        "用量里的时间必须是这一笔执行记录的受理时刻：{usage}"
+    );
+
     harness.cleanup().await;
 }
 
@@ -528,6 +547,135 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
         Some(ledger_before["count"].as_u64().expect("count")),
         "空结果时 total 与 count 一致（都是 0）：{ledger_before}"
     );
+
+    harness.cleanup().await;
+}
+
+/// 客户吊销自己的密钥之后，用那把密钥调**对客生成接口**被拒（V-C4）。
+///
+/// 判据点名的就是这个端点：`/v1/account` 只证明读接口不认它了，而生成接口前面排着余额闸门与
+/// 受理——钱不够也回拒。两者混在一起就分不出这次被拒是不是因为密钥吊销了。所以这里先给账户充够钱、
+/// 用**同一把密钥**跑通一笔生成（钱与路由因此都不是拒绝的理由），再吊销、再打同一个端点。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_customer_revoked_key_is_rejected_at_the_generation_entry() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+
+    let (account_id, _) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let email = "revoked-key@example.com";
+    let password = "a-long-enough-password";
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": email, "password": password, "account_id": account_id}))
+            .send()
+            .await
+            .expect("open customer request")
+            .status(),
+        StatusCode::CREATED
+    );
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+
+    // 客户自己发一把密钥：明文与标识都在这一次响应里，吊销要用标识，而库里只有明文摘要。
+    let issued = client
+        .post(format!("{}/v1/customer/api-keys", harness.base_url))
+        .bearer_auth(&session)
+        .json(&json!({"label": "revoked-at-the-generation-entry"}))
+        .send()
+        .await
+        .expect("issue key request");
+    assert_eq!(issued.status(), StatusCode::CREATED);
+    let issued = issued.json::<Value>().await.expect("issue body");
+    let api_key = issued["api_key"]
+        .as_str()
+        .expect("plaintext key")
+        .to_owned();
+    let key_id = issued["key_id"].as_str().expect("key id").to_owned();
+
+    // 吊销之前先跑通一笔：这个账户的钱与这条路由到这里都不再是拒绝的理由。
+    let _worker = harness.spawn_worker();
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &format!("revoke-entry-before-{}", Uuid::new_v4()),
+        &route_request(harness.model, "before revocation"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "吊销前这把密钥必须能受理：{body}");
+
+    let revoked = client
+        .delete(format!(
+            "{}/v1/customer/api-keys/{key_id}",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("revoke request");
+    assert_eq!(revoked.status(), StatusCode::NO_CONTENT);
+
+    let (denied, denied_body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &format!("revoke-entry-after-{}", Uuid::new_v4()),
+        &route_request(harness.model, "after revocation"),
+    )
+    .await;
+    assert_eq!(
+        denied,
+        StatusCode::UNAUTHORIZED,
+        "吊销后同一把密钥必须在对客生成接口被拒：{denied_body}"
+    );
+    // 拒绝的理由必须是"密钥无效"而不是"钱不够"：余额闸门回 402 `insufficient_balance`，
+    // 所以这里要的是那个码，不是随便一个非 200。
+    assert_eq!(
+        denied_body["error"]["code"].as_str(),
+        Some("invalid_api_key"),
+        "{denied_body}"
+    );
+    // 密钥无效要在余额闸门与受理**之前**就被拒：这个账户名下不该多出第二条执行记录，
+    // 上游也一次都不该被碰到。
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT COUNT(*) FROM generation.jobs WHERE account_id = $1")
+            .bind(Uuid::parse_str(&account_id).expect("account id"))
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job count");
+    assert_eq!(jobs, 1, "被拒的请求不该留下第二条执行记录");
 
     harness.cleanup().await;
 }
