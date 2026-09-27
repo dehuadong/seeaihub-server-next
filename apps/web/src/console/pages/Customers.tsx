@@ -29,6 +29,7 @@ import { ConsolePage, Panel, whenText } from '../ui';
 /// 口径见 `docs/design/0011-console-information-architecture.md` §1.2 与 §3.3。
 export function CustomersPage({ client }: { client: AdminClient }) {
   const { message } = AntApp.useApp();
+  const [searchEmail, setSearchEmail] = useState('');
   const [filter, setFilter] = useState<{ email?: string }>({});
   const [selected, setSelected] = useState<CustomerView | null>(null);
   const [opening, setOpening] = useState(false);
@@ -150,29 +151,42 @@ export function CustomersPage({ client }: { client: AdminClient }) {
         description="邮箱精确匹配、大小写不敏感。留空即列出最近的客户。"
         extra={<Button onClick={customers.reload}>重取</Button>}
       >
-        <Form
-          layout="inline"
-          style={{ marginBottom: 16 }}
-          onFinish={(values: { email?: string }) => setFilter({ email: values.email })}
-        >
-          <Form.Item name="email">
+        {/* 与账户页同一套写法：普通 state + 一个按钮。这一处只需要"一个输入框 + 一个动作"，
+            取点击那一刻的值，不需要校验也不需要受控字段。 */}
+        <Flex gap={12} wrap align="flex-end" style={{ marginBottom: 16 }}>
+          <Flex vertical gap={4}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              客户邮箱
+            </Typography.Text>
             <Input
               data-testid="customers-search-email"
               prefix={<SearchOutlined />}
               placeholder="customer@example.com"
+              value={searchEmail}
+              onChange={(event) => setSearchEmail(event.target.value)}
+              onPressEnter={() => setFilter({ email: searchEmail })}
               style={{ width: 280 }}
               allowClear
             />
-          </Form.Item>
-          <Form.Item>
-            <Space>
-              <Button type="primary" htmlType="submit">
-                查找
-              </Button>
-              <Button onClick={() => setFilter({})}>清空</Button>
-            </Space>
-          </Form.Item>
-        </Form>
+          </Flex>
+          <Space>
+            <Button
+              data-testid="customers-search-submit"
+              type="primary"
+              onClick={() => setFilter({ email: searchEmail })}
+            >
+              查找
+            </Button>
+            <Button
+              onClick={() => {
+                setSearchEmail('');
+                setFilter({});
+              }}
+            >
+              清空
+            </Button>
+          </Space>
+        </Flex>
 
         <Table<CustomerView>
           size="small"
@@ -221,7 +235,11 @@ export function CustomersPage({ client }: { client: AdminClient }) {
               width: 150,
               render: (_value: unknown, customer: CustomerView) => (
                 <Space>
-                  <Button size="small" onClick={() => setSelected(customer)}>
+                  <Button
+                    data-testid="customers-open-detail"
+                    size="small"
+                    onClick={() => setSelected(customer)}
+                  >
                     详情
                   </Button>
                 </Space>
