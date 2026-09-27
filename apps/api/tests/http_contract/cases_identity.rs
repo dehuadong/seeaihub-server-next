@@ -1839,7 +1839,7 @@ fn probe_body(method: &str, path: &str) -> ProbeBody {
     }
 }
 
-/// 对客面**未认证即可访问的端点**只有那三个自助动作（V-C11 的前半）。
+/// 对客面**不需要凭据就能访问的端点**只有那三个自助动作，外加只读的公开目录（V-C11 的前半）。
 ///
 /// 做法是从路由表源码里把 `/v1/…` 的每一条读出来、逐个**不带任何凭据**打一遍，断言未认证可达的恰好
 /// 是注册、登录、凭令牌兑换（外加只读的公开目录，理由见 [`PUBLIC_CATALOGUE_ROUTE`]）。手抄清单会把
@@ -1849,7 +1849,8 @@ fn probe_body(method: &str, path: &str) -> ProbeBody {
 /// 401（被误挂上鉴权），这条用例也会红。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn the_credential_free_customer_surface_is_exactly_the_three_self_service_endpoints() {
+async fn the_credential_free_customer_surface_is_the_public_catalog_and_the_three_self_service_actions()
+ {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
