@@ -19,3 +19,5 @@ status: accepted
 - **限制只能收窄，但不需要"收窄证明"机制**：Profile 声明该 Provider 的实际支持面，Offering 的 `restrictions` 只在其内再收紧——同一事实在两个发布位置的落点，不是从全集推导子集。
 
 **修订史**：本条被取代的结论、失效原因与依据提交见 [`.agents/notes/implemented/platform/2026-09-27-adr-0009-revision-history.md`](../../.agents/notes/implemented/platform/2026-09-27-adr-0009-revision-history.md)。
+
+**可行性备选是"选中顺序完全由发布决定"**（发布物同时表达候选集与挑哪一条，没有第二个量）：落选，被 [ADR-0020](./0020-routing-strategy-layer-configured-by-operations.md) 取代——发布定的是"有哪些候选、按什么顺序"，策略定的是"在合格候选里怎么挑"，两者不是同一个量；一次性发布里表达不了"以后按成本挑""按客户标签指定渠道"这类运行期选择（依据提交 `54e25de` 与 [`.agents/notes/implemented/platform/2026-09-22-route-policy-layer.md`](../../.agents/notes/implemented/platform/2026-09-22-route-policy-layer.md) 的"问题"节）。**代价**：账户对象要多一个标签字段，`route_policies` 多一份运行期配置与它的版本标识，route 缓存要带策略版本校验才能让策略改动的陈旧可检——选路从此不只看发布物，还看运营当下配的那条策略。

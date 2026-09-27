@@ -11,3 +11,5 @@ status: accepted
 **2026-09-20 修订（"未证实的参数不开启"的适用范围）**：那条规则针对的是**冲突**与**未知字段**，不是"每个参数都要先花一次计费调用实测"。**渠道第一方文档写明支持的参数就该声明**，并按声明做受理前的取值校验；某个参数**真正需要用时**再验证它在实际端点上的行为（见 [0018](./0018-open-parameters-by-first-party-docs.md)）。该渠道按端点族分开放的参数面、素材声明的落点与随端点族的声明面规则属渠道事实与落地设计，见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节与 [`docs/design/0002`](../design/0002-image-generation-tech-design.md) §5。
 
 **2026-09-20**：本条原有的补充决定（输入侧只认渠道原生参数名、平台内部不做映射）不是本条的规则，输入侧的合同与渠道参数落位归 [0015](./0015-vendor-model-contract-and-offering-parameter-mapping.md)；以上内容不变。
+
+**可行性备选是建立 Canonical 参数大一统**（一份跨厂商的统一参数集，平台把统一名翻译成各家原生名）：落选，依据 [`docs/design/0002`](../design/0002-image-generation-tech-design.md) §5——统一名的翻译规则只能从各厂商原生文档推导，它比原生 Schema 多一层平台自己维护、并随每次上游改动重审的映射；输入侧同类取舍的落选理由见提交 `5dc17a7`（现在做会牵动每个渠道的适配与验证）。**代价**是平台的能力面与实时远端文档不再逐字一致：文档与端点不一致时（渠道文档是 OpenAI 兼容面、机器 Schema 却是另一套参数集合），平台会先按声明开放，到真正使用某个参数时才发现打不通；这类不一致按渠道事实登记，不靠"一律不声明"回避（[`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节）。

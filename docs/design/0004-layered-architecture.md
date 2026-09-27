@@ -72,7 +72,7 @@ Profile（③）声明该 Provider 实际支持什么；Offering（④）的渠�
 无论哪种，**共同点是：Provider 的支持面差异写在发布物里，而不是靠「从能力全集收窄」的证明机制**。
 
 **3.3 `native_model_id` 与 `provider_model_id` 的分工（0001 明确要求分开固化）。**
-- `native_model_id`：平台**对外的**型号身份，稳定、用于路由与 Job 固化（0001：「平台 `native_model_id` 与供应商调用所需 `provider_model_id` 分开固化」、ADR-0004）；
+- `native_model_id`：**厂商的**型号身份，稳定、用于合同身份与 Job 固化（0001：「平台 `native_model_id` 与供应商调用所需 `provider_model_id` 分开固化」、ADR-0004）。它**不进对客面**——对客看到的那个名字是 Gateway Model（[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.4）；
 - `provider_model_id`：**该 Provider 实际调用的模型字符串**，由 Offering 携带，**只有 Adapter 使用**（0001：「Adapter 只使用后者组装供应商请求」）。
 
 因此「两个 Provider 供同一型号」在目录里表现为：**两条 Offering，共同指向稳定身份，各自携带自己的 `provider_model_id`**；Provider 的**承载面**（能力子集）差异落在各自的发布物上，而**调用方合同不随 Provider 分叉**（[`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。这既满足了「同一 Vendor Model 多 Offering」，又不把渠道实现暴露到对外身份上。
