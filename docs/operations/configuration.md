@@ -62,7 +62,9 @@
 | --- | --- |
 | `AIHUBMIX_API_KEY` / `APIMART_API_KEY` | 变量名由发布素材里的 `credential_env` 指定 |
 
-**凭证只从环境变量读**，数据库只存变量名，日志与响应里不出现。缺哪个渠道的密钥，那个渠道的 Job 会失败——不是在启动时失败。把密钥放进 worker 的环境（同一个 `EnvironmentFile`，或密钥系统注入）；worker 在每个 Job 执行时按该渠道的 `credential_env` 现场读取，API 不调上游、不需要它们。
+**凭证只从环境变量读**，数据库只存变量名，日志与响应里不出现。缺哪个渠道的密钥，那个渠道的 Job 会失败——不是在启动时失败。worker 在每个 Job 执行时按该渠道的 `credential_env` 现场读取，API 不调上游、不需要它们。
+
+**怎么送进去**：生产用 systemd 的 `EnvironmentFile`（或由密钥系统在启动前渲染它），文件属服务账号、`chmod 600`；本地可以 `export` 或写开发机 `.env`。手动 `export` 只活在当前 shell，**机器重启后要重新 set**，所以它只适合本地，不是生产手段（见[生产环境](production.md) §2.4）。
 
 ## 6. 供给素材导入
 

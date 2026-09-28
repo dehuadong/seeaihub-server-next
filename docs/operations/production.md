@@ -146,6 +146,8 @@ API_BIND=127.0.0.1:8081
 RUST_LOG=info
 ```
 
+这份文件**不必列全**：代码给每个变量都留了缺省，只有**必填**（`DATABASE_URL`、`ADMIN_TOKEN`）和**要覆盖缺省**的项才需要写，全表见[配置项](configuration.md)。文件属服务账号、`chmod 600`。
+
 ```ini
 # /etc/systemd/system/seeai-api.service
 [Unit]
@@ -193,7 +195,7 @@ TimeoutStopSec=720
 WantedBy=multi-user.target
 ```
 
-`worker.env` 比 `api.env` 多两样：唯一的 `WORKER_ID`，以及渠道密钥（[配置项](configuration.md) §5）。启用：
+`worker.env` 比 `api.env` 多两样：唯一的 `WORKER_ID`，以及渠道密钥（[渠道凭证](configuration.md#5-渠道凭证)）。启用：
 
 ```sh
 sudo systemctl daemon-reload
@@ -273,12 +275,12 @@ DATABASE_URL=... WORKER_ID=worker-1 seeai-worker
 
 全部配置项（每个变量的缺省、含义、生产取值、失败方式）见[配置项](configuration.md)。这里只留两条上线会踩的：
 
-- **超时链是启动时一起校验的**：API 读已发布合同声明的最大输出张数，算一遍 `PROVIDER_TIMEOUT_*`、`WORKER_LEASE_SECONDS`、`GENERATION_SYNC_WAIT_SECONDS` 整条链，不一致就拒绝启动并点名——它不是"调大就更快"（见[配置项](configuration.md) §2）。
-- **渠道密钥只给 worker**：凭证只从环境变量读，数据库只存变量名；API 不调上游、不需要它们（见[配置项](configuration.md) §5）。
+- **超时链是启动时一起校验的**：API 读已发布合同声明的最大输出张数，算一遍 `PROVIDER_TIMEOUT_*`、`WORKER_LEASE_SECONDS`、`GENERATION_SYNC_WAIT_SECONDS` 整条链，不一致就拒绝启动并点名——它不是"调大就更快"（见[生成与成本护栏](configuration.md#2-生成与成本护栏)）。
+- **渠道密钥只给 worker**：凭证只从环境变量读，数据库只存变量名；API 不调上游、不需要它们（见[渠道凭证](configuration.md#5-渠道凭证)）。
 
 ## 5. 会话与口令
 
-会话与口令重置的有效期是配置项（`SESSION_TTL_SECONDS`、`PASSWORD_RESET_TTL_SECONDS`），见[配置项](configuration.md) §8。
+会话与口令重置的有效期是配置项（`SESSION_TTL_SECONDS`、`PASSWORD_RESET_TTL_SECONDS`），见[会话与口令](configuration.md#8-会话与口令)。
 
 ## 6. 备份
 
@@ -318,7 +320,7 @@ DATABASE_URL=... pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-Reten
 | 凭证 | 可以留空（不调上游就没用） | 必须是真密钥，按密钥管理 |
 | `ADMIN_TOKEN` | 任意非空 | 强随机、可轮换（§1.4） |
 | 前端产物 | 本机构建后即可 | **必须在构建 API 之前就位**（§1.1） |
-| `CONSOLE_DEV_HOST` | 可用 | **不设**（[配置项](configuration.md) §1） |
+| `CONSOLE_DEV_HOST` | 可用 | **不设**（[进程与连接](configuration.md#1-进程与连接)） |
 | TLS | 不需要 | 反代终止，必须 HTTPS（§1.2） |
 | 迁移 | 进程启动自动跑 | 同上；多实例冷启动会争锁（§1.3） |
 | 依赖 | 本机系统包安装的 PG17 与 Redis（§2.1） | 同样要 PG17，Redis 可选；按 §2.1 准备 |
