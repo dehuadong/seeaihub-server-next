@@ -93,15 +93,19 @@ _Avoid_: 加权轮询 / 负载均衡、按权重改变档位顺序、把权重�
 _Avoid_: 当前价格、把 Price Plan 的费率当对客售价、把"上游直接给金额"当成一种 Price Plan、把计价形态当成运营的定价选项
 
 **Pricing Formula**（计价形态）:
-一条 Offering 的**渠道事实**：这个渠道的这个模型**按什么计价**——`token_rates`（按四分项 token 计量量）、`per_image`（按产出张数）、`per_call`（按调用次数）、`upstream_declared`（上游终态直接给实扣金额）。它由渠道决定、平台如实登记（出处是渠道文档或实测），**不是运营的选项**：管理员最多登记或更正这条事实。它**决定成本怎么算**（平台与渠道怎么结算），**不决定对客卖多少钱**（对客走 [Consumer Rate Vector](#consumer-rate-vector对客费率向量)）；**上游给了金额就先取它**（见 [Provider Cost](#provider-cost渠道成本事实) 的 `declared`），只有拿不到金额时才按登记的形态自算。它随 Runtime Revision 发布、随 Job 的 [Price Snapshot](#price-snapshot) 冻结；每条 Offering 另声明它的**成本币种**。形态与参数的配套、发布期校验见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §1。
-_Avoid_: Cost Formula、把计价形态当运营的定价策略、把"按张 / 按次"当成对客计费单位、用计价形态决定对客售价
+一条 Offering 的**渠道事实**：这个渠道的这个模型**按什么计价**——`token_rates`（按四分项 token 计量量）、`per_image`（按产出张数）、`per_call`（按调用次数）、`upstream_declared`（上游终态直接给实扣金额）。它由渠道决定、平台如实登记（出处是渠道文档或实测），**不是运营的选项**：管理员最多登记或更正这条事实。它**决定成本怎么算**（平台与渠道怎么结算），**不决定对客卖多少钱**（对客由 [Consumer Pricing Form](#consumer-pricing-form对客计价形态) 选、落在 [Consumer Rate Vector](#consumer-rate-vector对客费率向量) 或单价上）；**上游给了金额就先取它**（见 [Provider Cost](#provider-cost渠道成本事实) 的 `declared`），只有拿不到金额时才按登记的形态自算。它随 Runtime Revision 发布、随 Job 的 [Price Snapshot](#price-snapshot) 冻结；每条 Offering 另声明它的**成本币种**。形态与参数的配套、发布期校验见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §1。
+_Avoid_: Cost Formula、把成本计价形态当运营的定价选项、把"按张 / 按次"当成对客计费单位、用成本计价形态决定对客售价
+
+**Consumer Pricing Form**（对客计价形态）:
+平台对客户**按什么方式收钱**，由**运营按候选选择**，与 Offering 的 [Pricing Formula](#pricing-formula计价形态)（成本计价形态）相互独立：`token_rates`（四档 token，读 [Consumer Rate Vector](#consumer-rate-vector对客费率向量)）、`per_image`（每张单价）、`per_call`（每次单价）、`upstream_declared`（上游声明金额 × [Markup](#markup加价系数)）。前三种的对客单价由运营维护（初始值取该 vendor/模型已知的渠道价目，经 Markup 与 [FX Rate](#fx-rate折算率) 折 CNY），**不依赖该候选的成本单价**，所以成本由上游直接给金额的渠道也能按 token 四档卖；前提是该渠道的响应能提供对应证据（四档 `usage` / 图片数组 / 声明 `cost`）。它随 Runtime Revision 按候选发布、随 Job 的 [Price Snapshot](#price-snapshot) 冻结。见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §1–§2。
+_Avoid_: 把成本计价形态当对客形态、在渠道不提供证据时仍选该对客形态、把对客形态写进 Offering（它按候选发布）
 
 **Consumer Rate Vector**（对客费率向量）:
-某个 Offering 的**对客四档 CNY token 费率**（文本输入 / 图像输入 / 文本输出 / 图像输出，每 1M tokens），**随 Runtime Revision 按候选发布**、**受理时随 Price Snapshot 冻结**。它是**按 token 计量量计价的候选的对客价**：实收由这份向量与本次实际用量算出，结算只读冻结的那一份；其余三种计价形态**没有这个载体**，它们的对客价由成本单价乘 [Markup](#markup加价系数) 算出来。**可被路由的供给必须能给出对客价**（或旧口径那份 Price Plan 费率）——给不出就发布期拒，**不按 0 收**。管理员按该候选的**成本单价**乘倍率推导，也可以直接录入。**同一个 Gateway Model 的不同候选价格不同**——候选的成本不同，售价就不同。它不是渠道成本费率：两者是两个量，混用会让成本跟着售价漂移。推导口径与旧口径见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §2–§3。
-_Avoid_: 把渠道成本费率当对客售价、用一个单值推出四档向量、按网关模型或全平台一个价、把它当成每种计价形态都要有的对客价载体
+某个 Offering 的**对客四档 CNY token 费率**（文本输入 / 图像输入 / 文本输出 / 图像输出，每 1M tokens），**随 Runtime Revision 按候选发布**、**受理时随 Price Snapshot 冻结**。它是**对客选 `token_rates` 的候选的对客价**：实收由这份向量与本次实际用量算出，结算只读冻结的那一份；对客选 `per_image` / `per_call` 的候选用运营给的**每张 / 每次单价**，对客选 `upstream_declared` 的按上游声明金额 × 冻结倍率 × 冻结折算率。**可被路由的供给必须能给出对客价**（或旧口径那份 Price Plan 费率）——给不出就发布期拒，**不按 0 收**。初始值取该 vendor/模型已知的渠道价目（经 [Markup](#markup加价系数) 与 [FX Rate](#fx-rate折算率) 折 CNY），运营可改、也可直接录入。**同一个 Gateway Model 的不同候选价格不同**，因为对客形态与价目按候选发布。它不是渠道成本费率：两者是两个量，混用会让成本跟着售价漂移。推导口径与旧口径见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §2–§3。
+_Avoid_: 把渠道成本费率当对客售价、用一个单值推出四档向量、按网关模型或全平台一个价、把它当成每种对客计价形态都要有的载体
 
 **Markup**（加价系数）:
-**每个 Gateway Model 一个**的倍率（倍率 = 1 + `markup_bps` / 10000），随 Runtime Revision 发布、随 Job 的 Price Snapshot 冻结。按 token 计量量的候选由管理员按它推导 [Consumer Rate Vector](#consumer-rate-vector对客费率向量)；其余三种计价形态的对客价由结算按**冻结的那份倍率**算出来。数值由后台录入，不是设计决策。
+**每个 Gateway Model 一个**的倍率（倍率 = 1 + `markup_bps` / 10000），随 Runtime Revision 发布、随 Job 的 Price Snapshot 冻结。它是推导对客 token 价目**初始值**的乘数；对客选 `upstream_declared` 时，结算按**冻结的那份倍率**乘上游声明金额。数值由后台录入，不是设计决策。
 _Avoid_: 全局加价、改价不用发布、在代码里写一个默认倍率
 
 **FX Rate**（折算率）:
@@ -109,15 +113,15 @@ _Avoid_: 全局加价、改价不用发布、在代码里写一个默认倍率
 _Avoid_: 把汇率固定在每份发布里、受理后再换算、用浮点算钱、拿对不上币种的汇率去折、把某个币种写死成"不用折算"
 
 **Floor Amount**（保底额）:
-受理时按**供给（vendor + offering）维度**从该供给的保底表查得的预授权额，**CNY**；保底表随 Runtime Revision 发布、随 Price Snapshot 冻结、**不编进代码**。供给内按 `(size, quality)` 两维给额，`quality` 留空即按 `size` 档；**像素型的 `size` 先归到档位**，`size = auto`（或没给 `size`）取默认档。它的**两个身份**：① **准入闸门**——受理时 `余额 ≥ 保底额` 才放行，不足即 402 `insufficient_balance`；② **结算的参考下限**——**不是上限**：实收按实际算，估小了由结算**透支**吸收（余额可为负），估大了结算释放差额。它**不由售价派生**。归位规则与回落链见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §6。
-_Avoid_: 把保底额当售价或结算上限、按张数乘单价、按网关模型或全平台一个数、写进代码、把像素尺寸一律当成"归不出档位"
+受理时按**供给（vendor + offering）维度**从该供给的保底表查得的预授权额，**CNY**；保底表随 Runtime Revision 发布、随 Price Snapshot 冻结、**不编进代码**。供给内按 `(size, quality)` 两维给**每张**额，受理时 `hold = n × 每张额`（`n` = 请求张数，缺省 1）；`quality` 留空即按 `size` 档；**像素型的 `size` 先归到档位**，`size = auto`（或没给 `size`）取默认档。它的**两个身份**：① **准入闸门**——受理时 `余额 ≥ 保底额` 才放行，不足即 402 `insufficient_balance`；② **结算的参考下限**——**不是上限**：实收按实际算，估小了由结算**透支**吸收（余额可为负），估大了结算释放差额。它**不由售价派生**。归位规则与回落链见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §6。
+_Avoid_: 把保底额当售价或结算上限、按网关模型或全平台一个数、写进代码、把像素尺寸一律当成"归不出档位"（**按张数乘每张保底额是正确口径**）
 
 **Gross Margin**（毛利）:
 `售价（CNY）− 成本折算后 CNY`，按 Job 可查。**两条线分开留痕**：售价 / 保底 / 扣费记 CNY（账本是权威，Price Snapshot 是冻结的那一份），成本记**原币种原值 + 币种 + 当时汇率 + 折算后 CNY**。成本来源可辨（`computed` / `declared` / `unavailable`）；来源是 `unavailable` 时标**"成本未知"**——金额与折算值留空，**不猜**（不写 0、不用费率顶替）。**上游声明的实际金额只影响毛利，不改对客金额**。落点见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §5 与 [代码结构图](docs/architecture.md) §5。
 _Avoid_: 用售价顶替成本、拿不到成本就写 0、把毛利算成"售价 − 参考成本"（参考成本只是定价参考）
 
 **Price Snapshot**:
-Job 受理时固定的计价单位、单价和公式版本；受理之后不再换算。**对客平面**（一律 CNY）：命中候选的 [Consumer Rate Vector](#consumer-rate-vector对客费率向量)、档位价目表（只作参考与展示）、该供给的保底表与算定的 [Floor Amount](#floor-amount保底额)、命中的候选。**成本平面**（按该供给声明的成本币种）：[计价形态](#pricing-formula计价形态)与它的参数、参考成本与成本币种、成本来源口径，以及受理时取的那一份 [FX Rate](#fx-rate折算率)。**对客实收 = 成本单价 × [Markup](#markup加价系数) 倍率 × [FX Rate](#fx-rate折算率) × 本次实际量**（按 token 计量量时读冻结的那份向量）；**算不出对客价 = 这条供给没有对客计费基准**——发布期就拒，运行时真遇到（只有历史修订才可能）按**平台侧故障**处置，**不按 0 结算**。字段与各量的落点见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §3。
+Job 受理时固定的计价单位、单价和公式版本；受理之后不再换算。**对客平面**（一律 CNY）：命中候选的 [Consumer Pricing Form](#consumer-pricing-form对客计价形态) 与它的 [Consumer Rate Vector](#consumer-rate-vector对客费率向量) 或单价、档位价目表（只作参考与展示）、该供给的保底表与算定的 [Floor Amount](#floor-amount保底额)、命中的候选。**成本平面**（按该供给声明的成本币种）：[计价形态](#pricing-formula计价形态)与它的参数、参考成本与成本币种、成本来源口径，以及受理时取的那一份 [FX Rate](#fx-rate折算率)。**对客实收 = 冻结的对客价目 × 本次实际量**（token 读冻结的向量、按张 / 按次读冻结单价）；对客选 `upstream_declared` 时 = 上游声明金额 × 冻结的 [Markup](#markup加价系数) × 冻结的 [FX Rate](#fx-rate折算率)；**算不出对客价 = 这条供给没有对客计费基准**——发布期就拒，运行时真遇到（只有历史修订才可能）按**平台侧故障**处置，**不按 0 结算**。字段与各量的落点见 [定价、保底与结算](docs/design/0007-pricing-floor-and-settlement.md) §3。
 _Avoid_: 当前价格、受理后再换算汇率、按发布物现价结算已受理的 Job、把"没有对客计费基准"当成 0 元计价
 
 **Reconciliation Case**:
