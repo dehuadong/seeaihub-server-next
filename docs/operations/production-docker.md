@@ -7,7 +7,7 @@
 | | systemd（[生产环境 §2.4](production.md#24-systemd-单元)） | 容器（本文） |
 | --- | --- | --- |
 | 进程管理 | 两个 systemd 单元 | 两个容器（`restart: unless-stopped`） |
-| 二进制与前端产物 | 目标机同一路径构建（[生产环境 §2.3](production.md#23-部署布局与编译期路径)） | 多阶段构建进镜像 |
+| 二进制与前端产物 | 目标机同一路径构建（[生产环境 §2.2](production.md#22-部署到生产机)） | 多阶段构建进镜像 |
 | 配置注入 | `EnvironmentFile` | `env_file`（密钥系统在启动前渲染进去） |
 | 停机 | 默认 SIGTERM + `TimeoutStopSec` | 默认 SIGTERM + `stop_grace_period` |
 | 日志 | journald | `docker logs` 或采集器 |

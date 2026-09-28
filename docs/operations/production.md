@@ -30,7 +30,7 @@ Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("web").join("dist")
 - 构建时目录不存在 → 编译照过；运行时只会记一条 `no web build found; the API serves no front end` 警告，**两个界面都打不开**（API 与 `/v1/*` 仍然正常，所以很容易查错方向）；
 - 构建后把二进制搬到别处 → 它仍然去找**编译时那个绝对路径**下的 `apps/api/../web/dist`，**跟着二进制走的是编译时路径**，不是运行目录。
 
-所以顺序是：**先 `npm run build` 出产物，再 `cargo build --release`**；运行时必须能在编译时那个**绝对路径**下找到 `apps/web/dist`。在目标机同一路径构建最省事（§2.3），把二进制或整个目录搬到别的绝对路径都不行。
+所以顺序是：**先 `npm run build` 出产物，再 `cargo build --release`**；运行时必须能在编译时那个**绝对路径**下找到 `apps/web/dist`。在目标机同一路径构建最省事（§2.2、§2.3），把二进制或整个目录搬到别的绝对路径都不行。
 
 ### 1.2 前端分发靠主机名，反代要透传 `Host`
 
@@ -94,15 +94,37 @@ sudo -u postgres psql -p 5432 -c "CREATE DATABASE seeai_next OWNER seeai;"
 
 **Redis 7（可选）**：装上并让 `REDIS_URL` 指过去，例如 `sudo apt-get install -y redis-server` 加 `REDIS_URL=redis://127.0.0.1:6379`。它是加速层，故障只算降级（缓存读不到按 miss 处理），不必为它做高可用来保可用性。
 
-### 2.2 构建顺序
+### 2.2 部署到生产机
+
+生产机上把仓库放在一个固定的绝对路径，本文用 `/opt/seeai`。这个路径就是**编译时的路径根**（§1.1）：进程的运行目录换了它也不会变，所以后面的构建与启动都围绕它。在别的机器构建再拷二进制也行，但编译时那个绝对路径必须在服务器上仍然存在（把 `apps/web/dist` 放到原处）。
+
+服务账号只用来**跑**进程，不参与构建，所以它不需要 Node/Rust，也不需要 home：
 
 ```sh
-# 1) 前端产物（必须在 cargo build 之前，见 §1.1）
-npm --prefix apps/web ci
-npm --prefix apps/web run build
+sudo useradd --system --user-group --shell /usr/sbin/nologin seeai
+sudo git clone <仓库地址> /opt/seeai      # /opt/seeai 必须为空；建过用户目录就先清掉
+```
 
-# 2) 两个二进制
-cargo build --release -p seeai-api -p seeai-worker
+部署后的布局（`seeai` 只读这棵树，目录 755、文件 644 就够；要让 `seeai` 拥有它就 `chown -R seeai:seeai /opt/seeai`）：
+
+| 路径 | 是什么 |
+| --- | --- |
+| `/opt/seeai/` | 检出目录，也是编译时路径的根 |
+| `/opt/seeai/apps/web/dist/` | 前端产物（构建后出现） |
+| `/opt/seeai/target/release/seeai-api` | API 二进制（构建后出现） |
+| `/opt/seeai/target/release/seeai-worker` | Worker 二进制（构建后出现） |
+
+`/etc/seeai/api.env`、`/etc/seeai/worker.env` 见 §2.4。
+
+### 2.3 构建
+
+用有 Node/Rust 工具链的账号在检出目录里构建（下例是 root；也可以用你的部署账号）。顺序不能反：**先出前端产物，再编译二进制**（原因见 §1.1）。
+
+```sh
+cd /opt/seeai
+sudo npm --prefix apps/web ci
+sudo npm --prefix apps/web run build
+sudo cargo build --release -p seeai-api -p seeai-worker
 ```
 
 产物：
@@ -113,45 +135,41 @@ cargo build --release -p seeai-api -p seeai-worker
 | `target/release/seeai-worker` | Worker 二进制 |
 | `apps/web/dist/` | `console.html`、`portal.html` 与它们引用的 `assets/*` |
 
-### 2.3 部署布局与编译期路径
-
-API 找前端的路径在**编译时**就写死成 `<构建目录>/apps/web/dist`（§1.1），**不是运行目录**。最省事的做法是：在运行它的那台机器、同一个绝对路径里构建。
-
-```sh
-sudo useradd --system --create-home --home-dir /opt/seeai --shell /usr/sbin/nologin seeai
-sudo -u seeai git clone <仓库地址> /opt/seeai
-sudo -u seeai sh -c 'cd /opt/seeai && npm --prefix apps/web ci && npm --prefix apps/web run build && cargo build --release -p seeai-api -p seeai-worker'
-```
-
-部署后的布局：
-
-| 路径 | 是什么 |
-| --- | --- |
-| `/opt/seeai/apps/web/dist/` | 两份前端产物，与二进制的编译路径同源 |
-| `/opt/seeai/target/release/seeai-api` | API 二进制 |
-| `/opt/seeai/target/release/seeai-worker` | Worker 二进制 |
-| `/etc/seeai/api.env`、`/etc/seeai/worker.env` | 环境变量（§2.4），属 `seeai`、`chmod 600` |
-
-**在 CI 构建再拷二进制**也能用，但必须保证编译时那个绝对路径在服务器上仍然存在（把 `apps/web/dist` 放到编译时的同一位置），否则界面打不开——就是 §1.1 的两种后果之一。
-
 ### 2.4 systemd 单元
 
-两个进程都用系统用户 `seeai` 跑，工作目录设成构建目录，配置从 `EnvironmentFile` 读。文件是每行 `KEY=VALUE`（systemd 自己解析，不做 shell 展开）：
+两个进程都用系统用户 `seeai` 跑，工作目录设成构建目录，配置从 `EnvironmentFile` 读。文件是每行 `KEY=VALUE`（systemd 自己解析，不做 shell 展开）。
+
+先建配置目录与两份 env（属服务账号、`600`——里面有口令）。值按[配置项](configuration.md) 换成真实的，`ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。**不必列全**：代码给每个变量都留了缺省，只有**必填**（`DATABASE_URL`、`ADMIN_TOKEN`）和**要覆盖缺省**的项才需要写：
 
 ```sh
-# /etc/seeai/api.env
+sudo install -d -m 750 -o seeai -g seeai /etc/seeai
+sudo install -m 600 -o seeai -g seeai /dev/null /etc/seeai/api.env
+sudo install -m 600 -o seeai -g seeai /dev/null /etc/seeai/worker.env
+
+sudo tee /etc/seeai/api.env >/dev/null <<'EOF'
 DATABASE_URL=postgres://seeai:<强口令>@127.0.0.1:5432/seeai_next
 ADMIN_TOKEN=<openssl rand -hex 32>
 ADMIN_EMAIL=ops@example.com
 ADMIN_PASSWORD=<强口令>
 API_BIND=127.0.0.1:8081
 RUST_LOG=info
+EOF
+
+sudo tee /etc/seeai/worker.env >/dev/null <<'EOF'
+DATABASE_URL=postgres://seeai:<强口令>@127.0.0.1:5432/seeai_next
+WORKER_ID=worker-1
+AIHUBMIX_API_KEY=<渠道密钥>
+APIMART_API_KEY=<渠道密钥>
+RUST_LOG=info
+EOF
 ```
 
-这份文件**不必列全**：代码给每个变量都留了缺省，只有**必填**（`DATABASE_URL`、`ADMIN_TOKEN`）和**要覆盖缺省**的项才需要写，全表见[配置项](configuration.md)。文件属服务账号、`chmod 600`。
+`worker.env` 比 `api.env` 多两样：每个实例唯一的 `WORKER_ID`，以及渠道密钥（[渠道凭证](configuration.md#5-渠道凭证)）。
 
-```ini
-# /etc/systemd/system/seeai-api.service
+再写两个 unit（root 所有、`644`），然后启用：
+
+```sh
+sudo tee /etc/systemd/system/seeai-api.service >/dev/null <<'EOF'
 [Unit]
 Description=SeeAI Hub API
 After=network-online.target
@@ -171,10 +189,9 @@ TimeoutStopSec=720
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-```ini
-# /etc/systemd/system/seeai-worker.service
+sudo tee /etc/systemd/system/seeai-worker.service >/dev/null <<'EOF'
 [Unit]
 Description=SeeAI Hub Worker
 After=network-online.target
@@ -195,14 +212,13 @@ TimeoutStopSec=720
 
 [Install]
 WantedBy=multi-user.target
-```
+EOF
 
-`worker.env` 比 `api.env` 多两样：唯一的 `WORKER_ID`，以及渠道密钥（[渠道凭证](configuration.md#5-渠道凭证)）。启用：
-
-```sh
 sudo systemctl daemon-reload
 sudo systemctl enable --now seeai-api seeai-worker
 ```
+
+改过 env 文件后要让新值生效，得 `sudo systemctl restart seeai-api seeai-worker`——进程只在启动时读一次环境变量。
 
 日志走 stdout、由 journald 收（JSON）：`journalctl -u seeai-api -f`。
 
