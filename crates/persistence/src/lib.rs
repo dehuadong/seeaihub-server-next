@@ -370,6 +370,10 @@ impl HubRepository for PgHubRepository {
                     rates: offering.rates.clone(),
                     formula: offering.formula,
                     cost_unit_price_microusd: offering.cost_unit_price_microusd,
+                    // 对客形态与对客单价：本片先按旧口径（等于成本形态、无对客单价）；
+                    // 发布侧落库与读取在下一片接上。
+                    consumer_formula: None,
+                    consumer_unit_price_cny_microusd: None,
                     captured_at: now,
                     // 命中的候选就是这条候选本身：快照是**按候选**带下来的，选中哪条就把哪条
                     // 的快照固化进 Job，所以"这一笔的售价按谁算的"在快照里读得出来。
@@ -4504,6 +4508,8 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
                 .map_err(database_error)?
                 .map(to_u64)
                 .transpose()?,
+            consumer_formula: None,
+            consumer_unit_price_cny_microusd: None,
             captured_at: row.try_get("captured_at").map_err(database_error)?,
             // 命中候选就是这条候选：受理时选中哪条，就把它这份快照固化进 Job。
             hit_candidate: Some(HitCandidate {

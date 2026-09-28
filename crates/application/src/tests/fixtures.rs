@@ -33,6 +33,8 @@ pub(super) fn offering() -> PublishedOffering {
             }),
             formula: PricingFormula::TokenRates,
             cost_unit_price_microusd: None,
+            consumer_formula: None,
+            consumer_unit_price_cny_microusd: None,
             captured_at: Utc::now(),
             // 夹具走**旧口径**（没有定价）：受理与结算的行为与今天逐位相同。
             hit_candidate: None,

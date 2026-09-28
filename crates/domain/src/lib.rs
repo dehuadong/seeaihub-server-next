@@ -946,6 +946,18 @@ pub struct PriceSnapshot {
     /// 渠道按张 / 按次计价时它是成本自算唯一的参数；另外两种形态为 `None`。
     #[serde(default)]
     pub cost_unit_price_microusd: Option<u64>,
+    /// 命中候选的**对客计价形态**（运营按候选选，随修订发布、随 Job 冻结）。
+    ///
+    /// 它与**成本**形态 [`Self::formula`] 相互独立，决定对客怎么收钱。历史快照缺这个键时读成
+    /// **等于 `formula`**（等同旧口径）——取值经 [`Self::consumer_formula`]。
+    #[serde(default)]
+    pub consumer_formula: Option<PricingFormula>,
+    /// 对客选 `per_image` / `per_call` 时的**每张 / 每次对客单价**（CNY 微单位）。
+    ///
+    /// 它是对客价目，不是成本：由运营给（初始值按该 vendor/模型已知渠道价目推导），结算直接乘
+    /// 本次实际量，不再乘倍率与折算率。
+    #[serde(default)]
+    pub consumer_unit_price_cny_microusd: Option<u64>,
     pub captured_at: DateTime<Utc>,
     /// 受理时命中并冻结的那条候选（售价按它算）。
     #[serde(default)]
@@ -1011,12 +1023,19 @@ impl PriceSnapshot {
             .or_else(|| self.rates.as_ref().map(|rates| rates.currency.as_str()))
     }
 
+    /// 这条快照的**对客计价形态**：运营选了就用它；历史快照缺这个键时读成**等于成本形态**
+    /// [`Self::formula`]（旧口径）。
+    #[must_use]
+    pub fn consumer_formula(&self) -> PricingFormula {
+        self.consumer_formula.unwrap_or(self.formula)
+    }
+
     /// 对客实收（对客平面，CNY）。
     ///
-    /// **对客价 = 成本单价 × 倍率 × 折算率**（[`Self::marked_up_cny_microusd`]）：倍率是
-    /// `1 + markup_bps / 10000`，折算率按该供给声明的成本币种取受理时冻结的那一行。渠道按什么
-    /// 计价只决定**成本单价是几档、几个数**（四档 token 费率 / 每张单价 / 每次单价 / 上游声明的
-    /// 金额），对客侧就是把它同单位地乘上这条乘法，再乘本次的实际量（用量 / 张数 / 1 次）。
+    /// **对客价按对客形态取**：token 四档读 [`Self::consumer_rates_cny`] × 实际用量；按张 /
+    /// 按次读 [`Self::consumer_unit_price_cny_microusd`]（运营给的对客价目，CNY） × 实际量；
+    /// 上游金额形态按声明金额 × 倍率 × 折算率（[`Self::marked_up_cny_microusd`]）。**成本**按
+    /// [`Self::formula`] 与 [`Self::cost_rates`] 另走一路，两者互不从属。
     ///
     /// 按 token 计量量的候选**不现算**：它的对客价是随修订发布的那份四档 CNY 向量
     /// （[`Self::consumer_rates_cny`]，运营按同一条乘法推导、也可以直接录入），受理时随快照冻结。
@@ -1030,7 +1049,7 @@ impl PriceSnapshot {
     ///
     /// 成本自算走 [`Self::cost_rates`] 与 [`Self::formula`]，与这里分成两个入口。
     pub fn charge_microusd(&self, facts: ChargeFacts<'_>) -> Result<u64, DomainError> {
-        match self.formula {
+        match self.consumer_formula() {
             PricingFormula::TokenRates => match (&self.consumer_rates_cny, &self.rates) {
                 (Some(rates), _) => rates.amount_microusd(facts.usage),
                 (None, Some(rates)) => rates.amount_microusd(facts.usage),
@@ -1060,10 +1079,10 @@ impl PriceSnapshot {
     /// 这两种形态没有对客价载体（四档向量是 token 计量量那一种形态的价格），对客价由成本单价按
     /// 同一条乘法算出来。单价缺了就是算不出对客价——不拿别的数顶替。
     fn consumer_unit_price_cny_microusd(&self) -> Result<u64, DomainError> {
-        let unit = self
-            .cost_unit_price_microusd
-            .ok_or(DomainError::MissingConsumerRate)?;
-        self.marked_up_cny_microusd(unit)
+        // 对客单价是**运营给的对客价目**（CNY），不是成本单价乘出来的：成本单价乘倍率只是推导
+        // 初始值的依据，推导在发布期做、结果落在 `consumer_unit_price_cny_microusd`。
+        self.consumer_unit_price_cny_microusd
+            .ok_or(DomainError::MissingConsumerRate)
     }
 
     /// 成本金额 × 倍率 × 折算率 → **对客金额**（CNY 微单位），向上取整。

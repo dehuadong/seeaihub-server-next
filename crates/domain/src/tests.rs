@@ -81,6 +81,8 @@ fn snapshot_with_rates(
         }),
         formula: PricingFormula::TokenRates,
         cost_unit_price_microusd: None,
+        consumer_formula: None,
+        consumer_unit_price_cny_microusd: None,
         captured_at: Utc::now(),
         hit_candidate: None,
         consumer_rates_cny: None,
@@ -527,10 +529,13 @@ fn a_supply_without_a_consumer_basis_cannot_be_charged() {
     assert_eq!(snapshot.charge_microusd(declared), Ok(96_737));
 }
 
-/// 造一份**按张 / 按次**计价的快照：成本单价、倍率与折算率都给上（对客价就是它们乘出来的）。
+/// 造一份**按张 / 按次 / 上游金额**计价的快照。
+///
+/// `unit_price_cny_microusd` 按形态解释：按张 / 按次时是**运营给的对客单价**（CNY，对客价
+/// 就是它乘数量）；上游金额形态没有单价，传 0。倍率与折算率只对**上游金额形态**的对客价生效。
 fn unit_snapshot(
     formula: PricingFormula,
-    unit_price_microusd: u64,
+    unit_price_cny_microusd: u64,
     currency: &str,
     markup_bps: i32,
     rate_micros: u64,
@@ -539,7 +544,9 @@ fn unit_snapshot(
     snapshot.price_plan_id = None;
     snapshot.rates = None;
     snapshot.formula = formula;
-    snapshot.cost_unit_price_microusd = Some(unit_price_microusd);
+    snapshot.cost_unit_price_microusd = Some(unit_price_cny_microusd);
+    snapshot.consumer_formula = Some(formula);
+    snapshot.consumer_unit_price_cny_microusd = Some(unit_price_cny_microusd);
     snapshot.cost_currency = Some(currency.to_owned());
     snapshot.markup_bps = Some(markup_bps);
     snapshot.fx_rate = Some(FxRate {
@@ -550,13 +557,13 @@ fn unit_snapshot(
     snapshot
 }
 
-/// 按张计价：对客价 = **成本单价 × 倍率 × 折算率**，再乘本次产出的张数。
+/// 按张计价：对客价 = **运营给的对客每张单价**（CNY） × 本次产出的张数。
 ///
-/// 单价 20_000 微美元、倍率 1.2、USD → CNY 7.1 ⇒ 每张 170_400 微元（20000 × 1.2 × 7.1，
-/// 恰好整除，没有取整误差）；两张就是它的两倍。
+/// 它不乘倍率、也不乘折算率——那两样是**推导初始单价**的依据，推导在发布期做，落在这份快照上的
+/// 就是终值。所以同一份快照换个倍率、拿掉折算率，按张的对客价逐位不变。
 #[test]
-fn a_per_image_supply_sells_at_its_cost_unit_price_times_the_markup() {
-    let snapshot = unit_snapshot(PricingFormula::PerImage, 20_000, "USD", 2_000, 7_100_000);
+fn a_per_image_supply_sells_at_its_consumer_unit_price() {
+    let snapshot = unit_snapshot(PricingFormula::PerImage, 170_400, "USD", 2_000, 7_100_000);
     assert_eq!(
         snapshot.charge_microusd(ChargeFacts {
             images: 1,
@@ -572,30 +579,29 @@ fn a_per_image_supply_sells_at_its_cost_unit_price_times_the_markup() {
         Ok(340_800),
         "按张计价乘的是产出张数"
     );
-    // 用量不参与按张的对客价：同一份快照换一份用量，金额逐位不变。
-    let other_usage = TokenUsage {
-        input_tokens: 1,
-        input_text_tokens: 1,
-        input_image_tokens: 0,
-        output_tokens: 1,
-        output_text_tokens: 0,
-        output_image_tokens: 1,
-        total_tokens: 2,
-    };
+    let mut other = snapshot.clone();
+    other.markup_bps = Some(9_999);
+    other.fx_rate = None;
     assert_eq!(
-        snapshot.charge_microusd(ChargeFacts {
-            usage: &other_usage,
+        other.charge_microusd(ChargeFacts {
             images: 1,
-            declared_cost_microusd: None,
+            ..facts(&usage())
         }),
-        Ok(170_400)
+        Ok(170_400),
+        "倍率与折算率不参与按张的对客价"
     );
 }
 
-/// 按次计价：对客价 = 成本单价 × 倍率 × 折算率，一次就是一份，**与产出张数、用量都无关**。
+/// 按次计价：对客价 = 运营给的对客每次单价，一次就是一份，**与产出张数、用量都无关**。
 #[test]
 fn a_per_call_supply_charges_once_per_call() {
-    let snapshot = unit_snapshot(PricingFormula::PerCall, 20_000, "USD", 2_000, 7_100_000);
+    let snapshot = unit_snapshot(
+        PricingFormula::PerCall,
+        170_400,
+        "CNY",
+        2_000,
+        FX_RATE_DENOMINATOR,
+    );
     for images in [1, 3] {
         assert_eq!(
             snapshot.charge_microusd(ChargeFacts {
@@ -624,42 +630,62 @@ fn an_upstream_declared_supply_sells_at_the_declared_amount_times_the_markup() {
     );
 }
 
-/// **同币种不产生折算**：折算率表里同币种那一行率恒为 1（CNY → CNY = 1），所以对客价就是
-/// 成本单价 × 倍率，乘 1 不改数。代码里没有"这个币种不用折算"的分支——把币种名写死，
-/// 接一个同币种的新渠道就得再改一次。
+/// **同币种不产生折算**：折算率表里同币种那一行率恒为 1（CNY → CNY = 1），所以上游金额形态的
+/// 对客价就是声明金额 × 倍率，乘 1 不改数。代码里没有"这个币种不用折算"的分支。
 #[test]
 fn a_same_currency_supply_is_not_converted() {
     let snapshot = unit_snapshot(
-        PricingFormula::PerImage,
-        300_000,
+        PricingFormula::UpstreamDeclared,
+        0,
         "CNY",
         2_000,
         FX_RATE_DENOMINATOR,
     );
     assert_eq!(
-        snapshot.charge_microusd(facts(&usage())),
+        snapshot.charge_microusd(ChargeFacts {
+            declared_cost_microusd: Some(300_000),
+            ..facts(&usage())
+        }),
         Ok(360_000),
         "300_000 微元 × 1.2 = 360_000，折算率 1 不改数"
     );
 }
 
-/// **倍率不是常量**：同一个成本单价、同一份执行事实，换个倍率对客实收就成比例地变。
+/// **倍率不是常量**：同一个声明金额、同一份执行事实，换个倍率对客实收就成比例地变。
 ///
-/// 用 20_000 微美元这个单价是为了两个倍率都整除（170_400 与 213_000），于是"成比例"可以逐位
-/// 断言：170_400 × 15 = 213_000 × 12 = 2_556_000。倍率是发布数据（每个网关模型一个），
-/// 代码里没有它的默认值——这里换的是数据，不是常量。
+/// 用 20_000 微单位这个金额是为了两个倍率都整除（24_000 与 30_000），于是"成比例"可以逐位
+/// 断言：24_000 × 15 = 30_000 × 12 = 360_000。倍率是发布数据（每个网关模型一个），代码里没有
+/// 它的默认值——这里换的是数据，不是常量。
 #[test]
 fn the_markup_coefficient_scales_the_charge_proportionally() {
-    let twenty_percent = unit_snapshot(PricingFormula::PerImage, 20_000, "USD", 2_000, 7_100_000);
-    let fifty_percent = unit_snapshot(PricingFormula::PerImage, 20_000, "USD", 5_000, 7_100_000);
+    let twenty_percent = unit_snapshot(
+        PricingFormula::UpstreamDeclared,
+        0,
+        "CNY",
+        2_000,
+        FX_RATE_DENOMINATOR,
+    );
+    let fifty_percent = unit_snapshot(
+        PricingFormula::UpstreamDeclared,
+        0,
+        "CNY",
+        5_000,
+        FX_RATE_DENOMINATOR,
+    );
     let cheap = twenty_percent
-        .charge_microusd(facts(&usage()))
+        .charge_microusd(ChargeFacts {
+            declared_cost_microusd: Some(20_000),
+            ..facts(&usage())
+        })
         .expect("1.2 倍率算得出对客价");
     let dear = fifty_percent
-        .charge_microusd(facts(&usage()))
+        .charge_microusd(ChargeFacts {
+            declared_cost_microusd: Some(20_000),
+            ..facts(&usage())
+        })
         .expect("1.5 倍率算得出对客价");
-    assert_eq!(cheap, 170_400);
-    assert_eq!(dear, 213_000);
+    assert_eq!(cheap, 24_000);
+    assert_eq!(dear, 30_000);
     assert_eq!(
         cheap * 15,
         dear * 12,
@@ -667,16 +693,26 @@ fn the_markup_coefficient_scales_the_charge_proportionally() {
     );
 }
 
-/// 算对客价要的三样（单价 / 倍率 / 折算率）缺一样就是算不出来：不拿别的数顶替。
+/// 上游金额形态算对客价要的三样（声明金额 / 倍率 / 折算率）缺一样就是算不出来：不拿别的数顶替。
+/// 按张 / 按次只要那份对客单价，缺它同理。
 #[test]
 fn a_derived_consumer_price_needs_all_of_its_inputs() {
-    let complete = unit_snapshot(PricingFormula::PerImage, 20_000, "USD", 2_000, 7_100_000);
-    assert_eq!(complete.charge_microusd(facts(&usage())), Ok(170_400));
+    let complete = unit_snapshot(PricingFormula::UpstreamDeclared, 0, "USD", 2_000, 7_100_000);
+    assert_eq!(
+        complete.charge_microusd(ChargeFacts {
+            declared_cost_microusd: Some(11_354),
+            ..facts(&usage())
+        }),
+        Ok(96_737)
+    );
 
     let mut without_markup = complete.clone();
     without_markup.markup_bps = None;
     assert_eq!(
-        without_markup.charge_microusd(facts(&usage())),
+        without_markup.charge_microusd(ChargeFacts {
+            declared_cost_microusd: Some(11_354),
+            ..facts(&usage())
+        }),
         Err(DomainError::MissingConsumerRate),
         "没有倍率就没有对客价"
     );
@@ -684,17 +720,32 @@ fn a_derived_consumer_price_needs_all_of_its_inputs() {
     let mut without_fx = complete.clone();
     without_fx.fx_rate = None;
     assert_eq!(
-        without_fx.charge_microusd(facts(&usage())),
+        without_fx.charge_microusd(ChargeFacts {
+            declared_cost_microusd: Some(11_354),
+            ..facts(&usage())
+        }),
         Err(DomainError::MissingConsumerRate),
         "没有折算率就没有对客价"
     );
 
-    let mut without_unit_price = complete;
-    without_unit_price.cost_unit_price_microusd = None;
     assert_eq!(
-        without_unit_price.charge_microusd(facts(&usage())),
+        complete.charge_microusd(facts(&usage())),
         Err(DomainError::MissingConsumerRate),
-        "没有单价就没有对客价"
+        "上游没声明金额就没有对客价"
+    );
+
+    let mut no_unit = unit_snapshot(
+        PricingFormula::PerImage,
+        170_400,
+        "CNY",
+        2_000,
+        FX_RATE_DENOMINATOR,
+    );
+    no_unit.consumer_unit_price_cny_microusd = None;
+    assert_eq!(
+        no_unit.charge_microusd(facts(&usage())),
+        Err(DomainError::MissingConsumerRate),
+        "按张没有对客单价就没有对客价"
     );
 }
 
@@ -762,4 +813,40 @@ fn ledger_entry_kinds_round_trip_through_their_stored_form() {
         assert_eq!(LedgerEntryKind::parse(kind.as_str()), Some(kind));
     }
     assert_eq!(LedgerEntryKind::parse("refund"), None);
+}
+
+/// **对客形态与成本形态解耦**：成本是 `upstream_declared`（APIMart）的候选也能对客按 token
+/// 四档收——`charge_microusd` 读对客形态；成本仍按 `formula` / `cost_rates` 另走一路。
+#[test]
+fn the_charge_follows_the_consumer_form_not_the_cost_form() {
+    let mut snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    snapshot.formula = PricingFormula::UpstreamDeclared;
+    snapshot.rates = None;
+    snapshot.price_plan_id = None;
+    snapshot.consumer_formula = Some(PricingFormula::TokenRates);
+    snapshot.consumer_rates_cny = Some(ConsumerRatesCny {
+        text_input_micros_per_million: 7_000_000,
+        image_input_micros_per_million: 9_000_000,
+        text_output_micros_per_million: 11_000_000,
+        image_output_micros_per_million: 40_000_000,
+    });
+    snapshot.markup_bps = Some(2_000);
+    snapshot.fx_rate = Some(FxRate {
+        currency: "USD".to_owned(),
+        rate_micros: 7_100_000,
+        effective_at: Utc::now(),
+    });
+    assert_eq!(
+        snapshot.charge_microusd(facts(&usage())),
+        Ok(17_245),
+        "成本是 upstream_declared，对客仍按四档 CNY 向量收"
+    );
+}
+
+/// 历史快照没有 `consumer_formula` 时，按**等于成本形态**解释（旧口径）。
+#[test]
+fn a_legacy_snapshot_reads_the_consumer_form_as_the_cost_form() {
+    let mut snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    snapshot.consumer_formula = None;
+    assert_eq!(snapshot.consumer_formula(), PricingFormula::TokenRates);
 }
