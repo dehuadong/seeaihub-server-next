@@ -326,6 +326,8 @@ impl HubRepository for PgHubRepository {
         let mut reference_cost_microusd = Map::new();
         let mut cost_currency = Map::new();
         let mut consumer_rates_cny = Map::new();
+        let mut consumer_formula = Map::new();
+        let mut consumer_unit_price_cny_microusd = Map::new();
         let mut cost_basis = Map::new();
         let mut tier_prices = Map::new();
         let mut floor_amounts = Map::new();
@@ -370,10 +372,8 @@ impl HubRepository for PgHubRepository {
                     rates: offering.rates.clone(),
                     formula: offering.formula,
                     cost_unit_price_microusd: offering.cost_unit_price_microusd,
-                    // 对客形态与对客单价：本片先按旧口径（等于成本形态、无对客单价）；
-                    // 发布侧落库与读取在下一片接上。
-                    consumer_formula: None,
-                    consumer_unit_price_cny_microusd: None,
+                    consumer_formula: Some(offering.consumer_formula),
+                    consumer_unit_price_cny_microusd: offering.consumer_unit_price_cny_microusd,
                     captured_at: now,
                     // 命中的候选就是这条候选本身：快照是**按候选**带下来的，选中哪条就把哪条
                     // 的快照固化进 Job，所以"这一笔的售价按谁算的"在快照里读得出来。
@@ -428,6 +428,18 @@ impl HubRepository for PgHubRepository {
                         .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
                 );
             }
+            // 对客计价形态与对客单价同样按候选键记：前者是运营这次选了什么，后者是选按张 / 按次
+            // 时的对客价目。它们与成本形态（条目快照里的 `formula`）分处两个字段。
+            {
+                let key = frozen.offering_id.to_string();
+                consumer_formula.insert(
+                    key.clone(),
+                    Value::String(offering.consumer_formula.as_str().to_owned()),
+                );
+                if let Some(unit) = offering.consumer_unit_price_cny_microusd {
+                    consumer_unit_price_cny_microusd.insert(key, Value::from(unit));
+                }
+            }
             if let Some(pricing) = &offering.pricing {
                 let key = frozen.offering_id.to_string();
                 reference_cost_microusd
@@ -456,6 +468,8 @@ impl HubRepository for PgHubRepository {
                 // 四档费率与价目出处只在有 Price Plan 时才有：它们属于 token 计量量这一种形态。
                 "rates": offering.rates,
                 "price_source_url": offering.price_source_url,
+                "consumer_formula": offering.consumer_formula.as_str(),
+                "consumer_unit_price_cny_microusd": offering.consumer_unit_price_cny_microusd,
             }));
         }
         // 发布即原子替换该模型的全部 active 条目：候选集与顺序
@@ -500,8 +514,9 @@ impl HubRepository for PgHubRepository {
             INSERT INTO publication.runtime_revisions
                 (id, snapshot, published_by, gateway_model, vendor_model_id,
                  markup_bps, reference_cost_microusd, cost_currency, consumer_rates_cny,
+                 consumer_formula, consumer_unit_price_cny_microusd,
                  cost_basis, tier_prices, floor_amounts)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)
             "#,
         )
         .bind(revision_id.0)
@@ -513,6 +528,8 @@ impl HubRepository for PgHubRepository {
         .bind(optional_pricing_map(reference_cost_microusd))
         .bind(optional_pricing_map(cost_currency))
         .bind(optional_pricing_map(consumer_rates_cny))
+        .bind(optional_pricing_map(consumer_formula))
+        .bind(optional_pricing_map(consumer_unit_price_cny_microusd))
         .bind(optional_pricing_map(cost_basis))
         .bind(optional_pricing_map(tier_prices))
         .bind(optional_pricing_map(floor_amounts))
@@ -627,6 +644,8 @@ impl HubRepository for PgHubRepository {
                 rr.reference_cost_microusd,
                 rr.cost_currency,
                 rr.consumer_rates_cny,
+                rr.consumer_formula,
+                rr.consumer_unit_price_cny_microusd,
                 rr.cost_basis,
                 rr.tier_prices,
                 rr.floor_amounts,
@@ -1089,6 +1108,8 @@ impl HubRepository for PgHubRepository {
                 rr.reference_cost_microusd,
                 rr.cost_currency,
                 rr.consumer_rates_cny,
+                rr.consumer_formula,
+                rr.consumer_unit_price_cny_microusd,
                 rr.cost_basis,
                 rr.tier_prices,
                 rr.floor_amounts,
@@ -4508,8 +4529,6 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
                 .map_err(database_error)?
                 .map(to_u64)
                 .transpose()?,
-            consumer_formula: None,
-            consumer_unit_price_cny_microusd: None,
             captured_at: row.try_get("captured_at").map_err(database_error)?,
             // 命中候选就是这条候选：受理时选中哪条，就把它这份快照固化进 Job。
             hit_candidate: Some(HitCandidate {
@@ -4518,6 +4537,8 @@ fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, Ap
                 provider_kind,
             }),
             consumer_rates_cny: pricing.consumer_rates_cny,
+            consumer_formula: pricing.consumer_formula,
+            consumer_unit_price_cny_microusd: pricing.consumer_unit_price_cny_microusd,
             tier_prices: pricing.tier_prices,
             floor_amounts: pricing.floor_amounts,
             // 保底额与汇率**依赖这次请求**，由受理用例算定后填（发布侧算不出来）。
@@ -4566,6 +4587,8 @@ fn row_weight(row: &sqlx::postgres::PgRow) -> Result<u32, ApplicationError> {
 /// 受理与结算走旧口径。这是"迁移前的旧修订"与"发布了定价但表为空"分得开的关键。
 struct CandidatePricingRow {
     consumer_rates_cny: Option<ConsumerRatesCny>,
+    consumer_formula: Option<PricingFormula>,
+    consumer_unit_price_cny_microusd: Option<u64>,
     tier_prices: Option<Value>,
     floor_amounts: Option<Value>,
     cost_basis: Option<CostBasis>,
@@ -4585,6 +4608,27 @@ fn row_candidate_pricing(
         .map(serde_json::from_value::<ConsumerRatesCny>)
         .transpose()
         .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+    let consumer_formula = entry("consumer_formula")?
+        .map(|value| {
+            value
+                .as_str()
+                .and_then(PricingFormula::parse)
+                .ok_or_else(|| {
+                    ApplicationError::Persistence(
+                        "the published consumer form is not a known pricing formula".to_owned(),
+                    )
+                })
+        })
+        .transpose()?;
+    let consumer_unit_price_cny_microusd = entry("consumer_unit_price_cny_microusd")?
+        .map(|value| {
+            value.as_u64().ok_or_else(|| {
+                ApplicationError::Persistence(
+                    "the published consumer unit price is not an amount".to_owned(),
+                )
+            })
+        })
+        .transpose()?;
     let cost_basis = match entry("cost_basis")? {
         Some(value) => Some(value.as_str().and_then(CostBasis::parse).ok_or_else(|| {
             ApplicationError::Persistence(
@@ -4613,6 +4657,8 @@ fn row_candidate_pricing(
         .transpose()?;
     Ok(CandidatePricingRow {
         consumer_rates_cny,
+        consumer_formula,
+        consumer_unit_price_cny_microusd,
         tier_prices: entry("tier_prices")?,
         floor_amounts: entry("floor_amounts")?,
         cost_basis,

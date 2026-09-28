@@ -482,22 +482,27 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
         "{error}"
     );
 
-    // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。它的对客价由
-    // 成本单价乘倍率算出来，所以**倍率必须给**——缺了就算不出该收多少钱，发布期就拒。
+    // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。但**对客每张单价
+    // 必须给**——按张的对客价是运营给的对客价目，不是成本单价乘倍率算出来的。
     per_image_without_unit_price.cost_unit_price_microusd = Some(11_354);
     let error = PublishRuntimeCommand {
         offerings: Some(vec![per_image_without_unit_price.clone()]),
         ..base_command()
     }
     .normalize()
-    .expect_err("a derived consumer price without its markup coefficient must fail");
+    .expect_err("a per_image candidate without its consumer unit price must fail");
     assert!(
-        error.to_string().contains("markup_bps is required"),
+        error
+            .to_string()
+            .contains("consumer_unit_price_cny_microusd"),
         "{error}"
     );
     let normalized = PublishRuntimeCommand {
         markup_bps: Some(2_000),
-        offerings: Some(vec![per_image_without_unit_price.clone()]),
+        offerings: Some(vec![OfferingDraft {
+            consumer_unit_price_cny_microusd: Some(170_400),
+            ..per_image_without_unit_price.clone()
+        }]),
         ..base_command()
     }
     .normalize()
@@ -508,6 +513,10 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
     assert!(
         normalized.offerings[0].consumer_rates_cny.is_none(),
         "对客四档向量是 token 计量量那一种形态的价格，按张的候选没有它"
+    );
+    assert_eq!(
+        normalized.offerings[0].consumer_unit_price_cny_microusd,
+        Some(170_400)
     );
 
     // 反向：按张计价给一份对客四档向量也要拒——那个数在别的形态下永远不会被读。
@@ -528,7 +537,7 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
     assert!(
         error
             .to_string()
-            .contains("consumer_rates_cny does not apply to formula"),
+            .contains("consumer_rates_cny does not apply"),
         "{error}"
     );
 
@@ -639,7 +648,7 @@ fn a_candidate_that_carries_half_a_pricing_is_rejected() {
 }
 
 #[test]
-fn markup_may_be_omitted_but_never_negative_nor_orphaned() {
+fn markup_may_be_omitted_but_never_negative() {
     // 带定价却**没给**加价系数是合法的：管理员可以直接录入对客费率向量，那一步用不上它。
     let command = PublishRuntimeCommand {
         offerings: Some(vec![priced_draft("pm-a")]),
@@ -653,17 +662,15 @@ fn markup_may_be_omitted_but_never_negative_nor_orphaned() {
         "定价照旧完整地归一出来"
     );
 
-    // 给了加价系数却没有一条候选带定价：它只是一条没人读的记录。
-    let command = PublishRuntimeCommand {
+    // 给了加价系数但这条修订没有对客选"上游金额 × 倍率"的候选：合法——它仍用于推导对客 token
+    // 价目的初始值，不再当作"没人读的记录"拒掉。
+    PublishRuntimeCommand {
         markup_bps: Some(2_000),
         offerings: Some(vec![draft("pm-a")]),
         ..base_command()
-    };
-    let error = command.normalize().expect_err("markup without pricing");
-    assert!(
-        error.to_string().contains("no offering carries pricing"),
-        "{error}"
-    );
+    }
+    .normalize()
+    .expect("a markup that only seeds the token price list is allowed");
 
     let command = PublishRuntimeCommand {
         markup_bps: Some(-1),
@@ -688,4 +695,106 @@ fn a_malformed_floor_table_is_rejected_at_publication() {
         .normalize()
         .expect_err("the same tier twice must be rejected before it can be looked up");
     assert!(error.to_string().contains("2K"), "{error}");
+}
+
+/// **对客计价形态与成本形态解耦**：成本是 `upstream_declared` 的候选也能对客按 token 四档卖——
+/// 只要显式给出对客四档向量（那条路径没有成本费率可沿用）。
+#[test]
+fn a_consumer_token_form_is_allowed_when_the_cost_is_upstream_declared() {
+    let command = PublishRuntimeCommand {
+        offerings: Some(vec![OfferingDraft {
+            provider_kind: Some("APIMart".to_owned()),
+            adapter_key: Some("apimart-image-v1".to_owned()),
+            formula: Some("upstream_declared".to_owned()),
+            price_plan: None,
+            cost_currency: Some("USD".to_owned()),
+            consumer_formula: Some("token_rates".to_owned()),
+            consumer_rates_cny: Some(ConsumerRatesCny {
+                text_input_micros_per_million: 7_000_000,
+                image_input_micros_per_million: 9_000_000,
+                text_output_micros_per_million: 11_000_000,
+                image_output_micros_per_million: 40_000_000,
+            }),
+            ..draft("gpt-image-2.5-flare")
+        }]),
+        ..base_command()
+    };
+    let normalized = command
+        .normalize()
+        .expect("the token consumer form is allowed");
+    assert_eq!(
+        normalized.offerings[0].consumer_formula,
+        PricingFormula::TokenRates
+    );
+    assert_eq!(
+        normalized.offerings[0].formula,
+        PricingFormula::UpstreamDeclared,
+        "成本形态不受对客形态影响"
+    );
+}
+
+/// 对客选 token 四档、成本不是 token 计量量时，必须显式给对客向量：没有成本费率可沿用。
+#[test]
+fn a_consumer_token_form_without_rates_is_rejected_when_the_cost_is_not_token_rates() {
+    let command = PublishRuntimeCommand {
+        offerings: Some(vec![OfferingDraft {
+            provider_kind: Some("APIMart".to_owned()),
+            adapter_key: Some("apimart-image-v1".to_owned()),
+            formula: Some("upstream_declared".to_owned()),
+            price_plan: None,
+            cost_currency: Some("USD".to_owned()),
+            consumer_formula: Some("token_rates".to_owned()),
+            consumer_rates_cny: None,
+            ..draft("gpt-image-2.5-flare")
+        }]),
+        ..base_command()
+    };
+    let error = command.normalize().expect_err("no rates to fall back on");
+    assert!(error.to_string().contains("consumer_rates_cny"), "{error}");
+}
+
+/// 对客选按张必须给每张对客单价；给了就落到归一结果上。
+#[test]
+fn a_consumer_per_image_form_needs_its_own_unit_price() {
+    let missing = PublishRuntimeCommand {
+        offerings: Some(vec![OfferingDraft {
+            formula: Some("per_image".to_owned()),
+            price_plan: None,
+            cost_currency: Some("USD".to_owned()),
+            cost_unit_price_microusd: Some(20_000),
+            consumer_formula: Some("per_image".to_owned()),
+            consumer_unit_price_cny_microusd: None,
+            ..draft("pm-a")
+        }]),
+        ..base_command()
+    };
+    let error = missing
+        .normalize()
+        .expect_err("per_image needs a consumer unit price");
+    assert!(
+        error
+            .to_string()
+            .contains("consumer_unit_price_cny_microusd"),
+        "{error}"
+    );
+
+    let complete = PublishRuntimeCommand {
+        offerings: Some(vec![OfferingDraft {
+            formula: Some("per_image".to_owned()),
+            price_plan: None,
+            cost_currency: Some("USD".to_owned()),
+            cost_unit_price_microusd: Some(20_000),
+            consumer_formula: Some("per_image".to_owned()),
+            consumer_unit_price_cny_microusd: Some(170_400),
+            ..draft("pm-a")
+        }]),
+        ..base_command()
+    };
+    let normalized = complete
+        .normalize()
+        .expect("per_image with a consumer unit price");
+    assert_eq!(
+        normalized.offerings[0].consumer_unit_price_cny_microusd,
+        Some(170_400)
+    );
 }

@@ -150,6 +150,12 @@ pub struct OfferingReference {
     /// 按 token 计量量时的对客四档 CNY 费率向量（`0007` §2）。
     #[serde(default)]
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 该候选的**对客计价形态**（运营按候选选，与成本形态独立）；缺省 = 等于成本形态。
+    #[serde(default)]
+    pub consumer_formula: Option<String>,
+    /// 对客选 per_image / per_call 时的每张 / 每次对客单价（CNY 微单位）。
+    #[serde(default)]
+    pub consumer_unit_price_cny_microusd: Option<u64>,
     /// 成本币种；缺省取该 Offering 实际生效的成本币种。
     #[serde(default)]
     pub cost_currency: Option<String>,
@@ -272,6 +278,12 @@ pub struct OfferingDraft {
     /// 在别的形态下永远不会被读），那时对客价由成本单价乘倍率算出来。
     #[serde(default)]
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 该候选的**对客计价形态**（运营按候选选，与成本形态独立）；缺省 = 等于成本形态。
+    #[serde(default)]
+    pub consumer_formula: Option<String>,
+    /// 对客选 per_image / per_call 时的每张 / 每次对客单价（CNY 微单位）。
+    #[serde(default)]
+    pub consumer_unit_price_cny_microusd: Option<u64>,
     /// 该候选的成本来源口径：`computed` 或 `declared`。
     #[serde(default)]
     pub cost_basis: Option<String>,
@@ -363,6 +375,10 @@ pub struct NormalizedOffering {
     /// 这条供给的**对客费率向量**（按 token 计量量的对客价）；`None` = 没给（旧口径按 Price Plan
     /// 的费率收，或这条供给按张 / 按次 / 上游给金额计价、对客价由成本单价乘倍率算出来）。
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 这条候选的**对客计价形态**（运营按候选选）；缺省 = 等于成本形态。
+    pub consumer_formula: PricingFormula,
+    /// 对客选 per_image / per_call 时的每张 / 每次对客单价（CNY 微单位）。
+    pub consumer_unit_price_cny_microusd: Option<u64>,
     /// 档位：显式给值就用它，没给就取数组下标。同一档可以有多条候选。
     pub routing_priority: i32,
     /// 档位内的分流比，至少为 1。
@@ -478,24 +494,18 @@ impl PublishRuntimeCommand {
     /// 对客价就是"成本单价 × 倍率 × 折算率"——倍率是这条修订唯一的那份，缺了就算不出该收多少钱。
     /// 那是"这条供给没有对客计费基准"，必须发布期拒：按 0 收等于白送，等到结算才发现就晚了一批请求。
     fn validate_markup(&self, offerings: &[NormalizedOffering]) -> Result<(), ApplicationError> {
-        let priced = offerings
-            .iter()
-            .any(|offering| offering.consumer_rates_cny.is_some() || offering.pricing.is_some());
-        // 按张 / 按次 / 上游给金额的候选的对客价就是**成本单价乘倍率**：它们的倍率是有人读的。
+        // 倍率只在**对客选"上游金额 × 倍率"**时才被读：其余三种对客形态的价格是运营给的对客价目
+        // （token 四档 / 每张 / 每次单价），倍率只用于推导初始值、不是结算的乘数。
         let derives_its_price = offerings
             .iter()
-            .any(|offering| offering.formula != PricingFormula::TokenRates);
+            .any(|offering| offering.consumer_formula == PricingFormula::UpstreamDeclared);
         match self.markup_bps {
             Some(bps) if bps < 0 => Err(ApplicationError::Validation(
                 "markup_bps must not be negative".to_owned(),
             )),
-            Some(_) if !priced && !derives_its_price => Err(ApplicationError::Validation(
-                "markup_bps is given but no offering carries pricing or derives its price from it"
-                    .to_owned(),
-            )),
             None if derives_its_price => Err(ApplicationError::Validation(
-                "markup_bps is required: a supply priced per image / per call / by the amount its \
-                 provider declares sells at its cost unit price times the markup coefficient"
+                "markup_bps is required: a candidate whose consumer form is upstream_declared \
+                 sells at the amount its provider declares times the markup coefficient"
                     .to_owned(),
             )),
             _ => Ok(()),
@@ -582,6 +592,8 @@ impl PublishRuntimeCommand {
                     cost_unit_price_microusd: billing.cost_unit_price_microusd,
                     cost_currency: billing.cost_currency,
                     consumer_rates_cny: billing.consumer_rates_cny,
+                    consumer_formula: billing.consumer_formula,
+                    consumer_unit_price_cny_microusd: billing.consumer_unit_price_cny_microusd,
                     routing_priority: normalize_routing_priority(index, draft)?,
                     weight: normalize_weight(index, draft)?,
                     pricing,
@@ -666,6 +678,10 @@ struct Billing {
     cost_unit_price_microusd: Option<u64>,
     cost_currency: Option<String>,
     consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 这条候选的**对客计价形态**（缺省 = 等于成本形态 `formula`）。
+    consumer_formula: PricingFormula,
+    /// 对客选 per_image / per_call 时的每张 / 每次对客单价（CNY 微单位）。
+    consumer_unit_price_cny_microusd: Option<u64>,
 }
 
 /// 归一一条候选的**计价形态与它的参数**，判据是"这个渠道按什么计价"。
@@ -732,13 +748,54 @@ fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, App
     // 成本单价按"× 倍率 × 折算率"算出来，一份向量在这里永远不会被读。留着它只会让人以为
     // 它在生效——发布者的意图与声明的形态对不上时，就该在发布期说清，而不是等对账时才发现
     // 自己录的价没被用。
-    if declared != PricingFormula::TokenRates && draft.consumer_rates_cny.is_some() {
-        return Err(ApplicationError::Validation(format!(
-            "offerings[{index}].consumer_rates_cny does not apply to formula {}: the four CNY \
-             rates are the token_rates price, and a supply priced per image / per call / by the \
-             amount its provider declares sells at its cost unit price times the markup coefficient",
-            declared.as_str()
-        )));
+    // **对客计价形态**：运营按候选选，与成本形态独立；缺省 = 等于成本形态（旧形状 / 历史修订）。
+    let consumer = match draft.consumer_formula.as_deref() {
+        None => declared,
+        Some(value) => PricingFormula::parse(value).ok_or_else(|| {
+            ApplicationError::Validation(format!(
+                "offerings[{index}].consumer_formula must be token_rates, per_image, per_call or \
+                 upstream_declared, got {value}"
+            ))
+        })?,
+    };
+    if consumer == PricingFormula::TokenRates {
+        if draft.consumer_unit_price_cny_microusd.is_some() {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].consumer_unit_price_cny_microusd does not apply to \
+                 consumer_formula token_rates"
+            )));
+        }
+        // 成本本身就按 token 计量量时，那份四档费率可兼作对客费率（旧口径），向量可以不给；
+        // 成本不是 token 计量量时没有任何费率可沿用，必须显式给对客向量。
+        if draft.consumer_rates_cny.is_none() && declared != PricingFormula::TokenRates {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].consumer_rates_cny is required when the consumer form is \
+                 token_rates and the cost form is {}: there is no cost rate to fall back on",
+                declared.as_str()
+            )));
+        }
+    } else {
+        if draft.consumer_rates_cny.is_some() {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].consumer_rates_cny does not apply to consumer_formula {}: the \
+                 four CNY rates are the token_rates price",
+                consumer.as_str()
+            )));
+        }
+        if consumer.takes_unit_price() && draft.consumer_unit_price_cny_microusd.is_none() {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].consumer_unit_price_cny_microusd is required when the \
+                 consumer form is {}",
+                consumer.as_str()
+            )));
+        }
+        if !consumer.takes_unit_price() && draft.consumer_unit_price_cny_microusd.is_some() {
+            return Err(ApplicationError::Validation(format!(
+                "offerings[{index}].consumer_unit_price_cny_microusd does not apply to \
+                 consumer_formula {}",
+                consumer.as_str()
+            )));
+        }
     }
     let (rates, price_source_url, plan_currency) = match draft.price_plan.clone() {
         Some(price_plan) => {
@@ -775,6 +832,8 @@ fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, App
         cost_unit_price_microusd: draft.cost_unit_price_microusd,
         cost_currency,
         consumer_rates_cny: draft.consumer_rates_cny.clone(),
+        consumer_formula: consumer,
+        consumer_unit_price_cny_microusd: draft.consumer_unit_price_cny_microusd,
     })
 }
 
@@ -4490,6 +4549,8 @@ impl RuntimeService {
                     .or_else(|| found.plan.as_ref().map(|plan| plan.currency.clone())),
                 reference_cost_microusd: reference.reference_cost_microusd,
                 consumer_rates_cny: reference.consumer_rates_cny.clone(),
+                consumer_formula: reference.consumer_formula.clone(),
+                consumer_unit_price_cny_microusd: reference.consumer_unit_price_cny_microusd,
                 // **成本口径与保底表也由服务端定**，不要运营给：这两样是渠道与结算的事实，而且
                 // 它们不是"运营的选择"——`cost_basis` 两态由计价形态唯一决定（渠道终态给金额就是
                 // `declared`，否则平台按用量自算就是 `computed`）；保底表缺省是空表（没声明保底）。
