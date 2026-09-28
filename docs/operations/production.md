@@ -278,12 +278,7 @@ DATABASE_URL=... WORKER_ID=worker-1 seeai-worker
 
 ## 5. 会话与口令
 
-| 变量 | 缺省 | 说明 |
-| --- | --- | --- |
-| `SESSION_TTL_SECONDS` | `43200`（12 小时） | 管理员与客户会话的有效期 |
-| `PASSWORD_RESET_TTL_SECONDS` | `1800`（30 分钟） | 口令重置令牌的有效期。**比会话短得多**：它能改口令，暴露窗口越小越好 |
-
-重置令牌与 API Key 都是**只存哈希**的：明文只在签发那一次回给调用方，之后无法再取出。
+会话与口令重置的有效期是配置项（`SESSION_TTL_SECONDS`、`PASSWORD_RESET_TTL_SECONDS`），见[配置项](configuration.md) §8。
 
 ## 6. 备份
 
