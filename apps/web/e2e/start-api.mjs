@@ -46,7 +46,7 @@ function findCargo() {
 const env = { ...process.env };
 delete env.DATABASE_URL;
 Object.assign(env, {
-  DATABASE_URL: process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_e2e',
+  DATABASE_URL: process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:5432/seeai_e2e',
   API_BIND: process.env.SEEAI_E2E_API_BIND ?? '0.0.0.0:8090',
   ADMIN_TOKEN: process.env.SEEAI_E2E_ADMIN_TOKEN ?? 'e2e-shared-token',
   ADMIN_EMAIL: process.env.SEEAI_E2E_ADMIN_EMAIL ?? 'ops@example.com',

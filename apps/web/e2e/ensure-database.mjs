@@ -19,7 +19,7 @@ import postgres from 'postgres';
 ///
 /// `playwright.config.ts` 会把同一个值**显式**交给这个进程（来自 `e2e/settings.ts`），所以正常运行
 /// 时不依赖这里的默认值；默认值只是让这个脚本能单独跑一下。
-const base = process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:54329/seeai_e2e';
+const base = process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:5432/seeai_e2e';
 const url = new URL(base);
 const database = decodeURIComponent(url.pathname.replace(/^\//, ''));
 if (!database) {

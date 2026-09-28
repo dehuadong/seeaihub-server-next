@@ -34,7 +34,7 @@ const pick = (key: string, fallback: string): string =>
 
 export const settings = {
   port: Number(pick('SEEAI_E2E_PORT', '8090')),
-  database: pick('SEEAI_E2E_DATABASE', 'postgres://seeai:seeai@127.0.0.1:54329/seeai_e2e'),
+  database: pick('SEEAI_E2E_DATABASE', 'postgres://seeai:seeai@127.0.0.1:5432/seeai_e2e'),
   adminEmail: pick('ADMIN_EMAIL', 'ops@example.com'),
   adminPassword: pick('ADMIN_PASSWORD', 'e2e-admin-password'),
   adminToken: pick('ADMIN_TOKEN', 'e2e-shared-token'),

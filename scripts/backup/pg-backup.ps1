@@ -3,13 +3,12 @@
 # PostgreSQL 备份与保留：导出一份自定义格式转储，并按保留天数清掉更旧的转储。
 #
 # 用法：
-#   pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-RetentionDays <天数>] [-Database <库名>] [-Keep]
+#   pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-RetentionDays <天数>] [-Keep]
 #
 # 连接串只从环境变量 `DATABASE_URL` 读（与运行时同一处），不从参数或配置读、不打印到输出：
 # 转储里含业务数据，凭据不进命令行历史。
 #
-# 导出方式按本机情况自动选：`pg_dump` 在 PATH 上就直接用；否则回落到
-# `docker compose exec postgres`（开发库就是这么起的）。两种方式都失败时明确报错，不静默产出空文件。
+# 导出方式用 PATH 上的 `pg_dump`；找不到或导出失败时明确报错，不静默产出空文件。
 
 [CmdletBinding()]
 param(
@@ -17,8 +16,6 @@ param(
     [string] $TargetDir = (Join-Path (Split-Path -Parent (Split-Path -Parent $PSScriptRoot)) '.data/backups'),
     # 保留天数：比它更旧的转储会被删掉。默认 7 天；这是运维取值，按需要覆盖。
     [int] $RetentionDays = 7,
-    # 目标库名（docker 方式下需要）。
-    [string] $Database = 'seeai_next',
     # 只导出，不清理。
     [switch] $Keep
 )
@@ -36,28 +33,15 @@ if (-not (Test-Path $TargetDir)) {
 $stamp = (Get-Date).ToUniversalTime().ToString('yyyyMMddTHHmmssZ')
 $dump = Join-Path $TargetDir "seeai-$stamp.dump"
 
-# 两种导出方式依次尝试：本机的 `pg_dump` 大版本可能与服务端不一致而直接拒绝导出，
-# 这时回落到容器里那份与服务端同版本的 `pg_dump`。每次尝试前清掉上一次的半成品文件，
-# 失败时也不留空转储——空文件看起来像备份成功，最危险。
-$repoRoot = Split-Path -Parent (Split-Path -Parent $PSScriptRoot)
-$attempts = @()
-if (Get-Command pg_dump -ErrorAction SilentlyContinue) {
-    $attempts += { & pg_dump --format=custom --file $dump $env:DATABASE_URL }
+# 导出前清掉上一次的半成品文件，失败时也不留空转储——空文件看起来像备份成功，最危险。
+if (-not (Get-Command pg_dump -ErrorAction SilentlyContinue)) {
+    throw '找不到 pg_dump：备份需要 PATH 上有与服务端同大版本的 pg_dump。'
 }
-$attempts += {
-    & docker compose --project-directory $repoRoot exec -T postgres pg_dump --format=custom --username seeai $Database > $dump
-}
-
-$failures = @()
-foreach ($attempt in $attempts) {
+if (Test-Path $dump) { Remove-Item -LiteralPath $dump -Force }
+& pg_dump --format=custom --file $dump $env:DATABASE_URL
+if ($LASTEXITCODE -ne 0 -or -not (Test-Path $dump) -or (Get-Item $dump).Length -le 0) {
     if (Test-Path $dump) { Remove-Item -LiteralPath $dump -Force }
-    & $attempt
-    if ($LASTEXITCODE -eq 0 -and (Test-Path $dump) -and (Get-Item $dump).Length -gt 0) { break }
-    $failures += "exit $LASTEXITCODE"
-}
-if (-not (Test-Path $dump) -or (Get-Item $dump).Length -le 0) {
-    if (Test-Path $dump) { Remove-Item -LiteralPath $dump -Force }
-    throw "导出没成功（$($failures -join '、')）：检查 DATABASE_URL、容器状态与 pg_dump 版本。"
+    throw "导出没成功（exit $LASTEXITCODE）：检查 DATABASE_URL 与 pg_dump 版本。"
 }
 
 $info = Get-Item $dump

@@ -1,6 +1,6 @@
 # 开发环境
 
-一台机器上把两个进程与依赖跑起来：`seeai-api`（控制面 + 图片生成入口 + 托管两份前端产物）与 `seeai-worker`（领取 Job、调上游、结算）。
+一台机器上把两个进程与依赖跑起来：`seeai-api`（控制面 + 图片生成入口 + 托管两份前端产物）与 `seeai-worker`（领取 Job、调上游、结算）。开发机是 WSL Ubuntu，PostgreSQL 与 Redis 由系统包安装并常驻，不用 Docker。
 
 ## 1. 前置
 
@@ -8,40 +8,49 @@
 | --- | --- | --- |
 | Rust | `Cargo.toml` 声明 `rust-version = 1.94`（edition 2024） | 两个进程都是 Rust 二进制 |
 | Node.js + npm | 24（CI 用的版本） | 只用来构建前端产物 |
-| PostgreSQL | 17 | 业务事实权威 |
+| PostgreSQL | 17 | 业务事实权威，监听 `127.0.0.1:5432` |
 | Redis | 7（可选） | 只是加速层；`REDIS_URL` 留空即不启用，受理与结算全部回源数据库 |
-| Docker（可选） | — | `compose.yaml` 用来起上面的 Postgres 与 Redis |
+
+`psql` / `pg_dump` / `redis-cli` 随包安装，建库、备份与探活用得到。
 
 ## 2. 起依赖
 
+PostgreSQL 17 与 Redis 7 已装好并监听 `127.0.0.1`：
+
+| 服务 | 宿主端口 | 凭据 / 说明 |
+| --- | --- | --- |
+| `postgresql`（集群 `17/main`） | **5432** | 超级用户 `postgres`，开发库 `seeai_next` |
+| `redis-server` | **6379** | 无密码；不启用加速层也能跑 |
+
+两个服务随 WSL 的系统服务启动，手动起停用 `sudo systemctl start postgresql redis-server`（停用就把 `start` 换成 `stop`）。
+
+首次给本项目建角色与库。角色带 `CREATEDB`：契约测试与 e2e 都要自己派生一次性库：
+
 ```sh
-docker compose up -d
+sudo -u postgres psql -p 5432 -c "CREATE ROLE seeai LOGIN CREATEDB PASSWORD 'seeai';"
+sudo -u postgres psql -p 5432 -c "CREATE DATABASE seeai_next OWNER seeai;"
+sudo -u postgres psql -p 5432 -c "CREATE DATABASE seeai_contract OWNER seeai;"
 ```
 
-`compose.yaml` 起两个容器，**端口是刻意错开的**（避开本机常见的占用）：
-
-| 服务 | 宿主端口 | 库 / 说明 |
-| --- | --- | --- |
-| `postgres` | **54329** | 容器内建库 `seeai_next`，超级用户 `seeai` / `seeai` |
-| `redis` | **63799** | 6379 留给本机可能已有的实例 |
+`seeai_next` 是开发库；`seeai_contract` 只当**可连接的空库**给契约用例派生用（见 §7），不放开发数据。
 
 ## 3. 配置
 
 ```sh
-copy .env.example .env      # Linux / macOS：cp
+cp .env.example .env
 ```
 
-进程**不自己读 `.env`**——它只读环境变量。所以要么用 shell 载入（`set -a; . ./.env; set +a`），要么由启动脚本注入。
+两个进程启动时都会调 `dotenvy::dotenv()`：它从**当前工作目录**起往上找 `.env`，找到就载入，但**不覆盖**已经存在的环境变量。所以在仓库根 `cargo run` 会自动读到这份 `.env`，不用手动 `export`；想临时换一个值，直接在命令前设环境变量即可（它优先于 `.env`）。`.env` 已在 `.gitignore` 里，不进版本库。
 
 必填与常用项（全表见 [`.env.example`](../../.env.example)，逐项说明见[生产环境](production.md) §4）：
 
 | 变量 | 开发取值 | 说明 |
 | --- | --- | --- |
-| `DATABASE_URL` | `postgres://seeai:seeai@127.0.0.1:54329/seeai_next` | 两个进程都读 |
+| `DATABASE_URL` | `postgres://seeai:seeai@127.0.0.1:5432/seeai_next` | 两个进程都读 |
 | `API_BIND` | `127.0.0.1:8081` | 只 `seeai-api` 读 |
 | `ADMIN_TOKEN` | 任意非空 | **必填**，空值会让进程起不来 |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 自定 | 用来建/更新那个管理员账号，运营后台的登录页用它 |
-| `REDIS_URL` | `redis://127.0.0.1:63799` | 留空则不启用加速层，功能不变 |
+| `REDIS_URL` | `redis://127.0.0.1:6379` | 留空则不启用加速层，功能不变 |
 | `SUPPLY_MATERIAL_DIR` | `config/bootstrap` | 设了才会导入供给素材；不设则可选供给清单是空的 |
 | `AIHUBMIX_API_KEY` / `APIMART_API_KEY` | 见下 | 变量名由素材的 `credential_env` 指定 |
 
@@ -97,7 +106,7 @@ cargo test --workspace --all-features
 契约用例默认被 `#[ignore]`，需要一个**可连接的空库**（它会自己派生独立库，**不要指向开发库**）：
 
 ```sh
-HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:54329/seeai_contract \
+HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract \
   cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1
 ```
 

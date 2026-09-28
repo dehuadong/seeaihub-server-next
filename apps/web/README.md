@@ -32,7 +32,7 @@
 
 ```sh
 # 后端（另一个终端）。ADMIN_EMAIL/ADMIN_PASSWORD 给的是**引导**用的初始账号：只在账号不存在时写入。
-DATABASE_URL=postgres://seeai:seeai@127.0.0.1:54329/seeai_next \
+DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_next \
 API_BIND=127.0.0.1:8081 ADMIN_TOKEN=... \
 ADMIN_EMAIL=ops@example.com ADMIN_PASSWORD=... cargo run -p seeai-api
 
