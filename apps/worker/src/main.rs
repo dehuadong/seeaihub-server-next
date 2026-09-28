@@ -11,7 +11,7 @@ use seeai_application::{
 };
 use seeai_cache_redis::RedisCache;
 use seeai_persistence::{PgHubRepository, max_declared_output_images};
-use std::{env, num::NonZeroU64, sync::Arc, time::Duration};
+use std::{env, future::Future, num::NonZeroU64, pin::Pin, sync::Arc, task::Poll, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
 
@@ -127,25 +127,63 @@ async fn main() -> Result<()> {
     let (_drain_signal, drain_control) = tokio::sync::watch::channel(false);
     let signals = ShutdownSignals {
         drain_control,
-        interrupt: Box::pin(tokio::signal::ctrl_c()),
+        interrupt: shutdown_signal(),
     };
     run_until_shutdown(&worker, signals, poll_interval).await
+}
+
+/// 主循环等的终止信号 future。
+type ShutdownFuture = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
+
+/// 进程终止信号：SIGINT（Ctrl+C）或 SIGTERM（systemd 与容器的默认信号）。两者走同一条排空路径
+/// （口径见 `docs/design/0009-operational-baseline.md` §2）。
+///
+/// **触发之后一直就绪**：主循环把手上那一轮等完时会反复轮询它，普通 `async fn` 或 `oneshot` 完成后再被轮询会 panic。
+fn shutdown_signal() -> ShutdownFuture {
+    let mut interrupt = Box::pin(tokio::signal::ctrl_c());
+    #[cfg(unix)]
+    let mut terminate =
+        match tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate()) {
+            Ok(stream) => Some(stream),
+            Err(error) => {
+                tracing::error!(%error, "failed to listen for SIGTERM; waiting for Ctrl+C only");
+                None
+            }
+        };
+    let mut fired = false;
+    Box::pin(std::future::poll_fn(move |context| {
+        if fired {
+            return Poll::Ready(Ok(()));
+        }
+        if let Poll::Ready(result) = interrupt.as_mut().poll(context) {
+            fired = true;
+            return Poll::Ready(result);
+        }
+        #[cfg(unix)]
+        if let Some(stream) = terminate.as_mut()
+            && let Poll::Ready(Some(())) = stream.poll_recv(context)
+        {
+            fired = true;
+            return Poll::Ready(Ok(()));
+        }
+        Poll::Pending
+    }))
 }
 
 /// 停机输入：一个"停止领新任务"的开关，以及一个"进程要退了"的终止信号。
 struct ShutdownSignals {
     /// 由别处置位（例如编排系统的排水接口）；置位之后不再领下一轮。`watch` 可以反复轮询。
     drain_control: tokio::sync::watch::Receiver<bool>,
-    /// Ctrl+C。钉成 `Pin<Box<..>>` 是因为它只在**一个**地方被轮询：每轮现造一个会把"监听"
+    /// 终止信号（SIGINT / SIGTERM）。钉成 `Pin<Box<..>>` 是因为它只在**一个**地方被轮询：每轮现造一个会把"监听"
     /// 反复注册一遍，而"等停机"这件事不需要它对每个轮次都重新就绪。
-    interrupt: std::pin::Pin<Box<dyn std::future::Future<Output = std::io::Result<()>> + Send>>,
+    interrupt: ShutdownFuture,
 }
 
 /// 领任务的主循环：直到停机条件成立为止。
 ///
 /// 停机分两级，**在飞的那一轮都不许丢**（丢了 Job 会留在提交中直到租约过期才被回收）：
 /// - `drain_control` 置位 = **排空**：不再领下一轮，手上这一轮跑完；
-/// - `interrupt` 就绪（Ctrl+C）= **终止**：同样不打断在飞的那一轮，等它跑完再退。
+/// - `interrupt` 就绪（SIGINT / SIGTERM）= **终止**：同样不打断在飞的那一轮，等它跑完再退。
 ///
 /// 领任务与"等停机"**同时**推进：停机请求不必等到某一轮结束才被看见，而停机一旦成立也不再领
 /// 下一轮——手上那一轮仍旧完整跑完（`select!` 只让停机**先被看见**，取消的是"再领一轮"，
@@ -203,7 +241,7 @@ async fn run_until_shutdown(
 /// 返回 `Some(true)` 是终止信号、`Some(false)` 是排空开关；`None` 表示排空开关的发送端没了——
 /// 那时没人再能要求排空，继续跑下去等于一个再也停不下来的进程，所以按停止处置。
 ///
-/// 只在这两个信号上等：`watch` 的值变化会唤醒它，`ctrl_c` 就绪也会。**不设超时分支**，
+/// 只在这两个信号上等：`watch` 的值变化会唤醒它，终止信号就绪也会。**不设超时分支**，
 /// 因为"没人要求停机"本来就该一直等下去（真正的让步由每轮之后的退避负责）。
 async fn await_stop(signals: &mut ShutdownSignals) -> Option<bool> {
     tokio::select! {

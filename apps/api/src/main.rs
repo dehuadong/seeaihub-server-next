@@ -505,9 +505,35 @@ fn static_spa() -> Result<Option<StaticSpa>> {
     }))
 }
 
+/// 进程终止信号：SIGINT（Ctrl+C）或 SIGTERM（systemd 与容器的默认信号），任一到达都触发 axum 优雅停机。
 async fn shutdown_signal() {
-    if let Err(error) = tokio::signal::ctrl_c().await {
-        tracing::error!(error = %error, "failed to listen for shutdown signal");
+    #[cfg(unix)]
+    {
+        use tokio::signal::unix::{SignalKind, signal};
+        match signal(SignalKind::terminate()) {
+            Ok(mut terminate) => {
+                let result = tokio::select! {
+                    result = tokio::signal::ctrl_c() => result,
+                    _ = terminate.recv() => Ok(()),
+                };
+                if let Err(error) = result {
+                    tracing::error!(error = %error, "failed to listen for shutdown signal");
+                }
+            }
+            Err(error) => {
+                tracing::error!(%error, "failed to listen for SIGTERM; waiting for Ctrl+C only");
+                if let Err(error) = tokio::signal::ctrl_c().await {
+                    tracing::error!(error = %error, "failed to listen for shutdown signal");
+                }
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if let Err(error) = tokio::signal::ctrl_c().await {
+            tracing::error!(error = %error, "failed to listen for shutdown signal");
+        }
     }
 }
 

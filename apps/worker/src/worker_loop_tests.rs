@@ -605,7 +605,7 @@ impl CredentialProvider for NoCredentials {
 
 /// 一条用例自己的终止信号：可以自己投递一次；[`Self::signal`] 给出主循环要的那份 future。
 ///
-/// 形状与生产里的 `ctrl_c` 一致：**可重复轮询**，触发之后一直就绪。用裸 `oneshot` 不行——
+/// 形状与生产里的终止信号（SIGINT / SIGTERM）一致：**可重复轮询**，触发之后一直就绪。用裸 `oneshot` 不行——
 /// `select!` 会在已就绪的分支上再轮询一次，而"已完成又被轮询"的 future 会 panic。
 #[derive(Default)]
 struct TestInterrupt {
