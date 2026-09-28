@@ -42,7 +42,7 @@ cp .env.example .env
 
 两个进程启动时都会调 `dotenvy::dotenv()`：它从**当前工作目录**起往上找 `.env`，找到就载入，但**不覆盖**已经存在的环境变量。所以在仓库根 `cargo run` 会自动读到这份 `.env`，不用手动 `export`；想临时换一个值，直接在命令前设环境变量即可（它优先于 `.env`）。`.env` 已在 `.gitignore` 里，不进版本库。
 
-必填与常用项（全表见 [`.env.example`](../../.env.example)，逐项说明见[生产环境](production.md) §4）：
+必填与常用项（全表见 [`.env.example`](../../.env.example)，逐项说明见[配置项](configuration.md)）：
 
 | 变量 | 开发取值 | 说明 |
 | --- | --- | --- |
@@ -131,5 +131,5 @@ npm --prefix apps/web run e2e
 ## 9. 这一节之外
 
 - 生产怎么部署、面向哪些风险、投产前做什么演练：见[生产环境](production.md)。
-- 各配置项在生产下的取值与理由：同上 §4。
+- 各配置项在生产下的取值与理由：见[配置项](configuration.md)。
 - 备份与恢复：见[生产环境](production.md) §6。
