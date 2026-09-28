@@ -34,14 +34,20 @@ Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("web").join("dist")
 
 ### 1.2 前端分发靠主机名，反代要透传 `Host`
 
-两份产物由同一个进程提供，判据是 `Host` 头的第一段：
+两份产物由同一个进程提供，判据是 `Host`（去掉端口后的整串）：
 
 | 请求的主机名 | 返回 |
 | --- | --- |
 | 以 `admin` 开头（如 `admin.example.com`） | 运营后台 `console.html` |
 | 其余（如 `app.example.com`、`example.com`） | 客户控制台 `portal.html` |
 
-因此反向代理**必须原样透传 `Host`**；改写成固定的 `127.0.0.1:8081` 会让所有请求都回客户控制台，运营后台打不开。另外两个入口有**文件名直达**（`/console.html`、`/portal.html`），任何主机上都有效。
+**不要求两个二级域名**：只有 `admin` 前缀是判据，`app` 只是习惯叫法——同一个二级域名下拿 `admin.example.com` 配裸域 `example.com` 也行，甚至可以用另一个域名。边界有三条：
+
+- 是**整串前缀**匹配，不是"第一段等于 `admin`"：`administrator.example.com` 也回运营后台，而 `foo.admin.example.com` 不回；
+- 匹配**区分大小写**：`Admin.example.com` 会落到客户入口；经 nginx 时 `$host` 已小写化，直连 API 要自己保证；
+- 端口会被去掉，`admin.example.com:8443` 仍判运营后台。
+
+因此反向代理**必须原样透传 `Host`**；改写成固定的 `127.0.0.1:8081` 会让所有请求都回客户控制台，运营后台打不开。另外两个入口有**文件名直达**（`/console.html`、`/portal.html`），精确文件名优先于主机名判据，在任何主机上都有效。
 
 TLS 在反代终止（本服务只监听明文 HTTP）。**用 HTTPS 是必须的**：管理员与客户的会话凭据都走 `Authorization` 头。
 
