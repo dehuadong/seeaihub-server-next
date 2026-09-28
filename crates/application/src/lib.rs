@@ -1836,6 +1836,10 @@ pub struct GatewayModelCandidateView {
     pub parameter_mapping: Value,
     /// 该候选的**对客四档 CNY 费率向量**（随修订发布）；这条候选不带定价时为 `null`。
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
+    /// 该候选的**对客计价形态**（随修订发布）；不带定价时为 `null`。
+    pub consumer_formula: Option<PricingFormula>,
+    /// 对客选 per_image / per_call 时的每张 / 每次对客单价（CNY 微单位）。
+    pub consumer_unit_price_cny_microusd: Option<u64>,
     /// 该候选的渠道成本（**原币种**微单位）：**只作定价参考，不是售价的被乘数**。
     pub reference_cost_microusd: Option<u64>,
     /// 该候选的成本币种（不假定 USD）。

@@ -4702,6 +4702,8 @@ fn row_to_gateway_model_candidate(
         carrier_schema: row.try_get("carrier_schema").map_err(database_error)?,
         parameter_mapping: row.try_get("parameter_mapping").map_err(database_error)?,
         consumer_rates_cny: pricing.consumer_rates_cny,
+        consumer_formula: pricing.consumer_formula,
+        consumer_unit_price_cny_microusd: pricing.consumer_unit_price_cny_microusd,
         reference_cost_microusd: pricing.reference_cost_microusd,
         cost_currency: pricing.cost_currency,
         cost_basis: pricing.cost_basis,
