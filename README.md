@@ -21,6 +21,7 @@
 | **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
 | **怎么上生产**（构建顺序、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
+| **容器部署**（Dockerfile、compose、镜像与升级） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **代码结构**：哪个 crate / 文件 / 表负责什么 | [`docs/architecture.md`](docs/architecture.md) |
 | 分层的**职责与规则**（①–⑤、R1–R4、接入清单） | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
 | 持久决定 | [`docs/adr/`](docs/adr/) |

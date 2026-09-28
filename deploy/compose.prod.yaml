@@ -1,0 +1,34 @@
+# 生产容器编排：只起两个应用进程，PostgreSQL 与 Redis 外置，由 DATABASE_URL / REDIS_URL 指过去。
+# TLS 与 Host 透传仍由宿主 nginx 负责（docs/operations/production.md §2.5），所以 API 只发布到宿主回环。
+#
+#   SEEAI_TAG=<镜像 tag> docker compose -f deploy/compose.prod.yaml up -d
+x-seeai-app: &seeai-app
+  image: seeai:${SEEAI_TAG:-local}
+  restart: unless-stopped
+  # 与 systemd 的 TimeoutStopSec 一样给在飞工作收尾：API 对齐 GENERATION_SYNC_WAIT_SECONDS、
+  # worker 对齐 PROVIDER_TIMEOUT_SECONDS；两者各以部署配置为准，720s 兜默认档。
+  stop_grace_period: 720s
+
+services:
+  seeai-api:
+    <<: *seeai-app
+    command: ["/app/target/release/seeai-api"]
+    env_file:
+      - /etc/seeai/api.env
+    environment:
+      # 容器内必须监听 0.0.0.0 才能被端口映射到；宿主侧只绑回环。
+      API_BIND: 0.0.0.0:8081
+    ports:
+      - "127.0.0.1:8081:8081"
+    healthcheck:
+      test: ["CMD", "curl", "-fsS", "http://127.0.0.1:8081/health"]
+      interval: 10s
+      timeout: 3s
+      start_period: 30s
+      retries: 3
+
+  seeai-worker:
+    <<: *seeai-app
+    command: ["/app/target/release/seeai-worker"]
+    env_file:
+      - /etc/seeai/worker.env

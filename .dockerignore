@@ -1,0 +1,15 @@
+# 构建上下文只留构建需要的东西：仓库历史、构建产物、依赖目录与上游参考材料都不进镜像。
+.git
+.github
+.agents
+.scratch
+.data
+target
+apps/web/node_modules
+apps/web/dist
+apps/web/test-results
+apps/web/playwright-report
+out-reference
+docs
+*.log
+.env
