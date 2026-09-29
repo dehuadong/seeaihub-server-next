@@ -701,7 +701,7 @@ impl HubRepository for PgHubRepository {
                    p.image_output_microusd_per_million,
                    p.source_url AS plan_source_url,
                    r.cost_currency, r.reference_cost_microusd, r.cost_basis,
-                   r.tier_prices, r.floor_amounts, r.consumer_rates_cny
+                   r.tier_prices, r.floor_amounts, r.consumer_rates_cny, r.consumer_formula
             FROM publication.runtime_entries re
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
