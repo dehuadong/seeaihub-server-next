@@ -1,5 +1,5 @@
 主题: 平台模型发布：可选择的 Offering 与选择式发布
-当前修订: v2
+当前修订: v3
 状态: 待评审
 来源: 提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 范围第 2 条；承接 Spec [`0001`](../specs/0001-admin-and-customer-consoles.md) §5.3 的 V-D8/V-D9
 依赖: [`0006`](./0006-gateway-models-and-consumer-surface.md)（网关模型对象）、[`0007`](./0007-pricing-floor-and-settlement.md)（定价归属）、[`0005`](./0005-vendor-model-contract-and-offering-mapping.md)（合同/承载面/映射分层）；[`CONTEXT.md`](../../CONTEXT.md)（Offering / Gateway Model / 供应商模型名）；`ADR-0003`、`ADR-0009`、`ADR-0015`
@@ -93,7 +93,7 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 | --- | --- |
 | 引用 | `offering_id`（选择的结果） |
 | 路由 | `routing_priority`、`weight` |
-| 定价 | **对客计价形态**、`consumer_rates_cny`（token 四档）、**对客每张 / 每次单价**、`cost_basis`、`reference_cost_microusd`、`tier_prices`、`floor_amounts`（`0007` §2；`markup_bps` **不在这里**——它是 Gateway Model 级的一个值，见 §6）。对客计价形态由运营选，与 Offering 的成本计价形态独立；**对客形态与对客价目（四档向量 / 每张 / 每次单价）落在 `runtime_revisions` 上按候选键的 jsonb，随 Job 快照冻结**（`0007` §1/§2） |
+| 定价 | **对客计价形态**、`consumer_rates_cny`（token 四档）、`cost_basis`、`reference_cost_microusd`、`tier_prices`、`floor_amounts`（`0007` §2；`markup_bps` **不在这里**——它是 Gateway Model 级的一个值，见 §6）。对客计价形态由运营选，与 Offering 的成本计价形态独立；**对客形态与 `consumer_rates_cny` 落在 `runtime_revisions` 上按候选键的 jsonb，随 Job 快照冻结**（`0007` §1/§2） |
 
 渠道三要素、驱动器、供应商模型名、承载面、参数映射、限制**不再出现在命令里**：由被引用的 Offering 决定，发布期从库里取，取不到或被停用就拒绝并点名是哪一条。
 
