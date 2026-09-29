@@ -171,7 +171,7 @@ RUST_LOG=info
 EOF
 ```
 
-`api.env` 里的 `SUPPLY_MATERIAL_DIR=config/bootstrap`（相对 `WorkingDirectory=/opt/seeai`）让 API 每次启动都把仓库里的供给素材幂等导成渠道与 Offering；**不设它，运营后台"选厂商"就是空的、平台模型发不出去**（[配置项 §6](configuration.md#6-供给素材导入)）。它只被 API 读，worker 不需要。
+`SUPPLY_MATERIAL_DIR`（相对 `WorkingDirectory=/opt/seeai`）让 API 每次启动都把仓库里的供给素材幂等导成渠道与 Offering；**不设时默认就是 `config/bootstrap`**，上面显式写出来只是为了部署文件可读——要换成自己的素材，把它指到挂载卷（[配置项 §6](configuration.md#6-供给素材导入)）。它只被 API 读，worker 不需要。
 
 `worker.env` 比 `api.env` 多两样：每个实例唯一的 `WORKER_ID`，以及渠道密钥（[渠道凭证](configuration.md#5-渠道凭证)）。
 

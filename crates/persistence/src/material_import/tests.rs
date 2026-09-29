@@ -163,3 +163,29 @@ fn a_missing_or_empty_directory_yields_no_materials() {
     assert!(materials.is_empty());
     std::fs::remove_dir_all(&empty).expect("clean the empty material directory");
 }
+
+/// **没设就导默认目录**：运营上架模型不该依赖谁记着去开一个环境变量。
+#[test]
+fn an_unset_material_dir_falls_back_to_the_shipped_materials() {
+    assert_eq!(
+        material_dir_from(None),
+        Some(PathBuf::from(DEFAULT_SUPPLY_MATERIAL_DIR))
+    );
+    assert_eq!(DEFAULT_SUPPLY_MATERIAL_DIR, "config/bootstrap");
+}
+
+/// **设成空白＝显式不导入**：测试库与开发库要一份干净的供给清单时用它。
+#[test]
+fn a_blank_material_dir_imports_nothing() {
+    assert_eq!(material_dir_from(Some("")), None);
+    assert_eq!(material_dir_from(Some("   ")), None);
+}
+
+/// 给了路径就用它（去掉两端空白）。
+#[test]
+fn an_explicit_material_dir_is_used_as_given() {
+    assert_eq!(
+        material_dir_from(Some("  /tmp/materials  ")),
+        Some(PathBuf::from("/tmp/materials"))
+    );
+}

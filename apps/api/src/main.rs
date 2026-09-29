@@ -118,10 +118,11 @@ async fn main() -> Result<()> {
     let admin_token: Arc<str> = Arc::from(required_env("ADMIN_TOKEN")?);
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
-    // 供给素材的幂等导入（**工程侧**的动作）：渠道与 Offering 的来源是工程师写的素材，目录由
-    // `SUPPLY_MATERIAL_DIR` 给。没设、没这个目录、目录里没有素材——都静默跳过：开发库与测试库
-    // 本来就没有素材，导入不该让服务起不来。它排在迁移之后、装配之前：导入写的是供给目录，
-    // 不发布修订、也不应答请求，因此与下面的超时校验（读已发布修订的合同）互不影响。
+    // 供给素材的幂等导入（**工程侧**的动作）：渠道与 Offering 的来源是工程师写的素材。目录由
+    // `SUPPLY_MATERIAL_DIR` 给，**不设时默认 `config/bootstrap`**（仓库、systemd 与 Docker 镜像
+    // 都把素材放在工作目录下）；设成空白＝显式不导入，测试库与开发库用它保持干净。目录不存在或
+    // 里面没有素材时什么都不做——导入不该让服务起不来。它排在迁移之后、装配之前：导入写的是供给
+    // 目录，不发布修订、也不应答请求，因此与下面的超时校验（读已发布修订的合同）互不影响。
     let imported = import_supply_materials_from_env(repository.pool()).await?;
     if imported.materials > 0 {
         info!(

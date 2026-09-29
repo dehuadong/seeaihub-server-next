@@ -52,6 +52,9 @@ Object.assign(env, {
   ADMIN_EMAIL: process.env.SEEAI_E2E_ADMIN_EMAIL ?? 'ops@example.com',
   ADMIN_PASSWORD: process.env.SEEAI_E2E_ADMIN_PASSWORD ?? 'a-long-enough-password',
   RUST_LOG: process.env.RUST_LOG ?? 'warn',
+  // **显式不导入供给素材**：e2e 库每次重置成空库、用例自己造夹具；不设的话默认值
+  // （`config/bootstrap`）会让每个用例都先看到仓库那两份素材。
+  SUPPLY_MATERIAL_DIR: '',
 });
 
 // 不走 `shell`：参数原样传给子进程（`shell: true` 会把参数拼成命令行，Windows 上有转义与弃用警告）。

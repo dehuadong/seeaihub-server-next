@@ -28,9 +28,16 @@ use uuid::Uuid;
 
 /// 素材目录的环境变量名。
 ///
-/// 没设、设成空串、目录不存在、目录里没有 `*.json`——四种情况都静默跳过：开发库与测试库没有素材
-/// 是正常状态，导入不该让服务起不来。
+/// **不设时默认 [`DEFAULT_SUPPLY_MATERIAL_DIR`]**：工程师写的素材就是供给的来源（随仓库与镜像
+/// 一起发布），运营上架模型不该依赖谁记着去开一个环境变量。设成**空白**＝显式不导入（测试库与
+/// 开发库要一份干净的供给清单时用它）；目录不存在、目录里没有 `*.json` 时什么都不做。
 pub const SUPPLY_MATERIAL_DIR_ENV: &str = "SUPPLY_MATERIAL_DIR";
+
+/// 没设 `SUPPLY_MATERIAL_DIR` 时用的目录（相对进程工作目录）。
+///
+/// 仓库、systemd 部署（`WorkingDirectory=/opt/seeai`）与 Docker 镜像（`WORKDIR /app`）都把
+/// `config/bootstrap` 放在工作目录下，所以这一个默认值在三种部署里都指得到素材。
+pub const DEFAULT_SUPPLY_MATERIAL_DIR: &str = "config/bootstrap";
 
 /// 素材没写 `actor` 时，价目表那行的来源标注。
 const DEFAULT_ACTOR: &str = "supply-material-import";
@@ -46,21 +53,29 @@ pub struct MaterialImportSummary {
     pub price_plans: usize,
 }
 
-/// 按环境变量给的目录导入素材；变量没设或目录不存在时什么都不做。
+/// 按环境变量给的目录导入素材；目录不存在时什么都不做。
 ///
 /// 素材存在但读不出来、或者形状不对，是**错误**而不是跳过：那是工程输入写错了，静默跳过会让库
 /// 与素材长期不一致，而那种不一致只会在发布或受理时才显形。调用方让启动失败即可。
 pub async fn import_supply_materials_from_env(
     pool: &PgPool,
 ) -> Result<MaterialImportSummary, ApplicationError> {
-    let Ok(dir) = std::env::var(SUPPLY_MATERIAL_DIR_ENV) else {
+    let Some(dir) = material_dir_from(std::env::var(SUPPLY_MATERIAL_DIR_ENV).ok().as_deref())
+    else {
         return Ok(MaterialImportSummary::default());
     };
-    let dir = dir.trim();
-    if dir.is_empty() {
-        return Ok(MaterialImportSummary::default());
+    import_supply_materials(pool, &dir).await
+}
+
+/// 从环境变量的取值决定素材目录。
+///
+/// `None`（没设）＝默认目录；空白（显式设成空）＝不导入；其余＝该路径。
+fn material_dir_from(value: Option<&str>) -> Option<PathBuf> {
+    match value {
+        Some(raw) if raw.trim().is_empty() => None,
+        Some(raw) => Some(PathBuf::from(raw.trim())),
+        None => Some(PathBuf::from(DEFAULT_SUPPLY_MATERIAL_DIR)),
     }
-    import_supply_materials(pool, Path::new(dir)).await
 }
 
 /// 把 `dir` 下的素材逐个导入。每份素材一个事务：一份写坏不影响别的，也不留半份进去的状态。

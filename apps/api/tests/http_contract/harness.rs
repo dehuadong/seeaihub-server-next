@@ -913,6 +913,9 @@ async fn start_api_with(
             .env("DATABASE_URL", database_url)
             .env("API_BIND", format!("127.0.0.1:{port}"))
             .env("ADMIN_TOKEN", &admin_token)
+            // **显式不导入供给素材**：每个用例的库是空的、夹具自己造；不设的话默认值
+            // （`config/bootstrap`）会让它们先看到仓库那两份素材。
+            .env("SUPPLY_MATERIAL_DIR", "")
             .env(
                 "GENERATION_MAX_CONCURRENT_JOBS",
                 max_concurrent_jobs.to_string(),

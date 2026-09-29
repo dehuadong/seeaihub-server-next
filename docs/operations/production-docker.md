@@ -20,7 +20,7 @@
 
 API 按编译期绝对路径找前端产物（[生产环境 §1.1](production.md#11-appswebdist-必须在构建-api-之前就位)）：构建与运行都在 `/app`，产物放 `/app/apps/web/dist`，并保留 `/app/apps/api` 这个空目录——路径里的 `apps/api/../web/dist` 要先能进 `apps/api`，中间目录不存在时 `..` 解析不到。改镜像布局时这两条要一起看。
 
-迁移由 `sqlx::migrate!` 在编译期嵌进二进制，运行镜像里不需要 `migrations/`。镜像带了 `config/bootstrap`，但 `SUPPLY_MATERIAL_DIR` 不设就不导入（[配置项 §6](configuration.md#6-供给素材导入)）；要导入就设 `SUPPLY_MATERIAL_DIR=/app/config/bootstrap`，用自己的素材则挂一个只读卷并把变量指过去。
+迁移由 `sqlx::migrate!` 在编译期嵌进二进制，运行镜像里不需要 `migrations/`。镜像把素材放在 `/app/config/bootstrap`，而 `SUPPLY_MATERIAL_DIR` 不设时默认就是 `config/bootstrap`（相对 `WORKDIR /app`），所以镜像起来就导入（[配置项 §6](configuration.md#6-供给素材导入)）；用自己的素材则挂一个只读卷并把变量指过去。
 
 ```sh
 docker build -t seeai:<tag> .
