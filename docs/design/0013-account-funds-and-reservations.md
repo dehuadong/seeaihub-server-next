@@ -1,7 +1,7 @@
 主题: 账户资金与预授权的当前值模型
-当前修订: v2
+当前修订: v3
 状态: 已评审，需修订（承接的 Spec 尚未生效，现行合同待同步）
-承接: [`账户余额、预授权与实际收支` v2](../specs/0002-account-funds-and-reservations.md) §1–§7；该 Spec 尚未生效，本 RFC 不作为实施依据
+承接: [`账户余额、预授权与实际收支` v3](../specs/0002-account-funds-and-reservations.md) §1–§7；该 Spec 尚未生效，本 RFC 不作为实施依据
 依赖: [`0007` 定价、保底与结算](0007-pricing-floor-and-settlement.md)、[`0008` 路由与缓存](0008-routing-strategy-and-caching.md)、[`0009` 运行基线](0009-operational-baseline.md)；[`ADR-0003`](../adr/0003-postgresql-is-source-of-truth.md)、[`ADR-0006`](../adr/0006-no-settlement-without-metering-evidence.md)
 
 # 账户资金与预授权的当前值模型
@@ -61,7 +61,7 @@ RETURNING balance_microusd, held_microusd,
 
 ## 3. 账户读取与 Redis
 
-账户仓储一次读取同一账户行中的余额、占用、可用额和版本，避免分别查询余额与 Holds 时混入两个提交时点。API 将 `balance_microusd` 明确为已结算余额，增加 `available_microusd`，保留 `held_microusd`；管理员和客户使用同一语义。管理员账户页可分别标示三项；客户控制台只渲染 `available_microusd` 为“可用余额”，移除现有“持有中”卡片及金额提示，客户用量与资金流水也不展示预授权金额。需要即时核账的余额读取与管理员读使用 PostgreSQL 当前行。
+账户仓储一次读取同一账户行中的余额、占用、可用额和版本，避免分别查询余额与 Holds 时混入两个提交时点。API 将 `balance_microusd` 明确为已结算余额，增加 `available_microusd`，保留 `held_microusd`；管理员和客户使用同一语义。管理员账户页可分别标示三项；客户控制台只渲染 `balance_microusd` 为“已结算余额”，移除现有“持有中”卡片及金额提示，不渲染可用额；客户用量与资金流水也不展示预授权金额。需要即时核账的余额读取与管理员读使用 PostgreSQL 当前行。
 
 Redis 的 `user_balance` 值改为 `{balance_microusd, held_microusd, available_microusd, version}`，继续在数据库提交后写入。写缓存时仅接受不低于缓存当前版本的快照，防止两个并发事务提交后的异步写回倒序覆盖；Redis 不可用或写失败时数据库结果不回滚。缓存副本核对仍按数据库当前行校正，不与账实核对混为一项。
 
@@ -83,10 +83,10 @@ Job 上增加终态时刻；成功结算的终态时刻与 `capture.created_at` 
 
 ## 6. 与现行文档和代码的交接
 
-本 RFC 未获接受前，[`0001` 控制台 Spec](../specs/0001-admin-and-customer-consoles.md)、[`0007`](0007-pricing-floor-and-settlement.md) §6、[`0008`](0008-routing-strategy-and-caching.md) §7、[`0009`](0009-operational-baseline.md) 的旧口径仍为现行合同。接受本方案时同步修订这些属主、[`0010`](0010-identity-and-consoles.md) 的账单读、词汇表与接口约定；其中 `0001` C7、V-C6、V-D5 的客户“持有中”展示要求必须改为仅显示可用余额。不能仅改代码而留下“预授权扣余额并写 `hold` / `release` 流水”或“余额就是可用额”的正文。
+本 RFC 未获接受前，[`0001` 控制台 Spec](../specs/0001-admin-and-customer-consoles.md)、[`0007`](0007-pricing-floor-and-settlement.md) §6、[`0008`](0008-routing-strategy-and-caching.md) §7、[`0009`](0009-operational-baseline.md) 的旧口径仍为现行合同。接受本方案时同步修订这些属主、[`0010`](0010-identity-and-consoles.md) 的账单读、词汇表与接口约定；其中 `0001` C7、V-C6、V-D5 的客户“持有中”展示要求必须改为仅显示已结算余额。不能仅改代码而留下“预授权扣余额并写 `hold` / `release` 流水”或“余额就是可用额”的正文。
 
 没有已上线账务数据需要转换。实现采用新建或调整数据库迁移并以干净开发库验证完整迁移链，不对已应用的迁移文件做历史改写，也不承担旧流水回填。账户页面布局工作与本方案的金额语义改动分别验收。
 
 ## 7. 验证切入点
 
-用无费用的假上游和 PostgreSQL 合同用例覆盖：同账户并发占用、幂等重放、充值与结算竞争、Hold 为零、实收小于/等于/大于 Hold、确定失败与不确定结果、人工释放、重复收尾、零实收、平台成本、每日消费跨 UTC 日、跨天结算账单、Redis 断连和倒序写回。断言账户当前额、每笔 Hold、实际流水、Job 状态及客户和管理员响应逐项一致；浏览器用例检查客户页面只显示可用余额，不出现持有中或单笔预授权金额；同时检查受理与余额读取的 SQL 不按历史流水求和。
+用无费用的假上游和 PostgreSQL 合同用例覆盖：同账户并发占用、幂等重放、充值与结算竞争、Hold 为零、实收小于/等于/大于 Hold、确定失败与不确定结果、人工释放、重复收尾、零实收、平台成本、每日消费跨 UTC 日、跨天结算账单、Redis 断连和倒序写回。断言账户当前额、每笔 Hold、实际流水、Job 状态及客户和管理员响应逐项一致；浏览器用例检查客户页面只显示已结算余额，不出现可用额、持有中或单笔预授权金额；同时检查受理与余额读取的 SQL 不按历史流水求和。
