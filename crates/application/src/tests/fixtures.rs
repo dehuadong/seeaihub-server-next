@@ -235,6 +235,7 @@ pub(super) fn descriptor() -> AdapterDescriptor {
             ImageBranch::Masked,
         ],
         max_reference_images: 1,
+        declares_cost: true,
     }
 }
 

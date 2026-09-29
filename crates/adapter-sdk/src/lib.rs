@@ -304,6 +304,12 @@ pub struct AdapterDescriptor {
     ///
     /// 只管输入：输出张数由合同声明的 `n` 表达，与这个数不是一回事，别拿它当输出上限。
     pub max_reference_images: u64,
+    /// 这条通路的**上游响应会不会带金额**（`cost`）。
+    ///
+    /// `true`：终态里能读到实扣金额，`upstream_declared` 那两种形态（成本按声明取、对客按声明
+    /// 金额 × 倍率）发得出去。`false`：上游只回四分项 `usage`，金额由平台按费率自算，声明
+    /// `upstream_declared` 的候选发布期就拒——否则受理时收不到金额，结算只能记成本缺口。
+    pub declares_cost: bool,
 }
 
 #[derive(Debug, Clone, Error)]

@@ -4860,6 +4860,25 @@ impl RuntimeService {
                 ApplicationError::Validation(format!("unknown adapter {}", offering.adapter_key))
             })?;
         validate_adapter_compatibility(&offering, &descriptor)?;
+        // **渠道能力**：声明"上游给金额"的候选，要求这条通路真的会把金额交回来。能力是驱动器的
+        // 事实——AIHubMix 只回四分项 `usage`，金额由平台按费率自算；APIMart 的终态另带 `cost`。
+        // 工程师把成本形态或对客形态写歪就在这里点名拒绝，不等到受理或结算才发现收不到钱。
+        if !descriptor.declares_cost {
+            if offering.formula == PricingFormula::UpstreamDeclared {
+                return Err(ApplicationError::Validation(format!(
+                    "offering {}: formula is upstream_declared but adapter {} does not declare a \
+                     cost (this channel returns usage only)",
+                    offering.provider_model_id, offering.adapter_key
+                )));
+            }
+            if offering.consumer_formula == PricingFormula::UpstreamDeclared {
+                return Err(ApplicationError::Validation(format!(
+                    "offering {}: consumer_formula is upstream_declared but adapter {} does not \
+                     declare a cost (the consumer price cannot be computed)",
+                    offering.provider_model_id, offering.adapter_key
+                )));
+            }
+        }
         // 尺寸换算声明也是**发布数据**：源字段必须在合同里（否则客户端提交不了它）、目标字段必须
         // 被这条供给的承载面声明（否则换算出来的值发不出去），档案必须成形状。写歪了在这里拒绝，
         // 不让它到受理期才变成一条"这条候选换算不出"的平台侧故障。

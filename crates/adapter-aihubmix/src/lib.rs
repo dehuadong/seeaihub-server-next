@@ -52,6 +52,9 @@ impl AdapterFactory for AihubmixAdapterFactory {
                 ImageBranch::Masked,
             ],
             max_reference_images: 16,
+            // AIHubMix 只回四分项 `usage`，金额由平台按费率自算：声明"上游给金额"的候选
+            // （成本或对客）在这条通路上发布期就拒。
+            declares_cost: false,
         })
     }
 

@@ -79,6 +79,9 @@ impl AdapterFactory for ApimartAdapterFactory {
                 ImageBranch::Masked,
             ],
             max_reference_images: 16,
+            // APIMart 的终态另带 `cost`（实扣金额，含渠道侧折扣）：声明"上游给金额"的候选
+            // 在这条通路上成立。
+            declares_cost: true,
         })
     }
 

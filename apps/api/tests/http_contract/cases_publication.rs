@@ -2043,7 +2043,8 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
     assert!(message(&body).contains("markup_bps is required"), "{body}");
 
-    // 8) 给它倍率（没有价目表也可以）：发布成功，受理照常、快照冻结成本形态与单价。
+    // 8) 给倍率也不行：AIHubMix 只回四分项 `usage`、**声明不了金额**，对客按上游金额这条形态在它
+    //    身上发布期就拒（渠道能力，`0012` §4）。
     let (status, body) = publish(
         &client,
         &base_url,
@@ -2053,11 +2054,8 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
         Some(2_000),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::OK,
-        "成本按张、对客按上游金额，没有价目表照样发布：{body}"
-    );
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("does not declare a cost"), "{body}");
 
     // 9) 对客选上游金额却带一份对客四档向量：那份向量只属对客按 token 四档，永远不会被读。
     let mut declared_with_rates = per_image.clone();
@@ -2081,6 +2079,30 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     assert!(
         message(&body).contains("consumer_rates_cny does not apply to consumer_formula"),
         "{body}"
+    );
+
+    // 10) 对客按 token 四档：同样不要价目表，发布成功；受理照常、快照冻结成本形态与单价。
+    let mut token_priced = per_image.clone();
+    token_priced["consumer_formula"] = json!("token_rates");
+    token_priced["consumer_rates_cny"] = json!({
+        "text_input_micros_per_million": 35_500_000u64,
+        "image_input_micros_per_million": 56_800_000u64,
+        "text_output_micros_per_million": 71_000_000u64,
+        "image_output_micros_per_million": 213_000_000u64
+    });
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![token_priced],
+        Some(2_000),
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "成本按张、对客按 token 四档，没有价目表照样发布：{body}"
     );
 
     // 落库：形态与单价在供给行上，价目行为 0、条目上的 Price Plan 为空。
@@ -2133,7 +2155,7 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     assert_eq!(snapshot["formula"], json!("per_image"));
     assert_eq!(snapshot["cost_unit_price_microusd"], json!(11_354));
     assert_eq!(snapshot["cost_currency"], json!("USD"));
-    assert_eq!(snapshot["consumer_formula"], json!("upstream_declared"));
+    assert_eq!(snapshot["consumer_formula"], json!("token_rates"));
     assert!(
         snapshot["fx_rate"].is_object(),
         "声明了成本币种就把折算率冻结下来（毛利要用它）：{snapshot}"
@@ -3051,4 +3073,70 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
     );
 
     drop_isolated_database(&database_name).await;
+}
+
+/// **渠道能力**：声明"上游给金额"的候选，要求这条通路真的会把金额交回来。
+///
+/// 能力是驱动器的事实（见 [`AdapterDescriptor::declares_cost`]）：AIHubMix 只回四分项 `usage`、
+/// 金额由平台按费率自算，所以成本形态或对客形态写 `upstream_declared` 在这条通路上发布期就拒并
+/// 点名驱动器；APIMart 的终态带 `cost`，同样两份在它那里成立（见 `cases_cost_facts`）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_upstream_declared_form_requires_a_channel_that_declares_a_cost() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    let publish = async |offering: Value| {
+        let body = publication_body(
+            Harness::MODEL,
+            "route-test-1",
+            None,
+            vec![offering],
+            Some(2_000),
+        );
+        let response = client
+            .post(format!("{}/api/v1/runtime-revisions", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&body)
+            .send()
+            .await
+            .expect("runtime publication");
+        let status = response.status();
+        let text = response.text().await.expect("publication body");
+        (status, text)
+    };
+
+    // 成本按上游声明金额：这条通路给不出金额。
+    let mut cost_declared = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    cost_declared["base_url"] = Value::String(harness.upstream_base_url.clone());
+    cost_declared["formula"] = json!("upstream_declared");
+    cost_declared["price_plan"] = Value::Null;
+    cost_declared["cost_currency"] = json!("USD");
+    cost_declared["reference_cost_microusd"] = json!(11_354);
+    cost_declared["cost_basis"] = json!("declared");
+    cost_declared["tier_prices"] = json!({});
+    cost_declared["floor_amounts"] = openai_floor_amounts();
+    let (status, text) = publish(cost_declared).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {text}");
+    assert!(text.contains("does not declare a cost"), "{text}");
+
+    // 成本按 token、对客选上游声明金额：同样算不出对客价。
+    let mut consumer_declared = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    consumer_declared["base_url"] = Value::String(harness.upstream_base_url.clone());
+    consumer_declared["consumer_formula"] = json!("upstream_declared");
+    consumer_declared["consumer_rates_cny"] = Value::Null;
+    consumer_declared["reference_cost_microusd"] = json!(11_354);
+    consumer_declared["cost_basis"] = json!("computed");
+    consumer_declared["tier_prices"] = json!({});
+    consumer_declared["floor_amounts"] = openai_floor_amounts();
+    let (status, text) = publish(consumer_declared).await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {text}");
+    assert!(text.contains("does not declare a cost"), "{text}");
+
+    harness.cleanup().await;
 }
