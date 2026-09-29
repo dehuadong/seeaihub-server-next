@@ -123,11 +123,11 @@ test('选厂商、勾供给、给价，发布一个平台模型', async ({ reque
   await page.getByTestId('platform-pick-E2EChannel-e2e-upstream-model').check();
 
   // 定价处显示的折算率与刚在折算率页看到的是同一个数。
-  const fxShown = await page.getByText(/当前折算率/).first().innerText();
-  expect(fxShown, `定价处应当显示 7.2 这个折算率：${fxShown}`).toContain('7.2');
+  await expect(page.getByText(/折算率 USD → CNY：7\.2/)).toBeVisible();
 
-  for (const [index, value] of [9_000_000, 14_000_000, 18_000_000, 54_000_000].entries()) {
-    await page.getByTestId(`platform-cny-${index}`).fill(String(value));
+  // 四档金额按**渠道原币种**（USD）填，默认取该渠道的费率表；这里改成 9/14/18/54。
+  for (const [index, value] of [9, 14, 18, 54].entries()) {
+    await page.getByTestId(`platform-amount-${index}`).fill(String(value));
   }
 
   await page.getByTestId('platform-publish').click();
@@ -148,5 +148,5 @@ test('选厂商、勾供给、给价，发布一个平台模型', async ({ reque
   expect(model, '发布出来的平台模型要能在目录里查到').toBeTruthy();
   expect(model?.vendor_id).toBe('OpenAI');
   // **P4：这一条候选带的是这次给的那份对客费率**（倍率是平台模型级一个，另外断言）。
-  expect(model?.candidates[0]?.consumer_rates_cny?.text_input_micros_per_million).toBe(9_000_000);
+  expect(model?.candidates[0]?.consumer_rates_cny?.text_input_micros_per_million).toBe(77_760_000);
 });

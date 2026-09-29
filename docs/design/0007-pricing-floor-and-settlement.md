@@ -60,7 +60,7 @@
 
 **对客计价形态随修订发布、随 Job 快照冻结**：成本形态在 `supply.offerings.formula`（工程登记），两者分处不同字段与生命周期；落点沿用 `consumer_rates_cny` 的同一模式——`runtime_revisions` 上**按候选键的 jsonb**（[`0009`](../../migrations/0009_pricing_floor_and_settlement.sql)），受理时随 Job 快照冻结。
 
-**对客 token 价目由平台维护、初始值取自该 vendor／模型已知的渠道价目**（如 AIHubMix 的四档 `$5 / $8 / $10 / $30` 每 1M tokens，按折算率折 CNY，可由倍率推导；见 [`out-reference/aihubmix/gpt-image-2.md`](../../out-reference/aihubmix/gpt-image-2.md)），运营可改。它**不依赖该候选的成本单价**，所以成本为标量（`upstream_declared`，APIMart）的候选同样能按 token 四档卖。这也是 vendor 厂商默认的四档 token 定价方式。
+**对客 token 价目由平台维护、初始值取自该 vendor／模型已知的渠道价目**（如 AIHubMix 的四档 `$5 / $8 / $10 / $30` 每 1M tokens，按折算率折 CNY，可由倍率推导；见 [`out-reference/aihubmix/gpt-image-2.md`](../../out-reference/aihubmix/gpt-image-2.md)），运营在发布页改的是**渠道原币种**金额（默认就是这张表），人民币对客价由同一乘法算出。它**不依赖该候选的成本单价**，所以成本为标量（`upstream_declared`，APIMart）的候选同样能按 token 四档卖。这也是 vendor 厂商默认的四档 token 定价方式。
 
 **发布期校验的是能力，不是某一次的值**：对客选 token 四档要求该渠道／驱动器**能提供**四分项 `usage`（两家都提供，见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 与 [`adapter-apimart`](../../crates/adapter-apimart/src/lib.rs)）；选上游金额要求渠道**能声明** `cost`。能力给不出即拒并点名。
 

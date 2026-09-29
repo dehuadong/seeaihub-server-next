@@ -31,6 +31,14 @@ function parseConsumerFormula(value: string | null | undefined): ConsumerFormula
   return value === 'token_rates' || value === 'upstream_declared' ? value : null;
 }
 
+/// 微单位 ↔ 原币种金额：库里存的是微单位（`5000000` = $5／每 1M token），给运营看与填的是**原币种
+/// 金额**（`5`）。换算在界面这一层做——运营不做单位换算。
+const MICRO_PER_UNIT = 1_000_000;
+const toMajor = (micros: number) => micros / MICRO_PER_UNIT;
+const toMicros = (value: number) => Math.round(value * MICRO_PER_UNIT);
+/// 微单位 → 人民币元的文本（`43200000` → `43.20`）。
+const yuanPerMillion = (micros: number) => (micros / MICRO_PER_UNIT).toFixed(2);
+
 /// 一条被勾中的候选：引用哪条 Offering、放在哪一档、权重多少、以及**这条候选的对客价**。
 ///
 /// 技术定义（驱动器、供应商模型名、渠道三要素、承载面、参数映射、限制）**不在这个表单里**——它们由被
@@ -41,13 +49,10 @@ type Selected = {
   weight: number;
   /// 对客计价形态：运营按候选选，与 Offering 的成本形态独立（`ADR-0021`）。
   consumerFormula: ConsumerFormula;
-  /// 对客选 token 四档时的四档 CNY 费率（每百万 token，微单位）。
-  /// `null` = 运营还没动过，按"该 vendor／模型已知渠道价目 × 倍率 × 折算率"实时推导；改动后固定为
-  /// 运营填的那份。
-  cny: [number, number, number, number] | null;
-  /// 该候选的参考成本与保底（`0007` §2 的载体）。
-  referenceCost: number;
-  floorAmounts: string;
+  /// 对客选 token 四档时的四档金额，**渠道原币种**（每百万 token，微单位）。
+  /// `null` = 运营还没动过，按"该 vendor／模型已知渠道价目"取默认值；改动后固定为运营填的那份。
+  /// 对客人民币价由它 × 折算率 × 倍率算出来，运营不直接填人民币微单位。
+  amounts: [number, number, number, number] | null;
 };
 
 /// 平台模型发布面板：**运营的那条路**。
@@ -117,30 +122,41 @@ export function PlatformModelPanel({
     return withRates[0] ?? null;
   }
 
-  /// 对客 token 四档的**初始值**：该 vendor／模型已知渠道价目 × 倍率 × 折算率（`0007` §2）。
+  /// 这条候选定价用的**渠道币种**：供给自己声明的优先，否则取那条已知价目的币种。
+  function pricingCurrency(offering: SelectableOffering): string | null {
+    return offering.cost_currency ?? knownRateSource(offering)?.cost_rates?.currency ?? null;
+  }
+
+  /// 四档金额的**默认值**：该 vendor／模型已知的渠道价目（原币种，每百万 token 微单位）。
   ///
-  /// 这是**推导**、不是平台替运营定价：值只是预填给运营看，改了就按他填的发布、随 Job 快照冻结。
-  /// 该 vendor／模型没有已知价目、或该币种没有折算率时返回 `null`——**不拿 0 顶替**：0 是一个真实的
-  /// 价（等于白送），而"推不出来"不是 0；界面会让运营自己填，空着不许发。
-  function derivedCny(offering: SelectableOffering): [number, number, number, number] | null {
+  /// 这是**默认值**、不是平台替运营定价：值只是预填给运营，改了就按他填的发布、随 Job 快照冻结。
+  /// 该 vendor／模型没有已知价目时返回 `null`——**不拿 0 顶替**：0 是一个真实的价（等于白送），
+  /// 而"没有默认值"不是 0；界面让运营自己填，空着不许发。
+  function defaultAmounts(offering: SelectableOffering): [number, number, number, number] | null {
     const known = knownRateSource(offering)?.cost_rates;
     if (!known) return null;
-    const fx = fxRate(known.currency);
-    if (fx === null) return null;
-    const scale = fx * multiplier;
-    const convert = (value: number) => Math.round(value * scale);
     return [
-      convert(known.text_input_microusd_per_million),
-      convert(known.image_input_microusd_per_million),
-      convert(known.text_output_microusd_per_million),
-      convert(known.image_output_microusd_per_million),
+      known.text_input_microusd_per_million,
+      known.image_input_microusd_per_million,
+      known.text_output_microusd_per_million,
+      known.image_output_microusd_per_million,
     ];
   }
 
-  /// 一条候选对客选 token 四档时实际会发出去的费率：运营填过就用他填的，否则用推导值；
-  /// 推不出来（没有渠道费率 / 折算率）时是 `null`——那时不能发，由 `publish` 先拦。
+  /// 这条候选实际用的四档金额：运营填过就用他填的，否则用默认值。
+  function effectiveAmounts(item: Selected): [number, number, number, number] | null {
+    return item.amounts ?? defaultAmounts(item.offering);
+  }
+
+  /// 对客人民币价（每百万 token，微单位）= **原币种金额 × 折算率 × 倍率**（`0007` §2）。
+  /// 金额或折算率缺一个就是 `null`——那时不能发，由 `publish` 先拦。
   function effectiveCny(item: Selected): [number, number, number, number] | null {
-    return item.cny ?? derivedCny(item.offering);
+    const amounts = effectiveAmounts(item);
+    if (!amounts) return null;
+    const fx = fxRate(pricingCurrency(item.offering));
+    if (fx === null) return null;
+    const scale = fx * multiplier;
+    return amounts.map((value) => Math.round(value * scale)) as [number, number, number, number];
   }
 
   // 改价：把已发布型号现有的候选与价带出来。候选的 `offering_id` 从模型视图的候选里拿——
@@ -150,20 +166,36 @@ export function PlatformModelPanel({
   // （第一条 effect 会在数据到达之前跑完）。只依赖 `editing` 会让改价抽屉打开后一条候选都没有，
   // 运营看到的是"这个型号没有供给"——而那是错的信息。
   //
-  // `loaded` 这个 ref 保证**只灌一次**：数据是每次渲染新建的对象，光看依赖会反复把运营改过的价覆盖
-  // 回上一版的值（改价改到一半被"还原"，是个很难查的 bug）。
-  const loaded = useRef<string | null>(null);
+  // 灌两次就够：第一次在数据到齐时，第二次在**折算率表**到达时（已发布的是人民币价，要反推回渠道
+  // 原币种金额；没有折算率就反推不出来）。`touched` 之后不再灌——数据是每次渲染新建的对象，光看依赖
+  // 会反复把运营改过的值覆盖回上一版。
+  const loadedEditing = useRef<string | null>(null);
+  const loadedWithFx = useRef(false);
+  const touched = useRef(false);
   useEffect(() => {
-    if (!editing) return;
-    if (loaded.current === editing) return;
+    if (!editing) {
+      loadedEditing.current = null;
+      loadedWithFx.current = false;
+      touched.current = false;
+      return;
+    }
+    if (loadedEditing.current !== editing) {
+      loadedEditing.current = editing;
+      loadedWithFx.current = false;
+      touched.current = false;
+    }
+    const hasFx = Boolean(rates.data);
+    if (loadedWithFx.current === hasFx) return;
+    if (touched.current) return;
     const listing = models.data?.gateway_models;
     if (!listing) return;
     const model = listing.find((item) => item.gateway_model === editing);
     if (!model) return;
-    loaded.current = editing;
+    loadedWithFx.current = hasFx;
     setName(model.gateway_model);
     setVendor(model.vendor_id);
     setMarkupBps(model.markup_bps ?? 2000);
+    const modelMultiplier = 1 + (model.markup_bps ?? 2000) / 10000;
     setSelected(
       model.candidates.map((candidate, index) => {
         const offering = all.find((item) => item.offering_id === candidate.offering_id);
@@ -182,6 +214,24 @@ export function PlatformModelPanel({
             cost_rates: null,
             enabled: candidate.enabled,
           } satisfies SelectableOffering);
+        // 已发布的是**人民币**价，反推回渠道原币种金额：界面给运营看与改的是原币种金额，人民币价由它
+        // 算出来。缺折算率或没带价时交给默认值。
+        const published = candidate.consumer_rates_cny;
+        const fx = fxRate(pricingCurrency(resolved));
+        const amounts =
+          published && fx !== null
+            ? ([ 
+                published.text_input_micros_per_million,
+                published.image_input_micros_per_million,
+                published.text_output_micros_per_million,
+                published.image_output_micros_per_million,
+              ].map((value) => Math.round(value / (fx * modelMultiplier))) as [
+                number,
+                number,
+                number,
+                number,
+              ])
+            : null;
         return {
           offering: resolved,
           priority: index,
@@ -190,23 +240,14 @@ export function PlatformModelPanel({
             parseConsumerFormula(candidate.consumer_formula) ??
             parseConsumerFormula(resolved.formula) ??
             'token_rates',
-          // 已发布的对客费率是运营确认过的那份，原样带回来；这一版没有就交给"按成本推导"。
-          cny: candidate.consumer_rates_cny
-            ? [
-                candidate.consumer_rates_cny.text_input_micros_per_million,
-                candidate.consumer_rates_cny.image_input_micros_per_million,
-                candidate.consumer_rates_cny.text_output_micros_per_million,
-                candidate.consumer_rates_cny.image_output_micros_per_million,
-              ]
-            : null,
-          referenceCost: candidate.reference_cost_microusd ?? 0,
-          floorAmounts: '{}',
+          amounts,
         };
       }),
     );
-  }, [editing, models.data, all]);
+  }, [editing, models.data, all, rates.data]);
 
   function toggle(offering: SelectableOffering, checked: boolean) {
+    touched.current = true;
     setSelected((list) =>
       checked
         ? [
@@ -217,9 +258,7 @@ export function PlatformModelPanel({
               weight: 1,
               // 对客形态的默认是**按 token 四档**（平台主流收法），运营可以立刻在下拉里改。
               consumerFormula: 'token_rates',
-              cny: null,
-              referenceCost: 0,
-              floorAmounts: '{}',
+              amounts: null,
             },
           ]
         : list.filter((item) => item.offering.offering_id !== offering.offering_id),
@@ -227,11 +266,34 @@ export function PlatformModelPanel({
   }
 
   function patch(offeringId: string, change: Partial<Selected>) {
+    touched.current = true;
     setSelected((list) =>
       list.map((item) =>
         item.offering.offering_id === offeringId ? { ...item, ...change } : item,
       ),
     );
+  }
+
+  const [fxDraft, setFxDraft] = useState<Record<string, number | null>>({});
+  const [recordingFx, setRecordingFx] = useState<string | null>(null);
+
+  /// 当场录一条折算率——缺它就算不出人民币对客价。录完重取折算率表，界面立刻出结果。
+  async function recordFx(currency: string) {
+    const value = fxDraft[currency];
+    if (!value || value <= 0) {
+      setError('折算率要填一个大于 0 的数');
+      return;
+    }
+    setRecordingFx(currency);
+    setError(null);
+    try {
+      await client.upsertFxRate(currency, Math.round(value * MICRO_PER_UNIT));
+      rates.reload();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      setRecordingFx(null);
+    }
   }
 
   /// 按表单拼出**引用式**发布命令。只有商务字段：引用、档位、权重、对客形态与对客价。
@@ -258,16 +320,9 @@ export function PlatformModelPanel({
             };
           }
         }
-        if (item.referenceCost > 0) reference.reference_cost_microusd = item.referenceCost;
-        if (item.offering.cost_currency) reference.cost_currency = item.offering.cost_currency;
-        const floors = item.floorAmounts.trim();
-        if (floors && floors !== '{}') {
-          try {
-            reference.floor_amounts = JSON.parse(floors);
-          } catch {
-            throw new Error('保底表不是合法 JSON');
-          }
-        }
+        // 渠道币种是**成本侧的管道**，不是运营填的字段：服务端按它取折算率、把成本折成人民币做毛利。
+        const currency = pricingCurrency(item.offering);
+        if (currency) reference.cost_currency = currency;
         return reference;
       }),
     };
@@ -288,7 +343,7 @@ export function PlatformModelPanel({
           (item) => item.consumerFormula === 'token_rates' && effectiveCny(item) === null,
         )
       ) {
-        throw new Error('按 token 四档要先填对客费率');
+        throw new Error('按 token 四档要先给四档金额，并给该币种的折算率');
       }
       const published = await client.publishRevision(buildCommand());
       setDone({ gateway_model: published.gateway_model });
@@ -387,6 +442,8 @@ export function PlatformModelPanel({
               );
               const rateSource = knownRateSource(offering);
               const known = rateSource?.cost_rates ?? null;
+              const currency = pricingCurrency(offering);
+              const shownAmounts = picked ? effectiveAmounts(picked) : null;
               const shownCny = picked ? effectiveCny(picked) : null;
               return (
                 <div key={offering.offering_id}>
@@ -428,71 +485,65 @@ export function PlatformModelPanel({
 
                       {picked.consumerFormula === 'token_rates' ? (
                         <>
-                          {known ? (
-                            <Typography.Text type="secondary">
-                              初始值 = 该 vendor／模型已知渠道价目（取自 {rateSource?.provider_kind}）× 倍率 × 折算率：
-                              {known.currency} 文入{' '}
-                              {known.text_input_microusd_per_million}／图入{' '}
-                              {known.image_input_microusd_per_million}／文出{' '}
-                              {known.text_output_microusd_per_million}／图出{' '}
-                              {known.image_output_microusd_per_million}（微单位）
-                              {fxRate(known.currency) === null
-                                ? ` · 当前折算率未录——先去「折算率」录一行 ${known.currency} → CNY，否则发布会拒`
-                                : ` · 当前折算率 ${fxRate(known.currency)}`}
-                              。已按此预填，改动后按你填的发布。
-                            </Typography.Text>
-                          ) : (
-                            <Typography.Text type="secondary">
-                              这个 vendor／模型还没有已知的渠道 token 价目可推导——对客四档请按报价直接填，
-                              空着不许发。
-                            </Typography.Text>
-                          )}
-                          <Flex gap={8}>
+                          <Typography.Text type="secondary">
+                            {known
+                              ? `四档金额按渠道原币种（${known.currency}／每 1M token）填，默认取该 vendor／模型已知的渠道价目（取自 ${rateSource?.provider_kind}），可以改。`
+                              : '这个 vendor／模型还没有已知的渠道价目可作默认值——请按报价填四档金额（原币种），空着不许发。'}
+                            对客人民币价 = 金额 × 折算率 × 倍率（当前 ×{multiplier.toFixed(4)}）。
+                          </Typography.Text>
+                          <Flex gap={8} wrap>
                             {(['文入', '图入', '文出', '图出'] as const).map((label, index) => (
                               <InputNumber
                                 key={label}
-                                data-testid={`platform-cny-${index}`}
+                                data-testid={`platform-amount-${index}`}
                                 addonBefore={label}
-                                value={shownCny?.[index] ?? undefined}
+                                addonAfter={currency ?? undefined}
+                                min={0}
+                                value={
+                                  shownAmounts ? toMajor(shownAmounts[index] ?? 0) : undefined
+                                }
                                 onChange={(value) =>
                                   patch(offering.offering_id, {
-                                    cny: (shownCny ?? [0, 0, 0, 0]).map((current, at) =>
-                                      at === index ? Number(value ?? 0) : current,
+                                    amounts: (shownAmounts ?? [0, 0, 0, 0]).map((current, at) =>
+                                      at === index ? toMicros(Number(value ?? 0)) : current,
                                     ) as [number, number, number, number],
                                   })
                                 }
                               />
                             ))}
                           </Flex>
+                          {shownCny ? (
+                            <Typography.Text type="secondary">
+                              对客人民币价（每 1M token）：文入 ¥{yuanPerMillion(shownCny[0])}／图入 ¥
+                              {yuanPerMillion(shownCny[1])}／文出 ¥{yuanPerMillion(shownCny[2])}／图出 ¥
+                              {yuanPerMillion(shownCny[3])}
+                            </Typography.Text>
+                          ) : (
+                            <Typography.Text type="warning">
+                              还缺折算率，人民币对客价算不出来。
+                            </Typography.Text>
+                          )}
                         </>
                       ) : null}
 
-
                       {picked.consumerFormula === 'upstream_declared' ? (
                         <Typography.Text type="secondary">
-                          对客价按上游这次声明的金额 × 倍率（当前 ×{multiplier.toFixed(4)}）算，
+                          对客价按上游这次声明的金额 × 倍率（当前 ×{multiplier.toFixed(4)}）× 折算率算，
                           这里不用填价。
                         </Typography.Text>
                       ) : null}
 
-                      {offering.formula !== 'token_rates' ? (
-                        <Flex gap={8} wrap>
-                          <InputNumber
-                            addonBefore="参考成本（原币种微单位）"
-                            value={picked.referenceCost}
-                            onChange={(value) =>
-                              patch(offering.offering_id, { referenceCost: Number(value ?? 0) })
-                            }
-                          />
-                          <Input
-                            addonBefore="保底表 JSON"
-                            style={{ width: 280 }}
-                            value={picked.floorAmounts}
-                            onChange={(event) =>
-                              patch(offering.offering_id, { floorAmounts: event.target.value })
-                            }
-                          />
-                        </Flex>
+                      {currency ? (
+                        <FxRateRow
+                          currency={currency}
+                          rate={fxRate(currency)}
+                          draft={fxDraft[currency] ?? null}
+                          recording={recordingFx === currency}
+                          onDraft={(value) =>
+                            setFxDraft((current) => ({ ...current, [currency]: value }))
+                          }
+                          onRecord={() => void recordFx(currency)}
+                        />
                       ) : null}
 
                       <Flex gap={8}>
@@ -547,7 +598,9 @@ export function PlatformModelPanel({
                 render: (_, row) => {
                   if (row.consumerFormula === 'token_rates') {
                     const cny = effectiveCny(row);
-                    return cny === null ? '（未填）' : cny.join(' / ');
+                    return cny === null
+                      ? '（未填）'
+                      : cny.map((value) => `¥${yuanPerMillion(value)}`).join(' / ');
                   }
                   return '上游声明额 × 倍率';
                 },
@@ -565,6 +618,55 @@ export function PlatformModelPanel({
           </Button>
         </Panel>
       ) : null}
+    </Flex>
+  );
+}
+
+/// 一条候选定价处显示的**折算率**（该币种 → CNY）：有就显示当前值；缺就当场录。
+///
+/// 缺它就算不出人民币对客价，所以不让人跳去别的页面——录完（`upsertFxRate`）重取折算率表，界面立刻
+/// 出结果。
+function FxRateRow({
+  currency,
+  rate,
+  draft,
+  recording,
+  onDraft,
+  onRecord,
+}: {
+  currency: string;
+  rate: number | null;
+  draft: number | null;
+  recording: boolean;
+  onDraft: (value: number) => void;
+  onRecord: () => void;
+}) {
+  if (rate !== null) {
+    return (
+      <Typography.Text type="secondary">
+        折算率 {currency} → CNY：{rate}（在「折算率」页可改）
+      </Typography.Text>
+    );
+  }
+  return (
+    <Flex gap={8} align="center" wrap>
+      <Typography.Text type="warning">还没有 {currency} → CNY 的折算率</Typography.Text>
+      <InputNumber
+        data-testid="platform-fx-rate"
+        addonBefore={`1 ${currency} =`}
+        addonAfter="CNY"
+        min={0}
+        value={draft ?? undefined}
+        onChange={(value) => onDraft(Number(value ?? 0))}
+      />
+      <Button
+        size="small"
+        loading={recording}
+        data-testid="platform-fx-record"
+        onClick={onRecord}
+      >
+        记录折算率
+      </Button>
     </Flex>
   );
 }

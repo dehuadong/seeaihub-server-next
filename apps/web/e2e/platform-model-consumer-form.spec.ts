@@ -129,14 +129,18 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
   // 对客形态只有两项：按 token 四档 / 上游声明金额 × 倍率。`option` 是选择器的稳定角色。
   await expect(page.getByRole('option')).toHaveCount(2);
   await page.getByTitle('按 token 四档').last().click();
-  // 5/8/10/30（百万微单位，USD）× 7.2 × 1.2 = 43.2/69.12/86.4/259.2（百万微单位，CNY）。
-  await expect(page.getByTestId('platform-cny-0')).toHaveValue('43200000');
-  await expect(page.getByTestId('platform-cny-1')).toHaveValue('69120000');
-  await expect(page.getByTestId('platform-cny-2')).toHaveValue('86400000');
-  await expect(page.getByTestId('platform-cny-3')).toHaveValue('259200000');
-  // 运营可改：改过的值固定下来。
-  await page.getByTestId('platform-cny-0').fill('43200001');
-  await expect(page.getByTestId('platform-cny-0')).toHaveValue('43200001');
+  // 四档金额按**渠道原币种**（USD）预填：该 vendor／模型已知的渠道价目 5/8/10/30；
+  // 人民币对客价 = 金额 × 折算率 7.2 × 倍率 1.2 = 43.20/69.12/86.40/259.20（元／每 1M token）。
+  await expect(page.getByTestId('platform-amount-0')).toHaveValue('5');
+  await expect(page.getByTestId('platform-amount-1')).toHaveValue('8');
+  await expect(page.getByTestId('platform-amount-2')).toHaveValue('10');
+  await expect(page.getByTestId('platform-amount-3')).toHaveValue('30');
+  await expect(
+    page.getByText('对客人民币价（每 1M token）：文入 ¥43.20／图入 ¥69.12／文出 ¥86.40／图出 ¥259.20'),
+  ).toBeVisible();
+  // 运营可改：改的是**原币种金额**，人民币价跟着变（5.5 × 8.64 = 47.52）。
+  await page.getByTestId('platform-amount-0').fill('5.5');
+  await expect(page.getByText(/文入 ¥47\.52/)).toBeVisible();
   // 这条只用来验预填，不发布。
   await tokenPick.uncheck();
 
@@ -146,17 +150,22 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
   const declaredForm = page.getByTestId(`platform-consumer-form-APIMart-${declaredUpstream}`);
   // 默认不跟成本形态走：新候选的对客形态默认就是按 token 四档。
   await expect(declaredForm).toContainText('按 token 四档');
-  // 这条渠道自己没有费率，但同一模型的另一家渠道有——初始值取的就是那份。
-  await expect(page.getByTestId('platform-cny-0')).toHaveValue('43200000');
-  await expect(page.getByTestId('platform-cny-1')).toHaveValue('69120000');
-  await expect(page.getByTestId('platform-cny-2')).toHaveValue('86400000');
-  await expect(page.getByTestId('platform-cny-3')).toHaveValue('259200000');
-  // 运营可改。
-  for (const [index, value] of [7_000_000, 9_000_000, 11_000_000, 40_000_000].entries()) {
-    await page.getByTestId('platform-cny-' + index).fill(String(value));
+  // 这条渠道自己没有费率，但同一模型的另一家渠道有——默认金额取的就是那份（原币种 5/8/10/30）。
+  await expect(page.getByTestId('platform-amount-0')).toHaveValue('5');
+  await expect(page.getByTestId('platform-amount-1')).toHaveValue('8');
+  await expect(page.getByTestId('platform-amount-2')).toHaveValue('10');
+  await expect(page.getByTestId('platform-amount-3')).toHaveValue('30');
+  // 运营可改（原币种金额）。
+  for (const [index, value] of [7, 9, 11, 40].entries()) {
+    await page.getByTestId('platform-amount-' + index).fill(String(value));
   }
 
   await scanBody();
+  // **P3：成本侧与技术细节不在运营表单里**：参考成本、保底表 JSON、微单位一个都不该出现。
+  const pricingBody = await page.locator('body').innerText();
+  for (const gone of ['微单位', '参考成本', '保底表']) {
+    expect(pricingBody, `运营定价处不该出现 \`${gone}\``).not.toContain(gone);
+  }
   await page.getByTestId('platform-publish').click();
   await expect(page.getByText(platformName).first()).toBeVisible({ timeout: 15_000 });
 
@@ -181,7 +190,7 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
   );
   expect(candidate, 'APIMart 那条候选应当在').toBeTruthy();
   expect(candidate?.consumer_formula).toBe('token_rates');
-  expect(candidate?.consumer_rates_cny?.text_input_micros_per_million).toBe(7_000_000);
+  expect(candidate?.consumer_rates_cny?.text_input_micros_per_million).toBe(60_480_000);
 
   // 供给登记的成本形态没被对客选择改写：仍是 upstream_declared。
   const offerings = await request.get(adminApiUrl + '/api/v1/offerings', {
