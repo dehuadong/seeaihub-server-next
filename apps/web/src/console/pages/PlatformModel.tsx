@@ -33,8 +33,14 @@ function parseConsumerFormula(value: string | null | undefined): ConsumerFormula
 
 /// 这条通路**允许**的对客计价形态。按 token 四档总是可以（两家渠道都回四分项用量）；
 /// "上游声明金额 × 倍率"要求驱动器会从上游响应里取到金额——取不到就不该让运营选出来（发布期也会拒）。
-function consumerFormulas(declaresCost: boolean): { value: ConsumerFormula; label: string }[] {
-  return CONSUMER_FORMULAS.filter((item) => item.value === 'token_rates' || declaresCost);
+///
+/// 判据是**显式的 `false`**：字段缺失（前端与后端版本错位时）按"不确定"处理、两项都留着，
+/// 免得把一个本来能选的形态静默藏掉；真选错了发布期那道校验仍会拒。
+function consumerFormulas(declaresCost: boolean | undefined): {
+  value: ConsumerFormula;
+  label: string;
+}[] {
+  return CONSUMER_FORMULAS.filter((item) => item.value === 'token_rates' || declaresCost !== false);
 }
 
 /// 微单位 ↔ 原币种金额：库里存的是微单位（`5000000` = $5／每 1M token），给运营看与填的是**原币种
