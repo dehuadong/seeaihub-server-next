@@ -126,9 +126,13 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
   await tokenPick.check();
   const tokenForm = page.getByTestId(`platform-consumer-form-E2ECfToken-${tokenUpstream}`);
   await tokenForm.click();
-  // 对客形态只有两项：按 token 四档 / 上游声明金额 × 倍率。`option` 是选择器的稳定角色。
-  await expect(page.getByRole('option')).toHaveCount(2);
-  await page.getByTitle('按 token 四档').last().click();
+  // **AIHubMix 只回用量、不给金额**：这条通路的对客形态只有"按 token 四档"一项，
+  // "上游声明金额 × 倍率"不该被摆出来（发布期也会拒）。`option` 是选择器的稳定角色。
+  await expect(page.getByRole('option')).toHaveCount(1);
+  await expect(
+    page.getByText('这条通路只回用量、不给金额，所以对客只能按 token 四档。'),
+  ).toBeVisible();
+  await page.keyboard.press('Escape');
   // 四档金额按**渠道原币种**（USD）预填：该 vendor／模型已知的渠道价目 5/8/10/30；
   // 人民币对客价 = 金额 × 折算率 7.2 × 倍率 1.2 = 43.20/69.12/86.40/259.20（元／每 1M token）。
   await expect(page.getByTestId('platform-amount-0')).toHaveValue('5');
@@ -150,6 +154,10 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
   const declaredForm = page.getByTestId(`platform-consumer-form-APIMart-${declaredUpstream}`);
   // 默认不跟成本形态走：新候选的对客形态默认就是按 token 四档。
   await expect(declaredForm).toContainText('按 token 四档');
+  // APIMart 的终态带 `cost`：两种对客形态都成立，下拉里两项都在。
+  await declaredForm.click();
+  await expect(page.getByRole('option')).toHaveCount(2);
+  await page.keyboard.press('Escape');
   // 这条渠道自己没有费率，但同一模型的另一家渠道有——默认金额取的就是那份（原币种 5/8/10/30）。
   await expect(page.getByTestId('platform-amount-0')).toHaveValue('5');
   await expect(page.getByTestId('platform-amount-1')).toHaveValue('8');

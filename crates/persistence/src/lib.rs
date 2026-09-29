@@ -1002,6 +1002,8 @@ impl HubRepository for PgHubRepository {
                     provider_model_id: row.try_get("provider_model_id").map_err(database_error)?,
                     adapter_key: row.try_get("adapter_key").map_err(database_error)?,
                     formula: row.try_get("formula").map_err(database_error)?,
+                    // 驱动器的事实，仓库读不出来：由应用层按该 `adapter_key` 的声明覆盖。
+                    declares_cost: false,
                     cost_currency,
                     cost_rates,
                     enabled: row.try_get("enabled").map_err(database_error)?,

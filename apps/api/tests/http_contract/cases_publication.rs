@@ -3140,3 +3140,86 @@ async fn an_upstream_declared_form_requires_a_channel_that_declares_a_cost() {
 
     harness.cleanup().await;
 }
+
+/// **清单里带"这条通路会不会声明金额"**（`declares_cost`）：它决定"上游声明金额 × 倍率"这条对客
+/// 形态成不成立——界面据此过滤下拉、发布期据此拒绝。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_offering_list_reports_whether_the_channel_declares_a_cost() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    // AIHubMix：只回四分项用量、金额自己算。APIMart：终态带 `cost`。
+    let mut token = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    token["base_url"] = json!("https://token.example.com");
+    let mut declared = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
+    declared["base_url"] = json!("https://declared.example.com");
+    declared["formula"] = json!("upstream_declared");
+    declared["price_plan"] = Value::Null;
+    declared["cost_currency"] = json!("USD");
+    // 对客形态缺省等于成本形态：APIMart 那条缺省就是"上游声明金额 × 倍率"，所以要给倍率；
+    // AIHubMix 那条缺省是按 token 四档，给了倍率反而没人消费它。
+    for (model, offering, markup_bps) in [
+        ("token-model", token, None),
+        ("declared-model", declared, Some(2_000)),
+    ] {
+        let contract = surface_schema(json!({
+            "model": {"const": model},
+            "prompt": {"type": "string", "minLength": 1}
+        }));
+        let mut full = offering;
+        full["provider_model_id"] = json!(model);
+        full["capability_schema"]["properties"]["model"]["const"] = json!(model);
+        let mut body = json!({
+            "vendor_id": "OpenAI",
+            "native_model_id": model,
+            "native_revision": "route-test-1",
+            "actor": "contract-test",
+            "capability_schema": contract,
+            "offerings": [full]
+        });
+        if let Some(markup_bps) = markup_bps {
+            body["markup_bps"] = json!(markup_bps);
+        }
+        let response = client
+            .post(format!("{base_url}/api/v1/runtime-revisions"))
+            .bearer_auth(&admin_token)
+            .json(&body)
+            .send()
+            .await
+            .expect("inline publication");
+        let status = response.status();
+        let text = response.text().await.expect("inline publication body");
+        assert_eq!(status, StatusCode::OK, "{model} 应当发布成功：{text}");
+    }
+
+    let listing = client
+        .get(format!("{base_url}/api/v1/offerings"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("offering list");
+    let body: Value = listing.json().await.expect("offering list body");
+    let offerings = body["offerings"].as_array().expect("offerings").clone();
+    let find = |model: &str| {
+        offerings
+            .iter()
+            .find(|item| item["native_model_id"] == json!(model))
+            .unwrap_or_else(|| panic!("{model} 应当在清单里：{body}"))
+            .clone()
+    };
+    assert_eq!(
+        find("token-model")["declares_cost"],
+        json!(false),
+        "AIHubMix 只回用量、不给金额"
+    );
+    assert_eq!(
+        find("declared-model")["declares_cost"],
+        json!(true),
+        "APIMart 的终态带 cost"
+    );
+
+    drop_isolated_database(&database_name).await;
+}

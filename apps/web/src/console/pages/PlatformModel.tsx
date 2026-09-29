@@ -31,6 +31,12 @@ function parseConsumerFormula(value: string | null | undefined): ConsumerFormula
   return value === 'token_rates' || value === 'upstream_declared' ? value : null;
 }
 
+/// 这条通路**允许**的对客计价形态。按 token 四档总是可以（两家渠道都回四分项用量）；
+/// "上游声明金额 × 倍率"要求驱动器会从上游响应里取到金额——取不到就不该让运营选出来（发布期也会拒）。
+function consumerFormulas(declaresCost: boolean): { value: ConsumerFormula; label: string }[] {
+  return CONSUMER_FORMULAS.filter((item) => item.value === 'token_rates' || declaresCost);
+}
+
 /// 微单位 ↔ 原币种金额：库里存的是微单位（`5000000` = $5／每 1M token），给运营看与填的是**原币种
 /// 金额**（`5`）。换算在界面这一层做——运营不做单位换算。
 const MICRO_PER_UNIT = 1_000_000;
@@ -210,6 +216,9 @@ export function PlatformModelPanel({
             provider_model_id: candidate.provider_model_id,
             adapter_key: candidate.adapter_key,
             formula: 'token_rates',
+            // 这条供给不在可选清单里（已删/停用）时查不到驱动器声明；对**已发布**的候选取宽松值，
+            // 免得把已经发出去的"上游声明金额"形态在改价时藏掉。
+            declares_cost: true,
             cost_currency: candidate.cost_currency,
             cost_rates: null,
             enabled: candidate.enabled,
@@ -473,13 +482,16 @@ export function PlatformModelPanel({
                           data-testid={`platform-consumer-form-${offering.provider_kind}-${offering.provider_model_id}`}
                           style={{ minWidth: 200 }}
                           value={picked.consumerFormula}
-                          options={CONSUMER_FORMULAS}
+                          options={consumerFormulas(offering.declares_cost)}
                           onChange={(value: ConsumerFormula) =>
                             patch(offering.offering_id, { consumerFormula: value })
                           }
                         />
                         <Typography.Text type="secondary">
                           与成本形态（{offering.formula}）相互独立：成本怎么算由渠道定，对客怎么收你定。
+                          {offering.declares_cost
+                            ? ''
+                            : '这条通路只回用量、不给金额，所以对客只能按 token 四档。'}
                         </Typography.Text>
                       </Flex>
 

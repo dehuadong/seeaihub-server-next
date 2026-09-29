@@ -4656,7 +4656,16 @@ impl RuntimeService {
     pub async fn selectable_offerings(
         &self,
     ) -> Result<Vec<SelectableOfferingView>, ApplicationError> {
-        self.repository.selectable_offerings().await
+        let mut offerings = self.repository.selectable_offerings().await?;
+        for offering in &mut offerings {
+            // 渠道能力是**驱动器的事实**，不是仓库能读出来的：能不能声明金额，决定"上游声明金额 ×
+            // 倍率"这条对客形态在这条通路上成不成立。界面据此过滤下拉，发布期据此拒绝。
+            offering.declares_cost = self
+                .adapters
+                .descriptor(&offering.adapter_key)
+                .is_some_and(|descriptor| descriptor.declares_cost);
+        }
+        Ok(offerings)
     }
 
     /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。
@@ -5113,6 +5122,11 @@ pub struct SelectableOfferingView {
     pub adapter_key: String,
     /// 这条供给按什么计价（`token_rates` / `per_image` / `per_call` / `upstream_declared`）。
     pub formula: String,
+    /// 这条通路的驱动器**会不会从上游响应里取到金额**（`AdapterDescriptor::declares_cost`）。
+    ///
+    /// 它决定"上游声明金额 × 倍率"这条对客形态在这条通路上成不成立：界面据此过滤下拉、发布期据此
+    /// 拒绝。由应用层按驱动器声明填——仓库不认识驱动器。
+    pub declares_cost: bool,
     /// 渠道成本币种与 `token_rates` 的四档费率（别的形态没有费率）。
     pub cost_currency: Option<String>,
     pub cost_rates: Option<PricePlanRates>,
