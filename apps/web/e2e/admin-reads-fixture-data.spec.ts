@@ -69,7 +69,7 @@ test.describe('管理页面读的是库里的数据', () => {
     await expect(row).toContainText('offering-e2e=8000');
   });
 
-  test('账户页的详情里显示刚建的账户与它的余额', async ({ page, request }) => {
+  test('账户页显示刚建的账户与它的余额', async ({ page, request }) => {
     const opened = await request.post(`${adminApiUrl}/api/v1/accounts`, {
       headers: { authorization: `Bearer ${settings.adminToken}` },
       data: { initial_credit_microusd: 12_340_000 },
@@ -82,14 +82,13 @@ test.describe('管理页面读的是库里的数据', () => {
     await goTo(page, '账户');
 
     // 在这一页上按刚建的账户标识去读余额：读出来的必须正是那个数（12.34 元）。
-    // 余额现在在**详情抽屉**里（账户页是"先搜到再操作"：列表 → 详情），所以先打开。
+    // 选中一个账户之后，余额直接显示在账户那一行（`#39`：没有「打开」、没有抽屉）。
     await page.getByTestId('accounts-lookup-id').fill(accountId);
     await page.getByTestId('accounts-open-by-id').click();
 
     // antd 会把文本切成多个节点，`getByText('12.34 元')` 匹配不到——按容器 + 归一化文本断言。
-    const balanceBlock = page.locator('.ant-drawer').locator('.ant-descriptions').first();
-    await expect(balanceBlock).toContainText('12.34');
-    await expect(balanceBlock).toContainText('元');
+    await expect(page.getByTestId('accounts-balance')).toContainText('12.34');
+    await expect(page.getByTestId('accounts-balance')).toContainText('元');
   });
 
   test('对账与诊断页把三块读出来，空库时显示空态而不是报错', async ({ page }) => {
