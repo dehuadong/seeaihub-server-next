@@ -1,7 +1,7 @@
 主题: 身份与控制台的技术设计
 当前修订: v1
 状态: 待评审
-承接: `docs/specs/0001-admin-and-customer-consoles.md` v1（待评审；本文按该修订起草，Spec 定稿后随之确认）
+承接: [`0001` 控制台 Spec v13](../specs/0001-admin-and-customer-consoles.md) 的身份与页面组织；账户金额及账单行为由 [`0002` 账户资金 Spec v3](../specs/0002-account-funds-and-reservations.md) 承接
 依赖: [`docs/design/0006`](./0006-gateway-models-and-consumer-surface.md)、[`0007`](./0007-pricing-floor-and-settlement.md)、[`0008`](./0008-routing-strategy-and-caching.md)、[`0009`](./0009-operational-baseline.md)；`ADR-0003`、`ADR-0015`、`ADR-0016`、`ADR-0017`
 
 # 身份与控制台的技术设计
@@ -141,28 +141,28 @@
 | `GET` | `/v1/customer/api-keys` | 客户会话 | — | `200 {keys:[{key_id, label, created_at, revoked_at}]}`（**无明文**） |
 | `POST` | `/v1/customer/api-keys` | 客户会话 | `{label}` | `201 {key_id, api_key}`（明文只此一次） |
 | `DELETE` | `/v1/customer/api-keys/{key_id}` | 客户会话 | — | `204`；不属于自己 ⇒ `404` |
-| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, updated_at}` |
+| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示已结算余额 |
 | `GET` | `/v1/customer/ledger` | 客户会话 | `?since=&until=&limit=` | `200 {entries:[{kind, amount_microusd, job_id, created_at}], count, total, truncated}`（充值与扣费都在这里；金额带符号，符号是语义的一部分。`[since, until)` 是半开区间，与 `billing` 同一条口径——同一区间下明细与汇总必须对得上） |
-| `GET` | `/v1/customer/usage` | 客户会话 | `?since=&until=&limit=` | `200 {usage:[{gateway_model, kind, status, created_at, image_count, charged_microusd}], count, truncated}` |
+| `GET` | `/v1/customer/usage` | 客户会话 | `?since=&until=&limit=` | `200 {usage:[{gateway_model, kind, status, created_at, terminal_at, image_count, charged_microusd}], count, truncated}`；处理中请求的 `terminal_at` 为 `null` |
 | `GET` | `/v1/customer/billing` | 客户会话 | `?since=&until=` | `200 {since, until, requests, images, charged_microusd}`（**汇总按区间全量**，与 `usage` 的 `limit` 无关） |
 
 **未认证与越权是两个不同的答复**：没有凭据（或凭据无效、已过期、已退出）访问任一客户端点 ⇒ **未认证**（401，与管理员面同一条）；凭据有效但目标数据不属于这个账户 ⇒ **不存在**（404），不返回 403、也不说明存在性（Spec §4.2、V-C10）。
 
 **为什么把账务拆成四条而不是一个聚合响应**：汇总与明细的"口径"不同——汇总必须按区间全量算，明细按上限截断；塞进一个响应里，改一次页大小就会让"明细求和等于汇总"这条验收条件失效（Spec V-C8）。拆开之后，每条端点的语义各自稳定，页面按需组合。
 
-**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`status`、`created_at`、`image_count`、`charged_microusd`——**不含 Generation Job 的标识与内部状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为"对客不可见、不投射成对客协议"，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。
+**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`status`、`created_at`、`terminal_at`、`image_count`、`charged_microusd`——**不含 Generation Job 的标识与内部状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为"对客不可见、不投射成对客协议"，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。
 
 `status` 是一个**收敛过的三值**（`succeeded` / `failed` / `pending`），由内部 Job 状态与结算结果映射而来；映射写在拥有它的那个读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。"失败"只说这次没产出，不改写渠道侧的错误细节。
 
-**汇总怎么算**（Spec §4.3 的取数口径）：`requests` 与 `images` 按区间内**有结算结果的执行记录**数（成功与失败都算一次请求，失败那次产出张数为 0），`charged_microusd` 按区间内账本里的**扣费与调整条目**求和（`capture` 与 `adjustment`）——**预授权（`hold`）与它的释放（`release`）都不算**：那一对是同一笔钱的一进一出，加起来恒为零，把它们计进来只会得到"平台占用过多少"，不是扣费。`[since, until)` 是半开区间、按 UTC 解释。
+**汇总怎么算**：`requests` 与 `images` 按区间内到达终态的执行记录计，`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
 
 **为什么重置令牌也走摘要入库**：它等同于一次登录凭据（能改口令），因此与会话令牌同一条纪律——明文只在响应里，库里只有 SHA-256，且有独立更短的过期（`PASSWORD_RESET_TTL_SECONDS`，默认 30 分钟），用完即删。
 
-**对客账务读的路径与既有对客面分开**（`/v1/customer/*` 而不是把 `/v1/account` 扩展成多功能端点）：既有 `/v1/account` 的响应形状保持不变（Spec §6），新能力走新路径，老调用方零影响。
+**对客账务读的路径与既有对客面分开**：充值记录、用量与账单走 `/v1/customer/*`。`/v1/account` 的余额字段改为已结算余额并增加可用额字段；金额语义以[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §4 为准。
 
-### 4.3 复用（不改形状）
+### 4.3 账户读与流水端点
 
-`GET /api/v1/accounts/{id}/entries`（管理员流水）保持既有参数与字段的含义；后续只**增加**了可选的 `until`/`offset` 与响应的 `total`（见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；对客流水在 §4.2 的 `ledger` 里给**只读**的同一份事实，但按 `WHERE account_id = <会话账户>` 收窄。既有 `/v1/account`（对客读自己的余额与持有中）不改形状——Spec §6 要求既有对客协议逐字保持；本次新增的对客读走 `/v1/customer/*`，与它并存。
+`GET /api/v1/accounts/{id}/entries`（管理员流水）保留分页与区间查询，条目只含实际收支；对客流水在 §4.2 的 `ledger` 里按 `WHERE account_id = <会话账户>` 收窄，不展示预授权或释放。`/v1/account` 返回已结算余额，客户控制台只渲染该金额；内部占用与可用额仍用于受理判定。
 
 ### 4.4 页面 → 端点（逐页承接 Spec M1–M6、C5–C12）
 

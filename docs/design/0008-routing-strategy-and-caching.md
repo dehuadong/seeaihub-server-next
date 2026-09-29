@@ -1,12 +1,14 @@
 主题: 路由策略层与缓存（运营后台设计之三）
 当前修订: v1
-状态: 待评审（从原单文件 `0006-gateway-models-pricing-and-admin-console.md` 拆出）
+状态: 路由与非账务缓存规则保留；账户金额缓存与资金判定由 [`0013`](0013-account-funds-and-reservations.md) 承接
 来源: 工作项「运营后台：平台网关模型、对客定价与路由权重」与提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)；原单文件的 §4、§5、§7 与 §10 的路由部分
 依赖: [`0006`](./0006-gateway-models-and-consumer-surface.md)（网关模型与对客面）、[`0007`](./0007-pricing-floor-and-settlement.md)（定价、保底与结算）；`ADR-0003`、`ADR-0009`、`ADR-0011`、`ADR-0015`、`ADR-0017`、`ADR-0020`
 
 # 路由策略层与缓存
 
 本文是运营后台工作的技术设计之三，承载**路由策略层与缓存**：候选怎么排（`routing_priority`）、同档怎么分流（`weight`）、在一批合格候选里挑哪一条由**运营配置的策略**决定（`route_policies`），以及 Redis 作为路由与余额的**纯加速层**。网关模型与对客面见 [`0006`](./0006-gateway-models-and-consumer-surface.md)，定价与结算见 [`0007`](./0007-pricing-floor-and-settlement.md)。**本文只承载设计决策与边界**：改动点、迁移与验收清单归各切片工单（切片总表见 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)）。
+
+路由候选与 API Key 缓存由本文负责。账户金额快照、预检及 Redis 与 PostgreSQL 的一致性由[账户资金设计](0013-account-funds-and-reservations.md) §3 负责。
 
 **币种与汇率的取值规则归 [`0007`](./0007-pricing-floor-and-settlement.md)**：本文的 route 缓存值里带定价输入（`reference_cost_microusd` / `cost_currency` / `consumer_rates_cny` / `cost_basis` / `markup_bps`），但它们的口径与汇率（`pricing.fx_rates`）的取值规则都在 `0007`，本文不重复。
 
@@ -143,7 +145,7 @@
 
 **缓存，不是事实源。** `ADR-0003` 逐字适用：目录、发布、Job、结算与审计的事实权威是 PostgreSQL。因此本设计的硬约束是：
 
-- 所有**金额判定**与**选路结果**的正确性**不依赖 Redis**（唯一一处"缓存判定直接决定对客响应"的是 §7.4 的"凭新鲜缓存提前拒绝"：只读、无副作用、必留审计，且**扣减与余额事实仍只在 PG 里发生**，因此**不是**对 `ADR-0003` 的例外）；
+- 所有**金额判定**与**选路结果**的正确性**不依赖 Redis**；余额缓存不足时也由 PostgreSQL 确认后才返回 402，规则见[账户资金设计](0013-account-funds-and-reservations.md) §3；
 - Redis 不可用时平台**照常工作**（降级直查 DB），只是变慢；
 - 缓存与 DB 不一致时，**以 DB 为准**。
 
@@ -153,7 +155,7 @@
 | --- | --- | --- |
 | `route:<gateway_model>` | 生效修订的候选集：合同、承载面、参数映射、限制、`routing_priority`、`weight`、定价输入（**按候选的** `reference_cost_microusd` / `cost_currency` / `consumer_rates_cny` / `cost_basis`、修订级 `markup_bps`），**加发布修订标识 `runtime_revision_id`** | 发布成功后主动失效；另设 TTL |
 | `api_key:<sha256(key)>` | `account_id` | 吊销时主动删；另设 TTL |
-| `user_balance:<account_id>` | 余额（**CNY** 微单位，**可为负**——透支发生在结算，[`0007`](./0007-pricing-floor-and-settlement.md) §6 与本文 §8）+ 写入时间 + **来源标记**（`db_commit` / `reconciler`，§7.4） | 充值/受理/结算后立即写；另设 TTL |
+| `user_balance:<account_id>` | 已结算余额、持有中、可用额与数据库版本的快照（CNY 微单位；见[账户资金设计](0013-account-funds-and-reservations.md) §3） | 账户金额变化提交后写入；另设 TTL |
 
 **策略不进缓存**：受理时直查数据库取该网关模型生效的那条（全局那条作兜底），每次写入换新的版本标识。运营配置不是热点，选路正确性不依赖缓存。
 
@@ -171,59 +173,30 @@
 ### 7.3 写入时机（先 DB，后 Redis，且只在提交成功后）
 
 - **发布成功**（事务提交后）：失效并重建 `route:<gateway_model>`；
-- **充值**：DB 事务提交后 `SET user_balance:<id>`（用户要求：充值后立即 `SET`），来源标记 `db_commit`；
-- **结算**：DB 事务提交后 `SET user_balance:<id>`（用户要求：扣减成功后立即 `SET`），来源标记 `db_commit`。写的是**扣减后的余额值**，不用 `DECRBY`——`DECRBY` 表达不了"以 DB 为准"，重放还会漂移；
-- **受理（预授权扣减）**：DB 扣减成功后同样刷新（来源标记 `db_commit`），否则缓存会滞后一个预授权额；
+- **充值**：DB 事务提交后按版本写入账户金额快照；
+- **结算**：DB 事务提交后按版本写入账户金额快照，不用 Redis 增量命令代替数据库结果；
+- **受理（预授权占用）**：DB 占用合计增加并提交后刷新账户快照；已结算余额不变；
 - **改策略成功**（事务提交后）：失效并重建 `route_policy:*`（§6.5）——**改策略不发修订**，这条失效没有"发布"事件可依附。
 
-### 7.4 扣费流程：Redis 只做加速，权威在 DB
+### 7.4 账户预检与资金判定
 
-**受理**（现状，`crates/persistence` 的 `create_job`，本设计只改"预授权额从哪来"）：
-
-```sql
-UPDATE ledger.accounts SET balance_microusd = balance_microusd - $保底额
-WHERE id = $1 AND balance_microusd >= $保底额
-```
-`rows_affected != 1` ⇒ `insufficient_balance`（对客 **402 余额不足**）——**这条硬拒绝保留**（用户澄清）。`$保底额` = **按供给维度查保底表**（[`0007`](./0007-pricing-floor-and-settlement.md) §6：键是 vendor + offering，档位 `(size, quality)`；`size=auto` 取该供给最大档；缺档回落该供给封顶保底值，再回落 `GENERATION_MAX_COST_MICROUSD`），不再是"永远一个固定数"。**余额是这里唯一的上限**——查得到保底额时 `GENERATION_MAX_COST_MICROUSD` 不参与判定（[`0007`](./0007-pricing-floor-and-settlement.md) §6）。**下一次受理按当时的余额判**：结算透支后余额可能已为负，此时 `balance_microusd >= $保底额` 不成立 ⇒ 同样 402。
-
-**结算**（现状，`complete_job`，本设计只改实收口径）：同一事务里 `release` 剩余授权 + `capture` 实收。**实收 = 对客四档 token 费率（CNY）× 实际 `usage` 的分项 token**（[`0007`](./0007-pricing-floor-and-settlement.md) §3 与本文 §5），**不封顶在保底额**——**实际 > 保底额时差额由余额吸收，`capture` 之后余额可为负（这才是"透支"：发生在结算，不在受理；该负值要求迁移放宽 `ledger.accounts.balance_microusd` 的 `>= 0` 约束，[`0007`](./0007-pricing-floor-and-settlement.md) §6/P2b 工单）**；实际 < 保底额时差额释放回余额。透支的追补属运营 / 充值流程（本设计不展开）。**对客金额全程 CNY**（[`0007`](./0007-pricing-floor-and-settlement.md) §8）。
-
-Redis 的位置：
-
-- 缓存命中且余额充足 → **仍走 DB 条件更新**（正确性在 DB，缓存只是少一次读）；
-- 缓存命中且余额不足 → **这是全设计唯一一处允许"缓存的判定结果直接决定对客响应"的地方**：仅在缓存**新鲜**时提前返回 `insufficient_balance`；不新鲜一律交给 DB。
-
-**"新鲜"的判据（两条都要满足）**：
-
-1. 值带**来源标记 `db_commit`**——由 DB 提交后的写入产生（§7.3 的充值 / 受理预授权扣减 / 结算三条写穿路径）。定时对账写回的条目标 `reconciler`（§7.5），**不用于提前拒绝**；
-2. 写入时间距当前 < **新鲜窗口**（默认 5 秒，可配），且这个窗口必须显著小于定时对账周期（默认 3 分钟），保证"能用来拒绝的值"实际都来自写穿路径。
-
-来源不明、没有写入时间戳的旧格式条目，一律**视为不新鲜**（宁可多打一次 DB）。
-
-**提前拒绝必须落审计**：每次提前拒绝写一条 `operations.audit_events`（`account_id`、缓存余额、写入时间与来源、判定结果），使误拒**可发现、可对账**（`ADR-0017` 的"平台侧事件必须可发现"）。
-
-**这一处不需要新 ADR**（用户更正，撤回上一轮的"需新 ADR"）：Redis 在这里就是"判断用户余额做预检"，**扣费仍然只在 PG 里发生**，不涉及资金安全，因此 `ADR-0003` 的"缓存不是事实源"已经覆盖。设计上写明两条即可：
-
-1. **缓存永不作为扣费依据**：扣减只在 PG 事务里做（受理的预授权扣减、结算的 `release` + `capture`，见本节开头）；Redis 的写入一律是"**DB 提交成功之后、写扣减后的值**"，**不是 `DECRBY`**（`DECRBY` 表达不了"以 DB 为准"，重放还会漂移）；不一致时**以 DB 覆盖**（§7.6）。缓存里"够不够"的结论**从不决定扣减**——扣减由 DB 的条件更新决定。
-2. **预检拒绝要留审计**：预检**没有 DB 记录**（不建 Job、不扣款、不写状态），事后必须能解释"为什么拒了这个客户"——这是**可解释性**要求（落点就是上面那条 `operations.audit_events`），不是资金安全要求。
-
-因此"Redis 说够、DB 说不够"由 DB 兜住；"Redis 说不够"只在新鲜窗口内发生、必然留下审计，且拒绝不产生任何副作用（不写状态、不扣款，调用方重试即可）。
+账户的已结算余额、预授权占用、真实收支流水及 Redis 余额快照统一由[账户资金设计](0013-account-funds-and-reservations.md) §1–§3 负责。受理以 PostgreSQL 的账户当前值做条件更新；Redis 命中只省去预检读取，不决定扣费，也不能单独返回 `402 insufficient_balance`。缓存不足、过期或不可用时仍交给数据库确认。
 
 ### 7.5 定时对账兜底
 
 独立定时任务，每 N 分钟（默认 3）：
 
-1. 把 DB 的 `ledger.accounts.balance_microusd`（按 `updated_at` 增量，必要时全量）写回 `user_balance:*`，来源标记 `reconciler`（§7.4：这种条目**不用于提前拒绝**）；
+1. 把 DB 的账户金额快照按版本校正到 `user_balance:*`，不允许较旧快照覆盖新版本；
 2. 校正 `route:*`（以当前生效修订为准）——它只处理"缓存里的修订标识不是当前生效的"这一类陈旧，**不写 `enabled`**：停用**不由对账兜住**，由受理路径按主键复核兜住（§7.2）；
 3. 校正 `api_key:*`（以 `identity.api_keys.revoked_at` 为准）。
 
 ### 7.6 不一致的处置
 
-**以 DB 为准**：发现 Redis 与 DB 不一致时，用 DB 的值**覆盖**缓存，并记一条 `operations.audit_events` + 一条日志（运营要能发现，参照 `ADR-0017` 对"平台侧事件必须可发现"的要求）。不尝试"合并"或"取中间值"。
+**以 DB 为准**：发现 Redis 与 DB 不一致时，用数据库最新版本的快照覆盖缓存，并记一条 `operations.audit_events` + 一条日志；较旧版本不得覆盖较新版本。不尝试"合并"或"取中间值"。
 
 ### 7.7 引入成本与风险
 
-新增一个运行时依赖（部署侧加一个 Redis 实例、`.env.example` 加地址、多一条故障路径）。**仓库今天完全没有 Redis**（全仓无任何 `redis` 引用）。**用户已批准引入**（纯加速层，见 §8「已定案」）；即便不引入，本设计其余部分也不受影响，只是余额与路由全部直查 DB（即现状）。
+Redis 是可选运行时依赖。不可用时余额与路由回源 PostgreSQL；账户金额缓存的版本与写入失败语义见[账户资金设计](0013-account-funds-and-reservations.md) §3。
 
 **命中缓存要多一次批量主键读**（§7.2）：读的是这批候选的供给与它们渠道的 `enabled`，一次受理最多一次。它买来的是"停用不等失效就生效"，代价是命中路径多一次往返，且这次读**失败就整次受理失败**（按平台侧故障，对客 5xx），不回退成"不复核"——静默放行会让停用在那几次请求上重新失效。
 
@@ -235,7 +208,7 @@ Redis 的位置：
 
 - **权重语义（原未决第 1 条，已定）**：**`priority`（数字小者优先）+ `weight`（加权随机）**，且**两者都是路由策略的输入**——`priority_failover` 用 `priority`、`weighted_random` 用 `weight`，分流按 **`(账户, 幂等键)`** 确定性哈希。决策已落 [`docs/adr/0020`](../adr/0020-routing-strategy-layer-configured-by-operations.md)（§2/§6.2/§6.4）。因此"权重只作次级排序依据"这一备选**不采纳**：同档允许多候选、档内按权重分流，唯一索引换成 `(gateway_model, offering_id) WHERE active`（§2）；
 - **路由策略层已定引入**（用户要求——「路由这层是运营的事」）：策略是**运营配置**（`route_policies`，运行期可改、即时生效、**不进不可变修订**），作用域为**全局一条 + 可按网关模型覆盖**，**未配置时默认 `priority_failover`（＝今天的行为）**；三条硬约束（**候选合格性优先于策略**、策略不改参数映射与承载面、**分流确定性可重放**）与折扣率定位（**折扣率不进成本，只作 `least_cost` 的比较输入**）见 §6。因此"是否引入路由策略层"**不再是未决、也不在范围边界**（旧口径"暂不引入"在 [`docs/design/0005`](./0005-vendor-model-contract-and-offering-mapping.md)，**已随本层落地改毕**，见 §6.6）；
-- **Redis 已批准引入**：**纯加速层**——缓存不是事实源（§7）；**凭新鲜缓存提前拒绝不需要新 ADR**（`ADR-0003` 的"缓存不是事实源"已覆盖，见 §7.4）。因此"是否批准引入 Redis"**不再待决**；
+- **Redis 已批准引入**：**纯加速层**，缓存不是事实源；账户余额预检不凭缓存独自拒绝，规则由[账户资金设计](0013-account-funds-and-reservations.md) §3 承接；
 - **"不可用时回退"的含义**：§4 已按**阶段**写清——受理前的候选不合格回退落地（现状）；提交前的失败技术上能回退，但这类失败重投同一份请求、不换候选（`ADR-0011`），改"回退下一候选"属**策略变更**；提交后的不确定（超时、断连、`5xx`）**不得回退**（会重复出图与重复计费），进对账。
 
 ### 范围边界（不待决，归其他工作项）
