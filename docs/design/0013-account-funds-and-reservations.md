@@ -1,6 +1,6 @@
 主题: 账户资金与预授权的当前值模型
 当前修订: v2
-状态: 待评审
+状态: 已评审，需修订（承接的 Spec 尚未生效，现行合同待同步）
 承接: [`账户余额、预授权与实际收支` v2](../specs/0002-account-funds-and-reservations.md) §1–§7；该 Spec 尚未生效，本 RFC 不作为实施依据
 依赖: [`0007` 定价、保底与结算](0007-pricing-floor-and-settlement.md)、[`0008` 路由与缓存](0008-routing-strategy-and-caching.md)、[`0009` 运行基线](0009-operational-baseline.md)；[`ADR-0003`](../adr/0003-postgresql-is-source-of-truth.md)、[`ADR-0006`](../adr/0006-no-settlement-without-metering-evidence.md)
 
