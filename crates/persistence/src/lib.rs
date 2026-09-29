@@ -53,6 +53,14 @@ const LEDGER_RANGE_PREDICATE: &str =
 /// 所以那个断言是"审过了"，不是把检查绕过去——别的动态 SQL 不要走这条路。
 const CANDIDATE_AVAILABLE_SQL: &str = "o.enabled AND c.enabled";
 
+/// 读候选定价必须**一起**选出来的列。
+///
+/// [`row_candidate_pricing`] 按名字逐列读它们，少一列就是运行期的 `no column found for name: …`
+/// ——曾经漏掉 `consumer_formula`，让"省略渠道的增量发布"整条 500。三处读候选定价的查询共用这一份，
+/// 新增列只改这里。列名不带表别名：这几列只有 `publication.runtime_revisions` 有，不会歧义。
+const CANDIDATE_PRICING_COLUMNS: &str = "consumer_rates_cny, consumer_formula, cost_basis, \
+     reference_cost_microusd, cost_currency, tier_prices, floor_amounts";
+
 /// 读**所有在效合同**里声明的输出张数上限，取最大的那份。
 ///
 /// 超时链上"按最大输出张数算出来的上限"要有个来源，这就是它：合同自己给 `n` 声明的取值面
@@ -633,13 +641,7 @@ impl HubRepository for PgHubRepository {
                 p.image_output_microusd_per_million,
                 rr.created_at AS captured_at,
                 rr.markup_bps,
-                rr.reference_cost_microusd,
-                rr.cost_currency,
-                rr.consumer_rates_cny,
-                rr.consumer_formula,
-                rr.cost_basis,
-                rr.tier_prices,
-                rr.floor_amounts,
+                {CANDIDATE_PRICING_COLUMNS},
                 re.routing_priority,
                 re.weight
             FROM publication.runtime_entries re
@@ -689,7 +691,7 @@ impl HubRepository for PgHubRepository {
         &self,
         gateway_model: &str,
     ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
-        let rows = sqlx::query(
+        let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT o.provider_model_id, o.adapter_key, c.provider_kind, c.base_url, c.credential_env,
                    o.id AS offering_id,
@@ -700,8 +702,7 @@ impl HubRepository for PgHubRepository {
                    p.text_output_microusd_per_million,
                    p.image_output_microusd_per_million,
                    p.source_url AS plan_source_url,
-                   r.cost_currency, r.reference_cost_microusd, r.cost_basis,
-                   r.tier_prices, r.floor_amounts, r.consumer_rates_cny, r.consumer_formula
+                   {CANDIDATE_PRICING_COLUMNS}
             FROM publication.runtime_entries re
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
@@ -710,7 +711,7 @@ impl HubRepository for PgHubRepository {
             WHERE re.active AND re.gateway_model = $1
             ORDER BY c.provider_kind, o.provider_model_id, o.id
             "#,
-        )
+        )))
         .bind(gateway_model)
         .fetch_all(&self.pool)
         .await
@@ -1096,13 +1097,7 @@ impl HubRepository for PgHubRepository {
                 re.provider_kind,
                 ({CANDIDATE_AVAILABLE_SQL}) AS candidate_available,
                 rr.markup_bps,
-                rr.reference_cost_microusd,
-                rr.cost_currency,
-                rr.consumer_rates_cny,
-                rr.consumer_formula,
-                rr.cost_basis,
-                rr.tier_prices,
-                rr.floor_amounts,
+                {CANDIDATE_PRICING_COLUMNS},
                 re.routing_priority,
                 re.weight
             FROM publication.runtime_entries re
