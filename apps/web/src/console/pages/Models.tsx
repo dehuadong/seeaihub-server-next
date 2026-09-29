@@ -99,9 +99,9 @@ export function ModelsPage({
             message="空库时这里什么都没有"
             description={
               <>
-                点右上角「上架新模型」，或贴一份发布素材（<code>config/bootstrap/*.json</code>——
-                那是夹具，其中的对客费率不是生产价）。上架之后这一页会列出每个型号的生效修订、加价
-                系数与候选。
+                点右上角「上架新模型」，选厂商、勾供给、给价。渠道与供给是工程师的资产：随发布素材
+                （<code>config/bootstrap/*.json</code>——那是发布夹具，其中的价不是生产价）配置、由服务
+                启动时导入。上架之后这一页会列出每个型号的生效修订、加价系数与候选。
               </>
             }
           />
@@ -216,6 +216,12 @@ export function ModelsPage({
                       ),
                   },
                   {
+                    title: '对客计价形态',
+                    dataIndex: 'consumer_formula',
+                    width: 160,
+                    render: (_value: unknown, candidate) => consumerFormulaText(candidate),
+                  },
+                  {
                     title: '对客费率（CNY/1M）',
                     dataIndex: 'consumer_rates_cny',
                     render: (_value: unknown, candidate) => <RatesCell candidate={candidate} />,
@@ -272,13 +278,30 @@ export function ModelsPage({
   );
 }
 
-/// 对客费率的四种计量分项。没有向量的候选走"成本单价 × 倍率"，这里如实说明，不留空。
+/// 该候选的**对客计价形态**的人类可读名（Spec §5.2 M1）。
+///
+/// 缺省（历史修订没带这个字段）时对客形态就等于成本形态，这里如实说"同成本形态"，不猜成某一种。
+function consumerFormulaText(candidate: GatewayModelCandidate): string {
+  if (candidate.consumer_formula === 'upstream_declared') {
+    return '上游声明金额 × 倍率';
+  }
+  if (candidate.consumer_formula === 'token_rates') {
+    return '按 token 四档';
+  }
+  return '同成本形态（旧修订）';
+}
+
+/// 对客费率的四种计量分项。对客形态是"上游声明金额 × 倍率"的候选按定义没有向量；缺省（旧修订）
+/// 读的是该供给的渠道费率。两种都如实说明，不留空。
 function RatesCell({ candidate }: { candidate: GatewayModelCandidate }) {
+  if (candidate.consumer_formula === 'upstream_declared') {
+    return (
+      <Typography.Text type="secondary">无（按上游声明金额 × 倍率）</Typography.Text>
+    );
+  }
   const rates = candidate.consumer_rates_cny;
   if (!rates) {
-    return (
-      <Typography.Text type="secondary">无向量（按成本单价 × 倍率算）</Typography.Text>
-    );
+    return <Typography.Text type="secondary">无向量（读渠道费率）</Typography.Text>;
   }
   return (
     <Flex vertical style={{ fontSize: 12 }}>
