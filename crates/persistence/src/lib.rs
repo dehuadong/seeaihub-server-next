@@ -1348,6 +1348,7 @@ impl HubRepository for PgHubRepository {
         let rows = sqlx::query(
             r#"
             SELECT
+                j.id AS job_id,
                 j.gateway_model,
                 j.state,
                 j.branch,
@@ -1383,6 +1384,7 @@ impl HubRepository for PgHubRepository {
                 let branch: String = row.try_get("branch").map_err(database_error)?;
                 let image_count: i64 = row.try_get("image_count").map_err(database_error)?;
                 Ok(CustomerUsageView {
+                    job_id: JobId(row.try_get("job_id").map_err(database_error)?),
                     gateway_model: row.try_get("gateway_model").map_err(database_error)?,
                     status: customer_usage_status(parse_state(&state)?),
                     kind: match branch.as_str() {
@@ -1616,6 +1618,7 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        kind: Option<&str>,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
@@ -1627,13 +1630,15 @@ impl HubRepository for PgHubRepository {
             SELECT account_id, job_id, kind, amount_microusd, created_at
             FROM ledger.entries
             WHERE account_id = $1 AND {LEDGER_RANGE_PREDICATE}
+              AND ($4::text IS NULL OR kind = $4)
             ORDER BY created_at DESC, id DESC
-            OFFSET $4 LIMIT $5
+            OFFSET $5 LIMIT $6
             "#
         )))
         .bind(account_id.0)
         .bind(since)
         .bind(until)
+        .bind(kind)
         .bind(i64::from(offset))
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
@@ -1651,6 +1656,7 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        kind: Option<&str>,
     ) -> Result<u64, ApplicationError> {
         if !self.account_exists(account_id).await? {
             return Err(ApplicationError::NotFound(format!("account {account_id}")));
@@ -1660,11 +1666,13 @@ impl HubRepository for PgHubRepository {
             SELECT count(*)::bigint
             FROM ledger.entries
             WHERE account_id = $1 AND {LEDGER_RANGE_PREDICATE}
+              AND ($4::text IS NULL OR kind = $4)
             "#
         )))
         .bind(account_id.0)
         .bind(since)
         .bind(until)
+        .bind(kind)
         .fetch_one(&self.pool)
         .await
         .map_err(database_error)?;

@@ -1692,6 +1692,8 @@ pub struct ApiKeyView {
 /// 什么型号、几张、扣了多少"，不是平台内部的任务标识。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CustomerUsageView {
+    /// 这一次请求的 Job 标识。对客投影**不**回它；管理员面要它来回答"哪一笔扣费对应哪次调用"。
+    pub job_id: JobId,
     /// K 平台型号名（对客的那个名字）。
     pub gateway_model: String,
     /// 对客状态：`succeeded` / `failed` / `pending`（内部 Job 状态收敛过的三值）。
@@ -2163,11 +2165,14 @@ pub trait HubRepository: Send + Sync {
     /// `until` 是**半开**上界（不含）。与对客账单汇总同一条口径：同一区间下明细与汇总必须对得上，
     /// 否则边界那一笔会被一边算进去、另一边不算。翻页用 `offset` 而不是靠 `since`/`until` 去切——
     /// 那两个参数是给"按区间看"用的，同一时刻可能有多条。
+    /// `kind` 只读某一类（例如充值记录只看 `credit`），`None` 读全部；取值面是 `ledger.entries`
+    /// 的五个类别。
     async fn read_ledger_entries(
         &self,
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        kind: Option<&str>,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError>;
@@ -2181,6 +2186,7 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        kind: Option<&str>,
     ) -> Result<u64, ApplicationError>;
 
     /// 该账户**当前持有中**的金额（人民币微单位）：`ledger.holds` 里还没结算的那些预授权之和。
@@ -3392,11 +3398,12 @@ impl AccountsService {
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        kind: Option<&str>,
         offset: u32,
         limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
         self.repository
-            .read_ledger_entries(account_id, since, until, offset, limit)
+            .read_ledger_entries(account_id, since, until, kind, offset, limit)
             .await
     }
 
@@ -3406,9 +3413,10 @@ impl AccountsService {
         account_id: AccountId,
         since: Option<DateTime<Utc>>,
         until: Option<DateTime<Utc>>,
+        kind: Option<&str>,
     ) -> Result<u64, ApplicationError> {
         self.repository
-            .count_ledger_entries(account_id, since, until)
+            .count_ledger_entries(account_id, since, until, kind)
             .await
     }
 

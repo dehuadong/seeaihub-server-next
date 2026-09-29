@@ -3,6 +3,7 @@ import type {
   AccountBalance,
   AccountEntriesResponse,
   AccountsResponse,
+  AdminUsageResponse,
   CreateAccountResponse,
   CustomerView,
   GatewayModelsResponse,
@@ -126,8 +127,23 @@ export class AdminClient {
     return this.get(`/api/v1/accounts?${query}`);
   }
 
-  accountEntries(accountId: string, limit = 50): Promise<AccountEntriesResponse> {
-    return this.get(`/api/v1/accounts/${encodeURIComponent(accountId)}/entries?limit=${limit}`);
+  /// 账目条目。`kind` 只读某一类（**充值记录**只看 `credit`）；缺省读全部。
+  accountEntries(
+    accountId: string,
+    kind?: string,
+    limit = 50,
+  ): Promise<AccountEntriesResponse> {
+    const query = new URLSearchParams();
+    if (kind) query.set('kind', kind);
+    query.set('limit', String(limit));
+    return this.get(`/api/v1/accounts/${encodeURIComponent(accountId)}/entries?${query}`);
+  }
+
+  /// 某个账户的**调用明细**（管理员面）：逐笔生成请求，带 `job_id`。
+  accountUsage(accountId: string, limit = 50): Promise<AdminUsageResponse> {
+    return this.get(
+      `/api/v1/accounts/${encodeURIComponent(accountId)}/usage?limit=${limit}`,
+    );
   }
 
   creditAccount(accountId: string, amountMicrousd: number, businessKey: string): Promise<void> {

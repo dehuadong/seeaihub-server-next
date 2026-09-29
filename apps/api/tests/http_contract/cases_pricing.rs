@@ -29,7 +29,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
         "带定价的发布必须成功"
     );
 
-    let (_, api_key) =
+    let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
     let _worker = harness.spawn_worker();
     let key = format!("pricing-{}", Uuid::new_v4());
@@ -97,6 +97,52 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     assert_eq!(held, 250_000);
     // 实收 = 对客费率向量 × 实际用量：14 文本输入 × 40 + 196 图像输出 × 220（每 1M）。
     assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    // **管理员读调用明细**：逐笔生成、带请求任务 ID、型号、张数与扣费（`#40`）。
+    let usage = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/usage",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("usage read");
+    assert_eq!(usage.status(), StatusCode::OK);
+    let usage: Value = usage.json().await.expect("usage body");
+    let row = &usage["usage"][0];
+    assert_eq!(row["job_id"], json!(job_id.to_string()), "{usage}");
+    assert_eq!(row["gateway_model"], json!(harness.model));
+    assert_eq!(row["image_count"], json!(1));
+    // 账本里的 `capture` 是负数（钱从账上出去），明细直接给这个和；界面上按"扣费"显示绝对值。
+    assert_eq!(row["charged_microusd"], json!(-43_680));
+    // **账本读能按类别过滤**：充值记录只看 `credit`；未知类别**拒**而不是静默回空。
+    let credits = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries?kind=credit",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("credits read");
+    assert_eq!(credits.status(), StatusCode::OK);
+    let credits: Value = credits.json().await.expect("credits body");
+    assert_eq!(
+        credits["count"],
+        json!(1),
+        "这个账户只有一次充值：{credits}"
+    );
+    assert_eq!(credits["entries"][0]["kind"], json!("credit"));
+    let bad = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries?kind=nope",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("bad kind read");
+    assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
     // 成本 = 原币种原值 + 折算后 CNY：5950 微美元 × 7.1 = 42245 微元。
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(amount, Some(5_950));

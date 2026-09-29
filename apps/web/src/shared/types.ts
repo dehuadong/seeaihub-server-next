@@ -188,6 +188,24 @@ export interface LedgerEntry {
   created_at: string;
 }
 
+/// 管理员看到的**一条调用明细**：逐笔生成请求（对客那条读**不回** `job_id`，这条回——运营要回答
+/// "哪一笔扣费对应哪次调用"）。
+export interface AdminUsageRow {
+  job_id: string;
+  gateway_model: string;
+  status: 'succeeded' | 'failed' | 'pending' | 'canceled';
+  kind: 'generation' | 'edit';
+  created_at: string;
+  image_count: number;
+  charged_microusd: number;
+}
+
+export interface AdminUsageResponse {
+  usage: AdminUsageRow[];
+  count: number;
+  truncated: boolean;
+}
+
 export interface AccountEntriesResponse {
   entries: LedgerEntry[];
   count: number;

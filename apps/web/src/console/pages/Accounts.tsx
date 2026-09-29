@@ -16,7 +16,12 @@ import {
 import { CreditCardOutlined, KeyOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { AdminClient } from '../client';
-import type { AccountSummary, IssueApiKeyResponse, LedgerEntry } from '../../shared/types';
+import type {
+  AccountSummary,
+  AdminUsageRow,
+  IssueApiKeyResponse,
+  LedgerEntry,
+} from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel, whenText, yuanText } from '../ui';
 
@@ -273,7 +278,15 @@ export function AccountsPage({ client }: { client: AdminClient }) {
   );
 }
 
-/// 选中账户之后直接给出的三块：**充值 / 账目流水 / API Key**（`#39`）。
+/// 调用明细里的状态：与对客那条读同一套收敛取值，运营看中文。
+const USAGE_STATUS: Record<string, string> = {
+  succeeded: '成功',
+  failed: '失败',
+  pending: '进行中',
+  canceled: '已取消',
+};
+
+/// 选中账户之后直接给出的三块：**充值记录 / 扣费记录 / API Key**（`#39`、`#40`）。
 ///
 /// 不套一层"打开"、不弹抽屉。充值的**幂等键在这里生成**——进这一块生成一个、充成功后换一个；
 /// 运营只填金额。双击（或网络重试）仍是同一个意图，只充一次。
@@ -296,7 +309,13 @@ function AccountActions({
   const [creditForm] = Form.useForm<{ yuan: string }>();
   const [tagForm] = Form.useForm<{ tag?: string }>();
   const balance = useLoadable(() => client.accountBalance(accountId), [client, accountId]);
-  const entries = useLoadable(() => client.accountEntries(accountId, 50), [client, accountId]);
+  // **充值记录**只看 `credit`；**扣费记录**走调用明细（逐笔生成、带请求任务 ID）。
+  // 预授权（`hold`/`release`）不进这两块——它是内部机制，排障看「对账与诊断」。
+  const credits = useLoadable(
+    () => client.accountEntries(accountId, 'credit', 50),
+    [client, accountId],
+  );
+  const usage = useLoadable(() => client.accountUsage(accountId, 50), [client, accountId]);
 
   return (
     <Flex vertical gap={16}>
@@ -370,7 +389,8 @@ function AccountActions({
               setBusinessKey(crypto.randomUUID());
               creditForm.resetFields();
               balance.reload();
-              entries.reload();
+              credits.reload();
+              usage.reload();
               onChanged();
             } catch (failure) {
               setError(failure instanceof Error ? failure.message : String(failure));
@@ -399,31 +419,71 @@ function AccountActions({
         </Form>
       </Card>
 
-      <Card size="small" title="账目流水" extra={<Button onClick={entries.reload}>重取</Button>}>
-        {entries.error ? <Alert type="error" showIcon message={entries.error} /> : null}
+      {/* **充值记录**：只有 `credit`。预授权与结算不混进来。 */}
+      <Card
+        size="small"
+        title="充值记录"
+        extra={<Button data-testid="accounts-credits-reload" onClick={credits.reload}>重取</Button>}
+      >
+        {credits.error ? <Alert type="error" showIcon message={credits.error} /> : null}
         <Table<LedgerEntry>
           size="small"
           rowKey={(entry, index) => `${entry.created_at}-${index ?? 0}`}
-          loading={entries.loading}
+          loading={credits.loading}
           pagination={false}
-          dataSource={entries.data?.entries ?? []}
-          locale={{ emptyText: <Alert type="info" showIcon message="这个账户还没有任何账目。" /> }}
+          dataSource={credits.data?.entries ?? []}
+          locale={{ emptyText: <Alert type="info" showIcon message="这个账户还没有充值记录。" /> }}
           columns={[
             { title: '时刻', dataIndex: 'created_at', render: (value: string) => whenText(value) },
-            {
-              title: '类别',
-              dataIndex: 'kind',
-              render: (value: string) => (
-                <Tag color={value === 'credit' ? 'green' : 'default'}>{value}</Tag>
-              ),
-            },
             {
               title: '金额（元）',
               dataIndex: 'amount_microusd',
               align: 'right',
+              render: (value: number) => <Typography.Text>{yuanText(value)}</Typography.Text>,
+            },
+          ]}
+        />
+      </Card>
+
+      {/* **扣费记录（调用明细）**：逐笔生成请求——型号、张数、扣费、请求任务 ID。 */}
+      <Card
+        size="small"
+        title="扣费记录（调用明细）"
+        extra={<Button data-testid="accounts-usage-reload" onClick={usage.reload}>重取</Button>}
+      >
+        {usage.error ? <Alert type="error" showIcon message={usage.error} /> : null}
+        <Table<AdminUsageRow>
+          size="small"
+          rowKey="job_id"
+          loading={usage.loading}
+          pagination={false}
+          scroll={{ x: 'max-content' }}
+          dataSource={usage.data?.usage ?? []}
+          locale={{ emptyText: <Alert type="info" showIcon message="这个账户还没有调用记录。" /> }}
+          columns={[
+            { title: '时刻', dataIndex: 'created_at', render: (value: string) => whenText(value) },
+            { title: '型号', dataIndex: 'gateway_model' },
+            {
+              title: '状态',
+              dataIndex: 'status',
+              render: (value: string) => <Tag color={value === 'succeeded' ? 'green' : 'default'}>{USAGE_STATUS[value] ?? value}</Tag>,
+            },
+            { title: '张数', dataIndex: 'image_count', align: 'right', width: 80 },
+            {
+              title: '扣费（元）',
+              dataIndex: 'charged_microusd',
+              align: 'right',
+              // 明细给的是账本 `capture` 的和（负数）；列名已经说了是"扣费"，这里显示绝对值。
               render: (value: number) => (
-                <Typography.Text type={value < 0 ? 'danger' : undefined}>
-                  {yuanText(value)}
+                <Typography.Text>{yuanText(Math.abs(value))}</Typography.Text>
+              ),
+            },
+            {
+              title: '请求任务 ID',
+              dataIndex: 'job_id',
+              render: (value: string) => (
+                <Typography.Text code copyable style={{ fontSize: 12 }}>
+                  {value}
                 </Typography.Text>
               ),
             },

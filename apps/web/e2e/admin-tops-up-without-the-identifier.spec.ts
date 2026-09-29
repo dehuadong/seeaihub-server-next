@@ -36,7 +36,9 @@ test('用邮箱搜到账户并充值，全程不用账户标识', async ({ page,
   // 点那一行选中它：页面直接给出三块，**没有「打开」、没有抽屉**。
   await body.getByText(email).click();
   await expect(page.getByTestId('accounts-credit-yuan')).toBeVisible();
-  await expect(page.getByText('账目流水')).toBeVisible();
+  // **钱与调用分开**：充值记录一块、扣费记录（调用明细）一块（`#40`）。
+  await expect(page.getByText('充值记录', { exact: true })).toBeVisible();
+  await expect(page.getByText('扣费记录（调用明细）')).toBeVisible();
   await expect(page.getByText('API Key')).toBeVisible();
   await expect(page.locator('.ant-drawer')).toHaveCount(0);
 
@@ -44,9 +46,9 @@ test('用邮箱搜到账户并充值，全程不用账户标识', async ({ page,
   await page.getByTestId('accounts-credit-yuan').fill('12.34');
   await page.getByTestId('accounts-credit-submit').click();
 
-  // 余额与流水都反映这次充值（不是只弹了个提示）。
+  // 余额与**充值记录**都反映这次充值（不是只弹了个提示）。
   await expect(page.getByTestId('accounts-balance')).toContainText('12.34', { timeout: 10_000 });
-  await expect(page.getByText('credit').first()).toBeVisible();
+  await expect(page.locator('.ant-card', { hasText: '充值记录' })).toContainText('12.34');
 
   // **全程没有出现过账户标识**：这页上没有把它填进过任何输入框。
   await expect(page.getByTestId('accounts-lookup-id')).toHaveValue('');

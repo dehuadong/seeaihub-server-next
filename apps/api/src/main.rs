@@ -249,6 +249,10 @@ async fn main() -> Result<()> {
             "/api/v1/accounts/{account_id}/entries",
             get(list_account_entries),
         )
+        .route(
+            "/api/v1/accounts/{account_id}/usage",
+            get(list_account_usage),
+        )
         .route("/api/v1/accounts/{account_id}/tag", put(set_account_tag))
         .route(
             "/api/v1/accounts/{account_id}/credits",
@@ -652,7 +656,13 @@ struct AccountEntriesQuery {
     until: Option<DateTime<Utc>>,
     offset: Option<u32>,
     limit: Option<u32>,
+    /// 只读某一类（例如**充值记录**只看 `credit`）；缺省读全部。
+    kind: Option<String>,
 }
+
+/// `ledger.entries.kind` 的取值面。未知取值**拒**而不是静默回空：写错一个词时"没有账目"与
+/// "你查的类别不存在"是两件事。
+const LEDGER_ENTRY_KINDS: [&str; 5] = ["credit", "hold", "capture", "release", "adjustment"];
 
 const DEFAULT_ENTRIES_LIMIT: u32 = 100;
 
@@ -687,12 +697,26 @@ async fn list_account_entries(
         .unwrap_or(DEFAULT_ENTRIES_LIMIT)
         .clamp(1, MAX_OPERATIONAL_LIMIT);
     let account = AccountId(account_id);
+    let kind = match query.kind.as_deref() {
+        None => None,
+        Some(value) if LEDGER_ENTRY_KINDS.contains(&value) => Some(value),
+        Some(value) => {
+            return Err(ApiError::bad_request(
+                "invalid_kind",
+                format!(
+                    "unknown ledger entry kind {value}; expected one of {}",
+                    LEDGER_ENTRY_KINDS.join(", ")
+                ),
+            ));
+        }
+    };
     let entries = state
         .accounts
         .read_entries(
             account,
             query.since,
             query.until,
+            kind,
             query.offset.unwrap_or(0),
             limit,
         )
@@ -702,7 +726,7 @@ async fn list_account_entries(
         .collect::<Vec<_>>();
     let total = state
         .accounts
-        .count_entries(account, query.since, query.until)
+        .count_entries(account, query.since, query.until, kind)
         .await?;
     let offset = query.offset.unwrap_or(0);
     Ok(Json(AccountEntriesResponse {
@@ -713,6 +737,56 @@ async fn list_account_entries(
         // "还有更多"，而那时下一页其实是空的。
         truncated: (offset as u64) + (entries.len() as u64) < total,
         entries,
+    }))
+}
+
+/// 管理员读某个账户的**调用明细**：逐笔生成请求（型号、张数、扣费、**请求任务 ID**）。
+///
+/// 与对客那条读的是同一份事实，但**回 Job 标识**——运营要回答"哪一笔扣费对应哪次调用"（`#40`）。
+/// 预授权（`hold`/`release`）不在这条读里：它是内部机制，排障走对账与诊断页。
+#[derive(Debug, Serialize)]
+struct AdminUsageRow {
+    job_id: Uuid,
+    gateway_model: String,
+    status: CustomerUsageStatus,
+    kind: CustomerUsageKind,
+    created_at: DateTime<Utc>,
+    image_count: u32,
+    charged_microusd: i64,
+}
+
+#[derive(Debug, Serialize)]
+struct AdminUsageResponse {
+    usage: Vec<AdminUsageRow>,
+    count: usize,
+    truncated: bool,
+}
+
+async fn list_account_usage(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    Query(query): Query<CustomerBillingQueryParams>,
+) -> Result<Json<AdminUsageResponse>, ApiError> {
+    let billing = query.billing_query();
+    let usage = state
+        .accounts
+        .customer_usage(AccountId(account_id), billing)
+        .await?
+        .into_iter()
+        .map(|row| AdminUsageRow {
+            job_id: row.job_id.0,
+            gateway_model: row.gateway_model,
+            status: row.status,
+            kind: row.kind,
+            created_at: row.created_at,
+            image_count: row.image_count,
+            charged_microusd: row.charged_microusd,
+        })
+        .collect::<Vec<_>>();
+    Ok(Json(AdminUsageResponse {
+        count: usage.len(),
+        truncated: usage.len() as u32 == billing.limit,
+        usage,
     }))
 }
 
@@ -1342,14 +1416,21 @@ async fn read_customer_ledger(
     let account = AccountId(account_id);
     let entries = state
         .accounts
-        .read_entries(account, billing.since, billing.until, 0, billing.limit)
+        .read_entries(
+            account,
+            billing.since,
+            billing.until,
+            None,
+            0,
+            billing.limit,
+        )
         .await?
         .into_iter()
         .map(LedgerEntryView::from)
         .collect::<Vec<_>>();
     let total = state
         .accounts
-        .count_entries(account, billing.since, billing.until)
+        .count_entries(account, billing.since, billing.until, None)
         .await?;
     Ok(Json(AccountEntriesResponse {
         count: entries.len(),

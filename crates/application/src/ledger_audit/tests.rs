@@ -443,6 +443,7 @@ impl HubRepository for AuditRepository {
         _account_id: AccountId,
         _since: Option<chrono::DateTime<chrono::Utc>>,
         _until: Option<chrono::DateTime<chrono::Utc>>,
+        _kind: Option<&str>,
         _offset: u32,
         _limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
@@ -454,6 +455,7 @@ impl HubRepository for AuditRepository {
         _account_id: AccountId,
         _since: Option<chrono::DateTime<chrono::Utc>>,
         _until: Option<chrono::DateTime<chrono::Utc>>,
+        _kind: Option<&str>,
     ) -> Result<u64, ApplicationError> {
         unused_repository()
     }
