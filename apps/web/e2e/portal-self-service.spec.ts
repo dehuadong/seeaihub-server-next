@@ -179,8 +179,8 @@ test('凭运营签发的重置令牌设置新口令，之后能用新口令登�
   // 这里用 `127.0.0.1` 而不是 `admin.localhost`：**Node 的解析器不认 `.localhost`**（Chrome 认），
   // 而这条签发只认凭据、不认主机名，所以直连回环即可。
   const issued = await request.post(
-    `http://127.0.0.1:8090/api/v1/accounts/${accountId}/password-reset`,
-    { headers: { authorization: `Bearer ${process.env.SEEAI_E2E_ADMIN_TOKEN ?? 'e2e-shared-token'}` } },
+    `http://127.0.0.1:${settings.port}/api/v1/accounts/${accountId}/password-reset`,
+    { headers: { authorization: `Bearer ${settings.adminToken}` } },
   );
   expect(issued.status()).toBe(201);
   const resetToken = (await issued.json()).reset_token as string;
