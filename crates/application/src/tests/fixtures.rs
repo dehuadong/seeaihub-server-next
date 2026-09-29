@@ -34,7 +34,6 @@ pub(super) fn offering() -> PublishedOffering {
             formula: PricingFormula::TokenRates,
             cost_unit_price_microusd: None,
             consumer_formula: None,
-            consumer_unit_price_cny_microusd: None,
             captured_at: Utc::now(),
             // 夹具走**旧口径**（没有定价）：受理与结算的行为与今天逐位相同。
             hit_candidate: None,
@@ -162,7 +161,6 @@ pub(super) fn draft(provider_model_id: &str) -> OfferingDraft {
         reference_cost_microusd: None,
         consumer_rates_cny: None,
         consumer_formula: None,
-        consumer_unit_price_cny_microusd: None,
         cost_basis: None,
         tier_prices: None,
         floor_amounts: None,
@@ -209,7 +207,6 @@ pub(super) fn offering_with(schema_properties: Value, restrictions: Value) -> No
         cost_currency: Some("USD".to_owned()),
         consumer_rates_cny: None,
         consumer_formula: PricingFormula::TokenRates,
-        consumer_unit_price_cny_microusd: None,
         routing_priority: 0,
         weight: 1,
         pricing: None,

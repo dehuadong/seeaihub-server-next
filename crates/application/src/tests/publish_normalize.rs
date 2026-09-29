@@ -482,45 +482,40 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
         "{error}"
     );
 
-    // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。但**对客每张单价
-    // 必须给**——按张的对客价是运营给的对客价目，不是成本单价乘倍率算出来的。
+    // 按张 / 按次**不必发**那份四档费率：这就是"Price Plan 不是每条供给必填"。但成本形态是按张 /
+    // 按次时，对客形态没有可沿用的取值（对客只有按 token 四档 / 上游声明金额两种），必须显式给出。
     per_image_without_unit_price.cost_unit_price_microusd = Some(11_354);
     let error = PublishRuntimeCommand {
         offerings: Some(vec![per_image_without_unit_price.clone()]),
         ..base_command()
     }
     .normalize()
-    .expect_err("a per_image candidate without its consumer unit price must fail");
-    assert!(
-        error
-            .to_string()
-            .contains("consumer_unit_price_cny_microusd"),
-        "{error}"
-    );
+    .expect_err("a per_image cost form must name its consumer form explicitly");
+    assert!(error.to_string().contains("consumer_formula"), "{error}");
+
+    // 显式选一种对客形态（这里选上游声明金额 × 倍率）就能发布；成本形态仍按张。
     let normalized = PublishRuntimeCommand {
         markup_bps: Some(2_000),
         offerings: Some(vec![OfferingDraft {
-            consumer_unit_price_cny_microusd: Some(170_400),
+            consumer_formula: Some("upstream_declared".to_owned()),
             ..per_image_without_unit_price.clone()
         }]),
         ..base_command()
     }
     .normalize()
-    .expect("a supply priced per image needs no rate card");
+    .expect("a per_image cost form can be sold with an explicit consumer form");
     assert_eq!(normalized.offerings[0].formula, PricingFormula::PerImage);
     assert!(normalized.offerings[0].rates.is_none());
     assert_eq!(normalized.offerings[0].cost_currency(), Some("USD"));
-    assert!(
-        normalized.offerings[0].consumer_rates_cny.is_none(),
-        "对客四档向量是 token 计量量那一种形态的价格，按张的候选没有它"
-    );
     assert_eq!(
-        normalized.offerings[0].consumer_unit_price_cny_microusd,
-        Some(170_400)
+        normalized.offerings[0].consumer_formula,
+        PricingFormula::UpstreamDeclared
     );
+    assert!(normalized.offerings[0].consumer_rates_cny.is_none());
 
-    // 反向：按张计价给一份对客四档向量也要拒——那个数在别的形态下永远不会被读。
+    // 反向：对客选上游声明金额时给一份对客四档向量也要拒——那个数永远不会被读。
     let mut per_image_with_rates = per_image_without_unit_price;
+    per_image_with_rates.consumer_formula = Some("upstream_declared".to_owned());
     per_image_with_rates.consumer_rates_cny = Some(ConsumerRatesCny {
         text_input_micros_per_million: 35_500_000,
         image_input_micros_per_million: 56_800_000,
@@ -533,7 +528,7 @@ fn normalize_rejects_parameters_that_do_not_match_the_formula() {
         ..base_command()
     }
     .normalize()
-    .expect_err("a consumer vector under per_image must fail");
+    .expect_err("a consumer vector under upstream_declared must fail");
     assert!(
         error
             .to_string()
@@ -753,48 +748,23 @@ fn a_consumer_token_form_without_rates_is_rejected_when_the_cost_is_not_token_ra
     assert!(error.to_string().contains("consumer_rates_cny"), "{error}");
 }
 
-/// 对客选按张必须给每张对客单价；给了就落到归一结果上。
+/// 对客形态只有按 token 四档 / 上游声明金额两种：给出按张 / 按次被拒并点名。
 #[test]
-fn a_consumer_per_image_form_needs_its_own_unit_price() {
-    let missing = PublishRuntimeCommand {
+fn a_consumer_per_image_form_is_rejected() {
+    let command = PublishRuntimeCommand {
         offerings: Some(vec![OfferingDraft {
-            formula: Some("per_image".to_owned()),
-            price_plan: None,
-            cost_currency: Some("USD".to_owned()),
-            cost_unit_price_microusd: Some(20_000),
             consumer_formula: Some("per_image".to_owned()),
-            consumer_unit_price_cny_microusd: None,
             ..draft("pm-a")
         }]),
         ..base_command()
     };
-    let error = missing
+    let error = command
         .normalize()
-        .expect_err("per_image needs a consumer unit price");
+        .expect_err("the per_image consumer form is not offered");
     assert!(
         error
             .to_string()
-            .contains("consumer_unit_price_cny_microusd"),
+            .contains("consumer_formula must be token_rates or upstream_declared"),
         "{error}"
-    );
-
-    let complete = PublishRuntimeCommand {
-        offerings: Some(vec![OfferingDraft {
-            formula: Some("per_image".to_owned()),
-            price_plan: None,
-            cost_currency: Some("USD".to_owned()),
-            cost_unit_price_microusd: Some(20_000),
-            consumer_formula: Some("per_image".to_owned()),
-            consumer_unit_price_cny_microusd: Some(170_400),
-            ..draft("pm-a")
-        }]),
-        ..base_command()
-    };
-    let normalized = complete
-        .normalize()
-        .expect("per_image with a consumer unit price");
-    assert_eq!(
-        normalized.offerings[0].consumer_unit_price_cny_microusd,
-        Some(170_400)
     );
 }

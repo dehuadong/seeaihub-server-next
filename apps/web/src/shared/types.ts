@@ -10,6 +10,9 @@ export interface ConsumerRatesCny {
   image_output_micros_per_million: number;
 }
 
+/// 对客计价形态：运营按候选选的收钱方式，与 Offering 的成本计价形态独立；只有两种（`0007` §1/§2）。
+export type ConsumerFormula = 'token_rates' | 'upstream_declared';
+
 export interface GatewayModelCandidate {
   offering_id: string;
   provider_kind: string;
@@ -23,6 +26,8 @@ export interface GatewayModelCandidate {
   parameter_mapping: unknown;
   /// 按 token 计量量那一种形态的对客价载体；这条候选不带定价时为 `null`。
   consumer_rates_cny: ConsumerRatesCny | null;
+  /// 对客计价形态（运营按候选选，与成本形态独立）；历史修订不带时为 `null`，按等于成本形态读。
+  consumer_formula: ConsumerFormula | null;
   /// 渠道成本（原币种微单位），只作定价参考，不是售价的被乘数。
   reference_cost_microusd: number | null;
   cost_currency: string | null;

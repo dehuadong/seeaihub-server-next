@@ -3007,9 +3007,12 @@ async fn republish_candidate(
     .await
 }
 
-/// 一条**按张 / 按次**计价的候选草案：形态、单价、成本币种与那组定价参考都带上。
+/// 一条**按张 / 按次**计价的候选草案：成本形态、成本单价、成本币种与那组定价参考都带上。
 ///
 /// 承载面沿用夹具那条默认候选（同一份合同、同一份承载面），所以重新发布它不会撞上"合同不可变"。
+///
+/// 按张 / 按次是**成本**形态；对客形态是另一件事，必须显式给一种。这里给按 token 四档与一份向量，
+/// 让这些用例只看成本侧的路径（成本护栏、成本事实）不被对客形态挡住。
 fn unit_candidate(formula: &str, unit_price_microusd: u64, currency: &str) -> Value {
     let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     draft["formula"] = Value::String(formula.to_owned());
@@ -3020,6 +3023,13 @@ fn unit_candidate(formula: &str, unit_price_microusd: u64, currency: &str) -> Va
     draft["cost_basis"] = json!("computed");
     draft["tier_prices"] = json!({});
     draft["floor_amounts"] = openai_floor_amounts();
+    draft["consumer_formula"] = json!("token_rates");
+    draft["consumer_rates_cny"] = json!({
+        "text_input_micros_per_million": 7_000_000,
+        "image_input_micros_per_million": 9_000_000,
+        "text_output_micros_per_million": 11_000_000,
+        "image_output_micros_per_million": 40_000_000,
+    });
     draft
 }
 

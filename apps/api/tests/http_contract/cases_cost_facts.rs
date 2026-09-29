@@ -365,10 +365,11 @@ async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
 }
 
 /// **同币种也要能录折算率**：`CNY → CNY = 1` 录得进去，声明 `cost_currency: "CNY"` 的供给因此
-/// 能发布、受理、结算，而且**对客实收不因折算而变化**——乘的是率恒为 1 的那一行。
+/// 能发布、受理、结算；率 1 那一行把**成本**折成 CNY 时逐位不变——代码里没有"这个币种不用
+/// 折算"的分支。
 ///
-/// 渠道币种不是"全平台统一美元"：按张计价的人民币渠道（例如方舟）就是这一条。代码里没有
-/// "这个币种不用折算"的分支——那条路走的就是折算率表里率 1 的那一行。
+/// 渠道币种不是"全平台统一美元"：按张计价的人民币渠道（例如方舟）就是这一条。这里成本形态是
+/// `per_image`（成本按张）、对客形态另有选择；本用例只看成本侧，对客收多少不影响这条事实。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
@@ -428,12 +429,7 @@ async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
         json!(1_000_000),
         "同币种的折算率就是 1：{snapshot}"
     );
-    // 对客实收 = 成本单价 300_000 微元 × 倍率 1.2 = 360_000（一张）；折算率 1 不改数。
-    assert_eq!(
-        harness.captured_microusd(job_id).await,
-        -360_000,
-        "同币种不产生折算：对客价就是成本单价乘倍率"
-    );
+    // 同币种不产生折算：证明在**成本**侧——记的是原值（300_000 微元），率 1 折出来逐位不变。
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(amount, Some(300_000), "按张的成本 = 一张 × 单价");
     assert_eq!(currency.as_deref(), Some("CNY"));

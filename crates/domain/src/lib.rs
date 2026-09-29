@@ -952,20 +952,15 @@ pub struct PriceSnapshot {
     /// **等于 `formula`**（等同旧口径）——取值经 [`Self::consumer_formula`]。
     #[serde(default)]
     pub consumer_formula: Option<PricingFormula>,
-    /// 对客选 `per_image` / `per_call` 时的**每张 / 每次对客单价**（CNY 微单位）。
-    ///
-    /// 它是对客价目，不是成本：由运营给（初始值按该 vendor/模型已知渠道价目推导），结算直接乘
-    /// 本次实际量，不再乘倍率与折算率。
-    #[serde(default)]
-    pub consumer_unit_price_cny_microusd: Option<u64>,
     pub captured_at: DateTime<Utc>,
     /// 受理时命中并冻结的那条候选（售价按它算）。
     #[serde(default)]
     pub hit_candidate: Option<HitCandidate>,
-    /// 命中候选的**对客四档 CNY 费率向量**（按 token 计量量的对客价）：实收依据。缺它 = 旧口径。
+    /// 命中候选的**对客四档 CNY 费率向量**（对客选 `token_rates` 时的售价）：实收依据。
     ///
-    /// 渠道按张 / 按次计价或直接由上游给金额时它是 `None`——那几种形态的对客价由成本单价按
-    /// "× 倍率 × 折算率"在结算时算出来（见 [`Self::charge_microusd`]）。
+    /// 对客选 `upstream_declared` 时它是 `None`——那时对客价按上游声明金额 × 倍率 × 折算率算
+    /// （见 [`Self::charge_microusd`]）。对客选 token 四档却没有它时走**旧口径**：Price Plan 的
+    /// 那份费率兼作对客费率。
     #[serde(default)]
     pub consumer_rates_cny: Option<ConsumerRatesCny>,
     /// 档位价目表（CNY）：**只作定价参考与展示**，不参与预授权、也不参与结算。
@@ -1032,10 +1027,9 @@ impl PriceSnapshot {
 
     /// 对客实收（对客平面，CNY）。
     ///
-    /// **对客价按对客形态取**：token 四档读 [`Self::consumer_rates_cny`] × 实际用量；按张 /
-    /// 按次读 [`Self::consumer_unit_price_cny_microusd`]（运营给的对客价目，CNY） × 实际量；
-    /// 上游金额形态按声明金额 × 倍率 × 折算率（[`Self::marked_up_cny_microusd`]）。**成本**按
-    /// [`Self::formula`] 与 [`Self::cost_rates`] 另走一路，两者互不从属。
+    /// **对客价按对客形态取**：`token_rates` 读 [`Self::consumer_rates_cny`] × 实际用量；
+    /// `upstream_declared` 按声明金额 × 倍率 × 折算率（[`Self::marked_up_cny_microusd`]）。**成本**
+    /// 按 [`Self::formula`] 与 [`Self::cost_rates`] 另走一路，两者互不从属。
     ///
     /// 按 token 计量量的候选**不现算**：它的对客价是随修订发布的那份四档 CNY 向量
     /// （[`Self::consumer_rates_cny`]，运营按同一条乘法推导、也可以直接录入），受理时随快照冻结。
@@ -1045,7 +1039,7 @@ impl PriceSnapshot {
     /// 算不出来时**不按 0 结算**（0 元等于白送，还会在账上留下一条"收过钱"的记录），也不拿别的
     /// 数顶替（成本只进毛利口径，把它当成对客金额就是把**成本当售价**卖出去）：返回错误，由调用方
     /// 按**平台侧故障**处置（今天那条路是"结算失败进对账"）。算不出来有几种：没有对客费率向量、
-    /// 没有单价、没有倍率、没有折算率、上游没声明金额。
+    /// 没有倍率、没有折算率、上游没声明金额。
     ///
     /// 成本自算走 [`Self::cost_rates`] 与 [`Self::formula`]，与这里分成两个入口。
     pub fn charge_microusd(&self, facts: ChargeFacts<'_>) -> Result<u64, DomainError> {
@@ -1055,34 +1049,19 @@ impl PriceSnapshot {
                 (None, Some(rates)) => rates.amount_microusd(facts.usage),
                 (None, None) => Err(DomainError::MissingConsumerRate),
             },
-            PricingFormula::PerImage => {
-                let unit = self.consumer_unit_price_cny_microusd()?;
-                let count =
-                    u64::try_from(facts.images).map_err(|_| DomainError::ArithmeticOverflow)?;
-                unit_amount_microusd(count, unit)
-            }
-            PricingFormula::PerCall => {
-                let unit = self.consumer_unit_price_cny_microusd()?;
-                unit_amount_microusd(1, unit)
-            }
             PricingFormula::UpstreamDeclared => {
                 let amount = facts
                     .declared_cost_microusd
                     .ok_or(DomainError::MissingConsumerRate)?;
                 self.marked_up_cny_microusd(amount)
             }
+            // 对客形态只有 token_rates / upstream_declared 两种；按张 / 按次是对客不提供的取值
+            // （它们是成本侧的事实），发布期已拒。这条分支只兜住存量或被绕过的快照——那时这条候选
+            // 没有对客计费基准，按平台侧故障处理。
+            PricingFormula::PerImage | PricingFormula::PerCall => {
+                Err(DomainError::MissingConsumerRate)
+            }
         }
-    }
-
-    /// 按张 / 按次计价的候选，**每张 / 每次的对客价**（CNY 微单位）：成本单价 × 倍率 × 折算率。
-    ///
-    /// 这两种形态没有对客价载体（四档向量是 token 计量量那一种形态的价格），对客价由成本单价按
-    /// 同一条乘法算出来。单价缺了就是算不出对客价——不拿别的数顶替。
-    fn consumer_unit_price_cny_microusd(&self) -> Result<u64, DomainError> {
-        // 对客单价是**运营给的对客价目**（CNY），不是成本单价乘出来的：成本单价乘倍率只是推导
-        // 初始值的依据，推导在发布期做、结果落在 `consumer_unit_price_cny_microusd`。
-        self.consumer_unit_price_cny_microusd
-            .ok_or(DomainError::MissingConsumerRate)
     }
 
     /// 成本金额 × 倍率 × 折算率 → **对客金额**（CNY 微单位），向上取整。
@@ -1300,8 +1279,9 @@ pub enum DomainError {
     InconsistentUsage,
     #[error("arithmetic overflow")]
     ArithmeticOverflow,
-    /// 这条供给**没有对客计费基准**：既没有对客费率向量，也算不出对客价（缺单价、缺倍率、
-    /// 缺折算率、上游没声明金额）。**不按 0 结算**——0 元等于白送。
+    /// 这条供给**没有对客计费基准**：既没有对客费率向量，也算不出对客价（缺倍率、缺折算率、
+    /// 上游没声明金额）；对客形态取了不提供的取值（按张 / 按次）时同样没有基准。
+    /// **不按 0 结算**——0 元等于白送。
     #[error("no consumer rate basis to charge this supply with")]
     MissingConsumerRate,
 }
