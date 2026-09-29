@@ -368,7 +368,12 @@ export function PlatformModelPanel({
         description="这些是工程师已经配好的调用通路。选完就能用——驱动器、渠道地址与凭证变量名不需要你填。"
       >
         {catalog.error ? <Alert type="error" showIcon message={catalog.error} /> : null}
-        {!vendor ? (
+        {!catalog.loading && !catalog.error && all.length === 0 ? (
+          <Typography.Text type="secondary" data-testid="platform-supply-empty">
+            还没有任何可选的供给。供给来自工程师配置的发布素材，由服务启动时导入；素材配好、服务重启
+            之后，这里会按厂商列出可选供给。
+          </Typography.Text>
+        ) : !vendor ? (
           <Typography.Text type="secondary">先在上面选一个厂商，这里会列出它下面的供给。</Typography.Text>
         ) : inVendor.length === 0 ? (
           <Typography.Text type="secondary">
