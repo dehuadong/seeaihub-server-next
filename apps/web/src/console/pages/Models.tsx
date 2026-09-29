@@ -2,7 +2,6 @@ import {
   Alert,
   App as AntApp,
   Button,
-  Collapse,
   Descriptions,
   Drawer,
   Flex,
@@ -19,7 +18,6 @@ import type { GatewayModel, GatewayModelCandidate } from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
 import { ConsolePage, Panel, whenText, yuanText } from '../ui';
 import { PlatformModelPanel } from './PlatformModel';
-import { PublishPanel } from './Publish';
 
 /// 模型目录：在售的模型与它们的价目，运营最常看的一页。
 ///
@@ -29,8 +27,9 @@ import { PublishPanel } from './Publish';
 /// **它同时是"看"和"写"的入口**：右上角"上架新模型"与每行的"改价"都把发布表单开在抽屉里。
 /// 一页看、一页写会让人看不出两者的联系（用户原话："和网关模型的区别是什么"），所以合并在这里。
 ///
-/// 抽屉里**默认是运营那条路**（[`PlatformModelPanel`]：填平台模型名 → 选厂商 → 勾供给 → 给价），
-/// 工程师那条"贴整份技术定义"的老路收在抽屉底部的折叠区里——过渡期仍可用（`0012` §7），但不占主位。
+/// 抽屉里**只有运营那条路**（[`PlatformModelPanel`]：填平台模型名 → 选厂商 → 勾供给 → 给价）。
+/// 渠道与供给是工程师的资产：随发布素材（`config/bootstrap/*.json`）配置、服务启动时导入，
+/// 运营后台不提供"贴整份技术定义"的入口（工程师侧与管理运营侧的边界见 `0012` §7）。
 ///
 /// `editRequest` 是容器（`App`）给的"要改哪个型号"：给 `null` 时抽屉里是新增表单，给型号名时先载入它
 /// 再进改价模式。`#/publish` 这个旧地址仍然可用，它落到本页并把要改的型号带进来。
@@ -259,38 +258,13 @@ export function ModelsPage({
         {form ? (
           // `key` 让换型号（或从改价切到新增）时表单重新挂载：不清空就会把上一个型号的字段带过来。
           //
-          // **默认是运营那条路**（[`PlatformModelPanel`]）：填平台模型名 → 选厂商 → 勾供给 → 给价，
-          // 技术字段一个都不出现。工程师那条老路（[`PublishPanel`]，即"贴整份技术定义"）收进下面的
-          // 折叠区——它在过渡期仍然可用（`0012` §7），但不再是运营的路径，所以不占主位。
+          // 抽屉里**只有运营那条路**（[`PlatformModelPanel`]）：填平台模型名 → 选厂商 → 勾供给 → 给价，
+          // 技术字段一个都不出现。渠道与供给由工程师随发布素材配置，运营后台没有别的发布入口。
           <PlatformModelPanel
             key={form.editing ?? '__new__'}
             client={client}
             editing={form.editing}
             onPublished={models.reload}
-          />
-        ) : null}
-        {form ? (
-          // **工程师那条路**：直接贴整份发布定义（含渠道三要素、驱动器、承载面、参数映射）。
-          // 过渡期仍接受（`0012` §7），所以留着；但它不是运营的路径，因此默认收起。
-          // `Collapse` 的 `destroyOnHidden` 让收起时表单卸载：不卸载的话，运营在展开状态下改过的东西
-          // 会留到下一次打开，而那条路本来就不该有"上次的残留"。
-          <Collapse
-            ghost
-            style={{ marginTop: 16 }}
-            items={[
-              {
-                key: 'engineer',
-                label: '工程师：贴整份发布定义（渠道接入用）',
-                children: (
-                  <PublishPanel
-                    key={`engineer-${form.editing ?? '__new__'}`}
-                    client={client}
-                    editing={form.editing}
-                    onPublished={models.reload}
-                  />
-                ),
-              },
-            ]}
           />
         ) : null}
       </Drawer>
