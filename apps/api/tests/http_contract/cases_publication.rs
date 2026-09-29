@@ -2008,27 +2008,14 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
         "{body}"
     );
 
-    // 5) 按张计价**不带**费率表也能发布：参数是单价，不是那份四档费率。
+    // 5) 按张 / 按次是**成本**形态：它的参数是单价，不是那份四档费率（Price Plan 可以不发）。
     let mut per_image = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     per_image["formula"] = json!("per_image");
     per_image["price_plan"] = Value::Null;
     per_image["cost_unit_price_microusd"] = json!(11_354);
     per_image["cost_currency"] = json!("USD");
-    // 6) 对客价是"成本单价 × 倍率 × 折算率"：缺了倍率就算不出该收多少钱，发布期就拒——
-    //    "不带价目表也能发布"不等于"连对客价一起没有"，那样结算只能按 0 收（等于白送）。
-    let (status, body) = publish(
-        &client,
-        &base_url,
-        &admin_token,
-        model,
-        vec![per_image.clone()],
-        None,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
-    assert!(message(&body).contains("markup_bps is required"), "{body}");
-
-    // 7) 给它倍率（没有价目表也可以）：发布成功，受理照常、快照冻结形态与单价。
+    // 6) 对客形态是另一件事，只有按 token 四档 / 上游声明金额 × 倍率两种，必须显式给出——
+    //    成本按张的候选没有可沿用的对客形态。
     let (status, body) = publish(
         &client,
         &base_url,
@@ -2038,16 +2025,44 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
         Some(2_000),
     )
     .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("consumer_formula"), "{body}");
+
+    // 7) 对客选"上游声明金额 × 倍率"：缺倍率算不出该收多少钱，发布期就拒。
+    let mut declared = per_image.clone();
+    declared["consumer_formula"] = json!("upstream_declared");
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![declared.clone()],
+        None,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert!(message(&body).contains("markup_bps is required"), "{body}");
+
+    // 8) 给它倍率（没有价目表也可以）：发布成功，受理照常、快照冻结成本形态与单价。
+    let (status, body) = publish(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        vec![declared],
+        Some(2_000),
+    )
+    .await;
     assert_eq!(
         status,
         StatusCode::OK,
-        "有对客计费基准、没有价目表照样发布：{body}"
+        "成本按张、对客按上游金额，没有价目表照样发布：{body}"
     );
 
-    // 8) 按张计价再带一份对客四档向量也要拒：那份向量是 token 计量量的价格，在别的形态下
-    //    永远不会被读——留着它只会让人以为它在生效。
-    let mut per_image_with_rates = per_image.clone();
-    per_image_with_rates["consumer_rates_cny"] = json!({
+    // 9) 对客选上游金额却带一份对客四档向量：那份向量只属对客按 token 四档，永远不会被读。
+    let mut declared_with_rates = per_image.clone();
+    declared_with_rates["consumer_formula"] = json!("upstream_declared");
+    declared_with_rates["consumer_rates_cny"] = json!({
         "text_input_micros_per_million": 35_500_000u64,
         "image_input_micros_per_million": 56_800_000u64,
         "text_output_micros_per_million": 71_000_000u64,
@@ -2058,13 +2073,13 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
         &base_url,
         &admin_token,
         model,
-        vec![per_image_with_rates],
+        vec![declared_with_rates],
         Some(2_000),
     )
     .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
     assert!(
-        message(&body).contains("consumer_rates_cny does not apply to formula"),
+        message(&body).contains("consumer_rates_cny does not apply to consumer_formula"),
         "{body}"
     );
 
@@ -2118,6 +2133,7 @@ async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     assert_eq!(snapshot["formula"], json!("per_image"));
     assert_eq!(snapshot["cost_unit_price_microusd"], json!(11_354));
     assert_eq!(snapshot["cost_currency"], json!("USD"));
+    assert_eq!(snapshot["consumer_formula"], json!("upstream_declared"));
     assert!(
         snapshot["fx_rate"].is_object(),
         "声明了成本币种就把折算率冻结下来（毛利要用它）：{snapshot}"

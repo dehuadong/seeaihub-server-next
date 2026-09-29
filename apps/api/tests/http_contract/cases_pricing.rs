@@ -674,3 +674,120 @@ async fn the_admin_view_lists_the_published_pricing() {
 
     harness.cleanup().await;
 }
+
+/// **换对客形态重发，已受理 Job 的收费与平台成本逐位不变**（#34 的 P2 / P5）。
+///
+/// 同一条候选先按"对客按 token 四档"发布、受理一笔；再把**对客形态**换成"上游声明金额 × 倍率"
+/// 重发。三件事一起钉住：已受理那笔的快照与实收**逐位不动**（结算只读受理时冻结的那份）；新受理
+/// 那笔按**新形态**算；两笔的**平台成本逐位相同**——成本按渠道的成本形态取，与对客形态无关。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouched() {
+    let harness = Harness::start(UpstreamBehaviour::apimart()).await;
+    let client = Client::new();
+    let _worker = harness.spawn_worker();
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+
+    // 渠道声明金额（APIMart 的 `cost` = 11_354 微美元）；对客先按 token 四档。
+    let mut first = candidate(
+        "APIMart",
+        "apimart-image-v1",
+        &["prompt_only", "image_conditioned", "masked"],
+    );
+    first["base_url"] = Value::String(harness.upstream_base_url.clone());
+    first["reference_cost_microusd"] = json!(11_354);
+    first["cost_basis"] = json!("declared");
+    first["consumer_formula"] = json!("token_rates");
+    first["consumer_rates_cny"] = priced_consumer_rates();
+    first["tier_prices"] = json!({});
+    first["floor_amounts"] = openai_floor_amounts();
+    assert_eq!(
+        publish_candidates_with_markup(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            Harness::MODEL,
+            None,
+            vec![first.clone()],
+            Some(2_000),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let request = route_request(harness.model, "consumer form change");
+    let key = format!("consumer-form-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (first_job, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    let first_snapshot = frozen_snapshot(&harness.pool, &key).await;
+    assert_eq!(first_snapshot["consumer_formula"], json!("token_rates"));
+    // 对客按四档向量算：14 文本输入 × 40 + 196 图像输出 × 220（每 1M） = 43_680。
+    assert_eq!(harness.captured_microusd(first_job).await, -43_680);
+    let first_cost = harness.attempt_cost(first_job).await;
+    assert_eq!(first_cost.0, Some(11_354), "成本取渠道声明的金额");
+
+    // 同一条候选，只把**对客形态**换成"上游声明金额 × 倍率"重发。
+    let mut second = first.clone();
+    second["consumer_formula"] = json!("upstream_declared");
+    second["consumer_rates_cny"] = Value::Null;
+    assert_eq!(
+        publish_candidates_with_markup(
+            &client,
+            &harness.base_url,
+            &harness.admin_token,
+            Harness::MODEL,
+            None,
+            vec![second],
+            Some(2_000),
+        )
+        .await,
+        StatusCode::OK
+    );
+
+    let next_key = format!("consumer-form-next-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &next_key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (next_job, state, _) = harness.job(&next_key).await;
+    assert_eq!(state, "succeeded");
+    let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
+    assert_eq!(
+        next_snapshot["consumer_formula"],
+        json!("upstream_declared")
+    );
+    assert!(next_snapshot["consumer_rates_cny"].is_null());
+    // 新形态：声明额 11_354 × 倍率 1.2 × 折算率 7.1 = 96_736.08 ⇒ 向上取整 96_737。
+    assert_eq!(harness.captured_microusd(next_job).await, -96_737);
+
+    // P2：换形态重发不许动已受理 Job 的快照与实收。
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &key).await,
+        first_snapshot,
+        "已受理 Job 的快照逐位不动"
+    );
+    assert_eq!(harness.captured_microusd(first_job).await, -43_680);
+    // P5：两笔的平台成本逐位相同——成本按渠道的成本形态取，与对客形态无关。
+    assert_eq!(
+        harness.attempt_cost(next_job).await,
+        first_cost,
+        "改对客形态前后，平台成本逐位不变"
+    );
+
+    harness.cleanup().await;
+}

@@ -755,6 +755,9 @@ async fn probe_api_startup_with_seed(
         .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
         .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
         .env("WORKER_LEASE_SECONDS", "30")
+        // 引导只认**显式给的**环境变量：在无 `.env` 的目录起进程，本地检出的 `.env` 才不会
+        // 替"只给邮箱"补上一个口令，把这条判据变成看天吃饭。
+        .current_dir(std::env::temp_dir())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
     // 两个都没给时要**明确不设**这两个变量，而不是设成空串（空串与"没配"在引导里是两回事）。
