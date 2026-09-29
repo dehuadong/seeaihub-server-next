@@ -1,12 +1,12 @@
 主题: 身份与控制台的技术设计
 当前修订: v1
 状态: 待评审
-承接: [`0001` 控制台 Spec v13](../specs/0001-admin-and-customer-consoles.md) 的身份与页面组织；账户金额及账单行为由 [`0002` 账户资金 Spec v3](../specs/0002-account-funds-and-reservations.md) 承接
+承接: [`0001` 控制台 Spec v14](../specs/0001-admin-and-customer-consoles.md) 的身份与双入口产物；账户金额及账单行为由 [`0002` 账户资金 Spec v3](../specs/0002-account-funds-and-reservations.md) 承接，客户独立页面由 [`0014`](0014-customer-console-navigation-and-history.md) 承接
 依赖: [`docs/design/0006`](./0006-gateway-models-and-consumer-surface.md)、[`0007`](./0007-pricing-floor-and-settlement.md)、[`0008`](./0008-routing-strategy-and-caching.md)、[`0009`](./0009-operational-baseline.md)；`ADR-0003`、`ADR-0015`、`ADR-0016`、`ADR-0017`
 
 # 身份与控制台的技术设计
 
-本文承接 `docs/specs/0001-admin-and-customer-consoles.md` v1，覆盖它的 §2（范围）、§4（可观察行为）、§5（验收条件）、§6（约束）与 §7（未解决问题）。技术上如何满足这些要求由本文决定；产品行为不在本文改写。
+本文负责客户与管理员身份、接口认证及双入口产物；客户控制台的导航、页面内容与历史浏览由[客户控制台设计](0014-customer-console-navigation-and-history.md)负责。技术上如何满足身份与交付要求由本文决定；产品行为不在本文改写。
 
 ## 1. 系统边界与职责
 
@@ -142,9 +142,9 @@
 | `POST` | `/v1/customer/api-keys` | 客户会话 | `{label}` | `201 {key_id, api_key}`（明文只此一次） |
 | `DELETE` | `/v1/customer/api-keys/{key_id}` | 客户会话 | — | `204`；不属于自己 ⇒ `404` |
 | `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示已结算余额 |
-| `GET` | `/v1/customer/ledger` | 客户会话 | `?since=&until=&limit=` | `200 {entries:[{kind, amount_microusd, job_id, created_at}], count, total, truncated}`（充值与扣费都在这里；金额带符号，符号是语义的一部分。`[since, until)` 是半开区间，与 `billing` 同一条口径——同一区间下明细与汇总必须对得上） |
-| `GET` | `/v1/customer/usage` | 客户会话 | `?since=&until=&limit=` | `200 {usage:[{gateway_model, kind, status, created_at, terminal_at, image_count, charged_microusd}], count, truncated}`；处理中请求的 `terminal_at` 为 `null` |
-| `GET` | `/v1/customer/billing` | 客户会话 | `?since=&until=` | `200 {since, until, requests, images, charged_microusd}`（**汇总按区间全量**，与 `usage` 的 `limit` 无关） |
+| `GET` | `/v1/customer/ledger` | 客户会话 | 资金记录查询 | 按账户和时间区间读真实收支；筛选、翻页和响应见[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
+| `GET` | `/v1/customer/usage` | 客户会话 | 调用记录查询 | 对客状态、终态时刻、分组和翻页见[客户控制台设计](0014-customer-console-navigation-and-history.md) §2 |
+| `GET` | `/v1/customer/billing` | 客户会话 | 时间区间 | 区间汇总与金额展示见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5 与[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
 
 **未认证与越权是两个不同的答复**：没有凭据（或凭据无效、已过期、已退出）访问任一客户端点 ⇒ **未认证**（401，与管理员面同一条）；凭据有效但目标数据不属于这个账户 ⇒ **不存在**（404），不返回 403、也不说明存在性（Spec §4.2、V-C10）。
 
@@ -152,7 +152,7 @@
 
 **`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`status`、`created_at`、`terminal_at`、`image_count`、`charged_microusd`——**不含 Generation Job 的标识与内部状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为"对客不可见、不投射成对客协议"，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。
 
-`status` 是一个**收敛过的三值**（`succeeded` / `failed` / `pending`），由内部 Job 状态与结算结果映射而来；映射写在拥有它的那个读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。"失败"只说这次没产出，不改写渠道侧的错误细节。
+`status` 是收敛后的四值（`succeeded` / `failed` / `pending` / `canceled`），由内部 Job 状态与结算结果映射而来；未结案的 `reconciliation_required` 对客仍是 `pending`，不提前宣告失败。映射写在拥有它的读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。`failed` 只说这次未产出，不改写渠道侧的错误细节。
 
 **汇总怎么算**：`requests` 与 `images` 按区间内到达终态的执行记录计，`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
 
@@ -280,7 +280,7 @@ apps/web/
 | --- | --- |
 | 应用层模块用例（内存替身） | 哈希与校验、令牌生成与摘要、邮箱归一化与口令下限、登录失败的同一错误、对客注册的账户-身份同事务（替身层面）、会话过期判定 |
 | 端到端合同用例（真库 + 真 API 进程） | V-A1…V-A8、V-C1…V-C14：登录与失败语义（V-A1/V-A2）、会话过期与退出（V-A3）、改口令与旧会话失效（V-A4）、引导幂等（V-A5）、共享令牌回归（V-A6）、重置令牌（V-A7）、引导三种配置（V-A8）；注册与冲突（V-C1/V-C2）、密钥三件套（V-C3/V-C4）、越权 404（V-C5）、充值可见（V-C6）、用量与账本一致（V-C7）、账单口径（V-C8）、口令重置（V-C9）、未认证被拒（V-C10）、无自助申请入口（V-C11）、客户改口令（V-C12）、运营替客户开户与给已有账户配身份（V-C13/V-C14） |
-| 浏览器实测（headless Chrome，本机可用） | V-D1…V-D7：两个地址各自的登录界面、六页读**端到端夹具自造**的数据（V-D2）、刷新保持登录与 URL 无凭据（V-D3）、未认证不发起取数请求（V-D4）、对客控制台四块（V-D5）、客户入口产物不含管理端代码（V-D6）、人工登录验收（V-D7） |
+| 浏览器实测（headless Chrome，本机可用） | V-D1…V-D7、V-D13：两个地址各自的登录界面、管理页读**端到端夹具自造**的数据（V-D2）、刷新保持登录与 URL 无凭据（V-D3）、未认证不发起取数请求（V-D4）、客户页面首屏余额与独立导航（V-D5）、客户入口产物不含管理端代码（V-D6）、直接打开客户页面地址（V-D13）、人工登录验收（V-D7） |
 | 人工验收（浏览器，由人执行并留档） | V-D7：服务起着、用引导出来的邮箱口令登录、逐个打开六个管理页面确认数据 |
 
 **人工验收怎么留档**：写在工单评论里（谁、什么时候、哪个地址与账号、每个页面看到什么、发现的问题与处理），不写进 Spec 或 RFC——那是交付记录，归工作项。
