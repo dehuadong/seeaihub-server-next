@@ -5776,8 +5776,18 @@ impl GenerationService {
         // 判据是"这条候选带不带定价"，不是"有没有对客费率向量"：按张 / 按次 / 上游给金额的候选
         // 本来就没有那份四档向量，但它们照样有保底表要查。带定价就一定有保底表（发布期两者
         // 全有或全无），所以这里看保底表在不在。
+        // 保底额按**请求张数**缩放：保底表里给的是每张额，`hold = n × 每张额`（`n` 缺省 1，
+        // `ADR-0009` ②）。回落链的每一层都乘 `n`——请求 10 张时"档位查不到"也不能按 1 张冻。
+        let images = requested_image_count(&request.native_parameters);
+        let scale = |per_image: u64| {
+            per_image.checked_mul(images).ok_or_else(|| {
+                ApplicationError::Configuration(format!(
+                    "the hold overflows: {per_image} micros per image × {images} images"
+                ))
+            })
+        };
         if offering.price_snapshot.floor_amounts.is_none() {
-            return Ok(self.max_cost_microusd);
+            return scale(self.max_cost_microusd);
         }
         let table = offering
             .price_snapshot
@@ -5804,12 +5814,13 @@ impl GenerationService {
             literal_parameter_text(&request.native_parameters, "size"),
             &profile,
         );
-        let (hold_microusd, hold_source) = table
+        let (per_image_microusd, hold_source) = table
             .lookup(
                 tier.as_ref(),
                 literal_parameter_text(&request.native_parameters, "quality"),
             )
             .unwrap_or((self.max_cost_microusd, HoldSource::PlatformDefault));
+        let hold_microusd = scale(per_image_microusd)?;
         offering.price_snapshot.hold_microusd = Some(hold_microusd);
         offering.price_snapshot.hold_source = Some(hold_source);
         Ok(hold_microusd)

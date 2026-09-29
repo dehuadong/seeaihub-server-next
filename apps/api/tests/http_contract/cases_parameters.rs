@@ -380,6 +380,27 @@ async fn a_requested_image_count_beyond_the_contracts_maximum_is_rejected_before
     let harness =
         Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
     let account_id = Uuid::parse_str(&harness.account_id).expect("account id");
+    // 保底额按请求张数缩放（#35）：`n = 10` 那笔要冻 10 张的钱，夹具账户那 ¥1 不够。先充足以把
+    // "合同上界"这条判据与"余额够不够"这条判据分开。
+    let client = Client::new();
+    let credited = client
+        .post(format!(
+            "{}/api/v1/accounts/{}/credits",
+            harness.base_url, harness.account_id
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "amount_microusd": 10_000_000,
+            "business_key": "n-boundary"
+        }))
+        .send()
+        .await
+        .expect("credit request");
+    assert!(
+        credited.status().is_success(),
+        "充值必须成功：{}",
+        credited.status()
+    );
 
     let mut over = route_request(harness.model, "one image too many");
     over["n"] = json!(11);

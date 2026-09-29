@@ -363,8 +363,14 @@ async fn the_hold_resolves_the_tier_then_walks_the_supply_floor_chain() {
         .await,
         StatusCode::OK
     );
-    let (_, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    // 充得多一点：`n = 10` 那几笔的保底额按张数放大，1_000_000 会直接撞上准入闸门。
+    let (_, api_key) = funded_account(
+        &client,
+        &harness.base_url,
+        &harness.admin_token,
+        100_000_000,
+    )
+    .await;
     let _worker = harness.spawn_worker();
 
     // 档位查表：2K = ¥0.25。
@@ -390,6 +396,21 @@ async fn the_hold_resolves_the_tier_then_walks_the_supply_floor_chain() {
             "quality={quality}"
         );
     }
+    // **保底额按请求张数缩放**（#35）：同一档位 n=1 与 n=10 的 hold 之比为 1:10。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "2K", "n": 1})).await,
+        (250_000, "tier".to_owned())
+    );
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "2K", "n": 10})).await,
+        (2_500_000, "tier".to_owned()),
+        "10 张不能按 1 张冻"
+    );
+    // **回落链的每一层都乘 `n`**：归不出档位时用该供给的每张封顶值 × n。
+    assert_eq!(
+        hold_for(&harness, &api_key, json!({"size": "16:9", "n": 4})).await,
+        (1_200_000, "supply_cap".to_owned())
+    );
     // **像素型 `size` 先归到档位**（用户口径：按分辨率保底、通过 `size` 判断 1K/2K/4K）：
     // 这条供给没发布尺寸档案，所以按**最长边**阈值兜底。
     for (size, amount) in [
