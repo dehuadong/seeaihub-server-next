@@ -4,7 +4,8 @@ import { adminApiUrl, consoleUrl, settings } from './settings';
 /// **充值不需要先知道账户标识**（Spec V-D10、`#39`）。
 ///
 /// 运营手上没有 UUID，他们有的是客户邮箱或自己设的标签。这条从造一个带邮箱的客户开始，全程**不出现
-/// 账户标识**：用邮箱搜到它，点那一行选中，页面直接给出充值 / 账目流水 / API Key 三块。
+/// 账户标识**：用邮箱搜到它，点那一行选中，选中区只给四个按钮；充值开**弹窗**（充值输入框打开前不
+/// 存在），充值记录开**侧边栏**——模块内容不摊在页面上（`#41` 的 P1/P2）。
 ///
 /// 这条判据的要害在"不出现标识"上，所以用例**不能**为了省事把接口返回的 `account_id` 填回界面——
 /// 那样验的是"拿到标识之后能用"，正是判据排除的那条路。
@@ -33,22 +34,28 @@ test('用邮箱搜到账户并充值，全程不用账户标识', async ({ page,
   await expect(body.getByRole('row')).toHaveCount(1);
   await expect(body).toContainText(email);
 
-  // 点那一行选中它：页面直接给出三块，**没有「打开」、没有抽屉**。
+  // 点那一行选中它：只出现四个按钮，**没有任何模块内容**（输入框、侧边栏都不在）。
   await body.getByText(email).click();
-  await expect(page.getByTestId('accounts-credit-yuan')).toBeVisible();
-  // **钱与调用分开**：充值记录一块、扣费记录（调用明细）一块（`#40`）。
-  await expect(page.getByText('充值记录', { exact: true })).toBeVisible();
-  await expect(page.getByText('扣费记录（调用明细）')).toBeVisible();
-  await expect(page.getByText('API Key')).toBeVisible();
+  for (const id of [
+    'accounts-credit-open',
+    'accounts-credits-open',
+    'accounts-usage-open',
+    'accounts-keys-open',
+  ]) {
+    await expect(page.getByTestId(id)).toBeVisible();
+  }
+  await expect(page.getByTestId('accounts-credit-yuan')).toHaveCount(0);
   await expect(page.locator('.ant-drawer')).toHaveCount(0);
 
-  // 充值**只填金额**——幂等键由平台生成，不用运营抄一个。
+  // 充值**只填金额**——幂等键由平台生成，不用运营抄一个；输入框在弹窗打开后才出现。
+  await page.getByTestId('accounts-credit-open').click();
   await page.getByTestId('accounts-credit-yuan').fill('12.34');
   await page.getByTestId('accounts-credit-submit').click();
 
-  // 余额与**充值记录**都反映这次充值（不是只弹了个提示）。
+  // 余额与**充值记录**都反映这次充值（不是只弹了个提示）；充值记录在侧边栏里。
   await expect(page.getByTestId('accounts-balance')).toContainText('12.34', { timeout: 10_000 });
-  await expect(page.locator('.ant-card', { hasText: '充值记录' })).toContainText('12.34');
+  await page.getByTestId('accounts-credits-open').click();
+  await expect(page.locator('.ant-drawer')).toContainText('12.34');
 
   // **全程没有出现过账户标识**：这页上没有把它填进过任何输入框。
   await expect(page.getByTestId('accounts-lookup-id')).toHaveValue('');

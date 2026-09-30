@@ -82,13 +82,16 @@ test.describe('管理页面读的是库里的数据', () => {
     await goTo(page, '账户');
 
     // 在这一页上按刚建的账户标识去读余额：读出来的必须正是那个数（12.34 元）。
-    // 选中一个账户之后，余额直接显示在账户那一行（`#39`：没有「打开」、没有抽屉）。
+    // 选中一个账户之后，三个金额显示在账户那一行（`#41`：模块内容在弹层里，金额读数留在页面上）。
     await page.getByTestId('accounts-lookup-id').fill(accountId);
     await page.getByTestId('accounts-open-by-id').click();
 
     // antd 会把文本切成多个节点，`getByText('12.34 元')` 匹配不到——按容器 + 归一化文本断言。
     await expect(page.getByTestId('accounts-balance')).toContainText('12.34');
     await expect(page.getByTestId('accounts-balance')).toContainText('元');
+    // 没有在飞请求时持有中为 0，可用额等于已结算余额（账户资金 Spec `0002` §4）。
+    await expect(page.getByTestId('accounts-held')).toContainText('0');
+    await expect(page.getByTestId('accounts-available')).toContainText('12.34');
   });
 
   test('对账与诊断页把三块读出来，空库时显示空态而不是报错', async ({ page }) => {

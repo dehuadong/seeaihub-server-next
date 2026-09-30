@@ -27,7 +27,7 @@ test('建账户要先填表单：取消不建、确认才建且标签能搜到',
   await page.getByTestId('accounts-create-yuan').fill('5');
   await page.getByTestId('accounts-create-submit').click();
 
-  // 建出来的账户按**标签**能搜到。用"账户列表"那张卡限定：页面上还有流水那张表。
+  // 建出来的账户按**标签**能搜到。用"账户列表"那张卡限定，免得与选中区那张卡混淆。
   await page.getByTestId('accounts-lookup-tag').fill(tag);
   await page.getByTestId('accounts-search').click();
   const list = page.locator('.ant-card', { hasText: '账户列表' });

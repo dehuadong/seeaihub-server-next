@@ -154,7 +154,6 @@ export interface RoutePoliciesResponse {
   route_policies: RoutePolicy[];
 }
 
-/// 管理员读余额的形状（`AccountBalanceResponse`）。对客那条是另一个形状（多一个持有中）。
 /// 管理端看到的一个账户（账户列表的一项）。**不含持有中**：那是与余额并列才有意义的第二个数，
 /// 放进详情读。
 export interface AccountSummary {
@@ -172,8 +171,17 @@ export interface AccountsResponse {
   accounts: AccountSummary[];
 }
 
+/// 管理员读余额的形状（`AccountBalanceResponse`）：已结算余额、持有中与可用额分开给，同一时点满足
+/// `available = balance − held`（账户资金 Spec `0002` §4）。管理员可以分别显示三个金额。
 export interface AccountBalance {
+  /// 已结算余额（可以为负）。
   balance_microusd: number;
+  /// 持有中：active 预授权之和。
+  held_microusd: number;
+  /// 可用额 = 已结算余额 − 持有中。
+  available_microusd: number;
+  /// 账户金额版本。
+  version: number;
   updated_at: string;
 }
 
