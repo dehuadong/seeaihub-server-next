@@ -17,7 +17,14 @@ export function KeysPage({ client }: { client: CustomerClient }) {
   const [form] = Form.useForm<{ label: string }>();
 
   return (
-    <Card title="API Key" extra={<Button onClick={keys.reload}>重取</Button>}>
+    <Card
+      title="API Key"
+      extra={
+        <Button data-testid="portal-keys-reload" onClick={keys.reload}>
+          重取
+        </Button>
+      }
+    >
       <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
         明文只在创建那一次出现，之后谁也拿不回来。吊销立刻生效（不删行）。
       </Typography.Paragraph>

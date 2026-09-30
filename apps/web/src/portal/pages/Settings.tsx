@@ -2,6 +2,7 @@ import { Alert, App as AntApp, Button, Card, Descriptions, Flex, Form, Input, Sp
 import { LockOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { CustomerClient } from '../client';
+import { NO_ONLINE_PAYMENT, RESET_VIA_OPERATIONS } from '../notices';
 import { useCustomerSession } from '../session';
 
 /// 账户设置：登录邮箱、可复制的账户 id、改口令与退出。低频资料与低频动作收在这里，不占概览首屏。
@@ -129,8 +130,8 @@ export function SettingsPage({
 
       <Card title="关于充值">
         <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
-          平台目前没有在线支付：充值由运营在后台完成，这里只展示充值记录与余额。忘了口令也不能自助
-          重置——请找运营签发一枚一次性重置令牌，用它设置新口令。
+          {NO_ONLINE_PAYMENT}
+          {RESET_VIA_OPERATIONS}
         </Typography.Paragraph>
       </Card>
     </Flex>

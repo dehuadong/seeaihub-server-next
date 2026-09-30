@@ -149,3 +149,52 @@ test('账单读失败时不把缺失值画成零', async ({ page }) => {
   await expect(summary.getByRole('alert')).toBeVisible();
   await expect(summary.getByText('—').first()).toBeVisible();
 });
+
+test('对客请求回 401 时清掉页面数据并回到登录', async ({ page }) => {
+  await registerCustomer(page, uniqueEmail('portal-nav-401'));
+
+  // 先制造可见的密钥数据，清屏才有东西可"消失"。
+  await nav(page, 'API Key');
+  await page.getByTestId('portal-key-label').fill('401 前可见');
+  await page.getByTestId('portal-key-create').click();
+  await expect(page.getByText('401 前可见')).toBeVisible();
+
+  // 服务端提前吊销会话：之后的对客取数一律回 401。
+  await page.route('**/v1/customer/**', (route) =>
+    route.fulfill({
+      status: 401,
+      contentType: 'application/json',
+      body: '{"error":{"code":"unauthorized","message":"unauthorized"}}',
+    }),
+  );
+
+  // 同一页面上触发一次重取——401 由客户端集中清屏，而不是把旧数据留在可见页面（设计 0014 §4）。
+  await page.getByTestId('portal-keys-reload').click();
+
+  await expect(page.getByTestId('portal-submit')).toBeVisible();
+  await expect(page.getByText('401 前可见')).toHaveCount(0);
+  await expect(page.getByTestId('portal-key-create')).toHaveCount(0);
+  await expect(page.getByRole('menuitem', { name: '概览' })).toHaveCount(0);
+  expect(await page.evaluate(() => sessionStorage.getItem('seeai.portal.session'))).toBeNull();
+});
+
+test('会话 expires_at 已过期时刷新回到登录并清屏', async ({ page }) => {
+  await registerCustomer(page, uniqueEmail('portal-nav-expired'));
+
+  await nav(page, 'API Key');
+  await page.getByTestId('portal-key-label').fill('过期前可见');
+  await page.getByTestId('portal-key-create').click();
+  await expect(page.getByText('过期前可见')).toBeVisible();
+
+  // 只把本地会话的到期时刻改成过去：服务端那条会话可能仍然有效，页面也必须按到期时刻自行清屏。
+  await page.evaluate(() => {
+    sessionStorage.setItem('seeai.portal.session.expires', new Date(Date.now() - 60_000).toISOString());
+  });
+  await page.reload();
+
+  await expect(page.getByTestId('portal-submit')).toBeVisible();
+  await expect(page.getByText('过期前可见')).toHaveCount(0);
+  await expect(page.getByTestId('portal-key-create')).toHaveCount(0);
+  await expect(page.getByRole('menuitem', { name: '概览' })).toHaveCount(0);
+  expect(await page.evaluate(() => sessionStorage.getItem('seeai.portal.session'))).toBeNull();
+});

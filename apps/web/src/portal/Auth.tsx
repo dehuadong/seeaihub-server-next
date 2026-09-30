@@ -4,6 +4,7 @@ import { useState } from 'react';
 import { apiFetch } from '../shared/api';
 import type { CustomerSession } from '../shared/types';
 import { CustomerClient } from './client';
+import { NO_ONLINE_PAYMENT, RESET_VIA_OPERATIONS } from './notices';
 import { useCustomerSession } from './session';
 import { useLoadable } from '../shared/ui';
 
@@ -128,8 +129,8 @@ export function AuthPage() {
 
         <Card size="small">
           <Typography.Paragraph type="secondary" style={{ margin: 0, fontSize: 12 }}>
-            平台目前没有在线支付：充值由运营在后台完成，这里只展示充值记录与余额。忘了口令也不能自助
-            重置——请找运营签发一枚一次性重置令牌，用它设置新口令。
+            {NO_ONLINE_PAYMENT}
+            {RESET_VIA_OPERATIONS}
           </Typography.Paragraph>
         </Card>
       </Flex>
@@ -160,7 +161,7 @@ function ResetPanel() {
       }
     >
       <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
-        口令忘了就找运营要一枚一次性重置令牌（平台不发邮件）。重置成功会使此前所有登录会话失效。
+        {`${RESET_VIA_OPERATIONS}平台不发邮件，重置成功会使此前所有登录会话失效。`}
       </Typography.Paragraph>
       <Form
         form={form}
