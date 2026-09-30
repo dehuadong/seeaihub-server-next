@@ -3532,8 +3532,8 @@ pub trait CacheStore: Send + Sync {
 
 /// 加速层的运行参数。
 ///
-/// 新鲜窗口必须**显著小于**对账周期：对账写回的条目来源标记是 `reconciler`、本来就**不用于**
-/// 提前拒绝，这条比例关系是第二道保险——它保证"能用来拒绝的值"实际都来自写穿路径。
+/// 新鲜窗口必须**显著小于**对账周期：对账写回的条目来源标记是 `reconciler`、本来就**不作为**
+/// 新鲜提示，这条比例关系是第二道保险——它保证"能用作提示的值"实际都来自写穿路径。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachePolicy {
     pub route_ttl: Duration,
@@ -5601,7 +5601,7 @@ pub struct GenerationService {
     /// 的——一个接一个地跑、每一个都合规，照样能在一天里把余额花完。所以这里问的是账本上
     /// "今天已经扣掉多少"，而不是任何计数器。
     max_daily_spend_microusd: u64,
-    /// 加速层：候选集从缓存取、受理后把余额写穿、以及**只在新鲜时**的提前拒绝。
+    /// 加速层：候选集从缓存取、受理后把余额快照写穿、以及**只在新鲜时**的不足提示。
     acceleration: Arc<AccelerationService>,
     /// 成本护栏：单次请求可能花掉的上游成本上限（运营取值）。
     cost_ceiling: RequestCostCeiling,
