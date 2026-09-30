@@ -15,11 +15,13 @@ verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo 
 
 ## 决定
 
-- `ledger.daily_spend` 每账户每 UTC 自然日一行，以正数记已完成实收；成功结算在写 `capture` 的同一事务按 `(now() AT TIME ZONE UTC)::date` upsert 累加，零实收不写；受理只读当天一行，缺行视为 0。
-- `generation.jobs.terminal_at`：`succeeded` 由 `complete_job` 与 `capture` 同一事务取 `now()`；`failed` 由 `fail_job` 与人工解除对账（`refund_reconciliation`）取 `now()`；`canceled` 当前没有写入方；`reconciliation_required` 不是领域终态（`JobState::is_terminal`），留空。
-- 用量：已完成（`terminal_at IS NOT NULL`）按终态时刻过滤，处理中按受理时刻，行里同时返回 `created_at` 与 `terminal_at`；逐笔扣费改为该 Job 的 `capture` 标量子查询，不再带流水时间过滤。对客用量与管理员用量的响应都新增 `terminal_at`。
-- 账单：请求数与产出张数只算已完成、按终态时刻归属；`charged_microusd` 仍按 `capture` 与 `adjustment` 的流水入账时刻求和。
-- 索引：`jobs (account_id, terminal_at) WHERE terminal_at IS NOT NULL`、`jobs (account_id, created_at)`、`entries (account_id, created_at)`、`entries (job_id) WHERE kind = capture`；`daily_spend` 主键 `(account_id, day)`。
+合同（合计记什么、归属规则、限额语义）归 [`0013` §4–§5](../../../../docs/design/0013-account-funds-and-reservations.md)；这里只记本次实现选定的机制。
+
+- `ledger.daily_spend` 主键 `(account_id, day)`，以正数记已完成实收；结算在写 `capture` 的同一事务按 `(now() AT TIME ZONE 'UTC')::date` upsert 累加，零实收不写；受理只读当天一行、缺行视为 0。
+- `generation.jobs.terminal_at` 的落点：`succeeded` 在 `complete_job`、`failed` 在 `fail_job`、人工解除对账在 `refund_reconciliation`，各与自己那次状态变更同事务；`canceled` 当前没有写入方，`reconciliation_required` 不是领域终态（`JobState::is_terminal`），留空。
+- 用量按 `terminal_at IS NOT NULL` 与否分两支（不用 `COALESCE`，否则两个索引都用不上）；逐笔扣费改成该 Job 的 `capture` 标量子查询，不再带流水时间过滤；对客与管理员用量响应都新增 `terminal_at`。
+- 账单的请求数与张数按 `terminal_at` 归属，`charged_microusd` 仍按 `capture` / `adjustment` 的入账时刻求和。
+- 索引：`jobs (account_id, terminal_at) WHERE terminal_at IS NOT NULL`、`jobs (account_id, created_at)`、`entries (account_id, created_at)`、`entries (job_id) WHERE kind = 'capture'`。
 
 ## 备选方案
 
