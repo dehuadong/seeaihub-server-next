@@ -1,4 +1,4 @@
-//! 账实核对这条任务的编排用例：发现不符之后**做什么**、一致时**什么都不做**、以及"已经有未结案
+//! 账实核对按账户的编排用例：发现不符之后**做什么**、一致时**什么都不做**、以及"已经有未结案
 //! 案例"时**不重复告警**。
 //!
 //! 这里用一个只记账的假仓库：真库那侧的语义（比对口径、部分唯一索引挡住重复建案）由端到端的
@@ -28,18 +28,18 @@ use std::{
 };
 use uuid::Uuid;
 
-/// 一个只服务账实核对的假仓库：它给出一批"对不上"的账户，并记下每次建案的请求。
+/// 一个只服务账实核对的假仓库：它给一个账户的"对不上"事实（或没有），并记下每次建案的请求。
 struct AuditRepository {
-    mismatches: Vec<LedgerBalanceMismatch>,
+    mismatch: Option<LedgerMismatch>,
     /// 建案这次是否**真的插进去了**。已有未结案案例时真库会把插入挡掉，那时这里是 `false`。
     case_opened: bool,
     opened: Mutex<Vec<OpenLedgerCaseCommand>>,
 }
 
 impl AuditRepository {
-    fn new(mismatches: Vec<LedgerBalanceMismatch>, case_opened: bool) -> Self {
+    fn new(mismatch: Option<LedgerMismatch>, case_opened: bool) -> Self {
         Self {
-            mismatches,
+            mismatch,
             case_opened,
             opened: Mutex::new(Vec::new()),
         }
@@ -638,10 +638,11 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn accounts_with_ledger_mismatch(
+    async fn account_ledger_mismatch(
         &self,
-    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError> {
-        Ok(self.mismatches.clone())
+        _account_id: AccountId,
+    ) -> Result<Option<LedgerMismatch>, ApplicationError> {
+        Ok(self.mismatch)
     }
 
     async fn open_ledger_reconciliation_case(
@@ -669,11 +670,23 @@ impl AlertSink for RecordingSink {
     }
 }
 
-fn mismatch(account_id: AccountId) -> LedgerBalanceMismatch {
-    LedgerBalanceMismatch {
+fn mismatch(account_id: AccountId) -> LedgerMismatch {
+    LedgerMismatch {
         account_id,
         ledger_total_microusd: 1_000_000,
         balance_microusd: 999_999,
+        holds_total_microusd: 0,
+        held_microusd: 0,
+    }
+}
+
+fn held_mismatch(account_id: AccountId) -> LedgerMismatch {
+    LedgerMismatch {
+        account_id,
+        ledger_total_microusd: 1_000_000,
+        balance_microusd: 1_000_000,
+        holds_total_microusd: 30_000,
+        held_microusd: 29_000,
     }
 }
 
@@ -683,35 +696,38 @@ fn auditor(
     let sink = Arc::new(RecordingSink {
         sent: Mutex::new(Vec::new()),
     });
-    let auditor = LedgerAuditor::new(
-        repository.clone(),
-        LedgerAuditPolicy::new(Duration::from_secs(900)).expect("a positive interval"),
-    )
-    .with_alerts(Arc::new(PlatformAlerter::new(sink.clone())));
+    let auditor = LedgerAuditor::new(repository.clone())
+        .with_alerts(Arc::new(PlatformAlerter::new(sink.clone())));
     (auditor, sink, repository)
 }
 
-/// 发现不符：建一条案例，并外发一条**账实不符**的告警——载荷带上账户与两个数，两个数一个不改。
+/// 余额对不上：建一条案例，并外发一条**账实不符**的告警——载荷带上账户与两组数，一个数不改。
 #[tokio::test]
-async fn a_mismatch_opens_a_case_and_alerts_the_platform() {
+async fn a_balance_mismatch_opens_a_case_and_alerts_the_platform() {
     let account_id = AccountId::new();
-    let repository = Arc::new(AuditRepository::new(vec![mismatch(account_id)], true));
+    let repository = Arc::new(AuditRepository::new(Some(mismatch(account_id)), true));
     let (auditor, sink, repository) = auditor(repository);
 
-    let report = auditor.audit_once().await.expect("this run converges");
+    let report = auditor
+        .audit_account(account_id)
+        .await
+        .expect("this check converges");
 
     assert_eq!(
         report,
         LedgerAuditReport {
-            mismatches_found: 1,
-            cases_opened: 1
+            mismatch_found: true,
+            case_opened: true
         }
     );
     let opened = repository.opened();
     assert_eq!(opened.len(), 1, "对不上就要建一条案例");
     assert_eq!(opened[0].account_id, account_id);
-    assert_eq!(opened[0].ledger_total_microusd, 1_000_000);
-    assert_eq!(opened[0].balance_microusd, 999_999);
+    assert!(
+        opened[0].reason.contains("1000000") && opened[0].reason.contains("999999"),
+        "案例要写清哪条等式断了与两边的数：{}",
+        opened[0].reason
+    );
 
     let sent = sink.sent.lock().expect("sent lock").clone();
     assert_eq!(sent.len(), 1, "新建一条案例就外发一条告警");
@@ -721,15 +737,86 @@ async fn a_mismatch_opens_a_case_and_alerts_the_platform() {
     assert_eq!(alert.account_id, account_id);
     assert_eq!(alert.ledger_total_microusd, 1_000_000);
     assert_eq!(alert.balance_microusd, 999_999);
+    assert_eq!(alert.holds_total_microusd, 0);
+    assert_eq!(alert.held_microusd, 0);
+}
+
+/// 占用合计对不上：同样建案告警，理由写的是占用那条等式。
+#[tokio::test]
+async fn a_held_mismatch_opens_a_case_and_alerts_the_platform() {
+    let account_id = AccountId::new();
+    let repository = Arc::new(AuditRepository::new(Some(held_mismatch(account_id)), true));
+    let (auditor, sink, repository) = auditor(repository);
+
+    let report = auditor
+        .audit_account(account_id)
+        .await
+        .expect("this check converges");
+
+    assert_eq!(
+        report,
+        LedgerAuditReport {
+            mismatch_found: true,
+            case_opened: true
+        }
+    );
+    let opened = repository.opened();
+    assert_eq!(opened.len(), 1);
+    assert!(
+        opened[0].reason.contains("30000") && opened[0].reason.contains("29000"),
+        "占用对不上要写清 active holds 与 held：{}",
+        opened[0].reason
+    );
+    let sent = sink.sent.lock().expect("sent lock").clone();
+    let PlatformAlert::LedgerMismatch(alert) = &sent[0] else {
+        panic!("账实不符外发的是它自己那种形态");
+    };
+    assert_eq!(alert.holds_total_microusd, 30_000);
+    assert_eq!(alert.held_microusd, 29_000);
+}
+
+/// 两条等式都断：理由把两句话都写上，案例只建一条。
+#[tokio::test]
+async fn both_equations_breaking_are_reported_in_one_case() {
+    let account_id = AccountId::new();
+    let both = LedgerMismatch {
+        account_id,
+        ledger_total_microusd: 1_000_000,
+        balance_microusd: 999_999,
+        holds_total_microusd: 30_000,
+        held_microusd: 29_000,
+    };
+    let repository = Arc::new(AuditRepository::new(Some(both), true));
+    let (auditor, _sink, repository) = auditor(repository);
+
+    let report = auditor
+        .audit_account(account_id)
+        .await
+        .expect("this check converges");
+
+    assert_eq!(
+        report,
+        LedgerAuditReport {
+            mismatch_found: true,
+            case_opened: true
+        }
+    );
+    let opened = repository.opened();
+    assert_eq!(opened.len(), 1, "两条都断也只建一条案例");
+    assert!(opened[0].reason.contains("balance"));
+    assert!(opened[0].reason.contains("held"));
 }
 
 /// 账实一致：**什么都不做**——不建案、不告警。
 #[tokio::test]
 async fn a_consistent_ledger_produces_no_action_at_all() {
-    let repository = Arc::new(AuditRepository::new(Vec::new(), true));
+    let repository = Arc::new(AuditRepository::new(None, true));
     let (auditor, sink, repository) = auditor(repository);
 
-    let report = auditor.audit_once().await.expect("this run converges");
+    let report = auditor
+        .audit_account(AccountId::new())
+        .await
+        .expect("this check converges");
 
     assert_eq!(report, LedgerAuditReport::default());
     assert!(repository.opened().is_empty(), "一致时不建案");
@@ -739,39 +826,34 @@ async fn a_consistent_ledger_produces_no_action_at_all() {
     );
 }
 
-/// 案例还开着的时候这一轮**不重复外发**：发现照记（报告里数得出来），但收告警的人不该每 15 分钟
-/// 收到同一条——新建一条案例才是那一条平台侧事件。
+/// 案例还开着的时候**不重复外发**：发现照记（报告里看得出来），但收告警的人不该反复收到同一条
+/// ——新建一条案例才是那一条平台侧事件。
 #[tokio::test]
 async fn an_already_open_case_is_not_alerted_again() {
     let account_id = AccountId::new();
-    let repository = Arc::new(AuditRepository::new(vec![mismatch(account_id)], false));
+    let repository = Arc::new(AuditRepository::new(Some(mismatch(account_id)), false));
     let (auditor, sink, repository) = auditor(repository);
 
-    let report = auditor.audit_once().await.expect("this run converges");
+    let report = auditor
+        .audit_account(account_id)
+        .await
+        .expect("this check converges");
 
     assert_eq!(
         report,
         LedgerAuditReport {
-            mismatches_found: 1,
-            cases_opened: 0
+            mismatch_found: true,
+            case_opened: false
         },
-        "这轮照样发现了不符，只是没有新建案例"
+        "照样发现了不符，只是没有新建案例"
     );
     assert_eq!(
         repository.opened().len(),
         1,
-        "该账户这轮的建案请求照发（真库那边由唯一索引挡掉）"
+        "该账户的建案请求照发（真库那边由唯一索引挡掉）"
     );
     assert!(
         sink.sent.lock().expect("sent lock").is_empty(),
         "没有新案例就不外发"
     );
-}
-
-/// 周期是配置项：0 不接受（一个转不停的循环会把库打满），非 0 原样收下。
-#[test]
-fn the_interval_must_be_positive() {
-    assert!(LedgerAuditPolicy::new(Duration::ZERO).is_err());
-    let policy = LedgerAuditPolicy::new(Duration::from_millis(250)).expect("a positive interval");
-    assert_eq!(policy.interval, Duration::from_millis(250));
 }

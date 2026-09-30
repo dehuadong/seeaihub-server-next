@@ -5,7 +5,7 @@ use seeai_application::{
     AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery,
     CustomerBillingSummary, CustomerUsageKind, CustomerUsageView, CustomerView,
     GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LeaseRecovery, LedgerBalanceMismatch, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
+    LeaseRecovery, LedgerMismatch, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
     PricePlanRates, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
     ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
     ReferencedOffering, RefundReconciliationCommand, RoutingDecision, SelectableOfferingView,
@@ -3095,41 +3095,57 @@ impl HubRepository for PgHubRepository {
             .collect()
     }
 
-    async fn accounts_with_ledger_mismatch(
+    async fn account_ledger_mismatch(
         &self,
-    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError> {
-        // 一次全表比对：账户行上的余额 vs 它自己账本条目的符号和。两个数都来自库，缓存不参与，
-        // 这条 SQL 也不写任何一行——"发现"是它的全部职责（改账是人的决定）。
+        account_id: AccountId,
+    ) -> Result<Option<LedgerMismatch>, ApplicationError> {
+        // 一次只问一个账户：账户行上的当前值 vs 它自己的明细。四条数都来自库，缓存不参与，
+        // 这条 SQL 也不写任何一行——“发现”是它的全部职责（改账是人的决定）。
         //
-        // `HAVING` 里重算一次和而不是引用别名：余额与账本两边都取自 GROUP BY 的同一批行，
-        // 这样写不依赖任何 SELECT 别名的解析顺序。`COALESCE` 让"一条条目都没有"的账户按 0 比，
-        // 于是"余额非 0 却没有任何条目"这种形态也报得出来。
-        let rows = sqlx::query(
+        // 两组 `LATERAL` 各自算一个和：账本条目的符号和、active 预授权的金额和。`COALESCE`
+        // 让“一条条目都没有 / 一笔预授权都没有”按 0 比，于是“余额非 0 却没有任何条目”这种形态
+        // 也报得出来。`WHERE` 只留至少一条等式断了的账户。
+        let row = sqlx::query(
             r#"
             SELECT a.id AS account_id,
                    a.balance_microusd,
-                   COALESCE(sum(e.amount_microusd), 0)::bigint AS ledger_total_microusd
+                   a.held_microusd,
+                   COALESCE(e.total, 0)::bigint AS ledger_total_microusd,
+                   COALESCE(h.total, 0)::bigint AS holds_total_microusd
             FROM ledger.accounts a
-            LEFT JOIN ledger.entries e ON e.account_id = a.id
-            GROUP BY a.id, a.balance_microusd
-            HAVING a.balance_microusd <> COALESCE(sum(e.amount_microusd), 0)
-            ORDER BY a.id
+            LEFT JOIN LATERAL (
+                SELECT sum(amount_microusd) AS total
+                FROM ledger.entries
+                WHERE account_id = a.id
+            ) e ON true
+            LEFT JOIN LATERAL (
+                SELECT sum(amount_microusd) AS total
+                FROM ledger.holds
+                WHERE account_id = a.id AND status = 'active'
+            ) h ON true
+            WHERE a.id = $1
+              AND (a.balance_microusd <> COALESCE(e.total, 0)
+                   OR a.held_microusd <> COALESCE(h.total, 0))
             "#,
         )
-        .fetch_all(&self.pool)
+        .bind(account_id.0)
+        .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?;
-        rows.iter()
-            .map(|row| {
-                Ok(LedgerBalanceMismatch {
-                    account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
-                    ledger_total_microusd: row
-                        .try_get("ledger_total_microusd")
-                        .map_err(database_error)?,
-                    balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
-                })
+        row.map(|row| {
+            Ok(LedgerMismatch {
+                account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+                ledger_total_microusd: row
+                    .try_get("ledger_total_microusd")
+                    .map_err(database_error)?,
+                balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+                holds_total_microusd: row
+                    .try_get("holds_total_microusd")
+                    .map_err(database_error)?,
+                held_microusd: row.try_get("held_microusd").map_err(database_error)?,
             })
-            .collect()
+        })
+        .transpose()
     }
 
     async fn open_ledger_reconciliation_case(
@@ -3137,15 +3153,11 @@ impl HubRepository for PgHubRepository {
         command: OpenLedgerCaseCommand,
     ) -> Result<bool, ApplicationError> {
         // `ON CONFLICT DO NOTHING` 落在那条"一个账户同时只留一条未结案账实案例"的部分唯一索引
-        // 上：核对是周期跑的，没有它每跑一轮就多一条同样的案例。插入被挡下时返回 `false`，
-        // 调用方据此**不重复外发告警**（见 `LedgerAuditor::audit_once`）。
+        // 上：没有它，一个一直对不上的账户每次核对都会多一条同样的案例。插入被挡下时返回 `false`，
+        // 调用方据此**不重复外发告警**（见 `LedgerAuditor::audit_account`）。
         //
-        // 这条案例**不写** `job_id` / `attempt_id`（两列留空）：它指向的是一条账户的余额与账本，
+        // 这条案例**不写** `job_id` / `attempt_id`（两列留空）：它指向的是一个账户的当前值与明细，
         // 不是某一次执行。
-        let reason = format!(
-            "ledger entries total {} microusd does not match the account balance {} microusd",
-            command.ledger_total_microusd, command.balance_microusd
-        );
         let inserted = sqlx::query(
             r#"
             INSERT INTO operations.reconciliation_cases (id, account_id, reason)
@@ -3155,7 +3167,7 @@ impl HubRepository for PgHubRepository {
         )
         .bind(Uuid::new_v4())
         .bind(command.account_id.0)
-        .bind(&reason)
+        .bind(&command.reason)
         .execute(&self.pool)
         .await
         .map_err(database_error)?;

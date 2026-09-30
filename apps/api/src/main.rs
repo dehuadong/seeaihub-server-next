@@ -15,12 +15,12 @@ use seeai_application::{
     AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
     CachePolicy, CreateImageGenerationRequest, CustomerBillingQuery, CustomerUsageKind,
     CustomerUsageStatus, CustomerView, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
-    GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView,
-    LedgerAuditPolicy, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
-    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
-    RoutePolicyService, RuntimeService, SelectableOfferingView, with_admin_id,
+    GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView, LedgerAuditor,
+    LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate,
+    PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
+    RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService,
+    RuntimeService, SelectableOfferingView, with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -44,6 +44,8 @@ struct AppState {
     identity: IdentityService,
     runtime: RuntimeService,
     reconciliation: ReconciliationService,
+    /// 账实核对：管理员按账户触发，后台执行；只读账本与账户当前值，不在资金路径上。
+    ledger_audit: Arc<LedgerAuditor>,
     /// 定价侧的管理员面：折算率的录入与取值（汇率不进不可变修订）。
     pricing: PricingService,
     /// 账户面的管理员用例：建账户与充值——两件事都要在提交成功后把余额写进缓存。
@@ -186,28 +188,23 @@ async fn main() -> Result<()> {
             "no cache service configured; the per-API-key rate limit does not apply in this process"
         );
     }
-    // 账实核对：比对**账本汇总**与**账户余额**。它**不是**上面那个缓存对账——那个问的是"缓存里的
-    // 值还是不是库里的值"，做法是以库为准覆盖缓存，改的是缓存；这条问的是"库里那个余额还是不是
-    // 它自己那本账的和"，两边都是库里的**事实**。它只发现、不改账：不一致就告警并建一条对账案例，
-    // 改账是人的决定。读的是账本，与有没有缓存无关，所以两个进程状态都挂。
-    if let Some(policy) = LedgerAuditPolicy::from_env()? {
-        info!(
-            interval_ms = policy.interval.as_millis(),
-            "the ledger audit is enabled"
-        );
-        let auditor = LedgerAuditor::new(repository_port.clone(), policy);
-        // 告警出口与 Worker 共用同一组配置项与同一个实现：没配 `PROVIDER_ALERT_WEBHOOK` 就没有
-        // 出口，那时核对照样发现、照样建案，只是一条都不外发。地址写错在构造时就失败，不让进程
-        // 带着一个"永远发不出去"的出口跑起来。
-        let auditor = match WebhookAlertSink::from_env()? {
-            Some(sink) => {
-                info!("the platform alert webhook is configured for the ledger audit");
-                auditor.with_alerts(Arc::new(PlatformAlerter::new(Arc::new(sink))))
-            }
-            None => auditor,
-        };
-        tokio::spawn(Arc::new(auditor).run());
-    }
+    // 账实核对：比对**账户当前值**与它自己的**明细**。它**不是**上面那个缓存对账——那个问的是
+    // "缓存里的值还是不是库里的值"，做法是以库为准覆盖缓存，改的是缓存；这条问的是"库里那个
+    // 余额与占用还是不是它自己那本账的和"，两边都是库里的**事实**。它只发现、不改账：不一致就
+    // 告警并建一条对账案例，改账是人的决定。**没有默认周期**：只由管理员按账户触发
+    // （`POST /api/v1/accounts/{id}/ledger-audit`），在后台任务里执行，不在资金路径上。
+    let auditor = LedgerAuditor::new(repository_port.clone());
+    // 告警出口与 Worker 共用同一组配置项与同一个实现：没配 `PROVIDER_ALERT_WEBHOOK` 就没有
+    // 出口，那时核对照样发现、照样建案，只是一条都不外发。地址写错在构造时就失败，不让进程
+    // 带着一个"永远发不出去"的出口跑起来。
+    let ledger_audit = match WebhookAlertSink::from_env()? {
+        Some(sink) => {
+            info!("the platform alert webhook is configured for the ledger audit");
+            auditor.with_alerts(Arc::new(PlatformAlerter::new(Arc::new(sink))))
+        }
+        None => auditor,
+    };
+    let ledger_audit = Arc::new(ledger_audit);
     let state = AppState {
         admin_token,
         identity: IdentityService::new(repository_port.clone())
@@ -217,6 +214,7 @@ async fn main() -> Result<()> {
             .with_cost_ceiling(cost_ceiling()?),
         reconciliation: ReconciliationService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
+        ledger_audit,
         pricing: PricingService::new(repository_port.clone()),
         accounts: AccountsService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
@@ -257,6 +255,10 @@ async fn main() -> Result<()> {
         .route(
             "/api/v1/accounts/{account_id}/credits",
             post(credit_account),
+        )
+        .route(
+            "/api/v1/accounts/{account_id}/ledger-audit",
+            post(trigger_ledger_audit),
         )
         .route(
             "/api/v1/accounts/{account_id}/api-keys",
@@ -655,6 +657,24 @@ async fn read_account_balance(
         version: change.version,
         updated_at: change.updated_at,
     }))
+}
+
+/// 按账户触发一次账实核对（`POST /api/v1/accounts/{account_id}/ledger-audit`）。
+///
+/// 触发即返回 `202`：核对**在后台任务里跑**，不在这个请求里——它不参与资金写入或余额读取，
+/// 也不该让管理员请求等它扫完。发现不一致时由核对自己建案并告警（只建案，不改账）。
+async fn trigger_ledger_audit(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+) -> StatusCode {
+    let auditor = state.ledger_audit.clone();
+    let account_id = AccountId(account_id);
+    tokio::spawn(async move {
+        if let Err(error) = auditor.audit_account(account_id).await {
+            tracing::error!(error = %error, "the ledger audit failed");
+        }
+    });
+    StatusCode::ACCEPTED
 }
 
 /// 管理员看账目流水的查询参数：`since` 是 RFC3339 的增量起点（开区间），`until` 是闭区间上界，

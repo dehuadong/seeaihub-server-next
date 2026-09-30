@@ -801,8 +801,8 @@ impl ApiRateLimit {
     }
 }
 
-/// API 进程的可选配置：**加速层**、**每把密钥的速率上限**、**每账户每日扣费上限**、**账实核对**
-/// 与**成本护栏**。
+/// API 进程的可选配置：**加速层**、**每把密钥的速率上限**、**每账户每日扣费上限**、**平台告警
+/// 出口**与**成本护栏**。
 ///
 /// 前两项绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流那一层
 /// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
@@ -810,7 +810,8 @@ impl ApiRateLimit {
 /// 每日扣费上限**不**依赖缓存：它问的是账本上的事实，有没有加速层都从账本聚合，所以它可以单独配。
 /// 这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
 ///
-/// 账实核对同样不依赖缓存：它读的是账本与余额（见 [`LedgerAudit`]）。
+/// 平台告警出口（`PROVIDER_ALERT_WEBHOOK`）给账实核对用：核对**没有默认周期**，由用例显式触发
+/// （见 `trigger_ledger_audit`），出口只决定发现不符时外发到哪里。
 ///
 /// 成本护栏是单次请求可能花掉的上游成本上限（`GENERATION_MAX_REQUEST_COST_MICROUSD`）。它由
 /// **发布期与受理期共用**，所以夹具自己那条候选必须在上限之下，否则连发布都过不去。
@@ -819,7 +820,7 @@ struct ApiProcessSettings {
     cache: Option<CacheFixture>,
     rate_limit: Option<ApiRateLimit>,
     daily_spend_limit_microusd: Option<u64>,
-    ledger_audit: Option<LedgerAudit>,
+    alert_webhook: Option<String>,
     cost_ceiling_microusd: Option<u64>,
     /// 引导管理员账号用的邮箱与口令：给了就等价于运维在部署时配了 `ADMIN_EMAIL`/`ADMIN_PASSWORD`。
     ///
@@ -827,17 +828,6 @@ struct ApiProcessSettings {
     admin_credentials: Option<(String, String)>,
     /// 会话有效期（秒）：用例要验"过期凭据被拒"时把它压到等得起的量级。
     session_ttl_seconds: Option<u64>,
-}
-
-/// 一次用例给 API 进程配的**账实核对**：周期，以及可选的一个告警接收器。
-///
-/// 它是**任务级**配置：周期压到用例等得起的量级（生产默认是分钟级），接收器不给就是"没有出口"
-/// 那条路径——核对照样发现、照样建案，只是一条都不外发。
-struct LedgerAudit {
-    /// 核对周期（毫秒）。
-    interval_ms: u64,
-    /// 告警接收器地址（`PROVIDER_ALERT_WEBHOOK`）；`None` 就是没配接收器。
-    webhook: Option<String>,
 }
 
 /// 一次用例的全部进程配置：API 进程那一套、发布时的修订级加价系数、以及 Worker 的重投策略。
@@ -963,15 +953,8 @@ async fn start_api_with(
                 ceiling_microusd.to_string(),
             );
         }
-        if let Some(ledger_audit) = &settings.ledger_audit {
-            // 开关本身不配：默认就是开着的，用例要验的正是"开着的时候做什么"。
-            command.env(
-                "LEDGER_AUDIT_INTERVAL_MS",
-                ledger_audit.interval_ms.to_string(),
-            );
-            if let Some(webhook) = &ledger_audit.webhook {
-                command.env("PROVIDER_ALERT_WEBHOOK", webhook);
-            }
+        if let Some(webhook) = &settings.alert_webhook {
+            command.env("PROVIDER_ALERT_WEBHOOK", webhook);
         }
         if let Some((email, password)) = &settings.admin_credentials {
             command
@@ -1379,12 +1362,12 @@ impl Harness {
         .await
     }
 
-    /// 同 `start_with`，但给 API 进程配上**账实核对**（周期与可选的告警接收器）。
+    /// 同 `start_with`，但给 API 进程配上**平台告警出口**（账实核对发现不符时外发到哪里）。
     ///
-    /// 它**不**启缓存：核对读的是账本与余额，与加速层无关——顺带也就验了"没有缓存时这条任务
-    /// 照样跑"（那条缓存对账在没有缓存时根本不进循环，两条任务的启用条件不同）。
+    /// 它**不**启缓存：核对读的是账本与余额，与加速层无关——顺带也就验了"没有缓存时这条核查
+    /// 照样跑"（那条缓存对账在没有缓存时根本不进循环，两条检查的启用条件不同）。
     async fn start_with_ledger_audit(
-        ledger_audit: LedgerAudit,
+        webhook: Option<String>,
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
     ) -> Self {
@@ -1396,7 +1379,7 @@ impl Harness {
             30,
             CaseSettings {
                 api: ApiProcessSettings {
-                    ledger_audit: Some(ledger_audit),
+                    alert_webhook: webhook,
                     ..ApiProcessSettings::default()
                 },
                 ..CaseSettings::default()
@@ -3580,8 +3563,8 @@ async fn reconciliation_case_count(harness: &Harness) -> i64 {
 
 /// 等账实核对在库里留下那条案例（返回案例 id 与它写的理由）。
 ///
-/// 核对跑在 API 进程的定时循环里、周期是毫秒级，但"这一轮跑到哪了"只能由库里的痕迹回答，
-/// 所以有上限地等，而不是睡一个固定时长就断言。
+/// 核对在触发之后由后台任务执行，"跑完没有"只能由库里的痕迹回答，所以有上限地等，而不是睡一个
+/// 固定时长就断言。
 async fn wait_for_open_ledger_case(harness: &Harness, account_id: &str) -> (Uuid, String) {
     for _ in 0..200 {
         let row = sqlx::query(
@@ -3600,7 +3583,54 @@ async fn wait_for_open_ledger_case(harness: &Harness, account_id: &str) -> (Uuid
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
-    panic!("账实核对必须在这些轮次里为这个账户留下一条案例");
+    panic!("按账户触发的账实核对必须为这个账户留下一条案例");
+}
+
+/// 触发一次按账户的账实核对（`POST /api/v1/accounts/{account_id}/ledger-audit`）。
+///
+/// 触发即返回 `202`：核对在后台任务里跑，所以断言要等库里的痕迹，不能紧跟在这条请求后面。
+async fn trigger_ledger_audit(harness: &Harness, account_id: &str) {
+    let response = Client::new()
+        .post(format!(
+            "{}/api/v1/accounts/{account_id}/ledger-audit",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("trigger the ledger audit");
+    assert_eq!(response.status(), 202, "触发只是把核对交给后台");
+}
+
+/// 把某个账户的**占用合计**直接改错：active 预授权一行不动——占用那条等式断掉的那种形态。
+async fn forge_account_held(harness: &Harness, account_id: &str, held: i64) {
+    sqlx::query("UPDATE ledger.accounts SET held_microusd = $2, updated_at = now() WHERE id = $1")
+        .bind(Uuid::parse_str(account_id).expect("account id"))
+        .bind(held)
+        .execute(&harness.pool)
+        .await
+        .expect("forged held");
+}
+
+/// 该账户 active 预授权的金额之和：核对拿它当"明细说是多少"。
+async fn holds_total_microusd(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT COALESCE(sum(amount_microusd), 0)::bigint FROM ledger.holds
+         WHERE account_id = $1 AND status = 'active'",
+    )
+    .bind(Uuid::parse_str(account_id).expect("account id"))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("holds total")
+}
+
+/// 该账户在**数据库**里的占用合计。
+async fn database_held(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT held_microusd FROM ledger.accounts WHERE id = $1")
+        .bind(Uuid::parse_str(account_id).expect("account id"))
+        .fetch_one(&harness.pool)
+        .await
+        .expect("held")
 }
 
 /// 某一类审计事件的载荷（运营要能发现平台侧事件）。

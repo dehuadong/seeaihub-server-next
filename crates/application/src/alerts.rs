@@ -49,17 +49,22 @@ pub struct ExecutionAlert {
     pub occurred_at: DateTime<Utc>,
 }
 
-/// 一次账实核对发现的不符：某个账户**账本的符号和**与它**行上的余额**对不上。
+/// 一次账实核对发现的不符：某个账户**当前值**与它**自己的明细**对不上。
 ///
-/// 三个数就是定位所需：哪个账户、账本说是多少、余额说是多少。差额是两者之差，收到的人自己会算，
-/// 所以不另发一个字段。它**不带**"谁对谁错"——这条任务只发现不符，改账是人的决定。
+/// 四条数就是定位所需：哪个账户、账本说是多少、余额说是多少、active 预授权合计是多少、占用合计
+/// 说是多少。差额是两边之差，收到的人自己会算，所以不另发差额字段。它**不带**"谁对谁错"——这条
+/// 任务只发现不符，改账是人的决定。
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize)]
 pub struct LedgerMismatchAlert {
     pub account_id: AccountId,
     /// `ledger.entries` 按账户求和的符号金额。
     pub ledger_total_microusd: i64,
-    /// `ledger.accounts` 那一行上的余额。
+    /// `ledger.accounts` 那一行上的已结算余额。
     pub balance_microusd: i64,
+    /// `ledger.holds` 里该账户 active 行的金额之和。
+    pub holds_total_microusd: i64,
+    /// `ledger.accounts` 那一行上的占用合计。
+    pub held_microusd: i64,
     pub occurred_at: DateTime<Utc>,
 }
 
@@ -82,11 +87,15 @@ impl PlatformAlert {
         account_id: AccountId,
         ledger_total_microusd: i64,
         balance_microusd: i64,
+        holds_total_microusd: i64,
+        held_microusd: i64,
     ) -> Self {
         Self::LedgerMismatch(LedgerMismatchAlert {
             account_id,
             ledger_total_microusd,
             balance_microusd,
+            holds_total_microusd,
+            held_microusd,
             occurred_at: Utc::now(),
         })
     }
@@ -109,6 +118,8 @@ impl PlatformAlert {
                 account_id = %alert.account_id,
                 ledger_total_microusd = alert.ledger_total_microusd,
                 balance_microusd = alert.balance_microusd,
+                holds_total_microusd = alert.holds_total_microusd,
+                held_microusd = alert.held_microusd,
                 delivered,
                 "platform alert delivered"
             ),
@@ -130,6 +141,8 @@ impl PlatformAlert {
                 account_id = %alert.account_id,
                 ledger_total_microusd = alert.ledger_total_microusd,
                 balance_microusd = alert.balance_microusd,
+                holds_total_microusd = alert.holds_total_microusd,
+                held_microusd = alert.held_microusd,
                 failed,
                 error = %error,
                 "platform alert could not be delivered"

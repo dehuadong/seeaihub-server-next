@@ -47,10 +47,7 @@ pub use auth::{
 };
 
 mod ledger_audit;
-pub use ledger_audit::{
-    LedgerAuditPolicy, LedgerAuditReport, LedgerAuditor, LedgerBalanceMismatch,
-    OpenLedgerCaseCommand,
-};
+pub use ledger_audit::{LedgerAuditReport, LedgerAuditor, LedgerMismatch, OpenLedgerCaseCommand};
 
 mod declared_images;
 pub use declared_images::{DeclaredOutputImages, declared_output_images};
@@ -2385,22 +2382,23 @@ pub trait HubRepository: Send + Sync {
         command: RefundReconciliationCommand,
     ) -> Result<BalanceChange, ApplicationError>;
 
-    /// 余额与**它自己那本账**对不上的账户（只读）。
+    /// 某个账户的**当前值**与**它自己的明细**对不上时返回它（只读）。
     ///
-    /// 判据是库内两个事实的比对：`ledger.accounts.balance_microusd` 与该账户
-    /// `ledger.entries.amount_microusd` 的符号和。**这不是缓存对账**：两个数都取自数据库，
-    /// 缓存不参与；它也**不改任何账**——发现不符是这条查询的全部职责。
+    /// 判据是库内两组事实的比对：`ledger.accounts` 的 `balance_microusd` 与该账户
+    /// `ledger.entries.amount_microusd` 的符号和，以及 `held_microusd` 与该账户
+    /// `ledger.holds` 里 active 行的金额和。**这不是缓存对账**：两组数都取自数据库，缓存不参与；
+    /// 它也**不改任何账**——发现不符是这条查询的全部职责。
     ///
-    /// 每一笔账都同时改这两边：充值写一条正数条目并加余额；预授权写一条负数条目并减余额；
-    /// 结算写"释放"（正）与"实收"（负）两条并加回差额；失败释放、对账退款同理。所以"两边相等"
-    /// 是一条不变量，对不上就意味着有人只改了一边——那正是要报出来的东西。
-    async fn accounts_with_ledger_mismatch(
+    /// 每次受理与结算都同时改当前值与明细：受理只加占用与 active 预授权，结算只减实收并关占用。
+    /// 所以"两组相等"是不变量，对不上就意味着有人只改了一边——那正是要报出来的东西。
+    async fn account_ledger_mismatch(
         &self,
-    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError>;
+        account_id: AccountId,
+    ) -> Result<Option<LedgerMismatch>, ApplicationError>;
 
     /// 给一个对不上的账户建一条对账案例。已经有未结案的那条时什么都不做，返回 `false`。
     ///
-    /// 这条案例**没有 Job、也没有 Attempt**：被核对的是账户的余额与它的账本，不是某一次执行。
+    /// 这条案例**没有 Job、也没有 Attempt**：被核对的是账户的当前值与它的明细，不是某一次执行。
     /// 状态沿用既有取值（`open` / `resolved`），不新造状态。
     async fn open_ledger_reconciliation_case(
         &self,

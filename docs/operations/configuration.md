@@ -80,12 +80,12 @@
 
 这是**工程侧**的开关：渠道与供给由工程师随素材配一次，运营在后台**选**它们、给价。运营那条路本身不建供给，管理接口也只能启停（`PATCH /api/v1/channels/{id}`、`PATCH /api/v1/offerings/{id}`）；要凭空造供给只剩**旧的内联发布形状**（`POST /api/v1/runtime-revisions` 直接带 `offerings`，`docs/design/0012-platform-model-publishing.md` §7 的过渡路径，不是运营的路）。**不设也能上架**：默认目录就是那份素材；换自己的素材就用只读卷把变量指过去。
 
-## 7. 账本巡检与告警
+## 7. 账本核查与告警
+
+账实核对**没有默认周期**：只由管理员按账户触发（`POST /api/v1/accounts/{id}/ledger-audit`），在后台任务里执行，不参与资金写入或余额读取。
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
-| `LEDGER_AUDIT_ENABLED` | 开 | 关掉时这一层**根本不挂起来**（不是挂起来空转） |
-| `LEDGER_AUDIT_INTERVAL_MS` | `900000`（15 分钟） | 巡检周期 |
 | `PROVIDER_ALERT_WEBHOOK` | 空＝没有出口 | 平台侧故障告警的 POST JSON 出口。**没有默认地址、代码里不写死 URL**；地址写错在启动时就失败，不让进程带着一个"永远发不出去"的出口跑 |
 | `PROVIDER_ALERT_CONSECUTIVE_FAILURES` | `3` | 某候选连续失败几次才告警。必须 ≥ 1 |
 | `PROVIDER_ALERT_TIMEOUT_MS` | `5000` | 告警投递超时 |

@@ -161,12 +161,12 @@ fn the_payload_is_exactly_the_four_locating_fields() {
     );
 }
 
-/// 账实不符那一种形态的载荷是它自己的四个字段：**没有** `job_id`、`provider_kind`、
-/// `failure_kind`——那条余额对不上不属于任何一次执行，收到告警的人也不该去查一个不存在的 Job。
+/// 账实不符那一种形态的载荷是它自己的定位字段：**没有** `job_id`、`provider_kind`、
+/// `failure_kind`——账户当前值对不上不属于任何一次执行，收到告警的人也不该去查一个不存在的 Job。
 #[test]
 fn the_ledger_mismatch_payload_is_its_own_locating_fields() {
     let account_id = AccountId::new();
-    let alert = PlatformAlert::ledger_mismatch(account_id, 1_000_000, 999_999);
+    let alert = PlatformAlert::ledger_mismatch(account_id, 1_000_000, 999_999, 30_000, 29_000);
     let rendered = serde_json::to_value(&alert).expect("the alert serializes");
     let object = rendered.as_object().expect("the alert is a JSON object");
     let mut keys: Vec<String> = object.keys().cloned().collect();
@@ -176,6 +176,8 @@ fn the_ledger_mismatch_payload_is_its_own_locating_fields() {
         [
             "account_id",
             "balance_microusd",
+            "held_microusd",
+            "holds_total_microusd",
             "ledger_total_microusd",
             "occurred_at"
         ]
@@ -191,6 +193,8 @@ fn the_ledger_mismatch_payload_is_its_own_locating_fields() {
         serde_json::json!(1_000_000)
     );
     assert_eq!(object["balance_microusd"], serde_json::json!(999_999));
+    assert_eq!(object["holds_total_microusd"], serde_json::json!(30_000));
+    assert_eq!(object["held_microusd"], serde_json::json!(29_000));
 }
 
 /// 阈值是配置项：往回看多少次由它决定，而它不接受 0（0 会把"每一次失败"都当成长度足够的连续段）。

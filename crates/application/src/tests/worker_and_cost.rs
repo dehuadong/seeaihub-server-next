@@ -647,10 +647,11 @@ impl HubRepository for WorkerRepository {
     }
 
     /// 账实核对不在 Worker 这条路径上：这里报到"用错了"，而不是编一个"没有不符"的答案——
-    /// 编出来的空集合会让一个真的对不上的账户在测试里看起来是好的。
-    async fn accounts_with_ledger_mismatch(
+    /// 编出来的 `None` 会让一个真的对不上的账户在测试里看起来是好的。
+    async fn account_ledger_mismatch(
         &self,
-    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError> {
+        _account_id: AccountId,
+    ) -> Result<Option<LedgerMismatch>, ApplicationError> {
         unused_repository()
     }
 

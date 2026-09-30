@@ -397,6 +397,7 @@ impl HubRepository for EmptyQueueRepository {
         _account_id: AccountId,
         _since: Option<chrono::DateTime<chrono::Utc>>,
         _until: Option<chrono::DateTime<chrono::Utc>>,
+        _kind: Option<&str>,
         _offset: u32,
         _limit: u32,
     ) -> Result<Vec<LedgerEntry>, ApplicationError> {
@@ -407,6 +408,7 @@ impl HubRepository for EmptyQueueRepository {
         _account_id: AccountId,
         _since: Option<chrono::DateTime<chrono::Utc>>,
         _until: Option<chrono::DateTime<chrono::Utc>>,
+        _kind: Option<&str>,
     ) -> Result<u64, ApplicationError> {
         unimplemented!()
     }
@@ -553,9 +555,10 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<BalanceChange, ApplicationError> {
         unimplemented!()
     }
-    async fn accounts_with_ledger_mismatch(
+    async fn account_ledger_mismatch(
         &self,
-    ) -> Result<Vec<LedgerBalanceMismatch>, ApplicationError> {
+        _account_id: AccountId,
+    ) -> Result<Option<LedgerMismatch>, ApplicationError> {
         unimplemented!()
     }
     async fn open_ledger_reconciliation_case(

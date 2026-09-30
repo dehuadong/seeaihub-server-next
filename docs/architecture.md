@@ -53,6 +53,7 @@
 | GET | `/api/v1/accounts` | `list_accounts` | 管理员（**列账户**：按创建时间倒序，可按 `tag` 精确或 `email`（大小写不敏感）收窄，两个条件是「与」。列表项带绑定的登录邮箱（没有登录身份时为 `null`）与余额；没有登录身份的账户也在列表里。只读、不写审计、不读缓存） |
 | GET | `/api/v1/accounts/{account_id}` | `read_account_balance` | 管理员（读余额与写入时刻；**读数据库那一行，不读缓存**：缓存可能滞后、也可能来自对账覆盖，用它当答案会把账实不符读成账实相符。账户不存在是 404） |
 | POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
+| POST | `/api/v1/accounts/{account_id}/ledger-audit` | `trigger_ledger_audit` | 管理员（按账户触发一次账实核对：核对**在后台任务里跑**，触发即返回 202；发现不一致只建账户级案例并告警，不改账。它**没有默认周期**） |
 | GET | `/api/v1/accounts/{account_id}/entries` | `list_account_entries` | 管理员（账目流水：**时间倒序**，`since` 是 RFC3339 的增量起点（不含）、`until` 是上界（不含）、`offset` 翻页、`limit` 截断（缺省 100）；响应带 `count`（本页条数）与 `total`（同一区间条件下的总条数），`truncated` 表示"这个位置之后还有没有更多"。每条带 `kind`（`credit` / `hold` / `capture` / `release` / `adjustment` / `cost`，与账本存储取值同名）与金额（人民币微单位，**正负号有语义**）。读 `ledger.entries`、**不读缓存**；**只读**——不改状态、不写审计。账户不存在 404，与"还没有流水"（空数组）分开） |
 | POST | `/api/v1/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
 | POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；每个候选带**计价形态**（`formula`：`token_rates` / `per_image` / `per_call` / `upstream_declared`）与它的参数——按 token 计量量要那份四档费率（`price_plan`），按张 / 按次要单价（`cost_unit_price_microusd`），上游直接给金额两种参数都不要；另可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：形态必填且与参数配套、每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
@@ -159,7 +160,7 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 已结算余额、占用、预授权与账目。账户行另存**占用合计**（`held_microusd`，= active 预授权之和）与**版本**（`version`，每次金额变化 +1）；可用额 = 余额 − 占用合计，不落第三份。账户分**消费者**与**平台**两类（`kind`）：消费者账户有 API Key 与余额缓存；平台账户只有一行（`migrations/0019_ledger_platform_cost.sql` 种下的固定 id），承载**平台自担的上游成本**，无缓存、无预授权。**余额与可用额可为负**（透支发生在结算：实收超过保底额时差额把余额扣成负数；平台账户的余额就是它承担的累计成本），**保底额可为 0**。资金流水科目：`credit` / `capture` / `adjustment` / `cost`——预授权只留在 `ledger.holds`（`active` / `captured` / `released`），不进流水 | `create_job`（占用：`held += 保底额`）、`complete_job`（`balance -= 实收`、`held -= 保底额`）、`fail_job`（`held -= 保底额`，以及**成本条目**：终态失败且这次执行有折算后 CNY 成本时，记一条 `cost` 挂平台账户）、`refund_reconciliation`（`held -= 保底额`） |
 | `ledger.daily_spend` | **每账户每 UTC 自然日一行的已完成实收合计**（正数）：每日消费限额的判据——受理只读当天一行，不扫历史流水 | `complete_job`（与 `capture` 同事务累加） |
 | `identity.api_keys` | API Key 摘要 | `IdentityService` |
-| `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载缓存对账发现的覆盖） | `fail_job`、`ReconciliationService`、`AccelerationService`（`insert_audit_event`）、`LedgerAuditor`（账户级账实不符案例） |
+| `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载缓存对账发现的覆盖） | `fail_job`、`ReconciliationService`、`AccelerationService`（`insert_audit_event`）、`LedgerAuditor`（按账户触发的账实不符案例） |
 
 `crates/persistence` 是这些表的唯一写入方；其他 crate 只能通过 `crates/application` 的 `HubRepository` 端口访问，不直接写 SQL。
 

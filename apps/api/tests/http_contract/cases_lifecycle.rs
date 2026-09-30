@@ -1368,21 +1368,18 @@ async fn no_configured_webhook_means_nothing_leaves_the_worker() {
     );
 }
 
-/// 账实核对：把余额**直接改错**（只改这一边、账本条目一条不动）⇒ 核对必须在下一轮里报出不符，
-/// 留下一条**账户级**的对账案例，并外发一条账实不符的告警。
+/// 账实核对：把余额**直接改错**（只改这一边、账本条目一条不动）⇒ 管理员按账户触发核查之后，
+/// 后台任务必须报出不符，留下一条**账户级**的对账案例，并外发一条账实不符的告警。
 ///
-/// 它与上面那条缓存对账不是一回事：那个以库为准覆盖缓存里的副本，这条比的是库里两个事实——余额
-/// 与它自己那本账。案例与告警都要指得出**哪个账户、两个数各是多少**，收到的人不必先猜是哪一笔
-/// 执行出了问题；而它**不是**某次执行，所以两个 Job 字段都是空的。
+/// 它与上面那条缓存对账不是一回事：那个以库为准覆盖缓存里的副本，这条比的是库里两组事实——余额
+/// 与它自己那本账、占用合计与 active 预授权。案例与告警都要指得出**哪个账户、两组数各是多少**，
+/// 收到的人不必先猜是哪一笔执行出了问题；而它**不是**某次执行，所以两个 Job 字段都是空的。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_ledger_audit_reports_a_balance_that_disagrees_with_its_entries() {
     let receiver = AlertReceiver::start(200).await;
     let harness = Harness::start_with_ledger_audit(
-        LedgerAudit {
-            interval_ms: 300,
-            webhook: Some(receiver.url.clone()),
-        },
+        Some(receiver.url.clone()),
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
     )
@@ -1393,6 +1390,7 @@ async fn the_ledger_audit_reports_a_balance_that_disagrees_with_its_entries() {
     let forged = ledger_total - 1;
     forge_account_balance(&harness, &account_id, forged).await;
 
+    trigger_ledger_audit(&harness, &account_id).await;
     let (case_id, reason) = wait_for_open_ledger_case(&harness, &account_id).await;
     assert!(
         reason.contains(&ledger_total.to_string()) && reason.contains(&forged.to_string()),
@@ -1425,6 +1423,8 @@ async fn the_ledger_audit_reports_a_balance_that_disagrees_with_its_entries() {
     assert_eq!(alerts[0]["account_id"].as_str(), Some(account_id.as_str()));
     assert_eq!(alerts[0]["ledger_total_microusd"], json!(ledger_total));
     assert_eq!(alerts[0]["balance_microusd"], json!(forged));
+    assert_eq!(alerts[0]["holds_total_microusd"], json!(0));
+    assert_eq!(alerts[0]["held_microusd"], json!(0));
     assert!(
         alerts[0]["job_id"].is_null(),
         "账实不符不属于任何一次执行：{alerts:?}"
@@ -1433,32 +1433,56 @@ async fn the_ledger_audit_reports_a_balance_that_disagrees_with_its_entries() {
     harness.cleanup().await;
 }
 
-/// 账实**一致**时核对**什么都不做**：不建案（连一条历史都不留）、不告警、一个数都不改。
-///
-/// 周期压到 300 毫秒、先跑够几轮再数——"没动作"必须是跑过的轮次里没动作，不是"还没来得及跑"。
-/// 这一条还自己证明那个循环是活的：最后把余额改错，同一个进程必须在下一轮里报出来，于是上面那次
-/// 计数为零才不是"循环根本没跑"。
+/// 占用那条等式：把 `held_microusd` 直接改错（active 预授权一行不动）⇒ 核查同样报出不符，
+/// 案例写清 active holds 与 held 两个数。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_ledger_audit_reports_a_held_total_that_disagrees_with_active_holds() {
+    let harness = Harness::start_with_ledger_audit(
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let account_id = harness.account_id.clone();
+    let holds_total = holds_total_microusd(&harness, &account_id).await;
+    assert_eq!(holds_total, 0, "夹具账户还没有任何预授权");
+    let forged = 12_345;
+    forge_account_held(&harness, &account_id, forged).await;
+
+    trigger_ledger_audit(&harness, &account_id).await;
+    let (_case_id, reason) = wait_for_open_ledger_case(&harness, &account_id).await;
+    assert!(
+        reason.contains(&holds_total.to_string()) && reason.contains(&forged.to_string()),
+        "占用对不上要写清 active holds 与 held：{reason}"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 账实**一致**时核查**什么都不做**：不建案（连一条历史都不留）、不告警、一个数都不改。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_consistent_ledger_leaves_no_case_and_no_alert() {
     let receiver = AlertReceiver::start(200).await;
     let harness = Harness::start_with_ledger_audit(
-        LedgerAudit {
-            interval_ms: 300,
-            webhook: Some(receiver.url.clone()),
-        },
+        Some(receiver.url.clone()),
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
     )
     .await;
     let account_id = harness.account_id.clone();
     let balance = database_balance(&harness, &account_id).await;
+    let held = database_held(&harness, &account_id).await;
     let ledger_total = ledger_total_microusd(&harness, &account_id).await;
+    let holds_total = holds_total_microusd(&harness, &account_id).await;
     assert_eq!(balance, ledger_total, "起点必须是一致的");
+    assert_eq!(held, holds_total, "起点占用也是一致的");
     let cases_before = reconciliation_case_count(&harness).await;
 
-    // 300 毫秒一轮，2 秒里有 6 轮以上。
-    tokio::time::sleep(Duration::from_secs(2)).await;
+    trigger_ledger_audit(&harness, &account_id).await;
+    // 后台任务跑完才有结论；一致时它什么痕迹都不留，只能等一个足够它跑完的窗口。
+    tokio::time::sleep(Duration::from_millis(1_000)).await;
 
     assert_eq!(
         reconciliation_case_count(&harness).await,
@@ -1481,26 +1505,23 @@ async fn a_consistent_ledger_leaves_no_case_and_no_alert() {
         "一致时账本一条都不写"
     );
 
-    // 证明那个循环是活的：改错余额，同一个进程必须在下一轮里报出来。
+    // 证明触发的那条路是活的：改错余额，再触发一次必须报出来。
     forge_account_balance(&harness, &account_id, balance - 1).await;
+    trigger_ledger_audit(&harness, &account_id).await;
     wait_for_open_ledger_case(&harness, &account_id).await;
 
     harness.cleanup().await;
 }
 
-/// 核对**只发现、不改账**：报出不符之后再跑几轮，那条被改错的余额与账本条目仍是测试留下的样子。
+/// 核查**只发现、不改账**：报出不符之后再触发几次，那条被改错的余额与账本条目仍是测试留下的样子，
+/// 未结案案例仍只有一条。
 ///
-/// 与上一条的差别在"持续看"：上一条在案例出现的那一刻断言，这一条让循环多跑几轮，确认它没有在
-/// 报出不符之后顺手把账平上（那会把一个原因未知的错变成一个结论已知的错）。这一条还**没配接收器**
-/// ——发现与建案不依赖有没有出口。
+/// 这一条还**没配接收器**——发现与建案不依赖有没有出口。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_ledger_audit_never_repairs_the_books_itself() {
     let harness = Harness::start_with_ledger_audit(
-        LedgerAudit {
-            interval_ms: 300,
-            webhook: None,
-        },
+        None,
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
     )
@@ -1511,8 +1532,13 @@ async fn the_ledger_audit_never_repairs_the_books_itself() {
     let forged = ledger_total - 7;
     forge_account_balance(&harness, &account_id, forged).await;
 
+    trigger_ledger_audit(&harness, &account_id).await;
     wait_for_open_ledger_case(&harness, &account_id).await;
-    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    // 再触发几次：持续不符既不该把账平上，也不该多出案例。
+    for _ in 0..3 {
+        trigger_ledger_audit(&harness, &account_id).await;
+    }
+    tokio::time::sleep(Duration::from_millis(800)).await;
 
     assert_eq!(
         database_balance(&harness, &account_id).await,
@@ -1527,8 +1553,51 @@ async fn the_ledger_audit_never_repairs_the_books_itself() {
     assert_eq!(
         open_ledger_cases(&harness, &account_id).await,
         1,
-        "一直对不上也只留一条未结案案例，不每轮多一条"
+        "一直对不上也只留一条未结案案例，不每次多一条"
     );
+
+    harness.cleanup().await;
+}
+
+/// **不默认全库重算**：正常启动的 API 进程没有账实核对的定时任务；把余额改错、再读一次账户、
+/// 等够一段时间，库里一条案例都不该出现。随后显式触发才出现——证明"没出现"是没跑，不是坏掉了。
+///
+/// 这一条就是 A9 的"核对不在请求路径运行"：余额读取与生成请求都不触发它，只有管理员按账户
+/// 触发才跑。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn no_ledger_audit_runs_without_an_explicit_trigger() {
+    let harness = Harness::start_with(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let account_id = harness.account_id.clone();
+    let ledger_total = ledger_total_microusd(&harness, &account_id).await;
+    forge_account_balance(&harness, &account_id, ledger_total - 1).await;
+
+    // 读一次账户（管理面与资金读都在这条路上），再等一个够任何定时任务跑几轮的窗口。
+    let client = Client::new();
+    client
+        .get(format!("{}/api/v1/accounts/{account_id}", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("read the account");
+    tokio::time::sleep(Duration::from_secs(2)).await;
+
+    assert_eq!(
+        open_ledger_cases(&harness, &account_id).await,
+        0,
+        "没有触发就不该有核查在跑"
+    );
+
+    trigger_ledger_audit(&harness, &account_id).await;
+    wait_for_open_ledger_case(&harness, &account_id).await;
 
     harness.cleanup().await;
 }
