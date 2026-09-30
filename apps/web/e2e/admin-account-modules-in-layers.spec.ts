@@ -95,6 +95,13 @@ test.describe('账户页的四个模块开在弹层里', () => {
     await page.getByTestId('accounts-keys-open').click();
     await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
 
+    // **切到别的模块再切回来**也不该再现：签发那一次过去就该丢。这条路径与"关掉再打开"不同
+    // （侧边栏不挡页面，模块按钮一直可点），漏了它明文会二次显示。
+    await page.getByTestId('accounts-credits-open').click();
+    await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
+    await page.getByTestId('accounts-keys-open').click();
+    await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
+
     // 吊销要二次确认：点"吊销"先出确认按钮，不直接发请求。
     await page.getByTestId('accounts-revoke-key').fill('00000000-0000-4000-8000-000000000000');
     await page.getByTestId('accounts-revoke-open').click();

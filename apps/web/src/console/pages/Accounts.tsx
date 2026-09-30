@@ -291,6 +291,9 @@ const USAGE_STATUS: Record<string, string> = {
   canceled: '已取消',
 };
 
+/// 选中账户之后的四个模块：充值开弹窗，其余三个各开一个侧边栏。
+type Layer = 'credit' | 'credits' | 'usage' | 'keys';
+
 /// 选中账户之后给出的那一行：账户 id、三个金额（已结算余额 / 持有中 / 可用额）与可就地改的标签，
 /// 外加**四个按钮**。模块内容一律不摊在页面上：充值开弹窗，充值记录、扣费记录（调用明细）与
 /// API Key 各开一个侧边栏（`#41` 的 P1/P2）。
@@ -311,7 +314,7 @@ function AccountActions({
   onChanged: () => void;
 }) {
   const { message } = AntApp.useApp();
-  const [layer, setLayer] = useState<'credit' | 'credits' | 'usage' | 'keys' | null>(null);
+  const [layer, setLayer] = useState<Layer | null>(null);
   const [busy, setBusy] = useState(false);
   const [tagError, setTagError] = useState<string | null>(null);
   const [creditError, setCreditError] = useState<string | null>(null);
@@ -331,12 +334,22 @@ function AccountActions({
   );
   const usage = useLoadable(() => client.accountUsage(accountId, 50), [client, accountId]);
 
+  /// 打开或切换模块。**离开 API Key 就把签发明文与错误丢掉**——明文只在签发那一次出现
+  /// （Spec M5）；关闭与切换走同一条路，否则"切到别的模块再切回来"会把明文又带出来。
+  function openLayer(next: Layer | null) {
+    if (next !== 'keys') {
+      setIssued(null);
+      setKeyError(null);
+    }
+    setLayer(next);
+  }
+
   /// 每次打开充值弹窗都是**新的一次意图**：换一个幂等键；上一次没提交的金额由表单的
   /// `preserve={false}` 在关闭时清掉，不在这里手动重置。
   function openCredit() {
     setCreditError(null);
     setBusinessKey(crypto.randomUUID());
-    setLayer('credit');
+    openLayer('credit');
   }
 
   return (
@@ -422,16 +435,16 @@ function AccountActions({
           >
             充值
           </Button>
-          <Button data-testid="accounts-credits-open" onClick={() => setLayer('credits')}>
+          <Button data-testid="accounts-credits-open" onClick={() => openLayer('credits')}>
             充值记录
           </Button>
-          <Button data-testid="accounts-usage-open" onClick={() => setLayer('usage')}>
+          <Button data-testid="accounts-usage-open" onClick={() => openLayer('usage')}>
             扣费记录（调用明细）
           </Button>
           <Button
             icon={<KeyOutlined />}
             data-testid="accounts-keys-open"
-            onClick={() => setLayer('keys')}
+            onClick={() => openLayer('keys')}
           >
             API Key
           </Button>
@@ -598,11 +611,7 @@ function AccountActions({
         width="min(720px, 100vw)"
         open={layer === 'keys'}
         // 关掉侧边栏就把签发明文丢掉：它只在签发那一次出现（Spec M5）。
-        onClose={() => {
-          setLayer(null);
-          setIssued(null);
-          setKeyError(null);
-        }}
+        onClose={() => openLayer(null)}
         mask={false}
         destroyOnHidden
       >
@@ -650,6 +659,8 @@ function AccountActions({
             <Form
               form={revokeForm}
               layout="inline"
+              // 与充值表单一致：关掉侧边栏就把填了一半的吊销标识丢掉，别在下次打开时又冒出来。
+              preserve={false}
               onFinish={async (values: { keyId: string }) => {
                 setBusy(true);
                 setKeyError(null);
