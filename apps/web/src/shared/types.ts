@@ -180,9 +180,10 @@ export interface AccountBalance {
 /// `AccountEntriesResponse`：不翻页，所以要能看出被截断。
 export interface LedgerEntry {
   account_id: string;
-  /// `credit` / `hold` / `capture` / `release` / `adjustment`，与落库取值同名。
+  /// `credit` / `capture` / `adjustment` / `cost`，与落库取值同名。预授权只留在 `ledger.holds`，
+  /// 不作为资金流水。
   kind: string;
-  /// 人民币微单位；持有与扣费为负、释放与调整为正。
+  /// 人民币微单位；入账为正，实收与平台成本为负，正式调整按资金增减带符号。
   amount_microusd: number;
   job_id: string | null;
   created_at: string;
@@ -243,9 +244,11 @@ export interface PublicModelsResponse {
   data: PublicModel[];
 }
 
-/// 对客账户面：余额与持有中**分开给**，不合成一个"总资产"。
+/// 对客账户面：已结算余额与持有中分开给。客户控制台只渲染 `balance_microusd`（"已结算余额"），
+/// 不显示持有中、可用额或单笔预授权额（账户资金 Spec §4、C7）。
 export interface OwnAccount {
   balance_microusd: number;
+  /// 已受理未结清的占用合计。接口返回，但客户页面不展示。
   held_microusd: number;
   updated_at: string;
 }

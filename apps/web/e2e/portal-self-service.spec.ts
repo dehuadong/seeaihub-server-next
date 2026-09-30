@@ -1,8 +1,8 @@
 import { expect, test, type Locator, type Page } from '@playwright/test';
 import { portalUrl, settings } from './settings';
 
-/// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、首屏三个数、密钥明文只显示
-/// 一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
+/// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进控制台、首屏只显示已结算余额、密钥
+/// 明文只显示一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
 ///
 /// 这些行为的接口契约由 `apps/api/tests/http_contract/cases_identity.rs` 管；这里验的是"人在浏览器里
 /// 点下去会发生什么"。
@@ -49,14 +49,19 @@ async function register(page: Page, email: string): Promise<void> {
   await expect(overview(page).first()).toBeVisible();
 }
 
-test('注册后进控制台：首屏三个数 + 三个标签页', async ({ page }) => {
+test('注册后进控制台：首屏只有已结算余额与扣费总额 + 三个标签页', async ({ page }) => {
   await register(page, uniqueEmail());
 
-  // **首屏**（不切标签页、不滚动）就该看到三个数：可用余额、持有中、扣费总额。
-  await expect(page.getByText('可用余额')).toBeVisible();
-  await expect(page.getByText('持有中')).toBeVisible();
+  // **首屏**（不切标签页、不滚动）就该看到余额与扣费总额，且余额的标题是"已结算余额"。
+  await expect(page.getByText('已结算余额')).toBeVisible();
+  await expect(page.getByTestId('portal-settled-balance')).toContainText('0 元');
   await expect(page.getByText('扣费总额（全部）')).toBeVisible();
-  expect(await overview(page).count()).toBeGreaterThanOrEqual(3);
+  expect(await overview(page).count()).toBeGreaterThanOrEqual(2);
+
+  // 客户页面不出现可用额、持有中或预授权金额（Spec C7、A7）。
+  for (const forbidden of ['可用余额', '可用额', '持有中', '预授权']) {
+    await expect(page.getByText(forbidden)).toHaveCount(0);
+  }
 
   // 三个标签页都在；明细收在后面，不占首屏。
   for (const label of ['用量与账单', 'API Key', '账户设置']) {

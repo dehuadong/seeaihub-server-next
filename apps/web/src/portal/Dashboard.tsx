@@ -26,9 +26,12 @@ import { useLoadable } from '../shared/ui';
 
 /// 客户控制台的主体。
 ///
-/// **首屏只回答三件事**（可用余额、持有中、扣费总额）——那是客户打开这一页的动机；其余按标签页收起
+/// **首屏只回答两件事**（已结算余额、扣费总额）——那是客户打开这一页的动机；其余按标签页收起
 /// 来：用量与账单（明细）、API Key、账户设置（改口令等低频动作）。分组依据是**使用频次**，不是端点
 /// 归属：改口令是一次性动作，与余额并列会把两件常看的事切开。
+///
+/// 余额只渲染 `balance_microusd`（已结算余额）：预授权建立或释放不改变它，持有中、可用额与单笔
+/// 预授权额都不在客户页面出现（[账户资金 Spec](../../../docs/specs/0002-account-funds-and-reservations.md) §4、C7）。
 ///
 /// 口径见 `docs/design/0011-console-information-architecture.md` §3.4。
 export function Dashboard({ client }: { client: CustomerClient }) {
@@ -61,35 +64,22 @@ export function Dashboard({ client }: { client: CustomerClient }) {
         </Space>
       </Flex>
 
-      {/* 概览：三个数，一屏可见，不需要滚动也不需要切标签页。 */}
+      {/* 概览：两个数，一屏可见，不需要滚动也不需要切标签页。 */}
       <Card styles={{ body: { paddingTop: 20 } }}>
         {account.error ? (
           <Alert style={{ marginBottom: 8 }} type="error" showIcon message={account.error} />
         ) : null}
         {billing.error ? <Alert type="error" showIcon message={billing.error} /> : null}
         <Row gutter={[24, 16]}>
-          <Col xs={24} sm={8}>
+          <Col xs={24} sm={12}>
             <Statistic
-              title="可用余额"
+              data-testid="portal-settled-balance"
+              title="已结算余额"
               value={account.data ? yuanText(account.data.balance_microusd) : '—'}
               loading={account.loading}
             />
           </Col>
-          <Col xs={24} sm={8}>
-            <Statistic
-              title={
-                <Space size={4}>
-                  持有中
-                  <Tooltip title="已预授权、还没结算的部分。它不是可用额的一部分——这笔钱到底扣没扣，看这个数。">
-                    <InfoCircleOutlined style={{ color: 'rgba(0,0,0,0.45)' }} />
-                  </Tooltip>
-                </Space>
-              }
-              value={account.data ? yuanText(account.data.held_microusd) : '—'}
-              loading={account.loading}
-            />
-          </Col>
-          <Col xs={24} sm={8}>
+          <Col xs={24} sm={12}>
             <Statistic
               title={
                 <Space size={4}>

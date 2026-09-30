@@ -55,6 +55,16 @@ Object.assign(env, {
   // **显式不导入供给素材**：e2e 库每次重置成空库、用例自己造夹具；不设的话默认值
   // （`config/bootstrap`）会让每个用例都先看到仓库那两份素材。
   SUPPLY_MATERIAL_DIR: '',
+  // 超时链压到秒级：e2e **不起 Worker**，`portal-settled-balance.spec.ts` 靠"同步入口在窗口后
+  // 超时、请求停在持有中"来造一条真实的预授权。生产缺省的基础超时是 180 秒、对客窗口 390 秒，
+  // 浏览器用例等不起。四环仍然自洽（窗口 ≥ 上游上限 ≤ 租约），值见
+  // `crates/application/src/request_timeout.rs` 的校验。
+  PROVIDER_TIMEOUT_BASE_SECONDS: '5',
+  PROVIDER_TIMEOUT_INCLUDED_IMAGES: '4',
+  PROVIDER_TIMEOUT_PER_IMAGE_SECONDS: '0',
+  PROVIDER_TIMEOUT_SECONDS: '5',
+  WORKER_LEASE_SECONDS: '5',
+  GENERATION_SYNC_WAIT_SECONDS: '5',
 });
 
 // 不走 `shell`：参数原样传给子进程（`shell: true` 会把参数拼成命令行，Windows 上有转义与弃用警告）。
