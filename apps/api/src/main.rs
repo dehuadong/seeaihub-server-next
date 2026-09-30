@@ -760,7 +760,10 @@ struct AdminUsageRow {
     gateway_model: String,
     status: CustomerUsageStatus,
     kind: CustomerUsageKind,
+    /// 受理时刻；处理中的请求按它归属查询区间。
     created_at: DateTime<Utc>,
+    /// 终态时刻；已完成请求按它归属查询区间，未定终态时为空。
+    terminal_at: Option<DateTime<Utc>>,
     image_count: u32,
     charged_microusd: i64,
 }
@@ -789,6 +792,7 @@ async fn list_account_usage(
             status: row.status,
             kind: row.kind,
             created_at: row.created_at,
+            terminal_at: row.terminal_at,
             image_count: row.image_count,
             charged_microusd: row.charged_microusd,
         })
@@ -1359,7 +1363,10 @@ struct CustomerUsageRow {
     gateway_model: String,
     status: CustomerUsageStatus,
     kind: CustomerUsageKind,
+    /// 受理时刻；处理中的请求按它归属查询区间。
     created_at: DateTime<Utc>,
+    /// 终态时刻；已完成请求按它归属查询区间，未定终态时为空。
+    terminal_at: Option<DateTime<Utc>>,
     image_count: u32,
     charged_microusd: i64,
 }
@@ -1469,6 +1476,7 @@ async fn read_customer_usage(
             status: row.status,
             kind: row.kind,
             created_at: row.created_at,
+            terminal_at: row.terminal_at,
             image_count: row.image_count,
             charged_microusd: row.charged_microusd,
         })

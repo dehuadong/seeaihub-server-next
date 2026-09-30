@@ -679,3 +679,379 @@ async fn a_customer_revoked_key_is_rejected_at_the_generation_entry() {
 
     harness.cleanup().await;
 }
+
+/// 跨 UTC 日结算的扣费计入**结算日**，已完成请求按终态时刻归属（A8）。
+///
+/// 用例把真实结算出来的那笔请求的时刻改到"昨天零点十分结算、前天受理"，然后按 UTC 自然日分别
+/// 读用量与账单：受理那天查不到它，结算那天才查到——归属看的是终态时刻，不是受理时刻。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let email = "cross-day@example.com";
+    let password = "a-long-enough-password";
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": email, "password": password, "account_id": account_id}))
+            .send()
+            .await
+            .expect("open customer request")
+            .status(),
+        StatusCode::CREATED
+    );
+
+    let _worker = harness.spawn_worker();
+    let key = format!("cross-day-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "settles after midnight"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+
+    let (terminal_at, capture_at): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
+        sqlx::query_as(
+            "SELECT j.terminal_at, e.created_at
+             FROM generation.jobs j
+             JOIN ledger.entries e ON e.job_id = j.id AND e.kind = 'capture'
+             WHERE j.id = $1",
+        )
+        .bind(job_id)
+        .fetch_one(&harness.pool)
+        .await
+        .expect("terminal and capture times");
+    assert_eq!(
+        terminal_at, capture_at,
+        "成功结算的终态时刻必须与 capture 的入账时刻同事务"
+    );
+    let capture = harness.captured_microusd(job_id).await;
+    assert!(capture < 0, "夹具应当真的扣了一笔：{capture}");
+
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days')
+                           + interval '23 hours 50 minutes') AT TIME ZONE 'UTC',
+             terminal_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day')
+                            + interval '10 minutes') AT TIME ZONE 'UTC'
+         WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(&harness.pool)
+    .await
+    .expect("shift the job across the UTC day boundary");
+    sqlx::query(
+        "UPDATE ledger.entries
+         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day')
+                           + interval '10 minutes') AT TIME ZONE 'UTC'
+         WHERE job_id = $1 AND kind = 'capture'",
+    )
+    .bind(job_id)
+    .execute(&harness.pool)
+    .await
+    .expect("shift the capture across the UTC day boundary");
+
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+
+    let today = chrono::Utc::now().date_naive();
+    let midnight = |offset: i64| {
+        let date = today - chrono::Duration::days(offset);
+        let naive = date.and_hms_opt(0, 0, 0).expect("midnight");
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let (request_day, settled_day, next_day) = (midnight(2), midnight(1), midnight(0));
+
+    let read_billing = |since: &str, until: &str| {
+        let url = format!(
+            "{}/v1/customer/billing?since={since}&until={until}",
+            harness.base_url
+        );
+        let client = client.clone();
+        let session = session.clone();
+        async move {
+            client
+                .get(url)
+                .bearer_auth(&session)
+                .send()
+                .await
+                .expect("billing request")
+                .json::<Value>()
+                .await
+                .expect("billing body")
+        }
+    };
+
+    let request_day_billing = read_billing(&request_day, &settled_day).await;
+    assert_eq!(
+        request_day_billing["requests"],
+        json!(0),
+        "跨天结算的那一笔不该落在受理日：{request_day_billing}"
+    );
+    assert_eq!(request_day_billing["charged_microusd"], json!(0));
+
+    let settled_day_billing = read_billing(&settled_day, &next_day).await;
+    assert_eq!(
+        settled_day_billing["requests"],
+        json!(1),
+        "跨天结算的那一笔必须落在结算日：{settled_day_billing}"
+    );
+    assert_eq!(settled_day_billing["images"], json!(1));
+    assert_eq!(
+        settled_day_billing["charged_microusd"],
+        json!(capture),
+        "结算日的扣费就是那笔 capture"
+    );
+
+    let request_day_usage = client
+        .get(format!(
+            "{}/v1/customer/usage?since={request_day}&until={settled_day}&limit=100",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    assert_eq!(
+        request_day_usage["count"],
+        json!(0),
+        "跨天结算的请求不该按受理时刻归到受理日：{request_day_usage}"
+    );
+    let settled_day_usage = client
+        .get(format!(
+            "{}/v1/customer/usage?since={settled_day}&until={next_day}&limit=100",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    assert_eq!(settled_day_usage["count"], json!(1));
+    let row = &settled_day_usage["usage"][0];
+    assert_eq!(row["status"], json!("succeeded"));
+    assert_eq!(row["charged_microusd"], json!(capture));
+    assert_eq!(
+        row["terminal_at"].as_str().map(str::to_owned),
+        Some(
+            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
+                (today - chrono::Duration::days(1))
+                    .and_hms_opt(0, 10, 0)
+                    .expect("00:10"),
+                chrono::Utc,
+            )
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+        ),
+        "用量行要给出终态时刻：{settled_day_usage}"
+    );
+
+    let combined = read_billing(&request_day, &next_day).await;
+    assert_eq!(combined["requests"], json!(1));
+    assert_eq!(combined["charged_microusd"], json!(capture));
+
+    harness.cleanup().await;
+}
+
+/// 已完成用量的逐笔扣费等于实际扣费流水；正式调整单独列示后与账单净额相等（A8）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        republish_priced(
+            &harness,
+            &client,
+            openai_floor_amounts(),
+            priced_consumer_rates(),
+            2_000
+        )
+        .await,
+        StatusCode::OK,
+        "带定价的发布必须成功"
+    );
+
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let email = "capture-and-adjustment@example.com";
+    let password = "a-long-enough-password";
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": email, "password": password, "account_id": account_id}))
+            .send()
+            .await
+            .expect("open customer request")
+            .status(),
+        StatusCode::CREATED
+    );
+
+    let _worker = harness.spawn_worker();
+    for index in 0..2 {
+        let key = format!("capture-sum-{index}-{}", Uuid::new_v4());
+        let (status, body) = post_json(
+            &harness.base_url,
+            &api_key,
+            "/v1/images/generations",
+            &key,
+            &route_request(harness.model, "capture sum contract"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "got {body}");
+    }
+
+    let adjustment = -12_345_i64;
+    sqlx::query(
+        "INSERT INTO ledger.entries (id, account_id, job_id, kind, amount_microusd, business_key)
+         VALUES ($1,$2,NULL,'adjustment',$3,$4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(Uuid::parse_str(&account_id).expect("account id"))
+    .bind(adjustment)
+    .bind(format!("adjustment:{}", Uuid::new_v4()))
+    .execute(&harness.pool)
+    .await
+    .expect("seed a formal adjustment");
+
+    let captures: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(amount_microusd), 0)::bigint FROM ledger.entries
+         WHERE account_id = $1 AND kind = 'capture'",
+    )
+    .bind(Uuid::parse_str(&account_id).expect("account id"))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("capture sum");
+    assert!(captures < 0, "夹具应当真的扣了两笔：{captures}");
+
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+
+    let usage = client
+        .get(format!("{}/v1/customer/usage?limit=100", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    let usage_sum: i64 = usage["usage"]
+        .as_array()
+        .expect("usage array")
+        .iter()
+        .map(|row| row["charged_microusd"].as_i64().expect("charged"))
+        .sum();
+    assert_eq!(
+        usage_sum, captures,
+        "已完成用量逐笔扣费合计必须等于实际扣费流水：usage={usage}"
+    );
+
+    let billing = client
+        .get(format!("{}/v1/customer/billing", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("billing request")
+        .json::<Value>()
+        .await
+        .expect("billing body");
+    assert_eq!(
+        billing["charged_microusd"],
+        json!(captures + adjustment),
+        "账单净额 = 实际扣费 + 正式调整：billing={billing}"
+    );
+
+    let ledger = client
+        .get(format!("{}/v1/customer/ledger?limit=100", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("ledger request")
+        .json::<Value>()
+        .await
+        .expect("ledger body");
+    let entries = ledger["entries"].as_array().expect("entries");
+    let adjustments: Vec<i64> = entries
+        .iter()
+        .filter(|entry| entry["kind"].as_str() == Some("adjustment"))
+        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .collect();
+    assert_eq!(
+        adjustments,
+        vec![adjustment],
+        "正式调整必须单独列示：{ledger}"
+    );
+    let ledger_net: i64 = entries
+        .iter()
+        .filter(|entry| matches!(entry["kind"].as_str(), Some("capture") | Some("adjustment")))
+        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .sum();
+    assert_eq!(
+        json!(ledger_net),
+        billing["charged_microusd"],
+        "同一区间下扣费与调整之和等于账单净额：ledger={ledger} billing={billing}"
+    );
+
+    harness.cleanup().await;
+}

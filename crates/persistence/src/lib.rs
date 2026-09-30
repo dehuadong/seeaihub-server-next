@@ -1346,6 +1346,8 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
         query: CustomerBillingQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        // 已完成请求按**终态时刻**归属，处理中请求按**受理时刻**：跨天结算的扣费因此落在结算日。
+        // 逐笔扣费只关联该 Job 自己的 `capture`，不再用流水入账时刻筛同一笔（`0013` §5）。
         let rows = sqlx::query(
             r#"
             SELECT
@@ -1354,21 +1356,24 @@ impl HubRepository for PgHubRepository {
                 j.state,
                 j.branch,
                 j.created_at,
+                j.terminal_at,
                 COALESCE(jsonb_array_length(j.result_images), 0)::bigint AS image_count,
-                COALESCE(charged.total, 0)::bigint AS charged_microusd
+                COALESCE((
+                    SELECT SUM(e.amount_microusd)
+                    FROM ledger.entries e
+                    WHERE e.job_id = j.id AND e.kind = 'capture'
+                ), 0)::bigint AS charged_microusd
             FROM generation.jobs j
-            LEFT JOIN (
-                SELECT job_id, SUM(amount_microusd)::bigint AS total
-                FROM ledger.entries
-                WHERE account_id = $1 AND kind = 'capture' AND job_id IS NOT NULL
-                  AND ($2::timestamptz IS NULL OR created_at >= $2)
-                  AND ($3::timestamptz IS NULL OR created_at < $3)
-                GROUP BY job_id
-            ) charged ON charged.job_id = j.id
             WHERE j.account_id = $1
-              AND ($2::timestamptz IS NULL OR j.created_at >= $2)
-              AND ($3::timestamptz IS NULL OR j.created_at < $3)
-            ORDER BY j.created_at DESC
+              AND (
+                    (j.terminal_at IS NOT NULL
+                        AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
+                        AND ($3::timestamptz IS NULL OR j.terminal_at < $3))
+                 OR (j.terminal_at IS NULL
+                        AND ($2::timestamptz IS NULL OR j.created_at >= $2)
+                        AND ($3::timestamptz IS NULL OR j.created_at < $3))
+              )
+            ORDER BY COALESCE(j.terminal_at, j.created_at) DESC
             LIMIT $4
             "#,
         )
@@ -1393,6 +1398,7 @@ impl HubRepository for PgHubRepository {
                         _ => CustomerUsageKind::Generation,
                     },
                     created_at: row.try_get("created_at").map_err(database_error)?,
+                    terminal_at: row.try_get("terminal_at").map_err(database_error)?,
                     image_count: u32::try_from(image_count).unwrap_or(0),
                     charged_microusd: row.try_get("charged_microusd").map_err(database_error)?,
                 })
@@ -1405,19 +1411,20 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
         query: CustomerBillingQuery,
     ) -> Result<CustomerBillingSummary, ApplicationError> {
-        // 请求数与产出张数按**执行记录**数，扣费总额按账本条目：与逐笔明细说的是同一批事实。
+        // 请求数与产出张数按**已完成**执行记录的终态时刻归属（处理中不计）；扣费与正式调整按
+        // 各自流水的入账时刻归属：同一区间里明细求和与汇总说的是同一批事实（`0013` §5）。
         let row = sqlx::query(
             r#"
             SELECT
                 (SELECT COUNT(*) FROM generation.jobs j
-                 WHERE j.account_id = $1
-                   AND ($2::timestamptz IS NULL OR j.created_at >= $2)
-                   AND ($3::timestamptz IS NULL OR j.created_at < $3)) AS requests,
+                 WHERE j.account_id = $1 AND j.terminal_at IS NOT NULL
+                   AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
+                   AND ($3::timestamptz IS NULL OR j.terminal_at < $3)) AS requests,
                 (SELECT COALESCE(SUM(jsonb_array_length(j.result_images)), 0)::bigint
                  FROM generation.jobs j
-                 WHERE j.account_id = $1
-                   AND ($2::timestamptz IS NULL OR j.created_at >= $2)
-                   AND ($3::timestamptz IS NULL OR j.created_at < $3)) AS images,
+                 WHERE j.account_id = $1 AND j.terminal_at IS NOT NULL
+                   AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
+                   AND ($3::timestamptz IS NULL OR j.terminal_at < $3)) AS images,
                 (SELECT COALESCE(SUM(e.amount_microusd), 0)::bigint FROM ledger.entries e
                  WHERE e.account_id = $1 AND e.kind IN ('capture', 'adjustment')
                    AND ($2::timestamptz IS NULL OR e.created_at >= $2)
@@ -2761,7 +2768,8 @@ impl HubRepository for PgHubRepository {
             r#"
             UPDATE generation.jobs
             SET state = 'succeeded', result_images = $3, lease_owner = NULL,
-                lease_expires_at = NULL, version = version + 1, updated_at = now()
+                lease_expires_at = NULL, terminal_at = now(),
+                version = version + 1, updated_at = now()
             WHERE id = $1 AND lease_owner = $2
             "#,
         )
@@ -2811,6 +2819,22 @@ impl HubRepository for PgHubRepository {
                 &format!("job:{job_id}:capture"),
             )
             .await?;
+            // 每日合计与 `capture` 同一事务累加：跨天结算因此计入**结算日**，与 `capture.created_at`
+            // 取同一事务时刻（`0013` §4）。零实收不进合计。
+            sqlx::query(
+                r#"
+                INSERT INTO ledger.daily_spend (account_id, day, settled_microusd)
+                VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2)
+                ON CONFLICT (account_id, day) DO UPDATE
+                SET settled_microusd = ledger.daily_spend.settled_microusd + EXCLUDED.settled_microusd,
+                    updated_at = now()
+                "#,
+            )
+            .bind(account_id.0)
+            .bind(charge)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
         }
         transaction.commit().await.map_err(database_error)?;
         balance_change(&settled, account_id)
@@ -2899,6 +2923,7 @@ impl HubRepository for PgHubRepository {
             r#"
             UPDATE generation.jobs
             SET state = $3, error_code = $4, error_message = $5, failure_kind = $6,
+                terminal_at = CASE WHEN $3 = 'failed' THEN now() ELSE terminal_at END,
                 lease_owner = NULL, lease_expires_at = NULL,
                 version = version + 1, updated_at = now()
             WHERE id = $1 AND lease_owner = $2
@@ -3012,25 +3037,15 @@ impl HubRepository for PgHubRepository {
     }
 
     async fn daily_spend_microusd(&self, account_id: AccountId) -> Result<u64, ApplicationError> {
-        // **从账本读事实**：今天已经扣掉多少，只有这条路径能回答。按需聚合、不写缓存、
-        // 也不读缓存——配额判的是"钱花到哪了"，拿一份可能过时的计数去判会放出不该放的请求。
-        //
-        // 判据是 `today`（数据库的 `now()` 落在哪个 UTC 自然日）：一天的边界应当由**事实的
-        // 书写者**（数据库）划，而不是由受理进程的本地时区划；否则同一份账本在两个时区的
-        // 进程眼里是两天的花销。
-        //
-        // `capture` 在结算时是**负数**（见结算那段：预授权释放一笔正数、实收一笔负数），
-        // 所以这里取负数的相反数——"花掉多少"是正着说的。持有与释放都不是花费：预授权只是
-        // 占位，它已经由余额那条路挡着；释放是把没花的退回去。既然余额不足时受理会拒，这个
-        // 和式就不会为负；真出现负数（对账退款之类）也只归到 0，绝不折成一个巨大的 `u64`。
+        // **读当天那一行每日合计**：受理不逐次汇总历史资金流水（`0013` §4）。合计只由成功结算
+        // 在写 `capture` 的同一事务累加，缺行就是 0；"今天"的边界由**事实的书写者**（数据库）
+        // 划，而不是受理进程的本地时区。
         let spent: i64 = sqlx::query_scalar(
             r#"
-            SELECT COALESCE(sum(-e.amount_microusd), 0)::bigint
-            FROM ledger.entries e
-            WHERE e.account_id = $1
-              AND e.kind = 'capture'
-              AND e.amount_microusd < 0
-              AND e.created_at >= date_trunc('day', now() AT TIME ZONE 'UTC') AT TIME ZONE 'UTC'
+            SELECT COALESCE((
+                SELECT settled_microusd FROM ledger.daily_spend
+                WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date
+            ), 0)::bigint
             "#,
         )
         .bind(account_id.0)
@@ -3344,7 +3359,7 @@ impl HubRepository for PgHubRepository {
             r#"
             UPDATE generation.jobs
             SET state = 'failed', error_code = 'platform_unavailable', error_message = $2,
-                failure_kind = 'platform_internal',
+                failure_kind = 'platform_internal', terminal_at = now(),
                 version = version + 1, updated_at = now()
             WHERE id = $1 AND state = 'reconciliation_required'
             "#,

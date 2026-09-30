@@ -1078,28 +1078,29 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
         "第一笔必须在额度之内，否则试不出'先过后拒'：扣了 {captured}，额度 {DAILY_LIMIT}"
     );
     let account_id = Uuid::parse_str(&harness.account_id).expect("account id");
-    let todays_spend = |pool: &PgPool, account_id: Uuid| {
+    // 限额的判据是**每日合计那一行**，不是历史流水的求和：这里直接读那一行。
+    let daily_total = |pool: &PgPool, account_id: Uuid| {
         let pool = pool.clone();
         async move {
             sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(sum(-amount_microusd), 0)::bigint FROM ledger.entries
-                 WHERE account_id = $1 AND kind = 'capture'",
+                "SELECT COALESCE(settled_microusd, 0)::bigint FROM ledger.daily_spend
+                 WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date",
             )
             .bind(account_id)
             .fetch_one(&pool)
             .await
-            .expect("今日已花的聚合")
+            .expect("当日合计的读取")
         }
     };
     assert_eq!(
-        todays_spend(&harness.pool, account_id).await,
+        daily_total(&harness.pool, account_id).await,
         captured,
-        "聚合出来的就是账本上那笔实收"
+        "成功结算在同一事务把实收累加进当天那一行"
     );
 
-    // 再把额度用掉：补一笔当天的扣费，让"今天已经花掉"正好等于额度。这笔同样是账本上的
-    // **事实**（一笔已结算的扣费），不是凭空写一个计数：额度判的就是这样的分录。
-    let filler = DAILY_LIMIT as i64 - captured;
+    // **限额检查不扫历史流水**：往账本里补一笔当天的扣费（比额度还大），但**不**碰当天合计。
+    // 若受理还按流水求和，这一笔就会把下一次请求挡在门外；只读当天那一行的实现则照常受理。
+    let history_only = DAILY_LIMIT as i64 * 2;
     sqlx::query(
         "INSERT INTO ledger.entries (id, account_id, job_id, kind, amount_microusd, business_key)
          VALUES ($1,$2,$3,'capture',$4,$5)",
@@ -1107,18 +1108,50 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
     .bind(Uuid::new_v4())
     .bind(account_id)
     .bind(job_id)
-    .bind(-filler)
-    .bind(format!("job:{job_id}:daily-cap-fixture"))
+    .bind(-history_only)
+    .bind(format!("job:{job_id}:daily-cap-history-fixture"))
     .execute(&harness.pool)
     .await
-    .expect("seed one more charge of the same day");
+    .expect("seed a charge that only exists in the history");
     assert_eq!(
-        todays_spend(&harness.pool, account_id).await,
-        DAILY_LIMIT as i64,
-        "账本上今天的总额现在正好等于额度"
+        daily_total(&harness.pool, account_id).await,
+        captured,
+        "历史流水不会改变当天合计"
     );
 
-    // 第二次：同一个账户、新的幂等键。余额是充裕的（刚充过），所以被拒的唯一理由就是它。
+    // 第二次：额度内照常受理并结算——它证明限额没有去汇总那笔历史流水。
+    let second_key = format!("daily-cap-inside-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &second_key,
+            route_request(harness.model, "history alone does not spend the day"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("历史流水不参与限额", &body);
+    let (_, second_state, _) = harness.job(&second_key).await;
+    assert_eq!(second_state, "succeeded", "第二笔必须真的跑完并结算");
+    let second_captured = daily_total(&harness.pool, account_id).await - captured;
+    assert!(second_captured > 0, "第二笔结算必须真的加了当天合计");
+
+    // 再把当天合计正好顶到额度：判据是这一行，不是账本上的历史分录。
+    sqlx::query(
+        "UPDATE ledger.daily_spend SET settled_microusd = $2
+         WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date",
+    )
+    .bind(account_id)
+    .bind(DAILY_LIMIT as i64)
+    .execute(&harness.pool)
+    .await
+    .expect("fill the day's settled total up to the limit");
+    assert_eq!(
+        daily_total(&harness.pool, account_id).await,
+        DAILY_LIMIT as i64,
+        "当天合计现在正好等于额度"
+    );
+
+    // 第三次：同一个账户、新的幂等键。余额是充裕的（刚充过），所以被拒的唯一理由就是它。
     let response = client
         .post(format!("{}/v1/images/generations", harness.base_url))
         .bearer_auth(&harness.api_key)
@@ -1169,10 +1202,9 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
             .fetch_one(&harness.pool)
             .await
             .expect("job count at the cap");
-    assert_eq!(jobs, 1, "被拒的那次不许建 Job");
-    // 账本上**只有第一笔**留下的痕迹：一笔预授权、它对应的释放、实收，与用例补上的那笔当天
-    // 扣费。被拒的那次连预授权都没有——它根本没走到扣款那一步。留意 `hold` / `release` 都不算
-    // "花掉的钱"：它们只是占位与退还，所以它们有、而"今日已花"里没有它们。
+    assert_eq!(jobs, 2, "被拒的那次不许建 Job");
+    // 账本上是两次结算的实收，加上用例补的那笔**只存在于历史里**的扣费。被拒的那次连预授权
+    // 都没有——它根本没走到扣款那一步。留意 `hold` / `release` 都不算"花掉的钱"。
     let dump: Vec<(String, i64)> = sqlx::query_as(
         "SELECT kind, amount_microusd FROM ledger.entries WHERE account_id = $1 ORDER BY created_at",
     )
@@ -1183,16 +1215,16 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
     let count_of = |kind: &str| dump.iter().filter(|(name, _)| name == kind).count();
     assert_eq!(
         count_of("capture"),
-        2,
-        "账本上只有第一笔的实收与那笔补上的当天扣费：被拒的那次没有扣款；实得 {dump:?}"
+        3,
+        "账本上是两次结算的实收与那笔历史扣费：被拒的那次没有扣款；实得 {dump:?}"
     );
     // 预授权**不进资金流水**（`0002` §3）：这里只有入账与实收两种科目。
     assert_eq!(count_of("hold"), 0, "预授权不进资金流水；实得 {dump:?}");
     assert_eq!(count_of("release"), 0, "释放不进资金流水；实得 {dump:?}");
     assert_eq!(
         database_balance(&harness, &harness.account_id).await,
-        1_000_000 + 100_000_000 - captured,
-        "余额只被第一笔动过（充值那一笔不算扣费）"
+        1_000_000 + 100_000_000 - captured - second_captured,
+        "余额被两次真实结算动过（那笔历史分录不改余额）"
     );
     // 配额**不写缓存**：被拒的这次哪怕进程配着缓存，也不该留下任何一条"今天的累计"。
     {
