@@ -707,7 +707,7 @@ async fn a_cache_that_says_there_is_enough_still_lets_the_database_refuse() {
 /// **倒序写回不得覆盖新值**：缓存里已经是一条版本更高的快照（模拟后提交的事务先写回），
 /// 再发生一次版本更低的写回时，闸门必须拒绝它——否则并发提交后的异步写回会把新值盖成旧值。
 ///
-/// 这里用充值触发写回：先把缓存伪造成版本 999 的快照，再充值（数据库版本只有 3）。写回被挡下，
+/// 这里用充值触发写回：先把缓存伪造成版本 999 的快照，再充值（开户后版本是 0，这一笔充到 1）。写回被挡下，
 /// 缓存里那条高版本快照原样留着。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]

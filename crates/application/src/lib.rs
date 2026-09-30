@@ -3695,7 +3695,7 @@ struct CachedRoute {
 
 /// 余额缓存的值：一次账户读取的完整快照 + 写入时间（数据库盖章）+ 来源标记。
 ///
-/// 四个金额与版本同属一次读取（见 [`HubRepository::read_account_balance`]），因此
+/// 三个金额与版本同属一次读取（见 [`HubRepository::read_account_balance`]），因此
 /// `available = balance − held` 在缓存里同样成立；`version` 是倒序写回闸门的判据
 /// （[`AccelerationService::write_balance`]）。
 #[derive(Debug, Serialize, Deserialize)]
@@ -3713,7 +3713,7 @@ impl CachedBalance {
     ///
     /// 1. 来源是**写穿路径**——对账写回的只是"与数据库一致"的副本，不构成"刚有一笔钱变动过"；
     /// 2. 写入时间落在新鲜窗口内，且**不晚于数据库当前时刻**。晚于它只可能是两个时钟不同步，
-    ///    那种值一律当不新鲜：宁可多打一次数据库，也不要凭一个来路不明的时间提示客户。
+    ///    那种值一律当不新鲜：不拿一个来路不明的时间去提示。
     ///
     /// 它只影响预检日志，**不决定受理**：402 一律由数据库条件更新确认
     /// （[`AccelerationService::precheck_balance`]）。
@@ -4243,7 +4243,7 @@ impl AccelerationService {
                 tracing::warn!(
                     account_id = %account_id,
                     error = %error,
-                    "the cached balance is unreadable; falling back to the database"
+                    "the cached balance is unreadable; treating it as a cache miss"
                 );
                 None
             }

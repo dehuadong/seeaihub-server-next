@@ -11,11 +11,13 @@ verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo 
 
 ## 问题
 
-账户当前值改为 `ledger.accounts` 的 `balance_microusd` / `held_microusd` / 单调递增 `version` 之后，`user_balance` 缓存里的旧值只有余额、写入时间与来源三项。两个后果：缓存表达不了"可用额 = 余额 − 占用"，预检只能拿已结算余额与保底额比；两个事务提交后的异步写回可能乱序到达，旧快照覆盖新快照。RFC v3 §3 要求缓存值带版本、写回拒绝倒序，且**缓存不足不得单独产生 402**——受理闸门只能是数据库那条条件更新。
+账户当前值改为 `ledger.accounts` 的 `balance_microusd` / `held_microusd` / 单调递增 `version` 之后，`user_balance` 缓存里的旧值只有余额、写入时间与来源三项。两个后果：缓存表达不了"可用额 = 余额 − 占用"，预检只能拿已结算余额与保底额比；两个事务提交后的异步写回可能乱序到达，旧快照覆盖新快照。RFC v3 §3（[`0013` §3](../../../../docs/design/0013-account-funds-and-reservations.md)）要求缓存值带版本、写回拒绝倒序，且**缓存不足不得单独产生 402**——受理闸门只能是数据库那条条件更新。
+
+本记录只覆盖余额快照的版本闸门与预检口径；route 缓存、写穿时机、对账与降级仍由 [2026-09-22 的加速层记录](./2026-09-22-redis-acceleration-layer.md) 承接，两条互相链接。
 
 ## 决定
 
-- **快照带版本**：`user_balance:<account_id>` 的值是 `{balance_microusd, held_microusd, available_microusd, version, written_at, source}`。四个金额与版本同属一次账户读取，`available = balance − held` 在缓存里同样成立。
+- **快照带版本**：`user_balance:<account_id>` 的值是 `{balance_microusd, held_microusd, available_microusd, version, written_at, source}`。三个金额与版本同属一次账户读取，`available = balance − held` 在缓存里同样成立。
 - **版本闸门**：`write_balance` 先读缓存当前版本，只有版本**不低于**它的快照才写。数据库对同一账户的金额更新串行，版本随每次变更递增；两个提交后的异步写回乱序到达时，旧快照被挡下。读不到当前值（键不存在、缓存不可用或值不可读）时照写——数据库是权威；写失败只记日志，不回滚数据库。
 - **预检只提示**：`precheck_balance` 读一条新鲜（写穿来源、写入时间在窗口内、非重放）快照，可用额低于本次保底额时只记一条日志；它不返回拒绝、不写审计。402 一律由受理时的数据库条件更新（`balance − held ≥ 保底额` 且 `kind = consumer`）确认。
 - **对账按版本校正**：`reconcile_once` 读数据库当前行；缓存版本高于这次读数时不动它（那次读发生在新提交之前），版本与三个金额都相同才算同一个快照，版本相同而金额不同按缓存被改坏覆盖并写 `cache.balance_corrected` 审计。
