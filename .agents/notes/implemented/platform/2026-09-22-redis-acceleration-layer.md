@@ -2,7 +2,7 @@
 title: Redis 加速层：纯加速的路由与余额缓存
 status: implemented
 created: 2026-09-22
-updated: 2026-09-22
+updated: 2026-09-30
 approval: 用户在会话中授权实施 P4（Redis 加速层）；范围与验收见提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 的 P4 工单 [#19](https://github.com/dehuadong/seeaihub-server-next/issues/19)
 verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-server-next/issues/19) 的逐条可勾选清单（依据 `docs/design/0008` §7）。**全部离线**（真实空库 + 真实 API/Worker 进程 + 进程内假上游与假 Redis，零真实计费调用、零外网）：`apps/api/tests/http_contract.rs` 新增 7 条端到端用例，`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1` 在**最终代码**上 **65 passed / 0 failed**（180.77s）；`crates/cache-redis` 另有一条对着真实 Redis 的 `#[ignore]` 用例与两条失败路径单测；门禁 `cargo fmt --all -- --check`、`cargo clippy --workspace --all-targets --all-features -- -D warnings`、`cargo test --workspace --all-features`、`node scripts/decisions/check.mjs` 全部通过。逐条证据见正文「验证」。
 ---
@@ -15,14 +15,16 @@ verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-
 
 把 Redis 放进来会引入一条新的失败路径与一个新的运行时依赖，所以约束先于做法：**缓存不是事实源**（[`ADR-0003`](../../../../docs/adr/0003-postgresql-is-source-of-truth.md)），扣减与余额事实只在数据库事务里发生；缓存不可用时平台必须照常正确工作，只是变慢；缓存与数据库不一致时以数据库为准。另一条约束来自可解释性：平台不允许"缓存说余额不够"这种**没有业务记录**的拒绝悄悄发生——预检不建 Job、不扣款、不写状态，事后只能靠审计解释"为什么拒了这个客户"。
 
+**部分取代**：余额快照的形状、写回版本闸门与预检口径已由 [账户余额缓存：带版本的快照与数据库最终判定](2026-09-30-account-balance-cache-version-guard.md) 取代；本记录的 route 缓存、写穿时机、对账与降级仍适用。
+
 ## 决定
 
 按 `docs/design/0008-routing-strategy-and-caching.md` §7 落地，范围见工单 [#19](https://github.com/dehuadong/seeaihub-server-next/issues/19)：
 
 - **端口与实现分开**：`crates/application` 有 `CacheStore` 端口（`GET` / `SET … PX` / `DEL`）与 `AccelerationService`（键名、值形状、新鲜度判定、写穿、失效、对账）；`crates/cache-redis` 只把这三条命令发给 Redis，连接惰性建立、单次操作带超时（`CACHE_OPERATION_TIMEOUT_MS`，默认 200 毫秒），任何失败都返回错误，由用例层当"未命中"。缓存语义留在用例层，是为了不让"余额"与"候选集"的语义在实现方各自漂移。
 - **route 缓存带版本校验**：`route:<gateway_model>` 的值是候选集 + 写它那次发布的修订标识。受理前做一次轻量读（`HubRepository::acceptance_probe`：生效修订标识 + 网关模型开关 + 数据库时钟 + 这次是不是重放），标识不一致、开关已关或值读不出来就当未命中、回源数据库。陈旧因此是**可检的**，不依赖发布后的失效一定成功；失效失败只让缓存里留旧值。空候选集不入缓存。
-- **写穿**：充值、受理预授权扣减、结算、失败释放与对账退款五条改动余额的路径，都在事务提交后把**提交后的值**写进 `user_balance:<account_id>`（不用 `DECRBY`），写入时间取数据库给出的 `updated_at`。为此 `HubRepository` 的这几条写路径用 `RETURNING` 返回 `BalanceChange`（账户、余额、数据库时刻），幂等重放与"保留预授权的失败收尾"返回当前余额。
-- **预检可拒绝但必留审计**：缓存条目来源是写穿路径（`db_commit`）**且**写入时间落在新鲜窗口内**且**这次不是重放，才允许在余额低于保底额时提前回 402；拒绝前先写 `operations.audit_events`（缓存余额、写入时间、来源、本次保底额、网关模型），审计写不下去就不拒绝，交给数据库的条件更新。
+- **写穿**：充值、受理预授权扣减、结算、失败释放与对账退款五条改动余额的路径，都在事务提交后把**提交后的值**写进 `user_balance:<account_id>`（不用 `DECRBY`），写入时间取数据库给出的 `updated_at`。为此 `HubRepository` 的这几条写路径用 `RETURNING` 返回 `BalanceChange`（账户、余额、占用、可用额、版本与数据库时刻），幂等重放与"保留预授权的失败收尾"返回当前余额。
+- **预检可拒绝但必留审计（已由 [新记录](2026-09-30-account-balance-cache-version-guard.md) 取代）**：缓存条目来源是写穿路径（`db_commit`）**且**写入时间落在新鲜窗口内**且**这次不是重放，才允许在余额低于保底额时提前回 402；拒绝前先写 `operations.audit_events`（缓存余额、写入时间、来源、本次保底额、网关模型），审计写不下去就不拒绝，交给数据库的条件更新。
 - **重放不受预检管辖**：重放会去重成原来那个 Job，不新建也不扣款；预检要避免的正是"新建一个 Job 却扣不动钱"。受理前那次轻量读里折了一个按 `(account_id, idempotency_key)` 唯一索引的探测，用来判这次是不是重放，不额外多一次往返。
 - **定时对账**：API 进程内的独立任务（`AccelerationService::run_reconciler`，周期 `CACHE_RECONCILE_INTERVAL_MS`）按 `updated_at` 增量把余额写回（来源标记 `reconciler`）、把不是当前生效修订的候选集拿掉；只覆盖**真的不一致**的条目，覆盖时写一条审计，相等的不动——重写会把来源降级成 `reconciler`，那等于"这条值不能再用于提前拒绝"。
 - **降级**：`REDIS_URL` 未配置时加速层根本不构造，受理路径不额外查库，行为与没有这一层时逐位相同；配了但连不上、超时或命令报错，每次操作都当未命中，回源数据库。
@@ -52,7 +54,7 @@ verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-
 - **付的代价**：多一个可选运行时依赖与一条失败路径；受理多一次轻量 DB 读（仅在缓存启用时）；缓存操作本身的时间会加到受理延迟上，上界是 `CACHE_OPERATION_TIMEOUT_MS`。
 - **对账只做增量**：窗口取对账周期的三倍，窗口之外没被动过的账户，其缓存条目只在下次写穿或对账触及时纠正；发现"很久没动过的账户的缓存被改错"需要全量扫描，本片不做。
 - **`supply.offerings.enabled` / `supply.channels.enabled` 不进 route 缓存的版本比对**：这两个开关今天没有写入方（提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 明确不做启停接口），所以候选可用性只可能被绕过发布入口的直接改库改变；将来若加启停入口，必须让它同时失效 route 缓存或进版本比对。
-- **预检误拒仍可能发生**：新鲜窗口内缓存与数据库不一致时会拒掉一个其实有钱的客户。拒绝无副作用、有审计，调用方重试即可；把窗口调小是运营侧的取舍。
+- **预检不再误拒**：预检只提示，402 由数据库条件更新确认（见 [新记录](2026-09-30-account-balance-cache-version-guard.md)）。
 - **对账任务挂在 API 进程上**：API 不在跑就没有对账；缓存里留下的错值由受理时的版本比对与新鲜度判定兜住正确性，对账只负责把它纠正回来。
 - **`compose.yaml` 里没有 redis 服务**：本地要验真实 Redis 路径需自己起一个并把 `REDIS_URL` 指过去。
 
@@ -68,7 +70,7 @@ verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-
 | 停掉 Redis：结果逐位相同 | `stopping_the_cache_leaves_acceptance_and_settlement_bit_identical`（同一场景跑两遍：充值后把假 Redis 关掉 / 完全不配 `REDIS_URL`，实收、最终余额、Job 终态与对客响应结构逐位相同） |
 | route 缓存陈旧不可用 | `a_stale_route_cache_falls_back_to_the_database`（重发修订并让假 Redis 拒绝写入 → 缓存里留着旧值，受理仍用新修订的定价；再手工把修订标识改旧，结果同样回源） |
 | 陈旧缓存不得拒绝 | `a_stale_balance_entry_never_rejects`（来源改成 `reconciler`、以及写穿来源但写入时间在一小时前 → 两次都照常成功、都真的扣了钱、没有凭缓存拒绝的审计） |
-| 误拒有审计 | `a_fresh_cache_rejection_is_audited`（缓存新鲜且低于保底额 → 402 `insufficient_balance`、不建 Job、不扣款，`operations.audit_events` 里一条 `balance.precheck_rejected`，含缓存余额、写入时间、来源、保底额与网关模型） |
+| 误拒有审计（已由 [新记录](2026-09-30-account-balance-cache-version-guard.md) 取代） | 该口径与 `a_fresh_cache_rejection_is_audited` 已移除：缓存不足不再单独产生 402，改由数据库条件更新确认 |
 | 重放不受预检管辖 | `a_replayed_request_is_never_refused_by_the_balance_precheck`（余额刚好够扣一次保底额 → 受理之后缓存里是"新鲜且低于保底额"的值 → 同键立刻重发去重成原 Job、余额不变、无审计）。**变异实测**：把 `precheck_balance` 里的重放豁免去掉 → 该用例实测得到 402（有检出能力），恢复后通过 |
 | 人为改错 → 对账以数据库为准覆盖并留审计 | `the_reconciler_overwrites_corrupted_entries_from_the_database`（对账周期 1 秒：改错余额与候选集 → 余额被覆盖回数据库的值且来源变成 `reconciler`、候选集被拿掉，两条审计各一条） |
 | 真实 Redis 路径 | `crates/cache-redis/tests/real_redis.rs` 的 `a_real_redis_round_trip_keeps_values_and_honours_the_ttl`（`#[ignore]`，`REDIS_URL` 指向真实服务时验 `GET` / `SET … PX` / `DEL` 与 TTL 到期；没给就跳过） |

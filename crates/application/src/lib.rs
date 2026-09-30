@@ -3658,7 +3658,7 @@ pub struct AcceptanceProbe {
     pub replay: bool,
 }
 
-/// 余额缓存条目的来源：写穿路径写下的值**可以**用于提前拒绝，对账写回的不行。
+/// 余额缓存条目的来源：写穿路径写下的值**可以**用作新鲜提示，对账写回的不行。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BalanceSource {
@@ -3693,20 +3693,30 @@ struct CachedRoute {
     candidates: Vec<OfferingCandidate>,
 }
 
-/// 余额缓存的值：余额 + 写入时间（数据库盖章）+ 来源标记。
+/// 余额缓存的值：一次账户读取的完整快照 + 写入时间（数据库盖章）+ 来源标记。
+///
+/// 四个金额与版本同属一次读取（见 [`HubRepository::read_account_balance`]），因此
+/// `available = balance − held` 在缓存里同样成立；`version` 是倒序写回闸门的判据
+/// （[`AccelerationService::write_balance`]）。
 #[derive(Debug, Serialize, Deserialize)]
 struct CachedBalance {
     balance_microusd: i64,
+    held_microusd: i64,
+    available_microusd: i64,
+    version: i64,
     written_at: DateTime<Utc>,
     source: BalanceSource,
 }
 
 impl CachedBalance {
-    /// 这条值能不能用来下结论（提前拒绝）。两条判据都要满足：
+    /// 这条值能不能作为**新鲜提示**。两条判据都要满足：
     ///
     /// 1. 来源是**写穿路径**——对账写回的只是"与数据库一致"的副本，不构成"刚有一笔钱变动过"；
     /// 2. 写入时间落在新鲜窗口内，且**不晚于数据库当前时刻**。晚于它只可能是两个时钟不同步，
-    ///    那种值一律当不新鲜：宁可多打一次数据库，也不要凭一个来路不明的时间拒绝客户。
+    ///    那种值一律当不新鲜：宁可多打一次数据库，也不要凭一个来路不明的时间提示客户。
+    ///
+    /// 它只影响预检日志，**不决定受理**：402 一律由数据库条件更新确认
+    /// （[`AccelerationService::precheck_balance`]）。
     fn is_fresh(&self, database_now: DateTime<Utc>, window: Duration) -> bool {
         if self.source != BalanceSource::DbCommit {
             return false;
@@ -3745,7 +3755,7 @@ struct CachedRateLimit {
 /// 1. **任何一次缓存操作失败都只是"这次没命中"**——回源数据库，绝不让请求因为缓存出问题而失败；
 /// 2. **扣减与余额事实只在数据库事务里发生**：这里的写入一律发生在提交**之后**、写的是提交后的
 ///    值，从不用 `DECRBY` 之类的增量命令（增量表达不了"以数据库为准"，重放还会漂移）；
-/// 3. **只有新鲜的值能用来拒绝**：来源必须是写穿路径且写入时间落在窗口内，其余一律交给数据库判。
+/// 3. **缓存从不决定资金结果**：预检只读新鲜值作提示，受理与 402 一律由数据库条件更新判定。
 #[derive(Clone)]
 pub struct AccelerationService {
     repository: Arc<dyn HubRepository>,
@@ -3946,83 +3956,73 @@ impl AccelerationService {
         })
     }
 
-    /// 受理前的余额预检：**只有新鲜的值才允许提前拒绝**，返回 `true` 表示"凭缓存拒绝"。
+    /// 受理前的余额预检：读缓存里的**可用额**作提示，**不决定受理**。
     ///
-    /// 三条判据缺一不可：条目来源是写穿路径、写入时间落在新鲜窗口内、**这次不是重放**。
-    /// 重放会去重成原来那个 Job，不新建也不扣款——预检要避免的是"新建一个 Job 却扣不动钱"，
-    /// 拿它拦一次重放只会让"重发同一个键"变成看余额脸色的行为。
-    ///
-    /// 拒绝本身没有副作用——不建 Job、不扣款、不写状态，所以事后必须解释得清"为什么拒了这个
-    /// 客户"，这就是那条审计。审计写不下去时**不拒绝**：宁可多打一次数据库，也不能留下一次
-    /// 没有记录的拒绝。
+    /// 缓存不可用、值过期、不是写穿来源或这次是重放时都不提示。命中一条新鲜且可用额低于本次
+    /// 保底额的值时只记一条日志——它说明"这次很可能受理不了"，但**不产生 402**：受理闸门是
+    /// 数据库那条条件更新（`balance − held ≥ 保底额` 且 `kind = consumer`），缓存不足也要由它
+    /// 确认才回 402（`0013` §3）。重放会去重成原来那个 Job，不新建也不扣款，提示对它是噪音。
     pub async fn precheck_balance(
         &self,
         account_id: AccountId,
         hold_microusd: u64,
         gateway_model: &str,
         probe: &AcceptanceProbe,
-    ) -> Result<bool, ApplicationError> {
+    ) {
         if probe.replay {
-            return Ok(false);
+            return;
         }
         let Some(cached) = self.read_balance(account_id).await else {
-            return Ok(false);
+            return;
         };
         if !cached.is_fresh(probe.database_now, self.policy.freshness_window) {
-            return Ok(false);
+            return;
         }
         let Ok(hold) = i64::try_from(hold_microusd) else {
-            return Ok(false);
+            return;
         };
-        if cached.balance_microusd >= hold {
-            return Ok(false);
-        }
-        let payload = json!({
-            "reason": "the cached balance is below the hold while the entry is fresh",
-            "gateway_model": gateway_model,
-            "cached_balance_microusd": cached.balance_microusd,
-            "cached_written_at": cached.written_at,
-            "cached_source": cached.source,
-            "hold_microusd": hold_microusd,
-            "database_now": probe.database_now,
-        });
-        if let Err(error) = self
-            .repository
-            .insert_audit_event(
-                "acceleration-precheck",
-                "balance.precheck_rejected",
-                "account",
-                &account_id.to_string(),
-                payload,
-            )
-            .await
-        {
-            tracing::warn!(
-                account_id = %account_id,
-                error = %error,
-                "could not record the cache-based balance rejection; falling back to the database"
-            );
-            return Ok(false);
+        if cached.available_microusd >= hold {
+            return;
         }
         tracing::warn!(
             account_id = %account_id,
-            cached_balance_microusd = cached.balance_microusd,
+            gateway_model,
+            cached_available_microusd = cached.available_microusd,
+            cached_version = cached.version,
             hold_microusd,
-            "rejected a request on a fresh cached balance below the hold"
+            "the fresh cached available amount is below the hold; the database conditional update decides"
         );
-        Ok(true)
     }
 
-    /// 把**数据库提交后**的余额写进缓存（写穿）。
+    /// 把**数据库提交后**的余额快照写进缓存（写穿），并拒绝倒序写回。
     ///
     /// 写的是提交后的值而不是增量：`DECRBY` 表达不了"以数据库为准"，重放还会漂移。写入时间用
-    /// 数据库给出的 `updated_at`，于是"新鲜"判定与审计里的时间都是数据库的时间。
+    /// 数据库给出的 `updated_at`，于是"新鲜"提示与日志里的时间都是数据库的时间。
+    ///
+    /// **版本闸门**：只有版本**不低于**缓存当前值的快照才写。数据库对同一账户的金额更新是串行的，
+    /// 版本随每次变更递增；两个事务提交后的异步写回若乱序到达，旧快照会试图覆盖新快照——这里按
+    /// 版本挡掉它（`0013` §3）。读不到当前值（键不存在、缓存不可用或值不可读）时照写：数据库是
+    /// 权威，覆盖一个读不出来的值是恢复而不是降级；写失败只记日志，不回滚数据库。
     pub async fn write_balance(&self, change: &BalanceChange, source: BalanceSource) {
         if !self.is_enabled() {
             return;
         }
+        if let Some(current) = self.read_balance(change.account_id).await
+            && current.version > change.version
+        {
+            tracing::warn!(
+                account_id = %change.account_id,
+                cached_version = current.version,
+                incoming_version = change.version,
+                "skipped a cache write-back older than the cached snapshot"
+            );
+            return;
+        }
         let value = CachedBalance {
             balance_microusd: change.balance_microusd,
+            held_microusd: change.held_microusd,
+            available_microusd: change.available_microusd,
+            version: change.version,
             written_at: change.updated_at,
             source,
         };
@@ -4060,7 +4060,8 @@ impl AccelerationService {
     /// 定时对账兜底：以数据库为准把缓存覆盖回去，并把**真的不一致**记下来。
     ///
     /// 只覆盖不一致的条目：已经等于数据库值的条目不动——重写会把它的来源降级成 `reconciler`
-    /// （等于"这条值不能再用于提前拒绝"），没必要为一次没发生的不一致付这个代价。
+    /// （等于这条值不再能作为新鲜提示），没必要为一次没发生的不一致付这个代价。缓存比这次读到的
+    /// 数据库行**新**时也不动它：那次读发生在新提交之前，覆盖回去才是倒序写回。
     pub async fn reconcile_once(&self) -> Result<ReconcileReport, ApplicationError> {
         if !self.is_enabled() {
             return Ok(ReconcileReport::default());
@@ -4071,18 +4072,28 @@ impl AccelerationService {
         for change in self.repository.accounts_updated_within(window).await? {
             report.accounts_checked += 1;
             let cached = self.read_balance(change.account_id).await;
-            if cached
-                .as_ref()
-                .is_some_and(|cached| cached.balance_microusd == change.balance_microusd)
-            {
-                continue;
-            }
             if let Some(cached) = &cached {
+                // 缓存比这次读到的数据库行**新**：两次读取之间又提交了一笔，这一份是旧读数，
+                // 不动它，等下一轮对账带着更新的行再来。
+                if cached.version > change.version {
+                    continue;
+                }
+                // 版本与三个金额都相同才是同一个快照；版本相同而金额不同只可能是缓存被改坏。
+                if cached.version == change.version
+                    && cached.balance_microusd == change.balance_microusd
+                    && cached.held_microusd == change.held_microusd
+                    && cached.available_microusd == change.available_microusd
+                {
+                    continue;
+                }
                 report.balances_corrected += 1;
                 tracing::warn!(
                     account_id = %change.account_id,
                     cached_balance_microusd = cached.balance_microusd,
+                    cached_held_microusd = cached.held_microusd,
+                    cached_version = cached.version,
                     database_balance_microusd = change.balance_microusd,
+                    database_version = change.version,
                     "the cached balance disagreed with the database; overwriting it"
                 );
                 self.record_reconcile_correction(
@@ -4091,9 +4102,15 @@ impl AccelerationService {
                     &change.account_id.to_string(),
                     json!({
                         "cached_balance_microusd": cached.balance_microusd,
+                        "cached_held_microusd": cached.held_microusd,
+                        "cached_available_microusd": cached.available_microusd,
+                        "cached_version": cached.version,
                         "cached_written_at": cached.written_at,
                         "cached_source": cached.source,
                         "database_balance_microusd": change.balance_microusd,
+                        "database_held_microusd": change.held_microusd,
+                        "database_available_microusd": change.available_microusd,
+                        "database_version": change.version,
                         "database_updated_at": change.updated_at,
                     }),
                 )
@@ -5747,15 +5764,12 @@ impl GenerationService {
                 self.cost_ceiling.max_request_cost_microusd()
             )));
         }
-        // 预检：缓存里的余额**新鲜**且明显不够时提前拒绝。它只读不写、不建 Job、不扣款，
-        // 因此必然留下一条审计（`precheck_balance` 里落）；不新鲜一律交给下面的数据库条件更新。
-        if let Some(probe) = &probe
-            && self
-                .acceleration
+        // 预检：读缓存里的可用额作提示（新鲜且不足时记一条日志）。它**不决定受理**：缓存不足
+        // 也要由下面的数据库条件更新确认才回 402（`0013` §3）。
+        if let Some(probe) = &probe {
+            self.acceleration
                 .precheck_balance(request.account_id, hold_microusd, &request.model, probe)
-                .await?
-        {
-            return Err(ApplicationError::InsufficientBalance);
+                .await;
         }
         // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按承载面过滤的结果）：
         // 上游目录变了、或另一个候选的承载面更窄，都不该让同一个幂等键算出不同的哈希。

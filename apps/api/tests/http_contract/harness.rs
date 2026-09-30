@@ -3279,6 +3279,9 @@ impl CacheFixture {
     }
 
     /// 把缓存里的余额改成一个错值（写入时间与来源由用例指定）。
+    ///
+    /// 版本取 0：低于任何真实账户版本，所以既不会挡住后续写回，也能被对账按数据库校正。要构造
+    /// "缓存里的版本比数据库新"那种倒序形态，用 [`Self::put_balance`] 自己给版本。
     fn corrupt_balance(
         &self,
         account_id: &str,
@@ -3286,14 +3289,22 @@ impl CacheFixture {
         source: &str,
         written_at: Value,
     ) {
-        self.put(
-            &format!("user_balance:{account_id}"),
-            &json!({
+        self.put_balance(
+            account_id,
+            json!({
                 "balance_microusd": balance_microusd,
+                "held_microusd": 0,
+                "available_microusd": balance_microusd,
+                "version": 0,
                 "written_at": written_at,
                 "source": source,
             }),
         );
+    }
+
+    /// 直接写一条完整的余额快照（绕过服务）。
+    fn put_balance(&self, account_id: &str, value: Value) {
+        self.put(&format!("user_balance:{account_id}"), &value);
     }
 
     /// 等到缓存里的余额变成这个值（对账是定时的，只能等）。
@@ -3481,6 +3492,15 @@ async fn database_balance(harness: &Harness, account_id: &str) -> i64 {
         .fetch_one(&harness.pool)
         .await
         .expect("balance")
+}
+
+/// 该账户在**数据库**里的金额版本（缓存快照的版本必须与它一致）。
+async fn database_version(harness: &Harness, account_id: &str) -> i64 {
+    sqlx::query_scalar("SELECT version FROM ledger.accounts WHERE id = $1")
+        .bind(Uuid::parse_str(account_id).expect("account id"))
+        .fetch_one(&harness.pool)
+        .await
+        .expect("version")
 }
 
 /// 该账户账本条目的**符号和**：账实核对拿它当"账本说是多少"。

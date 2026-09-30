@@ -213,6 +213,21 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         .balance(&account_id)
         .expect("充值之后缓存里必须立刻有余额");
     assert_eq!(cached["balance_microusd"], json!(1_000_000));
+    assert_eq!(
+        cached["held_microusd"],
+        json!(0),
+        "还没有任何占用：{cached}"
+    );
+    assert_eq!(
+        cached["available_microusd"],
+        json!(1_000_000),
+        "可用额 = 已结算余额 − 占用：{cached}"
+    );
+    assert_eq!(
+        cached["version"],
+        json!(database_version(&harness, &account_id).await),
+        "快照的版本就是数据库那一行的版本：{cached}"
+    );
     assert_eq!(cached["source"], json!("db_commit"));
     assert_eq!(
         cached["balance_microusd"],
@@ -243,8 +258,23 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         "受理只增加占用（记在 held），不改已结算余额"
     );
     assert_eq!(
+        cached["held_microusd"],
+        json!(250_000),
+        "2K 档的保底额记在占用里：{cached}"
+    );
+    assert_eq!(
+        cached["available_microusd"],
+        json!(750_000),
+        "可用额 = 已结算余额 − 占用：{cached}"
+    );
+    assert_eq!(
         cached["balance_microusd"],
         json!(database_balance(&harness, &account_id).await)
+    );
+    assert_eq!(
+        cached["version"],
+        json!(database_version(&harness, &account_id).await),
+        "受理把版本推进到数据库那一行：{cached}"
     );
 
     // route 缓存也建起来了，且带着**当前生效修订**的标识。
@@ -271,6 +301,21 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
     assert_eq!(settled, 1_000_000 - 43_680, "实收按对客费率向量算");
     let cached = harness.cache().balance(&account_id).expect("结算之后缓存");
     assert_eq!(cached["balance_microusd"], json!(settled));
+    assert_eq!(
+        cached["held_microusd"],
+        json!(0),
+        "结算把占用结清：{cached}"
+    );
+    assert_eq!(
+        cached["available_microusd"],
+        json!(settled),
+        "占用归零后可用额等于已结算余额：{cached}"
+    );
+    assert_eq!(
+        cached["version"],
+        json!(database_version(&harness, &account_id).await),
+        "结算把版本推进到数据库那一行：{cached}"
+    );
     assert_eq!(cached["source"], json!("db_commit"));
 
     harness.cleanup().await;
@@ -456,7 +501,7 @@ async fn a_stale_route_cache_falls_back_to_the_database() {
     harness.cleanup().await;
 }
 
-/// **陈旧缓存不得拒绝**：缓存里的余额偏低，但超出新鲜窗口（或来源是对账写回）→ 不提前拒绝，
+/// **陈旧缓存不得拒绝**：缓存里的余额偏低，且超出新鲜窗口（或来源是对账写回）→ 不提示、不拒绝，
 /// 判定交给数据库，请求照常成功。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
@@ -531,11 +576,12 @@ async fn a_stale_balance_entry_never_rejects() {
     harness.cleanup().await;
 }
 
-/// **误拒有审计**：缓存**新鲜**（来源写穿、写入时间在窗口内）且余额低于保底额 → 提前返回
-/// 402，不建 Job、不扣款，同时留下一条审计（缓存余额、写入时间、来源与本次保底额）。
+/// **新鲜缓存说"不够"也不得单独拒**：缓存里是一条新鲜（写穿来源、写入时间在窗口内）但可用额
+/// 低于保底额的快照——例如充值的写回丢了，缓存落后于数据库。受理必须交给数据库条件更新确认：
+/// 数据库说够就照常受理、照常扣费，缓存只留下一条"很可能不够"的日志。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_fresh_cache_rejection_is_audited() {
+async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
     let settings = CacheSettings::default().with_windows(30_000, 300_000);
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
@@ -555,13 +601,14 @@ async fn a_fresh_cache_rejection_is_audited() {
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
     let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
     let written_at = fresh["written_at"].clone();
-    // 缓存说"不够"（比 2K 档的保底额 ¥0.25 还少），数据库说"够"——这正是要能解释清楚的那一次。
+    // 缓存落后于充值：新鲜、写穿来源，但可用额比 2K 档的保底额 ¥0.25 还少；数据库说够。
     harness
         .cache()
-        .corrupt_balance(&account_id, 1, "db_commit", written_at.clone());
+        .corrupt_balance(&account_id, 1, "db_commit", written_at);
 
-    let key = format!("cache-reject-{}", Uuid::new_v4());
-    let mut request = route_request(harness.model, "fresh cache rejection");
+    let _worker = harness.spawn_worker();
+    let key = format!("cache-short-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "fresh cache shortfall");
     request["size"] = json!("2K");
     request["quality"] = json!("low");
     let (status, body) = post_json(
@@ -572,33 +619,161 @@ async fn a_fresh_cache_rejection_is_audited() {
         &request,
     )
     .await;
-    assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "got {body}");
-    assert_eq!(body["error"]["code"], json!("insufficient_balance"));
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "缓存说不够不能单独拒，必须由数据库确认：{body}"
+    );
+    // 判定交给了数据库：真的建了 Job、真的扣了实收，也没有"凭缓存拒绝"的痕迹。
+    assert_eq!(
+        database_balance(&harness, &account_id).await,
+        1_000_000 - 43_680,
+        "数据库确认够并照常结算"
+    );
+    assert!(
+        audit_events(&harness, "balance.precheck_rejected")
+            .await
+            .is_empty(),
+        "不再有凭缓存的拒绝审计"
+    );
 
-    // 拒绝没有副作用：不建 Job、不扣款。
+    harness.cleanup().await;
+}
+
+/// **缓存说"够"也不得单独受理**：缓存里是一条新鲜且可用额充足的快照，数据库却已经不够——
+/// 402 必须由数据库条件更新确认，缓存显示的充足不能代替它（`0002` §4、`0013` §3）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_cache_that_says_there_is_enough_still_lets_the_database_refuse() {
+    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(settings).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    // 余额低于 2K 档的保底额 ¥0.25：数据库这一侧本来就不够。
+    let (account_id, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 100_000).await;
+    let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
+    let written_at = fresh["written_at"].clone();
+    // 缓存被改成一个充足、新鲜的数：它不能成为"可以受理"的依据。
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 10_000_000, "db_commit", written_at);
+
+    let key = format!("cache-enough-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "cache says enough");
+    request["size"] = json!("2K");
+    request["quality"] = json!("low");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::PAYMENT_REQUIRED,
+        "数据库条件更新确认不足：{body}"
+    );
+    assert_eq!(body["error"]["code"], json!("insufficient_balance"));
     let jobs: i64 =
         sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
             .bind(&key)
             .fetch_one(&harness.pool)
             .await
             .expect("job count");
-    assert_eq!(jobs, 0, "凭缓存拒绝不建 Job");
-    assert_eq!(database_balance(&harness, &account_id).await, 1_000_000);
-
-    // 但必须留下一条能解释"为什么拒了这个客户"的审计。
-    let events = audit_events(&harness, "balance.precheck_rejected").await;
-    assert_eq!(events.len(), 1, "凭缓存拒绝必须留审计");
-    assert_eq!(events[0]["cached_balance_microusd"], json!(1));
-    assert_eq!(events[0]["cached_source"], json!("db_commit"));
-    assert_eq!(events[0]["cached_written_at"], written_at);
-    assert_eq!(events[0]["hold_microusd"], json!(250_000));
-    assert_eq!(events[0]["gateway_model"], json!(harness.model));
+    assert_eq!(jobs, 0, "被拒的受理不建 Job");
+    assert_eq!(
+        database_balance(&harness, &account_id).await,
+        100_000,
+        "余额没动"
+    );
 
     harness.cleanup().await;
 }
 
-/// **重放不受余额预检管辖**：同一个幂等键重发会去重成原来那个 Job，不新建、不扣款，所以哪怕
-/// 缓存新鲜且余额已经低于保底额，也不能凭它回 402——否则"重发同一个键"就变成看余额脸色的行为。
+/// **倒序写回不得覆盖新值**：缓存里已经是一条版本更高的快照（模拟后提交的事务先写回），
+/// 再发生一次版本更低的写回时，闸门必须拒绝它——否则并发提交后的异步写回会把新值盖成旧值。
+///
+/// 这里用充值触发写回：先把缓存伪造成版本 999 的快照，再充值（数据库版本只有 3）。写回被挡下，
+/// 缓存里那条高版本快照原样留着。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    let (account_id, _api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    // 缓存里放一条版本远高于数据库的快照：它代表"后提交的那次已经写回来了"。
+    harness.cache().put_balance(
+        &account_id,
+        json!({
+            "balance_microusd": 777,
+            "held_microusd": 0,
+            "available_microusd": 777,
+            "version": 999,
+            "written_at": chrono::Utc::now().to_rfc3339(),
+            "source": "db_commit",
+        }),
+    );
+    // 再充一笔：数据库版本只到 1，写回是"旧版本"，必须被拒绝。
+    let response = client
+        .post(format!(
+            "{}/api/v1/accounts/{account_id}/credits",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "amount_microusd": 500_000_u64,
+            "business_key": format!("cache-order-{}", Uuid::new_v4()),
+        }))
+        .send()
+        .await
+        .expect("credit");
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+    let cached = harness.cache().balance(&account_id).expect("缓存还在");
+    assert_eq!(
+        cached["version"],
+        json!(999),
+        "旧版本的写回被挡下，缓存里仍是那条高版本快照：{cached}"
+    );
+    assert_eq!(cached["balance_microusd"], json!(777));
+    assert_eq!(
+        database_balance(&harness, &account_id).await,
+        1_500_000,
+        "数据库照常记下这次充值"
+    );
+
+    harness.cleanup().await;
+}
+
+/// **重放不受余额预检影响**：预检只提示、不产生 402，同一个幂等键重发仍去重成原来那个 Job，
+/// 不新建、不扣款；"重发同一个键"不因缓存说什么而改变行为。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
