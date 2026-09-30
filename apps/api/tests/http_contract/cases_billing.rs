@@ -682,8 +682,10 @@ async fn a_customer_revoked_key_is_rejected_at_the_generation_entry() {
 
 /// 跨 UTC 日结算的扣费计入**结算日**，已完成请求按终态时刻归属（A8）。
 ///
-/// 用例把真实结算出来的那笔请求的时刻改到"昨天零点十分结算、前天受理"，然后按 UTC 自然日分别
-/// 读用量与账单：受理那天查不到它，结算那天才查到——归属看的是终态时刻，不是受理时刻。
+/// 用例先把请求**受理在前天 23:50**（不起 Worker，同步入口超时，Job 停在受理态），再把受理时刻改到
+/// 前天，然后才起 Worker 在**今天**把它结算掉。受理日与结算日因此真的错开；按 UTC 自然日分别读
+/// 用量、账单与每日合计：受理那天查不到它，结算那天才查到——归属看终态时刻，每日合计看结算日，
+/// 都不是受理时刻。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
@@ -724,7 +726,7 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         StatusCode::CREATED
     );
 
-    let _worker = harness.spawn_worker();
+    // 先受理、不结算：没有 Worker 时同步入口等到超时回 504，但 Job 与预授权已经落地。
     let key = format!("cross-day-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,
@@ -734,9 +736,30 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         &route_request(harness.model, "settles after midnight"),
     )
     .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        status,
+        StatusCode::GATEWAY_TIMEOUT,
+        "没有 Worker 时同步入口超时：{body}"
+    );
     let (job_id, state, _) = harness.job(&key).await;
-    assert_eq!(state, "succeeded");
+    assert_eq!(state, "accepted", "夹具必须停在受理态：{body}");
+
+    // 受理时刻改到**前天 23:50**。这一步必须在**结算之前**：结算时数据库看到的受理时刻与结算
+    // 时刻因此真的跨了 UTC 自然日，按受理日入桶与按结算日入桶才会落到不同的行。
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days')
+                           + interval '23 hours 50 minutes') AT TIME ZONE 'UTC'
+         WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(&harness.pool)
+    .await
+    .expect("backdate the acceptance time before settling");
+
+    // 现在才起 Worker：它在**今天**把这一笔结算掉。
+    let _worker = harness.spawn_worker();
+    wait_for_job_state(&harness, &key, "succeeded").await;
 
     let (terminal_at, capture_at): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
         sqlx::query_as(
@@ -755,29 +778,6 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
     );
     let capture = harness.captured_microusd(job_id).await;
     assert!(capture < 0, "夹具应当真的扣了一笔：{capture}");
-
-    sqlx::query(
-        "UPDATE generation.jobs
-         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days')
-                           + interval '23 hours 50 minutes') AT TIME ZONE 'UTC',
-             terminal_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day')
-                            + interval '10 minutes') AT TIME ZONE 'UTC'
-         WHERE id = $1",
-    )
-    .bind(job_id)
-    .execute(&harness.pool)
-    .await
-    .expect("shift the job across the UTC day boundary");
-    sqlx::query(
-        "UPDATE ledger.entries
-         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day')
-                           + interval '10 minutes') AT TIME ZONE 'UTC'
-         WHERE job_id = $1 AND kind = 'capture'",
-    )
-    .bind(job_id)
-    .execute(&harness.pool)
-    .await
-    .expect("shift the capture across the UTC day boundary");
 
     let session = client
         .post(format!("{}/v1/customer/sessions", harness.base_url))
@@ -799,7 +799,8 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
             .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
     };
-    let (request_day, settled_day, next_day) = (midnight(2), midnight(1), midnight(0));
+    // 受理日是前天，结算日（终态时刻所在）是今天，`next_day` 是明天。
+    let (request_day, settled_day, next_day) = (midnight(2), midnight(0), midnight(-1));
 
     let read_billing = |since: &str, until: &str| {
         let url = format!(
@@ -842,6 +843,39 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         "结算日的扣费就是那笔 capture"
     );
 
+    // 每日合计那一行：实收必须落在**结算日**，受理日那一行不受影响（A8）。受理时刻是这次结算
+    // **之前**改的，所以"按受理日入桶"的实现会把这笔实收写到前天，下面第一处 `day` 断言就会失败。
+    let daily_rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
+        "SELECT day, settled_microusd FROM ledger.daily_spend WHERE account_id = $1 ORDER BY day",
+    )
+    .bind(Uuid::parse_str(&account_id).expect("account id"))
+    .fetch_all(&harness.pool)
+    .await
+    .expect("daily spend rows");
+    assert_eq!(
+        daily_rows.len(),
+        1,
+        "这个账户只有一笔结算，每日合计只该有一行：{daily_rows:?}"
+    );
+    assert_eq!(
+        daily_rows[0].0, today,
+        "实收必须入结算日那一行，而不是受理日：{daily_rows:?}"
+    );
+    assert_eq!(
+        daily_rows[0].1, -capture,
+        "结算日那一行的合计就是这笔实收（正数记实收）：{daily_rows:?}"
+    );
+    let request_day_total: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(settled_microusd), 0)::bigint FROM ledger.daily_spend
+         WHERE account_id = $1 AND day = $2",
+    )
+    .bind(Uuid::parse_str(&account_id).expect("account id"))
+    .bind(today - chrono::Duration::days(2))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("acceptance-day daily total");
+    assert_eq!(request_day_total, 0, "受理日那一行不该被这笔跨天结算改到");
+
     let request_day_usage = client
         .get(format!(
             "{}/v1/customer/usage?since={request_day}&until={settled_day}&limit=100",
@@ -875,23 +909,180 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
     let row = &settled_day_usage["usage"][0];
     assert_eq!(row["status"], json!("succeeded"));
     assert_eq!(row["charged_microusd"], json!(capture));
+    let row_terminal_at = row["terminal_at"].as_str().expect("用量行要给出终态时刻");
     assert_eq!(
-        row["terminal_at"].as_str().map(str::to_owned),
-        Some(
-            chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(
-                (today - chrono::Duration::days(1))
-                    .and_hms_opt(0, 10, 0)
-                    .expect("00:10"),
-                chrono::Utc,
-            )
-            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
-        ),
-        "用量行要给出终态时刻：{settled_day_usage}"
+        chrono::DateTime::parse_from_rfc3339(row_terminal_at)
+            .expect("时间要是 RFC 3339")
+            .with_timezone(&chrono::Utc),
+        terminal_at,
+        "用量里的终态时刻必须与库里那一笔一致：{settled_day_usage}"
     );
 
     let combined = read_billing(&request_day, &next_day).await;
     assert_eq!(combined["requests"], json!(1));
     assert_eq!(combined["charged_microusd"], json!(capture));
+
+    harness.cleanup().await;
+}
+
+/// 未完成的 Job 出现在用量里（按受理时刻、`terminal_at` 为空），但不进账单的请求数与已扣费额。
+///
+/// 用一次"上游终态没有结果图"的执行把 Job 停在 `reconciliation_required`：它不是终态，`terminal_at`
+/// 为空，正好走用量查询里 `terminal_at IS NULL` 那条按受理时刻过滤的分支（现在没有别的用例走它）。
+/// 对客状态怎么收敛是控制台/身份那条线的事（#47 已记录），这里只钉"出现与不计入"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
+    let mut behaviour = UpstreamBehaviour::apimart();
+    behaviour.terminal_without_images = true;
+    let harness = Harness::start(behaviour).await;
+    let client = Client::new();
+
+    let account_id = harness.account_id.clone();
+    let email = "unfinished-usage@example.com";
+    let password = "a-long-enough-password";
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": email, "password": password, "account_id": account_id}))
+            .send()
+            .await
+            .expect("open customer request")
+            .status(),
+        StatusCode::CREATED
+    );
+
+    // 一次执行：上游终态没有结果图 ⇒ Job 停在 `reconciliation_required`，不是终态、`terminal_at` 为空。
+    let key = format!("unfinished-usage-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "unfinished usage contract"),
+        )
+        .await;
+    assert_ne!(status, StatusCode::OK, "这次执行不该成功：{body}");
+    let (job_id, state, _) = harness.job(&key).await;
+    assert_eq!(
+        state, "reconciliation_required",
+        "夹具必须留下一个未完成的 Job"
+    );
+    let (terminal_at, created_at): (
+        Option<chrono::DateTime<chrono::Utc>>,
+        chrono::DateTime<chrono::Utc>,
+    ) = sqlx::query_as("SELECT terminal_at, created_at FROM generation.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&harness.pool)
+        .await
+        .expect("job times");
+    assert!(terminal_at.is_none(), "对账态不是终态，终态时刻必须为空");
+
+    // 夹具自检：这一笔没有 capture，账本上因此没有它的扣费。
+    let charged: i64 = sqlx::query_scalar(
+        "SELECT COALESCE(SUM(e.amount_microusd), 0)::bigint
+         FROM ledger.entries e
+         WHERE e.job_id = $1 AND e.kind = 'capture'",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job capture sum");
+    assert_eq!(charged, 0, "未完成的 Job 不该有 capture");
+
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+
+    let stamp = |instant: chrono::DateTime<chrono::Utc>| {
+        instant.to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let since = stamp(created_at - chrono::Duration::minutes(1));
+    let until = stamp(created_at + chrono::Duration::minutes(1));
+
+    // 用量：窗口包住受理时刻，这一笔按受理时刻出现；终态时刻为空、扣费为 0。
+    let usage = client
+        .get(format!(
+            "{}/v1/customer/usage?since={since}&until={until}&limit=100",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    assert_eq!(
+        usage["count"],
+        json!(1),
+        "未完成的 Job 必须按受理时刻出现在用量里：{usage}"
+    );
+    let row = &usage["usage"][0];
+    assert_eq!(
+        row["terminal_at"],
+        Value::Null,
+        "未完成就没有终态时刻：{usage}"
+    );
+    assert_eq!(
+        row["charged_microusd"],
+        json!(0),
+        "没结算就没有扣费：{usage}"
+    );
+    assert_eq!(row["image_count"], json!(0), "没有交付结果图：{usage}");
+
+    // 窗口挪到受理之后：`terminal_at IS NULL` 分支按受理时刻过滤，这一笔不该漏进来。
+    let after = stamp(chrono::Utc::now() + chrono::Duration::hours(1));
+    let later = stamp(chrono::Utc::now() + chrono::Duration::hours(2));
+    let future_usage = client
+        .get(format!(
+            "{}/v1/customer/usage?since={after}&until={later}&limit=100",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    assert_eq!(
+        future_usage["count"],
+        json!(0),
+        "处理中按受理时刻归属，受理之后的窗口不该有它：{future_usage}"
+    );
+
+    // 账单：未完成的 Job 不计入已完成请求数，也不增加已扣费额。**不传窗口**读——受理分支的
+    // `terminal_at IS NOT NULL` 一旦被去掉，不传窗口时这个 Job 就会被算成一次已完成请求。
+    let billing = client
+        .get(format!("{}/v1/customer/billing", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("billing request")
+        .json::<Value>()
+        .await
+        .expect("billing body");
+    assert_eq!(
+        billing["requests"],
+        json!(0),
+        "处理中的 Job 不计入已完成请求数：{billing}"
+    );
+    assert_eq!(billing["images"], json!(0), "{billing}");
+    assert_eq!(
+        billing["charged_microusd"],
+        json!(0),
+        "没结算就没有已扣费额：{billing}"
+    );
 
     harness.cleanup().await;
 }
@@ -938,6 +1129,7 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
     );
 
     let _worker = harness.spawn_worker();
+    let mut keys = Vec::new();
     for index in 0..2 {
         let key = format!("capture-sum-{index}-{}", Uuid::new_v4());
         let (status, body) = post_json(
@@ -949,7 +1141,41 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
         )
         .await;
         assert_eq!(status, StatusCode::OK, "got {body}");
+        keys.push(key);
     }
+
+    // 真实路径上终态时刻与 `capture` 入账时刻由同一事务确定、逐位相等；这里把其中一笔**人为错开**
+    // ——终态落在昨天，capture 落在前天。不这样错开，"逐笔扣费退回按流水入账时刻过滤"这条回归
+    // 也能通过；错开之后，下面按结算日窗口读用量就能把回归逼出来（`0013` §5）。
+    let (shifted_job_id, shifted_state, _) = harness.job(&keys[0]).await;
+    assert_eq!(shifted_state, "succeeded", "错开时刻的那一笔必须已结算");
+    let shifted_capture = harness.captured_microusd(shifted_job_id).await;
+    assert!(
+        shifted_capture < 0,
+        "夹具应当真的扣了一笔：{shifted_capture}"
+    );
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days')
+                           + interval '23 hours 50 minutes') AT TIME ZONE 'UTC',
+             terminal_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '1 day')
+                            + interval '10 minutes') AT TIME ZONE 'UTC'
+         WHERE id = $1",
+    )
+    .bind(shifted_job_id)
+    .execute(&harness.pool)
+    .await
+    .expect("shift the job across the UTC day boundary");
+    sqlx::query(
+        "UPDATE ledger.entries
+         SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days')
+                           + interval '23 hours 50 minutes') AT TIME ZONE 'UTC'
+         WHERE job_id = $1 AND kind = 'capture'",
+    )
+    .bind(shifted_job_id)
+    .execute(&harness.pool)
+    .await
+    .expect("shift the capture away from the terminal time");
 
     let adjustment = -12_345_i64;
     sqlx::query(
@@ -1005,6 +1231,39 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
     assert_eq!(
         usage_sum, captures,
         "已完成用量逐笔扣费合计必须等于实际扣费流水：usage={usage}"
+    );
+
+    // 按**结算日**窗口读那一笔错开时刻的用量：它按终态时刻出现，逐笔扣费必须是这个 Job 的完整
+    // capture——哪怕那笔 capture 的入账时刻已经落在窗口之外。按流水入账时刻过滤的实现这里会给 0。
+    let today = chrono::Utc::now().date_naive();
+    let midnight = |offset: i64| {
+        let date = today - chrono::Duration::days(offset);
+        let naive = date.and_hms_opt(0, 0, 0).expect("midnight");
+        chrono::DateTime::<chrono::Utc>::from_naive_utc_and_offset(naive, chrono::Utc)
+            .to_rfc3339_opts(chrono::SecondsFormat::Secs, true)
+    };
+    let (settled_day, next_day) = (midnight(1), midnight(0));
+    let shifted_usage = client
+        .get(format!(
+            "{}/v1/customer/usage?since={settled_day}&until={next_day}&limit=100",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("usage request")
+        .json::<Value>()
+        .await
+        .expect("usage body");
+    assert_eq!(
+        shifted_usage["count"],
+        json!(1),
+        "错开时刻的那一笔仍按终态时刻归属到结算日：{shifted_usage}"
+    );
+    assert_eq!(
+        shifted_usage["usage"][0]["charged_microusd"],
+        json!(shifted_capture),
+        "用量行必须返回该 Job 的完整 capture，不能按流水入账时刻过滤：{shifted_usage}"
     );
 
     let billing = client
