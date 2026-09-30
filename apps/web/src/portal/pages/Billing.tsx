@@ -36,10 +36,19 @@ export function BillingPage({ client }: { client: CustomerClient }) {
         {billing.error ? <Alert type="error" showIcon message={billing.error} /> : null}
         <Row gutter={[24, 16]}>
           <Col xs={8}>
-            <Statistic title="请求数" value={billing.data?.requests ?? 0} loading={billing.loading} />
+            <Statistic
+              title="请求数"
+              // 失败时 `data` 保持 null：显示 `—` 而不是 0——把"没读到"画成"零"是错的读数（V-D14）。
+              value={billing.data ? billing.data.requests : '—'}
+              loading={billing.loading}
+            />
           </Col>
           <Col xs={8}>
-            <Statistic title="产出图片数" value={billing.data?.images ?? 0} loading={billing.loading} />
+            <Statistic
+              title="产出图片数"
+              value={billing.data ? billing.data.images : '—'}
+              loading={billing.loading}
+            />
           </Col>
           <Col xs={8}>
             <Statistic

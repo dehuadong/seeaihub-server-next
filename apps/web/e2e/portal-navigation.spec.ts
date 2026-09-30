@@ -134,3 +134,18 @@ test('未知客户路径显示客户侧 404，不回落到概览', async ({ page
   await expect(page.getByTestId('portal-settled-balance')).toHaveCount(0);
   await expect(page.getByRole('menuitem', { name: '概览' })).toBeVisible();
 });
+
+test('账单读失败时不把缺失值画成零', async ({ page }) => {
+  await registerCustomer(page, uniqueEmail('portal-nav-billing-failure'));
+
+  // 让账单汇总那条读失败：缺失值要显示 `—` 并给出错误与重取，**不能**画成 0——把"没读到"
+  // 画成"零"是错的读数（V-D14、设计 0014 §3）。
+  await page.route('**/v1/customer/billing*', (route) =>
+    route.fulfill({ status: 500, contentType: 'application/json', body: '{"error":"boom"}' }),
+  );
+  await page.goto(portalAt('/billing'));
+
+  const summary = panel(page, '账单汇总');
+  await expect(summary.getByRole('alert')).toBeVisible();
+  await expect(summary.getByText('—').first()).toBeVisible();
+});
