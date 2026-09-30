@@ -755,6 +755,16 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         jobs.push((JobId(job_id), AttemptId(attempt_id)));
     }
 
+    // 夹具直接插了 Job 与 Hold：账户的**占用合计**要跟着补上（`0013` §1：held = active holds 之和）。
+    // 少了这一步，释放路径减占用就会把 `held_microusd` 减成负数、撞上非负约束。
+    sqlx::query(
+        "UPDATE ledger.accounts SET held_microusd = COALESCE((SELECT SUM(h.amount_microusd) FROM ledger.holds h WHERE h.account_id = $1 AND h.status = 'active'), 0) WHERE id = $1",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("account held fixture");
+
     let cost_fact = || ProviderCostFact {
         source: ProviderCostSource::Computed,
         amount_microusd: Some(5_950),
@@ -942,11 +952,11 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
         -84_490,
         "两笔成本都落在平台账户的余额上"
     );
-    // 消费者账户**一点成本都没沾**：初始 100000，加上两次释放回来的预授权（每条 20000）。
+    // 消费者账户**一点成本都没沾**，**释放也不改已结算余额**（`0002` §2.4/§3）：仍是初始 100000。
     assert_eq!(
         account_balance(&pool, account).await,
-        140_000,
-        "成本只动平台账户：消费者的余额里找不到它"
+        100_000,
+        "成本只动平台账户；解除预授权不改已结算余额"
     );
 
     pool.close().await;
@@ -1176,16 +1186,9 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
         2,
         "账本上只有第一笔的实收与那笔补上的当天扣费：被拒的那次没有扣款；实得 {dump:?}"
     );
-    assert_eq!(
-        count_of("hold"),
-        1,
-        "被拒的那次连预授权都没有；实得 {dump:?}"
-    );
-    assert_eq!(
-        count_of("release"),
-        1,
-        "预授权只被第一笔释放过；实得 {dump:?}"
-    );
+    // 预授权**不进资金流水**（`0002` §3）：这里只有入账与实收两种科目。
+    assert_eq!(count_of("hold"), 0, "预授权不进资金流水；实得 {dump:?}");
+    assert_eq!(count_of("release"), 0, "释放不进资金流水；实得 {dump:?}");
     assert_eq!(
         database_balance(&harness, &harness.account_id).await,
         1_000_000 + 100_000_000 - captured,

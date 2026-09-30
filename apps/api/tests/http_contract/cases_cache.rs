@@ -239,8 +239,8 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
     let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
     assert_eq!(
         cached["balance_microusd"],
-        json!(1_000_000 - 250_000),
-        "缓存跟着变成扣掉保底额之后的值"
+        json!(1_000_000),
+        "受理只增加占用（记在 held），不改已结算余额"
     );
     assert_eq!(
         cached["balance_microusd"],
@@ -634,12 +634,17 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
     )
     .await;
     assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
+    // 新口径下受理**不改变已结算余额**（占用记在 `held`），所以缓存里仍是 300000。
     let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
     assert_eq!(
         cached["balance_microusd"],
-        json!(50_000),
-        "缓存新鲜，且已经低于 2K 档的保底额"
+        json!(300_000),
+        "受理只增加占用，不改已结算余额"
     );
+    // 把缓存改到**低于保底额**、来源仍是写穿（新鲜）：这才是"凭缓存可以提前拒绝"的形态。
+    harness
+        .cache()
+        .corrupt_balance(&account_id, 1, "db_commit", cached["written_at"].clone());
 
     // 同一个键立刻重发：去重成原来那个 Job，不因为缓存说"不够"而被拒。
     let (status, body) = post_json(
@@ -666,8 +671,8 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
     assert_eq!(jobs, 1, "重放去重成原来那个 Job");
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        50_000,
-        "重放不扣款"
+        300_000,
+        "重放不扣款：已结算余额没动"
     );
     assert!(
         audit_events(&harness, "balance.precheck_rejected")
@@ -1126,10 +1131,15 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
             .fetch_one(&harness.pool)
             .await
             .expect("受理必然记下这次的预授权额");
-    assert_eq!(
-        database_balance(&harness, &account_id).await,
-        1_000_000 - 2 * hold
-    );
+    // 两次受理各占一笔预授权；已结算余额**不动**（占用记在 `held`），被限流拒的那次连占用都没有。
+    assert_eq!(database_balance(&harness, &account_id).await, 1_000_000);
+    let held_total: i64 =
+        sqlx::query_scalar("SELECT held_microusd FROM ledger.accounts WHERE id = $1")
+            .bind(Uuid::parse_str(&account_id).expect("account id"))
+            .fetch_one(&harness.pool)
+            .await
+            .expect("account held");
+    assert_eq!(held_total, 2 * hold, "两次受理各占一笔预授权");
     let jobs: i64 =
         sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
             .bind(Uuid::parse_str(&account_id).expect("account id"))

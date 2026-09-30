@@ -667,6 +667,9 @@ fn worker_balance_change() -> BalanceChange {
     BalanceChange {
         account_id: AccountId::new(),
         balance_microusd: 0,
+        held_microusd: 0,
+        available_microusd: 0,
+        version: 0,
         updated_at: Utc::now(),
     }
 }

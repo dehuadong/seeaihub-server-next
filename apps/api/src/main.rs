@@ -628,7 +628,14 @@ async fn credit_account(
 
 #[derive(Debug, Serialize)]
 struct AccountBalanceResponse {
+    /// 已结算余额（可以为负）。
     balance_microusd: i64,
+    /// 占用合计：active 预授权之和。
+    held_microusd: i64,
+    /// 可用额 = 已结算余额 − 占用合计（同一时点读出来）。
+    available_microusd: i64,
+    /// 账户金额版本。
+    version: i64,
     updated_at: DateTime<Utc>,
 }
 
@@ -643,6 +650,9 @@ async fn read_account_balance(
     let change = state.accounts.read_balance(AccountId(account_id)).await?;
     Ok(Json(AccountBalanceResponse {
         balance_microusd: change.balance_microusd,
+        held_microusd: change.held_microusd,
+        available_microusd: change.available_microusd,
+        version: change.version,
         updated_at: change.updated_at,
     }))
 }

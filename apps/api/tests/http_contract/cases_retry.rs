@@ -103,7 +103,8 @@ async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
     );
     assert_eq!(holds[0].0, "captured", "结算之后这个 hold 是 captured");
 
-    // 释放分录也只有一条：结算那次（`release` 差额 + `capture` 实收是一对）。
+    // 资金流水里**没有**释放分录：预授权只留在 `ledger.holds`（上面已断言它是 `captured`），
+    // 结算只留一条实收（`0002` §3）。重投不重复扣、也不重复结清。
     let releases: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ledger.entries WHERE job_id = $1 AND kind = 'release'",
     )
@@ -111,7 +112,7 @@ async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
     .fetch_one(&harness.pool)
     .await
     .expect("release entries");
-    assert_eq!(releases, 1, "预授权只在结算那一次被释放并结清");
+    assert_eq!(releases, 0, "预授权不进资金流水，只留在 holds");
 
     harness.cleanup().await;
 }

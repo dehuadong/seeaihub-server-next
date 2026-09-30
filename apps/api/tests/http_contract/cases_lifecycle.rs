@@ -561,8 +561,9 @@ async fn a_settled_job_leaves_hold_release_and_capture_in_the_ledger_view() {
         .await
         .expect("ledger entries JSON");
     let entries = listed["entries"].as_array().expect("entries array");
-    // 这次用例的账户只有建账户那一笔充值加上这次结算的三条：多出来的条目说明有别的路径在写账。
-    assert_eq!(entries.len(), 4, "这次结算只该留下三条分录：{listed}");
+    // 资金流水**只记真实收支**（`0002` §3）：这个账户只有建账户那一笔充值 + 这次结算的一条实收。
+    // 预授权（占用）不进流水——它在 `ledger.holds` 里，上面已经单独读过。
+    assert_eq!(entries.len(), 2, "资金流水只该有充值 + 这次实收：{listed}");
 
     let find = |kind: &str| {
         entries
@@ -570,62 +571,38 @@ async fn a_settled_job_leaves_hold_release_and_capture_in_the_ledger_view() {
             .find(|entry| entry["kind"].as_str() == Some(kind))
             .unwrap_or_else(|| panic!("流水里必须看得到 {kind}：{listed}"))
     };
-    let hold = find("hold");
-    let release = find("release");
+    let credit = find("credit");
     let capture = find("capture");
 
-    assert_eq!(
-        hold["amount_microusd"].as_i64(),
-        Some(-held),
-        "持有是占住保底额，金额为负：{listed}"
-    );
-    assert_eq!(
-        release["amount_microusd"].as_i64(),
-        Some(held),
-        "释放把占住的整笔退回来，金额为正：{listed}"
-    );
+    assert_eq!(credit["amount_microusd"].as_i64(), Some(1_000_000));
     assert_eq!(
         capture["amount_microusd"].as_i64(),
         Some(-captured),
         "扣费是实收，金额为负：{listed}"
     );
     assert_eq!(
-        hold["job_id"].as_str(),
+        capture["job_id"].as_str(),
         Some(job_id.to_string().as_str()),
-        "每一条都要指得出是哪次执行：{listed}"
+        "实收要指得出是哪次执行：{listed}"
     );
     assert!(capture["created_at"].is_string(), "每条都要带写入时刻");
 
-    // 三条与余额**互相印证**：受理时占住整笔保底额，结算时把整笔释放、再扣掉实收，所以这三条
-    // 加起来就是这次执行对余额的净影响（等于负的实收），而余额正好是初始额减去它。
-    assert_eq!(
-        hold["amount_microusd"].as_i64().unwrap_or_default()
-            + release["amount_microusd"].as_i64().unwrap_or_default()
-            + capture["amount_microusd"].as_i64().unwrap_or_default(),
-        -captured,
-        "持有 + 释放 + 扣费就是这次执行对余额的净影响：{listed}"
-    );
+    // 与余额**互相印证**：已结算余额 = 初始充值 − 实收；占用结清之后这笔 hold 是 `captured`。
     assert_eq!(
         db_balance,
         1_000_000 - captured,
-        "余额只被这次结算动过（充值的 1000000 加上这三条的净影响）"
+        "余额只被这次结算动过（充值 1000000 减去实收）"
     );
+    let hold_status: String =
+        sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("hold status");
+    assert_eq!(hold_status, "captured", "结算之后这笔占用已结清：{listed}");
     assert!(
         held > captured,
-        "保底额要估得比实收高，这条用例才试得出'先占住、结算时退回差额'：持有 {held}、实收 {captured}"
-    );
-
-    // 时间倒序：持有发生在受理那一刻，结算那两条同样板之间的先后不承诺（同一事务共用
-    // `now()`），所以这里只钉"更早的持有排在后面"。
-    let position = |kind: &str| {
-        entries
-            .iter()
-            .position(|entry| entry["kind"].as_str() == Some(kind))
-            .expect("kind")
-    };
-    assert!(
-        position("hold") > position("capture"),
-        "受理时的持有比结算那两条更早，所以排在它们后面：{listed}"
+        "保底额要估得比实收高，这条用例才试得出'先占住、后按实收结清'：持有 {held}、实收 {captured}"
     );
     let times: Vec<&str> = entries
         .iter()

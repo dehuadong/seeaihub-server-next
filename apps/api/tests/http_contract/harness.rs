@@ -2647,9 +2647,11 @@ async fn verify_reconciliation_contract(
     assert_eq!(row.get::<String, _>("error_code"), "platform_unavailable");
     assert_eq!(row.get::<String, _>("failure_kind"), "platform_internal");
     assert_eq!(row.get::<String, _>("status"), "released");
+    // 解除预授权**不改已结算余额**（`0002` §2.4/§3）：余额就是受理之后那个数，不把占用加回来。
     assert_eq!(
         row.get::<i64, _>("balance_microusd"),
-        balance_after_hold + row.get::<i64, _>("amount_microusd")
+        balance_after_hold,
+        "解除预授权只减占用，不动已结算余额"
     );
     let capture_count: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM ledger.entries WHERE job_id = $1 AND kind = 'capture'",

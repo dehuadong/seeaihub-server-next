@@ -148,9 +148,10 @@ impl PgHubRepository {
         &self,
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError> {
-        let row =
-            sqlx::query("SELECT balance_microusd, updated_at FROM ledger.accounts WHERE id = $1")
-                .bind(account_id.0)
+        let row = sqlx::query(
+            "SELECT balance_microusd, held_microusd,\n                    balance_microusd - held_microusd AS available_microusd,\n                    version, updated_at\n             FROM ledger.accounts WHERE id = $1",
+        )
+        .bind(account_id.0)
                 .fetch_optional(&self.pool)
                 .await
                 .map_err(database_error)?
@@ -1850,7 +1851,9 @@ impl HubRepository for PgHubRepository {
         let inserted = sqlx::query(
             r#"
             INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, $2)
-            RETURNING balance_microusd, updated_at
+            RETURNING balance_microusd, held_microusd,
+                      balance_microusd - held_microusd AS available_microusd,
+                      version, updated_at
             "#,
         )
         .bind(account_id.0)
@@ -1919,9 +1922,13 @@ impl HubRepository for PgHubRepository {
             let updated = sqlx::query(
                 r#"
                 UPDATE ledger.accounts
-                SET balance_microusd = balance_microusd + $2, updated_at = now()
+                SET balance_microusd = balance_microusd + $2,
+                    version = version + 1,
+                    updated_at = now()
                 WHERE id = $1
-                RETURNING balance_microusd, updated_at
+                RETURNING balance_microusd, held_microusd,
+                          balance_microusd - held_microusd AS available_microusd,
+                          version, updated_at
                 "#,
             )
             .bind(account_id.0)
@@ -2040,7 +2047,10 @@ impl HubRepository for PgHubRepository {
         // 条目可比的空检查。
         let rows = sqlx::query(
             r#"
-            SELECT id, balance_microusd, updated_at FROM ledger.accounts
+            SELECT id, balance_microusd, held_microusd,
+                   balance_microusd - held_microusd AS available_microusd,
+                   version, updated_at
+            FROM ledger.accounts
             WHERE kind = 'consumer' AND updated_at >= now() - make_interval(secs => $1)
             ORDER BY updated_at ASC, id ASC
             "#,
@@ -2219,13 +2229,22 @@ impl HubRepository for PgHubRepository {
         }
         let max_cost = to_i64(command.max_cost_microusd)?;
         // 预授权扣减：`RETURNING` 把**扣减之后**的余额带出来，调用方据此写穿缓存。
-        // 判据一字不动（`rows_affected != 1` ⇒ 余额不足），缓存从不参与这个判定。
+        // 受理闸门：**占用**而不是扣余额。占用合计加上本次保底额，条件是可用额够
+        // （可用额 = 已结算余额 − 占用合计）；占用为零而可用额为负时条件仍不成立（`0002` §2.1）。
+        // 判据与更新是**同一条语句**，同账户并发因此共同遵守同一可用额（`0013` §2.2）；
+        // 缓存从不参与这个判定。
         let reserved = sqlx::query(
             r#"
             UPDATE ledger.accounts
-            SET balance_microusd = balance_microusd - $2, updated_at = now()
-            WHERE id = $1 AND balance_microusd >= $2
-            RETURNING balance_microusd, updated_at
+            SET held_microusd = held_microusd + $2,
+                version = version + 1,
+                updated_at = now()
+            WHERE id = $1
+              AND kind = 'consumer'
+              AND balance_microusd::numeric - held_microusd::numeric >= $2
+            RETURNING balance_microusd, held_microusd,
+                      balance_microusd - held_microusd AS available_microusd,
+                      version, updated_at
             "#,
         )
         .bind(command.account_id.0)
@@ -2280,20 +2299,6 @@ impl HubRepository for PgHubRepository {
         .bind(command.account_id.0)
         .bind(job_id.0)
         .bind(max_cost)
-        .execute(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        sqlx::query(
-            r#"
-            INSERT INTO ledger.entries (id, account_id, job_id, kind, amount_microusd, business_key)
-            VALUES ($1,$2,$3,'hold',$4,$5)
-            "#,
-        )
-        .bind(Uuid::new_v4())
-        .bind(command.account_id.0)
-        .bind(job_id.0)
-        .bind(-max_cost)
-        .bind(format!("job:{job_id}:hold"))
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -2773,42 +2778,40 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        // 释放差额 = 预授权额 − 实收：估大了退回余额，**估小了这里就是负数**，余额被扣成负的
-        // （透支在结算吸收）。库层的非负约束已放宽，所以这一步不再需要绕开。
-        let refund = authorized - charge;
-        // `RETURNING` 把结算之后的余额带出来：调用方据此写穿缓存（用户要求：扣减成功后立即同步）。
+        // 结算：**只按实收减少已结算余额**，同时把这笔占用从占用合计里去掉（`0002` §2.3）。
+        // 实收可以高于预授权额——差额把余额扣成负数（透支在结算吸收）；低于预授权额时未花的
+        // 部分只恢复可用额，不产生退款。零实收不写 `capture`（`0013` §1）。
         let settled = sqlx::query(
             r#"
             UPDATE ledger.accounts
-            SET balance_microusd = balance_microusd + $2, updated_at = now()
+            SET balance_microusd = balance_microusd - $2,
+                held_microusd = held_microusd - $3,
+                version = version + 1,
+                updated_at = now()
             WHERE id = $1
-            RETURNING balance_microusd, updated_at
+            RETURNING balance_microusd, held_microusd,
+                      balance_microusd - held_microusd AS available_microusd,
+                      version, updated_at
             "#,
         )
         .bind(account_id.0)
-        .bind(refund)
+        .bind(charge)
+        .bind(authorized)
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?
         .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-        insert_ledger_entry(
-            &mut transaction,
-            account_id,
-            Some(job_id),
-            "release",
-            authorized,
-            &format!("job:{job_id}:hold-release"),
-        )
-        .await?;
-        insert_ledger_entry(
-            &mut transaction,
-            account_id,
-            Some(job_id),
-            "capture",
-            -charge,
-            &format!("job:{job_id}:capture"),
-        )
-        .await?;
+        if charge > 0 {
+            insert_ledger_entry(
+                &mut transaction,
+                account_id,
+                Some(job_id),
+                "capture",
+                -charge,
+                &format!("job:{job_id}:capture"),
+            )
+            .await?;
+        }
         transaction.commit().await.map_err(database_error)?;
         balance_change(&settled, account_id)
     }
@@ -2955,13 +2958,17 @@ impl HubRepository for PgHubRepository {
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
-            // 释放预授权：余额变了，所以这里要把变更后的值带回去（调用方要写穿缓存）。
+            // 确定无需收费：只把这笔占用从占用合计里去掉，**不动已结算余额、不写对客流水**（`0002` §2.4）。
             let released = sqlx::query(
                 r#"
                 UPDATE ledger.accounts
-                SET balance_microusd = balance_microusd + $2, updated_at = now()
+                SET held_microusd = held_microusd - $2,
+                    version = version + 1,
+                    updated_at = now()
                 WHERE id = $1
-                RETURNING balance_microusd, updated_at
+                RETURNING balance_microusd, held_microusd,
+                          balance_microusd - held_microusd AS available_microusd,
+                          version, updated_at
                 "#,
             )
             .bind(account_id.0)
@@ -2970,15 +2977,6 @@ impl HubRepository for PgHubRepository {
             .await
             .map_err(database_error)?
             .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-            insert_ledger_entry(
-                &mut transaction,
-                account_id,
-                Some(job_id),
-                "release",
-                held,
-                &format!("job:{job_id}:failure-release"),
-            )
-            .await?;
             released_balance = Some(balance_change(&released, account_id)?);
         }
         transaction.commit().await.map_err(database_error)?;
@@ -3307,12 +3305,18 @@ impl HubRepository for PgHubRepository {
             ));
         }
         let held: i64 = row.try_get("held_microusd").map_err(database_error)?;
+        // 人工解除：只关这笔占用并减占用合计，**不动已结算余额、不写对客流水**（`0002` §2.4/§3）；
+        // 运营处置记录写"解除预授权"，不叫退款。
         let released = sqlx::query(
             r#"
             UPDATE ledger.accounts
-            SET balance_microusd = balance_microusd + $2, updated_at = now()
+            SET held_microusd = held_microusd - $2,
+                version = version + 1,
+                updated_at = now()
             WHERE id = $1
-            RETURNING balance_microusd, updated_at
+                RETURNING balance_microusd, held_microusd,
+                          balance_microusd - held_microusd AS available_microusd,
+                          version, updated_at
             "#,
         )
         .bind(account_id.0)
@@ -3328,18 +3332,6 @@ impl HubRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        insert_ledger_entry(
-            &mut transaction,
-            account_id,
-            Some(command.job_id),
-            "release",
-            held,
-            &format!(
-                "reconciliation:{}:{}:release",
-                command.job_id, command.business_key
-            ),
-        )
-        .await?;
         let attempt_id: Uuid = row.try_get("attempt_id").map_err(database_error)?;
         sqlx::query(
             "UPDATE generation.attempts SET state = 'failed', completed_at = now() WHERE id = $1",
@@ -4264,6 +4256,9 @@ fn balance_change(
     Ok(BalanceChange {
         account_id,
         balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+        held_microusd: row.try_get("held_microusd").map_err(database_error)?,
+        available_microusd: row.try_get("available_microusd").map_err(database_error)?,
+        version: row.try_get("version").map_err(database_error)?,
         updated_at: row.try_get("updated_at").map_err(database_error)?,
     })
 }

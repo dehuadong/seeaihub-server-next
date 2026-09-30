@@ -3628,7 +3628,14 @@ fn cache_duration_env(name: &str, default: u64) -> Result<Duration, ApplicationE
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct BalanceChange {
     pub account_id: AccountId,
+    /// 已结算余额（可以为负：透支发生在结算）。
     pub balance_microusd: i64,
+    /// 占用合计：active 预授权之和。
+    pub held_microusd: i64,
+    /// 可用额 = 已结算余额 − 占用合计（同一时点、同一条语句读出来）。
+    pub available_microusd: i64,
+    /// 账户金额的单调递增版本：供缓存拒绝倒序写回（`0013` §3）。
+    pub version: i64,
     pub updated_at: DateTime<Utc>,
 }
 
