@@ -1563,7 +1563,8 @@ async fn the_ledger_audit_never_repairs_the_books_itself() {
 /// 等够一段时间，库里一条案例都不该出现。随后显式触发才出现——证明"没出现"是没跑，不是坏掉了。
 ///
 /// 这一条就是 A9 的"核对不在请求路径运行"：余额读取与生成请求都不触发它，只有管理员按账户
-/// 触发才跑。
+/// 触发才跑。两秒窗口抓的是"残留的定时任务若用 `tokio::time::interval`（首 tick 立即执行）"
+/// 这一形态——它**不是**对任意周期的证明。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn no_ledger_audit_runs_without_an_explicit_trigger() {

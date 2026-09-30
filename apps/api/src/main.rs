@@ -663,18 +663,21 @@ async fn read_account_balance(
 ///
 /// 触发即返回 `202`：核对**在后台任务里跑**，不在这个请求里——它不参与资金写入或余额读取，
 /// 也不该让管理员请求等它扫完。发现不一致时由核对自己建案并告警（只建案，不改账）。
+///
+/// 账户不存在回 `404`：与"账户一致"的 `202` 分开，运维敲错 id 要能立刻看出来。
 async fn trigger_ledger_audit(
     State(state): State<AppState>,
     Path(account_id): Path<Uuid>,
-) -> StatusCode {
-    let auditor = state.ledger_audit.clone();
+) -> Result<StatusCode, ApiError> {
     let account_id = AccountId(account_id);
+    state.accounts.read_balance(account_id).await?;
+    let auditor = state.ledger_audit.clone();
     tokio::spawn(async move {
         if let Err(error) = auditor.audit_account(account_id).await {
             tracing::error!(error = %error, "the ledger audit failed");
         }
     });
-    StatusCode::ACCEPTED
+    Ok(StatusCode::ACCEPTED)
 }
 
 /// 管理员看账目流水的查询参数：`since` 是 RFC3339 的增量起点（开区间），`until` 是闭区间上界，
