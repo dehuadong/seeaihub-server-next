@@ -40,16 +40,18 @@ test('未登录直达任一页都只显示登录，且不取账户数据', async
     await expect(page.getByTestId('portal-submit')).toBeVisible();
     await expect(page.locator('.ant-statistic')).toHaveCount(0);
     await expect(page.getByRole('menuitem', { name: '概览' })).toHaveCount(0);
-  }
 
-  // 全程没有向对客账户端点取过数：路由守卫在登录前不挂载任何取数组件（Spec C11、D5）。
-  const accountCalls = await page.evaluate(() =>
-    performance
-      .getEntriesByType('resource')
-      .map((entry) => entry.name)
-      .filter((name) => name.includes('/v1/customer/')),
-  );
-  expect(accountCalls).toEqual([]);
+    // 这一页没有向对客账户端点取过数：路由守卫在登录前不挂载任何取数组件（Spec C11、D5）。
+    // 断言必须落在**每次 `goto` 之后**——`resource timing` 只属于当前文档，循环外查只看得到
+    // 最后一次导航那一页，前面几页发了请求也抓不到。
+    const accountCalls = await page.evaluate(() =>
+      performance
+        .getEntriesByType('resource')
+        .map((entry) => entry.name)
+        .filter((name) => name.includes('/v1/customer/')),
+    );
+    expect(accountCalls, `${path} 不该向对客账户端点取数`).toEqual([]);
+  }
 });
 
 test('未登录直达 /billing，登录后回到 /billing', async ({ page }) => {
