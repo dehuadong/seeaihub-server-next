@@ -1,4 +1,4 @@
-import { apiFetch } from '../shared/api';
+import { ApiError, apiFetch } from '../shared/api';
 import type {
   AccountEntriesResponse,
   CustomerBilling,
@@ -12,14 +12,28 @@ import type {
 /// 对客 API 的客户端。**只调 `/v1/customer/*`**：管理面那批端点一条都不在这里，
 /// 客户会话调它们只会被拒（那正是服务端的隔离）。
 export class CustomerClient {
-  constructor(private readonly token: () => string | null) {}
+  constructor(
+    private readonly token: () => string | null,
+    /// 会话失效（服务端回 401）时的回调：由外壳清掉本地会话与页面数据、回登录页。
+    private readonly onUnauthorized?: () => void,
+  ) {}
 
   private get<T>(path: string): Promise<T> {
-    return apiFetch<T>(path, this.token);
+    return this.observe(apiFetch<T>(path, this.token));
   }
 
   private send<T>(path: string, method: string, body?: unknown, admin = true): Promise<T> {
-    return apiFetch<T>(path, this.token, { method, body, admin });
+    return this.observe(apiFetch<T>(path, this.token, { method, body, admin }));
+  }
+
+  /// 401 是"这次会话不被接受"：集中清屏，不让旧账务或密钥留在可见页面上（`docs/design/0014` §4）。
+  private async observe<T>(call: Promise<T>): Promise<T> {
+    try {
+      return await call;
+    } catch (failure) {
+      if (failure instanceof ApiError && failure.status === 401) this.onUnauthorized?.();
+      throw failure;
+    }
   }
 
   /// 注册（未认证）：拿到会话与自己的账户。

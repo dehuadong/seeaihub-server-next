@@ -53,7 +53,7 @@ test('运营后台的外壳与六个页面都渲染 Ant Design 组件', async ({
   }
 });
 
-test('客户控制台的登录页与控制台都渲染 Ant Design 组件', async ({ page }) => {
+test('客户控制台的登录页与五个页面都渲染 Ant Design 组件', async ({ page }) => {
   await page.goto(portalUrl);
 
   // 登录/注册页：一张 `Card`、一个 `Segmented`（登录/注册切换）与表单控件。
@@ -61,22 +61,30 @@ test('客户控制台的登录页与控制台都渲染 Ant Design 组件', async
   await expect(page.locator('.ant-segmented')).toBeVisible();
   await expect(page.locator('.ant-input').first()).toBeVisible();
 
-  // 注册一个客户，看控制台那几块面板。控制台按**使用频次**分组：首屏三个数，其余在标签页里。
+  // 注册一个客户，看五个页面。页面按**使用频次**拆分：概览只放已结算余额，其余各自成页。
   await page.getByTestId('portal-mode-register').click();
   await page.getByTestId('portal-email').fill(`antd-${Date.now()}@example.com`);
   await page.getByTestId('portal-password').fill('e2e-customer-password');
   await page.getByTestId('portal-submit').click();
 
-  // 首屏的概览与标签页都是 antd 组件。
+  // 外壳与固定导航都是 antd：`Layout.Header` + `Menu`；概览是 `Statistic`。
+  await expect(page.locator('.ant-layout-header')).toBeVisible();
+  await expect(page.locator('.ant-menu').first()).toBeVisible();
   await expect(page.locator('.ant-statistic').first()).toBeVisible();
-  await expect(page.locator('.ant-tabs')).toBeVisible();
 
-  for (const title of ['用量与账单', 'API Key', '账户设置']) {
-    await expect(page.getByRole('tab', { name: title })).toBeVisible();
+  const pages: { label: string; markers: string[] }[] = [
+    { label: '概览', markers: ['.ant-statistic', '.ant-card', '.ant-btn'] },
+    { label: '调用记录', markers: ['.ant-card', '.ant-table'] },
+    { label: '账单与资金记录', markers: ['.ant-card', '.ant-table', '.ant-statistic'] },
+    { label: 'API Key', markers: ['.ant-card', '.ant-table', '.ant-form'] },
+    { label: '账户设置', markers: ['.ant-card', '.ant-form'] },
+  ];
+  for (const { label, markers } of pages) {
+    await page.getByRole('menuitem', { name: label }).click();
+    await expect(page.locator('.ant-card').first()).toBeVisible();
+    const found = await Promise.all(
+      markers.map(async (selector) => (await page.locator(selector).count()) > 0),
+    );
+    expect(found.some(Boolean), `${label} 页应当至少有 antd 组件之一：${markers}`).toBe(true);
   }
-  // 默认停在"用量与账单"，里面有汇总卡与表格（空库时表格也在，只是显示空态）。
-  await expect(
-    page.locator('.ant-card').filter({ has: page.getByText('账单汇总', { exact: true }) }),
-  ).toBeVisible();
-  await expect(page.locator('.ant-table').first()).toBeVisible();
 });

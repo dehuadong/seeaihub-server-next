@@ -2,6 +2,7 @@ import { Alert, App as AntApp, Button, Card, Flex, Form, Input, Segmented, Typog
 import { LockOutlined, MailOutlined, SafetyOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import { apiFetch } from '../shared/api';
+import type { CustomerSession } from '../shared/types';
 import { CustomerClient } from './client';
 import { useCustomerSession } from './session';
 import { useLoadable } from '../shared/ui';
@@ -27,7 +28,7 @@ export function AuthPage() {
     setError(null);
     try {
       const path = mode === 'register' ? '/v1/customers' : '/v1/customer/sessions';
-      const session = await apiFetch<{ token: string; email: string; account_id: string }>(
+      const session = await apiFetch<CustomerSession>(
         path,
         () => null,
         { method: 'POST', body: { email: values.email.trim(), password: values.password }, admin: false },
