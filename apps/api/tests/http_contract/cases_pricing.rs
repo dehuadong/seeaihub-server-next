@@ -143,6 +143,35 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
         .await
         .expect("bad kind read");
     assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+    // `cost` 已是合法科目（迁移 `0024` 把科目面收紧为四个）：这条账户没有成本分录，回空是
+    // 正确答复，**不是**参数错——把合法科目当未知类别拒，会让"查了但没有"与"你写错了"混在一起。
+    let cost = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries?kind=cost",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("cost kind read");
+    assert_eq!(cost.status(), StatusCode::OK, "cost 是合法科目");
+    let cost: Value = cost.json().await.expect("cost body");
+    assert_eq!(cost["count"], json!(0), "这个账户没有平台成本分录：{cost}");
+    // 预授权不是资金流水科目（只留在 `ledger.holds`）：`hold` 必须与未知类别一样被拒。
+    let hold = client
+        .get(format!(
+            "{}/api/v1/accounts/{account_id}/entries?kind=hold",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("hold kind read");
+    assert_eq!(
+        hold.status(),
+        StatusCode::BAD_REQUEST,
+        "hold 不再是流水科目，必须拒"
+    );
     // 成本 = 原币种原值 + 折算后 CNY：5950 微美元 × 7.1 = 42245 微元。
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(amount, Some(5_950));

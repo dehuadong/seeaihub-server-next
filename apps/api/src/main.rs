@@ -672,7 +672,7 @@ struct AccountEntriesQuery {
 
 /// `ledger.entries.kind` 的取值面。未知取值**拒**而不是静默回空：写错一个词时"没有账目"与
 /// "你查的类别不存在"是两件事。
-const LEDGER_ENTRY_KINDS: [&str; 5] = ["credit", "hold", "capture", "release", "adjustment"];
+const LEDGER_ENTRY_KINDS: [&str; 4] = ["credit", "capture", "adjustment", "cost"];
 
 const DEFAULT_ENTRIES_LIMIT: u32 = 100;
 
@@ -804,19 +804,21 @@ async fn list_account_usage(
     }))
 }
 
-/// 对客的账户面：**自己的**余额与持有中。
+/// 对客的账户面：**自己的**已结算余额、持有中与可用额。
 ///
-/// 两者**分开给、不合成一个数**：余额是可用额，持有中是已预授权但还没结算的部分——预授权不是
-/// 扣款，它只是先把钱占住。合成一个"总资产"会让"这笔钱到底扣没扣"说不清，而这两个数的用途
-/// 正是让人看清这件事。
+/// 三个数**分开给、不合成一个数**：已结算余额是已经真的扣掉的钱，持有中是已预授权但还没结算的
+/// 部分——预授权不是扣款，它只是先把钱占住；可用额是前两者相减，受理只用它判能不能再占
+/// （账户资金 Spec `0002` §4）。合成一个"总资产"会让"这笔钱到底扣没扣"说不清，而这三个数的
+/// 用途正是让人看清这件事。客户控制台只渲染已结算余额。
 ///
-/// 两个数都以**数据库**为准、不读缓存：缓存里的值可能滞后、也可能刚被对账覆盖写回，而这条读
-/// 的用途正是查看与核对，拿被怀疑的一方作证没有意义。认证沿用对客那条路径（消费者自己的 API
+/// 三个数都从**数据库**同一行读出、不读缓存：缓存里的值可能滞后、也可能刚被对账覆盖写回，而这条
+/// 读的用途正是查看与核对，拿被怀疑的一方作证没有意义。认证沿用对客那条路径（消费者自己的 API
 /// Key），所以看到的只可能是自己的账户。
 #[derive(Debug, Serialize)]
 struct OwnAccountResponse {
     balance_microusd: i64,
     held_microusd: i64,
+    available_microusd: i64,
     updated_at: DateTime<Utc>,
 }
 
@@ -826,10 +828,10 @@ async fn read_own_account(
 ) -> Result<Json<OwnAccountResponse>, ApiError> {
     let account_id = authenticate(&state, &headers).await?;
     let change = state.accounts.read_balance(account_id).await?;
-    let held_microusd = state.accounts.read_held(account_id).await?;
     Ok(Json(OwnAccountResponse {
         balance_microusd: change.balance_microusd,
-        held_microusd,
+        held_microusd: change.held_microusd,
+        available_microusd: change.available_microusd,
         updated_at: change.updated_at,
     }))
 }
@@ -1403,10 +1405,10 @@ impl CustomerBillingQueryParams {
     }
 }
 
-/// 对客读自己的余额与持有中（`GET /v1/customer/account`）。
+/// 对客读自己的已结算余额、持有中与可用额（`GET /v1/customer/account`）。
 ///
 /// 认的是**客户会话**（与 `/v1/account` 的 API Key 不是一回事）：客户控制台要能登录之后直接看账。
-/// 两个数分开给、不合成"总资产"——预授权不是扣款。
+/// 三个数分开给、不合成"总资产"——预授权不是扣款；客户控制台只渲染已结算余额。
 async fn read_customer_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -1414,10 +1416,10 @@ async fn read_customer_account(
     let (_, account_id) = state.require_customer(&headers).await?;
     let account_id = AccountId(account_id);
     let change = state.accounts.read_balance(account_id).await?;
-    let held_microusd = state.accounts.read_held(account_id).await?;
     Ok(Json(OwnAccountResponse {
         balance_microusd: change.balance_microusd,
-        held_microusd,
+        held_microusd: change.held_microusd,
+        available_microusd: change.available_microusd,
         updated_at: change.updated_at,
     }))
 }

@@ -491,14 +491,15 @@ fn offset_seconds(created_at: &str, seconds: i64) -> String {
     )
 }
 
-/// 一次完整的"受理 → 结算"之后，账目流水上能看到 hold / release / capture 三条，且与余额一致。
+/// 一次完整的"受理 → 结算"之后，账目流水上只看到 **充值 + 实收**两条真实收支，且与余额一致。
 ///
-/// 判据不只是"三条都在"：三条的**金额**必须与库里的余额、与这次结算实际扣的钱对得上，符号也要
-/// 对——持有与扣费是负的（占住 / 真的扣掉），释放是正的（把估高的那部分退回来）。对不上就说明
-/// 流水这条读视图漏了或错了一支分录，而流水正是拿来核对账目的东西。
+/// 判据不只是"两条都在"：两条的**金额**必须与库里的余额、与这次结算实际扣的钱对得上，符号也要
+/// 对——充值入账为正，实收是负的（真的扣掉）。预授权（占用）不进资金流水：它只留在 `ledger.holds`，
+/// 结算之后那笔占用是 `captured`。对不上就说明流水这条读视图漏了或错了一支分录，而流水正是拿来
+/// 核对账目的东西。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_settled_job_leaves_hold_release_and_capture_in_the_ledger_view() {
+async fn a_settled_job_leaves_credit_and_capture_in_the_ledger_view() {
     let harness = Harness::start_with(
         "AIHubMix",
         "aihubmix-image-v1",
@@ -898,11 +899,11 @@ async fn the_ledger_view_pages_by_limit_and_pulls_incrementally_by_since() {
     harness.cleanup().await;
 }
 
-/// 对客账户面：只给**自己的**余额与持有中，两者**分开给**，且与库里一致。
+/// 对客账户面：只给**自己的**余额、持有中与可用额，三者**分开给**，且与库里一致。
 ///
-/// 换一把 Key 必须看不到别人的账户；余额与持有中不合成一个数——合成"总资产"会让"这笔钱到底
-/// 扣没扣"说不清。这里用一个**停在持有中**的 Job 把两个数拉开：余额已经少了保底额，持有中
-/// 正好是那个保底额，而它还没有被结算。
+/// 换一把 Key 必须看不到别人的账户；三个数不合成一个数——合成"总资产"会让"这笔钱到底扣没扣"
+/// 说不清。这里用一个**停在持有中**的 Job 把三个数拉开：已结算余额没有被预授权动过，持有中
+/// 正好是那个保底额，可用额是两者相减，而它还没有被结算。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_consumer_account_view_shows_only_its_own_balance_and_hold() {
@@ -921,7 +922,7 @@ async fn the_consumer_account_view_shows_only_its_own_balance_and_hold() {
     let own_id = harness.account_id.clone();
     let own_key = harness.api_key.clone();
 
-    // 一次受理（不起 Worker）：预授权扣掉了余额，同时留下一条持有中的预授权。
+    // 一次受理（不起 Worker）：只增加持有中、留下一条 active 预授权，不动已结算余额。
     let key = format!("statement-hold-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,

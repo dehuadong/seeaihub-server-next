@@ -42,6 +42,8 @@ mod cases_cache;
 mod cases_cost_ceiling;
 #[path = "cases_cost_facts.rs"]
 mod cases_cost_facts;
+#[path = "cases_funds.rs"]
+mod cases_funds;
 #[path = "cases_identity.rs"]
 mod cases_identity;
 #[path = "cases_lifecycle.rs"]
@@ -1248,6 +1250,27 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             30,
+            CaseSettings::default(),
+        )
+        .await
+    }
+
+    /// 同 [`Self::start_with_draft`]，但把同步入口的等待窗口压到用例等得起的量级。
+    ///
+    /// 不跑 Worker 的用例靠它让"已受理但没结算"的那次请求尽快以 `504 result_pending` 返回：
+    /// 受理与占用已经提交，正好在占用还占着的时候观察账户当前值。
+    async fn start_with_sync_wait(
+        draft: Value,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+    ) -> Self {
+        Self::build(
+            draft,
+            None,
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
             CaseSettings::default(),
         )
         .await
