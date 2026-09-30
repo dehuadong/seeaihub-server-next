@@ -3,8 +3,8 @@ title: 每日消费合计与跨天账单归属
 status: implemented
 created: 2026-09-30
 updated: 2026-09-30
-approval: 用户授权按 Spec v3 §5 与 RFC v3 §4–§5 实施每日消费合计、Job 终态时刻与跨天用量账单归属
-verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo test -p seeai-application -p seeai-persistence`，以及合同套件 `HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract cargo test -p seeai-api --test http_contract -- --ignored cases_cost_facts cases_billing`（本地 PG + 进程内假 Redis）。
+approval: 用户授权按 Spec v3 §5 与 RFC v4 §4–§5 实施每日消费合计、Job 终态时刻与跨天用量账单归属
+verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo test -p seeai-application -p seeai-persistence`，以及合同套件 `HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract cargo test -p seeai-api --test http_contract -- --ignored cases_cost_facts cases_billing cases_public_surface`（本地 PG + 进程内假 Redis）。
 ---
 
 # Agent Note：每日消费合计与跨天账单归属
