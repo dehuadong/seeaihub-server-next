@@ -245,7 +245,7 @@ export interface PublicModelsResponse {
 }
 
 /// 对客账户面：已结算余额与持有中分开给。客户控制台只渲染 `balance_microusd`（"已结算余额"），
-/// 不显示持有中、可用额或单笔预授权额（账户资金 Spec §4、C7）。
+/// 不显示持有中、可用额或单笔预授权额（账户资金 Spec `0002` §4；控制台 Spec `0001` C7）。
 export interface OwnAccount {
   balance_microusd: number;
   /// 已受理未结清的占用合计。接口返回，但客户页面不展示。

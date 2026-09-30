@@ -24,12 +24,12 @@ function panel(page: Page, title: string): Locator {
   return page.locator('.ant-card').filter({ has: page.getByText(title, { exact: true }) });
 }
 
-/// 切标签页。控制台的分组依据是**使用频次**：首屏只放三个数，其余按标签页收起来。
+/// 切标签页。控制台的分组依据是**使用频次**：首屏只放两个数，其余按标签页收起来。
 async function tab(page: Page, label: string): Promise<void> {
   await page.getByRole('tab', { name: label }).click();
 }
 
-/// 控制台是否已经渲染出来。用首屏那三个统计数判断——**它们不依赖任何标签页**，
+/// 控制台是否已经渲染出来。用首屏那两个统计数判断——**它们不依赖任何标签页**，
 /// 所以"登录后看到控制台"这件事与"当前停在哪个标签页"无关。
 function overview(page: Page): Locator {
   return page.locator('.ant-statistic');
@@ -53,7 +53,7 @@ test('注册后进控制台：首屏只有已结算余额与扣费总额 + 三�
   await register(page, uniqueEmail());
 
   // **首屏**（不切标签页、不滚动）就该看到余额与扣费总额，且余额的标题是"已结算余额"。
-  await expect(page.getByText('已结算余额')).toBeVisible();
+  await expect(page.getByTestId('portal-settled-balance')).toContainText('已结算余额');
   await expect(page.getByTestId('portal-settled-balance')).toContainText('0 元');
   await expect(page.getByText('扣费总额（全部）')).toBeVisible();
   expect(await overview(page).count()).toBeGreaterThanOrEqual(2);

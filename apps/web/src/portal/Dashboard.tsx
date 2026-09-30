@@ -31,9 +31,9 @@ import { useLoadable } from '../shared/ui';
 /// 归属：改口令是一次性动作，与余额并列会把两件常看的事切开。
 ///
 /// 余额只渲染 `balance_microusd`（已结算余额）：预授权建立或释放不改变它，持有中、可用额与单笔
-/// 预授权额都不在客户页面出现（[账户资金 Spec](../../../docs/specs/0002-account-funds-and-reservations.md) §4、C7）。
+/// 预授权额都不在客户页面出现（[账户资金 Spec](../../../../docs/specs/0002-account-funds-and-reservations.md) §4、[控制台 Spec](../../../../docs/specs/0001-admin-and-customer-consoles.md) C7）。
 ///
-/// 口径见 `docs/design/0011-console-information-architecture.md` §3.4。
+/// 口径见 `docs/design/0011-console-information-architecture.md` §3.2。
 export function Dashboard({ client }: { client: CustomerClient }) {
   const { email, accountId, signOut } = useCustomerSession();
   const account = useLoadable(() => client.account(), [client]);

@@ -127,7 +127,7 @@ async function signIn(page: Page, email: string, password: string): Promise<void
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(password);
   await page.getByTestId('portal-submit').click();
-  await expect(page.getByText('已结算余额')).toBeVisible();
+  await expect(page.getByTestId('portal-settled-balance')).toContainText('已结算余额');
 }
 
 /// 受理一次并让它停在持有中：没有 Worker，同步入口在窗口后超时。
@@ -162,7 +162,7 @@ async function expectHold(request: APIRequestContext, apiKey: string): Promise<v
 
 /// 页面只显示已结算余额：读数正确，且不出现可用额、持有中或预授权金额。
 async function expectSettledBalance(page: Page, text: string): Promise<void> {
-  await expect(page.getByText('已结算余额')).toBeVisible();
+  await expect(page.getByTestId('portal-settled-balance')).toContainText('已结算余额');
   await expect(page.getByTestId('portal-settled-balance')).toContainText(text);
   for (const forbidden of FORBIDDEN) {
     await expect(page.getByText(forbidden)).toHaveCount(0);

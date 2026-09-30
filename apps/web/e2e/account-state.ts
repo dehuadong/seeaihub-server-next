@@ -9,9 +9,11 @@ import { settings } from './settings';
 /// 用真 Worker + 假上游覆盖；这里只摆结果，让浏览器用例能验"页面读的是结算/释放之后的已结算余额"。
 /// 连接用 e2e 自己的 `postgres` 客户端——与 `ensure-database.mjs` 同一个依赖，不引入新装置。
 ///
-/// 状态形状与 `docs/design/0013-account-funds-and-reservations.md` §2.3–§2.4 一致：结算同时改
-/// 已结算余额与占用、Hold 转 `captured` 并写一条指向该 Job 的 `capture`；释放只减占用、Hold 转
-/// `released`，不动余额也不写流水。
+/// **只摆页面读数依赖的那几处**：`ledger.accounts` 的余额/占用/版本、`ledger.holds` 的状态、
+/// `ledger.entries` 的 `capture`（口径见 `docs/design/0013-account-funds-and-reservations.md`
+/// §2.3–§2.4）。真收尾事务还会改 `generation.jobs` 的状态与终态时刻、清租约、写
+/// `ledger.daily_spend` 并 bump `updated_at`——这些夹具**不碰**，所以它摆出来的不是真系统会有的
+/// 完整状态，只够验"页面读的是结算/释放之后的已结算余额"。
 
 /// 每条用例只期望**恰好一条** active Hold：多了说明夹具没摆干净，宁可报错也不猜哪一条。
 async function soleActiveHoldJob(
