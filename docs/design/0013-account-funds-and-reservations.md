@@ -1,5 +1,5 @@
 主题: 账户资金与预授权的当前值模型
-当前修订: v3
+当前修订: v4
 状态: 已评审通过
 承接: [`账户余额、预授权与实际收支` v3](../specs/0002-account-funds-and-reservations.md) §1–§7
 依赖: [`0007` 定价、保底与结算](0007-pricing-floor-and-settlement.md)、[`0008` 路由与缓存](0008-routing-strategy-and-caching.md)、[`0009` 运行基线](0009-operational-baseline.md)；[`ADR-0003`](../adr/0003-postgresql-is-source-of-truth.md)、[`ADR-0006`](../adr/0006-no-settlement-without-metering-evidence.md)
@@ -63,7 +63,7 @@ RETURNING balance_microusd, held_microusd,
 
 账户仓储一次读取同一账户行中的余额、占用、可用额和版本，避免分别查询余额与 Holds 时混入两个提交时点。API 将 `balance_microusd` 明确为已结算余额，增加 `available_microusd`，保留 `held_microusd`；管理员和客户使用同一语义。管理员账户页可分别标示三项；客户控制台只渲染 `balance_microusd` 为“已结算余额”，移除现有“持有中”卡片及金额提示，不渲染可用额；客户用量与资金流水也不展示预授权金额。需要即时核账的余额读取与管理员读使用 PostgreSQL 当前行。
 
-Redis 的 `user_balance` 值改为 `{balance_microusd, held_microusd, available_microusd, version}`，继续在数据库提交后写入。写缓存时仅接受不低于缓存当前版本的快照，防止两个并发事务提交后的异步写回倒序覆盖；Redis 不可用或写失败时数据库结果不回滚。缓存副本核对仍按数据库当前行校正，不与账实核对混为一项。
+Redis 的 `user_balance` 值改为 `{balance_microusd, held_microusd, available_microusd, version}`，继续在数据库提交后写入。写缓存时仅接受不低于缓存当前版本的快照：写回按「读当前版本 → 比较 → 写」执行，挡下「提交更早、写回更晚」的倒序。两条写回真正同时执行、都读到同一旧版本的窄窗口**不在缓存层消除**——它只让缓存暂时偏旧，不改变任何资金结果（受理一律由数据库条件更新确认），由数据库的串行提交、下一轮对账与缓存过期兜底；把该判定做成原子操作需要缓存实现理解「版本」，与「缓存语义留在用例层」的分工相悖，本设计不采用。Redis 不可用或写失败时数据库结果不回滚。缓存副本核对仍按数据库当前行校正，不与账实核对混为一项；缓存版本高于这次数据库读数时不动它（那次读发生在新提交之前）。
 
 预检可以从缓存读取可用额以减少不必要的读取，但不直接完成受理；缓存报告不足时也继续交给数据库条件更新确认，再决定是否返回 402。PostgreSQL 是资金事实来源，遵守 [`ADR-0003`](../adr/0003-postgresql-is-source-of-truth.md)；路由候选、API Key 的缓存规则见[`0008`](0008-routing-strategy-and-caching.md) §7。
 
