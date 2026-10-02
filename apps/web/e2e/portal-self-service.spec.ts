@@ -122,6 +122,20 @@ test('新建密钥时明文只出现一次，列表里之后再也拿不到', as
   const key = (await plaintext.textContent())?.trim() ?? '';
   expect(key).toMatch(/^sk_seeai_/);
 
+  // **主动关闭**一次性展示：明文立刻从页面上消失，列表还在，页面源码里也搜不到它（Spec C5、V-D14）。
+  await page.getByTestId('portal-key-plaintext-close').click();
+  await expect(page.getByTestId('portal-key-plaintext')).toHaveCount(0);
+  await expect(page.getByText('e2e 脚本')).toBeVisible();
+  expect(await page.content()).not.toContain(key);
+
+  // **吊销先确认**：点「吊销」只出确认框，确认之后状态才变已吊销（Spec C5、V-D14）。
+  const rows = page.locator('.ant-table-tbody');
+  await expect(rows.getByText('可用')).toBeVisible();
+  await page.getByTestId('portal-key-revoke').click();
+  await expect(page.getByTestId('portal-key-revoke-confirm')).toBeVisible();
+  await page.getByTestId('portal-key-revoke-confirm').click();
+  await expect(rows.getByText('已吊销', { exact: false })).toBeVisible();
+
   // **只此一次**：刷新之后明文那一块不再出现，列表里也只有标签/时间/状态；地址仍停在 /keys。
   await page.reload();
   expect(pathnameOf(page)).toBe('/keys');

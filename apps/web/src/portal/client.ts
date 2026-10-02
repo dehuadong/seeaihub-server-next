@@ -1,8 +1,8 @@
 import { ApiError, apiFetch } from '../shared/api';
 import type {
-  AccountEntriesResponse,
   CustomerBilling,
   CustomerKeysResponse,
+  CustomerLedgerResponse,
   CustomerSession,
   CustomerUsageResponse,
   IssueApiKeyResponse,
@@ -83,15 +83,59 @@ export class CustomerClient {
     return this.get('/v1/customer/account');
   }
 
-  ledger(limit = 50): Promise<AccountEntriesResponse> {
-    return this.get(`/v1/customer/ledger?limit=${limit}`);
+  /// 账单汇总：按区间**全量**算，不随逐笔列表的条数上限变化。
+  billing(range: { since?: string; until?: string } = {}): Promise<CustomerBilling> {
+    return this.get(`/v1/customer/billing?${windowQuery(range)}`);
   }
 
-  usage(limit = 50): Promise<CustomerUsageResponse> {
-    return this.get(`/v1/customer/usage?limit=${limit}`);
+  /// 真实资金流水：区间半开 `[since, until)`、可按类别筛选、可带上一页给的游标。
+  ///
+  /// 不带任何新参数时就是旧调用（全部类别、第一页）。
+  ledger(params: LedgerQuery = {}): Promise<CustomerLedgerResponse> {
+    return this.get(`/v1/customer/ledger?${windowQuery(params)}`);
   }
 
-  billing(): Promise<CustomerBilling> {
-    return this.get('/v1/customer/billing');
+  /// 调用记录：`view=active` 是处理中、`view=completed` 是已结束历史；不带 `view` 是两者的合并。
+  usage(params: UsageQuery = {}): Promise<CustomerUsageResponse> {
+    return this.get(`/v1/customer/usage?${windowQuery(params)}`);
   }
+}
+
+/// 区间、条数上限与翻页参数。缺省条数由服务端夹上限，这里给一个够看一屏的数。
+const DEFAULT_PAGE = 50;
+
+function windowQuery(params: {
+  since?: string;
+  until?: string;
+  limit?: number;
+  cursor?: string;
+  kind?: string;
+  view?: string;
+}): string {
+  const query = new URLSearchParams();
+  if (params.since) query.set('since', params.since);
+  if (params.until) query.set('until', params.until);
+  if (params.kind) query.set('kind', params.kind);
+  if (params.view) query.set('view', params.view);
+  if (params.cursor) query.set('cursor', params.cursor);
+  query.set('limit', String(params.limit ?? DEFAULT_PAGE));
+  return `${query}`;
+}
+
+interface WindowQuery {
+  since?: string;
+  until?: string;
+  limit?: number;
+}
+
+/// 资金流水查询：窗口 + 类别 + 游标。
+export interface LedgerQuery extends WindowQuery {
+  kind?: string;
+  cursor?: string;
+}
+
+/// 调用记录查询：窗口 + 视图 + 游标。
+export interface UsageQuery extends WindowQuery {
+  view?: 'active' | 'completed';
+  cursor?: string;
 }

@@ -1,4 +1,16 @@
-import { Alert, App as AntApp, Button, Card, Flex, Form, Input, Table, Tag, Typography } from 'antd';
+import {
+  Alert,
+  App as AntApp,
+  Button,
+  Card,
+  Flex,
+  Form,
+  Input,
+  Popconfirm,
+  Table,
+  Tag,
+  Typography,
+} from 'antd';
 import { PlusOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { CustomerClient } from '../client';
@@ -15,6 +27,18 @@ export function KeysPage({ client }: { client: CustomerClient }) {
   const [error, setError] = useState<string | null>(null);
   const [issued, setIssued] = useState<{ api_key: string; key_id: string } | null>(null);
   const [form] = Form.useForm<{ label: string }>();
+
+  /// 吊销：**确认之后才发请求**，成功后重取列表（Spec C5、V-D14）。
+  async function revoke(keyId: string): Promise<void> {
+    setError(null);
+    try {
+      await client.revokeApiKey(keyId);
+      message.success('已吊销');
+      keys.reload();
+    } catch (failure) {
+      setError(failure instanceof Error ? failure.message : String(failure));
+    }
+  }
 
   return (
     <Card
@@ -76,7 +100,7 @@ export function KeysPage({ client }: { client: CustomerClient }) {
           showIcon
           message="密钥明文——只显示这一次，现在就抄走"
           description={
-            <Flex vertical gap={4}>
+            <Flex vertical gap={8}>
               <Typography.Text
                 data-testid="portal-key-plaintext"
                 code
@@ -91,6 +115,14 @@ export function KeysPage({ client }: { client: CustomerClient }) {
                   {issued.key_id}
                 </Typography.Text>
               </Typography.Text>
+              {/* 关掉一次性展示就把明文从页面状态里清掉：它不该在页面上多留一秒（Spec C5）。 */}
+              <Button
+                size="small"
+                data-testid="portal-key-plaintext-close"
+                onClick={() => setIssued(null)}
+              >
+                我已抄走，关闭明文
+              </Button>
             </Flex>
           }
         />
@@ -118,26 +150,21 @@ export function KeysPage({ client }: { client: CustomerClient }) {
           {
             title: '',
             width: 100,
-            render: (_value: unknown, key: { key_id: string; revoked_at: string | null }) => {
+            render: (_value: unknown, key: { key_id: string; label: string; revoked_at: string | null }) => {
               if (key.revoked_at) return null;
-              const keyId = key.key_id;
               return (
-                <Button
-                  danger
-                  size="small"
-                  onClick={async () => {
-                    setError(null);
-                    try {
-                      await client.revokeApiKey(keyId);
-                      message.success('已吊销');
-                      keys.reload();
-                    } catch (failure) {
-                      setError(failure instanceof Error ? failure.message : String(failure));
-                    }
-                  }}
+                <Popconfirm
+                  title="吊销这把密钥？"
+                  description={`吊销后用它调用会被拒，不能撤销。标签：${key.label}`}
+                  okText="吊销"
+                  cancelText="取消"
+                  okButtonProps={{ 'data-testid': 'portal-key-revoke-confirm' }}
+                  onConfirm={() => void revoke(key.key_id)}
                 >
-                  吊销
-                </Button>
+                  <Button danger size="small" data-testid="portal-key-revoke">
+                    吊销
+                  </Button>
+                </Popconfirm>
               );
             },
           },

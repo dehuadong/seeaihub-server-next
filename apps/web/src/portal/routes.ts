@@ -32,6 +32,7 @@ export function usePortalRoute(): {
   pathname: string;
   search: string;
   navigate: (to: string) => void;
+  replace: (to: string) => void;
 } {
   const [location, setLocation] = useState(() => ({
     pathname: window.location.pathname,
@@ -45,16 +46,34 @@ export function usePortalRoute(): {
     return () => window.removeEventListener('popstate', sync);
   }, []);
 
-  const navigate = useCallback((to: string) => {
-    if (to === `${window.location.pathname}${window.location.search}`) return;
-    window.history.pushState(null, '', to);
+  const sync = useCallback(() => {
     setLocation({ pathname: window.location.pathname, search: window.location.search });
   }, []);
+
+  const navigate = useCallback(
+    (to: string) => {
+      if (to === `${window.location.pathname}${window.location.search}`) return;
+      window.history.pushState(null, '', to);
+      sync();
+    },
+    [sync],
+  );
+
+  /// 改写当前这一条历史（不新增）：页面自己补上缺省筛选条件时用它，免得刷新前先多出一条"返回"。
+  const replace = useCallback(
+    (to: string) => {
+      if (to === `${window.location.pathname}${window.location.search}`) return;
+      window.history.replaceState(null, '', to);
+      sync();
+    },
+    [sync],
+  );
 
   return {
     route: routeFor(location.pathname),
     pathname: location.pathname,
     search: location.search,
     navigate,
+    replace,
   };
 }

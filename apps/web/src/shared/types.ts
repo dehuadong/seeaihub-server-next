@@ -292,6 +292,8 @@ export interface CustomerUsageRow {
   /// `generation` / `edit`。
   kind: 'generation' | 'edit';
   created_at: string;
+  /// 终态时刻；处理中（结果未定）时为 `null`。已结束历史按它归属日期区间。
+  terminal_at: string | null;
   image_count: number;
   charged_microusd: number;
 }
@@ -300,6 +302,19 @@ export interface CustomerUsageResponse {
   usage: CustomerUsageRow[];
   count: number;
   truncated: boolean;
+  /// 下一页的不透明定位；没有下一页时为 `null`。
+  next_cursor: string | null;
+}
+
+/// 对客资金流水响应：与管理员那条同形，外加翻页定位与同一条件下的总数。
+export interface CustomerLedgerResponse {
+  entries: LedgerEntry[];
+  count: number;
+  /// 同一套区间与类别条件下的总条数（与 `count` 不同：本页条数）。
+  total: number;
+  truncated: boolean;
+  /// 下一页的不透明定位；没有下一页时为 `null`。
+  next_cursor: string | null;
 }
 
 /// 账单汇总：按区间**全量**算，不随明细条数上限变化。
