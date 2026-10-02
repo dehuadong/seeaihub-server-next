@@ -150,7 +150,10 @@ test('多于一页的资金流水：继续查看取到更早的那一页，汇�
   const net = await text('portal-billing-net');
 
   const rows = page.getByTestId('portal-ledger-table').getByRole('row');
-  await expect(rows).toHaveCount(21, { timeout: 10_000 }); // 表头 + 20 条
+  // 表头 + 20 条流水（其中一条是正式调整）：充值与资金调整在行内分得开。
+  await expect(rows).toHaveCount(21, { timeout: 10_000 });
+  await expect(page.getByTestId('portal-ledger-entry-kind-capture').first()).toBeVisible();
+  await expect(page.getByTestId('portal-ledger-entry-kind-adjustment')).toBeVisible();
   await expect(page.getByTestId('portal-ledger-more')).toBeVisible();
 
   // 翻页用的仍然是**同一区间**：只多一个游标。
@@ -162,7 +165,8 @@ test('多于一页的资金流水：继续查看取到更早的那一页，汇�
   const billingReads = customerCalls.filter((url) => url.includes('/v1/customer/billing')).length;
   const first = new URL(page.url()).searchParams;
   await page.getByTestId('portal-ledger-more').click();
-  await expect(rows).toHaveCount(22, { timeout: 10_000 }); // 表头 + 21 条
+  // 21 条扣费 + 1 条正式调整：第二页取回剩下的两条。
+  await expect(rows).toHaveCount(23, { timeout: 10_000 });
   await expect(page.getByTestId('portal-ledger-more')).toHaveCount(0);
 
   const continued = customerCalls.find((url) => url.includes('cursor='));

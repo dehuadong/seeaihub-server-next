@@ -90,7 +90,7 @@ export async function accountIdOfEmail(email: string): Promise<string> {
   }
 }
 
-/// 给这个账户摆出**多于一页**的真实扣费流水（`count` 条 `capture`）。
+/// 给这个账户摆出**多于一页**的真实流水：`count` 条 `capture`，外加一条正式调整（`adjustment`）。
 ///
 /// 浏览器用例要验"一页放不下时能继续查看"，而 e2e 不起 Worker，多于一页的历史造不出来。这里只摆
 /// 翻页读数依赖的那一处：`ledger.entries`（真收尾事务还会动余额、Hold 与日累计，翻页用例不读它们）。
@@ -112,5 +112,11 @@ export async function seedLedgerPage(accountId: string, count: number): Promise<
     if (rows.length !== count) {
       throw new Error(`expected ${count} seeded ledger entries, got ${rows.length}`);
     }
+    // 一条正式调整：类别筛选要能把"充值"与"资金调整"分开，夹具里就得两种都有。
+    await tx`
+      INSERT INTO ledger.entries (id, account_id, kind, amount_microusd, business_key)
+      VALUES (${randomUUID()}, ${accountId}, 'adjustment', 5000,
+              ${'e2e-history-adjustment-' + randomUUID()})
+    `;
   });
 }

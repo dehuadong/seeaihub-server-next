@@ -215,7 +215,10 @@ export function BillingPage({ client }: { client: CustomerClient }) {
                 dataIndex: 'kind',
                 render: (value: string) => (
                   <Tag color={value === 'credit' ? 'green' : 'default'}>
-                    {KIND_LABELS[value] ?? value}
+                    {/* 每个取值一个稳定锚点：浏览器用例据此确认"充值"与"资金调整"分得开。 */}
+                    <span data-testid={`portal-ledger-entry-kind-${value}`}>
+                      {KIND_LABELS[value] ?? value}
+                    </span>
                   </Tag>
                 ),
               },

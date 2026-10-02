@@ -690,6 +690,19 @@ async fn the_customer_ledger_hides_the_platform_cost_line() {
     .await
     .expect("insert platform cost entry");
 
+    // 一条正式调整：类别筛选要能把充值与资金调整分开。
+    sqlx::query(
+        "INSERT INTO ledger.entries (id, account_id, kind, amount_microusd, business_key)
+         VALUES ($1, $2, 'adjustment', $3, $4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account_uuid)
+    .bind(5_000_i64)
+    .bind(format!("history-adjustment-{}", Uuid::new_v4()))
+    .execute(&harness.pool)
+    .await
+    .expect("insert adjustment entry");
+
     // 管理员那条流水读看得到它：证明这一行真的在库里，不是"没插进去"。
     let admin = client
         .get(format!(
@@ -736,6 +749,19 @@ async fn the_customer_ledger_hides_the_platform_cost_line() {
             "被排除的行不该算进 total（{query}）：{body}"
         );
     }
+
+    // 正式调整能单独筛出来，且与充值分得开。
+    let (status, adjustments) = get_json(
+        &client,
+        format!("{}/v1/customer/ledger?kind=adjustment", harness.base_url),
+        &session,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{adjustments}");
+    let entries = adjustments["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "只该有那一条正式调整：{adjustments}");
+    assert_eq!(entries[0]["kind"], json!("adjustment"));
+    assert_eq!(entries[0]["amount_microusd"], json!(5_000));
 
     // `cost` 连"可筛的类别"都不是：问它就该被拒，而不是回一批空数据让它以为"这个类别没有记录"。
     let (status, body) = get_json(
