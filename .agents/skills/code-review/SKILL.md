@@ -1,16 +1,16 @@
 ---
 name: code-review
-description: "Review the changes since a fixed point (commit, branch, tag, or merge-base) along two axes: Standards (does the code follow this repo's documented coding standards?) and Spec (does the code match what the originating issue/spec asked for?). Runs both reviews in parallel sub-agents and reports them side by side. Use when the user wants to review a branch, a PR, work-in-progress changes, or asks to \"review since X\"."
+description: "Review changes since a fixed point along two axes: Standards (project rules and current decisions) and Spec (the governing work item's acceptance contract and applicable independent Spec). Runs both reviews in parallel sub-agents and reports them side by side. Use for a branch, PR, work-in-progress changes, or a review since a named point."
 ---
 
 Two-axis review of the requested change scope, including uncommitted work when applicable:
 
-- **Standards**: does the code conform to this repo's documented coding standards?
-- **Spec**: does the code faithfully implement the originating issue / spec?
+- **Standards**: does the change conform to this repo's documented standards and current authoritative decisions?
+- **Spec**: does the change satisfy the governing work item's scope and acceptance conditions, including any applicable independent Spec?
 
 Both axes run as **parallel sub-agents** so they don't pollute each other's context, then this skill aggregates their findings.
 
-The issue tracker should have been provided to you. If `docs/agents/issue-tracker.md` is missing, tell the user to run `/setup-matt-pocock-skills`.
+Resolve work tracking and document ownership from project instructions. A particular tracker configuration path or separate Spec file is not required for a review.
 
 ## Process
 
@@ -22,18 +22,17 @@ Capture the exact review commands once. For committed branch changes use `git di
 
 Before dispatch, resolve the fixed point and verify the complete scope, including new files. If it is empty, report no changes to review; do not mistake an empty committed diff for an empty worktree.
 
-### 2. Identify the spec source
+### 2. Identify the acceptance contract
 
-First reuse the governing spec/ticket already supplied by the caller or conversation. Otherwise look in this order:
+First reuse the governing work item, acceptance conditions and applicable design already supplied by the caller or conversation. Otherwise:
 
-1. Issue references in the commit messages (`#123`, `Closes #45`, GitLab `!67`, etc.), fetched via the workflow in `docs/agents/issue-tracker.md`.
-2. A path the user passed as an argument.
-3. A spec file under `docs/`, `specs/`, or `.scratch/` matching the branch name or feature.
-4. If nothing is found, ask the user where the spec is. If they say there isn't one, the **Spec** sub-agent will skip and report "no spec available".
+1. Resolve a work identifier or path from the user's request, branch or relevant commits; locate it through the project's configured tracker or existing work-item convention.
+2. Read that work item's selected scope and acceptance conditions, then follow its references to the applicable revision and sections of any independently owned Spec. Use the registered document owner to resolve design decisions; do not infer a Spec solely from a matching filename.
+3. For direct changes without a separate work item, use the authorized user request and settled decisions in the conversation as the contract. If the contract still cannot be identified, ask the user for its owner. Skip the Spec axis only when no reliable acceptance contract exists, and report that coverage gap.
 
 ### 3. Identify the standards sources
 
-Anything in the repo that documents how code should be written, such as `CODING_STANDARDS.md` or `CONTRIBUTING.md`.
+Read project instructions and the document ownership entry, then relevant writing and coding standards such as `CODING_STANDARDS.md` or `CONTRIBUTING.md`. Include the applicable design decisions and constraints identified by the project configuration and governing work item. Report missing or conflicting required inputs as review coverage gaps.
 
 On top of whatever the repo documents, the Standards axis always carries the **smell baseline** below: a fixed set of Fowler code smells (_Refactoring_, ch.3) that applies even when a repo documents nothing. Two rules bind it:
 
@@ -60,16 +59,16 @@ Each smell reads *what it is* → *how to fix*; match it against the diff:
 **Standards sub-agent prompt** should include:
 
 - The full diff command and commit list.
-- The list of standards-source files you found in step 3, **plus the smell baseline from step 3** pasted in full (the sub-agent has no other access to it).
-- The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard: cite the standard (file + the rule); and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented-standard breaches can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words."
+- The standards and current-decision sources found in step 3, **plus the smell baseline from step 3** pasted in full (the sub-agent has no other access to it).
+- The brief: "Report, per file/hunk where relevant, (a) every place the diff violates a documented standard or current authoritative decision: cite the source and rule; and (b) any baseline smell you spot: name it and quote the hunk. Distinguish hard violations from judgement calls: documented rules and current decisions can be hard, but baseline smells are always judgement calls, and a documented repo standard overrides the baseline. Skip anything tooling enforces. Under 400 words."
 
 **Spec sub-agent prompt** should include:
 
 - The diff command and commit list.
-- The path or fetched contents of the spec.
-- The brief: "Report: (a) requirements the spec asked for that are missing or partial; (b) behaviour in the diff that wasn't asked for (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote the spec line for each finding. Under 400 words."
+- The governing work item or conversational acceptance contract and relevant sections of any applicable independent Spec.
+- The brief: "Report: (a) requirements of the acceptance contract that are missing or partial; (b) behaviour in the diff that wasn't requested (scope creep); (c) requirements that look implemented but where the implementation looks wrong. Quote or identify the exact contract clause for each finding. Under 400 words."
 
-If the spec is missing, skip the Spec sub-agent and note this in the final report.
+If no reliable acceptance contract exists, skip the Spec sub-agent and note this in the final report.
 
 ### 5. Aggregate
 
