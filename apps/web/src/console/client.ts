@@ -24,8 +24,8 @@ import type {
 export class AdminClient {
   constructor(
     private readonly token: AdminToken,
-    /// 凭据不再被接受时的收尾动作（入口传 `signOut`）。
-    private readonly onUnauthorized?: () => void,
+    /// 凭据不再被接受时的收尾动作（入口传 `signOut`）。参数是这次请求真正用的那枚凭据。
+    private readonly onUnauthorized?: (rejectedToken: string | null) => void,
   ) {}
 
   /// 一次管理 API 调用。
@@ -33,9 +33,13 @@ export class AdminClient {
   /// **403 在管理面只有一个含义：这次凭据不被接受**——会话过期、被吊销，或拿的是共享令牌而这条端点
   /// 只认会话。此时唯一能解决它的动作是重新登录，所以在这里集中上报（Spec M7；会话结束要顺带清掉
   /// 上一名运营留下的列表筛选，见设计 `0011` §4.4.1），页面不必各自判断。
+  ///
+  /// 上报时把**这次用的那枚凭据**一起交出去：403 可能迟到（换人登录之后才回来），收尾那一侧要能
+  /// 判断被拒的是不是现在这枚，别拿一条迟到的 403 把新会话踢回登录页。
   private call<T>(run: () => Promise<T>): Promise<T> {
+    const used = this.token();
     return run().catch((failure: unknown) => {
-      if (failure instanceof ApiError && failure.status === 403) this.onUnauthorized?.();
+      if (failure instanceof ApiError && failure.status === 403) this.onUnauthorized?.(used);
       throw failure;
     });
   }

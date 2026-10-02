@@ -153,6 +153,15 @@ test('不存在的对象与未知地址显示找不到，不残留上一个对�
   await expect(page.getByTestId('console-not-found')).toBeVisible();
   await expect(page.getByTestId('customers-detail-email')).toHaveCount(0);
 
+  // 对象存在、但地址多出一段：这不是我们的地址，照旧显示找不到，而不是把后面的段当噪声忽略。
+  await page.goto(`${consoleUrl}#/accounts/${accountId}/junk`);
+  await expect(page.getByTestId('console-not-found')).toBeVisible();
+  await expect(page.getByTestId('accounts-balance')).toHaveCount(0);
+
+  // 别的已知工作区后面跟一段同理：不是我们的地址，不回落到那个工作区。
+  await page.goto(`${consoleUrl}#/models/junk`);
+  await expect(page.getByTestId('console-not-found')).toBeVisible();
+
   // 地址本身不是已知页面：也显示找不到，而不是悄悄落到模型目录。
   await page.goto(`${consoleUrl}#/no-such-page`);
   await expect(page.getByTestId('console-not-found')).toBeVisible();

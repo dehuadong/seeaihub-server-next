@@ -11,7 +11,7 @@ import {
   TeamOutlined,
   UserOutlined,
 } from '@ant-design/icons';
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import { AdminClient } from './client';
 import { useAdminSession } from './session';
 import { accountPath, customerPath, useHashRoute, type Route } from '../shared/routes';
@@ -62,9 +62,21 @@ function Console() {
   const [showPassword, setShowPassword] = useState(false);
 
   /// 令牌的取值函数传给客户端：它每次请求时读当前值，所以换会话不必重建客户端。
-  /// 第二次参数是 403 的收尾：会话不再被接受时回到登录页，并清掉上一名运营留下的列表筛选。
   const tokenGetter = useCallback(() => token, [token]);
-  const client = useMemo(() => new AdminClient(tokenGetter, signOut), [tokenGetter, signOut]);
+  /// 现在这枚凭据的最新值。403 的收尾要拿它比对，而**旧页面里在飞的请求持有的是旧闭包**——只有
+  /// ref 读到的是最新值，否则换人登录后一条迟到的 403 会把新会话踢回登录页。
+  const tokenRef = useRef<string | null>(token);
+  tokenRef.current = token;
+  const onUnauthorized = useCallback(
+    (rejected: string | null) => {
+      if (rejected !== null && rejected === tokenRef.current) signOut();
+    },
+    [signOut],
+  );
+  const client = useMemo(
+    () => new AdminClient(tokenGetter, onUnauthorized),
+    [tokenGetter, onUnauthorized],
+  );
 
   // **路由守卫**：没登录就只渲染登录页。六个页面的组件在登录之前根本不挂载，因此也不会发任何
   // 管理 API 取数请求（Spec M7）——会话过期或被吊销时，返回来的 403 会把我们带回这里。

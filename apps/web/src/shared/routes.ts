@@ -58,11 +58,11 @@ export function parseLocation(hash: string): ConsoleLocation {
   if (parts.length > 2) return { page: 'not-found', detailId: null };
   const page = head as Route;
   const tail = parts[1] ?? '';
-  // 只有账户与客户有详情地址；其余工作区即使带上一段也只当列表。
-  if ((page === 'accounts' || page === 'customers') && tail) {
-    return { page, detailId: segment(tail) };
-  }
-  return { page, detailId: null };
+  if (!tail) return { page, detailId: null };
+  // 只有账户与客户有详情地址。别的已知工作区后面再跟一段，同样是"不是我们的地址"——静默把那段
+  // 当噪声丢掉，就是把敲错的地址显示成一个看似正确的页面。
+  if (page === 'accounts' || page === 'customers') return { page, detailId: segment(tail) };
+  return { page: 'not-found', detailId: null };
 }
 
 /// 账户详情地址（`#/` 之后的那一段）。标识编码后再进地址，页面侧再解回来。
