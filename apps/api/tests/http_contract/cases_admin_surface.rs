@@ -20,10 +20,11 @@ async fn every_admin_endpoint_requires_credentials() {
     const ID: &str = "00000000-0000-4000-8000-000000000000";
 
     // (方法, 路径, 是否带 JSON body)——PATCH/PUT/POST 都带上 body，免得被 body 解析拦在前面。
-    let matrix: [(&str, String, bool); 25] = [
+    let matrix: [(&str, String, bool); 27] = [
         ("POST", "/api/v1/accounts".to_owned(), true),
         ("GET", "/api/v1/accounts".to_owned(), false),
         ("GET", format!("/api/v1/accounts/{ID}"), false),
+        ("GET", format!("/api/v1/accounts/{ID}/summary"), false),
         ("GET", format!("/api/v1/accounts/{ID}/entries"), false),
         ("PUT", format!("/api/v1/accounts/{ID}/tag"), true),
         ("POST", format!("/api/v1/accounts/{ID}/credits"), true),
@@ -36,6 +37,7 @@ async fn every_admin_endpoint_requires_credentials() {
         ("DELETE", format!("/api/v1/api-keys/{ID}"), false),
         ("GET", "/api/v1/customers".to_owned(), false),
         ("POST", "/api/v1/customers".to_owned(), true),
+        ("GET", format!("/api/v1/customers/{ID}"), false),
         ("GET", "/api/v1/admin/session".to_owned(), false),
         ("PUT", "/api/v1/admin/password".to_owned(), true),
         ("POST", "/api/v1/admin/password-resets".to_owned(), true),
@@ -291,6 +293,182 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
         .await
         .expect("list with unknown query");
     assert_eq!(unknown.status(), StatusCode::BAD_REQUEST);
+
+    drop_isolated_database(&database_name).await;
+}
+
+/// 账户与客户的详情能**按标识**读回来：这两条是详情页直达与刷新的读（Spec V-D15、设计 `0011` §6.3）。
+///
+/// 列表读不算答案：它有筛选与条数上限，刷新一个较旧对象的详情时可能根本不在结果里。所以详情页只
+/// 拿地址里的标识取数，这两条端点必须按标识稳定命中原对象，且响应与列表项同形、不含任何凭据。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn account_and_customer_details_are_readable_by_identifier() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    // 一个带标签与余额、**还没有登录身份**的账户；摘要的 `email` 这时必须是 `null`。
+    let created = client
+        .post(format!("{base_url}/api/v1/accounts"))
+        .bearer_auth(&admin_token)
+        .json(&json!({ "initial_credit_microusd": 3_210_000 }))
+        .send()
+        .await
+        .expect("create account");
+    assert!(
+        created.status().is_success(),
+        "建账户：{}",
+        created.status()
+    );
+    let account_id = created.json::<Value>().await.expect("account id")["account_id"]
+        .as_str()
+        .expect("account_id")
+        .to_owned();
+    assert!(
+        client
+            .put(format!("{base_url}/api/v1/accounts/{account_id}/tag"))
+            .bearer_auth(&admin_token)
+            .json(&json!({ "tag": "detail-e2e" }))
+            .send()
+            .await
+            .expect("set tag")
+            .status()
+            .is_success()
+    );
+
+    let bare: Value = client
+        .get(format!("{base_url}/api/v1/accounts/{account_id}/summary"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("account summary")
+        .json()
+        .await
+        .expect("account summary body");
+    assert_eq!(bare["account_id"].as_str(), Some(account_id.as_str()));
+    assert_eq!(bare["balance_microusd"].as_i64(), Some(3_210_000));
+    assert_eq!(bare["tag"].as_str(), Some("detail-e2e"));
+    assert_eq!(bare["email"], Value::Null, "还没有登录身份：{bare}");
+    assert!(bare["created_at"].is_string(), "摘要要带创建时刻：{bare}");
+    assert!(bare["updated_at"].is_string(), "摘要要带更新时刻：{bare}");
+
+    // 同一个账户从列表里读一次：两条读的字段与取值必须一致，页面才不会"刷新前后不一样"。
+    let listed: Value = client
+        .get(format!("{base_url}/api/v1/accounts?tag=detail-e2e"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("list by tag")
+        .json()
+        .await
+        .expect("accounts body");
+    let rows = listed["accounts"].as_array().expect("accounts array");
+    assert_eq!(rows.len(), 1, "按标签只该命中一个：{listed}");
+    assert_eq!(
+        rows[0], bare,
+        "按标识的摘要与列表项必须同形同值：{listed} vs {bare}"
+    );
+
+    // 配一个登录身份之后，摘要要带上邮箱；客户视图能按 `customer_id` 读回来。
+    let email = format!("detail-{}@example.com", Uuid::new_v4());
+    let opened = client
+        .post(format!("{base_url}/api/v1/customers"))
+        .bearer_auth(&admin_token)
+        .json(&json!({
+            "email": email,
+            "password": "a-long-enough-password",
+            "account_id": account_id,
+        }))
+        .send()
+        .await
+        .expect("open customer");
+    assert_eq!(opened.status(), StatusCode::CREATED);
+    let customer: Value = opened.json().await.expect("customer view");
+    let customer_id = customer["customer_id"]
+        .as_str()
+        .expect("customer_id")
+        .to_owned();
+
+    let bound: Value = client
+        .get(format!("{base_url}/api/v1/accounts/{account_id}/summary"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("account summary with identity")
+        .json()
+        .await
+        .expect("account summary body");
+    assert_eq!(bound["email"].as_str(), Some(email.as_str()));
+
+    let read: Value = client
+        .get(format!("{base_url}/api/v1/customers/{customer_id}"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("customer view by id")
+        .json()
+        .await
+        .expect("customer view body");
+    assert_eq!(read["customer_id"].as_str(), Some(customer_id.as_str()));
+    assert_eq!(read["email"].as_str(), Some(email.as_str()));
+    assert_eq!(read["account_id"].as_str(), Some(account_id.as_str()));
+    assert!(
+        read["created_at"].is_string(),
+        "客户视图要带创建时刻：{read}"
+    );
+    assert_eq!(read["last_login_at"], Value::Null, "还没登录过：{read}");
+    // 与开户那次的响应同形同值：开户后进入的详情页就是这条读的样子。
+    assert_eq!(read, customer, "按标识的客户视图要与开户响应一致：{read}");
+
+    // **不返回任何凭据**：口令、会话、API Key 明文、重置令牌都不该出现在这两个响应里。
+    let mut keys = vec![];
+    for value in [&bare, &read] {
+        keys.extend(
+            value
+                .as_object()
+                .expect("object")
+                .keys()
+                .map(String::as_str),
+        );
+    }
+    for forbidden in [
+        "password",
+        "password_hash",
+        "token",
+        "reset_token",
+        "api_key",
+        "session",
+    ] {
+        assert!(
+            !keys.contains(&forbidden),
+            "响应里不该出现 {forbidden}：{keys:?}"
+        );
+    }
+
+    // 不存在的标识：404，而不是空对象或 500——详情页据此显示找不到并清掉上一个对象。
+    let unknown = Uuid::new_v4();
+    for path in [
+        format!("{base_url}/api/v1/accounts/{unknown}/summary"),
+        format!("{base_url}/api/v1/customers/{unknown}"),
+    ] {
+        let response = client
+            .get(&path)
+            .bearer_auth(&admin_token)
+            .send()
+            .await
+            .expect("read unknown detail");
+        assert_eq!(response.status(), StatusCode::NOT_FOUND, "{path}");
+    }
+    // 不是 UUID 的标识：400（参数不成立），与"这个对象不存在"分开。
+    let malformed = client
+        .get(format!("{base_url}/api/v1/customers/not-a-uuid"))
+        .bearer_auth(&admin_token)
+        .send()
+        .await
+        .expect("read malformed id");
+    assert_eq!(malformed.status(), StatusCode::BAD_REQUEST);
 
     drop_isolated_database(&database_name).await;
 }

@@ -183,6 +183,13 @@ impl HubRepository for AuditRepository {
         unused_option()
     }
 
+    async fn find_customer_view_by_id(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        unused_option()
+    }
+
     async fn list_customers(&self, _limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
         unused_repository()
     }
@@ -436,6 +443,13 @@ impl HubRepository for AuditRepository {
         _limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
         unused_repository()
+    }
+
+    async fn find_account_summary(
+        &self,
+        _account_id: AccountId,
+    ) -> Result<Option<AccountSummary>, ApplicationError> {
+        unused_option()
     }
 
     async fn read_ledger_entries(

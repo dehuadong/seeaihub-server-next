@@ -2154,6 +2154,18 @@ pub trait HubRepository: Send + Sync {
         limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError>;
 
+    /// 按**账户标识**读同一个 [`AccountSummary`]；没有这个账户时 `None`。
+    ///
+    /// 它是账户详情**直达与刷新**的读：详情地址里只有账户标识，列表那次查询可能已经翻不到这一行
+    /// （列表有条数上限、筛选条件也可能已经变了），所以详情不能拿列表结果当答案。字段与
+    /// [`Self::list_accounts`] 的列表项完全一致。
+    ///
+    /// 只读、不写审计、不读缓存：详情里的余额要能与账本对上。
+    async fn find_account_summary(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<AccountSummary>, ApplicationError>;
+
     /// 按账户读账本流水：**时间倒序**、只取 `since` 之后的、最多 `limit` 条。
     ///
     /// 权威是 `ledger.entries` 本身，这条读不改写任何东西、也不写审计。`since` 是**开区间**：
@@ -2610,6 +2622,15 @@ pub trait HubRepository: Send + Sync {
     async fn find_customer_view(
         &self,
         email: &str,
+    ) -> Result<Option<CustomerView>, ApplicationError>;
+
+    /// 按**客户标识**读同一个 [`CustomerView`]；没有这个客户时 `None`。
+    ///
+    /// 客户详情地址里只有客户标识，所以详情直达与刷新走这条，而不是回查按邮箱的列表——列表只按
+    /// 邮箱筛选或取最近若干条，较旧的客户翻不到。
+    async fn find_customer_view_by_id(
+        &self,
+        customer_id: Uuid,
     ) -> Result<Option<CustomerView>, ApplicationError>;
 
     /// 列客户（按创建时间倒序，最近 `limit` 条）。
@@ -3227,6 +3248,19 @@ impl IdentityService {
         self.repository.list_customers(limit).await
     }
 
+    /// 按客户标识读客户视图（详情直达与刷新用）。
+    ///
+    /// 客户不存在时 [`ApplicationError::NotFound`]：详情页要显示找不到，且不残留上一个客户的资料。
+    pub async fn customer_view_by_id(
+        &self,
+        customer_id: Uuid,
+    ) -> Result<CustomerView, ApplicationError> {
+        self.repository
+            .find_customer_view_by_id(customer_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(format!("customer {customer_id}")))
+    }
+
     /// 签发一枚重置令牌：作废该身份此前未兑换的那些，再落新的。
     async fn issue_reset_token(
         &self,
@@ -3389,6 +3423,20 @@ impl AccountsService {
         limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
         self.repository.list_accounts(email, tag, limit).await
+    }
+
+    /// 按账户标识读账户摘要（详情直达与刷新用）。
+    ///
+    /// 账户不存在时 [`ApplicationError::NotFound`]——详情页要把"这个账户不在了"与"这一读失败"
+    /// 分开，前者要显示找不到、且不残留上一个账户的读数。
+    pub async fn account_summary(
+        &self,
+        account_id: AccountId,
+    ) -> Result<AccountSummary, ApplicationError> {
+        self.repository
+            .find_account_summary(account_id)
+            .await?
+            .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))
     }
 
     /// 读账户**账目流水**（权威在账本；管理员面与对客面共用这条读）。

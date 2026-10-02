@@ -1599,20 +1599,30 @@ impl HubRepository for PgHubRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
-        rows.iter()
-            .map(|row| {
-                use sqlx::Row as _;
-                Ok(AccountSummary {
-                    account_id: AccountId(row.try_get("id").map_err(database_error)?),
-                    balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
-                    tag: row.try_get("tag").map_err(database_error)?,
-                    // 一个账户最多一个登录身份，所以 LEFT JOIN 至多带出一行、不会重复账户。
-                    email: row.try_get("email").map_err(database_error)?,
-                    created_at: row.try_get("created_at").map_err(database_error)?,
-                    updated_at: row.try_get("updated_at").map_err(database_error)?,
-                })
-            })
-            .collect()
+        rows.iter().map(account_summary_row).collect()
+    }
+
+    /// 按账户标识读同一个摘要投影。
+    ///
+    /// 与 [`HubRepository::list_accounts`] 同一张表、同一组列、同一个 `LEFT JOIN`：一个账户最多一个
+    /// 登录身份，所以这里至多一行。账户不存在返回 `None`，由用例层翻成 404。
+    async fn find_account_summary(
+        &self,
+        account_id: AccountId,
+    ) -> Result<Option<AccountSummary>, ApplicationError> {
+        let row = sqlx::query(
+            r#"
+            SELECT a.id, a.balance_microusd, a.tag, c.email, a.created_at, a.updated_at
+            FROM ledger.accounts a
+            LEFT JOIN identity.customers c ON c.account_id = a.id
+            WHERE a.id = $1
+            "#,
+        )
+        .bind(account_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        row.as_ref().map(account_summary_row).transpose()
     }
 
     /// 按账户读账本流水：时间**倒序**、`[since, until)` 半开区间、`offset` 翻页、`limit` 截断。
@@ -4016,15 +4026,26 @@ impl HubRepository for PgHubRepository {
         .fetch_optional(&self.pool)
         .await
         .map_err(database_error)?;
-        Ok(row.map(
-            |(customer_id, email, account_id, created_at, last_login_at)| CustomerView {
-                customer_id,
-                email,
-                account_id: AccountId(account_id),
-                created_at,
-                last_login_at,
-            },
-        ))
+        Ok(row.map(customer_view_row))
+    }
+
+    /// 按客户标识读同一个客户视图投影；没有这个客户返回 `None`。
+    async fn find_customer_view_by_id(
+        &self,
+        customer_id: Uuid,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        let row = sqlx::query_as::<_, (Uuid, String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+            r#"
+            SELECT id, email, account_id, created_at, last_login_at
+            FROM identity.customers
+            WHERE id = $1
+            "#,
+        )
+        .bind(customer_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(row.map(customer_view_row))
     }
 
     async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
@@ -4040,18 +4061,7 @@ impl HubRepository for PgHubRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
-        Ok(rows
-            .into_iter()
-            .map(
-                |(customer_id, email, account_id, created_at, last_login_at)| CustomerView {
-                    customer_id,
-                    email,
-                    account_id: AccountId(account_id),
-                    created_at,
-                    last_login_at,
-                },
-            )
-            .collect())
+        Ok(rows.into_iter().map(customer_view_row).collect())
     }
 }
 
@@ -4831,6 +4841,41 @@ fn to_u64(value: i64) -> Result<u64, ApplicationError> {
 
 fn database_error(error: impl std::fmt::Display) -> ApplicationError {
     ApplicationError::Persistence(error.to_string())
+}
+
+/// 账户摘要那一行 → 投影：账户行（id、已结算余额、标签、两个时刻）加它的登录邮箱。
+///
+/// 列表与按标识两条读共用它，所以"列表里看到的那一行"与"详情里的那个账户"永远同形；`LEFT JOIN`
+/// 至多带出一个身份（一个账户最多绑一个邮箱），`email` 为 `None` 是"还没有登录身份"这个事实。
+fn account_summary_row(row: &sqlx::postgres::PgRow) -> Result<AccountSummary, ApplicationError> {
+    use sqlx::Row as _;
+    Ok(AccountSummary {
+        account_id: AccountId(row.try_get("id").map_err(database_error)?),
+        balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+        tag: row.try_get("tag").map_err(database_error)?,
+        email: row.try_get("email").map_err(database_error)?,
+        created_at: row.try_get("created_at").map_err(database_error)?,
+        updated_at: row.try_get("updated_at").map_err(database_error)?,
+    })
+}
+
+/// 客户视图那一行 → 投影：`identity.customers` 的五个字段。三条读（按邮箱、按标识、列表）共用。
+fn customer_view_row(
+    (customer_id, email, account_id, created_at, last_login_at): (
+        Uuid,
+        String,
+        Uuid,
+        DateTime<Utc>,
+        Option<DateTime<Utc>>,
+    ),
+) -> CustomerView {
+    CustomerView {
+        customer_id,
+        email,
+        account_id: AccountId(account_id),
+        created_at,
+        last_login_at,
+    }
 }
 
 /// 发布物的内容指纹：把**合同**与这条供给的**承载面**一起哈希。

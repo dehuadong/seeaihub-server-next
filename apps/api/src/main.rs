@@ -244,6 +244,10 @@ async fn main() -> Result<()> {
         .route("/api/v1/accounts", post(create_account).get(list_accounts))
         .route("/api/v1/accounts/{account_id}", get(read_account_balance))
         .route(
+            "/api/v1/accounts/{account_id}/summary",
+            get(read_account_summary),
+        )
+        .route(
             "/api/v1/accounts/{account_id}/entries",
             get(list_account_entries),
         )
@@ -270,6 +274,7 @@ async fn main() -> Result<()> {
         )
         .route("/api/v1/api-keys/{key_id}", delete(revoke_api_key))
         .route("/api/v1/customers", get(list_customers).post(open_customer))
+        .route("/api/v1/customers/{customer_id}", get(read_customer_view))
         .route("/api/v1/admin/session", get(read_admin_session))
         .route("/api/v1/admin/password", put(change_admin_password))
         .route(
@@ -657,6 +662,22 @@ async fn read_account_balance(
         version: change.version,
         updated_at: change.updated_at,
     }))
+}
+
+/// 按账户标识读账户摘要（`GET /api/v1/accounts/{account_id}/summary`）：账户详情页直达与刷新用。
+///
+/// 字段与列表项一致；金额仍由 [`read_account_balance`] 那条读给。账户不存在返回 404，页面据此
+/// 显示找不到并清掉上一个账户的读数。
+async fn read_account_summary(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+) -> Result<Json<AccountSummary>, ApiError> {
+    Ok(Json(
+        state
+            .accounts
+            .account_summary(AccountId(account_id))
+            .await?,
+    ))
 }
 
 /// 按账户触发一次账实核对（`POST /api/v1/accounts/{account_id}/ledger-audit`）。
@@ -1185,6 +1206,16 @@ async fn list_customers(
         }
     };
     Ok(Json(CustomersResponse { customers }))
+}
+
+/// 按客户标识读客户视图（`GET /api/v1/customers/{customer_id}`）：客户详情页直达与刷新用。
+///
+/// 字段与列表项一致，不含口令、会话、API Key 明文与重置令牌；不存在返回 404。
+async fn read_customer_view(
+    State(state): State<AppState>,
+    Path(customer_id): Path<Uuid>,
+) -> Result<Json<CustomerView>, ApiError> {
+    Ok(Json(state.identity.customer_view_by_id(customer_id).await?))
 }
 
 const DEFAULT_CUSTOMERS_LIMIT: u32 = 50;

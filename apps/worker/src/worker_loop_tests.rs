@@ -241,6 +241,13 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
+    async fn find_customer_view_by_id(
+        &self,
+        _customer_id: Uuid,
+    ) -> Result<Option<CustomerView>, ApplicationError> {
+        unimplemented!()
+    }
+
     async fn list_customers(&self, _limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
         unimplemented!()
     }
@@ -390,6 +397,12 @@ impl HubRepository for EmptyQueueRepository {
         _tag: Option<&str>,
         _limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
+        unimplemented!()
+    }
+    async fn find_account_summary(
+        &self,
+        _account_id: AccountId,
+    ) -> Result<Option<AccountSummary>, ApplicationError> {
         unimplemented!()
     }
     async fn read_ledger_entries(
