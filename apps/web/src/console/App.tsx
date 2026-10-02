@@ -14,14 +14,15 @@ import {
 import { useCallback, useMemo, useState } from 'react';
 import { AdminClient } from './client';
 import { useAdminSession } from './session';
-import { useHashRoute, type Route } from '../shared/routes';
-import { AccountsPage } from './pages/Accounts';
-import { CustomersPage } from './pages/Customers';
+import { accountPath, customerPath, useHashRoute, type Route } from '../shared/routes';
+import { AccountDetailPage, AccountsPage } from './pages/Accounts';
+import { CustomerDetailPage, CustomersPage } from './pages/Customers';
 import { DiagnosticsPage } from './pages/Diagnostics';
 import { ChangePasswordPanel, LoginPage } from './pages/Login';
 import { ModelsPage } from './pages/Models';
 import { RatesPage } from './pages/Rates';
 import { RoutingPage } from './pages/Routing';
+import { ConsoleNotFound } from './ui';
 
 const NAV: { route: Route; label: string; icon: React.ReactNode }[] = [
   // 一页看、一页写会让人看不出两者的联系，所以「上架与改价」并进了「模型目录」：那一页右上角
@@ -55,20 +56,26 @@ export function App() {
 
 function Console() {
   const { token, email, signOut } = useAdminSession();
-  const [route, navigate] = useHashRoute();
+  const [location, navigate] = useHashRoute();
   const [collapsed, setCollapsed] = useState(false);
   /// "改口令"面板默认收起：它是低频操作，不该常占着页面。
   const [showPassword, setShowPassword] = useState(false);
 
   /// 令牌的取值函数传给客户端：它每次请求时读当前值，所以换会话不必重建客户端。
+  /// 第二次参数是 403 的收尾：会话不再被接受时回到登录页，并清掉上一名运营留下的列表筛选。
   const tokenGetter = useCallback(() => token, [token]);
-  const client = useMemo(() => new AdminClient(tokenGetter), [tokenGetter]);
+  const client = useMemo(() => new AdminClient(tokenGetter, signOut), [tokenGetter, signOut]);
 
   // **路由守卫**：没登录就只渲染登录页。六个页面的组件在登录之前根本不挂载，因此也不会发任何
   // 管理 API 取数请求（Spec M7）——会话过期或被吊销时，返回来的 403 会把我们带回这里。
+  //
+  // 地址**保持不变**：登录成功后仍然解析同一段 hash，于是直接打开的账户／客户详情、以及刷新时
+  // 停留的页面都会自动回到原处（Spec D6）。
   if (!token) return <LoginPage />;
 
-  const current = NAV.find((item) => item.route === route);
+  const current = NAV.find((item) => item.route === location.page);
+  const openAccount = (accountId: string) => navigate(accountPath(accountId));
+  const openCustomer = (customerId: string) => navigate(customerPath(customerId));
 
   return (
     <Layout style={{ minHeight: '100vh' }}>
@@ -88,14 +95,21 @@ function Console() {
         </div>
         <Menu
           mode="inline"
-          selectedKeys={[route]}
+          // 列表与详情映射到同一个侧栏项：详情页里「账户」仍然是选中的那一项。
+          selectedKeys={[location.page]}
           style={{ borderInlineEnd: 0 }}
           items={NAV.map((item) => ({
             key: item.route,
             icon: item.icon,
-            label: item.label,
+            // 列表与详情共用一个工作区，所以"当前在哪个工作区"由地址里的页面段决定；`aria-current`
+            // 让这件事既能被读屏软件念出来，也能被浏览器用例当作稳定锚点断言。
+            label: (
+              <span aria-current={location.page === item.route ? 'page' : undefined}>
+                {item.label}
+              </span>
+            ),
           }))}
-          onClick={({ key }) => navigate(key as Route)}
+          onClick={({ key }) => navigate(key)}
         />
       </Layout.Sider>
       <Layout>
@@ -120,7 +134,11 @@ function Console() {
                 label: '',
                 onClick: () => setCollapsed((value) => !value),
               },
-              { key: 'where', label: current?.label ?? '', disabled: true },
+              {
+                key: 'where',
+                label: current?.label ?? (location.page === 'not-found' ? '找不到' : ''),
+                disabled: true,
+              },
             ]}
           />
           <Menu
@@ -151,21 +169,52 @@ function Console() {
               <ChangePasswordPanel onClose={() => setShowPassword(false)} />
             </div>
           ) : null}
-          {route === 'models' || route === 'publish' ? (
+          {location.page === 'models' || location.page === 'publish' ? (
             <ModelsPage
               client={client}
               // `#/publish` 是合并之前的旧地址：它现在落到本页并把"改价"抽屉带上，旧链接与书签不废。
-              editRequest={route === 'publish' ? '' : undefined}
+              editRequest={location.page === 'publish' ? '' : undefined}
               onEditRequestHandled={
-                route === 'publish' ? () => navigate('models') : undefined
+                location.page === 'publish' ? () => navigate('models') : undefined
               }
             />
           ) : null}
-          {route === 'rates' ? <RatesPage client={client} /> : null}
-          {route === 'routing' ? <RoutingPage client={client} /> : null}
-          {route === 'accounts' ? <AccountsPage client={client} /> : null}
-          {route === 'customers' ? <CustomersPage client={client} /> : null}
-          {route === 'diagnostics' ? <DiagnosticsPage client={client} /> : null}
+          {location.page === 'rates' ? <RatesPage client={client} /> : null}
+          {location.page === 'routing' ? <RoutingPage client={client} /> : null}
+          {location.page === 'accounts' ? (
+            location.detailId ? (
+              <AccountDetailPage
+                // 换一个账户就重挂：一次性明文与模块状态必须跟着标识换掉，不能留在下一个账户上。
+                key={location.detailId}
+                client={client}
+                accountId={location.detailId}
+                onBack={() => navigate('accounts')}
+              />
+            ) : (
+              <AccountsPage client={client} onOpenAccount={openAccount} />
+            )
+          ) : null}
+          {location.page === 'customers' ? (
+            location.detailId ? (
+              <CustomerDetailPage
+                key={location.detailId}
+                client={client}
+                customerId={location.detailId}
+                onBack={() => navigate('customers')}
+                onOpenAccount={openAccount}
+              />
+            ) : (
+              <CustomersPage client={client} onOpenCustomer={openCustomer} />
+            )
+          ) : null}
+          {location.page === 'diagnostics' ? <DiagnosticsPage client={client} /> : null}
+          {location.page === 'not-found' ? (
+            <ConsoleNotFound
+              what="页面"
+              backLabel="回模型目录"
+              onBack={() => navigate('models')}
+            />
+          ) : null}
         </Layout.Content>
       </Layout>
     </Layout>

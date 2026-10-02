@@ -27,11 +27,14 @@ test('建账户要先填表单：取消不建、确认才建且标签能搜到',
   await page.getByTestId('accounts-create-yuan').fill('5');
   await page.getByTestId('accounts-create-submit').click();
 
-  // 建出来的账户按**标签**能搜到。用"账户列表"那张卡限定，免得与选中区那张卡混淆。
+  // 建完直接进它的详情页：余额显示刚填的初始充值 5 元，地址指向这个新账户，列表让位。
+  await expect(page).toHaveURL(/#\/accounts\/[0-9a-f-]{36}$/);
+  await expect(page.getByTestId('accounts-balance')).toContainText('5');
+  await expect(page.getByTestId('accounts-lookup-tag')).toHaveCount(0);
+
+  // 回列表按**标签**能搜到它：不填标签时之后只能靠标识找，所以这条路径必须能用。
+  await page.getByTestId('accounts-back-to-list').click();
   await page.getByTestId('accounts-lookup-tag').fill(tag);
   await page.getByTestId('accounts-search').click();
-  const list = page.locator('.ant-card', { hasText: '账户列表' });
-  await expect(list.locator('.ant-table-tbody').getByText(tag)).toBeVisible();
-  // 建完直接选中它：余额显示在账户那一行（刚填的初始充值 5 元）。
-  await expect(page.getByTestId('accounts-balance')).toContainText('5');
+  await expect(page.locator('.ant-table-tbody').getByText(tag)).toBeVisible();
 });

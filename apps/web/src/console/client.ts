@@ -1,8 +1,9 @@
-import { apiFetch, type AdminToken } from '../shared/api';
+import { ApiError, apiFetch, type AdminToken } from '../shared/api';
 import type {
   AccountBalance,
   AccountEntriesResponse,
   AccountsResponse,
+  AccountSummary,
   AdminUsageResponse,
   CreateAccountResponse,
   CustomerView,
@@ -21,14 +22,30 @@ import type {
 ///
 /// 与 `apps/api/src/main.rs` 的路由表一一对应；域名前缀由 Vite 代理（开发）或同源部署（生产）提供。
 export class AdminClient {
-  constructor(private readonly token: AdminToken) {}
+  constructor(
+    private readonly token: AdminToken,
+    /// 凭据不再被接受时的收尾动作（入口传 `signOut`）。
+    private readonly onUnauthorized?: () => void,
+  ) {}
+
+  /// 一次管理 API 调用。
+  ///
+  /// **403 在管理面只有一个含义：这次凭据不被接受**——会话过期、被吊销，或拿的是共享令牌而这条端点
+  /// 只认会话。此时唯一能解决它的动作是重新登录，所以在这里集中上报（Spec M7；会话结束要顺带清掉
+  /// 上一名运营留下的列表筛选，见设计 `0011` §4.4.1），页面不必各自判断。
+  private call<T>(run: () => Promise<T>): Promise<T> {
+    return run().catch((failure: unknown) => {
+      if (failure instanceof ApiError && failure.status === 403) this.onUnauthorized?.();
+      throw failure;
+    });
+  }
 
   private get<T>(path: string): Promise<T> {
-    return apiFetch<T>(path, this.token);
+    return this.call(() => apiFetch<T>(path, this.token));
   }
 
   private send<T>(path: string, method: string, body?: unknown): Promise<T> {
-    return apiFetch<T>(path, this.token, { method, body });
+    return this.call(() => apiFetch<T>(path, this.token, { method, body }));
   }
 
   gatewayModels(): Promise<GatewayModelsResponse> {
@@ -82,6 +99,11 @@ export class AdminClient {
     return this.get(`/api/v1/customers?limit=${limit}`);
   }
 
+  /// 按客户标识读客户视图（详情直达与刷新用）。不存在时 404。
+  customerView(customerId: string): Promise<CustomerView> {
+    return this.get(`/api/v1/customers/${encodeURIComponent(customerId)}`);
+  }
+
   /// 为客户账户签发一次性重置令牌（运营转交；平台不发邮件）。
   issueCustomerPasswordReset(
     accountId: string,
@@ -116,6 +138,11 @@ export class AdminClient {
 
   accountBalance(accountId: string): Promise<AccountBalance> {
     return this.get(`/api/v1/accounts/${encodeURIComponent(accountId)}`);
+  }
+
+  /// 按账户标识读摘要（详情直达与刷新用；理由见 `HubRepository::find_account_summary`）。不存在时 404。
+  accountSummary(accountId: string): Promise<AccountSummary> {
+    return this.get(`/api/v1/accounts/${encodeURIComponent(accountId)}/summary`);
   }
 
   /// 列账户：运营**先找到再操作**的入口。`email` 与 `tag` 都是精确匹配（服务端按"与"处理）。

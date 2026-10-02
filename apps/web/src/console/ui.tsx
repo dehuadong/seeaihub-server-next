@@ -1,4 +1,4 @@
-import { Alert, Button, Card, Flex, Skeleton, Space, Typography } from 'antd';
+import { Alert, Button, Card, Flex, Result, Skeleton, Space, Typography } from 'antd';
 import type { ReactNode } from 'react';
 import { ReloadOutlined } from '@ant-design/icons';
 
@@ -68,3 +68,25 @@ export function Panel(props: {
 
 // 金额与时间的展示规则在共享层（`shared/format.ts`）：两个入口都要用同一套，而它不含 antd。
 export { whenText, yuan, yuanText } from '../shared/format';
+
+/// 管理端的"找不到"：地址指向的对象不存在，或地址本身不是已知页面。
+///
+/// 它与"这一读失败"分开：失败要显示错误并让人重取，找不到要**清掉上一个对象**并给一条回去的路
+/// （Spec D6、设计 `0011` §4.4.1）。文案里只说哪个对象找不到，不重复读到的任何字段——残留上一个
+/// 对象的金额或邮箱正是这条要防的事。
+export function ConsoleNotFound(props: { what: string; onBack: () => void; backLabel?: string }) {
+  return (
+    <div data-testid="console-not-found">
+      <Result
+        status="404"
+        title={`找不到${props.what}`}
+        subTitle={`这个地址上的${props.what}不存在。检查地址，或回到列表重新找。`}
+        extra={
+          <Button type="primary" onClick={props.onBack}>
+            {props.backLabel ?? '回列表'}
+          </Button>
+        }
+      />
+    </div>
+  );
+}

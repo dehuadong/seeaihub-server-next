@@ -19,19 +19,16 @@ test('开户并签发重置令牌，客户能用它设新口令', async ({ page 
   await page.getByTestId('admin-sign-in').click();
   await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '客户' }).click();
 
-  // **开户**：邮箱 + 初始口令，不填账户标识（留空即新建一个空账户）。
+  // **开户**：邮箱 + 初始口令，不填账户标识（留空即新建一个空账户）。开完直接进这个客户的详情页。
   await page.getByTestId('customers-open-email').fill(email);
   await page.getByTestId('customers-open-password').fill(initial);
   await page.getByTestId('customers-open-submit').click();
 
-  // 列表里查得到（邮箱精确匹配）——开户即选中这个客户，详情卡片的标题带邮箱。
-  await page.getByTestId('customers-search-email').fill(email);
-  await page.getByTestId('customers-search-submit').click();
-  await expect(page.locator('.ant-table-tbody').getByRole('row')).toHaveCount(1);
-
-  const detail = page.locator('.ant-card').filter({ hasText: `客户 ${email}` });
-  await expect(detail).toBeVisible();
-  await expect(detail.getByText('账户', { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/#\/customers\/[0-9a-f-]{36}$/);
+  await expect(page.getByTestId('customers-detail-email')).toHaveText(email);
+  // 详情页上不出现查找列表：列表与详情不纵向拼接。
+  await expect(page.getByTestId('customers-search-email')).toHaveCount(0);
+  await expect(page.getByText('关联账户', { exact: true })).toBeVisible();
 
   // **签发重置令牌**：明文只显示这一次。
   await page.getByTestId('customers-issue-reset').click();
@@ -41,6 +38,17 @@ test('开户并签发重置令牌，客户能用它设新口令', async ({ page 
   expect(token.length).toBeGreaterThan(20);
   // 界面上写明它只活一次、平台不发邮件——运营要当场转交。
   await expect(page.getByText('只显示这一次，当场转交客户')).toBeVisible();
+
+  // **列表那条入口也进同一个详情**：按邮箱找到客户、点「详情」，地址指向这个客户。
+  await page.getByTestId('customers-back-to-list').click();
+  await page.getByTestId('customers-search-email').fill(email);
+  await page.getByTestId('customers-search-submit').click();
+  const rows = page.locator('.ant-table-tbody').getByRole('row');
+  await expect(rows).toHaveCount(1);
+  await expect(rows).toContainText(email);
+  await page.getByTestId('customers-open-detail').click();
+  await expect(page).toHaveURL(/#\/customers\/[0-9a-f-]{36}$/);
+  await expect(page.getByTestId('customers-detail-email')).toHaveText(email);
 
   // **令牌真的能用**：客户凭它在客户端设新口令，然后用新口令登录。
   await page.goto(portalUrl);

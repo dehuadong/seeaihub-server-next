@@ -2,7 +2,6 @@ import {
   Alert,
   App as AntApp,
   Button,
-  Card,
   Col,
   Descriptions,
   Flex,
@@ -13,27 +12,32 @@ import {
   Table,
   Typography,
 } from 'antd';
-import { KeyOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
+import { ArrowLeftOutlined, KeyOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
 import { useState } from 'react';
 import type { AdminClient } from '../client';
 import type { CustomerView } from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
-import { ConsolePage, Panel, whenText } from '../ui';
+import { useScreenState } from '../screen-state';
+import { ConsoleNotFound, ConsolePage, Panel, whenText } from '../ui';
 
-/// 客户：登录身份的开立与找回口令。
+/// 客户：登录身份的开立与找回口令，**列表与详情分开**（`docs/design/0011` §4.4）。
 ///
 /// 它与"账户"是两件事：账户是账本上的一行（余额、流水、密钥），客户是**登录身份**（邮箱 → 账户）。
-/// 一个账户可以没有登录身份（运营直接建的），一个身份只指向一个账户。**按邮箱找到客户账户**是这一区
-/// 的主入口（Spec M5）：给客户充值、替他签重置令牌都要先拿到账户。
-///
-/// 口径见 `docs/design/0011-console-information-architecture.md` §3.3。
-export function CustomersPage({ client }: { client: AdminClient }) {
+/// 一个账户可以没有登录身份（运营直接建的），一个身份只指向一个账户。列表只负责开户、按邮箱找客户与
+/// 列出客户；点「详情」或开户成功都**换地址**进入该客户的详情页（`#/customers/{customer_id}`）。
+export function CustomersPage({
+  client,
+  onOpenCustomer,
+}: {
+  client: AdminClient;
+  onOpenCustomer: (customerId: string) => void;
+}) {
   const { message } = AntApp.useApp();
-  const [searchEmail, setSearchEmail] = useState('');
-  const [filter, setFilter] = useState<{ email?: string }>({});
-  const [selected, setSelected] = useState<CustomerView | null>(null);
+  /// 本次查找条件活在**会话状态**里：进详情再返回、或前进后退回来时恢复（邮箱不进地址）。
+  /// 输入框也从它起：回来时看到的必须是**正在生效的**那个条件，而不是空框配一份筛过的列表。
+  const [filter, setFilter] = useScreenState<{ email?: string }>('customers.filter', {});
+  const [searchEmail, setSearchEmail] = useState(filter.email ?? '');
   const [opening, setOpening] = useState(false);
-  const [reset, setReset] = useState<{ reset_token: string; expires_at: string } | null>(null);
 
   const customers = useLoadable(
     () =>
@@ -51,27 +55,6 @@ export function CustomersPage({ client }: { client: AdminClient }) {
       loading={customers.loading}
       onReload={customers.reload}
     >
-      {reset ? (
-        <Alert
-          type="warning"
-          showIcon
-          closable
-          onClose={() => setReset(null)}
-          message="重置令牌——只显示这一次，当场转交客户"
-          description={
-            <Flex vertical gap={4}>
-              <Typography.Text data-testid="customers-reset-token" code copyable style={{ fontSize: 14 }}>
-                {reset.reset_token}
-              </Typography.Text>
-              <Typography.Text type="secondary">
-                有效期至 {whenText(reset.expires_at)}；用过一次即失效。平台不发邮件，请用你与客户
-                已有的渠道转交。
-              </Typography.Text>
-            </Flex>
-          }
-        />
-      ) : null}
-
       <Panel
         title="开户"
         description="不填账户标识就新建一个空账户；填了就把它配到那个已有账户上（配身份不动余额、密钥与历史）。不填初始口令时，改用重置令牌让客户自己设。"
@@ -86,9 +69,9 @@ export function CustomersPage({ client }: { client: AdminClient }) {
                 values.password || undefined,
                 values.accountId?.trim() || undefined,
               );
-              setSelected(created);
               message.success(`已开户：${created.email}`);
-              customers.reload();
+              // 开完直接进这个客户的详情页：签发重置令牌是运营的下一步。
+              onOpenCustomer(created.customer_id);
             } catch (failure) {
               message.error(failure instanceof Error ? failure.message : String(failure));
             } finally {
@@ -238,7 +221,7 @@ export function CustomersPage({ client }: { client: AdminClient }) {
                   <Button
                     data-testid="customers-open-detail"
                     size="small"
-                    onClick={() => setSelected(customer)}
+                    onClick={() => onOpenCustomer(customer.customer_id)}
                   >
                     详情
                   </Button>
@@ -248,55 +231,143 @@ export function CustomersPage({ client }: { client: AdminClient }) {
           ]}
         />
       </Panel>
+    </ConsolePage>
+  );
+}
 
-      {selected ? (
-        <Card
-          title={`客户 ${selected.email}`}
-          extra={
-            <Button type="text" onClick={() => setSelected(null)}>
-              收起
-            </Button>
+/// 一个客户的详情页：按地址里的客户标识**独立取数**，不依赖刚才那次查找或开户的响应。
+///
+/// 关联账户是通往账户详情的入口——运营无须复制标识再查一次。重置令牌的明文只在这次签发后的提示里
+/// 出现；关闭提示、离开详情或刷新即随组件卸载消失（Spec M5、C12）。
+export function CustomerDetailPage({
+  client,
+  customerId,
+  onBack,
+  onOpenAccount,
+}: {
+  client: AdminClient;
+  customerId: string;
+  onBack: () => void;
+  onOpenAccount: (accountId: string) => void;
+}) {
+  const { message } = AntApp.useApp();
+  const [reset, setReset] = useState<{ reset_token: string; expires_at: string } | null>(null);
+  const [busy, setBusy] = useState(false);
+
+  const customer = useLoadable(() => client.customerView(customerId), [client, customerId]);
+  const accountId = customer.data?.account_id ?? null;
+
+  // 400 是地址里的标识不成形、404 是客户不在了：两条都显示找不到，不把上一个客户的资料留在屏幕上。
+  if (customer.status === 404 || customer.status === 400) {
+    return <ConsoleNotFound what="客户" onBack={onBack} />;
+  }
+
+  return (
+    <ConsolePage
+      title="客户详情"
+      hint="这一个客户的登录身份、关联账户与重置令牌"
+      error={customer.error}
+      loading={customer.loading}
+      onReload={customer.reload}
+      extra={
+        <Button icon={<ArrowLeftOutlined />} data-testid="customers-back-to-list" onClick={onBack}>
+          返回列表
+        </Button>
+      }
+    >
+      {reset ? (
+        <Alert
+          type="warning"
+          showIcon
+          closable
+          onClose={() => setReset(null)}
+          message="重置令牌——只显示这一次，当场转交客户"
+          description={
+            <Flex vertical gap={4}>
+              <Typography.Text data-testid="customers-reset-token" code copyable style={{ fontSize: 14 }}>
+                {reset.reset_token}
+              </Typography.Text>
+              <Typography.Text type="secondary">
+                有效期至 {whenText(reset.expires_at)}；用过一次即失效。平台不发邮件，请用你与客户
+                已有的渠道转交。
+              </Typography.Text>
+            </Flex>
           }
-        >
-          <Descriptions
-            size="small"
-            bordered
-            column={{ xs: 1, sm: 2 }}
-            items={[
-              { key: 'email', label: '邮箱', children: selected.email },
-              {
-                key: 'account',
-                label: '账户',
-                children: (
-                  <Typography.Text code copyable>
-                    {selected.account_id}
-                  </Typography.Text>
-                ),
-              },
-              { key: 'last', label: '上次登录', children: whenText(selected.last_login_at) },
-            ]}
-          />
-          <Space style={{ marginTop: 16 }} wrap>
-            <Button
-              data-testid="customers-issue-reset"
-              icon={<KeyOutlined />}
-              onClick={async () => {
-                try {
-                  setReset(await client.issueCustomerPasswordReset(selected.account_id));
-                  message.success('已签发一次性重置令牌');
-                } catch (failure) {
-                  message.error(failure instanceof Error ? failure.message : String(failure));
-                }
-              }}
-            >
-              签发重置令牌
-            </Button>
-            <Typography.Text type="secondary">
-              客户忘了口令时用这个；平台不发邮件，令牌要靠你转交。
-            </Typography.Text>
-          </Space>
-        </Card>
+        />
       ) : null}
+
+      <Panel title="客户" description="客户是登录身份：一个邮箱指向一个账户。">
+        <Descriptions
+          size="small"
+          bordered
+          column={{ xs: 1, sm: 2 }}
+          items={[
+            {
+              key: 'email',
+              label: '邮箱',
+              children: (
+                <Typography.Text data-testid="customers-detail-email">
+                  {customer.data?.email ?? '—'}
+                </Typography.Text>
+              ),
+            },
+            {
+              key: 'account',
+              label: '关联账户',
+              children: accountId ? (
+                <Space>
+                  <Typography.Text code copyable style={{ fontSize: 12 }}>
+                    {accountId}
+                  </Typography.Text>
+                  <Button
+                    size="small"
+                    data-testid="customers-open-account"
+                    onClick={() => onOpenAccount(accountId)}
+                  >
+                    进入账户详情
+                  </Button>
+                </Space>
+              ) : (
+                '—'
+              ),
+            },
+            {
+              key: 'created',
+              label: '创建时间',
+              children: whenText(customer.data?.created_at ?? null),
+            },
+            {
+              key: 'last',
+              label: '上次登录',
+              children: whenText(customer.data?.last_login_at ?? null),
+            },
+          ]}
+        />
+        <Space style={{ marginTop: 16 }} wrap>
+          <Button
+            data-testid="customers-issue-reset"
+            icon={<KeyOutlined />}
+            loading={busy}
+            onClick={async () => {
+              if (!customer.data) return;
+              setBusy(true);
+              try {
+                setReset(await client.issueCustomerPasswordReset(customer.data.account_id));
+                message.success('已签发一次性重置令牌');
+              } catch (failure) {
+                message.error(failure instanceof Error ? failure.message : String(failure));
+              } finally {
+                setBusy(false);
+              }
+            }}
+          >
+            签发重置令牌
+          </Button>
+          <Typography.Text type="secondary">
+            客户忘了口令时用这个；平台不发邮件，令牌要靠你转交。
+          </Typography.Text>
+        </Space>
+      </Panel>
     </ConsolePage>
   );
 }

@@ -1,4 +1,5 @@
 import { createContext, useCallback, useContext, useMemo, useState, type ReactNode } from 'react';
+import { clearScreenState } from './screen-state';
 
 /// 管理端会话的存放位置。
 ///
@@ -26,6 +27,8 @@ export function AdminSessionProvider({ children }: { children: ReactNode }) {
   );
 
   const signIn = useCallback((next: string, nextEmail: string) => {
+    // 上一次的列表查找条件属于上一个人：换人登录就从干净的状态开始（设计 0011 §4.4.1）。
+    clearScreenState();
     sessionStorage.setItem(TOKEN_KEY, next);
     sessionStorage.setItem(`${TOKEN_KEY}.email`, nextEmail);
     setToken(next);
@@ -33,6 +36,7 @@ export function AdminSessionProvider({ children }: { children: ReactNode }) {
   }, []);
 
   const signOut = useCallback(() => {
+    clearScreenState();
     sessionStorage.removeItem(TOKEN_KEY);
     sessionStorage.removeItem(`${TOKEN_KEY}.email`);
     setToken(null);
