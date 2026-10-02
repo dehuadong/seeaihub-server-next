@@ -52,6 +52,7 @@
 | POST | `/api/v1/accounts` | `create_account` | 管理员（`ADMIN_TOKEN`） |
 | GET | `/api/v1/accounts` | `list_accounts` | 管理员（**列账户**：按创建时间倒序，可按 `tag` 精确或 `email`（大小写不敏感）收窄，两个条件是「与」。列表项带绑定的登录邮箱（没有登录身份时为 `null`）与余额；没有登录身份的账户也在列表里。只读、不写审计、不读缓存） |
 | GET | `/api/v1/accounts/{account_id}` | `read_account_balance` | 管理员（读余额与写入时刻；**读数据库那一行，不读缓存**：缓存可能滞后、也可能来自对账覆盖，用它当答案会把账实不符读成账实相符。账户不存在是 404） |
+| GET | `/api/v1/accounts/{account_id}/summary` | `read_account_summary` | 管理员（按账户标识读既有 `AccountSummary`，账户详情页直达与刷新用；金额仍由余额那条读给。不存在是 404） |
 | POST | `/api/v1/accounts/{account_id}/credits` | `credit_account` | 管理员 |
 | POST | `/api/v1/accounts/{account_id}/ledger-audit` | `trigger_ledger_audit` | 管理员（按账户触发一次账实核对：核对**在后台任务里跑**，触发即返回 202；发现不一致只建账户级案例并告警，不改账。它**没有默认周期**） |
 | GET | `/api/v1/accounts/{account_id}/entries` | `list_account_entries` | 管理员（账目流水：**时间倒序**，`since` 是 RFC3339 的增量起点（不含）、`until` 是上界（不含）、`offset` 翻页、`limit` 截断（缺省 100）；响应带 `count`（本页条数）与 `total`（同一区间条件下的总条数），`truncated` 表示"这个位置之后还有没有更多"。每条带 `kind`（`credit` / `capture` / `adjustment` / `cost`，与账本存储取值同名；预授权不进流水）与金额（人民币微单位，**正负号有语义**）。读 `ledger.entries`、**不读缓存**；**只读**——不改状态、不写审计。账户不存在 404，与"还没有流水"（空数组）分开） |
@@ -77,6 +78,7 @@
 | PUT | `/api/v1/admin/password` | `change_admin_password` | **仅会话**（需当前口令；成功后该管理员**全部**会话失效） |
 | POST | `/api/v1/admin/password-resets`、`…/redeem` | 签发 / 兑换重置令牌 | 前者认会话或共享令牌（运维自救入口），后者**无需凭据**——口令重置的意义就是"进不去了"；令牌一次性、只存摘要 |
 | POST / GET | `/api/v1/customers`、`/api/v1/customers/{…}` | `open_customer`、`list_customers` | 管理员（替客户开户：新建账户或给**已有账户**配登录身份；按邮箱找账户，给客户充值/签重置令牌都要那个标识） |
+| GET | `/api/v1/customers/{customer_id}` | `read_customer_view` | 管理员（按客户标识读既有 `CustomerView`，客户详情页直达与刷新用；不含口令、会话与令牌。不存在是 404） |
 | POST | `/api/v1/accounts/{account_id}/password-reset` | `issue_customer_password_reset` | 管理员（为客户账户签一次性重置令牌；该账户没有登录身份时 404） |
 | GET | `/api/v1/fx-rates` | `list_fx_rates` | 管理员（每个币种**当前生效**的那一行，供折算率页显示录入结果） |
 | POST | `/v1/customers`、`/v1/customer/sessions` | `register_customer`、`login_customer` | 公开（客户自助注册与登录） |
