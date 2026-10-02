@@ -99,6 +99,8 @@
 | `POST` | `/api/v1/admin/password-resets/redeem` | 无（凭令牌） | `{reset_token, new_password}` | `204`；令牌无效/过期/已用 `400 invalid_parameter`；成功后删掉该管理员全部会话 |
 | `POST` | `/api/v1/customers` | 管理员 | `{email, password?, account_id?}` | `201 {customer_id, email, account_id}`（**替客户开户**：不给 `account_id` 就新建一个空账户；给了就把登录身份配到那个已有账户上。邮箱或账户已被绑定 `409 conflict`；`password` 缺省时不设初始口令，改用重置令牌让客户自己设） |
 | `GET` | `/api/v1/customers` | 管理员 | `?email=&limit=` | `200 {customers:[{customer_id, email, account_id, created_at, last_login_at}]}`（**按邮箱找客户账户**：`email` 精确匹配、大小写不敏感，缺省按创建时间倒序列最近若干条；**不含口令哈希、会话与余额**——余额按 `account_id` 走既有的 `GET /api/v1/accounts/{id}`） |
+| `GET` | `/api/v1/accounts/{account_id}/summary` | 管理员 | — | `200 {account_id, balance_microusd, tag, email, created_at, updated_at}`（**按标识读账户摘要**，账户详情直达与刷新用；账户不存在 `404`。持有中与可用额仍走既有的 `GET /api/v1/accounts/{id}`，页面不重算金额） |
+| `GET` | `/api/v1/customers/{customer_id}` | 管理员 | — | `200 {customer_id, email, account_id, created_at, last_login_at}`（**按标识读客户视图**，客户详情直达与刷新用；客户不存在 `404`。不含口令、会话、API Key 明文与重置令牌） |
 | `POST` | `/api/v1/accounts/{account_id}/password-reset` | 管理员 | — | `201 {reset_token, expires_at}`（运营为客户账户签发重置令牌，写审计；那个账户没有邮箱登录身份时 `404`） |
 | `GET` | `/api/v1/fx-rates` | 管理员 | — | `200 {rates:[{currency, rate_micros, effective_at}]}`（折算率页要显示"当前录入结果"，今天只有 `PUT`） |
 
@@ -172,7 +174,7 @@
 | M2 发布修订 | `POST /api/v1/runtime-revisions` |
 | M3 折算率 | `GET/PUT /api/v1/fx-rates`（`GET` 为本次新增） |
 | M4 路由策略 | `GET/PUT /api/v1/route-policies` |
-| M5 账户与密钥 | `POST /api/v1/accounts`；`GET /api/v1/accounts`（列账户，供"先搜到再操作"——见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；`GET /api/v1/accounts/{id}`；`GET /api/v1/accounts/{id}/entries`；`POST /api/v1/accounts/{id}/credits`；`PUT /api/v1/accounts/{id}/tag`；`POST /api/v1/accounts/{id}/api-keys`；`DELETE /api/v1/api-keys/{key_id}`；`POST /api/v1/customers`（替客户开户）；`GET /api/v1/customers`（按邮箱找客户账户）；`POST /api/v1/accounts/{id}/password-reset`（为客户账户签发重置令牌） |
+| M5 账户与密钥 | `POST /api/v1/accounts`；`GET /api/v1/accounts`（列账户，供"先搜到再操作"——见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；`GET /api/v1/accounts/{id}`；`GET /api/v1/accounts/{id}/summary`（按标识读账户摘要，账户详情直达与刷新）；`GET /api/v1/accounts/{id}/entries`；`POST /api/v1/accounts/{id}/credits`；`PUT /api/v1/accounts/{id}/tag`；`POST /api/v1/accounts/{id}/api-keys`；`DELETE /api/v1/api-keys/{key_id}`；`POST /api/v1/customers`（替客户开户）；`GET /api/v1/customers`（按邮箱找客户账户）；`GET /api/v1/customers/{id}`（按标识读客户视图，客户详情直达与刷新）；`POST /api/v1/accounts/{id}/password-reset`（为客户账户签发重置令牌） |
 | M6 对账与诊断 | `GET /api/v1/reconciliation-cases`；`POST /api/v1/reconciliation-cases/{job_id}/refund`；`GET /api/v1/provider-failures`；`GET /api/v1/provider-cost-gaps` |
 | 管理员登录/退出/改口令/重置 | §4.1 的六条 |
 | C5 密钥自助 | §4.2 的 `api-keys` 三条 |
