@@ -1,7 +1,7 @@
 主题: 身份与控制台的技术设计
 当前修订: v1
 状态: 待评审
-承接: [`0001` 控制台 Spec v14](../specs/0001-admin-and-customer-consoles.md) 的身份与双入口产物；账户金额及账单行为由 [`0002` 账户资金 Spec v3](../specs/0002-account-funds-and-reservations.md) 承接，客户独立页面由 [`0014`](0014-customer-console-navigation-and-history.md) 承接
+承接: [`0001` 控制台 Spec v15](../specs/0001-admin-and-customer-consoles.md) 的身份与双入口产物；账户金额及账单行为由 [`0002` 账户资金 Spec v3](../specs/0002-account-funds-and-reservations.md) 承接，客户独立页面由 [`0014`](0014-customer-console-navigation-and-history.md) 承接
 依赖: [`docs/design/0006`](./0006-gateway-models-and-consumer-surface.md)、[`0007`](./0007-pricing-floor-and-settlement.md)、[`0008`](./0008-routing-strategy-and-caching.md)、[`0009`](./0009-operational-baseline.md)；`ADR-0003`、`ADR-0015`、`ADR-0016`、`ADR-0017`
 
 # 身份与控制台的技术设计

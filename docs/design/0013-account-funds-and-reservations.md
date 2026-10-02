@@ -83,7 +83,7 @@ Job 上增加终态时刻；成功结算的终态时刻与 `capture.created_at` 
 
 ## 6. 与现行文档和代码的交接
 
-[`0001` 控制台 Spec](../specs/0001-admin-and-customer-consoles.md) v14 与本 RFC 使用同一客户金额语义；[`0007`](0007-pricing-floor-and-settlement.md) 继续负责保底额与价格计算，[`0008`](0008-routing-strategy-and-caching.md) 继续负责路由及非账务缓存，[`0009`](0009-operational-baseline.md) 负责运维入口，[`0010`](0010-identity-and-consoles.md) 负责身份与控制台读，[`0011`](0011-console-information-architecture.md) 负责管理端页面组织，[`0014`](0014-customer-console-navigation-and-history.md) 负责客户页面组织与历史浏览。账户资金写法、Redis 余额快照与账实核查由本 RFC 统一承接。
+[`0001` 控制台 Spec](../specs/0001-admin-and-customer-consoles.md) v15 与本 RFC 使用同一客户金额语义；[`0007`](0007-pricing-floor-and-settlement.md) 继续负责保底额与价格计算，[`0008`](0008-routing-strategy-and-caching.md) 继续负责路由及非账务缓存，[`0009`](0009-operational-baseline.md) 负责运维入口，[`0010`](0010-identity-and-consoles.md) 负责身份与控制台读，[`0011`](0011-console-information-architecture.md) 负责管理端页面组织，[`0014`](0014-customer-console-navigation-and-history.md) 负责客户页面组织与历史浏览。账户资金写法、Redis 余额快照与账实核查由本 RFC 统一承接。
 
 没有已上线账务数据需要转换。实现采用新建或调整数据库迁移并以干净开发库验证完整迁移链，不对已应用的迁移文件做历史改写，也不承担旧流水回填。账户页面布局工作与本方案的金额语义改动分别验收。
 
