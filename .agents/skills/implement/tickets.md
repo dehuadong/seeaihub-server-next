@@ -88,6 +88,7 @@ This may include:
 - Proposal
 - PRD
 - Spec
+- Agent Note
 - RFC
 - ADRs
 - project constraints
