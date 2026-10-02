@@ -8,10 +8,11 @@ use super::*;
 use crate::{
     AcceptanceProbe, AccountSummary, ActiveOfferingChannel, AlertSink, ApiKeyView, AttemptFailure,
     BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery, CustomerBillingSummary,
-    CustomerUsageView, CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry,
-    NewFxRate, ProviderCostGapView, ProviderFailureQuery, ProviderFailureView,
-    PublishRuntimeRequest, ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand,
-    RoutingDecision, SelectableOfferingView, UnacceptedAttempt,
+    CustomerLedgerQuery, CustomerUsageQuery, CustomerUsageView, CustomerView, GatewayModelView,
+    JobView, LeaseRecovery, LedgerEntry, LedgerPage, NewFxRate, ProviderCostGapView,
+    ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest, ReconciliationCaseView,
+    ReferencedOffering, RefundReconciliationCommand, RoutingDecision, SelectableOfferingView,
+    UnacceptedAttempt,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
@@ -67,8 +68,16 @@ impl HubRepository for AuditRepository {
     async fn customer_usage(
         &self,
         _account_id: AccountId,
-        _query: CustomerBillingQuery,
+        _query: CustomerUsageQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn customer_ledger(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerLedgerQuery,
+    ) -> Result<LedgerPage, ApplicationError> {
         unused_repository()
     }
 

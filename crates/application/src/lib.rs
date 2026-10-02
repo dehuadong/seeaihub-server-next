@@ -8,14 +8,14 @@ pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ChargeFacts, ConsumerRatesCny, CostBasis,
     CreateImageGeneration, FloorTable, FxRate, GenerationJob, HoldSource, ImageBranch,
-    ImageParameterKind, JobId, JobState, LedgerEntry, MeteringEvidence, OfferingCandidate,
-    OfferingId, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
-    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
-    RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps, apply_parameter_defaults,
-    apply_parameter_renames, apply_size_mapping, carries_parameter, contract_image_parameter_kind,
-    contract_model_identity, declared_defaults, declared_enum_maps, declared_field_names,
-    declared_parameter_names, declared_reference_image_limit, declared_renames,
-    declared_size_mapping, declares_mask_parameter, declares_parameter,
+    ImageParameterKind, JobId, JobState, LedgerEntry, LedgerEntryKind, MeteringEvidence,
+    OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula,
+    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
+    RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps,
+    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
+    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
+    declared_field_names, declared_parameter_names, declared_reference_image_limit,
+    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
     declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
     place_image_inputs, platform_image_parameters, resolve_size_tier, unit_amount_microusd,
     wire_parameter_name,
@@ -65,6 +65,11 @@ pub use retry::{DEFAULT_BACKOFF_BASE_MS, DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECON
 mod cost_ceiling;
 pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
 
+mod history_cursor;
+pub use history_cursor::{
+    CursorPosition, HISTORY_CURSOR_KEY_LEN, HistoryCursor, HistoryFilter, HistoryStream,
+    decode_history_cursor, encode_history_cursor, invalid_history_cursor,
+};
 /// 发布一个 Vendor Model 的供给。
 ///
 /// 一次发布携带该模型**完整、有序**的候选集合（`offerings`，必填且非空）；
@@ -1729,14 +1734,16 @@ pub enum CustomerUsageKind {
 }
 
 /// 把内部 Job 状态收敛成对客取值。
+///
+/// 分流口径是**结果定了没有**，不是"有没有终态时刻"：对账中（`reconciliation_required`）结果还没定，
+/// 对客必须一直看到"处理中"，直到结案（Spec C9）；把它并进 `failed` 会让客户以为这一笔已经失败。
 #[must_use]
 pub fn customer_usage_status(state: seeai_domain::JobState) -> CustomerUsageStatus {
     match state {
         seeai_domain::JobState::Succeeded => CustomerUsageStatus::Succeeded,
-        // 失败与对账中：对客都是"这次没成"。对账终会走向失败或补回，不会对客可见地悬着。
-        seeai_domain::JobState::Failed | seeai_domain::JobState::ReconciliationRequired => {
-            CustomerUsageStatus::Failed
-        }
+        seeai_domain::JobState::Failed => CustomerUsageStatus::Failed,
+        // 对账中不是终态：结果未定，对客显示"处理中"。
+        seeai_domain::JobState::ReconciliationRequired => CustomerUsageStatus::Pending,
         // 取消是终态，不能并进"处理中"。
         seeai_domain::JobState::Canceled => CustomerUsageStatus::Canceled,
         seeai_domain::JobState::Accepted
@@ -1765,6 +1772,51 @@ pub struct CustomerBillingQuery {
     pub since: Option<DateTime<Utc>>,
     pub until: Option<DateTime<Utc>>,
     pub limit: u32,
+}
+
+/// 调用记录要读哪一段：处理中、已结束历史，或两者的合并（不带 `view` 的旧调用）。
+///
+/// 分流判据是**结果定了没有**：处理中包含 `reconciliation_required`（结果未定），已结束是
+/// `succeeded` / `failed` / `canceled` 三种终态。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CustomerUsageScope {
+    All,
+    Active,
+    Completed,
+}
+
+/// 客户调用记录的查询条件。
+///
+/// `after` 只在 `Completed` 下有意义：处理中的请求会变，不承担稳定历史，带游标即参数错误。
+#[derive(Debug, Clone, Copy)]
+pub struct CustomerUsageQuery {
+    pub scope: CustomerUsageScope,
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub after: Option<CursorPosition>,
+    pub limit: u32,
+}
+
+/// 客户真实资金流水的查询条件：区间**半开** `[since, until)`。
+///
+/// `kind` 只接受真实收支类别（`credit` / `capture` / `adjustment`）；预授权与释放不是资金记录。
+/// 类型就是账本的分录类别：调用方先在入口把字符串收成这个枚举，仓储层不必再猜。
+#[derive(Debug, Clone)]
+pub struct CustomerLedgerQuery {
+    pub since: Option<DateTime<Utc>>,
+    pub until: Option<DateTime<Utc>>,
+    pub kind: Option<LedgerEntryKind>,
+    pub after: Option<CursorPosition>,
+    pub limit: u32,
+}
+
+/// 一页真实资金流水：本页条目 + **同一套区间与类别条件下**的总条数。
+///
+/// 总数与逐笔用同一个半开区间谓词算：两者口径不一致时，"还有没有下一页"会在边界那一笔上错位。
+#[derive(Debug, Clone)]
+pub struct LedgerPage {
+    pub entries: Vec<LedgerEntry>,
+    pub total: u64,
 }
 
 /// 管理端看到的**一条客户**：邮箱身份与它指向的账户。
@@ -2423,14 +2475,25 @@ pub trait HubRepository: Send + Sync {
         account_id: AccountId,
     ) -> Result<Vec<ApiKeyView>, ApplicationError>;
 
-    /// 对客用量：该账户在 `[since, until)` 里的每一次生成请求，按时间倒序、最多 `limit` 条。
+    /// 对客用量：按 `query.scope` 读处理中、已结束历史或两者的合并，最多 `limit` 条。
     ///
     /// 投影成对客事实（型号、对客状态、类别、产出张数、扣费金额），**不含 Job 标识与内部状态**。
+    /// 已结束历史按 `(terminal_at, id)` 倒序，`after` 给的是上一页最后一行的位置。
     async fn customer_usage(
         &self,
         account_id: AccountId,
-        query: CustomerBillingQuery,
+        query: CustomerUsageQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError>;
+
+    /// 对客真实资金流水：区间**半开** `[since, until)`、可按类别筛选、按 `(created_at, id)` 倒序，
+    /// `after` 给的是上一页最后一行的位置。
+    ///
+    /// 只读真实收支（`credit` / `capture` / `adjustment`），预授权与释放不出现在这里。
+    async fn customer_ledger(
+        &self,
+        account_id: AccountId,
+        query: CustomerLedgerQuery,
+    ) -> Result<LedgerPage, ApplicationError>;
 
     /// 对客账单汇总：同一区间**全量**的请求数、产出张数与扣费总额。
     ///
@@ -3482,13 +3545,25 @@ impl AccountsService {
         self.repository.held_microusd(account_id).await
     }
 
-    /// 对客用量：`[since, until)` 里的每一次生成请求（对客投影，不含 Job 标识与内部状态）。
+    /// 对客用量：按 `query.scope` 读处理中、已结束历史或两者的合并（对客投影，不含 Job 标识与内部状态）。
     pub async fn customer_usage(
         &self,
         account_id: AccountId,
-        query: CustomerBillingQuery,
+        query: CustomerUsageQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
         self.repository.customer_usage(account_id, query).await
+    }
+
+    /// 对客真实资金流水：区间**半开** `[since, until)`，可按类别筛选，按 `(created_at, id)` 倒序翻页。
+    ///
+    /// 它与管理员那条增量读分开：管理员的 `since` 是开区间（上一次拉到的位置不重复计入），对客这条
+    /// 与账单汇总同为半开，否则边界那一笔会进汇总、不进流水。
+    pub async fn customer_ledger(
+        &self,
+        account_id: AccountId,
+        query: CustomerLedgerQuery,
+    ) -> Result<LedgerPage, ApplicationError> {
+        self.repository.customer_ledger(account_id, query).await
     }
 
     /// 对客账单汇总：同一区间**全量**的请求数、产出张数与扣费总额（不随明细条数上限变化）。

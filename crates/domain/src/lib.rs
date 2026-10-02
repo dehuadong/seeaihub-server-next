@@ -294,6 +294,9 @@ impl LedgerEntryKind {
 /// 它是账本行的**只读投影**：金额与余额的权威都是账本本身，流水不改写它们。
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct LedgerEntry {
+    /// 账本行的标识。它是**同一时刻多条分录的定序键**（`created_at` 在事务内并列），因此也是历史
+    /// 翻页游标定位的一部分；不进对客响应。
+    pub id: Uuid,
     pub account_id: AccountId,
     pub kind: LedgerEntryKind,
     /// 分录金额（人民币微单位）：持有、扣费与成本为负，释放与调整为正。

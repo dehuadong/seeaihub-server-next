@@ -1033,6 +1033,13 @@ async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
         Value::Null,
         "未完成就没有终态时刻：{usage}"
     );
+    // 结果还没定、仍需对账的请求，对客要显示"处理中"（Spec C9）：并进"未产出"会让客户以为这一笔
+    // 已经失败，而它还可能补回成功。
+    assert_eq!(
+        row["status"],
+        json!("pending"),
+        "对账中的请求对客显示处理中：{usage}"
+    );
     assert_eq!(
         row["charged_microusd"],
         json!(0),

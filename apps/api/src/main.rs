@@ -13,19 +13,22 @@ use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
-    CachePolicy, CreateImageGenerationRequest, CustomerBillingQuery, CustomerUsageKind,
+    CachePolicy, CreateImageGenerationRequest, CursorPosition, CustomerBillingQuery,
+    CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope,
     CustomerUsageStatus, CustomerView, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
-    GenerationRateLimit, GenerationService, HubRepository, IdentityService, JobView, LedgerAuditor,
-    LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate,
-    PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand, ReconciliationService,
-    RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy, RoutePolicyService,
-    RuntimeService, SelectableOfferingView, with_admin_id,
+    GenerationRateLimit, GenerationService, HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream,
+    HubRepository, IdentityService, JobView, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
+    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
+    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
+    RoutePolicyService, RuntimeService, SelectableOfferingView, decode_history_cursor,
+    encode_history_cursor, invalid_history_cursor, with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
-    AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, OfferingId, PublishedModel,
-    RoutePolicy, RouteStrategy, contract_image_parameter_kind, replace_contract_model_identity,
+    AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, LedgerEntryKind, OfferingId,
+    PublishedModel, RoutePolicy, RouteStrategy, contract_image_parameter_kind,
+    replace_contract_model_identity,
 };
 use seeai_persistence::{
     PgHubRepository, material_import::import_supply_materials_from_env, max_declared_output_images,
@@ -61,6 +64,9 @@ struct AppState {
     session_ttl: ChronoDuration,
     /// 口令重置令牌的有效期：比会话更短，缺省 30 分钟。
     password_reset_ttl: ChronoDuration,
+    /// 客户历史翻页游标的加密密钥：部署期配置，同一部署的所有 API 实例必须一致；缺失或格式无效时
+    /// 进程启动失败（`docs/design/0014-customer-console-navigation-and-history.md` §5）。
+    history_cursor_key: [u8; HISTORY_CURSOR_KEY_LEN],
 }
 
 impl AppState {
@@ -234,6 +240,7 @@ async fn main() -> Result<()> {
         // 会话与重置令牌的有效期：部署期取值（缺省 12 小时 / 30 分钟）。
         session_ttl: session_ttl()?,
         password_reset_ttl: password_reset_ttl()?,
+        history_cursor_key: history_cursor_key()?,
     };
     // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
     seed_admin_account(&state).await?;
@@ -827,7 +834,17 @@ async fn list_account_usage(
     let billing = query.billing_query();
     let usage = state
         .accounts
-        .customer_usage(AccountId(account_id), billing)
+        .customer_usage(
+            AccountId(account_id),
+            // 管理员这条读是**合并视图**（处理中与已结束都在），与对客页面的分流是两回事。
+            CustomerUsageQuery {
+                scope: CustomerUsageScope::All,
+                since: billing.since,
+                until: billing.until,
+                after: None,
+                limit: billing.limit,
+            },
+        )
         .await?
         .into_iter()
         .map(|row| AdminUsageRow {
@@ -1432,11 +1449,30 @@ struct CustomerUsageResponse {
     usage: Vec<CustomerUsageRow>,
     count: usize,
     truncated: bool,
+    /// 下一页的不透明定位；没有下一页时为 `null`。只在 `view=completed` 下可能非空。
+    next_cursor: Option<String>,
+}
+
+/// 对客资金流水的响应：与管理员那条同形，外加翻页定位。
+///
+/// 单开一个类型而不是给管理员的 `AccountEntriesResponse` 加字段：管理员那条的响应形状是既有合同，
+/// 不因为对客要翻页而改变。
+#[derive(Debug, Serialize)]
+struct CustomerLedgerResponse {
+    entries: Vec<LedgerEntryView>,
+    count: usize,
+    /// 同一套区间与类别条件下的总条数（与 `count` 不同：本页条数）。
+    total: u64,
+    truncated: bool,
+    /// 下一页的不透明定位；没有下一页时为 `null`。
+    next_cursor: Option<String>,
 }
 
 const DEFAULT_CUSTOMER_LEDGER_LIMIT: u32 = 100;
 
-/// 对客账务读的查询参数：`since` / `until` 是 RFC3339，区间**半开** `[since, until)`、按 UTC 解释。
+/// 对客账单汇总的查询参数：`since` / `until` 是 RFC3339，区间**半开** `[since, until)`、按 UTC 解释。
+///
+/// 汇总不吃 `view`/`kind`/`cursor`：它按整段区间全量算，与逐笔列表的翻页无关（Spec C10）。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct CustomerBillingQueryParams {
@@ -1451,12 +1487,92 @@ impl CustomerBillingQueryParams {
         CustomerBillingQuery {
             since: self.since,
             until: self.until,
-            limit: self
-                .limit
-                .unwrap_or(DEFAULT_CUSTOMER_LEDGER_LIMIT)
-                .clamp(1, MAX_OPERATIONAL_LIMIT),
+            limit: clamp_customer_limit(self.limit),
         }
     }
+}
+
+/// 对客调用记录的查询参数：窗口 + 视图 + 游标。
+///
+/// `view` 缺省是处理中与已结束的**合并**（不带新参数的旧调用）；`cursor` 只在 `view=completed` 下
+/// 有意义——处理中的请求会变，不承担稳定历史。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerUsageQueryParams {
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    limit: Option<u32>,
+    view: Option<String>,
+    cursor: Option<String>,
+}
+
+/// 对客真实资金流水的查询参数：窗口 + 类别 + 游标。
+#[derive(Debug, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CustomerLedgerQueryParams {
+    since: Option<DateTime<Utc>>,
+    until: Option<DateTime<Utc>>,
+    limit: Option<u32>,
+    kind: Option<String>,
+    cursor: Option<String>,
+}
+
+/// 对客历史流水能筛的类别。**不含 `hold`/`release`**（预授权不是资金记录）与 `cost`（平台成本不是
+/// 客户的事实）（Spec C8、V-C15）。取值就是账本的分录类别，入口只做一次收窄。
+const CUSTOMER_LEDGER_KINDS: [LedgerEntryKind; 3] = [
+    LedgerEntryKind::Credit,
+    LedgerEntryKind::Capture,
+    LedgerEntryKind::Adjustment,
+];
+
+fn clamp_customer_limit(limit: Option<u32>) -> u32 {
+    limit
+        .unwrap_or(DEFAULT_CUSTOMER_LEDGER_LIMIT)
+        .clamp(1, MAX_OPERATIONAL_LIMIT)
+}
+
+/// 把 `view` 翻成用例层的视图；未知取值拒而不是静默当成缺省。
+fn customer_usage_scope(view: Option<&str>) -> Result<CustomerUsageScope, ApiError> {
+    match view {
+        None => Ok(CustomerUsageScope::All),
+        Some("active") => Ok(CustomerUsageScope::Active),
+        Some("completed") => Ok(CustomerUsageScope::Completed),
+        Some(value) => Err(ApiError::bad_request(
+            "invalid_view",
+            format!("unknown usage view {value}; expected active or completed"),
+        )),
+    }
+}
+
+/// 把游标解成位置，并核对它**确实属于这次查询**：筛选面逐项相同才作数。
+///
+/// 解码失败、密钥不对、或与当前账户/区间/类别不符，一律按参数错误回——不静默从首页重查（那会让客户
+/// 看到重复的第一页而不知道发生了什么）。
+fn decode_cursor(
+    state: &AppState,
+    token: &str,
+    filter: &HistoryFilter,
+) -> Result<CursorPosition, ApiError> {
+    let cursor = decode_history_cursor(&state.history_cursor_key, token)?;
+    if !cursor.matches(filter) {
+        return Err(invalid_history_cursor().into());
+    }
+    Ok(cursor.position)
+}
+
+/// 给一页的最后一行编出下一页的游标。没有下一页时是 `None`。
+fn next_cursor(
+    state: &AppState,
+    filter: &HistoryFilter,
+    position: Option<CursorPosition>,
+) -> Result<Option<String>, ApiError> {
+    let Some(position) = position else {
+        return Ok(None);
+    };
+    Ok(Some(encode_history_cursor(
+        &state.history_cursor_key,
+        &filter.cursor_at(position),
+    )?))
 }
 
 /// 对客读自己的已结算余额、持有中与可用额（`GET /v1/customer/account`）。
@@ -1479,53 +1595,158 @@ async fn read_customer_account(
 }
 
 /// 对客读自己的账目流水（`GET /v1/customer/ledger`）：充值与扣费都在这里，金额带符号。
+///
+/// 区间**半开** `[since, until)`（与账单汇总同一条口径）；可按类别筛选；按 `(created_at, id)` 倒序，
+/// `cursor` 是上一页最后一行给的不透明定位。不带新参数时参数面与响应字段与旧调用一致。
 async fn read_customer_ledger(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CustomerBillingQueryParams>,
-) -> Result<Json<AccountEntriesResponse>, ApiError> {
+    Query(query): Query<CustomerLedgerQueryParams>,
+) -> Result<Json<CustomerLedgerResponse>, ApiError> {
     let (_, account_id) = state.require_customer(&headers).await?;
-    let billing = query.billing_query();
     let account = AccountId(account_id);
-    let entries = state
+    let kind = match query.kind.as_deref() {
+        None => None,
+        Some(value) => match LedgerEntryKind::parse(value) {
+            Some(kind) if CUSTOMER_LEDGER_KINDS.contains(&kind) => Some(kind),
+            _ => {
+                return Err(ApiError::bad_request(
+                    "invalid_kind",
+                    format!(
+                        "unknown ledger entry kind {value}; expected one of {}",
+                        CUSTOMER_LEDGER_KINDS
+                            .iter()
+                            .map(|kind| kind.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ")
+                    ),
+                ));
+            }
+        },
+    };
+    let limit = clamp_customer_limit(query.limit);
+    let filter = HistoryFilter {
+        stream: HistoryStream::Ledger,
+        account_id: account,
+        since: query.since,
+        until: query.until,
+        kind: kind.map(|kind| kind.as_str().to_owned()),
+    };
+    let after = match query.cursor.as_deref() {
+        Some(token) => Some(decode_cursor(&state, token, &filter)?),
+        None => None,
+    };
+    // 多取一行判断"还有没有下一页"：比拿总数减本页条数更准，也不怕条数正好整除。
+    let page = state
         .accounts
-        .read_entries(
+        .customer_ledger(
             account,
-            billing.since,
-            billing.until,
-            None,
-            0,
-            billing.limit,
+            CustomerLedgerQuery {
+                since: filter.since,
+                until: filter.until,
+                kind,
+                after,
+                limit: limit.saturating_add(1),
+            },
         )
-        .await?
+        .await?;
+    let has_more = page.entries.len() > limit as usize;
+    let mut entries = page.entries;
+    if has_more {
+        entries.truncate(limit as usize);
+    }
+    let cursor = if has_more {
+        next_cursor(
+            &state,
+            &filter,
+            entries.last().map(|entry| CursorPosition {
+                at: entry.created_at,
+                id: entry.id,
+            }),
+        )?
+    } else {
+        None
+    };
+    let views = entries
         .into_iter()
         .map(LedgerEntryView::from)
         .collect::<Vec<_>>();
-    let total = state
-        .accounts
-        .count_entries(account, billing.since, billing.until, None)
-        .await?;
-    Ok(Json(AccountEntriesResponse {
-        count: entries.len(),
-        total,
-        // 对客这条读不带 `offset`，所以"还有更多"只可能是被 `limit` 截断。
-        truncated: (entries.len() as u64) < total,
-        entries,
+    Ok(Json(CustomerLedgerResponse {
+        count: views.len(),
+        total: page.total,
+        truncated: cursor.is_some(),
+        next_cursor: cursor,
+        entries: views,
     }))
 }
 
 /// 对客读自己的用量（`GET /v1/customer/usage`）：每一次生成请求一行，**不含任务标识与内部状态**。
+///
+/// `view=active` 是可刷新的处理中列表（不承担稳定历史，带游标即参数错误）；`view=completed` 是已结束
+/// 历史，按 `(terminal_at, id)` 倒序翻页；不带 `view` 时是两者的合并（旧调用）。
 async fn read_customer_usage(
     State(state): State<AppState>,
     headers: HeaderMap,
-    Query(query): Query<CustomerBillingQueryParams>,
+    Query(query): Query<CustomerUsageQueryParams>,
 ) -> Result<Json<CustomerUsageResponse>, ApiError> {
     let (_, account_id) = state.require_customer(&headers).await?;
-    let billing = query.billing_query();
-    let usage = state
+    let account = AccountId(account_id);
+    let scope = customer_usage_scope(query.view.as_deref())?;
+    let limit = clamp_customer_limit(query.limit);
+    let filter = HistoryFilter {
+        stream: HistoryStream::UsageCompleted,
+        account_id: account,
+        since: query.since,
+        until: query.until,
+        kind: None,
+    };
+    let after = match (scope, query.cursor.as_deref()) {
+        (CustomerUsageScope::Completed, Some(token)) => {
+            Some(decode_cursor(&state, token, &filter)?)
+        }
+        (CustomerUsageScope::Completed, None) => None,
+        // 处理中的请求会变、合并视图混着两类：都不承担稳定历史，给了游标就是参数错误。
+        (_, Some(_)) => {
+            return Err(ApiError::bad_request(
+                "invalid_cursor",
+                "cursor is only valid with view=completed".to_owned(),
+            ));
+        }
+        (_, None) => None,
+    };
+    let rows = state
         .accounts
-        .customer_usage(AccountId(account_id), billing)
-        .await?
+        .customer_usage(
+            account,
+            CustomerUsageQuery {
+                scope,
+                since: filter.since,
+                until: filter.until,
+                after,
+                limit: limit.saturating_add(1),
+            },
+        )
+        .await?;
+    let has_more = rows.len() > limit as usize;
+    let mut rows = rows;
+    if has_more {
+        rows.truncate(limit as usize);
+    }
+    let cursor = if has_more && scope == CustomerUsageScope::Completed {
+        next_cursor(
+            &state,
+            &filter,
+            rows.last().and_then(|row| {
+                row.terminal_at.map(|at| CursorPosition {
+                    at,
+                    id: row.job_id.0,
+                })
+            }),
+        )?
+    } else {
+        None
+    };
+    let usage = rows
         .into_iter()
         .map(|row| CustomerUsageRow {
             gateway_model: row.gateway_model,
@@ -1539,7 +1760,8 @@ async fn read_customer_usage(
         .collect::<Vec<_>>();
     Ok(Json(CustomerUsageResponse {
         count: usage.len(),
-        truncated: usage.len() as u32 == billing.limit,
+        truncated: has_more,
+        next_cursor: cursor,
         usage,
     }))
 }
@@ -2572,6 +2794,24 @@ fn required_env(name: &str) -> Result<String> {
         .ok()
         .filter(|value| !value.trim().is_empty())
         .with_context(|| format!("missing environment {name}"))
+}
+
+/// 客户历史翻页游标的加密密钥：32 字节的 base64。
+///
+/// **必须配**：游标是加密载荷，没有密钥就给不出也解不开下一页。缺失或格式无效时**启动失败**并点名
+/// 配置，而不是等到客户翻第二页才报错。密钥只从环境变量读，不进仓库、日志或响应；换密钥会让旧游标
+/// 失效（页面重新查询即可）。
+fn history_cursor_key() -> Result<[u8; HISTORY_CURSOR_KEY_LEN]> {
+    let raw = required_env("CUSTOMER_HISTORY_CURSOR_KEY")?;
+    let decoded = STANDARD
+        .decode(raw.trim())
+        .context("CUSTOMER_HISTORY_CURSOR_KEY must be base64")?;
+    decoded.as_slice().try_into().with_context(|| {
+        format!(
+            "CUSTOMER_HISTORY_CURSOR_KEY must decode to {HISTORY_CURSOR_KEY_LEN} bytes (got {})",
+            decoded.len()
+        )
+    })
 }
 
 /// 预授权额（microusd）。**服务端定，不由调用方自报**——现状是一个固定数（默认 $0.02），

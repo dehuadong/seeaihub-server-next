@@ -3,13 +3,14 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     AcceptanceProbe, AccountSummary, ActiveOfferingChannel, ApiKeyView, ApplicationError,
     AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery,
-    CustomerBillingSummary, CustomerUsageKind, CustomerUsageView, CustomerView,
-    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LeaseRecovery, LedgerMismatch, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
-    PricePlanRates, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
-    ReferencedOffering, RefundReconciliationCommand, RoutingDecision, SelectableOfferingView,
-    UnacceptedAttempt, customer_usage_status, declared_output_images,
+    CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery,
+    CustomerUsageScope, CustomerUsageView, CustomerView, GatewayModelCandidateView,
+    GatewayModelView, HoldDisposition, HubRepository, JobView, LeaseRecovery, LedgerMismatch,
+    LedgerPage, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates,
+    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, ReferencedOffering,
+    RefundReconciliationCommand, RoutingDecision, SelectableOfferingView, UnacceptedAttempt,
+    customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -36,6 +37,10 @@ pub mod material_import;
 /// 会被一边算进去、另一边不算。
 const LEDGER_RANGE_PREDICATE: &str =
     "($2::timestamptz IS NULL OR created_at > $2) AND ($3::timestamptz IS NULL OR created_at < $3)";
+
+/// **对客资金流水只认这三类**：`hold` / `release` 是预授权机制，`cost` 是平台成本——都不是客户的事实
+/// （Spec C8、V-C15）。抽成一处是为了无论调用方给不给 `kind`，这条读都不会漏出预授权行。
+const CUSTOMER_ENTRY_KINDS_PREDICATE: &str = "kind IN ('credit', 'capture', 'adjustment')";
 
 /// **唯一的候选可用性判据**：这条候选现在真的能走吗——它自己启用，且它所在的渠道也启用。
 ///
@@ -1344,11 +1349,53 @@ impl HubRepository for PgHubRepository {
     async fn customer_usage(
         &self,
         account_id: AccountId,
-        query: CustomerBillingQuery,
+        query: CustomerUsageQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
         // 已完成请求按**终态时刻**归属，处理中请求按**受理时刻**：跨天结算的扣费因此落在结算日。
         // 逐笔扣费只关联该 Job 自己的 `capture`，不再用流水入账时刻筛同一笔（`0013` §5）。
-        let rows = sqlx::query(
+        //
+        // 分流判据是**结果定了没有**（Spec C9）：`reconciliation_required` 结果未定，算处理中；三种
+        // 终态才算已结束。`$5`/`$6` 是上一页的位置，只有已结束历史会给出，别处绑 `NULL` 即不生效。
+        let predicate = match query.scope {
+            CustomerUsageScope::All => {
+                "(j.terminal_at IS NOT NULL
+                    AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
+                    AND ($3::timestamptz IS NULL OR j.terminal_at < $3))
+                 OR (j.terminal_at IS NULL
+                    AND ($2::timestamptz IS NULL OR j.created_at >= $2)
+                    AND ($3::timestamptz IS NULL OR j.created_at < $3))"
+            }
+            CustomerUsageScope::Active => {
+                "j.state IN ('accepted', 'leased', 'submitting', 'reconciliation_required')
+                 AND ($2::timestamptz IS NULL OR j.created_at >= $2)
+                 AND ($3::timestamptz IS NULL OR j.created_at < $3)"
+            }
+            CustomerUsageScope::Completed => {
+                "j.state IN ('succeeded', 'failed', 'canceled')
+                 AND j.terminal_at IS NOT NULL
+                 AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
+                 AND ($3::timestamptz IS NULL OR j.terminal_at < $3)"
+            }
+        };
+        let order = match query.scope {
+            CustomerUsageScope::All => "COALESCE(j.terminal_at, j.created_at) DESC, j.id DESC",
+            CustomerUsageScope::Active => "j.created_at DESC, j.id DESC",
+            CustomerUsageScope::Completed => "j.terminal_at DESC, j.id DESC",
+        };
+        // 位置条件与各自的排序键**逐字对齐**：错开一个键就会在并列处重复或漏项。只有已结束历史会给出
+        // 位置，别处绑 `NULL`，参数个数因此恒定。
+        let cursor = match query.scope {
+            CustomerUsageScope::All => {
+                "($5::timestamptz IS NULL OR (COALESCE(j.terminal_at, j.created_at), j.id) < ($5, $6))"
+            }
+            CustomerUsageScope::Active => {
+                "($5::timestamptz IS NULL OR (j.created_at, j.id) < ($5, $6))"
+            }
+            CustomerUsageScope::Completed => {
+                "($5::timestamptz IS NULL OR (j.terminal_at, j.id) < ($5, $6))"
+            }
+        };
+        let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT
                 j.id AS job_id,
@@ -1365,22 +1412,18 @@ impl HubRepository for PgHubRepository {
                 ), 0)::bigint AS charged_microusd
             FROM generation.jobs j
             WHERE j.account_id = $1
-              AND (
-                    (j.terminal_at IS NOT NULL
-                        AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
-                        AND ($3::timestamptz IS NULL OR j.terminal_at < $3))
-                 OR (j.terminal_at IS NULL
-                        AND ($2::timestamptz IS NULL OR j.created_at >= $2)
-                        AND ($3::timestamptz IS NULL OR j.created_at < $3))
-              )
-            ORDER BY COALESCE(j.terminal_at, j.created_at) DESC
+              AND ({predicate})
+              AND {cursor}
+            ORDER BY {order}
             LIMIT $4
-            "#,
-        )
+            "#
+        )))
         .bind(account_id.0)
         .bind(query.since)
         .bind(query.until)
         .bind(i64::from(query.limit))
+        .bind(query.after.map(|position| position.at))
+        .bind(query.after.map(|position| position.id))
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
@@ -1404,6 +1447,71 @@ impl HubRepository for PgHubRepository {
                 })
             })
             .collect()
+    }
+
+    /// 对客真实资金流水：**半开区间** `[since, until)`、可按类别筛选、按 `(created_at, id)` 倒序翻页。
+    ///
+    /// 区间谓词与账单汇总同为 `>= since`：同一区间下逐笔与汇总必须对得上，否则边界那一笔会进汇总、
+    /// 不进流水。管理员那条增量读的 `since` 是开区间（上一次拉到的位置不重复计入），两者是各自的合同。
+    /// 总数用**同一个谓词**算，翻页判据因此不会与逐笔错位。
+    ///
+    /// **只读真实收支**：`hold` / `release` 是预授权机制、`cost` 是平台成本，都不是客户的事实
+    /// （Spec C8、V-C15），所以这里无条件收窄到三类，`kind` 只能在其内部再筛。
+    async fn customer_ledger(
+        &self,
+        account_id: AccountId,
+        query: CustomerLedgerQuery,
+    ) -> Result<LedgerPage, ApplicationError> {
+        if !self.account_exists(account_id).await? {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        let rows = sqlx::query(AssertSqlSafe(format!(
+            r#"
+            SELECT id, account_id, job_id, kind, amount_microusd, created_at
+            FROM ledger.entries
+            WHERE account_id = $1 AND {CUSTOMER_ENTRY_KINDS_PREDICATE}
+              AND ($2::timestamptz IS NULL OR created_at >= $2)
+              AND ($3::timestamptz IS NULL OR created_at < $3)
+              AND ($4::text IS NULL OR kind = $4)
+              AND ($6::timestamptz IS NULL OR (created_at, id) < ($6, $7))
+            ORDER BY created_at DESC, id DESC
+            LIMIT $5
+            "#
+        )))
+        .bind(account_id.0)
+        .bind(query.since)
+        .bind(query.until)
+        .bind(query.kind.map(|kind| kind.as_str()))
+        .bind(i64::from(query.limit))
+        .bind(query.after.map(|position| position.at))
+        .bind(query.after.map(|position| position.id))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let total: i64 = sqlx::query_scalar(AssertSqlSafe(format!(
+            r#"
+            SELECT count(*)::bigint
+            FROM ledger.entries
+            WHERE account_id = $1 AND {CUSTOMER_ENTRY_KINDS_PREDICATE}
+              AND ($2::timestamptz IS NULL OR created_at >= $2)
+              AND ($3::timestamptz IS NULL OR created_at < $3)
+              AND ($4::text IS NULL OR kind = $4)
+            "#
+        )))
+        .bind(account_id.0)
+        .bind(query.since)
+        .bind(query.until)
+        .bind(query.kind.map(|kind| kind.as_str()))
+        .fetch_one(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(LedgerPage {
+            entries: rows
+                .iter()
+                .map(ledger_entry_from_row)
+                .collect::<Result<_, _>>()?,
+            total: total.max(0) as u64,
+        })
     }
 
     async fn customer_billing(
@@ -1645,7 +1753,7 @@ impl HubRepository for PgHubRepository {
         }
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
-            SELECT account_id, job_id, kind, amount_microusd, created_at
+            SELECT id, account_id, job_id, kind, amount_microusd, created_at
             FROM ledger.entries
             WHERE account_id = $1 AND {LEDGER_RANGE_PREDICATE}
               AND ($4::text IS NULL OR kind = $4)
@@ -4319,6 +4427,7 @@ fn ledger_entry_from_row(row: &sqlx::postgres::PgRow) -> Result<LedgerEntry, App
         ))
     })?;
     Ok(LedgerEntry {
+        id: row.try_get("id").map_err(database_error)?,
         account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
         kind,
         amount_microusd: row.try_get("amount_microusd").map_err(database_error)?,

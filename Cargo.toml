@@ -23,6 +23,7 @@ license = "MIT"
 anyhow = "1.0.104"
 argon2 = { version = "0.6.0", features = ["password-hash"] }
 async-trait = "0.1.92"
+aws-lc-rs = "1.18.1"
 axum = { version = "0.8.9", features = ["http2", "json", "multipart", "tokio"] }
 base64 = "0.23.1"
 bytes = "1.12.1"

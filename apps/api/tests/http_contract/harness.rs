@@ -42,6 +42,8 @@ mod cases_cache;
 mod cases_cost_ceiling;
 #[path = "cases_cost_facts.rs"]
 mod cases_cost_facts;
+#[path = "cases_customer_history.rs"]
+mod cases_customer_history;
 #[path = "cases_funds.rs"]
 mod cases_funds;
 #[path = "cases_identity.rs"]
@@ -68,6 +70,9 @@ mod cases_routing;
 // 夹具自身的检查：不启平台进程、不用数据库，因此不进 `#[ignore]`，由 workspace 单测那一步跑。
 #[path = "harness_check.rs"]
 mod harness_check;
+
+/// 客户历史游标密钥（32 字节的 base64）：**必须配**，缺了 API 进程起不来，所以夹具给一份固定的。
+const CONTRACT_CURSOR_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
 /// 一个最小合法 PNG（1×1），用作假上游返回的结果图，也用作调用方传的参考图。
 const PNG_FIXTURE: &[u8] = &[
@@ -751,6 +756,7 @@ async fn probe_api_startup_with_seed(
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", "seed-probe-token")
+        .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
         .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
         .env("PROVIDER_TIMEOUT_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
@@ -779,6 +785,52 @@ async fn probe_api_startup_with_seed(
             Ok(())
         }
     }
+}
+
+/// 只配**游标密钥**起一个 API 进程，回报"还在跑吗"与它的 stderr。
+///
+/// 客户历史翻页的密钥是**必填**：缺失或不是 32 字节的 base64 时进程该起不来，而且报错要**点名那个
+/// 配置**——否则运维只知道"起不来"，不知道去配什么。`None` 表示**显式不设**这个变量。
+async fn probe_api_startup_with_cursor_key(
+    database_url: &str,
+    key: Option<&str>,
+) -> (bool, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    command
+        .env("DATABASE_URL", database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", "cursor-key-probe-token")
+        .env("ADMIN_EMAIL", "cursor-key-probe@example.com")
+        .env("ADMIN_PASSWORD", "a-long-enough-password")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
+        .env("PROVIDER_TIMEOUT_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
+        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
+        .env("WORKER_LEASE_SECONDS", "30")
+        // 与 [`probe_api_startup_with_seed`] 同理：在无 `.env` 的目录起进程，"没配"才是真的没配。
+        .current_dir(std::env::temp_dir())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(key) = key {
+        command.env("CUSTOMER_HISTORY_CURSOR_KEY", key);
+    }
+    let mut child = command.spawn().expect("API process should start");
+    tokio::time::sleep(Duration::from_millis(1_800)).await;
+    let running = child.try_wait().expect("try_wait").is_none();
+    if running {
+        let _ = child.kill();
+        let _ = child.wait();
+    }
+    let mut stderr = String::new();
+    if let Some(mut pipe) = child.stderr.take() {
+        use std::io::Read;
+        let _ = pipe.read_to_string(&mut stderr);
+    }
+    (running, stderr)
 }
 
 /// 一次用例要给 API 进程配的**速率上限**（每把 API Key）。
@@ -905,6 +957,8 @@ async fn start_api_with(
             .env("DATABASE_URL", database_url)
             .env("API_BIND", format!("127.0.0.1:{port}"))
             .env("ADMIN_TOKEN", &admin_token)
+            // 客户历史游标密钥是**必须配**的（生产缺了进程起不来），夹具也给一份固定的 32 字节。
+            .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
             // **显式不导入供给素材**：每个用例的库是空的、夹具自己造；不设的话默认值
             // （`config/bootstrap`）会让它们先看到仓库那两份素材。
             .env("SUPPLY_MATERIAL_DIR", "")

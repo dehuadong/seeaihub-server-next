@@ -40,8 +40,16 @@ impl HubRepository for WorkerRepository {
     async fn customer_usage(
         &self,
         _account_id: AccountId,
-        _query: CustomerBillingQuery,
+        _query: CustomerUsageQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn customer_ledger(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerLedgerQuery,
+    ) -> Result<LedgerPage, ApplicationError> {
         unused_repository()
     }
 

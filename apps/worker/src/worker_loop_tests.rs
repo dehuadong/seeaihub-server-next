@@ -25,8 +25,16 @@ impl HubRepository for EmptyQueueRepository {
     async fn customer_usage(
         &self,
         _account_id: AccountId,
-        _query: CustomerBillingQuery,
+        _query: CustomerUsageQuery,
     ) -> Result<Vec<CustomerUsageView>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn customer_ledger(
+        &self,
+        _account_id: AccountId,
+        _query: CustomerLedgerQuery,
+    ) -> Result<LedgerPage, ApplicationError> {
         unimplemented!()
     }
 
