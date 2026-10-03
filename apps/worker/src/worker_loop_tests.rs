@@ -733,7 +733,7 @@ async fn a_drain_request_waits_for_the_in_flight_iteration() {
         let _ = control.send(true);
     });
 
-    run_until_shutdown(&worker, signals, Duration::from_secs(3_600))
+    run_until_shutdown(&worker, None, signals, Duration::from_secs(3_600))
         .await
         .expect("draining must not fail");
 
@@ -756,7 +756,7 @@ async fn an_interrupt_waits_for_the_in_flight_iteration() {
         interrupt.send();
     });
 
-    run_until_shutdown(&worker, signals, Duration::from_secs(3_600))
+    run_until_shutdown(&worker, None, signals, Duration::from_secs(3_600))
         .await
         .expect("draining must not fail");
 
@@ -779,7 +779,7 @@ async fn an_already_draining_worker_does_not_claim_another_iteration() {
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(500),
-        run_until_shutdown(&worker, signals, Duration::from_secs(3_600)),
+        run_until_shutdown(&worker, None, signals, Duration::from_secs(3_600)),
     )
     .await;
 
@@ -806,7 +806,7 @@ async fn the_loop_keeps_working_while_no_stop_is_requested() {
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(600),
-        run_until_shutdown(&worker, signals, Duration::from_millis(100)),
+        run_until_shutdown(&worker, None, signals, Duration::from_millis(100)),
     )
     .await;
 

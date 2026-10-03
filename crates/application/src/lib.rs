@@ -1932,6 +1932,37 @@ pub enum LateFactsOutcome {
     Ignored,
 }
 
+/// 晚到事实的收件形态。落库字符串由 [`Self::as_str`] 给出，库层 `late_facts_kind_known` 也认
+/// 这一组；读回时用 [`Self::parse`]，解析不到按持久化错误报出，不静默归入某一类。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateFactKind {
+    /// 上游任务句柄。
+    TaskHandle,
+    /// 计量或成本事实。
+    Accounting,
+}
+
+impl LateFactKind {
+    /// 落库用的稳定字符串（库层 CHECK 也认这一组）。
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::TaskHandle => "task_handle",
+            Self::Accounting => "accounting",
+        }
+    }
+
+    /// 从落库值还原。库层有 CHECK 保证取值；解析不到说明存储被绕过，按错误处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "task_handle" => Some(Self::TaskHandle),
+            "accounting" => Some(Self::Accounting),
+            _ => None,
+        }
+    }
+}
+
 /// 领取到的一行晚到事实：Worker 按它核验并走现有收尾端口，消费成功后再调
 /// [`ExecutionRepository::mark_late_fact_consumed`]。
 #[derive(Debug, Clone)]
@@ -1940,8 +1971,8 @@ pub struct ClaimedLateFact {
     pub id: Uuid,
     pub job_id: JobId,
     pub attempt_id: AttemptId,
-    /// 收件形态：`task_handle` 或 `accounting`。
-    pub kind: String,
+    /// 收件形态。
+    pub kind: LateFactKind,
     pub provider_task_handle: Option<String>,
     pub provider_trace_id: Option<String>,
     /// 收件行记下的产出图片张数；收件形态不包含它时为 None。

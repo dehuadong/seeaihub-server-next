@@ -23,6 +23,7 @@ use seeai_domain::{
 };
 use std::{
     collections::HashMap,
+    future::Future,
     sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
@@ -33,9 +34,9 @@ use std::{
 use crate::{
     AccelerationService, AdapterFactory, ApplicationError, BalanceSource, ClaimedLateFact,
     CostInputs, CredentialProvider, ExecutionFinalization, ExecutionRepository,
-    FailOrReconcileExecution, FailureDisposition, HubRepository, LedgerAuditor, PlatformAlert,
-    PlatformAlerter, ProviderFailureKind, RetryPolicy, SettleExecution, TakenOverExecution,
-    failure_provider_cost, provider_cost_fact,
+    FailOrReconcileExecution, FailureDisposition, HubRepository, LateFactKind, LedgerAuditor,
+    PlatformAlert, PlatformAlerter, ProviderFailureKind, RetryPolicy, SettleExecution,
+    TakenOverExecution, failure_provider_cost, provider_cost_fact,
 };
 
 /// 异常对账每轮的边界、查询排期与慢周期节奏。都是运维取值：批大小决定一轮的最坏工作量，
@@ -657,17 +658,10 @@ impl ExecutionReconciliationService {
         owned: &HashMap<JobId, TakenOverExecution>,
         report: &mut ReconciliationReport,
     ) -> Result<(), ApplicationError> {
-        let outcome = match fact.kind.as_str() {
-            "task_handle" => self.consume_task_handle_fact(fact, owned, report).await,
-            "accounting" => self.consume_accounting_fact(fact, owned, report).await,
-            other => {
-                tracing::warn!(
-                    kind = other,
-                    fact_id = %fact.id,
-                    "an unknown late fact kind was claimed; leaving it unconsumed"
-                );
-                return Ok(());
-            }
+        // 未知取值在持久化映射处解析报错，到不了这里；这个 match 因此是穷尽的。
+        let outcome = match fact.kind {
+            LateFactKind::TaskHandle => self.consume_task_handle_fact(fact, owned, report).await,
+            LateFactKind::Accounting => self.consume_accounting_fact(fact, owned, report).await,
         };
         match outcome {
             Ok(LateFactAction::Consumed) => {
@@ -843,23 +837,35 @@ impl ExecutionReconciliationService {
         Ok(())
     }
 
-    /// 结算提交结果未知时先只读确认，再重试同一幂等收尾；仍不明时报错交下一轮。
-    async fn settle_with_confirmation(
+    /// 一次幂等收尾的「提交未知 → 只读确认 → 重试同一提交」骨架。
+    ///
+    /// 结算与失败处置只差提交端口与日志措辞：骨架负责有界重试与读确认，端口调用由 `submit`
+    /// 闭包给出。闭包拿到的是**新的仓储句柄与命令克隆**（都归它返回的未来所有），所以未来不借
+    /// 调用方、也不借捕获的局部变量，重试不会纠缠生命周期。
+    async fn confirm_finalization<C, F, Fut>(
         &self,
-        command: SettleExecution,
-    ) -> Result<ExecutionFinalization, ApplicationError> {
-        let job_id = command.job_id;
-        let attempt_id = command.attempt_id;
+        command: C,
+        job_id: JobId,
+        attempt_id: AttemptId,
+        label: &str,
+        submit: F,
+    ) -> Result<ExecutionFinalization, ApplicationError>
+    where
+        C: Clone,
+        F: Fn(Arc<dyn ExecutionRepository>, C) -> Fut,
+        Fut: Future<Output = Result<ExecutionFinalization, ApplicationError>>,
+    {
         let max_attempts = self.retry_policy.max_attempts.max(1);
         let mut last_error = None;
         for attempt in 1..=max_attempts {
-            match self.executions.settle(command.clone()).await {
+            match submit(self.executions.clone(), command.clone()).await {
                 Ok(finalization) => return Ok(finalization),
                 Err(error) => {
                     tracing::warn!(
                         job_id = %job_id,
                         error = %error,
-                        "the settle commit result is unknown; confirming the committed finalization"
+                        "the {} commit result is unknown; confirming the committed finalization",
+                        label
                     );
                     last_error = Some(error);
                 }
@@ -871,7 +877,8 @@ impl ExecutionReconciliationService {
                     tracing::warn!(
                         job_id = %job_id,
                         error = %error,
-                        "could not confirm the settle commit result"
+                        "could not confirm the {} result",
+                        label
                     );
                     last_error = Some(error);
                 }
@@ -882,9 +889,26 @@ impl ExecutionReconciliationService {
         }
         Err(last_error.unwrap_or_else(|| {
             ApplicationError::Reconciliation(format!(
-                "job {job_id} settle stayed unknown after bounded confirmation"
+                "job {job_id} {label} stayed unknown after bounded confirmation"
             ))
         }))
+    }
+
+    /// 结算提交结果未知时先只读确认，再重试同一幂等收尾；仍不明时报错交下一轮。
+    async fn settle_with_confirmation(
+        &self,
+        command: SettleExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        let job_id = command.job_id;
+        let attempt_id = command.attempt_id;
+        self.confirm_finalization(
+            command,
+            job_id,
+            attempt_id,
+            "settle",
+            |executions, command| async move { executions.settle(command).await },
+        )
+        .await
     }
 
     /// 失败处置的同一套确认：提交结果未知先读确认，再重试同一幂等处置。
@@ -894,41 +918,14 @@ impl ExecutionReconciliationService {
     ) -> Result<ExecutionFinalization, ApplicationError> {
         let job_id = command.job_id;
         let attempt_id = command.attempt_id;
-        let max_attempts = self.retry_policy.max_attempts.max(1);
-        let mut last_error = None;
-        for attempt in 1..=max_attempts {
-            match self.executions.fail_or_reconcile(command.clone()).await {
-                Ok(finalization) => return Ok(finalization),
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %error,
-                        "the failure finalization result is unknown; confirming the committed record"
-                    );
-                    last_error = Some(error);
-                }
-            }
-            match self.executions.read_finalization(job_id, attempt_id).await {
-                Ok(Some(finalization)) => return Ok(finalization),
-                Ok(None) => {}
-                Err(error) => {
-                    tracing::warn!(
-                        job_id = %job_id,
-                        error = %error,
-                        "could not confirm the failure finalization result"
-                    );
-                    last_error = Some(error);
-                }
-            }
-            if attempt < max_attempts {
-                tokio::time::sleep(self.retry_policy.backoff_for(attempt)).await;
-            }
-        }
-        Err(last_error.unwrap_or_else(|| {
-            ApplicationError::Reconciliation(format!(
-                "job {job_id} failure finalization stayed unknown after bounded confirmation"
-            ))
-        }))
+        self.confirm_finalization(
+            command,
+            job_id,
+            attempt_id,
+            "failure finalization",
+            |executions, command| async move { executions.fail_or_reconcile(command).await },
+        )
+        .await
     }
 
     /// 提交后把数据库当前余额写穿缓存。读不到只记日志：缓存不是事实来源。

@@ -166,45 +166,29 @@ async fn main() -> Result<()> {
         drain_control,
         interrupt: shutdown_signal(),
     };
-    let rounds = WorkerRounds {
-        worker,
-        reconciliation,
-    };
-    run_until_shutdown(&rounds, signals, poll_interval).await
+    run_until_shutdown(&worker, Some(&reconciliation), signals, poll_interval).await
 }
 
-/// 主循环每轮要跑的东西：旧 Worker 的生成领取 + 新协议的异常对账。
-trait WorkerRound {
-    /// 跑一轮；返回是否真的动过什么（false 触发空闲退避）。
-    async fn run_round(&self) -> Result<bool, ApplicationError>;
-}
-
-impl WorkerRound for WorkerService {
-    async fn run_round(&self) -> Result<bool, ApplicationError> {
-        self.run_once().await
-    }
-}
-
-/// 两个循环的组合：先跑异常对账（有界、快），再跑旧 Worker 的生成领取。
+/// 跑一轮：先跑异常对账（有界、快），再跑旧 Worker 的生成领取。
 ///
 /// 对账出错不阻断生成路径：记账旁路的问题不该让旧协议的执行停摆。生成路径的错误照旧向上报。
-struct WorkerRounds {
-    worker: WorkerService,
-    reconciliation: ExecutionReconciliationService,
-}
-
-impl WorkerRound for WorkerRounds {
-    async fn run_round(&self) -> Result<bool, ApplicationError> {
-        let reconciled = match self.reconciliation.run_once().await {
+/// `reconciliation` 为空表示这轮循环不带对账（只验停机时序的用例用它）；生产里始终给 `Some`。
+async fn run_round(
+    worker: &WorkerService,
+    reconciliation: Option<&ExecutionReconciliationService>,
+) -> Result<bool, ApplicationError> {
+    let reconciled = match reconciliation {
+        Some(service) => match service.run_once().await {
             Ok(report) => report.did_work(),
             Err(error) => {
                 tracing::error!(error = %error, "the reconciliation iteration failed");
                 false
             }
-        };
-        let worked = self.worker.run_once().await?;
-        Ok(reconciled || worked)
-    }
+        },
+        None => false,
+    };
+    let worked = worker.run_once().await?;
+    Ok(reconciled || worked)
 }
 
 /// 主循环等的终止信号 future。
@@ -266,8 +250,9 @@ struct ShutdownSignals {
 ///
 /// 停机输入当参数传进来，是为了让这条合同能在测试里**确定地**验：真信号没法在进程内精确投递，
 /// 而"什么时候停、停的时候在飞的那一轮怎么办"与信号从哪来无关。
-async fn run_until_shutdown<R: WorkerRound + ?Sized>(
-    worker: &R,
+async fn run_until_shutdown(
+    worker: &WorkerService,
+    reconciliation: Option<&ExecutionReconciliationService>,
     mut signals: ShutdownSignals,
     poll_interval: Duration,
 ) -> Result<()> {
@@ -278,7 +263,7 @@ async fn run_until_shutdown<R: WorkerRound + ?Sized>(
             info!("worker stopped");
             return Ok(());
         }
-        let iteration = worker.run_round();
+        let iteration = run_round(worker, reconciliation);
         tokio::pin!(iteration);
         let mut draining = false;
         let handled = loop {
