@@ -175,7 +175,7 @@
 | M2 发布修订 | `POST /api/v1/runtime-revisions` |
 | M3 折算率 | `GET/PUT /api/v1/fx-rates`（`GET` 为本次新增） |
 | M4 路由策略 | `GET/PUT /api/v1/route-policies` |
-| M5 账户与密钥 | `POST /api/v1/accounts`；`GET /api/v1/accounts`（列账户，供"先搜到再操作"——见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；`GET /api/v1/accounts/{id}`；`GET /api/v1/accounts/{id}/summary`（按标识读账户摘要，账户详情直达与刷新）；`GET /api/v1/accounts/{id}/entries`；`POST /api/v1/accounts/{id}/credits`；`PUT /api/v1/accounts/{id}/tag`；`POST /api/v1/accounts/{id}/api-keys`；`DELETE /api/v1/api-keys/{key_id}`；`POST /api/v1/customers`（替客户开户）；`GET /api/v1/customers`（按邮箱找客户账户）；`GET /api/v1/customers/{id}`（按标识读客户视图，客户详情直达与刷新）；`POST /api/v1/accounts/{id}/password-reset`（为客户账户签发重置令牌） |
+| M5 账户与密钥 | `POST /api/v1/accounts`；`GET /api/v1/accounts`（列账户，供"先搜到再操作"——见 [`0011-console-information-architecture.md`](0011-console-information-architecture.md) §5）；`GET /api/v1/accounts/{id}`；`GET /api/v1/accounts/{id}/summary`（按标识读账户摘要，账户详情直达与刷新）；`GET /api/v1/accounts/{id}/entries`；`POST /api/v1/accounts/{id}/credits`；`PUT /api/v1/accounts/{id}/tag`；`POST /api/v1/accounts/{id}/api-keys`（管理端**只签发不吊销**，见 Spec `0001` M5／V-D16；吊销走客户会话的 `DELETE /v1/customer/api-keys/{key_id}`）；`POST /api/v1/customers`（替客户开户）；`GET /api/v1/customers`（按邮箱找客户账户）；`GET /api/v1/customers/{id}`（按标识读客户视图，客户详情直达与刷新）；`POST /api/v1/accounts/{id}/password-reset`（为客户账户签发重置令牌） |
 | M6 对账与诊断 | `GET /api/v1/reconciliation-cases`；`POST /api/v1/reconciliation-cases/{job_id}/refund`；`GET /api/v1/provider-failures`；`GET /api/v1/provider-cost-gaps` |
 | 管理员登录/退出/改口令/重置 | §4.1 的六条 |
 | C5 密钥自助 | §4.2 的 `api-keys` 三条 |
