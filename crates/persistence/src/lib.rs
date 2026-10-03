@@ -2058,7 +2058,7 @@ impl HubRepository for PgHubRepository {
         let Some(previous) = previous else {
             return Err(ApplicationError::NotFound(format!("account {account_id}")));
         };
-        // 改成别的账户已用的名称是冲突；改回自己原来的名称（只差大小写也算）不算。
+        // 改成别的账户已用的名称（逐字符完全相同）是冲突；改成自己当前的名称等于没改，不算冲突。
         if account_name_taken(&mut transaction, name, Some(account_id.0)).await? {
             return Err(ApplicationError::NameTaken(format!(
                 "account name {name} is already taken"
@@ -5065,7 +5065,7 @@ fn to_u64(value: i64) -> Result<u64, ApplicationError> {
         .map_err(|_| ApplicationError::Persistence("negative monetary value".to_owned()))
 }
 
-/// 账户名称唯一索引（迁移 `0029`）：唯一性是**大小写不敏感**的，索引建在 `lower(name)` 上。
+/// 账户名称唯一索引（迁移 `0029` 建立、`0030` 换到区分大小写的口径）：索引建在 `name` 上。
 const ACCOUNT_NAME_UNIQUE_INDEX: &str = "accounts_name_key";
 
 /// 撞名称唯一约束时的统一说法：名称必须唯一，调用方换一个（生成规则会自己再试更长的片段）。
@@ -5081,15 +5081,15 @@ fn account_name_conflict(error: sqlx::Error, name: &str) -> ApplicationError {
     database_error(error)
 }
 
-/// 账户名称是否已被**别的账户**占用（大小写不敏感）。`except` 用来把"自己"排除在外：
-/// 改名成自己原来的名称（哪怕只差大小写）不算冲突。
+/// 账户名称是否已被**别的账户**占用（**逐字符完全相同**，区分大小写）。`except` 把"自己"排除在外：
+/// 改名成自己当前的名称等于没改，不该被当成撞名。
 async fn account_name_taken(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     name: &str,
     except: Option<Uuid>,
 ) -> Result<bool, ApplicationError> {
     let taken: Option<Uuid> = sqlx::query_scalar(
-        "SELECT id FROM ledger.accounts WHERE lower(name) = lower($1) AND ($2::uuid IS NULL OR id <> $2)",
+        "SELECT id FROM ledger.accounts WHERE name = $1 AND ($2::uuid IS NULL OR id <> $2)",
     )
     .bind(name)
     .bind(except)

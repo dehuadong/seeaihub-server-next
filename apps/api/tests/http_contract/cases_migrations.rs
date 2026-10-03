@@ -1235,15 +1235,16 @@ async fn the_account_name_migration_deduplicates_names_and_adds_a_unique_index()
         .expect("row count after");
     assert_eq!(rows_after, rows_before, "去重只改名，不删行也不插行");
 
+    // 最终口径是区分大小写：这里断言"没有逐字符完全相同的名称"，只差大小写可以并存（下面另验）。
     let duplicates: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM (
-             SELECT lower(name) FROM ledger.accounts GROUP BY lower(name) HAVING count(*) > 1
+             SELECT name FROM ledger.accounts GROUP BY name HAVING count(*) > 1
          ) AS duplicated",
     )
     .fetch_one(&pool)
     .await
     .expect("duplicate count");
-    assert_eq!(duplicates, 0, "迁移后不该还有重名");
+    assert_eq!(duplicates, 0, "迁移后不该还有完全相同的名称");
 
     for (id, expected) in [
         (earliest, "星尘工作室"),
@@ -1269,6 +1270,8 @@ async fn the_account_name_migration_deduplicates_names_and_adds_a_unique_index()
             "{renamed} 应当以完整账户 id 结尾（后缀唯一由它保证）"
         );
     }
+    // `0029` 的去重比最终口径更严：只差大小写的那一对当时被拆开了（`globalstudio` → 带 id 后缀）。
+    // 这是历史迁移的既成结果，开发阶段不恢复。
     // 100 个字符那一组：被改名的那行仍在上限内（后缀按上限截断后再拼），长度 CHECK 不会被顶穿。
     let renamed_longest: String =
         sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
@@ -1306,14 +1309,25 @@ async fn the_account_name_migration_deduplicates_names_and_adds_a_unique_index()
         "{squatter_name}：它原本占着的名字被改走后，自己也被拆开一层"
     );
 
-    // 5) 索引真的挡重名：直接写一行同名的会失败。
+    // 5) 最终索引（`0030` 之后）按**区分大小写**挡重名：完全相同的写入失败，只差大小写的可以并存。
     let duplicate_insert = sqlx::query(
         "INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, '星尘工作室', 0)",
     )
     .bind(Uuid::new_v4())
     .execute(&pool)
     .await;
-    assert!(duplicate_insert.is_err(), "唯一索引必须挡住重名");
+    assert!(duplicate_insert.is_err(), "唯一索引必须挡住完全相同的名称");
+
+    let case_variant = sqlx::query(
+        "INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, 'GLOBALSTUDIO', 0)",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(
+        case_variant.is_ok(),
+        "0030 之后只差大小写是另一个名称，不该被唯一索引挡住：{case_variant:?}"
+    );
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);

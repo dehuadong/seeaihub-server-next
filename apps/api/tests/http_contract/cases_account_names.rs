@@ -1,6 +1,7 @@
 //! 账户名称：生成、校验、子串查找、改名（运营与客户各一条路）与既有读的投影。
 //!
-//! 覆盖 Spec `0003` v2 的 N1–N5、F1–F6、U1–U5 与 §5 的接口增量；V1/V9 的界面部分由浏览器用例覆盖。
+//! 覆盖 Spec `0003` v4 的 N1–N6、F1–F6、U1–U6 与 §5 的接口增量；界面部分由浏览器用例覆盖
+//! （V1–V10 的完整归属见设计 `0015` §6）。
 
 use super::*;
 use serde_json::json;
@@ -274,10 +275,10 @@ async fn name_search_ignores_case_and_combines_with_email_and_tag() {
     harness.cleanup().await;
 }
 
-/// 名称唯一（Spec N1/N6）：撞名创建与改名都是 `409`，仅大小写不同也算撞名，改回自己原名不算。
+/// 名称唯一（Spec N1/N6，**区分大小写**）：完全相同才冲突，只差大小写是两个名称。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn account_names_are_unique_and_case_insensitive() {
+async fn account_names_are_unique_case_sensitively() {
     let harness = names_harness().await;
     let client = Client::new();
 
@@ -290,7 +291,7 @@ async fn account_names_are_unique_and_case_insensitive() {
     assert_eq!(status, StatusCode::OK, "{first}");
     let first_id = first["account_id"].as_str().expect("account id").to_owned();
 
-    // 撞名之前先记下账户总数（夹具账户与平台账户都在列表里）：撞名的四次都不该改变它。
+    // 逐字符完全相同（含首尾空白被去掉之后相同）被拒：`409`，且不产生账户。
     let accounts_before = client
         .get(format!("{}/api/v1/accounts?limit=100", harness.base_url))
         .bearer_auth(&harness.admin_token)
@@ -303,9 +304,7 @@ async fn account_names_are_unique_and_case_insensitive() {
         .as_array()
         .expect("accounts")
         .len();
-
-    // 完全同名与只差大小写都被拒：`409`，且不产生账户。
-    for duplicate in ["StarStudio", "starstudio", "STARSTUDIO", " StarStudio "] {
+    for duplicate in ["StarStudio", " StarStudio "] {
         let (status, body) = create_account(
             &client,
             &harness,
@@ -313,13 +312,8 @@ async fn account_names_are_unique_and_case_insensitive() {
         )
         .await;
         assert_eq!(status, StatusCode::CONFLICT, "{duplicate} 应当冲突：{body}");
+        assert_eq!(body["error"]["code"], json!("name_taken"), "{body}");
     }
-    assert_eq!(
-        list_names(&client, &harness, "starstudio").await,
-        vec!["StarStudio"],
-        "被拒的创建没有留下账户"
-    );
-    // 「无写入」的直接证据：被拒的四次之后账户总数没有变化。
     let accounts_after = client
         .get(format!("{}/api/v1/accounts?limit=100", harness.base_url))
         .bearer_auth(&harness.admin_token)
@@ -334,7 +328,25 @@ async fn account_names_are_unique_and_case_insensitive() {
         .len();
     assert_eq!(accounts_after, accounts_before, "撞名的创建一次都没有落库");
 
-    // 改名撞别人的名称（含大小写变体）是 `409`；不改回自己的原名（含大小写变体）则允许。
+    // 只差大小写是**另一个**名称：可以并存，各是一个账户。
+    for variant in ["starstudio", "STARSTUDIO"] {
+        let (status, body) = create_account(
+            &client,
+            &harness,
+            json!({"initial_credit_microusd": 0, "name": variant}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "{variant} 是另一个名称：{body}");
+    }
+    let mut found = list_names(&client, &harness, "starstudio").await;
+    found.sort();
+    assert_eq!(found, vec!["STARSTUDIO", "StarStudio", "starstudio"]);
+    // 子串查询本身仍是大小写不敏感：换一种大小写查同一批账户。
+    let mut caseless = list_names(&client, &harness, "Studio").await;
+    caseless.sort();
+    assert_eq!(caseless, found, "筛选大小写不敏感，唯一性区分大小写");
+
+    // 改名撞另一个账户的完全相同名称是 `409`；改成只差大小写的名称允许。
     let (status, second) = create_account(
         &client,
         &harness,
@@ -347,56 +359,77 @@ async fn account_names_are_unique_and_case_insensitive() {
         .expect("account id")
         .to_owned();
 
-    for taken in ["StarStudio", "starstudio"] {
-        let response = client
-            .put(format!(
-                "{}/api/v1/accounts/{second_id}/name",
-                harness.base_url
-            ))
-            .bearer_auth(&harness.admin_token)
-            .json(&json!({"name": taken}))
-            .send()
-            .await
-            .expect("rename request");
-        assert_eq!(response.status(), StatusCode::CONFLICT, "{taken}");
-    }
+    let taken = client
+        .put(format!(
+            "{}/api/v1/accounts/{second_id}/name",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"name": "StarStudio"}))
+        .send()
+        .await
+        .expect("rename request");
+    assert_eq!(taken.status(), StatusCode::CONFLICT);
+    let conflict_body = taken.json::<Value>().await.expect("error body");
+    assert_eq!(
+        conflict_body["error"]["code"],
+        json!("name_taken"),
+        "{conflict_body}"
+    );
     assert_eq!(
         account_summary(&client, &harness, &second_id).await["name"],
         json!("Another Studio"),
         "冲突的改名不改动任何资料"
     );
 
-    // 改回自己原来的名称（只有大小写不同）不算冲突：写进去的就是新的大小写。
-    let own_case = client
+    let variant = client
+        .put(format!(
+            "{}/api/v1/accounts/{second_id}/name",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"name": "ANOTHER STUDIO"}))
+        .send()
+        .await
+        .expect("rename request");
+    assert_eq!(
+        variant.status(),
+        StatusCode::NO_CONTENT,
+        "大小写变体是另一个名称"
+    );
+    assert_eq!(
+        account_summary(&client, &harness, &second_id).await["name"],
+        json!("ANOTHER STUDIO")
+    );
+
+    // 改成自己当前的名称等于没改：不算冲突。
+    let unchanged = client
         .put(format!(
             "{}/api/v1/accounts/{first_id}/name",
             harness.base_url
         ))
         .bearer_auth(&harness.admin_token)
-        .json(&json!({"name": "STARSTUDIO"}))
+        .json(&json!({"name": "StarStudio"}))
         .send()
         .await
         .expect("rename own request");
-    assert_eq!(own_case.status(), StatusCode::NO_CONTENT);
-    assert_eq!(
-        account_summary(&client, &harness, &first_id).await["name"],
-        json!("STARSTUDIO")
-    );
+    assert_eq!(unchanged.status(), StatusCode::NO_CONTENT);
 
-    // 不存在的账户带一个已被占用的名称：不存在优先（`404`），不是冲突。
+    // 不存在的账户带一个被占用的名称：不存在优先（`404`），不是冲突。
     let missing = client
         .put(format!(
             "{}/api/v1/accounts/00000000-0000-4000-8000-000000000000/name",
             harness.base_url
         ))
         .bearer_auth(&harness.admin_token)
-        .json(&json!({"name": "STARSTUDIO"}))
+        .json(&json!({"name": "StarStudio"}))
         .send()
         .await
         .expect("rename missing request");
     assert_eq!(missing.status(), StatusCode::NOT_FOUND);
 
-    // 客户改自己的名称同样受唯一约束：改成运营那个账户的名称是冲突，原值不变。
+    // 客户改自己的名称同样受唯一约束：改成别人已用的完全相同名称是冲突，原值不变；
+    // 改成只差大小写的名称允许。
     let registered = client
         .post(format!("{}/v1/customers", harness.base_url))
         .json(&json!({"email": "unique@example.com", "password": "a-long-enough-password"}))
@@ -418,7 +451,7 @@ async fn account_names_are_unique_and_case_insensitive() {
     let conflict = client
         .put(format!("{}/v1/customer/account/name", harness.base_url))
         .bearer_auth(&session)
-        .json(&json!({"name": "starstudio"}))
+        .json(&json!({"name": "StarStudio"}))
         .send()
         .await
         .expect("customer rename request");
@@ -437,6 +470,31 @@ async fn account_names_are_unique_and_case_insensitive() {
         json!(format!("unique_{}", &customer_account[..4])),
         "冲突的改名不改动客户自己的名称"
     );
+
+    // 只差大小写是另一个名称：客户把自己的名称换成大写形式，改得成。
+    let upper = format!("UNIQUE_{}", customer_account[..4].to_uppercase());
+    let variant = client
+        .put(format!("{}/v1/customer/account/name", harness.base_url))
+        .bearer_auth(&session)
+        .json(&json!({"name": upper}))
+        .send()
+        .await
+        .expect("customer rename request");
+    assert_eq!(
+        variant.status(),
+        StatusCode::NO_CONTENT,
+        "大小写变体是另一个名称"
+    );
+    let account = client
+        .get(format!("{}/v1/customer/account", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("customer account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(account["name"], json!(upper));
 
     harness.cleanup().await;
 }
