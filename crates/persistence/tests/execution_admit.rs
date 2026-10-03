@@ -350,6 +350,65 @@ async fn admit_is_atomic_idempotent_and_owns_a_channel_slot() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 切换前已在飞的旧协议 Job 同样占用渠道上游并发：即使没有任何 v1 槽位也要计入渠道上限；
+/// 旧 Job 进终态后不再计入（RFC 0017 §7、Spec 0005 A9）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn legacy_in_flight_jobs_count_toward_the_channel_capacity() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 4)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+
+    sqlx::query(
+        "INSERT INTO generation.jobs
+             (id, account_id, state, branch, gateway_model, runtime_revision_id, vendor_model_id,
+              offering_id, channel_id, adapter_key, provider_model_id, base_url, credential_env,
+              price_snapshot, max_cost_microusd)
+         VALUES ($1,$2,'submitting','prompt_only','fake-gateway',$3,$4,$5,$6,'fake','fake-model',
+                 'http://127.0.0.1:9','FAKE_PROVIDER_KEY','{}'::jsonb,1000)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(fixture.account_id.0)
+    .bind(fixture.runtime_revision_id.0)
+    .bind(fixture.vendor_model_id.0)
+    .bind(fixture.offering_id.0)
+    .bind(fixture.channel_id.0)
+    .execute(&pool)
+    .await
+    .expect("seed a legacy in-flight job");
+
+    let mut blocked = command(&fixture, "legacy-slot", "legacy-slot-digest");
+    blocked.max_channel_in_flight = 1;
+    let rejected = repository.admit(blocked).await;
+    assert!(
+        matches!(rejected, Err(ApplicationError::PlatformCapacityExhausted)),
+        "a legacy in-flight job must consume the channel capacity, got {rejected:?}"
+    );
+
+    // 旧 Job 进终态后不再计入，同一渠道可以再受理。
+    sqlx::query(
+        "UPDATE generation.jobs SET state = 'succeeded' WHERE account_id = $1 AND execution_protocol = 'legacy'",
+    )
+    .bind(fixture.account_id.0)
+    .execute(&pool)
+    .await
+    .expect("finish the legacy job");
+    let mut allowed = command(&fixture, "legacy-slot-2", "legacy-slot-digest-2");
+    allowed.max_channel_in_flight = 1;
+    let admitted = repository
+        .admit(allowed)
+        .await
+        .expect("after the legacy job finished");
+    assert!(matches!(admitted, AdmitOutcome::Admitted { .. }));
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
 /// 并发受理共同遵守同一份账户名额：四个不同键同时进来，名额只允许一个通过。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]

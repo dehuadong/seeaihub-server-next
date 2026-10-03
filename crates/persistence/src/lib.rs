@@ -4367,9 +4367,20 @@ impl ExecutionRepository for PgHubRepository {
             return Err(ApplicationError::TooManyInFlight);
         }
         // 渠道全局容量：持有的槽位各计一个未决任务；租约过期不证明上游结束，所以只认 released。
-        // 渠道咨询锁已在前面取过，同渠道的并发受理在这里排队。
+        // 切换前已在飞的旧协议 Job 没有槽位行，但同样占用上游并发，必须一并计入——它们终态后自然减一，
+        // 不会像补写槽位那样泄漏。渠道咨询锁已在前面取过，同渠道的并发受理在这里排队。
         let channel_held: i64 = sqlx::query_scalar(
-            "SELECT count(*) FROM generation.execution_capacity WHERE channel_id = $1 AND state = 'held'",
+            r#"
+            SELECT (
+                SELECT count(*) FROM generation.execution_capacity
+                WHERE channel_id = $1 AND state = 'held'
+            ) + (
+                SELECT count(*) FROM generation.jobs
+                WHERE channel_id = $1
+                  AND execution_protocol = 'legacy'
+                  AND state IN ('accepted', 'leased', 'submitting')
+            )
+            "#,
         )
         .bind(offering.channel_id.0)
         .fetch_one(&mut *transaction)
