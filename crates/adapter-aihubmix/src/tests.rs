@@ -7,6 +7,26 @@ use seeai_domain::{ImageParameterKind, platform_image_parameter, platform_image_
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
+/// 同一传输策略（这里就是单次超时）经创建路径拿到同一个 Client，连接池因此跨请求、跨 Channel 复用。
+#[test]
+fn the_same_transport_policy_reuses_one_client() {
+    let first = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(17))
+        .expect("config");
+    let second = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(17))
+        .expect("config");
+    assert!(Arc::ptr_eq(&first.client, &second.client));
+}
+
+/// 超时不同的策略不共用 Client：不同默认超时的请求不能落进同一个 Client。
+#[test]
+fn a_different_transport_policy_gets_its_own_client() {
+    let first = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(17))
+        .expect("config");
+    let other = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(18))
+        .expect("config");
+    assert!(!Arc::ptr_eq(&first.client, &other.client));
+}
+
 /// 假执行上下文：期限与取消状态固定；同步渠道绝不该调用 accepted。
 struct FakeContext {
     deadline: Deadline,

@@ -4,6 +4,24 @@ use seeai_adapter_sdk::ImageSites;
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
+/// 同一传输策略（REQUEST_TIMEOUT）下，每次创建都复用同一个 Client，连接池跨请求、跨 Channel 复用。
+#[test]
+fn the_same_transport_policy_reuses_one_client() {
+    let first = ApimartImageAdapter::new("https://api.apimart.ai", Duration::from_secs(30))
+        .expect("config");
+    let second = ApimartImageAdapter::new("https://api.apimart.ai", Duration::from_secs(30))
+        .expect("config");
+    assert!(Arc::ptr_eq(&first.client, &second.client));
+}
+
+/// 策略进入缓存 key：不同超时拿到不同 Client，不会共享一份默认超时。
+#[test]
+fn a_different_transport_policy_gets_its_own_client() {
+    let first = shared_client(REQUEST_TIMEOUT).expect("client");
+    let other = shared_client(REQUEST_TIMEOUT + Duration::from_secs(1)).expect("client");
+    assert!(!Arc::ptr_eq(&first, &other));
+}
+
 fn envelope(code: i64, message: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
         "error": { "code": code, "message": message, "type": "invalid_request_error" }

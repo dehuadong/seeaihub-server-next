@@ -32,7 +32,8 @@ use seeai_domain::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use url::Url;
 
@@ -187,8 +188,35 @@ fn validate_apimart_publication(
     Ok(())
 }
 
+/// 按传输策略复用的进程级 HTTP Client。
+///
+/// 策略目前只有单次调用超时（本 Driver 固定为 [`REQUEST_TIMEOUT`]）：TLS、代理与连接池都用
+/// `reqwest` 默认值，不随渠道变化。同一策略的 Client 全局共用，连接池随之跨请求、跨 Channel
+/// 复用；凭证仍按请求设置（`bearer_auth`），绝不放进 Client 的默认头（RFC 0017 §4）。
+///
+/// 不复用另一家 adapter 的 Client：跨 crate 共用需要一个额外的共享属主，只增加耦合而不改变
+/// "按传输策略复用"这一要求。
+fn shared_client(timeout: Duration) -> Result<Arc<Client>, AdapterError> {
+    static CLIENTS: OnceLock<Mutex<HashMap<Duration, Arc<Client>>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = clients
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(client) = clients.get(&timeout) {
+        return Ok(Arc::clone(client));
+    }
+    let client = Arc::new(
+        Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| AdapterError::Configuration(error.to_string()))?,
+    );
+    clients.insert(timeout, Arc::clone(&client));
+    Ok(client)
+}
+
 pub struct ApimartImageAdapter {
-    client: Client,
+    client: Arc<Client>,
     base_url: Url,
     /// 整轮（提交 + 轮询到终态）的墙钟上限。
     deadline: Duration,
@@ -199,10 +227,7 @@ impl ApimartImageAdapter {
         let normalized = format!("{}/", base_url.trim_end_matches('/'));
         let base_url = Url::parse(&normalized)
             .map_err(|error| AdapterError::Configuration(error.to_string()))?;
-        let client = Client::builder()
-            .timeout(REQUEST_TIMEOUT)
-            .build()
-            .map_err(|error| AdapterError::Configuration(error.to_string()))?;
+        let client = shared_client(REQUEST_TIMEOUT)?;
         Ok(Self {
             client,
             base_url,

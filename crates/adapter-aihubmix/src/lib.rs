@@ -18,7 +18,8 @@ use seeai_domain::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 use url::Url;
 
@@ -320,9 +321,36 @@ fn require_string_with_optional_enum(
     }
 }
 
+/// 按传输策略复用的进程级 HTTP Client。
+///
+/// 策略目前只有单次调用超时：TLS、代理与连接池都用 `reqwest` 默认值，不随渠道变化。
+/// 同一策略的 Client 全局共用，连接池随之跨请求、跨 Channel 复用；凭证仍按请求设置
+/// （`bearer_auth`），绝不放进 Client 的默认头（RFC 0017 §4）。
+///
+/// 不复用另一家 adapter 的 Client：两者的超时来源不同，跨 crate 共用需要一个额外的共享属主，
+/// 只增加耦合而不改变"按传输策略复用"这一要求。
+fn shared_client(timeout: Duration) -> Result<Arc<Client>, AdapterError> {
+    static CLIENTS: OnceLock<Mutex<HashMap<Duration, Arc<Client>>>> = OnceLock::new();
+    let clients = CLIENTS.get_or_init(|| Mutex::new(HashMap::new()));
+    let mut clients = clients
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(client) = clients.get(&timeout) {
+        return Ok(Arc::clone(client));
+    }
+    let client = Arc::new(
+        Client::builder()
+            .timeout(timeout)
+            .build()
+            .map_err(|error| AdapterError::Configuration(error.to_string()))?,
+    );
+    clients.insert(timeout, Arc::clone(&client));
+    Ok(client)
+}
+
 #[derive(Debug, Clone)]
 pub struct AihubmixImageAdapter {
-    client: Client,
+    client: Arc<Client>,
     base_url: Url,
     /// 单次 HTTP 调用的配置超时；新协议再用总期限剩余夹一次。
     timeout: Duration,
@@ -333,10 +361,7 @@ impl AihubmixImageAdapter {
         let normalized = format!("{}/", base_url.trim_end_matches('/'));
         let base_url = Url::parse(&normalized)
             .map_err(|error| AdapterError::Configuration(error.to_string()))?;
-        let client = Client::builder()
-            .timeout(timeout)
-            .build()
-            .map_err(|error| AdapterError::Configuration(error.to_string()))?;
+        let client = shared_client(timeout)?;
         Ok(Self {
             client,
             base_url,
