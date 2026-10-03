@@ -226,6 +226,55 @@ test('已经绑过登录身份的账户：预览显示已绑定，且不能提�
   await expect(page).toHaveURL(/#\/customers$/);
 });
 
+test('建账户撞名：留在表单上说名称已被占用，换个名称就能建成', async ({ page }) => {
+  // 用拉丁名称，才验得了“只差大小写也算撞名”。
+  const taken = `NameTaken${Date.now()}`;
+  await signIn(page);
+
+  await page.getByTestId('accounts-create-open').click();
+  await page.getByTestId('accounts-create-name').fill(taken);
+  await page.getByTestId('accounts-create-submit').click();
+  await expect(page).toHaveURL(/#\/accounts\/[0-9a-f-]{36}$/);
+
+  // 再建一个同名的（含只差大小写的拉丁名称）：地址不进详情，提示"已被占用"，表单还在。
+  await page.getByTestId('accounts-back-to-list').click();
+  await page.getByTestId('accounts-create-open').click();
+  await page.getByTestId('accounts-create-name').fill(taken.toUpperCase());
+  await page.getByTestId('accounts-create-submit').click();
+  await expect(page.getByTestId('accounts-create-error')).toHaveText('这个名称已被占用，请换一个');
+  await expect(page).toHaveURL(/#\/accounts$/);
+  await expect(page.getByTestId('accounts-create-name')).toHaveValue(taken.toUpperCase());
+
+  // 换成另一个名称就能建成：冲突不把人卡死。
+  await page.getByTestId('accounts-create-name').fill(`${taken}-另一个`);
+  await page.getByTestId('accounts-create-submit').click();
+  await expect(page).toHaveURL(/#\/accounts\/[0-9a-f-]{36}$/);
+});
+
+test('改名撞名：显示冲突并保留原值', async ({ page }) => {
+  const taken = `改名撞名-${Date.now()}`;
+  const mine = `${taken}-我的`;
+  await signIn(page);
+
+  await page.getByTestId('accounts-create-open').click();
+  await page.getByTestId('accounts-create-name').fill(taken);
+  await page.getByTestId('accounts-create-submit').click();
+  await expect(page).toHaveURL(/#\/accounts\/[0-9a-f-]{36}$/);
+
+  await page.getByTestId('accounts-back-to-list').click();
+  await page.getByTestId('accounts-create-open').click();
+  await page.getByTestId('accounts-create-name').fill(mine);
+  await page.getByTestId('accounts-create-submit').click();
+  await expect(page).toHaveURL(/#\/accounts\/[0-9a-f-]{36}$/);
+  await expect(page.getByTestId('accounts-detail-name')).toHaveText(mine);
+
+  // 改成第一个账户的名称：冲突提示出现，详情上的名称仍是自己的。
+  await page.getByTestId('accounts-name-input').fill(taken.toUpperCase());
+  await page.getByTestId('accounts-name-submit').click();
+  await expect(page.getByTestId('accounts-name-error')).toHaveText('这个名称已被占用，请换一个');
+  await expect(page.getByTestId('accounts-detail-name')).toHaveText(mine);
+});
+
 test('客户登录列表显示关联账户名称', async ({ page }) => {
   const email = `named-list-${Date.now()}@example.com`;
   const name = `列表可见的名称-${Date.now()}`;

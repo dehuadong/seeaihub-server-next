@@ -1137,3 +1137,185 @@ async fn the_supply_identity_migration_adds_unique_indexes_and_refuses_duplicate
     let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
 }
+
+/// 名称唯一迁移在**已经存在重名行**的库上跑得通：先去重（保留最早那一行），再建唯一索引。
+///
+/// 这条是给非空开发库兜底的路径：`0028` 的回填本身不重名，但人可以改名——改名接口在 v3 之前不挡重名。
+/// 因此构造方式刻意是"先只应用 0028 之前的迁移、手动造出重名行，再补上 0029"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_account_name_migration_deduplicates_names_and_adds_a_unique_index() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("connect to the isolated database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用 0028 及更早的迁移：名称列已经存在且非空，但还没有唯一索引。
+    let staged = std::env::temp_dir().join(format!("seeai-name-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < "0029" {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy early migration");
+        }
+    }
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+
+    // 2) 造出重名：两行完全同名、两行只差大小写、两行都是 100 个字符（后缀不能把它顶出长度上限）。
+    let earliest = Uuid::new_v4();
+    let same_name = Uuid::new_v4();
+    let case_first = Uuid::new_v4();
+    let case_second = Uuid::new_v4();
+    let longest_first = Uuid::new_v4();
+    let longest_second = Uuid::new_v4();
+    // 构造性撞名：`crafted` 与 `victim` 同名，而 `squatted` 已经占着 crafted 改名后会得到的名字；
+    // 单条 UPDATE 解决不了它（改出来的名字正好撞上另一行），迁移里的循环必须再跑一轮。
+    let victim = Uuid::new_v4();
+    let crafted = Uuid::new_v4();
+    let squatter = Uuid::new_v4();
+    let squatted = format!("撞名_{}", crafted.simple());
+    let long_name = "长".repeat(100);
+    for (id, name, created) in [
+        (earliest, "星尘工作室".to_owned(), "2026-10-01T00:00:00Z"),
+        (same_name, "星尘工作室".to_owned(), "2026-10-02T00:00:00Z"),
+        (
+            case_first,
+            "GlobalStudio".to_owned(),
+            "2026-10-02T00:00:00Z",
+        ),
+        (
+            case_second,
+            "globalstudio".to_owned(),
+            "2026-10-03T00:00:00Z",
+        ),
+        (longest_first, long_name.clone(), "2026-10-01T00:00:00Z"),
+        (longest_second, long_name.clone(), "2026-10-04T00:00:00Z"),
+        (victim, "撞名".to_owned(), "2026-10-05T00:00:00Z"),
+        (crafted, "撞名".to_owned(), "2026-10-06T00:00:00Z"),
+        (squatter, squatted.clone(), "2026-10-07T00:00:00Z"),
+    ] {
+        sqlx::query(
+            "INSERT INTO ledger.accounts (id, name, balance_microusd, created_at, updated_at)
+             VALUES ($1, $2, 0, $3::timestamptz, $3::timestamptz)",
+        )
+        .bind(id)
+        .bind(&name)
+        .bind(created)
+        .execute(&pool)
+        .await
+        .expect("duplicate-name fixture");
+    }
+
+    // 去重只改名，不动行：迁移前后账户行数必须一致（数量、绑定、标签、资金、密钥与历史都不动）。
+    let rows_before: i64 = sqlx::query_scalar("SELECT count(*) FROM ledger.accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("row count");
+    assert!(rows_before >= 9, "夹具至少九行：{rows_before}");
+
+    // 3) 补上整批迁移：0029 必须自己去重后把索引建起来。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the name uniqueness migration must apply on a database with duplicates");
+
+    // 4) 库内不再有重名（大小写不敏感），每组最早那一行保留原值，其余各接上自己的 id 片段。
+    let rows_after: i64 = sqlx::query_scalar("SELECT count(*) FROM ledger.accounts")
+        .fetch_one(&pool)
+        .await
+        .expect("row count after");
+    assert_eq!(rows_after, rows_before, "去重只改名，不删行也不插行");
+
+    let duplicates: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM (
+             SELECT lower(name) FROM ledger.accounts GROUP BY lower(name) HAVING count(*) > 1
+         ) AS duplicated",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("duplicate count");
+    assert_eq!(duplicates, 0, "迁移后不该还有重名");
+
+    for (id, expected) in [
+        (earliest, "星尘工作室"),
+        (case_first, "GlobalStudio"),
+        (longest_first, long_name.as_str()),
+    ] {
+        let kept: String = sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("kept name");
+        assert_eq!(kept, expected, "每组最早那一行保留原值");
+    }
+    for (id, prefix) in [(same_name, "星尘工作室_"), (case_second, "globalstudio_")] {
+        let renamed: String = sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+            .bind(id)
+            .fetch_one(&pool)
+            .await
+            .expect("renamed row");
+        assert!(renamed.starts_with(prefix), "{renamed} 应当接上 id 片段");
+        assert!(
+            renamed.ends_with(&id.simple().to_string()),
+            "{renamed} 应当以完整账户 id 结尾（后缀唯一由它保证）"
+        );
+    }
+    // 100 个字符那一组：被改名的那行仍在上限内（后缀按上限截断后再拼），长度 CHECK 不会被顶穿。
+    let renamed_longest: String =
+        sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+            .bind(longest_second)
+            .fetch_one(&pool)
+            .await
+            .expect("renamed long row");
+    assert_eq!(
+        renamed_longest.chars().count(),
+        100,
+        "后缀不能把名称顶出长度上限"
+    );
+    assert!(renamed_longest.starts_with(&"长".repeat(67)));
+    assert!(renamed_longest.ends_with(&longest_second.simple().to_string()));
+
+    // 4.5) 构造性撞名那一组也收敛了：`crafted` 拿到了带自己 id 的名字，`squatter` 因为撞名又被拆开一层。
+    let crafted_name: String = sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+        .bind(crafted)
+        .fetch_one(&pool)
+        .await
+        .expect("crafted row");
+    assert!(
+        crafted_name.ends_with(&crafted.simple().to_string()),
+        "{crafted_name} 应当以 crafted 自己的完整 id 结尾"
+    );
+    let squatter_name: String =
+        sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+            .bind(squatter)
+            .fetch_one(&pool)
+            .await
+            .expect("squatter row");
+    assert_ne!(squatter_name, crafted_name, "两行不能同名");
+    assert!(
+        squatter_name.ends_with(&squatter.simple().to_string()),
+        "{squatter_name}：它原本占着的名字被改走后，自己也被拆开一层"
+    );
+
+    // 5) 索引真的挡重名：直接写一行同名的会失败。
+    let duplicate_insert = sqlx::query(
+        "INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, '星尘工作室', 0)",
+    )
+    .bind(Uuid::new_v4())
+    .execute(&pool)
+    .await;
+    assert!(duplicate_insert.is_err(), "唯一索引必须挡住重名");
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}

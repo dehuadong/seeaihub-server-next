@@ -23,7 +23,7 @@ import {
 import { useState } from 'react';
 import type { AdminClient } from '../client';
 import { ApiError } from '../../shared/api';
-import { accountNameProblem } from '../../shared/account-name';
+import { accountNameConflictHint, accountNameProblem } from '../../shared/account-name';
 import type {
   AccountSummary,
   AdminUsageRow,
@@ -104,7 +104,11 @@ export function AccountsPage({
         }
         message.warning('创建结果暂未确认，请先按账户名称查找确认');
       } else {
-        message.error(failure instanceof Error ? failure.message : String(failure));
+        // 撞名用一句能看懂的提示（`name_taken`）；其余确定失败照原样呈现。
+        const text =
+          accountNameConflictHint(failure) ??
+          (failure instanceof Error ? failure.message : String(failure));
+        message.error(<span data-testid="accounts-create-error">{text}</span>);
       }
     } finally {
       setCreating(false);
@@ -428,7 +432,10 @@ export function AccountDetailPage({
           message.success('名称已保存');
           summary.reload();
         } catch (failure) {
-          setNameError(failure instanceof Error ? failure.message : String(failure));
+          setNameError(
+            accountNameConflictHint(failure) ??
+              (failure instanceof Error ? failure.message : String(failure)),
+          );
         } finally {
           setBusy(false);
         }
@@ -550,7 +557,9 @@ export function AccountDetailPage({
             </Flex>
           </Flex>
 
-          {nameError ? <Alert type="error" showIcon message={nameError} /> : null}
+          {nameError ? (
+            <Alert type="error" showIcon data-testid="accounts-name-error" message={nameError} />
+          ) : null}
           {tagError ? <Alert type="error" showIcon message={tagError} /> : null}
         </Flex>
       </Panel>

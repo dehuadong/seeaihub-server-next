@@ -189,14 +189,14 @@ async fn names_are_searched_as_literal_substrings() {
     harness.cleanup().await;
 }
 
-/// 名称筛选的其余分支：Latin 大小写不敏感、与邮箱／标签按「与」组合、同名账户都能列出。
+/// 名称筛选的其余分支：Latin 大小写不敏感、与邮箱／标签按「与」组合。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn name_search_ignores_case_and_combines_with_email_and_tag() {
     let harness = names_harness().await;
     let client = Client::new();
 
-    // 同名两个账户 + 一个另名同标签账户 + 一个带登录邮箱的同名账户。
+    // 三个名字互不相同的账户（名称唯一，Spec N1），共用一个标签；其中一个再配上登录邮箱。
     let mut created = Vec::new();
     for (name, tag) in [
         ("StarStudio", "vip"),
@@ -212,19 +212,6 @@ async fn name_search_ignores_case_and_combines_with_email_and_tag() {
         assert_eq!(status, StatusCode::OK, "{body}");
         created.push(body["account_id"].as_str().expect("account id").to_owned());
     }
-    // 第二个同名账户：名称可重复（N1），列表必须两行都给、靠 id 区分。
-    let (status, duplicate) = create_account(
-        &client,
-        &harness,
-        json!({"initial_credit_microusd": 0, "name": "StarStudio", "tag": "vip"}),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "{duplicate}");
-    let duplicate_id = duplicate["account_id"]
-        .as_str()
-        .expect("account id")
-        .to_owned();
-    // 给其中一个配上登录邮箱：名称与邮箱同时给时按「与」筛选。
     let bound = client
         .post(format!("{}/api/v1/customers", harness.base_url))
         .bearer_auth(&harness.admin_token)
@@ -234,20 +221,21 @@ async fn name_search_ignores_case_and_combines_with_email_and_tag() {
         .expect("open customer request");
     assert_eq!(bound.status(), StatusCode::CREATED);
 
-    // 大小写不敏感的子串匹配。
-    let mut lower = list_names(&client, &harness, "starstudio").await;
-    lower.sort();
+    // 大小写不敏感的子串匹配：小写查询命中的是大写的那个账户。
     assert_eq!(
-        lower,
-        vec!["StarStudio", "StarStudio"],
-        "两个同名账户都要列出来（靠 id 区分）"
+        list_names(&client, &harness, "starstudio").await,
+        vec!["StarStudio"]
+    );
+    assert_eq!(
+        list_names(&client, &harness, "STUDIO").await.len(),
+        2,
+        "两个 Studio 都命中"
     );
 
-    // 名称 + 标签：仍然命中这两个（标签都是 vip）；换成不存在的标签就是空。
-    assert!(list_names(&client, &harness, "starstudio").await.len() == 2);
+    // 名称 + 标签：命中这两个 vip（换成不存在的标签就是空）。
     let filtered = client
         .get(format!(
-            "{}/api/v1/accounts?name=starstudio&tag=vip&limit=100",
+            "{}/api/v1/accounts?name=studio&tag=vip&limit=100",
             harness.base_url
         ))
         .bearer_auth(&harness.admin_token)
@@ -263,15 +251,13 @@ async fn name_search_ignores_case_and_combines_with_email_and_tag() {
         .iter()
         .map(|account| account["account_id"].as_str().expect("id").to_owned())
         .collect();
-    assert!(
-        ids.contains(&created[0]) && ids.contains(&duplicate_id),
-        "两行都在：{filtered}"
-    );
+    assert_eq!(ids.len(), 2, "名称与标签是「与」的关系：{filtered}");
+    assert!(ids.contains(&created[0]));
 
     // 名称 + 邮箱：只有绑了那个邮箱的那一行。
     let by_email = client
         .get(format!(
-            "{}/api/v1/accounts?name=starstudio&email=star@example.com&limit=100",
+            "{}/api/v1/accounts?name=studio&email=star@example.com&limit=100",
             harness.base_url
         ))
         .bearer_auth(&harness.admin_token)
@@ -284,6 +270,242 @@ async fn name_search_ignores_case_and_combines_with_email_and_tag() {
     let rows = by_email["accounts"].as_array().expect("accounts");
     assert_eq!(rows.len(), 1, "名称与邮箱是「与」的关系：{by_email}");
     assert_eq!(rows[0]["account_id"], json!(created[0]));
+
+    harness.cleanup().await;
+}
+
+/// 名称唯一（Spec N1/N6）：撞名创建与改名都是 `409`，仅大小写不同也算撞名，改回自己原名不算。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn account_names_are_unique_and_case_insensitive() {
+    let harness = names_harness().await;
+    let client = Client::new();
+
+    let (status, first) = create_account(
+        &client,
+        &harness,
+        json!({"initial_credit_microusd": 0, "name": "StarStudio"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{first}");
+    let first_id = first["account_id"].as_str().expect("account id").to_owned();
+
+    // 撞名之前先记下账户总数（夹具账户与平台账户都在列表里）：撞名的四次都不该改变它。
+    let accounts_before = client
+        .get(format!("{}/api/v1/accounts?limit=100", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("account list request")
+        .json::<Value>()
+        .await
+        .expect("account list")["accounts"]
+        .as_array()
+        .expect("accounts")
+        .len();
+
+    // 完全同名与只差大小写都被拒：`409`，且不产生账户。
+    for duplicate in ["StarStudio", "starstudio", "STARSTUDIO", " StarStudio "] {
+        let (status, body) = create_account(
+            &client,
+            &harness,
+            json!({"initial_credit_microusd": 0, "name": duplicate}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::CONFLICT, "{duplicate} 应当冲突：{body}");
+    }
+    assert_eq!(
+        list_names(&client, &harness, "starstudio").await,
+        vec!["StarStudio"],
+        "被拒的创建没有留下账户"
+    );
+    // 「无写入」的直接证据：被拒的四次之后账户总数没有变化。
+    let accounts_after = client
+        .get(format!("{}/api/v1/accounts?limit=100", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("account list request")
+        .json::<Value>()
+        .await
+        .expect("account list")["accounts"]
+        .as_array()
+        .expect("accounts")
+        .len();
+    assert_eq!(accounts_after, accounts_before, "撞名的创建一次都没有落库");
+
+    // 改名撞别人的名称（含大小写变体）是 `409`；不改回自己的原名（含大小写变体）则允许。
+    let (status, second) = create_account(
+        &client,
+        &harness,
+        json!({"initial_credit_microusd": 0, "name": "Another Studio"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "{second}");
+    let second_id = second["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+
+    for taken in ["StarStudio", "starstudio"] {
+        let response = client
+            .put(format!(
+                "{}/api/v1/accounts/{second_id}/name",
+                harness.base_url
+            ))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"name": taken}))
+            .send()
+            .await
+            .expect("rename request");
+        assert_eq!(response.status(), StatusCode::CONFLICT, "{taken}");
+    }
+    assert_eq!(
+        account_summary(&client, &harness, &second_id).await["name"],
+        json!("Another Studio"),
+        "冲突的改名不改动任何资料"
+    );
+
+    // 改回自己原来的名称（只有大小写不同）不算冲突：写进去的就是新的大小写。
+    let own_case = client
+        .put(format!(
+            "{}/api/v1/accounts/{first_id}/name",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"name": "STARSTUDIO"}))
+        .send()
+        .await
+        .expect("rename own request");
+    assert_eq!(own_case.status(), StatusCode::NO_CONTENT);
+    assert_eq!(
+        account_summary(&client, &harness, &first_id).await["name"],
+        json!("STARSTUDIO")
+    );
+
+    // 不存在的账户带一个已被占用的名称：不存在优先（`404`），不是冲突。
+    let missing = client
+        .put(format!(
+            "{}/api/v1/accounts/00000000-0000-4000-8000-000000000000/name",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"name": "STARSTUDIO"}))
+        .send()
+        .await
+        .expect("rename missing request");
+    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+
+    // 客户改自己的名称同样受唯一约束：改成运营那个账户的名称是冲突，原值不变。
+    let registered = client
+        .post(format!("{}/v1/customers", harness.base_url))
+        .json(&json!({"email": "unique@example.com", "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("register request")
+        .json::<Value>()
+        .await
+        .expect("register body");
+    let session = registered["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+    let customer_account = registered["account_id"]
+        .as_str()
+        .expect("account id")
+        .to_owned();
+    assert!(customer_account != first_id && customer_account != second_id);
+    let conflict = client
+        .put(format!("{}/v1/customer/account/name", harness.base_url))
+        .bearer_auth(&session)
+        .json(&json!({"name": "starstudio"}))
+        .send()
+        .await
+        .expect("customer rename request");
+    assert_eq!(conflict.status(), StatusCode::CONFLICT);
+    let account = client
+        .get(format!("{}/v1/customer/account", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("customer account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(
+        account["name"],
+        json!(format!("unique_{}", &customer_account[..4])),
+        "冲突的改名不改动客户自己的名称"
+    );
+
+    harness.cleanup().await;
+}
+
+/// 生成路径自己解决撞名：同一邮箱本地部分的两个账户都注册成功，名称互不相同（Spec N3）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn generated_names_stay_unique_for_the_same_email_local_part() {
+    let harness = names_harness().await;
+    let client = Client::new();
+
+    let mut names = Vec::new();
+    for domain in ["a.example.com", "b.example.com", "c.example.com"] {
+        let registered = client
+            .post(format!("{}/v1/customers", harness.base_url))
+            .json(&json!({
+                "email": format!("zhangsan@{domain}"),
+                "password": "a-long-enough-password",
+            }))
+            .send()
+            .await
+            .expect("register request");
+        assert_eq!(registered.status(), StatusCode::CREATED, "{domain}");
+        let registered = registered.json::<Value>().await.expect("register body");
+        let session = registered["token"].as_str().expect("session token");
+        let account = client
+            .get(format!("{}/v1/customer/account", harness.base_url))
+            .bearer_auth(session)
+            .send()
+            .await
+            .expect("customer account request")
+            .json::<Value>()
+            .await
+            .expect("account body");
+        let name = account["name"].as_str().expect("name").to_owned();
+        assert!(name.starts_with("zhangsan_"), "按邮箱本地部分生成：{name}");
+        assert!(
+            !names.contains(&name),
+            "生成名称必须唯一：{names:?} 里已有 {name}"
+        );
+        names.push(name);
+    }
+
+    // 三个账户都在库里。
+    assert_eq!(list_names(&client, &harness, "zhangsan_").await.len(), 3);
+
+    // 管理端「新建账户并开通邮箱登录」这条路径同样按候选生成：留空时也得唯一，且同样以本地部分开头。
+    let mut opened_names = Vec::new();
+    for domain in ["d.example.com", "e.example.com"] {
+        let opened = client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": format!("zhangsan@{domain}")}))
+            .send()
+            .await
+            .expect("open customer request");
+        assert_eq!(opened.status(), StatusCode::CREATED, "{domain}");
+        let view = opened.json::<Value>().await.expect("customer view");
+        let name = view["account_name"]
+            .as_str()
+            .expect("account name")
+            .to_owned();
+        assert!(name.starts_with("zhangsan_"), "{name}");
+        assert!(
+            !names.contains(&name) && !opened_names.contains(&name),
+            "两条路径生成的名字都不能重复：{names:?} {opened_names:?} 里已有 {name}"
+        );
+        opened_names.push(name);
+    }
 
     harness.cleanup().await;
 }
@@ -646,6 +868,76 @@ async fn binding_an_existing_account_cannot_set_a_name() {
         json!(format!("generated_{}", &generated_account[..4])),
         "省略名称时按登录邮箱生成：{generated}"
     );
+
+    harness.cleanup().await;
+}
+
+/// 重复邮箱与名称撞名是两类冲突：错误码不同，界面才能说对要换的是哪个参数。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_duplicate_email_is_a_conflict_not_a_name_taken() {
+    let harness = names_harness().await;
+    let client = Client::new();
+
+    let first = client
+        .post(format!("{}/v1/customers", harness.base_url))
+        .json(&json!({"email": "dup@example.com", "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("register request");
+    assert_eq!(first.status(), StatusCode::CREATED);
+
+    let second = client
+        .post(format!("{}/v1/customers", harness.base_url))
+        .json(&json!({"email": "dup@example.com", "password": "a-long-enough-password"}))
+        .send()
+        .await
+        .expect("second register request");
+    assert_eq!(second.status(), StatusCode::CONFLICT);
+    let body = second.json::<Value>().await.expect("error body");
+    assert_eq!(
+        body["error"]["code"],
+        json!("conflict"),
+        "撞邮箱是 conflict；只有名称撞了才是 name_taken：{body}"
+    );
+
+    // 管理端开户撞邮箱同理（这条路径也会走新建账户的候选序列）。
+    let opened = client
+        .post(format!("{}/api/v1/customers", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"email": "dup@example.com", "account_name": "想给的名字"}))
+        .send()
+        .await
+        .expect("open customer request");
+    assert_eq!(opened.status(), StatusCode::CONFLICT);
+    let body = opened.json::<Value>().await.expect("error body");
+    assert_eq!(body["error"]["code"], json!("conflict"), "{body}");
+
+    harness.cleanup().await;
+}
+
+/// 撞名时错误码是 `name_taken`（客户端据此说"换一个名称"）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_taken_name_reports_the_name_taken_code() {
+    let harness = names_harness().await;
+    let client = Client::new();
+
+    let (status, _) = create_account(
+        &client,
+        &harness,
+        json!({"initial_credit_microusd": 0, "name": "唯一名称"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, body) = create_account(
+        &client,
+        &harness,
+        json!({"initial_credit_microusd": 0, "name": "唯一名称"}),
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT);
+    assert_eq!(body["error"]["code"], json!("name_taken"), "{body}");
 
     harness.cleanup().await;
 }

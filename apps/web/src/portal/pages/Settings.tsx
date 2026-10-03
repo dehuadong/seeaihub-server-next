@@ -5,7 +5,7 @@ import type { CustomerClient } from '../client';
 import { NO_ONLINE_PAYMENT, RESET_VIA_OPERATIONS } from '../notices';
 import { useCustomerSession } from '../session';
 import { useLoadable } from '../../shared/ui';
-import { accountNameProblem } from '../../shared/account-name';
+import { accountNameConflictHint, accountNameProblem } from '../../shared/account-name';
 
 /// 账户设置：登录邮箱、可复制的账户 id、改口令与退出。低频资料与低频动作收在这里，不占概览首屏。
 ///
@@ -48,7 +48,10 @@ export function SettingsPage({
       account.reload();
       message.success('账户名称已保存');
     } catch (failure) {
-      setNameError(failure instanceof Error ? failure.message : String(failure));
+      setNameError(
+        accountNameConflictHint(failure) ??
+          (failure instanceof Error ? failure.message : String(failure)),
+      );
     } finally {
       setSavingName(false);
     }
@@ -99,7 +102,9 @@ export function SettingsPage({
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
             账户名称用于识别与账单，可随时修改。
           </Typography.Text>
-          {nameError ? <Alert type="error" showIcon message={nameError} /> : null}
+          {nameError ? (
+            <Alert type="error" showIcon data-testid="portal-account-name-error" message={nameError} />
+          ) : null}
         </Flex>
         <Button style={{ marginTop: 16 }} onClick={onSignOut}>
           退出登录

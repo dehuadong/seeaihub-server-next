@@ -1,10 +1,36 @@
 import { expect, test } from '@playwright/test';
 import { nav, registerCustomer, uniqueEmail } from './portal';
+import { adminApiUrl, settings } from './settings';
 
 /// 客户在「账户设置」里看与改自己的账户名称（账户名称 Spec `0003` U6、V6、V9）。
 ///
 /// 只有浏览器才观测得到的那一层：注册后账户设置里显示的是服务端生成的名称、能改成自己的名字、刷新后
 /// 仍是新值、清空被当场拦下且输入框回到已保存的值。生成规则与两侧读数一致由接口用例在真库上验。
+
+test('改成别人已经用的名称被拒：提示换一个，自己的名称不变', async ({ page, request }) => {
+  // 先用管理接口占掉一个名称（客户侧没有别的入口能造出"别人的名称"）。
+  const taken = `被别人占用的名称-${Date.now()}`;
+  const created = await request.post(`${adminApiUrl}/api/v1/accounts`, {
+    headers: { authorization: `Bearer ${settings.adminToken}` },
+    data: { initial_credit_microusd: 0, name: taken },
+  });
+  expect(created.ok()).toBeTruthy();
+
+  const email = uniqueEmail('portal-name-conflict');
+  await registerCustomer(page, email);
+  await nav(page, '账户设置');
+  const before = await page.getByTestId('portal-account-name').inputValue();
+
+  await page.getByTestId('portal-account-name').fill(taken);
+  await page.getByTestId('portal-account-name-save').click();
+  await expect(page.getByTestId('portal-account-name-error')).toHaveText(
+    '这个名称已被占用，请换一个',
+  );
+  // 冲突不改动服务端那一份：刷新后仍是原来的名称。
+  await page.reload();
+  await nav(page, '账户设置');
+  await expect(page.getByTestId('portal-account-name')).toHaveValue(before);
+});
 
 test('注册后账户设置显示生成的名称，改名成功并在刷新后保持', async ({ page }) => {
   const email = uniqueEmail('portal-name');
@@ -36,7 +62,7 @@ test('注册后账户设置显示生成的名称，改名成功并在刷新后�
   // 清空被拦下：输入框回到已保存的值，服务端那份也没被改掉。
   await page.getByTestId('portal-account-name').fill('   ');
   await page.getByTestId('portal-account-name-save').click();
-  await expect(page.getByText('账户名称不能为空')).toBeVisible();
+  await expect(page.getByTestId('portal-account-name-error')).toHaveText('账户名称不能为空');
   await page.reload();
   await nav(page, '账户设置');
   await expect(page.getByTestId('portal-account-name')).toHaveValue(name);

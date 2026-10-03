@@ -67,7 +67,10 @@ pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
 
 pub mod account_name;
 mod history_cursor;
-pub use account_name::{ACCOUNT_NAME_MAX_CHARS, generated_account_name, normalize_account_name};
+pub(crate) use account_name::name_taken_error;
+pub use account_name::{
+    ACCOUNT_NAME_MAX_CHARS, generated_account_name_attempts, normalize_account_name,
+};
 pub use history_cursor::{
     CursorPosition, HISTORY_CURSOR_KEY_LEN, HistoryCursor, HistoryFilter, HistoryStream,
     decode_history_cursor, encode_history_cursor, invalid_history_cursor,
@@ -1979,6 +1982,12 @@ pub enum ApplicationError {
     NotFound(String),
     #[error("conflict: {0}")]
     Conflict(String),
+    /// 账户名称已被别的账户占用（`409 name_taken`）。
+    ///
+    /// 与 [`Self::Conflict`] 分开是因为**调用方该做的事不同**：名称撞了就换一个名称再试（生成路径自己
+    /// 换更长的候选），而邮箱、账户绑定撞了要换的是另一个身份参数。HTTP 上两者都是 409，只是错误码不同。
+    #[error("account name taken: {0}")]
+    NameTaken(String),
     #[error("insufficient balance")]
     InsufficientBalance,
     #[error("too many requests in flight")]
@@ -3089,13 +3098,25 @@ impl IdentityService {
         let email = normalize_email(email)?;
         check_secret(password, "password")?;
         let hash = hash_password(password)?;
-        // 自助注册不给名称输入：账户 id 与名称都在这里定下来，再交给仓储写。
+        // 自助注册不给名称输入：账户 id 与名称都在这里定下来，再交给仓储写。名称撞了就换更长的
+        // id 片段再试——注册不该因为"生成的短名字恰好被占用"而失败。
         let account_id = AccountId::new();
-        let name = generated_account_name(account_id, Some(&email));
-        let customer_id = self
-            .repository
-            .create_customer(account_id, &name, &email, &hash)
-            .await?;
+        // 名称撞了就换更长的 id 片段再试（候选序列见 `generated_account_name_attempts`）。
+        let mut candidates = generated_account_name_attempts(account_id, Some(&email)).into_iter();
+        let customer_id = loop {
+            let Some(candidate) = candidates.next() else {
+                return Err(name_taken_error());
+            };
+            match self
+                .repository
+                .create_customer(account_id, &candidate, &email, &hash)
+                .await
+            {
+                Ok(customer_id) => break customer_id,
+                Err(ApplicationError::NameTaken(_)) => continue,
+                Err(error) => return Err(error),
+            }
+        };
         let token = new_session_token();
         let expires_at = session_expiry(Utc::now(), ttl);
         self.repository
@@ -3335,24 +3356,44 @@ impl IdentityService {
             // 没有初始口令时也要占住那一列：写一条**永远匹配不上**的口令，等重置令牌换掉它。
             None => hash_password(&new_session_token())?,
         };
-        let target = match account_id {
-            Some(existing) => CustomerAccountTarget::Existing(existing),
+        let (customer_id, account_id) = match account_id {
+            Some(existing) => {
+                self.repository
+                    .open_customer_account(&email, &hash, CustomerAccountTarget::Existing(existing))
+                    .await?
+            }
             None => {
                 let new_account_id = AccountId::new();
-                let name = match account_name {
-                    Some(raw) => normalize_account_name(raw)?,
-                    None => generated_account_name(new_account_id, Some(&email)),
+                let attempts = match account_name {
+                    // 调用方给了名称：只有这一个候选，撞名就是冲突。
+                    Some(raw) => vec![normalize_account_name(raw)?],
+                    // 留空：按登录邮箱生成候选，撞名就换更长的 id 片段。
+                    None => generated_account_name_attempts(new_account_id, Some(&email)),
                 };
-                CustomerAccountTarget::New {
-                    account_id: new_account_id,
-                    name,
+                let mut candidates = attempts.into_iter();
+                loop {
+                    let Some(candidate) = candidates.next() else {
+                        return Err(name_taken_error());
+                    };
+                    match self
+                        .repository
+                        .open_customer_account(
+                            &email,
+                            &hash,
+                            CustomerAccountTarget::New {
+                                account_id: new_account_id,
+                                name: candidate,
+                            },
+                        )
+                        .await
+                    {
+                        Ok(created) => break created,
+                        Err(ApplicationError::NameTaken(_)) => continue,
+                        Err(error) => return Err(error),
+                    }
                 }
             }
         };
-        let (customer_id, account_id) = self
-            .repository
-            .open_customer_account(&email, &hash, target)
-            .await?;
         self.customer_view(customer_id, account_id, &email).await
     }
 
@@ -3501,15 +3542,33 @@ impl AccountsService {
         actor: &str,
     ) -> Result<AccountId, ApplicationError> {
         let account_id = AccountId::new();
-        let name = match name {
-            Some(raw) => normalize_account_name(raw)?,
-            // 没有登录邮箱可用，生成规则退到账户 id 形式。
-            None => generated_account_name(account_id, None),
+        let change = match name {
+            // 调用方给了名称：只有这一个候选，撞名就是冲突。
+            Some(raw) => {
+                let name = normalize_account_name(raw)?;
+                self.repository
+                    .create_account(account_id, &name, tag, initial_credit_microusd, actor)
+                    .await?
+            }
+            // 留空：按候选序列生成，撞名就换下一个（见 `generated_account_name_attempts`）。
+            None => {
+                let mut candidates = generated_account_name_attempts(account_id, None).into_iter();
+                loop {
+                    let Some(candidate) = candidates.next() else {
+                        return Err(name_taken_error());
+                    };
+                    match self
+                        .repository
+                        .create_account(account_id, &candidate, tag, initial_credit_microusd, actor)
+                        .await
+                    {
+                        Ok(change) => break change,
+                        Err(ApplicationError::NameTaken(_)) => continue,
+                        Err(error) => return Err(error),
+                    }
+                }
+            }
         };
-        let change = self
-            .repository
-            .create_account(account_id, &name, tag, initial_credit_microusd, actor)
-            .await?;
         self.acceleration
             .write_balance(&change, BalanceSource::DbCommit)
             .await;

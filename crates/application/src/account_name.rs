@@ -12,8 +12,10 @@ use crate::ApplicationError;
 /// 名称的字符数上限，按 Unicode scalar value 计数（Spec N2）。
 pub const ACCOUNT_NAME_MAX_CHARS: usize = 100;
 
-/// 生成时留给邮箱本地部分的上限：拼上 `_` 与 4 位 id 片段仍不超过 [`ACCOUNT_NAME_MAX_CHARS`]。
-const GENERATED_LOCAL_PART_MAX_CHARS: usize = ACCOUNT_NAME_MAX_CHARS - 5;
+/// 有登录邮箱时的 id 片段长度：从 Spec N3 的 4 位起步，撞名就加长。
+const GENERATED_EMAIL_FRAGMENT_LENGTHS: [usize; 5] = [4, 6, 8, 12, 16];
+/// 没有可用邮箱时的 id 片段长度：从 Spec N3 的 8 位起步，撞名就加长。
+const GENERATED_FALLBACK_FRAGMENT_LENGTHS: [usize; 3] = [8, 12, 16];
 
 /// 规范化并校验一个由调用方给出的名称（Spec N2）。
 ///
@@ -40,33 +42,58 @@ pub fn normalize_account_name(raw: &str) -> Result<String, ApplicationError> {
     Ok(trimmed.to_owned())
 }
 
-/// 名称留空时生成的名称（Spec N3）。
+/// 名称留空时的**候选序列**：名称必须唯一（Spec N1），首选撞名时依次加长 id 片段再试。
 ///
-/// 能取到可用的登录邮箱本地部分就用 `<本地部分>_<账户 id 前 4 位>`，否则用 `账户_<账户 id 前 8 位>`。
-/// 生成不使用路由标签、日期或序号；结果一定满足 [`normalize_account_name`] 的规则。
+/// 顺序是"先给最好看的"：邮箱形式从 4 位片段起步，其后加长；`账户_` 形式从 8 位起步加长，并始终排在
+/// 邮箱形式之后作为兜底。最后一项用 16 位片段，撞名概率已经可以忽略（真撞上就用尽候选、返回冲突）。
+/// 结果按顺序去重，每一项都满足 [`normalize_account_name`]。
 #[must_use]
-pub fn generated_account_name(account_id: AccountId, email: Option<&str>) -> String {
-    if let Some(candidate) = email.and_then(|email| email_candidate(account_id, email))
-        && let Ok(name) = normalize_account_name(&candidate)
-    {
-        return name;
+pub fn generated_account_name_attempts(account_id: AccountId, email: Option<&str>) -> Vec<String> {
+    let local_part = email
+        .and_then(|email| {
+            email
+                .split_once('@')
+                .map(|(local, _)| local.trim().to_owned())
+        })
+        .filter(|local| !local.is_empty() && !has_rejected_character(local));
+
+    let mut attempts = Vec::new();
+    if let Some(local_part) = local_part.as_deref() {
+        for fragment in GENERATED_EMAIL_FRAGMENT_LENGTHS {
+            let suffix = format!("_{}", id_fragment(account_id, fragment));
+            // 本地部分超长时按 N2 的上限截断（保留前若干字符）：拼上后缀仍不超过上限。
+            let allowed = ACCOUNT_NAME_MAX_CHARS
+                .saturating_sub(suffix.chars().count())
+                .max(1);
+            let truncated = local_part.chars().take(allowed).collect::<String>();
+            push_candidate(&mut attempts, format!("{truncated}{suffix}"));
+        }
     }
-    format!("账户_{}", id_fragment(account_id, 8))
+    // 兜底形式始终参与：邮箱形式全部撞名（或本来就没有邮箱）时还有 `账户_<id>` 可用。
+    for fragment in GENERATED_FALLBACK_FRAGMENT_LENGTHS {
+        push_candidate(&mut attempts, fallback_name(account_id, fragment));
+    }
+    attempts
 }
 
-/// 邮箱之所以能被用作生成来源，只因为它是登录身份**已经**接受过的那一个；本地部分超长或含被拒字符
-/// 时返回 `None`，由调用方退回账户 id 形式——邮箱校验既不限长度、也不挡控制字符，这两条必须自己兜。
-fn email_candidate(account_id: AccountId, email: &str) -> Option<String> {
-    let (local_part, _) = email.split_once('@')?;
-    let local_part = local_part.trim();
-    if local_part.is_empty() || has_rejected_character(local_part) {
-        return None;
+/// 候选要能过 N2 才进列表（本地部分可能超长或带空白），重复的候选只留第一次出现的位置。
+fn push_candidate(attempts: &mut Vec<String>, candidate: String) {
+    if let Ok(name) = normalize_account_name(&candidate)
+        && !attempts.contains(&name)
+    {
+        attempts.push(name);
     }
-    let truncated = local_part
-        .chars()
-        .take(GENERATED_LOCAL_PART_MAX_CHARS)
-        .collect::<String>();
-    Some(format!("{truncated}_{}", id_fragment(account_id, 4)))
+}
+
+/// 候选用尽仍撞名时的统一答复：调用方（运营或客户）自己换一个名字。
+#[must_use]
+pub(crate) fn name_taken_error() -> ApplicationError {
+    ApplicationError::NameTaken("account name is already taken".to_owned())
+}
+
+/// `账户_<账户 id 前 n 位>`：没有可用邮箱时的生成形式，也是候选序列的兜底。
+fn fallback_name(account_id: AccountId, fragment: usize) -> String {
+    format!("账户_{}", id_fragment(account_id, fragment))
 }
 
 /// 账户 id 的前 `chars` 个十六进制字符（`Uuid` 的短横线形式去掉短横线也能用，这里按常规取前几位）。

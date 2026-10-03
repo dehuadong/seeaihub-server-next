@@ -1984,6 +1984,12 @@ impl HubRepository for PgHubRepository {
         actor: &str,
     ) -> Result<BalanceChange, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 名称唯一（Spec `0003` N1）：先查一次给出说得清的冲突，索引负责并发那一次。
+        if account_name_taken(&mut transaction, name, None).await? {
+            return Err(ApplicationError::NameTaken(format!(
+                "account name {name} is already taken"
+            )));
+        }
         let inserted = sqlx::query(
             r#"
             INSERT INTO ledger.accounts (id, name, tag, balance_microusd) VALUES ($1, $2, $3, $4)
@@ -1998,7 +2004,7 @@ impl HubRepository for PgHubRepository {
         .bind(to_i64(initial_credit_microusd)?)
         .fetch_one(&mut *transaction)
         .await
-        .map_err(database_error)?;
+        .map_err(|error| account_name_conflict(error, name))?;
         if initial_credit_microusd > 0 {
             sqlx::query(
                 r#"
@@ -2052,12 +2058,18 @@ impl HubRepository for PgHubRepository {
         let Some(previous) = previous else {
             return Err(ApplicationError::NotFound(format!("account {account_id}")));
         };
+        // 改成别的账户已用的名称是冲突；改回自己原来的名称（只差大小写也算）不算。
+        if account_name_taken(&mut transaction, name, Some(account_id.0)).await? {
+            return Err(ApplicationError::NameTaken(format!(
+                "account name {name} is already taken"
+            )));
+        }
         sqlx::query("UPDATE ledger.accounts SET name = $2 WHERE id = $1")
             .bind(account_id.0)
             .bind(name)
             .execute(&mut *transaction)
             .await
-            .map_err(database_error)?;
+            .map_err(|error| account_name_conflict(error, name))?;
         insert_audit(
             &mut transaction,
             actor,
@@ -3752,12 +3764,18 @@ impl HubRepository for PgHubRepository {
             )));
         }
         // 账户与身份同一个事务：注册出来的账户必须能立刻用，不能出现"有账户没身份"的半截状态。
+        // 名称同样唯一：撞名时回冲突，由用例换更长的 id 片段再试。
+        if account_name_taken(&mut transaction, account_name, None).await? {
+            return Err(ApplicationError::NameTaken(format!(
+                "account name {account_name} is already taken"
+            )));
+        }
         sqlx::query("INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 0)")
             .bind(account_id.0)
             .bind(account_name)
             .execute(&mut *transaction)
             .await
-            .map_err(database_error)?;
+            .map_err(|error| account_name_conflict(error, account_name))?;
         sqlx::query(
             r#"
             INSERT INTO identity.customers (id, email, password_hash, account_id)
@@ -4143,6 +4161,11 @@ impl HubRepository for PgHubRepository {
                 (existing, None)
             }
             CustomerAccountTarget::New { account_id, name } => {
+                if account_name_taken(&mut transaction, &name, None).await? {
+                    return Err(ApplicationError::NameTaken(format!(
+                        "account name {name} is already taken"
+                    )));
+                }
                 sqlx::query(
                     "INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 0)",
                 )
@@ -4150,7 +4173,7 @@ impl HubRepository for PgHubRepository {
                 .bind(&name)
                 .execute(&mut *transaction)
                 .await
-                .map_err(database_error)?;
+                .map_err(|error| account_name_conflict(error, &name))?;
                 (account_id.0, Some(name))
             }
         };
@@ -5040,6 +5063,40 @@ fn to_i64(value: u64) -> Result<i64, ApplicationError> {
 fn to_u64(value: i64) -> Result<u64, ApplicationError> {
     u64::try_from(value)
         .map_err(|_| ApplicationError::Persistence("negative monetary value".to_owned()))
+}
+
+/// 账户名称唯一索引（迁移 `0029`）：唯一性是**大小写不敏感**的，索引建在 `lower(name)` 上。
+const ACCOUNT_NAME_UNIQUE_INDEX: &str = "accounts_name_key";
+
+/// 撞名称唯一约束时的统一说法：名称必须唯一，调用方换一个（生成规则会自己再试更长的片段）。
+///
+/// 写入前先查一次是为了给出说得清的冲突答复；真正的兜底仍由那条唯一索引承担（两个并发请求都会查到
+/// “没被占用”）。
+fn account_name_conflict(error: sqlx::Error, name: &str) -> ApplicationError {
+    if let sqlx::Error::Database(database) = &error
+        && database.constraint() == Some(ACCOUNT_NAME_UNIQUE_INDEX)
+    {
+        return ApplicationError::NameTaken(format!("account name {name} is already taken"));
+    }
+    database_error(error)
+}
+
+/// 账户名称是否已被**别的账户**占用（大小写不敏感）。`except` 用来把"自己"排除在外：
+/// 改名成自己原来的名称（哪怕只差大小写）不算冲突。
+async fn account_name_taken(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    name: &str,
+    except: Option<Uuid>,
+) -> Result<bool, ApplicationError> {
+    let taken: Option<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM ledger.accounts WHERE lower(name) = lower($1) AND ($2::uuid IS NULL OR id <> $2)",
+    )
+    .bind(name)
+    .bind(except)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(taken.is_some())
 }
 
 fn database_error(error: impl std::fmt::Display) -> ApplicationError {

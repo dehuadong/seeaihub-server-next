@@ -17,6 +17,7 @@ import { ArrowLeftOutlined, KeyOutlined, PlusOutlined, SearchOutlined } from '@a
 import { useRef, useState } from 'react';
 import type { AdminClient } from '../client';
 import type { CustomerView } from '../../shared/types';
+import { accountNameConflictHint } from '../../shared/account-name';
 import { useLoadable } from '../../shared/ui';
 import { useScreenState } from '../screen-state';
 import { ConsoleNotFound, ConsolePage, Panel, whenText } from '../ui';
@@ -153,7 +154,10 @@ export function CustomersPage({
               // 开完直接进这个客户的详情页：签发重置令牌是运营的下一步。
               onOpenCustomer(created.customer_id);
             } catch (failure) {
-              message.error(failure instanceof Error ? failure.message : String(failure));
+              const text =
+                accountNameConflictHint(failure) ??
+                (failure instanceof Error ? failure.message : String(failure));
+              message.error(<span data-testid="customers-open-error">{text}</span>);
             } finally {
               setOpening(false);
             }

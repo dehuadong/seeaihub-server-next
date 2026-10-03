@@ -2809,6 +2809,9 @@ impl From<ApplicationError> for ApiError {
             }
             ApplicationError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             ApplicationError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
+            // 名称撞了要换的是名称本身：与邮箱、账户绑定撞了（`conflict`）区分开，界面上才能给出
+            // 说得对的那句话（"换一个名称"而不是"这个邮箱已经注册过了"）。
+            ApplicationError::NameTaken(_) => (StatusCode::CONFLICT, "name_taken"),
             ApplicationError::InsufficientBalance => {
                 (StatusCode::PAYMENT_REQUIRED, "insufficient_balance")
             }
@@ -2867,6 +2870,7 @@ fn error_category(error: &ApplicationError) -> &'static str {
         | ApplicationError::RequestCostCeilingExceeded(_)
         | ApplicationError::NotFound(_)
         | ApplicationError::Conflict(_)
+        | ApplicationError::NameTaken(_)
         | ApplicationError::InsufficientBalance
         | ApplicationError::TooManyInFlight
         | ApplicationError::RateLimitExceeded { .. }
