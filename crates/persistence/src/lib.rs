@@ -2337,49 +2337,6 @@ impl HubRepository for PgHubRepository {
         Ok((identity.0, AccountId(identity.1)))
     }
 
-    async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
-        let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        // 只改**还没吊销**的那一行：一条语句就把"第一次吊销"与"重复吊销"分开了——重复调用影响 0 行。
-        // 0 行既可能是"早就吊销过"（幂等成功）也可能是"这把键根本不存在"（404），下面再查一次区分。
-        let revoked_account: Option<Uuid> = sqlx::query_scalar(
-            r#"
-            UPDATE identity.api_keys
-            SET revoked_at = now()
-            WHERE id = $1 AND revoked_at IS NULL
-            RETURNING account_id
-            "#,
-        )
-        .bind(key_id)
-        .fetch_optional(&mut *transaction)
-        .await
-        .map_err(database_error)?;
-        let Some(account_id) = revoked_account else {
-            let existing: Option<Uuid> =
-                sqlx::query_scalar("SELECT account_id FROM identity.api_keys WHERE id = $1")
-                    .bind(key_id)
-                    .fetch_optional(&mut *transaction)
-                    .await
-                    .map_err(database_error)?;
-            // 已经吊销过：幂等成功，也不再写一条"又吊销了一次"的审计——吊销是一件事、只发生一次，
-            // 重复调用说明的是调用方不知道它已经生效，不是新的事实。
-            return match existing {
-                Some(_) => Ok(()),
-                None => Err(ApplicationError::NotFound("api key".to_owned())),
-            };
-        };
-        // 不删行：创建与吊销都是要留痕的历史事实，排障要看这把密钥什么时候被谁停掉。
-        insert_audit(
-            &mut transaction,
-            actor,
-            "api_key.revoke",
-            "api_key",
-            &key_id.to_string(),
-            &serde_json::json!({"account_id": account_id.to_string()}),
-        )
-        .await?;
-        transaction.commit().await.map_err(database_error)
-    }
-
     async fn create_job(
         &self,
         command: CreateImageGeneration,

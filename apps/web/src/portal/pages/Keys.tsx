@@ -3,9 +3,9 @@ import {
   App as AntApp,
   Button,
   Card,
-  Flex,
   Form,
   Input,
+  Modal,
   Popconfirm,
   Table,
   Tag,
@@ -17,7 +17,7 @@ import type { CustomerClient } from '../client';
 import { whenText } from '../../shared/format';
 import { useLoadable } from '../../shared/ui';
 
-/// API Key：列、建、吊销。明文只在创建那一次出现。
+/// API Key：列、建、按行吊销。新建的明文在**弹窗**里、只给密钥本身（不显示密钥标识），关闭即清。
 ///
 /// 只请求本页需要的 `/v1/customer/api-keys`；余额、账单与用量不在这一页（Spec C15）。
 export function KeysPage({ client }: { client: CustomerClient }) {
@@ -93,40 +93,25 @@ export function KeysPage({ client }: { client: CustomerClient }) {
         </Form.Item>
       </Form>
 
-      {issued ? (
-        <Alert
-          style={{ marginTop: 16 }}
-          type="warning"
-          showIcon
-          message="密钥明文——只显示这一次，现在就抄走"
-          description={
-            <Flex vertical gap={8}>
-              <Typography.Text
-                data-testid="portal-key-plaintext"
-                code
-                copyable
-                style={{ fontSize: 14 }}
-              >
-                {issued.api_key}
-              </Typography.Text>
-              <Typography.Text type="secondary">
-                密钥标识：
-                <Typography.Text code copyable>
-                  {issued.key_id}
-                </Typography.Text>
-              </Typography.Text>
-              {/* 关掉一次性展示就把明文从页面状态里清掉：它不该在页面上多留一秒（Spec C5）。 */}
-              <Button
-                size="small"
-                data-testid="portal-key-plaintext-close"
-                onClick={() => setIssued(null)}
-              >
-                我已抄走，关闭明文
-              </Button>
-            </Flex>
-          }
-        />
-      ) : null}
+      <Modal
+        title="密钥明文——只显示这一次"
+        open={issued !== null}
+        onCancel={() => setIssued(null)}
+        footer={
+          <Button data-testid="portal-key-plaintext-close" onClick={() => setIssued(null)}>
+            取消
+          </Button>
+        }
+        destroyOnHidden
+      >
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          现在就抄走；关闭即从页面清除，之后谁也拿不回来。
+        </Typography.Paragraph>
+        {/* 只给密钥本身：密钥标识是吊销用的，列表里那一行自己认人（Spec C5）。 */}
+        <Typography.Text data-testid="portal-key-plaintext" code copyable style={{ fontSize: 14 }}>
+          {issued?.api_key ?? ''}
+        </Typography.Text>
+      </Modal>
 
       <Table
         style={{ marginTop: 16 }}

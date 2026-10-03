@@ -21,13 +21,15 @@ import { useLoadable } from '../../shared/ui';
 import { useCursorPage } from '../history';
 import { rangeFromLocalDates, rangeLabel, useHistoryRange } from '../dates';
 
-/// 真实收支类别的展示文案。取值由服务端给，界面只翻译；不认识的原样透出，不猜。
+/// 真实收支类别的**客户语言**文案。取值由服务端给，界面只翻译；不认识的原样透出，不猜。
 ///
 /// 只列**对客可见**的三类：`hold` / `release` / `cost` 服务端根本不回（Spec C8、V-C15）。
+/// 不出现 `capture`／`adjustment` 这类内部科目名：`capture` 是结算后真正扣掉的钱，就叫「扣费」；
+/// `adjustment` 是运营对余额的人工调整，叫「运营调整」——说清是谁动的钱（Spec C8）。
 const KIND_LABELS: Record<string, string> = {
   credit: '充值',
-  capture: '实际扣费',
-  adjustment: '资金调整',
+  capture: '扣费',
+  adjustment: '运营调整',
 };
 
 /// 客户能筛的类别：**没有 `cost`**——平台成本不是客户的事实（Spec C8）。标签给一个稳定的锚点，
@@ -40,11 +42,11 @@ const KIND_OPTIONS = [
   },
   {
     value: 'capture',
-    label: <span data-testid="portal-ledger-kind-capture">实际扣费</span>,
+    label: <span data-testid="portal-ledger-kind-capture">扣费</span>,
   },
   {
     value: 'adjustment',
-    label: <span data-testid="portal-ledger-kind-adjustment">资金调整</span>,
+    label: <span data-testid="portal-ledger-kind-adjustment">运营调整</span>,
   },
 ];
 
@@ -172,7 +174,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
 
       <Card title="资金流水">
         <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-          充值由运营在后台完成；扣费在生成请求结算后出现在这里。金额的符号是语义的一部分。
+          充值由运营在后台完成；扣费按实际入账时刻出现在这里。金额的符号是语义的一部分。
         </Typography.Paragraph>
         <Flex gap={8} align="center" wrap style={{ marginBottom: 12 }}>
           <span data-testid="portal-ledger-kind">
@@ -200,7 +202,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
                 <Alert
                   type="info"
                   showIcon
-                  message="这个区间里没有资金记录。充值由运营在后台完成，完成之后这里会出现一条 credit。"
+                  message="这个区间里没有资金记录。充值由运营在后台完成，完成之后这里会出现一条充值记录。"
                 />
               ),
             }}
@@ -215,7 +217,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
                 dataIndex: 'kind',
                 render: (value: string) => (
                   <Tag color={value === 'credit' ? 'green' : 'default'}>
-                    {/* 每个取值一个稳定锚点：浏览器用例据此确认"充值"与"资金调整"分得开。 */}
+                    {/* 每个取值一个稳定锚点：浏览器用例据此确认"充值"与"运营调整"分得开。 */}
                     <span data-testid={`portal-ledger-entry-kind-${value}`}>
                       {KIND_LABELS[value] ?? value}
                     </span>

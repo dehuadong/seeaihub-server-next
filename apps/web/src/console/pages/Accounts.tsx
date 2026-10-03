@@ -7,7 +7,6 @@ import {
   Form,
   Input,
   Modal,
-  Popconfirm,
   Space,
   Table,
   Tag,
@@ -737,20 +736,25 @@ function UsageModule({ client, accountId }: { client: AdminClient; accountId: st
   );
 }
 
-/// **API Key**：可签发、吊销。明文只在签发成功后的当前模块里出现一次；切走模块或离开详情即卸载，
-/// 明文随之消失；吊销先二次确认（Spec M5）。
+/// **API Key**：只签发，不吊销（Spec M5、V-D16）。
+///
+/// 运营判断不了客户是否正在正常使用，也拿不到要吊销的密钥标识——它只出现在签发响应里，库里只有摘要。
+/// 所以这个模块不摆任何吊销入口；吊销由客户在自己的控制台按行做。签发的明文放在**弹窗**里（只有密钥
+/// 本身，不显示密钥标识），关闭弹窗、切换账户或离开详情即从页面状态清除（Spec M5、V-D14）。
 function KeysModule({ client, accountId }: { client: AdminClient; accountId: string }) {
   const { message } = AntApp.useApp();
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [issued, setIssued] = useState<IssueApiKeyResponse | null>(null);
-  const [revokeForm] = Form.useForm<{ keyId: string }>();
+
+  /// 关掉弹窗就把明文从页面状态里清掉：它不该在页面上多留一秒（Spec M5）。
+  const dismiss = () => setIssued(null);
 
   return (
     <Flex vertical gap={12}>
       {error ? <Alert type="error" showIcon message={error} /> : null}
       <Typography.Paragraph type="secondary" style={{ margin: 0 }}>
-        签发后明文只显示这一次，切走这个模块就没了；吊销要再确认一次。
+        签发后明文只显示这一次，切走这个模块就没了；吊销由客户在自己的控制台操作。
       </Typography.Paragraph>
       <Space wrap>
         <Button
@@ -773,63 +777,24 @@ function KeysModule({ client, accountId }: { client: AdminClient; accountId: str
           签发一把密钥
         </Button>
       </Space>
-      {issued ? (
-        <Alert
-          type="warning"
-          showIcon
-          message="密钥明文——现在抄走，切走这个模块就没了"
-          description={
-            <Flex vertical gap={4}>
-              <Typography.Text code copyable style={{ fontSize: 14 }} data-testid="accounts-issued-key">
-                {issued.api_key}
-              </Typography.Text>
-              <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-                密钥标识：{issued.key_id}（吊销用它）
-              </Typography.Text>
-            </Flex>
-          }
-        />
-      ) : null}
-      <Form
-        form={revokeForm}
-        layout="inline"
-        preserve={false}
-        onFinish={async (values: { keyId: string }) => {
-          setBusy(true);
-          setError(null);
-          try {
-            await client.revokeApiKey(values.keyId.trim());
-            message.success('密钥已吊销');
-            revokeForm.resetFields();
-          } catch (failure) {
-            setError(failure instanceof Error ? failure.message : String(failure));
-          } finally {
-            setBusy(false);
-          }
-        }}
+      <Modal
+        title="密钥明文——现在抄走"
+        open={issued !== null}
+        onCancel={dismiss}
+        footer={
+          <Button data-testid="accounts-issued-key-close" onClick={dismiss}>
+            取消
+          </Button>
+        }
+        destroyOnHidden
       >
-        <Form.Item name="keyId" rules={[{ required: true, message: '请填要吊销的密钥标识' }]}>
-          <Input
-            data-testid="accounts-revoke-key"
-            style={{ width: 320 }}
-            placeholder="要吊销的密钥标识"
-          />
-        </Form.Item>
-        <Form.Item>
-          <Popconfirm
-            title="吊销这把密钥？"
-            description="吊销后用它调用会被拒，不能撤销。"
-            okText="吊销"
-            cancelText="取消"
-            okButtonProps={{ 'data-testid': 'accounts-revoke-confirm' }}
-            onConfirm={() => revokeForm.submit()}
-          >
-            <Button danger data-testid="accounts-revoke-open" loading={busy}>
-              吊销
-            </Button>
-          </Popconfirm>
-        </Form.Item>
-      </Form>
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          只显示这一次，关闭即从页面清除；之后谁也拿不回来。
+        </Typography.Paragraph>
+        <Typography.Text code copyable style={{ fontSize: 14 }} data-testid="accounts-issued-key">
+          {issued?.api_key ?? ''}
+        </Typography.Text>
+      </Modal>
     </Flex>
   );
 }

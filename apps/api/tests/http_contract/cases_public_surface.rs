@@ -208,18 +208,18 @@ async fn public_surface_has_no_async_task_protocol() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 吊销一把 API Key 之后它**立刻**不能再用来受理：同一条请求、同一个 API 进程，吊销前成功、
+/// 客户吊销自己的 API Key 之后它**立刻**不能再用来受理：同一条请求、同一个 API 进程，吊销前成功、
 /// 吊销后被拒。
 ///
-/// "立刻"是这种动作的全部意义——管理员按下去，就是要从这一刻起停止受理，所以用例中间不重启进程、
+/// "立刻"是这种动作的全部意义——客户按下去，就是要从这一刻起停止受理，所以用例中间不重启进程、
 /// 不等任何窗口、不换请求形状，紧接着用同一把明文密钥再打一次。凭据值本身没有变，变的是库里的
 /// `revoked_at`，因此这条用例同时钉住"认证每次按密钥标识读库判吊销状态"：一旦有人在认证链路上加了
 /// 按密钥的缓存，这里就会在缓存寿命内放行一把已吊销的密钥，用例立刻变红。
 ///
 /// 吊销不删行（创建与吊销都是历史事实），所以还要验重复吊销仍然成功、且不改第一次的吊销时刻。
 ///
-/// 吊销要用的标识**只从发密钥的响应里拿**：明文只出现一次，库里只有它的摘要，反查不出 id；管理员
-/// 也没有库权限。所以这条用例同时钉住"发密钥回的那把 id 就是吊销路径认的那把"。
+/// **吊销只由客户自己做**（Spec `0001` M5、V-D16）：这条用例走客户会话，并顺带确认管理面那条
+/// `DELETE /api/v1/api-keys/{key_id}` 已经不存在——运营判断不了客户是否在用，也拿不到要吊销的标识。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
@@ -237,7 +237,8 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
         &account_id,
     )
     .await;
-    // 响应必须同时给明文和标识：少了标识，"吊销哪一把"就只剩回库捞这一条路，而管理员没有库权限。
+    // 发密钥的响应仍然同时给明文与标识：标识是密钥自己的身份，列表与吊销都用它（界面上不再显示，
+    // 接口字段不变）。
     assert!(
         issued.get("key_id").is_some_and(Value::is_string),
         "发密钥的响应必须带密钥标识：{issued}"
@@ -248,6 +249,56 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
         .to_owned();
     let key_id =
         Uuid::parse_str(issued["key_id"].as_str().expect("key_id")).expect("密钥标识得是个 UUID");
+
+    // 管理面已经没有吊销这条路：拿管理员令牌打旧接口是"没有这个端点"，不是"没权限"。
+    let gone = client
+        .delete(format!("{}/api/v1/api-keys/{key_id}", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("admin revocation request");
+    assert_eq!(
+        gone.status(),
+        StatusCode::NOT_FOUND,
+        "管理面不该还留着吊销接口"
+    );
+
+    // 运营给这个账户配一个登录身份，客户用会话吊销自己的密钥（这是现在唯一的吊销路径）。
+    let email = format!("revoke-{}@example.com", Uuid::new_v4());
+    let password = "a-long-enough-password";
+    let opened = client
+        .post(format!("{}/api/v1/customers", harness.base_url))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({"email": email, "password": password, "account_id": account_id}))
+        .send()
+        .await
+        .expect("open customer request");
+    assert_eq!(opened.status(), StatusCode::CREATED, "运营替客户配登录身份");
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+
+    // 夹具自检：响应给的标识指向刚发出来的那一行、且属于这个账户。
+    let stored_account: Uuid =
+        sqlx::query_scalar("SELECT account_id FROM identity.api_keys WHERE id = $1")
+            .bind(key_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("响应里的标识必须能定位到刚发出来的那一行");
+    assert_eq!(
+        stored_account.to_string(),
+        account_id,
+        "标识得指向这个账户的密钥"
+    );
 
     // ── 吊销前：这把密钥能受理并跑完一次生成（进程内假上游，不产生任何外部调用）──
     let worker = harness.spawn_worker();
@@ -263,22 +314,13 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
     assert_eq!(status, StatusCode::OK, "吊销前这把密钥必须可用：{body}");
     assert_sync_success("吊销前", &body);
 
-    // ── 吊销：204，与既有管理员写接口一致；痕迹落在 `revoked_at` 上而不是删行 ──
-    // 这里只**核对**响应给的标识指向刚建的那一行（建完还没吊销），id 本身不是从库里捞的。
-    let stored_account: Uuid =
-        sqlx::query_scalar("SELECT account_id FROM identity.api_keys WHERE id = $1")
-            .bind(key_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("响应里的标识必须能定位到刚发出来的那一行");
-    assert_eq!(
-        stored_account.to_string(),
-        account_id,
-        "标识得指向这个账户的密钥"
-    );
+    // ── 吊销：204，痕迹落在 `revoked_at` 上而不是删行 ──
     let revoked = client
-        .delete(format!("{}/api/v1/api-keys/{key_id}", harness.base_url))
-        .bearer_auth(&harness.admin_token)
+        .delete(format!(
+            "{}/v1/customer/api-keys/{key_id}",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
         .send()
         .await
         .expect("revocation request");
@@ -316,8 +358,11 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
 
     // ── 重复吊销仍然成功（幂等）：调用方在意的是"它现在不可用"，不是这次调用改变了什么 ──
     let again = client
-        .delete(format!("{}/api/v1/api-keys/{key_id}", harness.base_url))
-        .bearer_auth(&harness.admin_token)
+        .delete(format!(
+            "{}/v1/customer/api-keys/{key_id}",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
         .send()
         .await
         .expect("second revocation request");
@@ -333,35 +378,56 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
         "重复吊销不能改写第一次盖章的时刻"
     );
     // 审计是"发生了什么事"的记录：吊销只发生一次，重复调用不该凭空多出一条。
+    // 客户这条路把审计挂在**账户**上（subject_type = account），payload 里带密钥标识。
     let revoke_audits: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM operations.audit_events WHERE action = 'api_key.revoke' AND subject_id = $1",
+        "SELECT count(*) FROM operations.audit_events
+         WHERE action = 'api_key.revoke' AND actor = 'customer-self-service'
+           AND subject_id = $1 AND payload->>'key_id' = $2",
     )
+    .bind(account_id.clone())
     .bind(key_id.to_string())
     .fetch_one(&harness.pool)
     .await
     .expect("revocation audit");
     assert_eq!(revoke_audits, 1, "吊销必须留下一条审计，且只留一条");
 
-    // ── 不存在的键：404（这里只给已经发出来的行盖章，不创建任何东西）──
-    let missing = client
+    // ── 别的账户的密钥：客户按自己的账户吊销，指向别人的键就是"不存在"（不区分无权限）──
+    let other = issue_key_response(
+        &client,
+        &harness.base_url,
+        &harness.admin_token,
+        &create_account_with_credit(&client, &harness.base_url, &harness.admin_token, 0).await,
+    )
+    .await;
+    let other_key_id = Uuid::parse_str(other["key_id"].as_str().expect("key_id")).expect("uuid");
+    let not_mine = client
         .delete(format!(
-            "{}/api/v1/api-keys/{}",
-            harness.base_url,
-            Uuid::new_v4()
+            "{}/v1/customer/api-keys/{other_key_id}",
+            harness.base_url
         ))
-        .bearer_auth(&harness.admin_token)
+        .bearer_auth(&session)
         .send()
         .await
-        .expect("missing key revocation");
-    assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+        .expect("cross-account revocation request");
+    assert_eq!(not_mine.status(), StatusCode::NOT_FOUND);
+    let still_live: Option<String> =
+        sqlx::query_scalar("SELECT revoked_at::text FROM identity.api_keys WHERE id = $1")
+            .bind(other_key_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("other account key row");
+    assert!(still_live.is_none(), "别家账户的密钥不能被吊销");
 
-    // ── 无管理员凭证：403（管理面所有凭据失败都回同一个答复）──
+    // ── 没有会话：未认证（不是"不存在"）──
     let unauthorized = client
-        .delete(format!("{}/api/v1/api-keys/{key_id}", harness.base_url))
+        .delete(format!(
+            "{}/v1/customer/api-keys/{key_id}",
+            harness.base_url
+        ))
         .send()
         .await
         .expect("unauthorized revocation");
-    assert_eq!(unauthorized.status(), StatusCode::FORBIDDEN);
+    assert_eq!(unauthorized.status(), StatusCode::UNAUTHORIZED);
 
     harness.cleanup().await;
 }

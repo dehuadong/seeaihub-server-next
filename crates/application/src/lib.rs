@@ -2346,12 +2346,6 @@ pub trait HubRepository: Send + Sync {
         actor: &str,
     ) -> Result<Uuid, ApplicationError>;
 
-    /// 吊销一把密钥：写 `revoked_at`，**不删行**——创建与吊销都是要留痕的历史事实。
-    ///
-    /// 幂等：已吊销的再调一次仍然成功。调用方要的是"它现在不可用"这个状态，不是"这次调用改变了
-    /// 什么"；把重复吊销报成错误只会让重发求助变成故障。键不存在返回 `NotFound`。
-    async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError>;
-
     /// 按密钥摘要查这个调用方是谁：**账户**与**密钥标识**。吊销判定在这一条读里（只认
     /// `revoked_at IS NULL`），因此认证路径每次都要走它。
     async fn api_key_identity(&self, key_hash: &str)
@@ -2945,11 +2939,13 @@ impl IdentityService {
         self
     }
 
+    // ---- 身份：登录、会话、口令 ----
+
     /// 发一把密钥。返回 `(key_id, 明文)`。
     ///
     /// 明文只在这一刻存在：库里只有摘要，事后**没有**任何路径能把它还原出来，也就没有"再查一次密钥"的
-    /// 接口。正因如此，吊销要用的标识必须和明文一起回给调用方——不然管理员除了回库翻 id 别无他法，
-    /// 而管理员恰恰没有库权限。
+    /// 接口；标识与明文一起回给调用方，作为这把密钥在列表与吊销路径上的身份。控制台不把标识显示在
+    /// 一次性明文里，吊销只由客户按自己的账户做（Spec `0001` M5、C5）。
     pub async fn issue_api_key(
         &self,
         account_id: AccountId,
@@ -2970,15 +2966,6 @@ impl IdentityService {
             .create_api_key(account_id, label, &key_hash, actor)
             .await?;
         Ok((key_id, plaintext))
-    }
-
-    /// 吊销一把密钥（管理员，写审计）。
-    ///
-    /// 幂等：已经吊销过的再吊销一次仍然成功——调用方在意的是"它现在不可用"。写完提交，**下一个**
-    /// 请求就走不通了：认证路径每次读库判吊销状态（见 [`Self::authenticate`]），这里没有中间缓存
-    /// 要等。
-    pub async fn revoke_api_key(&self, key_id: Uuid, actor: &str) -> Result<(), ApplicationError> {
-        self.repository.revoke_api_key(key_id, actor).await
     }
 
     /// 列一个账户下的密钥（对客自助）。

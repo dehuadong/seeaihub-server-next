@@ -60,34 +60,43 @@ test.describe('账户详情页的四个模块', () => {
     await expect(page.getByTestId('accounts-usage-reload')).toBeVisible();
     await expect(page.getByTestId('accounts-credits-reload')).toHaveCount(0);
 
-    // API Key：可签发与吊销。
+    // API Key：只签发，**没有吊销入口**（Spec M5、V-D16）。
     await page.getByTestId('accounts-module-keys').click();
     await expect(page.getByTestId('accounts-issue-key')).toBeVisible();
-    await expect(page.getByTestId('accounts-revoke-key')).toBeVisible();
+    // 「没有吊销入口」是屏幕上的事实，不只是 testid 缺席：整页找不到吊销按钮，也没有要填的标识。
+    await expect(page.getByTestId('accounts-revoke-key')).toHaveCount(0);
+    await expect(page.getByRole('button', { name: '吊销' })).toHaveCount(0);
+    await expect(page.getByText('要吊销的密钥标识')).toHaveCount(0);
     await expect(page.getByTestId('accounts-usage-reload')).toHaveCount(0);
   });
 
-  test('API Key 明文只在签发那一次出现，吊销要确认', async ({ page, request }) => {
+  test('API Key 明文在弹窗里只出现一次，关闭即清；模块没有吊销入口', async ({ page, request }) => {
     const accountId = await openAccount(request, 0);
 
     await signIn(page);
     await openAccountDetail(page, accountId);
     await page.getByTestId('accounts-module-keys').click();
     await page.getByTestId('accounts-issue-key').click();
+    // 明文在**弹窗**里，且里面只有密钥本身（没有密钥标识：运营不吊销，用不着它）。
+    const dialog = page.getByRole('dialog');
+    await expect(dialog).toBeVisible();
     await expect(page.getByTestId('accounts-issued-key')).toBeVisible();
+    await expect(dialog).not.toContainText('密钥标识');
 
-    // 切到别的模块：那一块整个卸载，明文随之消失。
+    // 「取消」关掉弹窗：明文立刻从页面上消失。
+    await page.getByTestId('accounts-issued-key-close').click();
+    await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
+
+    // 再签发一次：弹窗开着时它挡住其他操作（这正是"必须先抄走"的意思），关掉之后切模块再回来
+    // **也不再出现**——签发那一次过去就该丢，模块重挂不该把明文带回来。
+    await page.getByTestId('accounts-issue-key').click();
+    await expect(page.getByTestId('accounts-issued-key')).toBeVisible();
+    await page.getByTestId('accounts-issued-key-close').click();
     await page.getByTestId('accounts-module-credits').click();
     await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
-
-    // **切回 API Key 也不再出现**：签发那一次过去就该丢，模块重挂不该把明文带回来。
     await page.getByTestId('accounts-module-keys').click();
     await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
-
-    // 吊销要二次确认：点"吊销"先出确认按钮，不直接发请求。
-    await page.getByTestId('accounts-revoke-key').fill('00000000-0000-4000-8000-000000000000');
-    await page.getByTestId('accounts-revoke-open').click();
-    await expect(page.getByTestId('accounts-revoke-confirm')).toBeVisible();
+    await expect(page.getByTestId('accounts-revoke-key')).toHaveCount(0);
   });
 
   test('换一个账户时模块与一次性明文都不跟过来', async ({ page, request }) => {
@@ -101,6 +110,9 @@ test.describe('账户详情页的四个模块', () => {
     await page.getByTestId('accounts-module-keys').click();
     await page.getByTestId('accounts-issue-key').click();
     await expect(page.getByTestId('accounts-issued-key')).toBeVisible();
+    // 弹窗挡着页面，先关掉它（明文随之清除）再离开。
+    await page.getByTestId('accounts-issued-key-close').click();
+    await expect(page.getByTestId('accounts-issued-key')).toHaveCount(0);
 
     // 回列表再点另一个账户：地址换成第二个账户，读数跟着换，密钥明文不出现。
     await page.getByTestId('accounts-back-to-list').click();

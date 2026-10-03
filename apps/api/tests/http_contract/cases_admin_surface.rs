@@ -20,7 +20,7 @@ async fn every_admin_endpoint_requires_credentials() {
     const ID: &str = "00000000-0000-4000-8000-000000000000";
 
     // (方法, 路径, 是否带 JSON body)——PATCH/PUT/POST 都带上 body，免得被 body 解析拦在前面。
-    let matrix: [(&str, String, bool); 28] = [
+    let matrix: [(&str, String, bool); 27] = [
         ("POST", "/api/v1/accounts".to_owned(), true),
         ("GET", "/api/v1/accounts".to_owned(), false),
         ("GET", format!("/api/v1/accounts/{ID}"), false),
@@ -35,7 +35,6 @@ async fn every_admin_endpoint_requires_credentials() {
             format!("/api/v1/accounts/{ID}/password-reset"),
             false,
         ),
-        ("DELETE", format!("/api/v1/api-keys/{ID}"), false),
         ("GET", "/api/v1/customers".to_owned(), false),
         ("POST", "/api/v1/customers".to_owned(), true),
         ("GET", format!("/api/v1/customers/{ID}"), false),

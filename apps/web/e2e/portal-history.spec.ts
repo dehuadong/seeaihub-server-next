@@ -122,6 +122,14 @@ test('资金流水的类别筛选只重取流水，汇总不跟着换区间', as
   await registerCustomer(page, uniqueEmail('portal-history-kind'));
   await nav(page, '账单与资金记录');
   await expect(panel(page, '账单汇总')).toBeVisible();
+  // 类别用客户语言：界面上是「充值／扣费／运营调整」，不出现 `capture`／`adjustment` 那类内部科目名
+  // 也不出现"实际扣费""资金调整"（Spec `0001` C8）。
+  await expect(page.getByTestId('portal-ledger-kind-credit')).toHaveText('充值');
+  await expect(page.getByTestId('portal-ledger-kind-capture')).toHaveText('扣费');
+  await expect(page.getByTestId('portal-ledger-kind-adjustment')).toHaveText('运营调整');
+  await expect(page.getByText('实际扣费')).toHaveCount(0);
+  await expect(page.getByText('资金调整')).toHaveCount(0);
+
   const calls = recordCustomerCalls(page);
   await page.getByTestId('portal-ledger-kind-credit').click();
   await expect
@@ -150,7 +158,7 @@ test('多于一页的资金流水：继续查看取到更早的那一页，汇�
   const net = await text('portal-billing-net');
 
   const rows = page.getByTestId('portal-ledger-table').getByRole('row');
-  // 表头 + 20 条流水（其中一条是正式调整）：充值与资金调整在行内分得开。
+  // 表头 + 20 条流水（其中一条是正式调整）：充值与运营调整在行内分得开。
   await expect(rows).toHaveCount(21, { timeout: 10_000 });
   await expect(page.getByTestId('portal-ledger-entry-kind-capture').first()).toBeVisible();
   await expect(page.getByTestId('portal-ledger-entry-kind-adjustment')).toBeVisible();

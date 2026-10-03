@@ -217,10 +217,6 @@ export class AdminClient {
     return this.send(`/api/v1/accounts/${encodeURIComponent(accountId)}/api-keys`, 'POST', { label });
   }
 
-  revokeApiKey(keyId: string): Promise<void> {
-    return this.send(`/api/v1/api-keys/${encodeURIComponent(keyId)}`, 'DELETE');
-  }
-
   providerFailures(kinds: string[] = [], limit = 50): Promise<ProviderFailuresResponse> {
     const query = new URLSearchParams();
     if (kinds.length > 0) query.set('kind', kinds.join(','));

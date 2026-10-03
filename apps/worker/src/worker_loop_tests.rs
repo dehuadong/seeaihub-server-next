@@ -492,9 +492,6 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<Uuid, ApplicationError> {
         unimplemented!()
     }
-    async fn revoke_api_key(&self, _key_id: Uuid, _actor: &str) -> Result<(), ApplicationError> {
-        unimplemented!()
-    }
     async fn api_key_identity(
         &self,
         _key_hash: &str,

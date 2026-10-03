@@ -112,7 +112,7 @@ export async function seedLedgerPage(accountId: string, count: number): Promise<
     if (rows.length !== count) {
       throw new Error(`expected ${count} seeded ledger entries, got ${rows.length}`);
     }
-    // 一条正式调整：类别筛选要能把"充值"与"资金调整"分开，夹具里就得两种都有。
+    // 一条正式调整：类别筛选要能把"充值"与"运营调整"分开，夹具里就得两种都有。
     await tx`
       INSERT INTO ledger.entries (id, account_id, kind, amount_microusd, business_key)
       VALUES (${randomUUID()}, ${accountId}, 'adjustment', 5000,

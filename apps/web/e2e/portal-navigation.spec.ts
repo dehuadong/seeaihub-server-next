@@ -157,6 +157,10 @@ test('对客请求回 401 时清掉页面数据并回到登录', async ({ page }
   await nav(page, 'API Key');
   await page.getByTestId('portal-key-label').fill('401 前可见');
   await page.getByTestId('portal-key-create').click();
+  // 明文弹窗挡着页面，先按「取消」关掉它，再继续（关闭即清，Spec C5）。
+  await expect(page.getByRole('dialog')).toBeVisible();
+  await page.getByTestId('portal-key-plaintext-close').click();
+  await expect(page.getByTestId('portal-key-plaintext')).toHaveCount(0);
   await expect(page.getByText('401 前可见')).toBeVisible();
 
   // 服务端提前吊销会话：之后的对客取数一律回 401。
@@ -188,7 +192,10 @@ test('会话 expires_at 已过期时刷新回到登录并清屏', async ({ page 
 
   // 只把本地会话的到期时刻改成过去：服务端那条会话可能仍然有效，页面也必须按到期时刻自行清屏。
   await page.evaluate(() => {
-    sessionStorage.setItem('seeai.portal.session.expires', new Date(Date.now() - 60_000).toISOString());
+    sessionStorage.setItem(
+      'seeai.portal.session.expires',
+      new Date(Date.now() - 60_000).toISOString(),
+    );
   });
   await page.reload();
 

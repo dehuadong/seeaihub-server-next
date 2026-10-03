@@ -280,7 +280,6 @@ async fn main() -> Result<()> {
             "/api/v1/accounts/{account_id}/password-reset",
             post(issue_customer_password_reset),
         )
-        .route("/api/v1/api-keys/{key_id}", delete(revoke_api_key))
         .route("/api/v1/customers", get(list_customers).post(open_customer))
         .route("/api/v1/customers/{customer_id}", get(read_customer_view))
         .route("/api/v1/admin/session", get(read_admin_session))
@@ -1049,10 +1048,10 @@ struct IssueApiKeyBody {
 #[derive(Debug, Serialize)]
 struct IssueApiKeyResponse {
     api_key: String,
-    /// 密钥标识，就是吊销那条路径上的 `{key_id}`。
+    /// 密钥标识：这把密钥自己的身份，客户列表的行键与按行吊销都用它。
     ///
-    /// 明文只在这一次响应里出现，事后谁也拿不回来；只回明文的话，"要不要吊销这一把"就只能回库捞 id，
-    /// 而管理员没有库权限——所以标识必须和明文一起交到发密钥的人手里。
+    /// 明文只在这一次响应里出现，事后谁也拿不回来；标识则一直在列表里。控制台**不把它显示在一次性
+    /// 明文里**（Spec `0001` M5、C5），但接口字段保持不变。
     key_id: Uuid,
 }
 
@@ -1067,22 +1066,6 @@ async fn issue_api_key(
         .await?;
     Ok(Json(IssueApiKeyResponse { api_key, key_id }))
 }
-
-/// 管理员写：吊销一把 API Key（`DELETE /api/v1/api-keys/{key_id}`）。
-///
-/// 吊销**不删行**：创建与吊销都是历史事实，排障要看这把密钥什么时候被停掉，所以只写 `revoked_at`。
-/// 它**立刻**生效——认证路径每次读库判吊销状态、不缓存"有效"，所以这里成功返回之后紧接着的那次
-/// 使用就会被拒。重复吊销是成功的空操作（调用方在意的是"现在不可用"，不是这次调用改变了什么）；
-/// 键不存在是 404——这里只给已经发出来的行盖章，不创建任何东西。
-async fn revoke_api_key(
-    State(state): State<AppState>,
-    Path(key_id): Path<Uuid>,
-) -> Result<StatusCode, ApiError> {
-    state.identity.revoke_api_key(key_id, "admin-api").await?;
-    Ok(StatusCode::NO_CONTENT)
-}
-
-// ---- 身份：登录、会话、口令 ----
 
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]

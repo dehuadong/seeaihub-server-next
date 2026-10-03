@@ -125,6 +125,10 @@ test('新建密钥时明文只出现一次，列表里之后再也拿不到', as
   await page.getByTestId('portal-key-label').fill('e2e 脚本');
   await page.getByTestId('portal-key-create').click();
 
+  // 明文在**弹窗**里，内容只有密钥本身——没有密钥标识（吊销在列表那一行做，Spec C5）。
+  const dialog = page.getByRole('dialog');
+  await expect(dialog).toBeVisible();
+  await expect(dialog).not.toContainText('密钥标识');
   const plaintext = page.getByTestId('portal-key-plaintext');
   await expect(plaintext).toBeVisible();
   const key = (await plaintext.textContent())?.trim() ?? '';
