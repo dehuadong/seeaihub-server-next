@@ -8,8 +8,8 @@ use seeai_application::{
     CustomerUsageScope, CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionLookup,
     ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
     GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
-    LateFacts, LateFactsOutcome, LeaseRecovery, LedgerMismatch, LedgerPage, NewFxRate,
-    NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView,
+    LateFactKind, LateFacts, LateFactsOutcome, LeaseRecovery, LedgerMismatch, LedgerPage,
+    NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView,
     ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
     PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance, ReferencedOffering,
     RefundReconciliationCommand, RoutingDecision, SelectableOfferingView, SettleExecution,
@@ -5409,7 +5409,7 @@ impl ExecutionRepository for PgHubRepository {
                 &mut transaction,
                 job_id,
                 attempt_id,
-                "task_handle",
+                LateFactKind::TaskHandle,
                 &digest,
                 Some(handle),
                 provider_trace_id.as_deref(),
@@ -5469,7 +5469,7 @@ impl ExecutionRepository for PgHubRepository {
                 &mut transaction,
                 job_id,
                 attempt_id,
-                "accounting",
+                LateFactKind::Accounting,
                 &digest,
                 None,
                 provider_trace_id.as_deref(),
@@ -5895,11 +5895,15 @@ fn claimed_late_fact(row: &sqlx::postgres::PgRow) -> Result<ClaimedLateFact, App
         }
         None => None,
     };
+    let kind: String = row.try_get("kind").map_err(database_error)?;
+    let kind = LateFactKind::parse(&kind).ok_or_else(|| {
+        ApplicationError::Persistence(format!("late fact kind {kind} is not a known value"))
+    })?;
     Ok(ClaimedLateFact {
         id: row.try_get("id").map_err(database_error)?,
         job_id: JobId(row.try_get("job_id").map_err(database_error)?),
         attempt_id: AttemptId(row.try_get("attempt_id").map_err(database_error)?),
-        kind: row.try_get("kind").map_err(database_error)?,
+        kind,
         provider_task_handle: row
             .try_get("provider_task_handle")
             .map_err(database_error)?,
@@ -6056,7 +6060,7 @@ async fn insert_late_fact(
     transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
     job_id: JobId,
     attempt_id: AttemptId,
-    kind: &str,
+    kind: LateFactKind,
     content_digest: &str,
     provider_task_handle: Option<&str>,
     provider_trace_id: Option<&str>,
@@ -6068,7 +6072,7 @@ async fn insert_late_fact(
         "SELECT content_digest FROM generation.late_facts WHERE attempt_id = $1 AND kind = $2",
     )
     .bind(attempt_id.0)
-    .bind(kind)
+    .bind(kind.as_str())
     .fetch_all(&mut **transaction)
     .await
     .map_err(database_error)?;
@@ -6100,7 +6104,7 @@ async fn insert_late_fact(
     .bind(Uuid::new_v4())
     .bind(job_id.0)
     .bind(attempt_id.0)
-    .bind(kind)
+    .bind(kind.as_str())
     .bind(content_digest)
     .bind(provider_task_handle)
     .bind(provider_trace_id)

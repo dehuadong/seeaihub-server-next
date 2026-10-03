@@ -6,8 +6,8 @@
 
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
-    AdmitExecution, AdmitOffering, AdmitOutcome, BeginSubmission, ExecutionRepository, LateFacts,
-    LateFactsOutcome, RoutingDecision,
+    AdmitExecution, AdmitOffering, AdmitOutcome, BeginSubmission, ExecutionRepository,
+    LateFactKind, LateFacts, LateFactsOutcome, RoutingDecision,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, FencingToken, ImageBranch, JobId, MeteringEvidence,
@@ -389,7 +389,7 @@ async fn a_late_task_handle_is_claimed_reclaimable_after_the_ttl_and_marked_cons
     let fact = &claimed[0];
     assert_eq!(fact.job_id, job_id);
     assert_eq!(fact.attempt_id, attempt_id);
-    assert_eq!(fact.kind, "task_handle");
+    assert_eq!(fact.kind, LateFactKind::TaskHandle);
     assert_eq!(fact.provider_task_handle.as_deref(), Some("task-claim"));
     assert_eq!(fact.provider_trace_id.as_deref(), Some("trace-claim"));
     assert!(fact.evidence.is_none());
@@ -496,7 +496,7 @@ async fn claimed_accounting_late_facts_carry_the_evidence_and_cost() {
         .expect("claim");
     assert_eq!(claimed.len(), 1);
     let fact = &claimed[0];
-    assert_eq!(fact.kind, "accounting");
+    assert_eq!(fact.kind, LateFactKind::Accounting);
     assert_eq!(
         fact.evidence
             .as_ref()
