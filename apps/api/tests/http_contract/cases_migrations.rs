@@ -211,6 +211,19 @@ async fn vendor_model_contract_migration_merges_existing_duplicate_rows() {
         .await
         .expect("the merge migration must apply on an already-built database");
 
+    // 3.5) 0028 的回填：这张老库里已经存在的账户也必须有一个非空名称（账户 id 形式的占位名）——
+    // 名称列是非空且无默认值的，回填不成立这张库就迁不过去。
+    let backfilled: String = sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .expect("account name backfilled");
+    assert_eq!(
+        backfilled,
+        format!("账户_{}", &account.simple().to_string()[..8]),
+        "旧行按账户 id 前 8 位回填"
+    );
+
     // 4) 合并结果：只留最新那一行；指向被删行的供给 / 条目 / Job 改挂到它。
     let remaining: Vec<(Uuid, Value)> = sqlx::query(
         "SELECT id, capability_schema FROM catalog.vendor_models WHERE native_model_id = 'legacy-model'",
@@ -634,6 +647,17 @@ async fn the_pricing_migration_relaxes_the_balance_checks_on_an_existing_databas
         .run(&pool)
         .await
         .expect("the pricing migration must apply on an already-built database");
+
+    // 3.5) 0028 的回填：老库里的账户在这张库上也要有非空名称。
+    let backfilled: String = sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1")
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .expect("account name backfilled");
+    assert_eq!(
+        backfilled,
+        format!("账户_{}", &account.simple().to_string()[..8])
+    );
 
     // 4) 旧修订的定价列全部为 NULL：它没有定价，受理与结算走旧口径。
     let row = sqlx::query(

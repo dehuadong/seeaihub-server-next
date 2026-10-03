@@ -2,15 +2,15 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     AcceptanceProbe, AccountSummary, ActiveOfferingChannel, ApiKeyView, ApplicationError,
-    AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerBillingQuery,
-    CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery,
-    CustomerUsageScope, CustomerUsageView, CustomerView, GatewayModelCandidateView,
-    GatewayModelView, HoldDisposition, HubRepository, JobView, LeaseRecovery, LedgerMismatch,
-    LedgerPage, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates,
-    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, ReferencedOffering,
-    RefundReconciliationCommand, RoutingDecision, SelectableOfferingView, UnacceptedAttempt,
-    customer_usage_status, declared_output_images,
+    AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerAccountTarget,
+    CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind,
+    CustomerUsageQuery, CustomerUsageScope, CustomerUsageView, CustomerView,
+    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
+    LeaseRecovery, LedgerMismatch, LedgerPage, NewFxRate, NormalizedOffering,
+    OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeRequest,
+    ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand, RoutingDecision,
+    SelectableOfferingView, UnacceptedAttempt, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
@@ -1688,21 +1688,30 @@ impl HubRepository for PgHubRepository {
         &self,
         email: Option<&str>,
         tag: Option<&str>,
+        name: Option<&str>,
         limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
+        // `%`、`_` 与反斜线按**字面**匹配：先转义，再显式声明 ESCAPE，绝不把调用方的输入当模式。
+        let name_pattern = name.map(|term| {
+            term.replace('\\', "\\\\")
+                .replace('%', "\\%")
+                .replace('_', "\\_")
+        });
         let rows = sqlx::query(
             r#"
-            SELECT a.id, a.balance_microusd, a.tag, c.email, a.created_at, a.updated_at
+            SELECT a.id, a.name, a.balance_microusd, a.tag, c.email, a.created_at, a.updated_at
             FROM ledger.accounts a
             LEFT JOIN identity.customers c ON c.account_id = a.id
             WHERE ($1::text IS NULL OR lower(c.email) = lower($1))
               AND ($2::text IS NULL OR a.tag = $2)
+              AND ($3::text IS NULL OR a.name ILIKE '%' || $3 || '%' ESCAPE '\')
             ORDER BY a.created_at DESC, a.id DESC
-            LIMIT $3
+            LIMIT $4
             "#,
         )
         .bind(email)
         .bind(tag)
+        .bind(name_pattern)
         .bind(i64::from(limit))
         .fetch_all(&self.pool)
         .await
@@ -1720,7 +1729,7 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Option<AccountSummary>, ApplicationError> {
         let row = sqlx::query(
             r#"
-            SELECT a.id, a.balance_microusd, a.tag, c.email, a.created_at, a.updated_at
+            SELECT a.id, a.name, a.balance_microusd, a.tag, c.email, a.created_at, a.updated_at
             FROM ledger.accounts a
             LEFT JOIN identity.customers c ON c.account_id = a.id
             WHERE a.id = $1
@@ -1969,19 +1978,23 @@ impl HubRepository for PgHubRepository {
     async fn create_account(
         &self,
         account_id: AccountId,
+        name: &str,
+        tag: Option<&str>,
         initial_credit_microusd: u64,
         actor: &str,
     ) -> Result<BalanceChange, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let inserted = sqlx::query(
             r#"
-            INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, $2)
+            INSERT INTO ledger.accounts (id, name, tag, balance_microusd) VALUES ($1, $2, $3, $4)
             RETURNING balance_microusd, held_microusd,
                       balance_microusd - held_microusd AS available_microusd,
                       version, updated_at
             "#,
         )
         .bind(account_id.0)
+        .bind(name)
+        .bind(tag)
         .bind(to_i64(initial_credit_microusd)?)
         .fetch_one(&mut *transaction)
         .await
@@ -2008,11 +2021,54 @@ impl HubRepository for PgHubRepository {
             "account.create",
             "account",
             &account_id.to_string(),
-            &serde_json::json!({"initial_credit_microusd": initial_credit_microusd}),
+            &serde_json::json!({
+                "initial_credit_microusd": initial_credit_microusd,
+                "name": name,
+                "tag": tag,
+            }),
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
         balance_change(&inserted, account_id)
+    }
+
+    /// 改账户名称：资料与审计同一事务，审计记旧值与新值。
+    ///
+    /// `FOR UPDATE` 把"读旧值"和"写新值"锁在同一行上：并发改名是**后写覆盖**（Spec N5），
+    /// 但审计里的旧值必须是这次真正覆盖掉的那个，不能是另一个事务刚写的值。
+    async fn set_account_name(
+        &self,
+        account_id: AccountId,
+        name: &str,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let previous: Option<String> =
+            sqlx::query_scalar("SELECT name FROM ledger.accounts WHERE id = $1 FOR UPDATE")
+                .bind(account_id.0)
+                .fetch_optional(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+        let Some(previous) = previous else {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        };
+        sqlx::query("UPDATE ledger.accounts SET name = $2 WHERE id = $1")
+            .bind(account_id.0)
+            .bind(name)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        insert_audit(
+            &mut transaction,
+            actor,
+            "account.name_set",
+            "account",
+            &account_id.to_string(),
+            &serde_json::json!({"name": name, "previous_name": previous}),
+        )
+        .await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
     }
 
     async fn credit_account(
@@ -3676,11 +3732,12 @@ impl HubRepository for PgHubRepository {
 
     async fn create_customer(
         &self,
+        account_id: AccountId,
+        account_name: &str,
         email: &str,
         password_hash: &str,
-    ) -> Result<(Uuid, Uuid), ApplicationError> {
+    ) -> Result<Uuid, ApplicationError> {
         let customer_id = Uuid::new_v4();
-        let account_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         // 撞邮箱是调用方能自己改的事：回 Conflict，让对客那一层说"这个邮箱已经注册过了"。
         let existing: Option<Uuid> =
@@ -3695,8 +3752,9 @@ impl HubRepository for PgHubRepository {
             )));
         }
         // 账户与身份同一个事务：注册出来的账户必须能立刻用，不能出现"有账户没身份"的半截状态。
-        sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 0)")
-            .bind(account_id)
+        sqlx::query("INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 0)")
+            .bind(account_id.0)
+            .bind(account_name)
             .execute(&mut *transaction)
             .await
             .map_err(database_error)?;
@@ -3709,7 +3767,7 @@ impl HubRepository for PgHubRepository {
         .bind(customer_id)
         .bind(email)
         .bind(password_hash)
-        .bind(account_id)
+        .bind(account_id.0)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -3719,11 +3777,11 @@ impl HubRepository for PgHubRepository {
             "customer.register",
             "account",
             &account_id.to_string(),
-            &serde_json::json!({"email": email}),
+            &serde_json::json!({"email": email, "name": account_name}),
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
-        Ok((customer_id, account_id))
+        Ok(customer_id)
     }
 
     async fn find_customer_by_email(
@@ -4041,7 +4099,7 @@ impl HubRepository for PgHubRepository {
         &self,
         email: &str,
         password_hash: &str,
-        account_id: Option<Uuid>,
+        target: CustomerAccountTarget,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
         let customer_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
@@ -4058,8 +4116,9 @@ impl HubRepository for PgHubRepository {
                 "email {email} already has a login identity"
             )));
         }
-        let account_id = match account_id {
-            Some(existing) => {
+        let (account_id, new_name) = match target {
+            CustomerAccountTarget::Existing(existing) => {
+                let existing = existing.0;
                 let bound: Option<Uuid> =
                     sqlx::query_scalar("SELECT id FROM identity.customers WHERE account_id = $1")
                         .bind(existing)
@@ -4081,16 +4140,18 @@ impl HubRepository for PgHubRepository {
                 if exists.is_none() {
                     return Err(ApplicationError::NotFound(format!("account {existing}")));
                 }
-                existing
+                (existing, None)
             }
-            None => {
-                let fresh = Uuid::new_v4();
-                sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 0)")
-                    .bind(fresh)
-                    .execute(&mut *transaction)
-                    .await
-                    .map_err(database_error)?;
-                fresh
+            CustomerAccountTarget::New { account_id, name } => {
+                sqlx::query(
+                    "INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 0)",
+                )
+                .bind(account_id.0)
+                .bind(&name)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                (account_id.0, Some(name))
             }
         };
         sqlx::query(
@@ -4112,7 +4173,7 @@ impl HubRepository for PgHubRepository {
             "customer.open",
             "account",
             &account_id.to_string(),
-            &serde_json::json!({"email": email}),
+            &serde_json::json!({"email": email, "name": new_name}),
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
@@ -4123,11 +4184,22 @@ impl HubRepository for PgHubRepository {
         &self,
         email: &str,
     ) -> Result<Option<CustomerView>, ApplicationError> {
-        let row = sqlx::query_as::<_, (Uuid, String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Uuid,
+                String,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
             r#"
-            SELECT id, email, account_id, created_at, last_login_at
-            FROM identity.customers
-            WHERE lower(email) = lower($1)
+            SELECT c.id, c.email, c.account_id, a.name, c.created_at, c.last_login_at
+            FROM identity.customers c
+            JOIN ledger.accounts a ON a.id = c.account_id
+            WHERE lower(c.email) = lower($1)
             "#,
         )
         .bind(email)
@@ -4142,11 +4214,22 @@ impl HubRepository for PgHubRepository {
         &self,
         customer_id: Uuid,
     ) -> Result<Option<CustomerView>, ApplicationError> {
-        let row = sqlx::query_as::<_, (Uuid, String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+        let row = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Uuid,
+                String,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
             r#"
-            SELECT id, email, account_id, created_at, last_login_at
-            FROM identity.customers
-            WHERE id = $1
+            SELECT c.id, c.email, c.account_id, a.name, c.created_at, c.last_login_at
+            FROM identity.customers c
+            JOIN ledger.accounts a ON a.id = c.account_id
+            WHERE c.id = $1
             "#,
         )
         .bind(customer_id)
@@ -4157,11 +4240,22 @@ impl HubRepository for PgHubRepository {
     }
 
     async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError> {
-        let rows = sqlx::query_as::<_, (Uuid, String, Uuid, DateTime<Utc>, Option<DateTime<Utc>>)>(
+        let rows = sqlx::query_as::<
+            _,
+            (
+                Uuid,
+                String,
+                Uuid,
+                String,
+                DateTime<Utc>,
+                Option<DateTime<Utc>>,
+            ),
+        >(
             r#"
-            SELECT id, email, account_id, created_at, last_login_at
-            FROM identity.customers
-            ORDER BY created_at DESC
+            SELECT c.id, c.email, c.account_id, a.name, c.created_at, c.last_login_at
+            FROM identity.customers c
+            JOIN ledger.accounts a ON a.id = c.account_id
+            ORDER BY c.created_at DESC
             LIMIT $1
             "#,
         )
@@ -4960,6 +5054,7 @@ fn account_summary_row(row: &sqlx::postgres::PgRow) -> Result<AccountSummary, Ap
     use sqlx::Row as _;
     Ok(AccountSummary {
         account_id: AccountId(row.try_get("id").map_err(database_error)?),
+        name: row.try_get("name").map_err(database_error)?,
         balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
         tag: row.try_get("tag").map_err(database_error)?,
         email: row.try_get("email").map_err(database_error)?,
@@ -4970,10 +5065,11 @@ fn account_summary_row(row: &sqlx::postgres::PgRow) -> Result<AccountSummary, Ap
 
 /// 客户视图那一行 → 投影：`identity.customers` 的五个字段。三条读（按邮箱、按标识、列表）共用。
 fn customer_view_row(
-    (customer_id, email, account_id, created_at, last_login_at): (
+    (customer_id, email, account_id, account_name, created_at, last_login_at): (
         Uuid,
         String,
         Uuid,
+        String,
         DateTime<Utc>,
         Option<DateTime<Utc>>,
     ),
@@ -4982,6 +5078,7 @@ fn customer_view_row(
         customer_id,
         email,
         account_id: AccountId(account_id),
+        account_name,
         created_at,
         last_login_at,
     }

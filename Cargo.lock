@@ -2129,6 +2129,7 @@ dependencies = [
  "thiserror",
  "tokio",
  "tracing",
+ "unicode-general-category",
  "url",
  "uuid",
 ]

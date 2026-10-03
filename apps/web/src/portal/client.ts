@@ -83,6 +83,11 @@ export class CustomerClient {
     return this.get('/v1/customer/account');
   }
 
+  /// 改自己账户的名称。账户由会话确定，请求体里没有账户标识；服务端不接受清空。
+  renameAccount(name: string): Promise<void> {
+    return this.send('/v1/customer/account/name', 'PUT', { name });
+  }
+
   /// 账单汇总：按区间**全量**算，不随逐笔列表的条数上限变化。
   billing(range: { since?: string; until?: string } = {}): Promise<CustomerBilling> {
     return this.get(`/v1/customer/billing?${windowQuery(range)}`);

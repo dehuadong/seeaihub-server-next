@@ -65,7 +65,9 @@ pub use retry::{DEFAULT_BACKOFF_BASE_MS, DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECON
 mod cost_ceiling;
 pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
 
+pub mod account_name;
 mod history_cursor;
+pub use account_name::{ACCOUNT_NAME_MAX_CHARS, generated_account_name, normalize_account_name};
 pub use history_cursor::{
     CursorPosition, HISTORY_CURSOR_KEY_LEN, HistoryCursor, HistoryFilter, HistoryStream,
     decode_history_cursor, encode_history_cursor, invalid_history_cursor,
@@ -1664,6 +1666,8 @@ pub struct ProviderFailureView {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct AccountSummary {
     pub account_id: AccountId,
+    /// 账户名称：每个账户始终有一个（创建时给出或由服务端生成），所以这里非空。
+    pub name: String,
     pub balance_microusd: i64,
     /// 运营设的标签；没设过就是 `None`。
     pub tag: Option<String>,
@@ -1671,6 +1675,18 @@ pub struct AccountSummary {
     pub email: Option<String>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
+}
+
+/// 开户的两个目标：给已有账户配身份，或新建一个账户并配身份。
+///
+/// 做成枚举而不是“可选的已有 id + 另一个新建 id”：两者只有一个成立，`Option` 拼参数会让
+/// “两个都给”这种非法组合变得可表达，而它在产品上是参数错误。
+#[derive(Debug, Clone)]
+pub enum CustomerAccountTarget {
+    /// 给已有账户配身份：不改它的名称、标签、余额、密钥与历史。
+    Existing(AccountId),
+    /// 新建账户并配身份：id 由用例铸造，名称已规范化或生成。
+    New { account_id: AccountId, name: String },
 }
 
 /// 一条 API Key 的**只读视图**（对客自助列表用）。
@@ -1828,6 +1844,8 @@ pub struct CustomerView {
     pub customer_id: Uuid,
     pub email: String,
     pub account_id: AccountId,
+    /// 关联账户的**当前**名称（开户、改名之后都从同一处读，不在这里存副本）。
+    pub account_name: String,
     pub created_at: DateTime<Utc>,
     pub last_login_at: Option<DateTime<Utc>>,
 }
@@ -2170,9 +2188,19 @@ pub trait HubRepository: Send + Sync {
     async fn create_account(
         &self,
         account_id: AccountId,
+        name: &str,
+        tag: Option<&str>,
         initial_credit_microusd: u64,
         actor: &str,
     ) -> Result<BalanceChange, ApplicationError>;
+
+    /// 改账户名称。只动资料与审计，不碰余额、标签、凭据与历史；账户不存在返回 `NotFound`。
+    async fn set_account_name(
+        &self,
+        account_id: AccountId,
+        name: &str,
+        actor: &str,
+    ) -> Result<(), ApplicationError>;
 
     /// 充值。返回提交后的余额与写入时刻（同一个幂等键重放时返回**当前**余额，让缓存跟着刷新）。
     async fn credit_account(
@@ -2203,6 +2231,7 @@ pub trait HubRepository: Send + Sync {
         &self,
         email: Option<&str>,
         tag: Option<&str>,
+        name: Option<&str>,
         limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError>;
 
@@ -2614,14 +2643,17 @@ pub trait HubRepository: Send + Sync {
     /// 把一枚重置令牌标记为已用（一次性）。影响 0 行说明它已被兑换过。
     async fn redeem_password_reset(&self, token_hash: &str) -> Result<bool, ApplicationError>;
 
-    /// 建一个对客账户与它的登录身份，**一次事务里一起写**：`(客户 id, 账户 id)`。
+    /// 建一个客户身份与它的新账户，**一次事务里一起写**，返回客户 id。
     ///
+    /// 账户 id 与名称由用例铸造／生成后传进来（名称含 id 片段，所以必须先生成再写），仓储不自己造。
     /// 邮箱已被占用时返回 [`ApplicationError::Conflict`]——注册撞邮箱是调用方能自己改的事。
     async fn create_customer(
         &self,
+        account_id: AccountId,
+        account_name: &str,
         email: &str,
         password_hash: &str,
-    ) -> Result<(Uuid, Uuid), ApplicationError>;
+    ) -> Result<Uuid, ApplicationError>;
 
     /// 按邮箱找一个客户：`(客户 id, 账户 id, 口令哈希)`；没有时 `None`。
     async fn find_customer_by_email(
@@ -2672,13 +2704,13 @@ pub trait HubRepository: Send + Sync {
 
     /// 运营替客户开户：给 `email` 配一个登录身份。
     ///
-    /// `account_id` 为 `None` 时新建一个空账户；给了就把身份配到那个**已有账户**上（账户可以还没有身份）。
+    /// [`CustomerAccountTarget`] 决定是新建账户（名称已由用例定好）还是绑到已有账户（不动它任何资料）。
     /// 邮箱已被占用、或该账户已被别的身份绑定时返回 [`ApplicationError::Conflict`]。
     async fn open_customer_account(
         &self,
         email: &str,
         password_hash: &str,
-        account_id: Option<Uuid>,
+        target: CustomerAccountTarget,
     ) -> Result<(Uuid, Uuid), ApplicationError>;
 
     /// 按邮箱找一个客户：`(customer_id, account_id, email, created_at, last_login_at)`；没有时 `None`。
@@ -3057,7 +3089,13 @@ impl IdentityService {
         let email = normalize_email(email)?;
         check_secret(password, "password")?;
         let hash = hash_password(password)?;
-        let (customer_id, account_id) = self.repository.create_customer(&email, &hash).await?;
+        // 自助注册不给名称输入：账户 id 与名称都在这里定下来，再交给仓储写。
+        let account_id = AccountId::new();
+        let name = generated_account_name(account_id, Some(&email));
+        let customer_id = self
+            .repository
+            .create_customer(account_id, &name, &email, &hash)
+            .await?;
         let token = new_session_token();
         let expires_at = session_expiry(Utc::now(), ttl);
         self.repository
@@ -3065,7 +3103,7 @@ impl IdentityService {
             .await?;
         Ok(CustomerLogin {
             customer_id,
-            account_id,
+            account_id: account_id.0,
             email,
             token,
             expires_at,
@@ -3280,8 +3318,15 @@ impl IdentityService {
         email: &str,
         password: Option<&str>,
         account_id: Option<AccountId>,
+        account_name: Option<&str>,
     ) -> Result<CustomerView, ApplicationError> {
         let email = normalize_email(email)?;
+        // 绑定已有账户时不能同时给名称——名称属于那个账户，改它要走改名那条路。
+        if account_id.is_some() && account_name.is_some() {
+            return Err(ApplicationError::Validation(
+                "account_name cannot be provided when binding an existing account".to_owned(),
+            ));
+        }
         let hash = match password {
             Some(password) => {
                 check_secret(password, "initial password")?;
@@ -3290,9 +3335,23 @@ impl IdentityService {
             // 没有初始口令时也要占住那一列：写一条**永远匹配不上**的口令，等重置令牌换掉它。
             None => hash_password(&new_session_token())?,
         };
+        let target = match account_id {
+            Some(existing) => CustomerAccountTarget::Existing(existing),
+            None => {
+                let new_account_id = AccountId::new();
+                let name = match account_name {
+                    Some(raw) => normalize_account_name(raw)?,
+                    None => generated_account_name(new_account_id, Some(&email)),
+                };
+                CustomerAccountTarget::New {
+                    account_id: new_account_id,
+                    name,
+                }
+            }
+        };
         let (customer_id, account_id) = self
             .repository
-            .open_customer_account(&email, &hash, account_id.map(|id| id.0))
+            .open_customer_account(&email, &hash, target)
             .await?;
         self.customer_view(customer_id, account_id, &email).await
     }
@@ -3431,20 +3490,43 @@ impl AccountsService {
         self
     }
 
+    /// 建账户：账户 id 在这里铸造，名称在这里判定（给了就校验、留空就生成）。
+    ///
+    /// 名称进入与初始充值同一个创建事务（见仓储实现）：没有“账户建好了但名字还没写上”的中间状态。
     pub async fn create_account(
         &self,
-        account_id: AccountId,
         initial_credit_microusd: u64,
+        name: Option<&str>,
+        tag: Option<&str>,
         actor: &str,
-    ) -> Result<(), ApplicationError> {
+    ) -> Result<AccountId, ApplicationError> {
+        let account_id = AccountId::new();
+        let name = match name {
+            Some(raw) => normalize_account_name(raw)?,
+            // 没有登录邮箱可用，生成规则退到账户 id 形式。
+            None => generated_account_name(account_id, None),
+        };
         let change = self
             .repository
-            .create_account(account_id, initial_credit_microusd, actor)
+            .create_account(account_id, &name, tag, initial_credit_microusd, actor)
             .await?;
         self.acceleration
             .write_balance(&change, BalanceSource::DbCommit)
             .await;
-        Ok(())
+        Ok(account_id)
+    }
+
+    /// 改账户名称（运营那条路；客户那条路见对客用例，actor 不同、规则相同）。
+    pub async fn rename_account(
+        &self,
+        account_id: AccountId,
+        name: &str,
+        actor: &str,
+    ) -> Result<(), ApplicationError> {
+        let name = normalize_account_name(name)?;
+        self.repository
+            .set_account_name(account_id, &name, actor)
+            .await
     }
 
     pub async fn credit_account(
@@ -3483,9 +3565,26 @@ impl AccountsService {
         &self,
         email: Option<&str>,
         tag: Option<&str>,
+        name: Option<&str>,
         limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
-        self.repository.list_accounts(email, tag, limit).await
+        // 名称条件按 Spec U2：首尾空白忽略、空查询不筛选、非空最长 100 字符且不含控制字符。
+        // 这里只做**查询词**的判定（比名称本身宽松：不拦格式字符），匹配本身在仓储层做转义。
+        let name = match name.map(str::trim) {
+            None | Some("") => None,
+            Some(term) => {
+                if term.chars().count() > ACCOUNT_NAME_MAX_CHARS
+                    || term.chars().any(char::is_control)
+                {
+                    return Err(ApplicationError::Validation(
+                        "account name query must be at most 100 characters without control characters"
+                            .to_owned(),
+                    ));
+                }
+                Some(term)
+            }
+        };
+        self.repository.list_accounts(email, tag, name, limit).await
     }
 
     /// 按账户标识读账户摘要（详情直达与刷新用）。

@@ -28,6 +28,8 @@ use std::{
 };
 use uuid::Uuid;
 
+#[path = "cases_account_names.rs"]
+mod cases_account_names;
 #[path = "cases_admin_surface.rs"]
 mod cases_admin_surface;
 #[path = "cases_aihubmix.rs"]

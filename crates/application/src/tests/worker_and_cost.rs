@@ -152,7 +152,7 @@ impl HubRepository for WorkerRepository {
         &self,
         _email: &str,
         _password_hash: &str,
-        _account_id: Option<Uuid>,
+        _target: CustomerAccountTarget,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
         unused_repository()
     }
@@ -224,9 +224,11 @@ impl HubRepository for WorkerRepository {
 
     async fn create_customer(
         &self,
+        _account_id: AccountId,
+        _account_name: &str,
         _email: &str,
         _password_hash: &str,
-    ) -> Result<(Uuid, Uuid), ApplicationError> {
+    ) -> Result<Uuid, ApplicationError> {
         unused_repository()
     }
 
@@ -367,9 +369,20 @@ impl HubRepository for WorkerRepository {
     async fn create_account(
         &self,
         _account_id: AccountId,
+        _name: &str,
+        _tag: Option<&str>,
         _initial_credit_microusd: u64,
         _actor: &str,
     ) -> Result<BalanceChange, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn set_account_name(
+        &self,
+        _account_id: AccountId,
+        _name: &str,
+        _actor: &str,
+    ) -> Result<(), ApplicationError> {
         unused_repository()
     }
 
@@ -394,6 +407,7 @@ impl HubRepository for WorkerRepository {
         &self,
         _email: Option<&str>,
         _tag: Option<&str>,
+        _name: Option<&str>,
         _limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
         unused_repository()

@@ -95,10 +95,10 @@ test('客户详情按地址直达，关联账户能进账户详情', async ({ pa
   await page.goto(`${consoleUrl}#/customers/${customerId}`);
   await expect(page.getByTestId('customers-detail-email')).toHaveText(email);
   await expect(page.getByTestId('customers-search-email')).toHaveCount(0);
-  // 侧栏把「客户」标成当前工作区（`aria-current` 由外壳写在导航项的标签上）。
+  // 侧栏把「客户登录」标成当前工作区（`aria-current` 由外壳写在导航项的标签上）。
   await expect(
     page.locator('.ant-layout-sider [aria-current="page"]'),
-  ).toHaveText('客户');
+  ).toHaveText('客户登录');
 
   // 关联账户是通往账户详情的入口：点一下就换到那个账户的地址。
   await page.getByTestId('customers-open-account').click();

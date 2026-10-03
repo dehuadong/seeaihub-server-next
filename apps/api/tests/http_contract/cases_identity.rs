@@ -1833,6 +1833,8 @@ fn probe_body(method: &str, path: &str) -> ProbeBody {
             "new_password": "another-long-password",
         })),
         "/v1/customer/api-keys" => ProbeBody::Json(json!({"label": "probe"})),
+        // 改名这条在**没有会话**时必须走到"未认证"，而不是被请求体解析拦在前面。
+        "/v1/customer/account/name" => ProbeBody::Json(json!({"name": "探针账户"})),
         other => panic!(
             "对客面新增了 {method} {other}：给它配一个能被解析的请求体，否则这里只能证明请求体没过解析，证不了鉴权。"
         ),

@@ -628,8 +628,9 @@ async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
             "prompt": {"type": "string"}
         }
     });
-    sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 100000)")
+    sqlx::query("INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 100000)")
         .bind(account)
+        .bind("成本夹具账户")
         .execute(&pool)
         .await
         .expect("account fixture");

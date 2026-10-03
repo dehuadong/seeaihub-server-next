@@ -263,6 +263,7 @@ async fn main() -> Result<()> {
             get(list_account_usage),
         )
         .route("/api/v1/accounts/{account_id}/tag", put(set_account_tag))
+        .route("/api/v1/accounts/{account_id}/name", put(rename_account))
         .route(
             "/api/v1/accounts/{account_id}/credits",
             post(credit_account),
@@ -353,6 +354,7 @@ async fn main() -> Result<()> {
             delete(revoke_customer_api_key),
         )
         .route("/v1/customer/account", get(read_customer_account))
+        .route("/v1/customer/account/name", put(rename_customer_account))
         .route("/v1/customer/ledger", get(read_customer_ledger))
         .route("/v1/customer/usage", get(read_customer_usage))
         .route("/v1/customer/billing", get(read_customer_billing));
@@ -598,6 +600,24 @@ fn health_probe_timeout() -> Duration {
 #[derive(Debug, Deserialize)]
 struct CreateAccountBody {
     initial_credit_microusd: u64,
+    /// 账户名称。**省略**＝由服务端生成；显式 `null`、空串或纯空白按参数错误拒（名称不允许被“清空”）。
+    /// `Option<Option<_>>` 加自定义解码就是为了把这两种情况分开——默认的 `Option<String>` 会把它们
+    /// 一起折成 `None`，于是“显式 null”会被悄悄当成“省略”。
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    name: Option<Option<String>>,
+    /// 路由标签。省略＝不设标签。
+    #[serde(default)]
+    tag: Option<String>,
+}
+
+/// 把“字段缺失”与“字段为 `null`”分开：缺失交给 `#[serde(default)]` 得到外层 `None`，
+/// 出现（哪怕是 `null`）则得到 `Some(内层)`。
+fn deserialize_optional_field<'de, D, T>(deserializer: D) -> Result<Option<T>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+    T: serde::Deserialize<'de>,
+{
+    T::deserialize(deserializer).map(Some)
 }
 
 #[derive(Debug, Serialize)]
@@ -609,12 +629,44 @@ async fn create_account(
     State(state): State<AppState>,
     Json(body): Json<CreateAccountBody>,
 ) -> Result<Json<CreateAccountResponse>, ApiError> {
-    let account_id = AccountId::new();
-    state
+    let name = match body.name {
+        None => None,
+        Some(Some(name)) => Some(name),
+        Some(None) => {
+            return Err(ApiError::bad_request(
+                "invalid_name",
+                "account name cannot be null; omit it to have one generated".to_owned(),
+            ));
+        }
+    };
+    let account_id = state
         .accounts
-        .create_account(account_id, body.initial_credit_microusd, "admin-api")
+        .create_account(
+            body.initial_credit_microusd,
+            name.as_deref(),
+            body.tag.as_deref(),
+            "admin-api",
+        )
         .await?;
     Ok(Json(CreateAccountResponse { account_id }))
+}
+
+#[derive(Debug, Deserialize)]
+struct RenameAccountBody {
+    name: String,
+}
+
+/// 改账户名称（`PUT /api/v1/accounts/{account_id}/name`）：只动资料，不碰余额、标签与凭据。
+async fn rename_account(
+    State(state): State<AppState>,
+    Path(account_id): Path<Uuid>,
+    Json(body): Json<RenameAccountBody>,
+) -> Result<StatusCode, ApiError> {
+    state
+        .accounts
+        .rename_account(AccountId(account_id), &body.name, "admin-api")
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 #[derive(Debug, Deserialize)]
@@ -877,6 +929,18 @@ async fn list_account_usage(
 /// Key），所以看到的只可能是自己的账户。
 #[derive(Debug, Serialize)]
 struct OwnAccountResponse {
+    balance_microusd: i64,
+    held_microusd: i64,
+    available_microusd: i64,
+    updated_at: DateTime<Utc>,
+}
+
+/// 客户会话面的账户读：比 API Key 面多一个**自己的账户名称**。
+///
+/// 两个面分开成两个类型是刻意的：`/v1/account` 的形状是既有合同，加字段会连带改掉它。
+#[derive(Debug, Serialize)]
+struct CustomerAccountResponse {
+    name: String,
     balance_microusd: i64,
     held_microusd: i64,
     available_microusd: i64,
@@ -1169,6 +1233,10 @@ struct OpenCustomerBody {
     password: Option<String>,
     /// 缺省时新建账户；给了就把登录身份配到这个**已有账户**上。
     account_id: Option<Uuid>,
+    /// 新账户的名称。省略＝按登录邮箱生成；与 `account_id` 同时出现是参数错误（绑定不改名）。
+    /// 与 `CreateAccountBody::name` 同理，显式 `null` 不允许。
+    #[serde(default, deserialize_with = "deserialize_optional_field")]
+    account_name: Option<Option<String>>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -1191,12 +1259,23 @@ async fn open_customer(
     State(state): State<AppState>,
     Json(body): Json<OpenCustomerBody>,
 ) -> Result<(StatusCode, Json<CustomerView>), ApiError> {
+    let account_name = match body.account_name {
+        None => None,
+        Some(Some(name)) => Some(name),
+        Some(None) => {
+            return Err(ApiError::bad_request(
+                "invalid_name",
+                "account_name cannot be null; omit it to have one generated".to_owned(),
+            ));
+        }
+    };
     let view = state
         .identity
         .open_customer_account(
             &body.email,
             body.password.as_deref(),
             body.account_id.map(AccountId),
+            account_name.as_deref(),
         )
         .await?;
     Ok((StatusCode::CREATED, Json(view)))
@@ -1243,6 +1322,8 @@ const DEFAULT_CUSTOMERS_LIMIT: u32 = 50;
 struct AccountsQuery {
     email: Option<String>,
     tag: Option<String>,
+    /// 名称子串筛选；首尾空白忽略，空串按“没给”处理（与 email、tag 同一条规则）。
+    name: Option<String>,
     limit: Option<u32>,
 }
 
@@ -1277,7 +1358,15 @@ async fn list_accounts(
         .as_deref()
         .map(str::trim)
         .filter(|v| !v.is_empty());
-    let accounts = state.accounts.list_accounts(email, tag, limit).await?;
+    let name = query
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|v| !v.is_empty());
+    let accounts = state
+        .accounts
+        .list_accounts(email, tag, name, limit)
+        .await?;
     Ok(Json(AccountsResponse { accounts }))
 }
 
@@ -1583,16 +1672,35 @@ fn next_cursor(
 async fn read_customer_account(
     State(state): State<AppState>,
     headers: HeaderMap,
-) -> Result<Json<OwnAccountResponse>, ApiError> {
+) -> Result<Json<CustomerAccountResponse>, ApiError> {
     let (_, account_id) = state.require_customer(&headers).await?;
     let account_id = AccountId(account_id);
     let change = state.accounts.read_balance(account_id).await?;
-    Ok(Json(OwnAccountResponse {
+    let summary = state.accounts.account_summary(account_id).await?;
+    Ok(Json(CustomerAccountResponse {
+        name: summary.name,
         balance_microusd: change.balance_microusd,
         held_microusd: change.held_microusd,
         available_microusd: change.available_microusd,
         updated_at: change.updated_at,
     }))
+}
+
+/// 客户改自己账户的名称（`PUT /v1/customer/account/name`）。
+///
+/// 账户由**会话**确定，请求体里没有账户标识：这条读不出“改别人的账户”这种形态。审计的操作者固定为
+/// 对客自助那一个取值（与管理员改名区分）。
+async fn rename_customer_account(
+    State(state): State<AppState>,
+    headers: HeaderMap,
+    Json(body): Json<RenameAccountBody>,
+) -> Result<StatusCode, ApiError> {
+    let (_, account_id) = state.require_customer(&headers).await?;
+    state
+        .accounts
+        .rename_account(AccountId(account_id), &body.name, "customer-self-service")
+        .await?;
+    Ok(StatusCode::NO_CONTENT)
 }
 
 /// 对客读自己的账目流水（`GET /v1/customer/ledger`）：充值与扣费都在这里，金额带符号。

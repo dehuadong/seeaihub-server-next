@@ -87,10 +87,18 @@ export class AdminClient {
   }
 
   /// 替客户开户：不给 `accountId` 就新建空账户，给了就把登录身份配到那个**已有账户**上。
-  openCustomer(email: string, password?: string, accountId?: string): Promise<CustomerView> {
+  /// 开户：两个模式共用一个请求——给了 `accountId` 就是绑定已有账户（此时不能再给名称），
+  /// 否则新建账户，`accountName` 留空即由服务端按登录邮箱生成。
+  openCustomer(
+    email: string,
+    password?: string,
+    accountId?: string,
+    accountName?: string,
+  ): Promise<CustomerView> {
     const body: Record<string, unknown> = { email };
     if (password) body.password = password;
     if (accountId) body.account_id = accountId;
+    if (accountName?.trim()) body.account_name = accountName.trim();
     return this.send('/api/v1/customers', 'POST', body);
   }
 
@@ -136,8 +144,17 @@ export class AdminClient {
     });
   }
 
-  createAccount(initialCreditMicrousd: number): Promise<CreateAccountResponse> {
-    return this.send('/api/v1/accounts', 'POST', { initial_credit_microusd: initialCreditMicrousd });
+  /// 建账户：名称与标签和初始充值**一次提交**（不再有"账户建好了但标签没写上"的中间状态）。
+  /// 名称为空即省略——服务端按规则生成，不由前端拼。
+  createAccount(
+    initialCreditMicrousd: number,
+    name?: string,
+    tag?: string,
+  ): Promise<CreateAccountResponse> {
+    const body: Record<string, unknown> = { initial_credit_microusd: initialCreditMicrousd };
+    if (name?.trim()) body.name = name.trim();
+    if (tag?.trim()) body.tag = tag.trim();
+    return this.send('/api/v1/accounts', 'POST', body);
   }
 
   accountBalance(accountId: string): Promise<AccountBalance> {
@@ -150,10 +167,13 @@ export class AdminClient {
   }
 
   /// 列账户：运营**先找到再操作**的入口。`email` 与 `tag` 都是精确匹配（服务端按"与"处理）。
-  listAccounts(filter: { email?: string; tag?: string; limit?: number } = {}): Promise<AccountsResponse> {
+  listAccounts(
+    filter: { email?: string; tag?: string; name?: string; limit?: number } = {},
+  ): Promise<AccountsResponse> {
     const query = new URLSearchParams();
     if (filter.email?.trim()) query.set('email', filter.email.trim());
     if (filter.tag?.trim()) query.set('tag', filter.tag.trim());
+    if (filter.name?.trim()) query.set('name', filter.name.trim());
     query.set('limit', String(filter.limit ?? 50));
     return this.get(`/api/v1/accounts?${query}`);
   }
@@ -186,6 +206,11 @@ export class AdminClient {
 
   setAccountTag(accountId: string, tag: string | null): Promise<void> {
     return this.send(`/api/v1/accounts/${encodeURIComponent(accountId)}/tag`, 'PUT', { tag });
+  }
+
+  /// 改账户名称：只动资料与审计，不碰余额、标签与凭据。
+  renameAccount(accountId: string, name: string): Promise<void> {
+    return this.send(`/api/v1/accounts/${encodeURIComponent(accountId)}/name`, 'PUT', { name });
   }
 
   issueApiKey(accountId: string, label: string): Promise<IssueApiKeyResponse> {

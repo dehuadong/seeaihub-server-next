@@ -158,6 +158,8 @@ export interface RoutePoliciesResponse {
 /// 放进详情读。
 export interface AccountSummary {
   account_id: string;
+  /// 账户名称：每个账户始终有一个（建账户时给的或服务端生成的）。
+  name: string;
   balance_microusd: number;
   /// 运营设的标签；没设过就是 null。
   tag: string | null;
@@ -230,6 +232,8 @@ export interface CustomerView {
   customer_id: string;
   email: string;
   account_id: string;
+  /// 关联账户的当前名称（开户、改名之后都从同一处读）。
+  account_name: string;
   created_at: string;
   last_login_at: string | null;
 }
@@ -257,6 +261,8 @@ export interface PublicModelsResponse {
 /// `available_microusd`（客户现在能用的钱），不分别展示已结算余额、持有中或可用额，也不显示单笔
 /// 预授权额（账户资金 Spec `0002` §4；控制台 Spec `0001` C7、V-D5）。
 export interface OwnAccount {
+  /// 自己的账户名称：客户可在账户设置里改（规则见账户名称 Spec）。
+  name: string;
   balance_microusd: number;
   /// 已受理未结清的占用合计。接口返回，但客户页面不作为单独的数展示。
   held_microusd: number;

@@ -8,12 +8,13 @@ import {
   Form,
   Input,
   Row,
+  Segmented,
   Space,
   Table,
   Typography,
 } from 'antd';
 import { ArrowLeftOutlined, KeyOutlined, PlusOutlined, SearchOutlined } from '@ant-design/icons';
-import { useState } from 'react';
+import { useRef, useState } from 'react';
 import type { AdminClient } from '../client';
 import type { CustomerView } from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
@@ -38,6 +39,45 @@ export function CustomersPage({
   const [filter, setFilter] = useScreenState<{ email?: string }>('customers.filter', {});
   const [searchEmail, setSearchEmail] = useState(filter.email ?? '');
   const [opening, setOpening] = useState(false);
+  /// 开户的两个模式显式分开：新建要名称，绑定只认已有账户 id，两者的字段不混在一次提交里。
+  const [mode, setMode] = useState<'new' | 'existing'>('new');
+  const [openForm] = Form.useForm<{
+    email: string;
+    password?: string;
+    name?: string;
+    accountId?: string;
+  }>();
+  /// 绑定的**预览**：只有当前输入 id 的成功响应能用于确认，换 id 立刻作废。
+  const [preview, setPreview] = useState<{ accountId: string; name: string; email: string | null } | null>(
+    null,
+  );
+  const [previewError, setPreviewError] = useState<string | null>(null);
+  const [previewing, setPreviewing] = useState(false);
+  /// 请求序号：迟到的响应直接丢掉，不能用它确认一个已经换掉的 id。
+  const previewSequence = useRef(0);
+
+  async function loadPreview(rawAccountId: string) {
+    const accountId = rawAccountId.trim();
+    const sequence = ++previewSequence.current;
+    if (!accountId) {
+      setPreview(null);
+      setPreviewError(null);
+      return;
+    }
+    setPreviewing(true);
+    setPreviewError(null);
+    try {
+      const summary = await client.accountSummary(accountId);
+      if (sequence !== previewSequence.current) return;
+      setPreview({ accountId, name: summary.name, email: summary.email });
+    } catch (failure) {
+      if (sequence !== previewSequence.current) return;
+      setPreview(null);
+      setPreviewError(failure instanceof Error ? failure.message : String(failure));
+    } finally {
+      if (sequence === previewSequence.current) setPreviewing(false);
+    }
+  }
 
   const customers = useLoadable(
     () =>
@@ -49,27 +89,67 @@ export function CustomersPage({
 
   return (
     <ConsolePage
-      title="客户"
-      hint="客户是登录身份：邮箱 → 账户。开立之后客户能自己登录、管密钥、看账务"
+      title="客户登录"
+      hint="登录身份：邮箱 → 账户。开立之后客户能自己登录、管密钥、看账务"
       error={customers.error}
       loading={customers.loading}
       onReload={customers.reload}
     >
       <Panel
-        title="开户"
-        description="不填账户标识就新建一个空账户；填了就把它配到那个已有账户上（配身份不动余额、密钥与历史）。不填初始口令时，改用重置令牌让客户自己设。"
+        title="开通邮箱登录"
+        description="新建一个账户并开通登录，或给已有账户配上登录身份。绑定不动余额、API Key 与历史，也不改它已有的名称；不填初始口令时，改用重置令牌让客户自己设。"
       >
+        <Segmented
+          data-testid="customers-open-mode"
+          options={[
+            { value: 'new', label: '新建账户并开通邮箱登录' },
+            { value: 'existing', label: '为已有账户开通邮箱登录' },
+          ]}
+          value={mode}
+          onChange={(value) => {
+            setMode(value as 'new' | 'existing');
+            // 换模式即作废另一套字段与预览：不适用字段绝不能跟着提交。
+            openForm.setFieldsValue({ name: undefined, accountId: undefined });
+            setPreview(null);
+            setPreviewError(null);
+            previewSequence.current += 1;
+          }}
+          style={{ marginBottom: 16 }}
+        />
         <Form
+          form={openForm}
           layout="vertical"
-          onFinish={async (values: { email: string; password?: string; accountId?: string }) => {
+          onFinish={async (values: {
+            email: string;
+            password?: string;
+            name?: string;
+            accountId?: string;
+          }) => {
+            const accountId = values.accountId?.trim();
+            if (mode === 'existing') {
+              if (!accountId) {
+                message.error('请填已有账户的标识');
+                return;
+              }
+              // 提交守卫：只有**当前输入 id** 的成功预览能作数，预览说它已有登录身份就不能提交。
+              if (!preview || preview.accountId !== accountId) {
+                message.error('请先确认这个账户的预览');
+                return;
+              }
+              if (preview.email) {
+                message.error('这个账户已经有登录身份了');
+                return;
+              }
+            }
             setOpening(true);
             try {
               const created = await client.openCustomer(
                 values.email.trim(),
                 values.password || undefined,
-                values.accountId?.trim() || undefined,
+                mode === 'existing' ? accountId : undefined,
+                mode === 'new' ? values.name : undefined,
               );
-              message.success(`已开户：${created.email}`);
+              message.success(`已开通：${created.email}`);
               // 开完直接进这个客户的详情页：签发重置令牌是运营的下一步。
               onOpenCustomer(created.customer_id);
             } catch (failure) {
@@ -92,6 +172,53 @@ export function CustomersPage({
                 <Input data-testid="customers-open-email" placeholder="customer@example.com" />
               </Form.Item>
             </Col>
+            {mode === 'new' ? (
+              <Col xs={24} md={8}>
+                <Form.Item
+                  name="name"
+                  label="账户名称（可空）"
+                  tooltip="留空将按登录邮箱自动生成，之后随时可以改"
+                >
+                  <Input
+                    data-testid="customers-open-name"
+                    placeholder="留空即自动生成"
+                    allowClear
+                  />
+                </Form.Item>
+              </Col>
+            ) : (
+              <Col xs={24} md={8}>
+                <Form.Item
+                  name="accountId"
+                  label="已有账户标识"
+                  tooltip="填完整账户 id 后点「预览」确认是这个账户"
+                >
+                  <Space.Compact style={{ width: '100%' }}>
+                    <Input
+                      data-testid="customers-open-account-id"
+                      placeholder="账户 id（UUID）"
+                      // 换 id 立刻清掉旧预览：旧对象的信息不该停在一个已经换了目标的表单上。
+                      onChange={(event) => {
+                        if (event.target.value.trim() !== preview?.accountId) {
+                          previewSequence.current += 1;
+                          setPreview(null);
+                          setPreviewError(null);
+                        }
+                      }}
+                      onPressEnter={() => void loadPreview(openForm.getFieldValue('accountId') ?? '')}
+                      allowClear
+                    />
+                    <Button
+                      data-testid="customers-open-preview"
+                      loading={previewing}
+                      onClick={() => void loadPreview(openForm.getFieldValue('accountId') ?? '')}
+                    >
+                      预览
+                    </Button>
+                  </Space.Compact>
+                </Form.Item>
+              </Col>
+            )}
             <Col xs={24} md={8}>
               <Form.Item
                 name="password"
@@ -105,16 +232,24 @@ export function CustomersPage({
                 />
               </Form.Item>
             </Col>
-            <Col xs={24} md={8}>
-              <Form.Item
-                name="accountId"
-                label="绑到已有账户（可空）"
-                tooltip="留空即新建一个空账户；填了就把登录身份配到那个账户上"
-              >
-                <Input placeholder="账户 id（UUID）" allowClear />
-              </Form.Item>
-            </Col>
           </Row>
+          {mode === 'existing' ? (
+            <Alert
+              style={{ marginBottom: 16 }}
+              type={preview ? 'success' : previewError ? 'error' : 'info'}
+              showIcon
+              data-testid="customers-open-preview-result"
+              message={
+                preview
+                  ? `名称：${preview.name}；账户：${preview.accountId}；登录身份：${
+                      preview.email ? `已绑定 ${preview.email}` : '未开通'
+                    }。绑定保留余额、API Key 与历史。`
+                  : previewError
+                    ? previewError
+                    : '填账户标识后点「预览」确认对象；预览确认前不能提交。'
+              }
+            />
+          ) : null}
           <Form.Item style={{ marginBottom: 0 }}>
             <Button
               data-testid="customers-open-submit"
@@ -123,7 +258,7 @@ export function CustomersPage({
               htmlType="submit"
               loading={opening}
             >
-              开户
+              开通
             </Button>
           </Form.Item>
         </Form>
@@ -191,6 +326,16 @@ export function CustomersPage({
             ),
           }}
           columns={[
+            {
+              title: '账户名称',
+              dataIndex: 'account_name',
+              width: 200,
+              render: (value: string) => (
+                <Typography.Text strong data-testid="customers-row-name">
+                  {value}
+                </Typography.Text>
+              ),
+            },
             { title: '邮箱', dataIndex: 'email' },
             {
               title: '账户',
@@ -302,6 +447,15 @@ export function CustomerDetailPage({
           bordered
           column={{ xs: 1, sm: 2 }}
           items={[
+            {
+              key: 'account_name',
+              label: '账户名称',
+              children: (
+                <Typography.Text strong data-testid="customers-detail-account-name">
+                  {customer.data?.account_name ?? '—'}
+                </Typography.Text>
+              ),
+            },
             {
               key: 'email',
               label: '邮箱',

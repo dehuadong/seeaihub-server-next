@@ -236,11 +236,14 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     // 账户用**固定 id**：分摊的输入里有账户，固定下来这批幂等键的分流结果就是确定的，
     // 用例因此可以逐条断言"落点等于按 (账户, 幂等键) 重算的结果"，而不是只能断言一个大概比例。
     let account_id = Uuid::from_u128(0x5eea_0000_0000_0000_0000_0000_0000_0002);
-    sqlx::query("INSERT INTO ledger.accounts (id, balance_microusd) VALUES ($1, 100000000)")
-        .bind(account_id)
-        .execute(&pool)
-        .await
-        .expect("fixed account");
+    sqlx::query(
+        "INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 100000000)",
+    )
+    .bind(account_id)
+    .bind("路由夹具账户")
+    .execute(&pool)
+    .await
+    .expect("fixed account");
     let api_key = issue_key(&client, &base_url, &admin_token, &account_id.to_string()).await;
 
     // ── 用例 1：同一档两条候选，权重 1:3 ──

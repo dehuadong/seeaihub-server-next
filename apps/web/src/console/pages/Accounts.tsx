@@ -22,6 +22,8 @@ import {
 } from '@ant-design/icons';
 import { useState } from 'react';
 import type { AdminClient } from '../client';
+import { ApiError } from '../../shared/api';
+import { accountNameProblem } from '../../shared/account-name';
 import type {
   AccountSummary,
   AdminUsageRow,
@@ -49,44 +51,61 @@ export function AccountsPage({
   const { message } = AntApp.useApp();
   /// 本次查找条件活在**会话状态**里：进详情再返回、或前进后退回来时恢复（邮箱不进地址）。
   /// 两个输入框也从它起：回来时看到的必须是**正在生效的**那个条件，而不是空框配一份筛过的列表。
-  const [filter, setFilter] = useScreenState<{ email?: string; tag?: string }>(
+  const [filter, setFilter] = useScreenState<{ email?: string; tag?: string; name?: string }>(
     'accounts.filter',
     {},
   );
   const [email, setEmail] = useState(filter.email ?? '');
   const [tag, setTag] = useState(filter.tag ?? '');
+  const [name, setName] = useState(filter.name ?? '');
   const [directId, setDirectId] = useState('');
   const [createOpen, setCreateOpen] = useState(false);
   const [creating, setCreating] = useState(false);
-  const [createForm] = Form.useForm<{ tag?: string; yuan?: string }>();
+  const [createForm] = Form.useForm<{ name?: string; tag?: string; yuan?: string }>();
 
   const accounts = useLoadable(() => client.listAccounts({ ...filter, limit: 100 }), [client, filter]);
 
-  /// 建账户：**确认才建**。不填标签时之后只能用账户标识找它——表单里点明这一点。
-  async function createAccount(values: { tag?: string; yuan?: string }) {
+  /// 建账户：**确认才建**，名称、标签与初始充值**一次提交**。
+  ///
+  /// 名称留空即省略——由服务端按规则生成，前端不拼名字（拼了就多一处规则、且与生成规则会漂移）。
+  /// 标签也不再是"建完之后的第二步"：它们同一个事务，不成立就一起不成立。
+  async function createAccount(values: { name?: string; tag?: string; yuan?: string }) {
     setCreating(true);
+    // 请求发出去之后、拿到确定答复之前的失败都是**结果未知**：可能已经建成了，不能引导重试。
+    let sent = false;
     try {
       const yuan = Number(values.yuan ?? 0);
       if (!Number.isFinite(yuan) || yuan < 0) throw new Error('初始充值不能是负数');
-      const created = await client.createAccount(Math.round(yuan * 1_000_000));
-      const label = values.tag?.trim();
-      if (label) {
-        // 标签是建账户之后的**第二步**。它失败时账户与初始充值已经成立，不能把人留在列表上——
-        // 那样运营手上只剩一个"找不回来"的账户（没标签就只能按标识找）。进详情页，标签在那里补写。
-        try {
-          await client.setAccountTag(created.account_id, label);
-        } catch (failure) {
-          const reason = failure instanceof Error ? failure.message : String(failure);
-          message.warning(`账户已建，但标签没写上（${reason}）；在详情页可以重写标签`);
-        }
+      // 名称规则的服务端同款预检：填了才检（留空是合法输入，生成在服务端做）。
+      if (values.name?.trim()) {
+        const problem = accountNameProblem(values.name);
+        if (problem) throw new Error(problem);
       }
+      sent = true;
+      const created = await client.createAccount(
+        Math.round(yuan * 1_000_000),
+        values.name,
+        values.tag,
+      );
       message.success(`已建账户 ${created.account_id}`);
       createForm.resetFields();
       setCreateOpen(false);
       // 建完直接进它的详情页：运营下一步就是充值或发密钥，不该再让他从列表里找一遍。
       onOpenAccount(created.account_id);
     } catch (failure) {
-      message.error(failure instanceof Error ? failure.message : String(failure));
+      // 服务端回过来的 4xx/5xx 是**确定失败**，可以重试；网络中断、超时或响应读不出来是结果未知，
+      // 要引导运营先按名称找一遍，而不是再点一次（那一按可能建出第二个账户）。
+      const certain = failure instanceof ApiError;
+      if (sent && !certain) {
+        const typed = values.name?.trim();
+        if (typed) {
+          setName(typed);
+          setFilter({ ...filter, name: typed });
+        }
+        message.warning('创建结果暂未确认，请先按账户名称查找确认');
+      } else {
+        message.error(failure instanceof Error ? failure.message : String(failure));
+      }
     } finally {
       setCreating(false);
     }
@@ -110,10 +129,28 @@ export function AccountsPage({
         </Button>
       }
     >
-      <Panel title="找账户" description="两个条件都填时是「与」的关系。标签是运营自己设的，邮箱来自客户登录身份。">
+      <Panel
+        title="找账户"
+        description="多个条件都填时是「与」的关系。名称按子串匹配（不区分大小写），标签是运营自己设的，邮箱来自客户登录身份。"
+      >
         {/* 用普通表单而不是 antd 的 `Form`：这一处只需要"两个输入框 + 一个动作"，
             取的是**点击那一刻**的值，不需要校验、不需要受控字段。少一层托管就少一处说不清。 */}
         <Flex gap={12} wrap align="flex-end">
+          <Flex vertical gap={4}>
+            <Typography.Text type="secondary" style={{ fontSize: 12 }}>
+              账户名称
+            </Typography.Text>
+            <Input
+              data-testid="accounts-lookup-name"
+              prefix={<SearchOutlined />}
+              placeholder="星尘工作室"
+              value={name}
+              onChange={(event) => setName(event.target.value)}
+              onPressEnter={() => setFilter({ email, tag, name })}
+              style={{ width: 200 }}
+              allowClear
+            />
+          </Flex>
           <Flex vertical gap={4}>
             <Typography.Text type="secondary" style={{ fontSize: 12 }}>
               客户邮箱
@@ -124,7 +161,7 @@ export function AccountsPage({
               placeholder="customer@example.com"
               value={email}
               onChange={(event) => setEmail(event.target.value)}
-              onPressEnter={() => setFilter({ email, tag })}
+              onPressEnter={() => setFilter({ email, tag, name })}
               style={{ width: 240 }}
               allowClear
             />
@@ -138,7 +175,7 @@ export function AccountsPage({
               placeholder="vip"
               value={tag}
               onChange={(event) => setTag(event.target.value)}
-              onPressEnter={() => setFilter({ email, tag })}
+              onPressEnter={() => setFilter({ email, tag, name })}
               style={{ width: 160 }}
               allowClear
             />
@@ -147,7 +184,7 @@ export function AccountsPage({
             <Button
               data-testid="accounts-search"
               type="primary"
-              onClick={() => setFilter({ email, tag })}
+              onClick={() => setFilter({ email, tag, name })}
             >
               查找
             </Button>
@@ -155,6 +192,7 @@ export function AccountsPage({
               onClick={() => {
                 setEmail('');
                 setTag('');
+                setName('');
                 setFilter({});
               }}
             >
@@ -210,7 +248,7 @@ export function AccountsPage({
                 type="info"
                 showIcon
                 message={
-                  filter.email || filter.tag
+                  filter.email || filter.tag || filter.name
                     ? '没有符合条件的账户。清空筛选看看全部账户。'
                     : '还没有任何账户。点右上角「建账户」，或让客户自己注册。'
                 }
@@ -219,6 +257,16 @@ export function AccountsPage({
           }}
           columns={[
             {
+              title: '账户名称',
+              dataIndex: 'name',
+              width: 200,
+              render: (value: string) => (
+                <Typography.Text strong data-testid="accounts-row-name">
+                  {value}
+                </Typography.Text>
+              ),
+            },
+            {
               title: '客户邮箱',
               dataIndex: 'email',
               width: 220,
@@ -226,7 +274,7 @@ export function AccountsPage({
                 value ? (
                   <Typography.Text>{value}</Typography.Text>
                 ) : (
-                  <Typography.Text type="secondary">（没有登录身份）</Typography.Text>
+                  <Typography.Text type="secondary">未开通邮箱登录</Typography.Text>
                 ),
             },
             {
@@ -264,7 +312,7 @@ export function AccountsPage({
       </Panel>
 
       <Modal
-        title="建账户"
+        title="建账户，暂不开通邮箱登录"
         open={createOpen}
         onCancel={() => setCreateOpen(false)}
         onOk={() => createForm.submit()}
@@ -275,11 +323,21 @@ export function AccountsPage({
         okButtonProps={{ 'data-testid': 'accounts-create-submit' }}
         destroyOnHidden
       >
+        <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
+          创建账户，暂不开通邮箱登录；可先充值、签发 API Key，之后再开通登录。
+        </Typography.Paragraph>
         <Form form={createForm} layout="vertical" onFinish={(values) => void createAccount(values)}>
           <Form.Item
+            name="name"
+            label="账户名称（可选）"
+            tooltip="留空将自动生成，如 zhangsan_3f9a；也可现在填写，之后随时修改"
+          >
+            <Input data-testid="accounts-create-name" placeholder="留空即自动生成" allowClear />
+          </Form.Item>
+          <Form.Item
             name="tag"
-            label="标签（可选）"
-            tooltip="运营用它找账户；不填的话之后只能用账户标识找它"
+            label="路由标签（可选）"
+            tooltip="只被生效的 user_tag 路由策略消费；不填的话之后也能按名称找它"
           >
             <Input data-testid="accounts-create-tag" placeholder="vip" allowClear />
           </Form.Item>
@@ -339,6 +397,7 @@ export function AccountDetailPage({
   const [module, setModule] = useState<Module>('credit');
   const [busy, setBusy] = useState(false);
   const [tagError, setTagError] = useState<string | null>(null);
+  const [nameError, setNameError] = useState<string | null>(null);
 
   const summary = useLoadable(() => client.accountSummary(accountId), [client, accountId]);
   const balance = useLoadable(() => client.accountBalance(accountId), [client, accountId]);
@@ -355,6 +414,36 @@ export function AccountDetailPage({
   // 而不是把上一次的读数留在屏幕上。
   const missing = [summary.status, balance.status].some((status) => status === 404 || status === 400);
   if (missing) return <ConsoleNotFound what="账户" onBack={onBack} />;
+
+  const nameForm = (
+    <Form
+      layout="inline"
+      key={summary.data?.name ?? ''}
+      initialValues={{ name: summary.data?.name ?? '' }}
+      onFinish={async (values: { name?: string }) => {
+        setBusy(true);
+        setNameError(null);
+        try {
+          await client.renameAccount(accountId, values.name?.trim() ?? '');
+          message.success('名称已保存');
+          summary.reload();
+        } catch (failure) {
+          setNameError(failure instanceof Error ? failure.message : String(failure));
+        } finally {
+          setBusy(false);
+        }
+      }}
+    >
+      <Form.Item name="name" label="名称" tooltip="识别这个账户的服务对象；可以重名，改动不影响金额与凭据">
+        <Input data-testid="accounts-name-input" style={{ width: 200 }} allowClear />
+      </Form.Item>
+      <Form.Item>
+        <Button data-testid="accounts-name-submit" htmlType="submit" loading={busy}>
+          改名
+        </Button>
+      </Form.Item>
+    </Form>
+  );
 
   const tagForm = (
     <Form
@@ -408,9 +497,14 @@ export function AccountDetailPage({
     >
       <Panel
         title="账户"
-        description="账户 id、绑定邮箱与三个金额。金额来自账本，页面不重算；预授权与释放不出现在这里。"
+        description="账户名称、账户 id、绑定邮箱与三个金额。金额来自账本，页面不重算；预授权与释放不出现在这里。"
       >
         <Flex vertical gap={16}>
+          {/* 名称是主要识别文字，放在最前面；id 仍然完整可复制。二者与标签**分开提交**，互不牵连。 */}
+          <Typography.Text strong style={{ fontSize: 16 }} data-testid="accounts-detail-name">
+            {summary.data?.name ?? '—'}
+          </Typography.Text>
+          {nameForm}
           <Flex align="center" gap={12} wrap>
             <Typography.Text
               code
@@ -422,7 +516,7 @@ export function AccountDetailPage({
             </Typography.Text>
             <Typography.Text type="secondary" data-testid="accounts-detail-email">
               {summary.data
-                ? (summary.data.email ?? '（没有登录身份）')
+                ? (summary.data.email ?? '未开通邮箱登录')
                 : '—'}
             </Typography.Text>
             {tagForm}
@@ -456,6 +550,7 @@ export function AccountDetailPage({
             </Flex>
           </Flex>
 
+          {nameError ? <Alert type="error" showIcon message={nameError} /> : null}
           {tagError ? <Alert type="error" showIcon message={tagError} /> : null}
         </Flex>
       </Panel>

@@ -29,7 +29,7 @@ const NAV: { route: Route; label: string; icon: React.ReactNode }[] = [
   // 就是"上架新模型"，每行有一个"改价"。`#/publish` 仍作为旧地址落到同一页。
   { route: 'models', label: '模型目录', icon: <DeploymentUnitOutlined /> },
   { route: 'accounts', label: '账户', icon: <KeyOutlined /> },
-  { route: 'customers', label: '客户', icon: <TeamOutlined /> },
+  { route: 'customers', label: '客户登录', icon: <TeamOutlined /> },
   { route: 'diagnostics', label: '对账与诊断', icon: <AuditOutlined /> },
   { route: 'rates', label: '折算率', icon: <DollarOutlined /> },
   { route: 'routing', label: '路由策略', icon: <SwapOutlined /> },

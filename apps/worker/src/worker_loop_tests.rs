@@ -165,9 +165,11 @@ impl HubRepository for EmptyQueueRepository {
 
     async fn create_customer(
         &self,
+        _account_id: AccountId,
+        _account_name: &str,
         _email: &str,
         _password_hash: &str,
-    ) -> Result<(Uuid, Uuid), ApplicationError> {
+    ) -> Result<Uuid, ApplicationError> {
         unimplemented!()
     }
 
@@ -237,7 +239,7 @@ impl HubRepository for EmptyQueueRepository {
         &self,
         _email: &str,
         _password_hash: &str,
-        _account_id: Option<Uuid>,
+        _target: CustomerAccountTarget,
     ) -> Result<(Uuid, Uuid), ApplicationError> {
         unimplemented!()
     }
@@ -379,11 +381,22 @@ impl HubRepository for EmptyQueueRepository {
     async fn create_account(
         &self,
         _account_id: AccountId,
+        _name: &str,
+        _tag: Option<&str>,
         _initial_credit_microusd: u64,
         _actor: &str,
     ) -> Result<BalanceChange, ApplicationError> {
         unimplemented!()
     }
+    async fn set_account_name(
+        &self,
+        _account_id: AccountId,
+        _name: &str,
+        _actor: &str,
+    ) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
     async fn credit_account(
         &self,
         _account_id: AccountId,
@@ -403,6 +416,7 @@ impl HubRepository for EmptyQueueRepository {
         &self,
         _email: Option<&str>,
         _tag: Option<&str>,
+        _name: Option<&str>,
         _limit: u32,
     ) -> Result<Vec<AccountSummary>, ApplicationError> {
         unimplemented!()

@@ -11,7 +11,7 @@ const ADMIN_PASSWORD = settings.adminPassword;
 const CONSOLE = consoleUrl;
 const PORTAL = portalUrl;
 
-const NAV_LABELS = ['模型目录', '账户', '客户', '对账与诊断', '折算率', '路由策略'];
+const NAV_LABELS = ['模型目录', '账户', '客户登录', '对账与诊断', '折算率', '路由策略'];
 
 /// 侧栏导航项。Ant Design 的 `Menu` 把每项渲染成 `role=menuitem`，不是 button——换 UI 库时
 /// 选择器要跟着实现走，但**断言的性质不变**（那六项在 / 不在）。

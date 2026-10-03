@@ -17,7 +17,7 @@ test('开户并签发重置令牌，客户能用它设新口令', async ({ page 
   await page.getByTestId('admin-email').fill(settings.adminEmail);
   await page.getByTestId('admin-password').fill(settings.adminPassword);
   await page.getByTestId('admin-sign-in').click();
-  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '客户' }).click();
+  await page.locator('.ant-layout-sider').getByRole('menuitem', { name: '客户登录' }).click();
 
   // **开户**：邮箱 + 初始口令，不填账户标识（留空即新建一个空账户）。开完直接进这个客户的详情页。
   await page.getByTestId('customers-open-email').fill(email);
@@ -26,6 +26,10 @@ test('开户并签发重置令牌，客户能用它设新口令', async ({ page 
 
   await expect(page).toHaveURL(/#\/customers\/[0-9a-f-]{36}$/);
   await expect(page.getByTestId('customers-detail-email')).toHaveText(email);
+  // 没填名称时按登录邮箱生成一个：详情上直接看得到关联账户的名称。
+  await expect(page.getByTestId('customers-detail-account-name')).toHaveText(
+    new RegExp(`^${email.split('@')[0]}_[0-9a-f]{4}$`),
+  );
   // 详情页上不出现查找列表：列表与详情不纵向拼接。
   await expect(page.getByTestId('customers-search-email')).toHaveCount(0);
   await expect(page.getByText('关联账户', { exact: true })).toBeVisible();

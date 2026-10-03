@@ -1,0 +1,85 @@
+//! 账户名称规则与生成（Spec `0003` N2/N3）的用例。
+//!
+//! 这里只验规则本身；“省略走生成、显式 `null` 报错、客户只能改自己的账户”由 API 合同用例在真库上验。
+
+use super::*;
+use uuid::Uuid;
+
+fn account_id(bits: u128) -> AccountId {
+    AccountId(Uuid::from_u128(bits))
+}
+
+/// 一个 id 形如 `00000000-0000-4000-8000-...` 的账户，取前 4/8 位便于断言。
+const FIXED: u128 = 0x3f9a_2b1c_0000_4000_8000_0000_0000_0001;
+
+#[test]
+fn a_name_is_trimmed_and_measured_in_unicode_scalar_values() {
+    assert_eq!(
+        normalize_account_name("  星尘工作室  ").expect("合法名称"),
+        "星尘工作室"
+    );
+    // 内部连续空格原样保留。
+    assert_eq!(
+        normalize_account_name("星尘  工作室").expect("合法名称"),
+        "星尘  工作室"
+    );
+    // 100 个字符可以，101 个不行；emoji 组合按 scalar value 计数。
+    let hundred = "a".repeat(ACCOUNT_NAME_MAX_CHARS);
+    assert!(normalize_account_name(&hundred).is_ok());
+    let over = "a".repeat(ACCOUNT_NAME_MAX_CHARS + 1);
+    assert!(normalize_account_name(&over).is_err());
+    assert!(normalize_account_name("👨‍👩‍👧").is_ok());
+}
+
+#[test]
+fn rejected_characters_are_control_and_format_but_emoji_joiners_pass() {
+    for rejected in ["\u{0009}", "\u{000A}", "\u{007F}", "\u{202E}"] {
+        assert!(
+            normalize_account_name(&format!("星尘{rejected}工作室")).is_err(),
+            "{rejected:?} 应当被拒"
+        );
+    }
+    // 零宽连接符与非连接符是 emoji 组合的一部分，必须放行。
+    assert!(normalize_account_name("星尘\u{200D}工作室").is_ok());
+    assert!(normalize_account_name("星尘\u{200C}工作室").is_ok());
+    // 空白与空串一律拒。
+    assert!(normalize_account_name("   ").is_err());
+    assert!(normalize_account_name("").is_err());
+}
+
+#[test]
+fn a_generated_name_uses_the_email_local_part_and_an_id_fragment() {
+    let generated = generated_account_name(account_id(FIXED), Some("zhangsan@example.com"));
+    assert_eq!(generated, "zhangsan_3f9a");
+    assert!(normalize_account_name(&generated).is_ok());
+}
+
+#[test]
+fn a_generated_name_falls_back_to_the_account_id_without_a_usable_email() {
+    let from_nothing = generated_account_name(account_id(FIXED), None);
+    assert_eq!(from_nothing, "账户_3f9a2b1c");
+    // 本地部分为空、含被拒字符、或邮箱没有 `@`：都退回 id 形式。
+    for unusable in ["@example.com", "zhang\tsan@example.com", "no-at-sign"] {
+        assert_eq!(
+            generated_account_name(account_id(FIXED), Some(unusable)),
+            from_nothing,
+            "{unusable} 不该被用作生成来源"
+        );
+    }
+}
+
+#[test]
+fn an_over_long_local_part_is_truncated_before_the_id_fragment() {
+    let long = format!("{}@example.com", "a".repeat(200));
+    let generated = generated_account_name(account_id(FIXED), Some(&long));
+    assert_eq!(generated, format!("{}_3f9a", "a".repeat(95)));
+    // 95 个字符的本地部分 + `_` + 4 位片段，正好顶到上限。
+    assert_eq!(generated.chars().count(), ACCOUNT_NAME_MAX_CHARS);
+}
+
+#[test]
+fn a_generated_name_keeps_whitespace_out_of_its_edges() {
+    // 本地部分带首尾空白：先按 N2 的规则收边，再做后缀拼接。
+    let generated = generated_account_name(account_id(FIXED), Some("  zhangsan  @example.com"));
+    assert_eq!(generated, "zhangsan_3f9a");
+}
