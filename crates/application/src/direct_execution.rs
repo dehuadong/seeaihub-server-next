@@ -36,13 +36,13 @@ use thiserror::Error;
 use crate::{
     AccelerationService, AdapterFactory, AdmitExecution, AdmitOffering, AdmitOutcome,
     ApplicationError, BalanceSource, BeginSubmission, CostInputs, CreateImageGenerationRequest,
-    CredentialProvider, DirectExecutionLimits, ExecutionFinalization, ExecutionReplay,
-    ExecutionRepository, FailOrReconcileExecution, FailureDisposition, FingerprintKeys,
-    HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling, RequestFingerprintInput,
-    RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision, SettleExecution,
-    contract_parameter_face, failure_provider_cost, freeze_offering_pricing, provider_cost_fact,
-    public_error_code, requested_image_count, select_candidate, select_candidate_with_strategy,
-    single_request_cost_cny, validate_idempotency_key,
+    CredentialProvider, DirectExecutionLimits, ExecutionFinalization, ExecutionLookup,
+    ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
+    FingerprintKeys, HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling,
+    RequestFingerprintInput, RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision,
+    SettleExecution, contract_parameter_face, failure_provider_cost, freeze_offering_pricing,
+    provider_cost_fact, public_error_code, requested_image_count, select_candidate,
+    select_candidate_with_strategy, single_request_cost_cny, validate_idempotency_key,
 };
 
 /// 直接执行总期限里预留给证据持久化、结算与提交确认的默认预算（秒）。
@@ -339,6 +339,17 @@ impl DirectExecutionService {
         }
         let routing_input = routing_request(&request)?;
         let branch = routing_input.branch()?;
+        let idempotency_key_digest = self.keys.idempotency_key_digest(&request.idempotency_key);
+        // 同键预查在选路、候选截断与冻价之前：原记录一旦存在，型号下架、候选停用或选路失败
+        // 都不能夺走它的 §4 重放投影（Spec 0005 §4）。命中后按记录冻结的合同与密钥版本比对，
+        // 一致才投影；不一致或无法安全比对按 idempotency_conflict 拒绝，绝不新建。
+        if let Some(lookup) = self
+            .executions
+            .lookup_execution(request.account_id, &idempotency_key_digest)
+            .await?
+        {
+            return Err(self.replay_projection(&request.endpoint, &routing_input, lookup)?);
+        }
         // 合同是模型级唯一一份：先读候选取合同，按它过滤出"已识别的参数"，指纹在选路与候选
         // 截断之前形成，且不依赖当前价格、候选或修订（Spec 0005 §4）。
         let candidates = self.repository.active_offering(&request.model).await?;
@@ -371,7 +382,6 @@ impl DirectExecutionService {
                     "the current request fingerprint key is not configured".to_owned(),
                 )
             })?;
-        let idempotency_key_digest = self.keys.idempotency_key_digest(&request.idempotency_key);
 
         // 选路、承载准备与冻价都复用旧路径的同一组函数：同一条请求、同一个账户与幂等键，两条路
         // 选出同一条候选、冻出同一份快照。
@@ -714,6 +724,54 @@ impl DirectExecutionService {
         }
     }
 
+    /// 同键命中后的安全比对与 Spec 0005 §4 投影。
+    ///
+    /// 用记录**冻结的合同**与它写下的密钥版本重算这次请求的指纹：一致才按原阶段投影；版本不同、
+    /// 旧密钥未配置，或这次请求在冻结合同下根本识别不出来时，都无法安全比对，一律按
+    /// idempotency_conflict 拒绝——旧记录仍按它自己的规则解释，不拿新修订重定义（RFC 0017 §2）。
+    fn replay_projection(
+        &self,
+        endpoint: &str,
+        request: &CreateImageGenerationRequest,
+        lookup: ExecutionLookup,
+    ) -> Result<DirectExecutionError, ApplicationError> {
+        let recognized = match contract_parameter_face(request, &lookup.capability_schema) {
+            Ok(parameters) => Value::Object(parameters),
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %lookup.job_id,
+                    error = %error,
+                    "the current request does not fit the recorded contract; treating it as an idempotency conflict"
+                );
+                return Ok(idempotency_conflict());
+            }
+        };
+        let recomputed = self.keys.request_fingerprint(
+            lookup.request_digest_key_version,
+            &RequestFingerprintInput {
+                endpoint,
+                gateway_model: &request.model,
+                parameters: &recognized,
+                reference_images: &request.reference_images,
+                mask: request.mask.as_deref(),
+                n: requested_image_count(&recognized),
+            },
+        )?;
+        if recomputed.as_deref() != Some(lookup.request_digest.as_str()) {
+            return Ok(idempotency_conflict());
+        }
+        Ok(project_replay(
+            ExecutionReplay {
+                job_id: lookup.job_id,
+                stage: lookup.stage,
+                error_code: lookup.error_code,
+                created_at: lookup.created_at,
+                updated_at: lookup.updated_at,
+            },
+            self.timeouts.sync_wait,
+        ))
+    }
+
     /// 选路：按策略在合格候选里挑一条，返回命中供给、承载参数面与判定记录。
     async fn select(
         &self,
@@ -1048,6 +1106,13 @@ fn admit_offering(offering: &PublishedOffering) -> AdmitOffering {
         base_url: offering.base_url.clone(),
         credential_env: offering.credential_env.clone(),
     }
+}
+
+/// 同键同请求之外的比对失败统一按 §4 的 idempotency_conflict 拒绝（对客 409）：
+/// 旧密钥未配置、请求指纹不等，或请求在冻结合同下识别不出来时都走这里。
+fn idempotency_conflict() -> DirectExecutionError {
+    ApplicationError::Conflict("idempotency key was already used with different input".to_owned())
+        .into()
 }
 
 /// 同键重放 → Spec 0005 §4 的四种投影。

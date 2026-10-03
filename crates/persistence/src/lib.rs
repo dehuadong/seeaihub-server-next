@@ -5,15 +5,16 @@ use seeai_application::{
     AdmittedJob, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange, BeginSubmission,
     ClaimedJob, ClaimedLateFact, CompleteJob, CustomerAccountTarget, CustomerBillingQuery,
     CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery,
-    CustomerUsageScope, CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionReplay,
-    ExecutionRepository, FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView,
-    GatewayModelView, HoldDisposition, HubRepository, JobView, LateFacts, LateFactsOutcome,
-    LeaseRecovery, LedgerMismatch, LedgerPage, NewFxRate, NormalizedOffering,
-    OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeRequest,
-    ReconciliationCaseView, RecordAcceptance, ReferencedOffering, RefundReconciliationCommand,
-    RoutingDecision, SelectableOfferingView, SettleExecution, SubmissionStarted,
-    TakenOverExecution, UnacceptedAttempt, customer_usage_status, declared_output_images,
+    CustomerUsageScope, CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionLookup,
+    ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
+    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
+    LateFacts, LateFactsOutcome, LeaseRecovery, LedgerMismatch, LedgerPage, NewFxRate,
+    NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance, ReferencedOffering,
+    RefundReconciliationCommand, RoutingDecision, SelectableOfferingView, SettleExecution,
+    SubmissionStarted, TakenOverExecution, UnacceptedAttempt, customer_usage_status,
+    declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis,
@@ -4258,6 +4259,62 @@ impl HubRepository for PgHubRepository {
 /// 请求正文、幂等明文、承载面或结果信封，JDBC 参数里也没有图片或 Value 请求体。
 #[async_trait]
 impl ExecutionRepository for PgHubRepository {
+    /// 同键只读预查：一条无锁无事务的 SELECT，顺带把记录冻结的模型合同取回来。
+    ///
+    /// 合同经 Job 的 `vendor_model_id` 直查 `catalog.vendor_models`：那一行按身份不可变，
+    /// 型号下架、候选停用或之后重新发布都不改它，所以旧记录的指纹总能按原样重算（RFC 0017 §2）。
+    async fn lookup_execution(
+        &self,
+        account_id: AccountId,
+        idempotency_key_digest: &str,
+    ) -> Result<Option<ExecutionLookup>, ApplicationError> {
+        let row = sqlx::query(
+            r#"
+            SELECT j.id, j.state, j.error_code, j.request_digest, j.request_digest_key_version,
+                   j.created_at, j.updated_at, vm.capability_schema
+            FROM generation.jobs j
+            JOIN catalog.vendor_models vm ON vm.id = j.vendor_model_id
+            WHERE j.account_id = $1 AND j.idempotency_key_digest = $2
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(idempotency_key_digest)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let job_id = JobId(row.try_get("id").map_err(database_error)?);
+        let state: String = row.try_get("state").map_err(database_error)?;
+        let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+            ApplicationError::Persistence(format!("job state {state} is not a v1 execution stage"))
+        })?;
+        // 有幂等摘要就必然有指纹与版本（受理同事务写入）；缺了说明记录被绕过，不猜。
+        let request_digest: Option<String> =
+            row.try_get("request_digest").map_err(database_error)?;
+        let request_digest_key_version: Option<i16> = row
+            .try_get("request_digest_key_version")
+            .map_err(database_error)?;
+        let (Some(request_digest), Some(request_digest_key_version)) =
+            (request_digest, request_digest_key_version)
+        else {
+            return Err(ApplicationError::Persistence(format!(
+                "job {job_id} has an idempotency digest but no request fingerprint"
+            )));
+        };
+        Ok(Some(ExecutionLookup {
+            job_id,
+            stage,
+            error_code: row.try_get("error_code").map_err(database_error)?,
+            request_digest,
+            request_digest_key_version,
+            capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+            created_at: row.try_get("created_at").map_err(database_error)?,
+            updated_at: row.try_get("updated_at").map_err(database_error)?,
+        }))
+    }
+
     async fn admit(&self, command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError> {
         let AdmitExecution {
             account_id,

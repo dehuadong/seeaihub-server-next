@@ -26,10 +26,10 @@ use seeai_application::{
     AdapterFactory, AdmitExecution, AdmitOutcome, ApplicationError, BeginSubmission,
     ClaimedLateFact, CredentialProvider, DirectExecutionCall, DirectExecutionError,
     DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService, ExecutionFinalization,
-    ExecutionRepository, FailOrReconcileExecution, FingerprintKeys, LateFacts, LateFactsOutcome,
-    OfferingDraft, PricePlanDraft, ProviderFailureKind, PublishRuntimeCommand, RecordAcceptance,
-    RequestTimeoutPolicy, RetryPolicy, RuntimeService, SettleExecution, SubmissionStarted,
-    TakenOverExecution,
+    ExecutionLookup, ExecutionRepository, FailOrReconcileExecution, FingerprintKeys, HubRepository,
+    LateFacts, LateFactsOutcome, OfferingDraft, PricePlanDraft, ProviderFailureKind,
+    PublishRuntimeCommand, RecordAcceptance, RequestTimeoutPolicy, RetryPolicy, RuntimeService,
+    SettleExecution, SubmissionStarted, TakenOverExecution,
 };
 use seeai_domain::{
     AccountId, AttemptId, ConsumerRatesCny, FencingToken, JobId, ProviderCostFact, TokenUsage,
@@ -288,6 +288,22 @@ fn test_keys() -> FingerprintKeys {
     FingerprintKeys::new(vec![9_u8; 32], 1, request_keys, 1).expect("the test fingerprint keys")
 }
 
+/// 轮换后的密钥：当前版本 v2，v1 仍保留——旧记录要用它比对（RFC 0017 §2）。
+fn test_keys_rotated_to_v2() -> FingerprintKeys {
+    let mut request_keys = BTreeMap::new();
+    request_keys.insert(1, vec![7_u8; 32]);
+    request_keys.insert(2, vec![8_u8; 32]);
+    FingerprintKeys::new(vec![9_u8; 32], 1, request_keys, 2).expect("the rotated fingerprint keys")
+}
+
+/// 轮换后旧版本已从配置移除：记录的版本取不到密钥，无法安全比对。
+fn test_keys_without_v1() -> FingerprintKeys {
+    let mut request_keys = BTreeMap::new();
+    request_keys.insert(2, vec![8_u8; 32]);
+    FingerprintKeys::new(vec![9_u8; 32], 1, request_keys, 2)
+        .expect("the rotated fingerprint keys without v1")
+}
+
 fn test_timeouts() -> RequestTimeoutPolicy {
     RequestTimeoutPolicy {
         base: Duration::from_secs(1),
@@ -380,6 +396,16 @@ struct FlakySettleRepository {
 
 #[async_trait]
 impl ExecutionRepository for FlakySettleRepository {
+    async fn lookup_execution(
+        &self,
+        account_id: AccountId,
+        idempotency_key_digest: &str,
+    ) -> Result<Option<ExecutionLookup>, ApplicationError> {
+        self.inner
+            .lookup_execution(account_id, idempotency_key_digest)
+            .await
+    }
+
     async fn admit(&self, command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError> {
         self.inner.admit(command).await
     }
@@ -514,6 +540,10 @@ async fn setup() -> Fixture {
 }
 
 async fn setup_with(flaky_settle: Option<Arc<AtomicBool>>) -> Fixture {
+    setup_with_keys(flaky_settle, test_keys()).await
+}
+
+async fn setup_with_keys(flaky_settle: Option<Arc<AtomicBool>>, keys: FingerprintKeys) -> Fixture {
     let (database_url, database_name) = isolated_database_url().await;
     let repository = Arc::new(
         PgHubRepository::connect(&database_url, 4)
@@ -549,12 +579,31 @@ async fn setup_with(flaky_settle: Option<Arc<AtomicBool>>) -> Fixture {
         }),
         None => repository.clone(),
     };
-    let service = DirectExecutionService::new(
-        repository.clone(),
+    let service = build_service(repository.clone(), executions, factory.clone(), keys);
+    Fixture {
+        repository,
+        database_name,
+        account_id,
+        service,
+        factory,
+        calls,
+        owner: "supervisor-a".to_owned(),
+    }
+}
+
+/// 用同一组依赖与限制装配一个服务：换一套指纹密钥（轮换用例）时只动密钥，别处逐位一致。
+fn build_service(
+    repository: Arc<PgHubRepository>,
+    executions: Arc<dyn ExecutionRepository>,
+    factory: Arc<FakeFactory>,
+    keys: FingerprintKeys,
+) -> DirectExecutionService {
+    DirectExecutionService::new(
+        repository,
         executions,
-        factory.clone(),
+        factory,
         Arc::new(FakeCredentials),
-        test_keys(),
+        keys,
         test_timeouts(),
         DirectExecutionLimits {
             max_account_in_flight: 8,
@@ -567,16 +616,7 @@ async fn setup_with(flaky_settle: Option<Arc<AtomicBool>>) -> Fixture {
     .with_retry_policy(RetryPolicy {
         max_attempts: 3,
         backoff_base: Duration::from_millis(1),
-    });
-    Fixture {
-        repository,
-        database_name,
-        account_id,
-        service,
-        factory,
-        calls,
-        owner: "supervisor-a".to_owned(),
-    }
+    })
 }
 
 impl Fixture {
@@ -623,6 +663,14 @@ impl Fixture {
             .fetch_one(self.pool())
             .await
             .expect("the job id")
+    }
+
+    async fn job_count(&self) -> i64 {
+        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
+            .bind(self.account_id.0)
+            .fetch_one(self.pool())
+            .await
+            .expect("the job count")
     }
 
     async fn job_state(&self) -> String {
@@ -960,6 +1008,134 @@ async fn the_same_key_replays_settled_failed_and_unknown_outcomes() {
         .execute(fixture.request("replay-unknown"), &fixture.call())
         .await;
     assert!(matches!(unknown, Err(DirectExecutionError::OutcomeUnknown)));
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_rotated_fingerprint_key_replays_the_same_request() {
+    let fixture = setup().await;
+    // 第一次用 v1 受理并结算成功：记录按 v1 写下指纹与版本。
+    fixture
+        .service
+        .execute(fixture.request("rotation-replay"), &fixture.call())
+        .await
+        .expect("the first request");
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+
+    // 轮换：当前版本换成 v2，v1 仍配置。旧记录必须用它的 v1 重算，不能拿 v2 重新解释。
+    let rotated = build_service(
+        fixture.repository.clone(),
+        fixture.repository.clone(),
+        fixture.factory.clone(),
+        test_keys_rotated_to_v2(),
+    );
+    let replay = rotated
+        .execute(fixture.request("rotation-replay"), &fixture.call())
+        .await;
+    assert!(matches!(
+        replay,
+        Err(DirectExecutionError::ResultNotRetained)
+    ));
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "rotation must not admit the same key as a new request"
+    );
+    assert_eq!(
+        fixture.job_count().await,
+        1,
+        "rotation creates no second job"
+    );
+
+    drop(rotated);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_replay_without_the_recorded_key_version_is_an_idempotency_conflict() {
+    let fixture = setup().await;
+    fixture
+        .service
+        .execute(fixture.request("rotation-missing"), &fixture.call())
+        .await
+        .expect("the first request");
+
+    // 旧版本已从配置移除：无法安全比对，按 409 idempotency_conflict 拒绝，不新建、不执行。
+    let rotated = build_service(
+        fixture.repository.clone(),
+        fixture.repository.clone(),
+        fixture.factory.clone(),
+        test_keys_without_v1(),
+    );
+    let replay = rotated
+        .execute(fixture.request("rotation-missing"), &fixture.call())
+        .await;
+    assert!(matches!(
+        replay,
+        Err(DirectExecutionError::Application(
+            ApplicationError::Conflict(_)
+        ))
+    ));
+    assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        fixture.job_count().await,
+        1,
+        "a conflict creates no second job"
+    );
+
+    drop(rotated);
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_replay_survives_a_disabled_candidate() {
+    let fixture = setup().await;
+    let success = fixture
+        .service
+        .execute(fixture.request("replay-delisted"), &fixture.call())
+        .await
+        .expect("the original request");
+    let offering_id: Uuid =
+        sqlx::query_scalar("SELECT offering_id FROM generation.jobs WHERE id = $1")
+            .bind(success.job_id.0)
+            .fetch_one(fixture.pool())
+            .await
+            .expect("the frozen offering id");
+    // 停用这条候选（型号下架同理会清空候选集）：此后选路取不到供给，但重放预查必须还按
+    // 记录冻结的合同给出投影，而不是 404。
+    sqlx::query("UPDATE supply.offerings SET enabled = false WHERE id = $1")
+        .bind(offering_id)
+        .execute(fixture.pool())
+        .await
+        .expect("disable the offering");
+    assert!(fixture.job_count().await == 1);
+    assert!(
+        fixture
+            .repository
+            .active_offering("gw")
+            .await
+            .expect("the active candidates")
+            .is_empty(),
+        "a disabled candidate disappears from routing"
+    );
+
+    let replay = fixture
+        .service
+        .execute(fixture.request("replay-delisted"), &fixture.call())
+        .await;
+    assert!(matches!(
+        replay,
+        Err(DirectExecutionError::ResultNotRetained)
+    ));
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "the replay never reaches the provider"
+    );
 
     fixture.cleanup().await;
 }

@@ -12,7 +12,7 @@
 | A1 | `cargo test -p seeai-api --test http_contract cases_direct_execution -- --ignored`（url/base64 闭环、全程不启 Worker） | 通过 |
 | A2 | persistence `execution_admit` 断言载荷列为 NULL；`execution_finalization` 断言不写 Provider 原文；adapter `gateway_error` 脱敏用例 | 通过 |
 | A3 | `cases_direct_execution::direct_invalid_key_is_rejected_before_the_body_is_parsed` | 通过 |
-| A4 | persistence `execution_admit`（同键/异指纹/并发名额）、`execution_finalization`（不重复扣费）、application `direct_execution` 同键四投影 | 通过 |
+| A4 | persistence `execution_admit`（同键/异指纹/并发名额）、`execution_finalization`（不重复扣费）、application `direct_execution` 同键四投影与轮换后重放（`a_rotated_fingerprint_key_replays_the_same_request`、`a_replay_without_the_recorded_key_version_is_an_idempotency_conflict`、`a_replay_survives_a_disabled_candidate`） | 通过 |
 | A5–A6 | persistence `execution_submission`（句柄先入库再轮询、fencing、期限）、application `execution_reconciliation`（只读查询、缺口建案、孤儿回收、晚到事实） | 通过 |
 | A7 | 真库 408 慢读用例；application `direct_execution` 期限与断开处置；`execution_reconciliation::api_and_worker_finalizations_charge_at_most_once`（S3 与 Worker 竞争不重复收费） | 通过 |
 | A8 | 直接执行不再每 250ms 查询（A1 用例不启 Worker）；`direct_sql_count_does_not_grow_with_provider_wait`（长短等待的事务增量不随等待增长）；`direct_slow_provider_does_not_occupy_a_database_connection` 与 `direct_slow_provider_keeps_more_requests_than_pool_connections_in_flight`（等待期间连接池空闲）；adapter 共享 Client 复用单测；执行/读取/发送许可单测 | 部分（峰值 RSS 与两态吞吐/延迟基线待做） |

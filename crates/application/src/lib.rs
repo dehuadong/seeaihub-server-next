@@ -1683,6 +1683,26 @@ pub struct ExecutionReplay {
     pub updated_at: DateTime<Utc>,
 }
 
+/// 同键只读预查返回的原记录投影：调用方据此在选路/候选截断之前判定重复调用。
+///
+/// 它比 [`ExecutionReplay`] 多带**记录冻结的请求指纹与合同**：指纹密钥轮换后，只有用记录写下的
+/// [`Self::request_digest_key_version`] 与 [`Self::capability_schema`] 才能安全重算并比对，
+/// 否则无法判断“同键同请求”还是“同键换请求”（Spec 0005 §4，RFC 0017 §2）。
+#[derive(Debug, Clone)]
+pub struct ExecutionLookup {
+    pub job_id: JobId,
+    pub stage: ExecutionStage,
+    /// 原记录写下的对客错误码；处理中或成功时为 None。
+    pub error_code: Option<String>,
+    pub request_digest: String,
+    /// 原记录生成请求指纹时用的密钥版本。
+    pub request_digest_key_version: i16,
+    /// 原记录冻结的模型级合同：旧记录比对用它重算已识别参数，不受之后的重新发布影响。
+    pub capability_schema: Value,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
 /// 一台过期 v1 执行被接管后的只读投影：Worker 只按它做只读查询与收尾。
 ///
 /// 它只带最小执行事实（身份、当前 Attempt 与任务句柄、适配器与凭证引用、冻结价格与账户），
@@ -3123,6 +3143,18 @@ pub trait ExecutionRepository: Send + Sync {
     /// 账户名额已满返回 ApplicationError::TooManyInFlight；
     /// 渠道全局容量已满返回 ApplicationError::PlatformCapacityExhausted。
     async fn admit(&self, command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError>;
+
+    /// 同键只读预查：按 `(account_id, idempotency_key_digest)` 取原记录的投影，未命中返回 `None`。
+    ///
+    /// 它不占锁、不改任何行、不做资金与容量检查。调用方在选路与候选截断之前用它判定重复调用：
+    /// 命中后按记录写下的 [`ExecutionLookup::request_digest_key_version`] 与冻结合同重算请求指纹
+    /// 再比对，一致才走 Spec 0005 §4 的重放投影；无法安全比对时按冲突拒绝。
+    /// [`Self::admit`] 仍在事务里做同一份最终校验，并发下以库为准。
+    async fn lookup_execution(
+        &self,
+        account_id: AccountId,
+        idempotency_key_digest: &str,
+    ) -> Result<Option<ExecutionLookup>, ApplicationError>;
 
     /// 持久化提交声明：锁定 Job，核验未终结、执行所有权、fencing token、总期限与当前 Attempt，
     /// 写 Job 为 executing 并落一行 submitting 的 Attempt——提交成功后调用方才可发出外部请求。
