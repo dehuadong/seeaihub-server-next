@@ -78,6 +78,24 @@ async fn probe_rejects_an_api_that_is_not_ours() {
     );
 }
 
+/// 无缓存用例必须**显式**把 `REDIS_URL` 置空：API 与 Worker 进程用 `dotenvy` 加载仓库
+/// `.env`，它不覆盖已设置的变量；只"不设"时本机那份 `.env` 的 `REDIS_URL` 会替用例补上一个
+/// 真实 Redis，跑的不是 CI（无 `.env`）那条路径。空值在 `RedisCache::from_env` 里判为未配置。
+#[test]
+fn no_cache_is_an_explicitly_empty_redis_url() {
+    let mut command = Command::new("unused");
+    apply_cache_env(&mut command, None);
+    let redis_url = command
+        .get_envs()
+        .find(|(name, _)| *name == std::ffi::OsStr::new("REDIS_URL"))
+        .and_then(|(_, value)| value);
+    assert_eq!(
+        redis_url,
+        Some(std::ffi::OsStr::new("")),
+        "a no-cache case must set REDIS_URL to the empty value, not leave it unset"
+    );
+}
+
 /// 反过来钉住判据本身：`/health` 与令牌都对就要被认下来。
 ///
 /// 这里回的 `{"status":"ok"}` 是**生产 `/health` 的线协议字面量**（`apps/api/src/main.rs` 的

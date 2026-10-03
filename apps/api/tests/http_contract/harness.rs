@@ -3501,7 +3501,11 @@ impl CacheFixture {
 /// 给子进程装上加速层的那几个环境变量。
 fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
     let Some(cache) = cache else {
-        // 不设 `REDIS_URL` 就是"没有缓存"：加速层不构造，路径与没有这一层时逐位相同。
+        // **显式**把 `REDIS_URL` 置空来表达"没有缓存"：API 与 Worker 进程用 `dotenvy` 加载仓库
+        // `.env`，它不覆盖已设置的变量，而空值在 `RedisCache::from_env` 里判为未配置。
+        // 只"不设"的话，本机那份 `.env` 的 `REDIS_URL` 会替无缓存用例补上一个真实 Redis，
+        // 跑的不是 CI（无 `.env`）那条路径。
+        command.env("REDIS_URL", "");
         return;
     };
     let settings = cache.settings();
