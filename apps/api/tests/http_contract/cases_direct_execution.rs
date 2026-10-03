@@ -569,3 +569,171 @@ async fn direct_slow_provider_keeps_more_requests_than_pool_connections_in_fligh
     assert_eq!(harness.create_calls(), CONCURRENT, "每个请求只调一次上游");
     harness.cleanup().await;
 }
+
+/// A8 与 Spec 0005 §3：本机字节预算被在飞执行占满时，新请求按容量不足拒（503
+/// platform_unavailable），不建执行记录、不调上游；预算释放后同样的请求正常工作。
+///
+/// 为什么用并发构造"超过预算"：每次执行固定预留 32MiB（EXECUTION_MEMORY_BYTES），预算配到比它小
+/// 进程直接拒绝启动（Supervisor::new），所以单个请求永远在预算内；能压出来的边界只有"又一个执行
+/// 要预留，而预算已被在飞执行占满"。执行、发送、读取名额都保持默认 64，唯一被压小的是字节预算，
+/// 因此这次 503 只能归因于内存预算，不会与并发名额超限混淆。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_memory_budget_rejects_a_second_concurrent_execution() {
+    // EXECUTION_MEMORY_BYTES 的值：一次执行的固定预留（生产常量见 apps/api/src/supervisor.rs）。
+    const ONE_EXECUTION_RESERVATION_BYTES: usize = 32 * 1024 * 1024;
+    let harness = Harness::start_direct_with(
+        candidate(
+            "AIHubMix",
+            "aihubmix-image-v1",
+            &["prompt_only", "image_conditioned", "masked"],
+        ),
+        UpstreamBehaviour {
+            delay_ms: 2_500,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
+        64,
+        30,
+        ApiProcessSettings {
+            direct_execution: true,
+            max_memory_bytes: Some(ONE_EXECUTION_RESERVATION_BYTES),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await;
+    let base = harness.base_url.clone();
+    let api_key = harness.api_key.clone();
+    let first_key = format!("direct-budget-first-{}", Uuid::new_v4());
+    let first_request = route_request(harness.model, "hold the whole memory budget open");
+    let first = tokio::spawn(async move {
+        post_json(
+            &base,
+            &api_key,
+            "/v1/images/generations",
+            &first_key,
+            &first_request,
+        )
+        .await
+    });
+    // 假上游已经收到第一个请求：它此刻持有那次执行的字节预留。
+    wait_for_create_calls(&harness, 1).await;
+
+    let second_key = format!("direct-budget-second-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &second_key,
+        &route_request(harness.model, "must be rejected by the byte budget"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("platform_unavailable"),
+        "预算占满时必须按本机容量不足投影，got {body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "被拒请求不能调上游");
+
+    let (status, body) = first.await.expect("the first request joins");
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    // 客户端已经读完整段响应，服务端的响应 body 随之销毁、字节预留回到预算池；这个短等的只有
+    // "body 被丢掉"这一跳，不用它掩盖任何判定。
+    tokio::time::sleep(Duration::from_millis(200)).await;
+
+    let third_key = format!("direct-budget-third-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &third_key,
+        &route_request(harness.model, "the budget is free again"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(harness.create_calls(), 2, "预算内的请求各调一次上游");
+
+    // 被拒那次没有留下任何执行记录：本账户只有受理成功的那两条。
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
+            .bind(Uuid::parse_str(&harness.account_id).expect("the fixture account id"))
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the direct job count");
+    assert_eq!(jobs, 2, "被预算拒绝的请求不建执行记录");
+    harness.cleanup().await;
+}
+
+/// 读 /proc/<pid>/status 里的峰值常驻内存 VmHWM（KiB）。
+///
+/// 取整段生命周期的最高水位而不是当前 VmRSS：测量发生在请求完成之后，当前值已经回落。
+#[cfg(target_os = "linux")]
+fn peak_rss_kib(pid: u32) -> u64 {
+    let status = std::fs::read_to_string(format!("/proc/{pid}/status"))
+        .expect("the API process must expose /proc/<pid>/status");
+    let line = status
+        .lines()
+        .find(|line| line.starts_with("VmHWM:"))
+        .expect("VmHWM must be reported for a live process");
+    line.split_whitespace()
+        .nth(1)
+        .expect("VmHWM has a numeric value")
+        .parse()
+        .expect("VmHWM is in KiB")
+}
+
+/// A8 与 RFC 0017 §8：一次大图请求后，API 进程的峰值 RSS 落在预先配置的字节预算内。
+///
+/// 预算在这里是进程级上界而不是"每执行预留"：RFC §8 要求最大合法输入与慢发送下 RSS 落在配置的
+/// 预算内。夹具把预算压到 256MiB（8 个执行预留）——既容得下一次请求，又比生产默认的 2GiB 紧，
+/// 断言才有判别力。抖动来源：进程基线与 tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的内存
+/// 留在 arena 里不还给内核、以及 data URL 解码与 multipart 编码的同尺寸副本。VmHWM 是内核对整段
+/// 生命周期的最高水位，只单调上升，不会漏记峰值。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_peak_rss_stays_within_the_memory_budget() {
+    const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+    const REFERENCE_IMAGE_BYTES: usize = 6 * 1024 * 1024;
+    let harness = Harness::start_direct_with(
+        candidate(
+            "AIHubMix",
+            "aihubmix-image-v1",
+            &["prompt_only", "image_conditioned", "masked"],
+        ),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        4,
+        30,
+        ApiProcessSettings {
+            direct_execution: true,
+            max_memory_bytes: Some(MEMORY_BUDGET_BYTES),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await;
+    // 接近正文上限的大图：base64 之后约 8MiB，触发解码与 multipart 编码的多份同尺寸副本。
+    let data_url = format!(
+        "data:image/png;base64,{}",
+        STANDARD.encode(vec![0_u8; REFERENCE_IMAGE_BYTES])
+    );
+    let mut request = route_request(harness.model, "a large reference image");
+    request["image"] = json!(data_url);
+    let key = format!("direct-peak-rss-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let peak_kib = peak_rss_kib(harness.api_pid());
+    let budget_kib = (MEMORY_BUDGET_BYTES / 1024) as u64;
+    println!("API 子进程峰值 RSS: {peak_kib} KiB（配置预算 {budget_kib} KiB）");
+    assert!(
+        peak_kib < budget_kib,
+        "大图请求后 API 峰值 RSS {peak_kib} KiB 超出配置预算 {budget_kib} KiB"
+    );
+    harness.cleanup().await;
+}

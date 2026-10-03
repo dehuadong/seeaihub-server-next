@@ -710,6 +710,11 @@ impl ApiProcess {
     fn exit_status(&mut self) -> Option<String> {
         self.child.try_wait().ok().flatten().map(|s| s.to_string())
     }
+
+    /// 子进程号：峰值 RSS 用例要读它的 `/proc/<pid>/status`。
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
 }
 
 impl Drop for ApiProcess {
@@ -911,6 +916,12 @@ struct ApiProcessSettings {
     settle_reserve_seconds: Option<u64>,
     /// 正文慢读期限（秒）：用例要观察"滴流慢读被 408 收口"时把它压到等得起的量级。
     slow_read_timeout_seconds: Option<u64>,
+    /// 本机在飞执行的字节预算（GENERATION_MAX_MEMORY_BYTES）：用例要观察在飞执行占满预算后
+    /// 新请求被拒时，把它压到只够一次执行。缺省不配，进程用生产默认值（2GiB）。
+    ///
+    /// 下限是每次执行的固定预留 32MiB——比它小 Supervisor::new 直接拒绝启动，所以单个请求
+    /// 永远在预算内；能压出来的边界只有预算已被另一个在飞执行占满这一种。
+    max_memory_bytes: Option<usize>,
 }
 
 /// 一次用例的全部进程配置：API 进程那一套、发布时的修订级加价系数、以及 Worker 的重投策略。
@@ -1065,6 +1076,9 @@ async fn start_api_with(
                 .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY);
             if let Some(seconds) = settings.slow_read_timeout_seconds {
                 command.env("GENERATION_SLOW_READ_TIMEOUT_SECONDS", seconds.to_string());
+            }
+            if let Some(bytes) = settings.max_memory_bytes {
+                command.env("GENERATION_MAX_MEMORY_BYTES", bytes.to_string());
             }
         }
         let child = command.spawn().expect("API process should start");
@@ -1854,6 +1868,11 @@ impl Harness {
                 );
             }
         }
+    }
+
+    /// 这次用例启动的 API 进程号：峰值 RSS 用例据此读 `VmHWM`。
+    fn api_pid(&self) -> u32 {
+        self._api.pid()
     }
 
     async fn cleanup(&self) {
