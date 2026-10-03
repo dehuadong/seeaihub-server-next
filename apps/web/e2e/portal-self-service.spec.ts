@@ -30,7 +30,16 @@ test('注册后进概览：首屏只有一个「余额」 + 五页固定导航',
     await expect(page.getByText(forbidden)).toHaveCount(0);
   }
   // 客户页面只有一个「余额」：不出现内部三分解的任何一个名字，也不出现预授权金额（Spec C7、V-D5）。
-  for (const forbidden of ['已结算余额', '可用余额', '可用额', '持有中', '预授权']) {
+  // 连解释内部占用机制的文案也不许出现：客户侧只呈现「余额」这个事实。
+  for (const forbidden of [
+    '已结算余额',
+    '可用余额',
+    '可用额',
+    '持有中',
+    '预授权',
+    '占住',
+    '多退少补',
+  ]) {
     await expect(page.getByText(forbidden)).toHaveCount(0);
   }
 
@@ -55,16 +64,16 @@ test('注册后进概览：首屏只有一个「余额」 + 五页固定导航',
 test('客户会话令牌调管理 API 一律被拒', async ({ page, request }) => {
   await registerCustomer(page, uniqueEmail('portal-e2e'));
 
-  const customerToken = await page.evaluate(() =>
-    sessionStorage.getItem('seeai.portal.session'),
-  );
+  const customerToken = await page.evaluate(() => sessionStorage.getItem('seeai.portal.session'));
   expect(customerToken).toBeTruthy();
 
   // 从**真正的浏览器页面**里发这次请求：要证的是"浏览器拿着客户令牌打管理面"这件事。
   const refused = await page.evaluate(async () => {
     const call = async (path: string) => {
       const response = await fetch(path, {
-        headers: { authorization: `Bearer ${sessionStorage.getItem('seeai.portal.session') ?? ''}` },
+        headers: {
+          authorization: `Bearer ${sessionStorage.getItem('seeai.portal.session') ?? ''}`,
+        },
       });
       const body = await response.text();
       return { status: response.status, code: JSON.parse(body)?.error?.code ?? null };
@@ -84,10 +93,9 @@ test('客户会话令牌调管理 API 一律被拒', async ({ page, request }) =
 
   // 反向确认这把令牌本身是好的：它对客面能用（否则上面的 403 证明不了"受众不同"）。
   // 用回环地址而不是 `portalUrl`：Node 的解析器不认 `.localhost`（那两个主机名只在浏览器里可用）。
-  const own = await request.get(
-    `http://127.0.0.1:${settings.port}/v1/customer/ledger?limit=1`,
-    { headers: { authorization: `Bearer ${customerToken}` } },
-  );
+  const own = await request.get(`http://127.0.0.1:${settings.port}/v1/customer/ledger?limit=1`, {
+    headers: { authorization: `Bearer ${customerToken}` },
+  });
   expect(own.ok(), '客户令牌在对客面必须是好的').toBeTruthy();
 });
 
