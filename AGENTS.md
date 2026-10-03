@@ -9,8 +9,8 @@
 
 ## 工程边界
 
-- `apps/api`：HTTP 控制面与图片生成入口。
-- `apps/worker`：领取持久 Job、调用 Provider、落账与结算。
+- `apps/api`：HTTP 控制面与图片生成的同步直接执行入口；执行事实与账务入 PostgreSQL，业务载荷只在内存。
+- `apps/worker`：异常对账与清理；不领取生成任务、不重发生成请求。
 - `crates/domain`：稳定领域类型与状态规则，不依赖数据库、HTTP 或 Provider。
 - `crates/application`：用例与端口，编排领域对象。
 - `crates/persistence`、`crates/adapter-*`：基础设施实现。

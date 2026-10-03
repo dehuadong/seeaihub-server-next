@@ -6,8 +6,9 @@ use seeai_adapter_sdk::ProviderCredential;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AdapterRegistry, ApplicationError, CachePolicy, CredentialProvider,
-    HubRepository, NO_CONTRACT_MAX_OUTPUT_IMAGES, PlatformAlerter, RequestTimeoutPolicy,
-    RetryPolicy, WorkerService,
+    DEFAULT_EXECUTION_LEASE_SECONDS, ExecutionReconciliationService, ExecutionRepository,
+    HubRepository, NO_CONTRACT_MAX_OUTPUT_IMAGES, PlatformAlerter, ReconciliationPolicy,
+    RequestTimeoutPolicy, RetryPolicy, WorkerService,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_persistence::{PgHubRepository, max_declared_output_images};
@@ -77,7 +78,8 @@ async fn main() -> Result<()> {
         "safe retries are configured: a retry only happens when the provider provably did not \
          accept the request"
     );
-    let repository_port: Arc<dyn HubRepository> = repository;
+    let repository_port: Arc<dyn HubRepository> = repository.clone();
+    let executions: Arc<dyn ExecutionRepository> = repository;
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
         Arc::new(AdapterRegistry::new(vec![
@@ -95,19 +97,19 @@ async fn main() -> Result<()> {
         None => Arc::new(AccelerationService::disabled(repository_port.clone())),
     };
     let worker = WorkerService::new(
-        repository_port,
-        adapters,
+        repository_port.clone(),
+        adapters.clone(),
         Arc::new(EnvironmentCredentialProvider),
         worker_id.clone(),
         ChronoDuration::seconds(lease_seconds),
         timeouts,
     )?
-    .with_acceleration(acceleration)
+    .with_acceleration(acceleration.clone())
     .with_retry_policy(retry_policy);
     // 平台故障告警出口是**配置项**：`PROVIDER_ALERT_WEBHOOK` 没配就没有出口，一条也不外发；
     // 阈值（某候选连续失败几次才告警）只在有出口时才读。地址写错在这里就失败，不让进程带着一个
     // "永远发不出去"的出口跑起来。
-    let worker = match WebhookAlertSink::from_env()? {
+    let alerting = match WebhookAlertSink::from_env()? {
         Some(sink) => {
             let consecutive_failures = parse_env("PROVIDER_ALERT_CONSECUTIVE_FAILURES", 3_u64)?;
             let consecutive_failures = NonZeroU64::new(consecutive_failures)
@@ -116,20 +118,93 @@ async fn main() -> Result<()> {
                 consecutive_failures = consecutive_failures.get(),
                 "platform failure alerts are enabled"
             );
-            worker.with_platform_alerts(
+            Some((
                 Arc::new(PlatformAlerter::new(Arc::new(sink))),
                 consecutive_failures,
-            )
+            ))
+        }
+        None => None,
+    };
+    let worker = match &alerting {
+        Some((alerter, consecutive_failures)) => {
+            worker.with_platform_alerts(alerter.clone(), *consecutive_failures)
         }
         None => worker,
     };
+    // 新协议的异常对账循环：只接管过期所有权、只读查询、按证据幂等结算或建案。它绝不领取
+    // 生成任务、也不读正文；旧 Worker 路径（run_once / claim_next_job / recover_expired_leases /
+    // renew_lease）逐位不变。
+    let execution_lease_seconds = parse_env(
+        "GENERATION_EXECUTION_LEASE_SECONDS",
+        DEFAULT_EXECUTION_LEASE_SECONDS,
+    )?;
+    let reconciliation_policy = ReconciliationPolicy::from_env().map_err(anyhow::Error::from)?;
+    info!(
+        batch_limit = reconciliation_policy.batch_limit,
+        query_max_attempts = reconciliation_policy.query_max_attempts,
+        query_backoff_base_seconds = reconciliation_policy.query_backoff_base.as_secs(),
+        query_backoff_max_seconds = reconciliation_policy.query_backoff_max.as_secs(),
+        "reconciliation query scheduling is configured"
+    );
+    let mut reconciliation = ExecutionReconciliationService::new(
+        repository_port,
+        executions,
+        adapters,
+        Arc::new(EnvironmentCredentialProvider),
+        worker_id.clone(),
+        ChronoDuration::seconds(execution_lease_seconds),
+    )
+    .with_policy(reconciliation_policy)
+    .with_retry_policy(retry_policy)
+    .with_acceleration(acceleration);
+    if let Some((alerter, _)) = &alerting {
+        reconciliation = reconciliation.with_platform_alerts(alerter.clone());
+    }
     info!(%worker_id, "worker started");
     let (_drain_signal, drain_control) = tokio::sync::watch::channel(false);
     let signals = ShutdownSignals {
         drain_control,
         interrupt: shutdown_signal(),
     };
-    run_until_shutdown(&worker, signals, poll_interval).await
+    let rounds = WorkerRounds {
+        worker,
+        reconciliation,
+    };
+    run_until_shutdown(&rounds, signals, poll_interval).await
+}
+
+/// 主循环每轮要跑的东西：旧 Worker 的生成领取 + 新协议的异常对账。
+trait WorkerRound {
+    /// 跑一轮；返回是否真的动过什么（false 触发空闲退避）。
+    async fn run_round(&self) -> Result<bool, ApplicationError>;
+}
+
+impl WorkerRound for WorkerService {
+    async fn run_round(&self) -> Result<bool, ApplicationError> {
+        self.run_once().await
+    }
+}
+
+/// 两个循环的组合：先跑异常对账（有界、快），再跑旧 Worker 的生成领取。
+///
+/// 对账出错不阻断生成路径：记账旁路的问题不该让旧协议的执行停摆。生成路径的错误照旧向上报。
+struct WorkerRounds {
+    worker: WorkerService,
+    reconciliation: ExecutionReconciliationService,
+}
+
+impl WorkerRound for WorkerRounds {
+    async fn run_round(&self) -> Result<bool, ApplicationError> {
+        let reconciled = match self.reconciliation.run_once().await {
+            Ok(report) => report.did_work(),
+            Err(error) => {
+                tracing::error!(error = %error, "the reconciliation iteration failed");
+                false
+            }
+        };
+        let worked = self.worker.run_once().await?;
+        Ok(reconciled || worked)
+    }
 }
 
 /// 主循环等的终止信号 future。
@@ -191,8 +266,8 @@ struct ShutdownSignals {
 ///
 /// 停机输入当参数传进来，是为了让这条合同能在测试里**确定地**验：真信号没法在进程内精确投递，
 /// 而"什么时候停、停的时候在飞的那一轮怎么办"与信号从哪来无关。
-async fn run_until_shutdown(
-    worker: &WorkerService,
+async fn run_until_shutdown<R: WorkerRound + ?Sized>(
+    worker: &R,
     mut signals: ShutdownSignals,
     poll_interval: Duration,
 ) -> Result<()> {
@@ -203,7 +278,7 @@ async fn run_until_shutdown(
             info!("worker stopped");
             return Ok(());
         }
-        let iteration = worker.run_once();
+        let iteration = worker.run_round();
         tokio::pin!(iteration);
         let mut draining = false;
         let handled = loop {

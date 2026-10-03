@@ -1333,3 +1333,114 @@ async fn the_account_name_migration_deduplicates_names_and_adds_a_unique_index()
     let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
 }
+/// 同步网关最小事实（迁移 0031）必须在既有库上增量生效：协议版本、幂等摘要与请求指纹列、
+/// 执行所有权与 fencing、上游任务句柄与渠道容量事实表都在场，旧正文列对新协议放宽为可空，
+/// 两套协议的阶段取值都进 state 的 CHECK。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_database() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 先只应用 0031 之前的迁移，构造一个已经建过库的现场。
+    let staged = std::env::temp_dir().join(format!("seeai-gateway-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < "0031" {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy earlier migration");
+        }
+    }
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("earlier migrator")
+        .run(&pool)
+        .await
+        .expect("earlier migrations apply");
+
+    // 2) 再应用完整迁移集：0031 必须能在既有库上升上来。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the gateway migration must apply on an already-built database");
+
+    // 3) 最小事实列与渠道容量事实表在场。
+    let column_exists = |table: &'static str, column: &'static str| {
+        let pool = pool.clone();
+        async move {
+            let count: i64 = sqlx::query_scalar(
+                "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'generation' AND table_name = $1 AND column_name = $2",
+            )
+            .bind(table)
+            .bind(column)
+            .fetch_one(&pool)
+            .await
+            .expect("column probe");
+            count == 1
+        }
+    };
+    for column in [
+        "execution_protocol",
+        "idempotency_key_digest",
+        "idempotency_lookup_key_version",
+        "request_digest",
+        "request_digest_key_version",
+        "execution_owner",
+        "fencing_token",
+        "provider_task_handle",
+    ] {
+        assert!(column_exists("jobs", column).await, "缺失列 jobs.{column}");
+    }
+    let capacity_table: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'generation' AND table_name = 'execution_capacity'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("table probe");
+    assert_eq!(capacity_table, 1, "渠道容量事实表必须在场");
+
+    // 4) 新协议不写 native_parameters，该列必须对新协议可空。
+    let nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'generation' AND table_name = 'jobs' AND column_name = 'native_parameters'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("nullable probe");
+    assert_eq!(
+        nullable, "YES",
+        "新协议不写 native_parameters，该列必须可空"
+    );
+
+    // 5) 两套协议的阶段都进 state 的 CHECK。
+    let jobs_check: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'generation.jobs'::regclass AND conname = 'jobs_state_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("jobs state check");
+    for value in ["admitted", "executing"] {
+        assert!(jobs_check.contains(value), "jobs.state CHECK 缺 {value}");
+    }
+    let attempts_check: String = sqlx::query_scalar(
+        "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'generation.attempts'::regclass AND conname = 'attempts_state_check'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("attempts state check");
+    for value in ["prepared", "accepted", "terminal", "unknown"] {
+        assert!(
+            attempts_check.contains(value),
+            "attempts.state CHECK 缺 {value}"
+        );
+    }
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}

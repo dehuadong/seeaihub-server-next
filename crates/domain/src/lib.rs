@@ -6,9 +6,11 @@ use std::fmt::{Display, Formatter};
 use thiserror::Error;
 use uuid::Uuid;
 
+mod execution_protocol;
 mod image_parameters;
 mod parameter_mapping;
 mod size_spec;
+pub use execution_protocol::{AttemptStage, ExecutionProtocol, ExecutionStage, FencingToken};
 pub use image_parameters::{
     ImageInputs, ImageParameterKind, contract_image_parameter_kind, declared_parameter_names,
     declared_reference_image_limit, declares_mask_parameter, declares_reference_image_parameter,
@@ -1278,6 +1280,11 @@ pub struct GenerationJob {
 pub enum DomainError {
     #[error("invalid job transition from {from} to {to}")]
     InvalidStateTransition { from: JobState, to: JobState },
+    #[error("invalid execution stage transition from {from} to {to}")]
+    InvalidExecutionStageTransition {
+        from: ExecutionStage,
+        to: ExecutionStage,
+    },
     #[error("provider usage fields are inconsistent")]
     InconsistentUsage,
     #[error("arithmetic overflow")]

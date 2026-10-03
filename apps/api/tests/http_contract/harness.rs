@@ -8,7 +8,8 @@
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode};
 use seeai_application::{
-    AttemptFailure, HoldDisposition, HubRepository, ProviderFailureKind, PublicErrorCode,
+    AttemptFailure, DEFAULT_SETTLE_RESERVE_SECONDS, HoldDisposition, HubRepository,
+    ProviderFailureKind, PublicErrorCode,
 };
 use seeai_domain::{
     AccountId, AttemptId, JobId, ProviderCostFact, ProviderCostSource,
@@ -46,6 +47,8 @@ mod cases_cost_ceiling;
 mod cases_cost_facts;
 #[path = "cases_customer_history.rs"]
 mod cases_customer_history;
+#[path = "cases_direct_execution.rs"]
+mod cases_direct_execution;
 #[path = "cases_funds.rs"]
 mod cases_funds;
 #[path = "cases_identity.rs"]
@@ -75,6 +78,14 @@ mod harness_check;
 
 /// 客户历史游标密钥（32 字节的 base64）：**必须配**，缺了 API 进程起不来，所以夹具给一份固定的。
 const CONTRACT_CURSOR_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+
+/// 直接执行要的摘要密钥（32 字节 base64）：幂等 lookup 与请求指纹各一份。
+///
+/// 夹具里只是让进程起得来、让摘要可复现；真实部署的密钥来自环境变量，不进仓库。
+const CONTRACT_LOOKUP_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
+const CONTRACT_FINGERPRINT_KEY: &str = "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
+/// 直接执行时渠道凭证的假值：只在本机假上游上用过，不写配置、日志或响应。
+const CONTRACT_PROVIDER_KEY: &str = "contract-test-key";
 
 /// 一个最小合法 PNG（1×1），用作假上游返回的结果图，也用作调用方传的参考图。
 const PNG_FIXTURE: &[u8] = &[
@@ -156,6 +167,8 @@ struct UpstreamBehaviour {
     ///
     /// 这是"上游明明给了金额、这次却没出图"的形态：用来观察那笔成本会不会丢。
     terminal_without_images: bool,
+    /// 生成请求应答前的延迟（毫秒）：把一次执行留在在飞状态，观察同键重放与期限。
+    delay_ms: u64,
 }
 
 impl UpstreamBehaviour {
@@ -173,6 +186,7 @@ impl UpstreamBehaviour {
             sync_image: SyncImageShape::Url,
             declared_cost: Some(json!(0.011354)),
             terminal_without_images: false,
+            delay_ms: 0,
         }
     }
 
@@ -317,6 +331,14 @@ async fn serve_fake_upstream(
             )
             .await;
         }
+    }
+
+    // 用例要观察"执行还在飞"时，先把这次生成请求压住。
+    if behaviour.delay_ms > 0
+        && method == "POST"
+        && (path.ends_with("/images/generations") || path.ends_with("/images/edits"))
+    {
+        tokio::time::sleep(Duration::from_millis(behaviour.delay_ms)).await;
     }
 
     // 同步渠道（AIHubMix）：`/v1/images/generations` 与 `/v1/images/edits` 都在同一个响应里
@@ -882,6 +904,13 @@ struct ApiProcessSettings {
     admin_credentials: Option<(String, String)>,
     /// 会话有效期（秒）：用例要验"过期凭据被拒"时把它压到等得起的量级。
     session_ttl_seconds: Option<u64>,
+    /// 开着时两条图片入口走进程内直接执行，并配上摘要密钥与渠道凭证的假值；不启 Worker 也能出图。
+    direct_execution: bool,
+    /// 结算预留 R（秒）：直接执行的总期限 D 减去它才是上游预算。缺省取应用层的
+    /// [`DEFAULT_SETTLE_RESERVE_SECONDS`]，不在这里另写一个数。
+    settle_reserve_seconds: Option<u64>,
+    /// 正文慢读期限（秒）：用例要观察"滴流慢读被 408 收口"时把它压到等得起的量级。
+    slow_read_timeout_seconds: Option<u64>,
 }
 
 /// 一次用例的全部进程配置：API 进程那一套、发布时的修订级加价系数、以及 Worker 的重投策略。
@@ -1019,6 +1048,24 @@ async fn start_api_with(
         }
         if let Some(seconds) = settings.session_ttl_seconds {
             command.env("SESSION_TTL_SECONDS", seconds.to_string());
+        }
+        if settings.direct_execution {
+            command
+                .env("GENERATION_DIRECT_EXECUTION", "true")
+                .env(
+                    "GENERATION_SETTLE_RESERVE_SECONDS",
+                    settings
+                        .settle_reserve_seconds
+                        .unwrap_or(DEFAULT_SETTLE_RESERVE_SECONDS)
+                        .to_string(),
+                )
+                .env("IDEMPOTENCY_LOOKUP_KEY", CONTRACT_LOOKUP_KEY)
+                .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
+                .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
+                .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY);
+            if let Some(seconds) = settings.slow_read_timeout_seconds {
+                command.env("GENERATION_SLOW_READ_TIMEOUT_SECONDS", seconds.to_string());
+            }
         }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
@@ -1467,6 +1514,74 @@ impl Harness {
                 },
                 ..CaseSettings::default()
             },
+        )
+        .await
+    }
+
+    /// 起一个开着**直接执行**的 API：不跑 Worker，图片入口在进程内直连假上游。
+    ///
+    /// sync_wait_seconds 是总期限 D，配置里的结算预留 R 由 ApiProcessSettings 给；上游预算因此
+    /// 是 D 减 R。用例不启 Worker，走的正是"API 自己执行、不读 Job、不轮询结果"那条路。
+    async fn start_direct(
+        draft: Value,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+    ) -> Self {
+        Self::build(
+            draft,
+            None,
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
+            CaseSettings {
+                api: ApiProcessSettings {
+                    direct_execution: true,
+                    ..ApiProcessSettings::default()
+                },
+                ..CaseSettings::default()
+            },
+        )
+        .await
+    }
+
+    /// 同 [`Self::start_direct`]，但允许用例覆盖进程配置（例如把慢读期限压短）。
+    async fn start_direct_with(
+        draft: Value,
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+        api: ApiProcessSettings,
+    ) -> Self {
+        Self::build(
+            draft,
+            None,
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
+            CaseSettings {
+                api,
+                ..CaseSettings::default()
+            },
+        )
+        .await
+    }
+
+    /// 直接执行 + AIHubMix 同步渠道的默认候选：A1 的最小闭环就用它。
+    async fn start_direct_aihubmix(
+        behaviour: UpstreamBehaviour,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+    ) -> Self {
+        Self::start_direct(
+            candidate(
+                "AIHubMix",
+                "aihubmix-image-v1",
+                &["prompt_only", "image_conditioned", "masked"],
+            ),
+            behaviour,
+            max_concurrent_jobs,
+            sync_wait_seconds,
         )
         .await
     }

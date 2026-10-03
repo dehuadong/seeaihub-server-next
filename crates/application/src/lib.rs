@@ -1,24 +1,24 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, ImageAdapter, PreparedImageRequest, ProviderCost,
-    ProviderCredential, ProviderSuccess, RetrySafety,
+    AdapterDescriptor, AdapterError, GatewayAdapter, ImageAdapter, PreparedImageRequest,
+    ProviderCost, ProviderCredential, ProviderSuccess, RetrySafety,
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AttemptId, ChannelId, ChargeFacts, ConsumerRatesCny, CostBasis,
-    CreateImageGeneration, FloorTable, FxRate, GenerationJob, HoldSource, ImageBranch,
-    ImageParameterKind, JobId, JobState, LedgerEntry, LedgerEntryKind, MeteringEvidence,
-    OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula,
-    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
-    RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, apply_enum_maps,
-    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
-    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
-    declared_field_names, declared_parameter_names, declared_reference_image_limit,
-    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
-    declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
-    place_image_inputs, platform_image_parameters, resolve_size_tier, unit_amount_microusd,
-    wire_parameter_name,
+    AccountId, AttemptId, AttemptStage, ChannelId, ChargeFacts, ConsumerRatesCny, CostBasis,
+    CreateImageGeneration, ExecutionStage, FencingToken, FloorTable, FxRate, GenerationJob,
+    HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, LedgerEntry, LedgerEntryKind,
+    MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot,
+    PricingFormula, ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering,
+    PublishedRevision, RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, VendorModelId,
+    apply_enum_maps, apply_parameter_defaults, apply_parameter_renames, apply_size_mapping,
+    carries_parameter, contract_image_parameter_kind, contract_model_identity, declared_defaults,
+    declared_enum_maps, declared_field_names, declared_parameter_names,
+    declared_reference_image_limit, declared_renames, declared_size_mapping,
+    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
+    is_used_parameter_value, literal_parameter_text, place_image_inputs, platform_image_parameters,
+    resolve_size_tier, unit_amount_microusd, wire_parameter_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -64,6 +64,36 @@ pub use retry::{DEFAULT_BACKOFF_BASE_MS, DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECON
 
 mod cost_ceiling;
 pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
+
+mod request_fingerprint;
+pub use request_fingerprint::{
+    FINGERPRINT_KEY_LEN, FingerprintKeys, RequestFingerprintInput, idempotency_key_digest,
+};
+
+mod direct_execution;
+pub use direct_execution::{
+    DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_SETTLE_RESERVE_SECONDS, DirectExecutionCall,
+    DirectExecutionError, DirectExecutionRequest, DirectExecutionService, DirectExecutionSuccess,
+    ExecutionOwnershipRegistrar, SupervisedExecutionContext, failure_disposition_for,
+    settle_reserve_from_env,
+};
+
+mod execution_reconciliation;
+pub use execution_reconciliation::{
+    ExecutionReconciliationService, ReconciliationPolicy, ReconciliationReport,
+};
+
+/// 直接执行的两个容量名额与平台兜底保底额：运营取值，随调用传入，本用例只在同一个事务里
+/// 按它判定，不在库层另存一份会与调用方漂移的限额（RFC 0017 §6）。
+#[derive(Debug, Clone, Copy)]
+pub struct DirectExecutionLimits {
+    /// 该账户同时允许的在飞执行数。
+    pub max_account_in_flight: u64,
+    /// 该渠道全局允许的未决任务数。
+    pub max_channel_in_flight: u64,
+    /// 候选没有发布保底表时的平台兜底保底额（CNY 微单位）。
+    pub default_hold_microusd: u64,
+}
 
 pub mod account_name;
 mod history_cursor;
@@ -1577,6 +1607,331 @@ pub struct UnacceptedAttempt {
     pub next_attempt_at: DateTime<Utc>,
 }
 
+/// 新协议受理时冻结的**供给身份**。
+///
+/// 只含执行与账务需要的最小事实：没有承载面、参数映射、限制，也没有任何请求参数值——
+/// 那些是执行期内存里的东西，不进新协议的持久记录（Spec 0005 §2，RFC 0017 §3）。
+#[derive(Debug, Clone)]
+pub struct AdmitOffering {
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub vendor_model_id: VendorModelId,
+    pub offering_id: OfferingId,
+    pub channel_id: ChannelId,
+    /// 对客模型名，落 Job 的 gateway_model。
+    pub gateway_model: String,
+    pub adapter_key: String,
+    pub provider_model_id: String,
+    /// 受理时冻结的渠道入口。
+    pub base_url: String,
+    /// 渠道凭证的**环境变量名**，不是凭证本身：凭证明文不进记录。
+    pub credential_env: String,
+}
+
+/// 新协议原子受理的命令：账户、冻结身份与摘要，**不含任何业务载荷**。
+///
+/// 请求正文、参考图、mask、结果信封不在这里，也不在同事务写入的 Job 上（Spec 0005 §2）。
+/// 两个容量名额是运营取值、随调用传入：本端口只负责在同一个事务里按它判定，不在库层另存一份
+/// 会与调用方漂移的限额（限额本身的归属见 RFC 0017 §6，尚未由切片定义）。
+#[derive(Debug, Clone)]
+pub struct AdmitExecution {
+    pub account_id: AccountId,
+    pub branch: ImageBranch,
+    pub offering: AdmitOffering,
+    /// 受理时冻结的定价快照，含本次保底额、保底来源与汇率。
+    pub price_snapshot: PriceSnapshot,
+    pub routing: RoutingDecision,
+    /// 幂等键的不可逆标识（稳定 lookup 密钥）与它的版本。
+    pub idempotency_key_digest: String,
+    pub idempotency_lookup_key_version: i16,
+    /// 请求指纹与指纹密钥版本。
+    pub request_digest: String,
+    pub request_digest_key_version: i16,
+    /// 本次预授权额（保底额，CNY 微单位），由定价侧算定并随快照冻结。
+    pub max_cost_microusd: u64,
+    /// 该账户同时允许的在飞执行数。
+    pub max_account_in_flight: u64,
+    /// 该渠道全局允许的未决任务数。
+    pub max_channel_in_flight: u64,
+}
+
+/// 一次新协议受理落库后的最小 Job 投影。
+///
+/// 它不是旧协议那条 GenerationJob：没有请求参数、没有结果信封，也不回明文幂等键。
+#[derive(Debug, Clone)]
+pub struct AdmittedJob {
+    pub job_id: JobId,
+    pub account_id: AccountId,
+    pub stage: ExecutionStage,
+    pub branch: ImageBranch,
+    pub offering_id: OfferingId,
+    pub channel_id: ChannelId,
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub fencing_token: FencingToken,
+    pub max_cost_microusd: u64,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 幂等重放时按原记录给出的只读投影（重复调用合同见 Spec 0005 §4）。
+#[derive(Debug, Clone)]
+pub struct ExecutionReplay {
+    pub job_id: JobId,
+    pub stage: ExecutionStage,
+    /// 原记录写下的对客错误码；处理中或成功时为 None。
+    pub error_code: Option<String>,
+    pub created_at: DateTime<Utc>,
+    pub updated_at: DateTime<Utc>,
+}
+
+/// 一台过期 v1 执行被接管后的只读投影：Worker 只按它做只读查询与收尾。
+///
+/// 它只带最小执行事实（身份、当前 Attempt 与任务句柄、适配器与凭证引用、冻结价格与账户），
+/// 不含请求正文、结果图片或渠道响应；`fencing_token` 是**本次接管后**的新 token。
+#[derive(Debug, Clone)]
+pub struct TakenOverExecution {
+    pub job_id: JobId,
+    /// 接管前的 Job 阶段（executing 或 reconciliation_required），用来判断这次建案是不是新的
+    /// 平台侧事件。
+    pub stage: ExecutionStage,
+    /// 当前 Attempt（同一台 Job 内最新的那次），没有 Attempt 时为 None。
+    pub attempt_id: Option<AttemptId>,
+    pub attempt_state: Option<AttemptStage>,
+    /// 该 Job 未结对账案例上的只读查询排期：已发起的查询次数与下次允许查询的时刻。
+    ///
+    /// 没有未结案例（例如仍在 executing、还没建案）时是 0 / None——那种执行的查询间隔由
+    /// 所有权租约本身给出。达到自动查询上限的案例不会出现在接管结果里。
+    pub query_attempts: u32,
+    pub next_query_at: Option<DateTime<Utc>>,
+    /// 上游任务句柄；任务式渠道才有。
+    pub provider_task_handle: Option<String>,
+    pub provider_trace_id: Option<String>,
+    pub adapter_key: String,
+    pub base_url: String,
+    pub credential_env: String,
+    /// 渠道类别：**读时 join 渠道表**，不新增冻结列（用于 v1 告警）。
+    pub provider_kind: String,
+    pub price_snapshot: PriceSnapshot,
+    pub account_id: AccountId,
+    /// 接管后的新 fencing token；旧所有者凭旧 token 的提交与收尾从此冲突。
+    pub fencing_token: FencingToken,
+}
+
+/// ExecutionRepository::admit 的结果：新建了受理，或命中同键的既有记录。
+#[derive(Debug, Clone)]
+pub enum AdmitOutcome {
+    /// 新建：最小 Job、Hold 与容量事实已同事务提交；余额是预授权扣减之后的值。
+    Admitted {
+        job: AdmittedJob,
+        balance: BalanceChange,
+    },
+    /// 同键同指纹的重放：**不新建、不占用**，只回原记录的投影。
+    Replayed(ExecutionReplay),
+}
+
+/// `begin_submission` 的命令：执行身份、fencing token 与绝对总期限，**不含业务载荷**。
+///
+/// 它对应 RFC 0017 §3 的提交声明：先持久化这次 Attempt 的提交状态，再发出可能产生费用的外部
+/// 请求。请求正文、参考图与结果信封都不经过这里（Spec 0005 §2）。
+#[derive(Debug, Clone)]
+pub struct BeginSubmission {
+    pub job_id: JobId,
+    /// 调用方（API Supervisor）的执行所有权标识；库为空时本次认领，已属他人时冲突。
+    pub execution_owner: String,
+    /// 受理时发给调用方的 fencing token；不匹配说明所有权已被接管。
+    pub fencing_token: FencingToken,
+    /// 本次执行的绝对总期限；数据库时钟到点即拒绝开始，不静默继续。
+    pub deadline: DateTime<Utc>,
+    /// 本次执行所有权的租约时长：`begin_submission` 把它落成 `lease_expires_at`，
+    /// 续约按同一时长延期。
+    pub lease: ChronoDuration,
+}
+
+/// `begin_submission` 落库后的本次 Attempt 标识：提交、接受与收尾都用它。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SubmissionStarted {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    /// 同一台 Job 内的第几次执行，从 1 起（与旧协议同名同义）。
+    pub attempt_no: u32,
+}
+
+/// `record_acceptance` 的命令：可信 task/trace 标识与执行身份，**不含请求或响应正文**。
+///
+/// `provider_task_handle` 落 Job（任务式上游的 task id，供后续只读查询），
+/// `provider_trace_id` 落本次 Attempt（逐请求标识，供人工对账）；同步渠道没有可恢复句柄时都可为空。
+#[derive(Debug, Clone)]
+pub struct RecordAcceptance {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub execution_owner: String,
+    pub fencing_token: FencingToken,
+    pub provider_task_handle: Option<String>,
+    pub provider_trace_id: Option<String>,
+}
+
+/// `settle` 的命令：执行身份、fencing token 与**强类型账务事实**，不含任何业务载荷。
+///
+/// 计量证据与成本事实是上游给出的有界事实（Spec 0005 §2）；结果信封、原始响应与图片不经过这里。
+/// `charge_microusd` 是按冻结快照算出的实收（CNY 微单位），可以高于保底额——透支在结算吸收。
+#[derive(Debug, Clone)]
+pub struct SettleExecution {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub execution_owner: String,
+    pub fencing_token: FencingToken,
+    /// 有效计量证据；它的 `attempt_id` 必须就是本次 Attempt，否则不做正式结算（ADR 0006）。
+    pub evidence: MeteringEvidence,
+    /// 这次执行看到的成本事实（成本平面，原币种）。它只进毛利口径，不改对客金额。
+    pub provider_cost: ProviderCostFact,
+    /// 按冻结快照算出的实收（CNY 微单位）。
+    pub charge_microusd: u64,
+    /// 上游逐请求标识；写入 Attempt 供人工对账。
+    pub provider_trace_id: Option<String>,
+}
+
+/// 一次新协议收尾的**已提交结果**：`settle` 的返回与 `read_finalization` 的确认共用。
+///
+/// `stage` 是 Job 落库的阶段；`charge_microusd` 是账本上已提交的实收——成功是 `capture` 的金额，
+/// 失败与对账为 0。提交结果未知时先拿它确认，再决定是否重试同一幂等收尾（RFC 0017 §3）。
+#[derive(Debug, Clone)]
+pub struct ExecutionFinalization {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub stage: ExecutionStage,
+    pub charge_microusd: u64,
+}
+
+/// `fail_or_reconcile` 的失败处置，决定 Job 终态与占用、容量是否释放。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FailureDisposition {
+    /// 确定失败：释放占用与渠道容量，Job 落 failed、Attempt 落 terminal。
+    DeterminedFailure,
+    /// 可证明未受理的中间失败：记录本次 Attempt、保留占用与容量，Job 保持 executing，可重试同一候选。
+    SafeRetry,
+    /// 受理或结果不确定：保留占用与容量，Job 落 reconciliation_required、Attempt 落 unknown，并建对账案例。
+    Unknown,
+}
+
+/// `fail_or_reconcile` 的命令：执行身份、fencing token、**有界失败分类**与处置。
+///
+/// 分类只收平台自己的对客码与渠道类别，不收渠道原文或原始错误正文（Spec 0005 §2）。
+/// 用 [`FailOrReconcileExecution::for_failure`] 构造：对客码由渠道类别与处置按唯一派生规则算出
+/// （ADR-0017 的规则在应用层，基础设施只执行结论、不重判一遍）。
+#[derive(Debug, Clone)]
+pub struct FailOrReconcileExecution {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    pub execution_owner: String,
+    pub fencing_token: FencingToken,
+    /// 对客平台错误码（三个白名单码之一）：由 `for_failure` 派生，不要手填。
+    pub error_code: PublicErrorCode,
+    /// 平台侧失败类别。
+    pub failure_kind: ProviderFailureKind,
+    /// 这次执行看到的成本事实或成本缺口：`Some(unavailable)` 是"本该有金额却拿不到"，
+    /// `None` 是"请求根本没交到渠道，没采过"——两者在成本缺口清单里的处置不同。
+    pub provider_cost: Option<ProviderCostFact>,
+    pub disposition: FailureDisposition,
+    /// 上游逐请求标识；没有可信标识时为空。
+    pub provider_trace_id: Option<String>,
+}
+
+impl FailOrReconcileExecution {
+    /// 唯一构造入口：对客码按渠道类别与处置派生，保证与 ADR-0017 的规则一致。
+    #[must_use]
+    #[allow(clippy::too_many_arguments)]
+    pub fn for_failure(
+        job_id: JobId,
+        attempt_id: AttemptId,
+        execution_owner: String,
+        fencing_token: FencingToken,
+        failure_kind: ProviderFailureKind,
+        disposition: FailureDisposition,
+        provider_cost: Option<ProviderCostFact>,
+        provider_trace_id: Option<String>,
+    ) -> Self {
+        Self {
+            job_id,
+            attempt_id,
+            execution_owner,
+            fencing_token,
+            error_code: public_error_code_for_disposition(failure_kind, disposition),
+            failure_kind,
+            provider_cost,
+            disposition,
+            provider_trace_id,
+        }
+    }
+}
+
+/// 新协议处置 → 对客码：把它译成既有 public_error_code 的输入，复用同一条唯一派生规则
+/// （ADR-0017），不在这里另写一份映射。
+#[must_use]
+pub fn public_error_code_for_disposition(
+    kind: ProviderFailureKind,
+    disposition: FailureDisposition,
+) -> PublicErrorCode {
+    let retry_safety = match disposition {
+        FailureDisposition::Unknown => RetrySafety::AcceptanceUnknown,
+        FailureDisposition::DeterminedFailure | FailureDisposition::SafeRetry => {
+            RetrySafety::NotRetryable
+        }
+    };
+    public_error_code(kind, retry_safety)
+}
+
+/// 晚到事实：原提交者在执行 token 可能已失效后交付的**有界** task handle 或账务事实。
+///
+/// 它不能改所有权、重开终态或直接结算——收尾由当前所有者按现有端口完成。字段只含 Spec 0005 §2
+/// 允许的最小事实，不含渠道正文、结果图片或任意请求参数。
+#[derive(Debug, Clone)]
+pub struct LateFacts {
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    /// 上游任务句柄；任务式渠道才有。
+    pub provider_task_handle: Option<String>,
+    /// 上游逐请求标识。
+    pub provider_trace_id: Option<String>,
+    /// 上游实际产出的图片张数；调用方拿不到时为空。
+    ///
+    /// 按张计价的成本或对客价靠它才算得出：缺它时按缺口处理，不拿 token 数或请求的 `n` 顶替。
+    pub image_count: Option<u32>,
+    /// 计量证据（自带 Attempt 关联）。
+    pub evidence: Option<MeteringEvidence>,
+    /// 成本事实或成本缺口。
+    pub provider_cost: Option<ProviderCostFact>,
+}
+
+/// 晚到事实的收件结果。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LateFactsOutcome {
+    /// 已收下；与既有收件内容相同的重复交付也走这里，不重复写。
+    Received,
+    /// 同一 Attempt 同一形态已有不同内容：建对账案例，不改原收件。
+    Conflicted,
+    /// 关联不上（Job 不是 v1、Attempt 不属于该 Job、或没有可收的有界事实）：不收件，也不改任何状态。
+    Ignored,
+}
+
+/// 领取到的一行晚到事实：Worker 按它核验并走现有收尾端口，消费成功后再调
+/// [`ExecutionRepository::mark_late_fact_consumed`]。
+#[derive(Debug, Clone)]
+pub struct ClaimedLateFact {
+    /// 收件行标识，mark 时用它。
+    pub id: Uuid,
+    pub job_id: JobId,
+    pub attempt_id: AttemptId,
+    /// 收件形态：`task_handle` 或 `accounting`。
+    pub kind: String,
+    pub provider_task_handle: Option<String>,
+    pub provider_trace_id: Option<String>,
+    /// 收件行记下的产出图片张数；收件形态不包含它时为 None。
+    pub image_count: Option<u32>,
+    /// 计量证据（自带 Attempt 关联）；收件形态不包含它时为 None。
+    pub evidence: Option<MeteringEvidence>,
+    /// 成本事实或成本缺口；收件形态不包含它时为 None。
+    pub provider_cost: Option<ProviderCostFact>,
+}
+
 /// 待录入的一行折算率：`effective_at` 为 `None` 表示"立即生效"，**由数据库盖章**。
 ///
 /// 它与 [`FxRate`] 回答的不是同一个问题：[`FxRate`] 是"库里那一行已生效的折算率"（读出来带着
@@ -1992,6 +2347,19 @@ pub enum ApplicationError {
     InsufficientBalance,
     #[error("too many requests in flight")]
     TooManyInFlight,
+    /// 渠道全局未决任务已经到上限。
+    ///
+    /// 与 TooManyInFlight 分开：那个是**这个账户**同时在跑的太多（对客 429），这个是
+    /// **这条渠道**全局已满——换一个账户、换一把密钥也进不来，对客必须说成平台侧不可用
+    /// （Spec 0005 §3）。渠道槽位只在确定终态或可信人工处置时释放，租约过期不算。
+    #[error("channel capacity exhausted")]
+    PlatformCapacityExhausted,
+    /// 数据库时钟已到本次执行的绝对总期限：提交声明落库前就不再有执行授权。
+    ///
+    /// 与 [Self::Conflict] 分开：那个是执行身份或所有权不成立，这个是期限事实——能确认没有发出
+    /// 生成请求，调用方要按“确定未提交”返回 504 request_timeout（Spec 0005 §4、RFC 0017 §6）。
+    #[error("execution deadline exceeded")]
+    ExecutionDeadlineExceeded,
     /// 这把密钥在当前窗口内已经用满每分钟请求数。
     ///
     /// 与 [`Self::TooManyInFlight`] 分成两个错误：那个是"上一个还没跑完"，等一会儿重发同一个请求
@@ -2733,6 +3101,176 @@ pub trait HubRepository: Send + Sync {
 
     /// 列客户（按创建时间倒序，最近 `limit` 条）。
     async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError>;
+}
+
+/// 新协议（execution_protocol = v1）的执行事实端口。
+///
+/// 与 HubRepository 分开，而不是把方法挂进那一条：旧协议路径（API 建 Job、Worker 领取执行、
+/// 正文与结果落库）保持原样，新端口只接最小事实与摘要，SQL 输入类型里没有图片、也没有
+/// serde_json::Value 请求正文（Spec 0005 §2，RFC 0017 §3）。每个操作是一个事务边界，
+/// 实现不得在事务里跨 Provider 等待，也不得把业务载荷带进端口参数。
+#[async_trait]
+pub trait ExecutionRepository: Send + Sync {
+    /// 原子受理：账户与键唯一性、资金最终检查、账户在飞名额与 Channel 全局容量检查、最小 Job、
+    /// Hold 与容量事实**同事务**提交。
+    ///
+    /// 同账户同 idempotency_key_digest 已存在时走幂等重放：只按原记录做只读投影，不新建、
+    /// 不再占用。既有记录的请求指纹（连同它的密钥版本）与这次不一致时返回
+    /// ApplicationError::Conflict——不覆盖原记录，也不把它当成一次新受理。
+    ///
+    /// 保底额可以为零（账户资金 Spec v4 §2.1）：零元预授权在可用额非负时放行，可用额为负时
+    /// 仍按资金闸门拒绝。失败：余额不足返回 ApplicationError::InsufficientBalance；
+    /// 账户名额已满返回 ApplicationError::TooManyInFlight；
+    /// 渠道全局容量已满返回 ApplicationError::PlatformCapacityExhausted。
+    async fn admit(&self, command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError>;
+
+    /// 持久化提交声明：锁定 Job，核验未终结、执行所有权、fencing token、总期限与当前 Attempt，
+    /// 写 Job 为 executing 并落一行 submitting 的 Attempt——提交成功后调用方才可发出外部请求。
+    ///
+    /// 返回的 Attempt 标识是提交、接受与收尾共用的身份；attempt_no 与旧协议同义（同一台 Job
+    /// 内从 1 起），由本次写入在 Job 行锁内定号，并发提交不会拿到同一个号。
+    ///
+    /// 失败：Job 不存在返回 ApplicationError::NotFound；已终态、已在 reconciliation_required、
+    /// 执行所有权已属别的调用方、fencing token 不匹配、已有未收尾的 Attempt
+    /// （submitting/accepted/unknown）返回 ApplicationError::Conflict；数据库时钟已到 deadline
+    /// 返回 ApplicationError::ExecutionDeadlineExceeded，且不写任何行。
+    async fn begin_submission(
+        &self,
+        command: BeginSubmission,
+    ) -> Result<SubmissionStarted, ApplicationError>;
+
+    /// 上游已受理：给**同一个 Attempt** 落可信 task/trace 标识并置 accepted，只有成功入库才
+    /// 允许后续按句柄查询。Job 保持 executing。
+    ///
+    /// 同一 Attempt 用同一组事实重复调用是幂等的（返回 Ok、不重复写）；出现不同事实返回
+    /// ApplicationError::Conflict，不覆盖原事实；Attempt 不属于该 Job、不在 submitting/accepted、
+    /// Job 已不是 executing、所有权或 fencing token 不匹配时同样冲突。
+    async fn record_acceptance(&self, command: RecordAcceptance) -> Result<(), ApplicationError>;
+
+    /// 原子结算：锁定 Job → Hold → 账户，核验执行所有权、fencing token、Attempt 归属与证据 Attempt，
+    /// 把 Attempt 写成 terminal 并落计量证据与成本事实，Job 写成 succeeded 并盖 `terminal_at`，
+    /// capture 预授权，按实收减少余额、按预授权额去掉占用，实收大于零时写 `capture` 流水与每日合计，
+    /// 并在同一事务释放该 Job 的渠道容量槽位（RFC 0017 §3、§6）。
+    ///
+    /// 没有有效计量证据不做正式结算：证据的 `attempt_id` 必须与本次 Attempt 一致，否则拒绝
+    /// （ADR 0006）。同一 Attempt 同事实重复调用返回已提交结果且不重复扣费；同 Attempt 冲突证据
+    /// 建对账案例、不覆盖原结果，返回的仍是原已提交结果。事务失败不留下部分写入。
+    ///
+    /// 失败：Job 或 Attempt 不存在、Attempt 不属于该 Job、所有权或 fencing token 不匹配、Job 不是
+    /// v1 记录、以及 Job 已是 failed 等不可重开的终态时返回 ApplicationError::Conflict。
+    /// `reconciliation_required` 允许晚到证据收成成功。
+    async fn settle(
+        &self,
+        command: SettleExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError>;
+
+    /// 原子失败或转对账：锁定 Job，核验所有权、fencing token 与 Attempt 归属，落有界失败分类与成本
+    /// 事实，按处置写 Job 与 Attempt。确定失败（释放占用）把 Job 写成 failed、Attempt 写成 terminal，
+    /// 释放 Hold、按预授权额去掉占用与渠道容量槽位；结果未知（保留占用）把 Job 写成
+    /// reconciliation_required、Attempt 写成 unknown，保留 Hold 与槽位并建对账案例（RFC 0017 §3、§5）。
+    ///
+    /// 渠道原文与原始错误正文不经过这里：分类只收平台错误码与渠道类别（Spec 0005 §2）。同一处置重复
+    /// 调用幂等，不再释放、不再记成本；换了处置返回 ApplicationError::Conflict。
+    async fn fail_or_reconcile(
+        &self,
+        command: FailOrReconcileExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError>;
+
+    /// 只读确认某次收尾是否已提交：已提交返回当时的 Job 阶段与账本实收，未提交返回 `None`。
+    ///
+    /// 提交结果未知（连接断开、COMMIT 确认丢失）时先确认再决定是否重试同一幂等收尾，不先假定失败
+    /// （RFC 0017 §3）。它不修改任何行。
+    async fn read_finalization(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+    ) -> Result<Option<ExecutionFinalization>, ApplicationError>;
+
+    /// 收下**晚到事实**：原提交者在执行 token 可能已失效后仍可交付有界 task handle 或计量/成本事实。
+    ///
+    /// 只写最小收件行，不改所有权、不重开终态、不直接结算；当前收尾者另行领取并按现有端口处理。
+    /// 重复事实幂等（同 Attempt 同形态同内容只收一次），冲突事实建对账案例且不覆盖；关联不上时忽略。
+    async fn offer_late_facts(
+        &self,
+        facts: LateFacts,
+    ) -> Result<LateFactsOutcome, ApplicationError>;
+
+    /// 续约一台 v1 执行的所有权：同一所有者名下只把租约推到 `now() + lease`，**不改 fencing token**。
+    ///
+    /// 只有 `execution_owner` 与 `fencing_token` 都与库里一致、Job 仍是 v1 的
+    /// executing/reconciliation_required 才续约；否则（已终态、所有权已属他人、token 已被接管、
+    /// 不是 v1 记录）返回 ApplicationError::Conflict，调用方据此立即取消该执行。它不写 Attempt、不改状态。
+    async fn renew_execution_ownership(
+        &self,
+        job_id: JobId,
+        execution_owner: &str,
+        fencing_token: FencingToken,
+        lease: ChronoDuration,
+    ) -> Result<(), ApplicationError>;
+
+    /// 领取过期所有权：在一条 `FOR UPDATE SKIP LOCKED` 语句里比较并交换一批 v1 执行的所有权，
+    /// **只有接管把 fencing_token 加一**，并续上 `lease`；返回只读投影。
+    ///
+    /// 硬过滤 `execution_protocol = 'v1'` 且状态为 executing/reconciliation_required；租约为空或已过期
+    /// 才算过期。已终结与 legacy 记录不会被领走。返回的 `fencing_token` 是接管后的新值，旧所有者
+    /// 凭旧 token 的提交与收尾一律冲突。最多返回 `limit` 条。
+    ///
+    /// 查询排期在**同一条语句**里守门（RFC 0017 §5）：该 Job 有未结对账案例且
+    /// `next_query_at` 未到、或 `attempts` 已达 `max_query_attempts` 时不领走——
+    /// 没到点的记录本轮跳过，额度用尽的记录转人工，不再被自动接管。
+    async fn takeover_expired_executions(
+        &self,
+        worker_id: &str,
+        lease: ChronoDuration,
+        limit: u32,
+        max_query_attempts: u32,
+    ) -> Result<Vec<TakenOverExecution>, ApplicationError>;
+
+    /// 回收超龄的未提交孤儿：v1 的 admitted、没有任何 Attempt、受理时间早于 `now() - max_age`。
+    ///
+    /// 这些执行从未写下提交声明，确定没有外部副作用：落 failed 并释放它的 Hold 与渠道槽位。
+    /// 不写对客错误码（没有对客结论，也没有重开路径）。返回回收条数，最多 `limit` 条。
+    async fn reap_unsubmitted_admissions(
+        &self,
+        max_age: ChronoDuration,
+        limit: u32,
+    ) -> Result<u64, ApplicationError>;
+
+    /// 短事务领取未消费的晚到事实：`SKIP LOCKED` + `claimed_by/claimed_at`，领取超过 `claim_ttl`
+    /// 的行可被另一领取者覆盖。领取不等于消费——`consumed_at` 只在消费成功后由
+    /// [`Self::mark_late_fact_consumed`] 写下。
+    async fn claim_unconsumed_late_facts(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        claim_ttl: ChronoDuration,
+    ) -> Result<Vec<ClaimedLateFact>, ApplicationError>;
+
+    /// 标记一行晚到事实已消费；返回是否由本次调用写下（重复调用或行不存在返回 false）。
+    async fn mark_late_fact_consumed(&self, id: Uuid) -> Result<bool, ApplicationError>;
+
+    /// 记一次只读对账查询：把该 Job 未结对账案例的 `attempts` 加一，并把 `next_query_at` 推到
+    /// `now() + backoff`（RFC 0017 §5 的退避）。没有未结案例时返回 `None`、不新建案例——
+    /// 那种执行（例如仍在 executing）的查询间隔由所有权租约本身给出。
+    ///
+    /// 返回加一之后的 `attempts`，调用方据此判断自动查询额度是否用尽。接管已经把到上限的案例
+    /// 过滤掉了，所以这里不会把 `attempts` 推过上限。
+    async fn record_reconciliation_query_attempt(
+        &self,
+        job_id: JobId,
+        backoff: ChronoDuration,
+    ) -> Result<Option<u32>, ApplicationError>;
+
+    /// 把晚到成本补到**已经收尾**的 Attempt 上，不重开终态、不改任何状态或对客金额。
+    ///
+    /// 只在原本没有成本事实（四列为空）或来源是 `unavailable` 时写入：已经有的真实成本事实
+    /// 不被覆盖，也不会把真实成本降成 `unavailable`。返回是否写下（不符合条件时不动）。
+    async fn record_terminal_provider_cost(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+        cost: &ProviderCostFact,
+    ) -> Result<bool, ApplicationError>;
 }
 
 /// 平台侧失败清单不传类别时的默认集合：只列**平台侧事件**。
@@ -4568,6 +5106,20 @@ pub trait AdapterFactory: Send + Sync {
         base_url: &str,
         timeout: Duration,
     ) -> Result<Arc<dyn ImageAdapter>, ApplicationError>;
+
+    /// 新协议（同步网关）的 Driver 装配：与 [`AdapterFactory::create`] 同一族 Driver，接口换成
+    /// [`GatewayAdapter`]。默认明确不支持——只有实现了同步网关协议的 adapter 才覆盖它，旧 Worker
+    /// 路径继续只用 [`AdapterFactory::create`]。
+    fn create_gateway(
+        &self,
+        adapter_key: &str,
+        _base_url: &str,
+        _timeout: Duration,
+    ) -> Result<Arc<dyn GatewayAdapter>, ApplicationError> {
+        Err(ApplicationError::Configuration(format!(
+            "adapter {adapter_key} does not implement the synchronous gateway protocol"
+        )))
+    }
 }
 
 /// 按 `adapter_key` 分派的组合工厂。
@@ -4621,6 +5173,20 @@ impl AdapterFactory for AdapterRegistry {
     ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
         match self.find(adapter_key) {
             Some(factory) => factory.create(adapter_key, base_url, timeout),
+            None => Err(ApplicationError::Configuration(format!(
+                "unknown adapter {adapter_key}"
+            ))),
+        }
+    }
+
+    fn create_gateway(
+        &self,
+        adapter_key: &str,
+        base_url: &str,
+        timeout: Duration,
+    ) -> Result<Arc<dyn GatewayAdapter>, ApplicationError> {
+        match self.find(adapter_key) {
+            Some(factory) => factory.create_gateway(adapter_key, base_url, timeout),
             None => Err(ApplicationError::Configuration(format!(
                 "unknown adapter {adapter_key}"
             ))),
@@ -6066,95 +6632,19 @@ impl GenerationService {
         Ok(job)
     }
 
-    /// 受理时把定价随 Job 冻结，并算定这次的**预授权额**（保底额）。
-    ///
-    /// 两件事都依赖这次请求，发布侧算不出来：
-    /// - **保底额**按请求的 `size` 先**归到档位**、再查该供给的保底表（回落链见
-    ///   [`resolve_size_tier`] 与 `FloorTable::lookup`）；连该供给的封顶保底值都没有时回落到
-    ///   平台兜底数。它**不由售价派生**——售价高不代表预授权高，两者是两件事；
-    /// - **汇率**按该候选的成本币种取"受理时刻生效的那一行"，原值快照进快照（受理之后不再换算）。
-    ///
-    /// **归位用的档位像素表就是这条供给已发布的尺寸档案**（`parameter_mapping` 里的档位 →
-    /// 比例 → 像素）：各供给的档位像素不同，只有它自己声明的那张表才是它的档位定义；这条供给
-    /// 没发布尺寸档案时按最长边阈值兜底。那份映射随 Job 一起冻结，所以事后重建"这次按哪一档
-    /// 冻的"用的是受理当时那一份，不是今天的发布物。
-    ///
-    /// 旧修订没有定价（快照里没有该供给的保底表）：这一步什么都不做，返回平台兜底数——它也按
-    /// 请求张数缩放（`n = 1` 时与旧口径逐位相同）。
+    /// 受理路径的定价冻结：预授权额与汇率都由 [`freeze_offering_pricing`] 按同一条规则算定。
     async fn freeze_pricing(
         &self,
         request: &CreateImageGenerationRequest,
         offering: &mut PublishedOffering,
     ) -> Result<u64, ApplicationError> {
-        // 汇率只要这条候选**声明了成本币种**就冻结：成本（上游声明的金额、或按计价形态自算
-        // 出来的金额）都要折成人民币才算得出毛利，而折算率只有受理时取得到。旧修订受理出的
-        // 历史 Job 快照里没有这个声明（那时没有这条事实），这一步因此什么都不做——那是旧口径。
-        if let Some(cost_currency) = offering.price_snapshot.cost_currency.clone() {
-            // 汇率在发布期已被校验过（该币种必须有一行已生效的折算率），所以取不到只可能是
-            // 汇率表被人删了行或只剩未来生效的行——那是平台自己的配置问题，不是这次请求的问题。
-            let fx_rate = self
-                .repository
-                .effective_fx_rate(&cost_currency)
-                .await?
-                .ok_or_else(|| {
-                    ApplicationError::Configuration(format!(
-                        "no effective fx rate for {cost_currency}; publication rejects a currency \
-                         without one, so the rate table lost a row it promised"
-                    ))
-                })?;
-            offering.price_snapshot.fx_rate = Some(fx_rate);
-        }
-        // 判据是"这条候选带不带定价"，不是"有没有对客费率向量"：按张 / 按次 / 上游给金额的候选
-        // 本来就没有那份四档向量，但它们照样有保底表要查。带定价就一定有保底表（发布期两者
-        // 全有或全无），所以这里看保底表在不在。
-        // 保底额按**请求张数**缩放：保底表里给的是每张额，`hold = n × 每张额`（`n` 缺省 1，
-        // `ADR-0009` ②）。回落链的每一层都乘 `n`——请求 10 张时"档位查不到"也不能按 1 张冻。
-        let images = requested_image_count(&request.native_parameters);
-        let scale = |per_image: u64| {
-            per_image.checked_mul(images).ok_or_else(|| {
-                ApplicationError::Configuration(format!(
-                    "the hold overflows: {per_image} micros per image × {images} images"
-                ))
-            })
-        };
-        if offering.price_snapshot.floor_amounts.is_none() {
-            return scale(self.max_cost_microusd);
-        }
-        let table = offering
-            .price_snapshot
-            .floor_amounts
-            .as_ref()
-            .map(FloorTable::from_json)
-            .transpose()
-            .map_err(|message| {
-                ApplicationError::Configuration(format!(
-                    "the published floor table is malformed: {message}"
-                ))
-            })?
-            .unwrap_or_default();
-        // 尺寸档案在发布期已校验过形状，这里取不到只可能是"这条供给没发布尺寸档案"（合法）。
-        let profile = declared_size_mapping(&offering.parameter_mapping)
-            .map_err(|message| {
-                ApplicationError::Configuration(format!(
-                    "the published size mapping is malformed: {message}"
-                ))
-            })?
-            .map(|mapping| mapping.profile)
-            .unwrap_or_default();
-        let tier = resolve_size_tier(
-            literal_parameter_text(&request.native_parameters, "size"),
-            &profile,
-        );
-        let (per_image_microusd, hold_source) = table
-            .lookup(
-                tier.as_ref(),
-                literal_parameter_text(&request.native_parameters, "quality"),
-            )
-            .unwrap_or((self.max_cost_microusd, HoldSource::PlatformDefault));
-        let hold_microusd = scale(per_image_microusd)?;
-        offering.price_snapshot.hold_microusd = Some(hold_microusd);
-        offering.price_snapshot.hold_source = Some(hold_source);
-        Ok(hold_microusd)
+        freeze_offering_pricing(
+            self.repository.as_ref(),
+            self.max_cost_microusd,
+            &request.native_parameters,
+            offering,
+        )
+        .await
     }
 
     pub async fn get(
@@ -6164,6 +6654,95 @@ impl GenerationService {
     ) -> Result<JobView, ApplicationError> {
         self.repository.get_job(account_id, job_id).await
     }
+}
+
+/// 受理时把定价随 Job 冻结，并算定这次的**预授权额**（保底额）。
+///
+/// 两件事都依赖这次请求，发布侧算不出来：
+/// - **保底额**按请求的 `size` 先**归到档位**、再查该供给的保底表（回落链见
+///   [`resolve_size_tier`] 与 `FloorTable::lookup`）；连该供给的封顶保底值都没有时回落到
+///   平台兜底数。它**不由售价派生**——售价高不代表预授权高，两者是两件事；
+/// - **汇率**按该候选的成本币种取"受理时刻生效的那一行"，原值快照进快照（受理之后不再换算）。
+///
+/// **归位用的档位像素表就是这条供给已发布的尺寸档案**（`parameter_mapping` 里的档位 →
+/// 比例 → 像素）：各供给的档位像素不同，只有它自己声明的那张表才是它的档位定义；这条供给
+/// 没发布尺寸档案时按最长边阈值兜底。那份映射随 Job 一起冻结，所以事后重建"这次按哪一档
+/// 冻的"用的是受理当时那一份，不是今天的发布物。
+///
+/// 旧修订没有定价（快照里没有该供给的保底表）：这一步什么都不做，返回平台兜底数——它也按
+/// 请求张数缩放（`n = 1` 时与旧口径逐位相同）。
+/// 沿用路径与直接执行路径共用这一处：两条路都必须按同一条规则冻结预授权与汇率。
+pub(crate) async fn freeze_offering_pricing(
+    repository: &dyn HubRepository,
+    max_cost_microusd: u64,
+    native_parameters: &Value,
+    offering: &mut PublishedOffering,
+) -> Result<u64, ApplicationError> {
+    // 汇率只要这条候选**声明了成本币种**就冻结：成本（上游声明的金额、或按计价形态自算
+    // 出来的金额）都要折成人民币才算得出毛利，而折算率只有受理时取得到。旧修订受理出的
+    // 历史 Job 快照里没有这个声明（那时没有这条事实），这一步因此什么都不做——那是旧口径。
+    if let Some(cost_currency) = offering.price_snapshot.cost_currency.clone() {
+        // 汇率在发布期已被校验过（该币种必须有一行已生效的折算率），所以取不到只可能是
+        // 汇率表被人删了行或只剩未来生效的行——那是平台自己的配置问题，不是这次请求的问题。
+        let fx_rate = repository
+            .effective_fx_rate(&cost_currency)
+            .await?
+            .ok_or_else(|| {
+                ApplicationError::Configuration(format!(
+                    "no effective fx rate for {cost_currency}; publication rejects a currency \
+                     without one, so the rate table lost a row it promised"
+                ))
+            })?;
+        offering.price_snapshot.fx_rate = Some(fx_rate);
+    }
+    // 判据是"这条候选带不带定价"，不是"有没有对客费率向量"：按张 / 按次 / 上游给金额的候选
+    // 本来就没有那份四档向量，但它们照样有保底表要查。带定价就一定有保底表（发布期两者
+    // 全有或全无），所以这里看保底表在不在。
+    // 保底额按**请求张数**缩放：保底表里给的是每张额，`hold = n × 每张额`（`n` 缺省 1，
+    // `ADR-0009` ②）。回落链的每一层都乘 `n`——请求 10 张时"档位查不到"也不能按 1 张冻。
+    let images = requested_image_count(native_parameters);
+    let scale = |per_image: u64| {
+        per_image.checked_mul(images).ok_or_else(|| {
+            ApplicationError::Configuration(format!(
+                "the hold overflows: {per_image} micros per image × {images} images"
+            ))
+        })
+    };
+    if offering.price_snapshot.floor_amounts.is_none() {
+        return scale(max_cost_microusd);
+    }
+    let table = offering
+        .price_snapshot
+        .floor_amounts
+        .as_ref()
+        .map(FloorTable::from_json)
+        .transpose()
+        .map_err(|message| {
+            ApplicationError::Configuration(format!(
+                "the published floor table is malformed: {message}"
+            ))
+        })?
+        .unwrap_or_default();
+    // 尺寸档案在发布期已校验过形状，这里取不到只可能是"这条供给没发布尺寸档案"（合法）。
+    let profile = declared_size_mapping(&offering.parameter_mapping)
+        .map_err(|message| {
+            ApplicationError::Configuration(format!(
+                "the published size mapping is malformed: {message}"
+            ))
+        })?
+        .map(|mapping| mapping.profile)
+        .unwrap_or_default();
+    let tier = resolve_size_tier(literal_parameter_text(native_parameters, "size"), &profile);
+    let (per_image_microusd, hold_source) = table
+        .lookup(
+            tier.as_ref(),
+            literal_parameter_text(native_parameters, "quality"),
+        )
+        .unwrap_or((max_cost_microusd, HoldSource::PlatformDefault));
+    let hold_microusd = scale(per_image_microusd)?;
+    offering.price_snapshot.hold_microusd = Some(hold_microusd);
+    offering.price_snapshot.hold_source = Some(hold_source);
+    Ok(hold_microusd)
 }
 
 pub struct WorkerService {
@@ -7162,6 +7741,32 @@ fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> Attemp
                 provider_cost: None,
             }
         }
+        // 新协议的接受结果不会出现在旧 Worker 路径上；真出现时按"结果不确定"进对账，
+        // 绝不凭它重发生成请求（RFC 0017 §4）。
+        AdapterError::AcceptedUnpersisted { reason, .. } => AttemptFailure {
+            provider_code: "accepted_unpersisted".to_owned(),
+            public_code: PublicErrorCode::OutcomeUnknown,
+            message: reason,
+            trace_id: None,
+            kind: ProviderFailureKind::PlatformInternal,
+            retry_safety: RetrySafety::AcceptanceUnknown,
+            target_state: JobState::ReconciliationRequired,
+            hold_disposition: HoldDisposition::RetainForReconciliation,
+            provider_cost: None,
+        },
+        // 取消与查询能力不支持同样不该出现在旧路径的一次性 execute 里；防御性地按平台故障释放。
+        AdapterError::Cancelled | AdapterError::QueryAccountingUnsupported => AttemptFailure {
+            provider_code: "adapter_rejected".to_owned(),
+            public_code: PublicErrorCode::PlatformUnavailable,
+            message: "the adapter reported an outcome the legacy execution path does not produce"
+                .to_owned(),
+            trace_id: None,
+            kind: ProviderFailureKind::PlatformInternal,
+            retry_safety: RetrySafety::NotRetryable,
+            target_state: JobState::Failed,
+            hold_disposition: HoldDisposition::Release,
+            provider_cost: None,
+        },
     }
 }
 

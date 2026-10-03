@@ -1,5 +1,55 @@
 use super::*;
-use seeai_domain::platform_image_parameters;
+use async_trait::async_trait;
+use seeai_adapter_sdk::{
+    AcceptanceError, AcceptedHandle, Deadline, ImageSite, ImageSites, ImageValueShape,
+};
+use seeai_domain::{ImageParameterKind, platform_image_parameter, platform_image_parameters};
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+
+/// 假执行上下文：期限与取消状态固定；同步渠道绝不该调用 accepted。
+struct FakeContext {
+    deadline: Deadline,
+    cancelled: bool,
+}
+
+impl FakeContext {
+    fn fresh() -> Self {
+        Self {
+            deadline: Deadline::after(Duration::from_secs(30)),
+            cancelled: false,
+        }
+    }
+
+    fn cancelled() -> Self {
+        Self {
+            deadline: Deadline::after(Duration::from_secs(30)),
+            cancelled: true,
+        }
+    }
+
+    fn expired() -> Self {
+        Self {
+            deadline: Deadline::after(Duration::ZERO),
+            cancelled: false,
+        }
+    }
+}
+
+#[async_trait]
+impl ExecutionContext for FakeContext {
+    fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    async fn accepted(&self, _handle: AcceptedHandle) -> Result<(), AcceptanceError> {
+        panic!("a synchronous channel must never confirm an accepted handle")
+    }
+}
 
 fn request(branch: ImageBranch) -> PreparedImageRequest {
     request_for(&published_schema(), branch)
@@ -569,4 +619,339 @@ fn usage_rejects_missing_token_detail_fields() {
     let error = serde_json::from_slice::<ImageResponse>(response)
         .expect_err("missing image_tokens must reject metering evidence");
     assert!(error.to_string().contains("image_tokens"));
+}
+// ── 同步网关协议（RFC 0017 §2/§4）──────────────────────────────────────────────
+
+/// 把 Driver 组好的表单摊成将要发出去的字节，供新旧入口逐字比对。
+async fn render_form(form: multipart::Form) -> Vec<u8> {
+    let chunks = form.into_stream().collect::<Vec<_>>().await;
+    let mut body = Vec::new();
+    for chunk in chunks {
+        body.extend_from_slice(&chunk.expect("the form should stream"));
+    }
+    body
+}
+
+/// 摊平表单并去掉每次随机生成的 boundary：两个入口的内容才可逐字比对。
+async fn normalized_form(form: multipart::Form) -> String {
+    let text = String::from_utf8_lossy(&render_form(form).await).into_owned();
+    let boundary = text
+        .split("\r\n")
+        .next()
+        .and_then(|line| line.strip_prefix("--"))
+        .unwrap_or_default()
+        .to_owned();
+    text.replace(&boundary, "BOUNDARY")
+}
+
+/// 从候选声明面推出新协议的图片参数位；角色判定与线上同一处推导。
+fn gateway_sites(schema: &Value, branch: ImageBranch) -> ImageSites {
+    let platform = platform_image_parameters(schema, branch);
+    let reference =
+        platform_image_parameter(&platform, ImageParameterKind::Reference).map(|name| ImageSite {
+            parameter: name.to_owned(),
+            shape: gateway_shape(schema, name),
+        });
+    let mask =
+        platform_image_parameter(&platform, ImageParameterKind::Mask).map(|name| ImageSite {
+            parameter: name.to_owned(),
+            shape: ImageValueShape::Scalar,
+        });
+    ImageSites { reference, mask }
+}
+
+fn gateway_shape(schema: &Value, name: &str) -> ImageValueShape {
+    match schema
+        .pointer(&format!("/properties/{name}/type"))
+        .and_then(Value::as_str)
+    {
+        Some("array") => ImageValueShape::Array,
+        _ => ImageValueShape::Scalar,
+    }
+}
+
+/// 一个只回固定图片字节的本地接收器：记下请求次数，用来区分「下载」与「就地解码」。
+struct ImageReceiver {
+    url: String,
+    requests: Arc<Mutex<usize>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl ImageReceiver {
+    async fn start(body: &'static [u8]) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the receiver binds a local port");
+        let port = listener.local_addr().expect("the receiver address").port();
+        let requests = Arc::new(Mutex::new(0_usize));
+        let recorded = requests.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = recorded.clone();
+                tokio::spawn(async move {
+                    let _ = serve_image(&mut socket, recorded, body).await;
+                });
+            }
+        });
+        Self {
+            url: format!("http://127.0.0.1:{port}/reference.png"),
+            requests,
+            _task: task,
+        }
+    }
+
+    fn requests(&self) -> usize {
+        *self.requests.lock().expect("requests lock")
+    }
+}
+
+async fn serve_image(
+    socket: &mut tokio::net::TcpStream,
+    requests: Arc<Mutex<usize>>,
+    body: &'static [u8],
+) -> std::io::Result<()> {
+    let mut reader = tokio::io::BufReader::new(&mut *socket);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).await?;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).await? == 0 {
+            break;
+        }
+        if header.trim_end().is_empty() {
+            break;
+        }
+    }
+    *requests.lock().expect("requests lock") += 1;
+    let head = format!(
+        "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(body).await?;
+    socket.flush().await
+}
+
+/// 新 JSON 入口与旧入口必须给出同一份上游字节：内部表达换了，wire 不能变。
+#[test]
+fn gateway_prompt_only_body_is_byte_identical_to_the_legacy_json_entry() {
+    let legacy = request(ImageBranch::PromptOnly);
+    let input = GatewayInput {
+        provider_model_id: legacy.provider_model_id.clone(),
+        branch: ImageBranch::PromptOnly,
+        native_parameters: legacy.native_parameters.clone(),
+        reference_images: Vec::new(),
+        mask: None,
+        image_sites: ImageSites::default(),
+        cost_currency: "USD".to_owned(),
+    };
+    let legacy_body =
+        serde_json::to_vec(&generation_body(&legacy).expect("the legacy request is supported"))
+            .expect("a body serializes");
+    let gateway_body = serde_json::to_vec(
+        &gateway_generation_body(&input).expect("the gateway request is supported"),
+    )
+    .expect("a body serializes");
+    assert_eq!(legacy_body, gateway_body, "JSON 入口逐字不变");
+}
+
+/// 新 multipart 入口与旧入口必须给出同一份部件字节：图片从强类型字段取，不经 data URL 往返。
+#[tokio::test]
+async fn gateway_edit_form_is_byte_identical_to_the_legacy_multipart_entry() {
+    let schema = published_schema();
+    let image = "data:image/png;base64,AAAA";
+    let mask = "data:image/png;base64,BBBB";
+    let mut legacy = request_for(&schema, ImageBranch::Masked);
+    legacy.native_parameters = serde_json::json!({
+        "prompt": "test",
+        "n": 1,
+        "image": image,
+        "mask": mask,
+    });
+    let input = GatewayInput {
+        provider_model_id: legacy.provider_model_id.clone(),
+        branch: ImageBranch::Masked,
+        native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
+        reference_images: vec![InputImage::DataUrl(image.to_owned())],
+        mask: Some(InputImage::DataUrl(mask.to_owned())),
+        image_sites: gateway_sites(&schema, ImageBranch::Masked),
+        cost_currency: "USD".to_owned(),
+    };
+    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
+        .expect("adapter config should be valid");
+    let legacy_bytes = normalized_form(
+        adapter
+            .edit_form(&legacy)
+            .await
+            .expect("the legacy form builds"),
+    )
+    .await;
+    let gateway_bytes = normalized_form(
+        adapter
+            .gateway_edit_form(&input, &FakeContext::fresh())
+            .await
+            .expect("the gateway form builds"),
+    )
+    .await;
+    assert_eq!(legacy_bytes, gateway_bytes, "multipart 入口逐字不变");
+}
+
+/// URL 态走既有下载：同一个公网地址，新旧入口下载出的字节逐字一致。
+#[tokio::test]
+async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
+    let payload: &'static [u8] = b"\x89PNG\r\n\x1a\n";
+    let receiver = ImageReceiver::start(payload).await;
+    let schema = published_schema();
+    let url = receiver.url.clone();
+    let mut legacy = request_for(&schema, ImageBranch::ImageConditioned);
+    legacy.native_parameters = serde_json::json!({"prompt": "test", "image": url});
+    let input = GatewayInput {
+        provider_model_id: legacy.provider_model_id.clone(),
+        branch: ImageBranch::ImageConditioned,
+        native_parameters: serde_json::json!({"prompt": "test"}),
+        reference_images: vec![InputImage::Url(receiver.url.clone())],
+        mask: None,
+        image_sites: gateway_sites(&schema, ImageBranch::ImageConditioned),
+        cost_currency: "USD".to_owned(),
+    };
+    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
+        .expect("adapter config should be valid");
+    let legacy_bytes = normalized_form(
+        adapter
+            .edit_form(&legacy)
+            .await
+            .expect("the legacy form builds"),
+    )
+    .await;
+    let gateway_bytes = normalized_form(
+        adapter
+            .gateway_edit_form(&input, &FakeContext::fresh())
+            .await
+            .expect("the gateway form builds"),
+    )
+    .await;
+    assert_eq!(legacy_bytes, gateway_bytes, "URL 态新旧入口下载同一份字节");
+    assert_eq!(receiver.requests(), 2, "两个入口各自下载一次公网参考图");
+}
+
+/// 内存态不发生网络往返：data URL 就地解码、Bytes 直接借用，只有 URL 才走下载。
+#[tokio::test]
+async fn gateway_input_images_decode_in_memory_without_network() {
+    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
+        .expect("adapter config should be valid");
+    let legacy = decode_inline_image("data:image/png;base64,AAAA").expect("legacy decodes inline");
+    let data_url = adapter
+        .gateway_image_bytes(
+            &InputImage::DataUrl("data:image/png;base64,AAAA".to_owned()),
+            &FakeContext::fresh(),
+        )
+        .await
+        .expect("a data url decodes in place");
+    assert_eq!(data_url.media_type, "image/png");
+    assert_eq!(
+        data_url.bytes, legacy.bytes,
+        "data URL 态与旧入口解出同一份字节"
+    );
+    let borrowed = adapter
+        .gateway_image_bytes(
+            &InputImage::Bytes(DecodedImage {
+                media_type: "image/jpeg".to_owned(),
+                bytes: Bytes::from_static(&[1, 2, 3]),
+            }),
+            &FakeContext::fresh(),
+        )
+        .await
+        .expect("declared bytes are borrowed");
+    assert_eq!(borrowed.bytes.as_ref(), &[1, 2, 3]);
+    assert_eq!(borrowed.media_type, "image/jpeg");
+    // 公网地址没有现成字节：模拟没有服务监听，证明它确实走下载而不是当字节用。
+    assert!(
+        adapter
+            .gateway_image_bytes(
+                &InputImage::Url("http://127.0.0.1:1/none.png".to_owned()),
+                &FakeContext::fresh(),
+            )
+            .await
+            .is_err(),
+        "URL 态必须走下载"
+    );
+}
+/// 取消在生成请求之前生效：闸门拦下，不会真的发出去（基址上没有服务在听）。
+#[tokio::test]
+async fn a_cancelled_gateway_execution_never_sends() {
+    let adapter =
+        AihubmixImageAdapter::new("http://127.0.0.1:1/", Duration::from_secs(10)).expect("config");
+    let input = GatewayInput {
+        provider_model_id: "gpt-image-2.5-flare".to_owned(),
+        branch: ImageBranch::PromptOnly,
+        native_parameters: serde_json::json!({"prompt": "test"}),
+        reference_images: Vec::new(),
+        mask: None,
+        image_sites: ImageSites::default(),
+        cost_currency: "USD".to_owned(),
+    };
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter,
+        Arc::new(input),
+        &FakeContext::cancelled(),
+        &credential,
+    )
+    .await
+    .expect_err("取消必须停下");
+    assert!(matches!(error, AdapterError::Cancelled), "{error:?}");
+}
+
+/// 总期限已到：生成请求之前停下，报明确的期限错误而不是传输失败。
+#[tokio::test]
+async fn an_expired_gateway_deadline_stops_before_sending() {
+    let adapter =
+        AihubmixImageAdapter::new("http://127.0.0.1:1/", Duration::from_secs(10)).expect("config");
+    let input = GatewayInput {
+        provider_model_id: "gpt-image-2.5-flare".to_owned(),
+        branch: ImageBranch::PromptOnly,
+        native_parameters: serde_json::json!({"prompt": "test"}),
+        reference_images: Vec::new(),
+        mask: None,
+        image_sites: ImageSites::default(),
+        cost_currency: "USD".to_owned(),
+    };
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let error = GatewayAdapter::execute(
+        &adapter,
+        Arc::new(input),
+        &FakeContext::expired(),
+        &credential,
+    )
+    .await
+    .expect_err("期限已到必须停下");
+    match error {
+        AdapterError::Provider(call) => {
+            assert_eq!(call.code, "execution_deadline_exceeded");
+            assert_eq!(call.retry_safety, RetrySafety::NotRetryable);
+        }
+        other => panic!("expected the deadline error, got {other:?}"),
+    }
+}
+
+/// 新协议的错误出口不把 Provider 自由文本或 reqwest 原始串带出去。
+#[test]
+fn gateway_errors_drop_provider_text_and_transport_strings() {
+    let error = AdapterError::Provider(ProviderCallError {
+        code: "provider_transport_unknown".to_owned(),
+        message: "error sending request for url (https://up.example/x?token=SECRET)".to_owned(),
+        trace_id: None,
+        retry_safety: RetrySafety::AcceptanceUnknown,
+        kind: ProviderFailureKind::UpstreamUnavailable,
+        provider_cost: None,
+    });
+    let AdapterError::Provider(call) = gateway_error(error) else {
+        panic!("a provider error stays a provider error");
+    };
+    assert_eq!(call.message, "the provider call failed");
+    assert!(!call.message.contains("SECRET"));
 }

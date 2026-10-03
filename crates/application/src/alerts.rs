@@ -81,6 +81,22 @@ impl PlatformAlert {
         })
     }
 
+    /// 新协议（v1）执行上的那条告警：没有 [`GenerationJob`]，渠道类别由对账 Worker 从只读
+    /// 投影读到的渠道事实给出。时间同样取**观测到它的时刻**（见 [`Self::of`]）。
+    #[must_use]
+    pub fn execution(
+        job_id: JobId,
+        provider_kind: String,
+        failure_kind: ProviderFailureKind,
+    ) -> Self {
+        Self::Execution(ExecutionAlert {
+            job_id,
+            provider_kind,
+            failure_kind,
+            occurred_at: Utc::now(),
+        })
+    }
+
     /// 一次账实不符外发的那条告警。时间同样是**观测到它的时刻**（见 [`Self::of`]）。
     #[must_use]
     pub fn ledger_mismatch(

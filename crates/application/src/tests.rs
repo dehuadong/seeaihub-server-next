@@ -11,6 +11,7 @@ use std::sync::{
 mod carrier_validation;
 mod contract_face;
 mod customer_usage;
+mod execution_protocol;
 mod failure_mapping;
 mod fixtures;
 mod publish_normalize;

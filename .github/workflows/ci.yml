@@ -32,6 +32,11 @@ jobs:
       - run: cargo test -p seeai-api --test http_contract -- --ignored
         env:
           HTTP_CONTRACT_DATABASE_URL: postgres://seeai:seeai@127.0.0.1:5432/seeai_contract
+      # 端口层的真库用例（受理/提交/收尾/晚到事实）也在这一层跑：它们同样需要真实 PostgreSQL，
+      # 普通 cargo test 会把它们跳过，只有显式 --ignored 才会执行。
+      - run: cargo test -p seeai-persistence -- --ignored --test-threads=1
+        env:
+          HTTP_CONTRACT_DATABASE_URL: postgres://seeai:seeai@127.0.0.1:5432/seeai_contract
 
   # 浏览器那一层：跑**构建产物**，验的是只有浏览器才观测得到的行为（路由守卫、会话存续、入口分发、
   # 全栈串联）。用例与选择器规则见 `apps/web/e2e/` 与根 `AGENTS.md` 的「浏览器行为」一节。

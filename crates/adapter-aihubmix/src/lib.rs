@@ -3,9 +3,12 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, DecodedImage, GeneratedImage, ImageAdapter,
-    PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind,
-    ProviderSuccess, RetrySafety, decode_data_url, is_http_url,
+    AccountingFacts, AdapterDescriptor, AdapterError, DecodedImage, ExecutionContext,
+    GatewayAdapter, GatewayInput, GeneratedImage, ImageAdapter, InputImage, PreparedImageRequest,
+    ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput,
+    ProviderSuccess, QueryAccountingCapability, ResponsePayload, RetrySafety, decode_data_url,
+    ensure_external_call_allowed, external_call_timeout, gateway_passthrough_parameters,
+    is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -15,6 +18,7 @@ use seeai_domain::{
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
+use std::sync::Arc;
 use std::time::Duration;
 use url::Url;
 
@@ -85,6 +89,23 @@ impl AdapterFactory for AihubmixAdapterFactory {
             .map(|adapter| std::sync::Arc::new(adapter) as std::sync::Arc<dyn ImageAdapter>)
             .map_err(|error| ApplicationError::Configuration(error.to_string()))
     }
+
+    /// 同步网关协议：同一条供给换成 [`GatewayAdapter`] 交出同一个 Driver。
+    fn create_gateway(
+        &self,
+        adapter_key: &str,
+        base_url: &str,
+        timeout: Duration,
+    ) -> Result<std::sync::Arc<dyn GatewayAdapter>, ApplicationError> {
+        if adapter_key != ADAPTER_KEY {
+            return Err(ApplicationError::Configuration(format!(
+                "unsupported adapter {adapter_key}"
+            )));
+        }
+        AihubmixImageAdapter::new(base_url, timeout)
+            .map(|adapter| std::sync::Arc::new(adapter) as std::sync::Arc<dyn GatewayAdapter>)
+            .map_err(|error| ApplicationError::Configuration(error.to_string()))
+    }
 }
 
 /// 校验这条供给的**承载面**（它声明要往线文里写的字段面）本 Driver 能不能执行。
@@ -133,10 +154,8 @@ fn validate_aihubmix_publication(
             require_string_enum(properties, name)?;
         }
     }
-    for name in ["output_compression"] {
-        if properties.contains_key(name) {
-            require_type(properties, name, "integer")?;
-        }
+    if properties.contains_key("output_compression") {
+        require_type(properties, "output_compression", "integer")?;
     }
     if properties.contains_key("user") {
         require_type(properties, "user", "string")?;
@@ -305,6 +324,8 @@ fn require_string_with_optional_enum(
 pub struct AihubmixImageAdapter {
     client: Client,
     base_url: Url,
+    /// 单次 HTTP 调用的配置超时；新协议再用总期限剩余夹一次。
+    timeout: Duration,
 }
 
 impl AihubmixImageAdapter {
@@ -316,7 +337,11 @@ impl AihubmixImageAdapter {
             .timeout(timeout)
             .build()
             .map_err(|error| AdapterError::Configuration(error.to_string()))?;
-        Ok(Self { client, base_url })
+        Ok(Self {
+            client,
+            base_url,
+            timeout,
+        })
     }
 
     fn endpoint(&self, branch: ImageBranch) -> Result<Url, AdapterError> {
@@ -418,9 +443,19 @@ impl AihubmixImageAdapter {
 
     /// 公网 URL 自己下载：带超时（用本 Driver 的 HTTP 客户端）与体积上限，只在内存里。
     async fn download_image(&self, url: &str) -> Result<DecodedImage, AdapterError> {
+        self.download_image_within(url, self.timeout).await
+    }
+
+    /// 带显式单次超时的下载；新协议用总期限剩余夹住它（RFC 0017 §6）。
+    async fn download_image_within(
+        &self,
+        url: &str,
+        timeout: Duration,
+    ) -> Result<DecodedImage, AdapterError> {
         let response = self
             .client
             .get(url)
+            .timeout(timeout)
             .send()
             .await
             .map_err(reference_image_unavailable)?;
@@ -554,6 +589,204 @@ impl ImageAdapter for AihubmixImageAdapter {
                 self.edit(&request, credential).await
             }
         }
+    }
+}
+
+/// 新协议的 JSON 入口：普通参数逐字进顶层字段，平台装载的图片参数名不参与（它们只是
+/// 候选声明面里的名字，取值已提升到 `GatewayInput` 的图片字段）。
+fn gateway_generation_body(input: &GatewayInput) -> Result<Value, AdapterError> {
+    let mut object = Map::new();
+    object.insert(
+        "model".to_owned(),
+        Value::String(input.provider_model_id.clone()),
+    );
+    object.insert(
+        "prompt".to_owned(),
+        Value::String(required_string(&input.native_parameters, "/prompt")?),
+    );
+    for (name, value) in gateway_passthrough_parameters(input) {
+        object.insert(name.clone(), value.clone());
+    }
+    Ok(Value::Object(object))
+}
+
+/// 一次成功执行 → 内存载荷与强类型账务事实（RFC 0017 §2）；图片与账务事实分开，结果不进日志。
+fn gateway_output(success: ProviderSuccess) -> ProviderOutput {
+    let image_count = u32::try_from(success.images.len()).unwrap_or(u32::MAX);
+    ProviderOutput {
+        response_payload: ResponsePayload {
+            // 应用层按自己的时钟兜底 `created`；这条渠道的响应信封没读它。
+            created: None,
+            images: success.images,
+        },
+        accounting_facts: AccountingFacts {
+            usage: Some(success.usage),
+            provider_cost: success.provider_cost,
+            image_count,
+            response_digest: success.response_digest,
+            provider_trace_id: success.provider_trace_id,
+        },
+    }
+}
+
+impl AihubmixImageAdapter {
+    /// 新协议的 JSON 入口：与旧路径同一份 wire 形状。
+    async fn gateway_generate(
+        &self,
+        input: &GatewayInput,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<ProviderOutput, AdapterError> {
+        let body = gateway_generation_body(input)?;
+        ensure_external_call_allowed(context)?;
+        let response = self
+            .client
+            .post(self.endpoint(ImageBranch::PromptOnly)?)
+            .timeout(external_call_timeout(self.timeout, context))
+            .bearer_auth(credential.expose())
+            .json(&body)
+            .send()
+            .await
+            .map_err(ambiguous_transport_error)?;
+        parse_response(response).await.map(gateway_output)
+    }
+
+    /// 新协议的 multipart 入口：图片直接来自 `input.reference_images` / `input.mask`，字节由
+    /// [`InputImage::decoded`] 给出、公网 URL 走既有下载，不经 data URL 往返。
+    async fn gateway_edit(
+        &self,
+        input: &GatewayInput,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<ProviderOutput, AdapterError> {
+        let form = self.gateway_edit_form(input, context).await?;
+        ensure_external_call_allowed(context)?;
+        let response = self
+            .client
+            .post(self.endpoint(input.branch)?)
+            .timeout(external_call_timeout(self.timeout, context))
+            .bearer_auth(credential.expose())
+            .multipart(form)
+            .send()
+            .await
+            .map_err(ambiguous_transport_error)?;
+        parse_response(response).await.map(gateway_output)
+    }
+
+    /// 组好新入口的编辑表单：部件名取自 [`GatewayInput::image_sites`]，不写死也不读
+    /// `platform_parameters`。一张参考图是单值部件，多张是重复的 `image[]`（与旧入口同一条
+    /// wire 规则）。
+    async fn gateway_edit_form(
+        &self,
+        input: &GatewayInput,
+        context: &dyn ExecutionContext,
+    ) -> Result<multipart::Form, AdapterError> {
+        let reference_site = input.image_sites.reference.as_ref().ok_or_else(|| {
+            AdapterError::UnsupportedInput(
+                "the offering declares no reference image parameter, so the edit endpoint has no \
+                 part to carry it"
+                    .to_owned(),
+            )
+        })?;
+        if input.reference_images.is_empty() {
+            return Err(AdapterError::UnsupportedInput(
+                "the edit endpoint needs one reference image".to_owned(),
+            ));
+        }
+        let mut form = multipart::Form::new()
+            .text("model", input.provider_model_id.clone())
+            .text(
+                "prompt",
+                required_string(&input.native_parameters, "/prompt")?,
+            );
+        for (name, value) in gateway_passthrough_parameters(input) {
+            form = form.text(name.clone(), multipart_text(name, value)?);
+        }
+        let reference_part = if input.reference_images.len() > 1 {
+            format!("{}[]", reference_site.parameter)
+        } else {
+            reference_site.parameter.clone()
+        };
+        for image in &input.reference_images {
+            let bytes = self.gateway_image_bytes(image, context).await?;
+            form = form.part(reference_part.clone(), image_part(bytes)?);
+        }
+        if let Some(mask) = &input.mask {
+            let mask_site = input.image_sites.mask.as_ref().ok_or_else(|| {
+                AdapterError::UnsupportedInput(
+                    "the offering declares no mask parameter, so the edit endpoint has no part \
+                     to carry it"
+                        .to_owned(),
+                )
+            })?;
+            let bytes = self.gateway_image_bytes(mask, context).await?;
+            form = form.part(mask_site.parameter.clone(), image_part(bytes)?);
+        }
+        Ok(form)
+    }
+
+    /// 一份内存输入图取成字节：`Bytes` 借用、`DataUrl` 就地解码，公网 URL 在自己下载前
+    /// 先过取消/期限闸，单次超时取 min(自身配置, 总期限剩余)。两种内存形态都不发生网络往返
+    /// （RFC 0017 §2、§6）。
+    async fn gateway_image_bytes(
+        &self,
+        image: &InputImage,
+        context: &dyn ExecutionContext,
+    ) -> Result<DecodedImage, AdapterError> {
+        match image {
+            InputImage::Url(url) => {
+                ensure_external_call_allowed(context)?;
+                self.download_image_within(url, external_call_timeout(self.timeout, context))
+                    .await
+            }
+            InputImage::DataUrl(_) | InputImage::Bytes(_) => {
+                let decoded = image.decoded()?;
+                ensure_input_size(decoded.bytes.len())?;
+                Ok(decoded.into_owned())
+            }
+        }
+    }
+}
+
+/// 同步网关协议（RFC 0017 §4）：同步渠道不伪造可恢复句柄，也不声明按句柄查询计量。
+#[async_trait]
+impl GatewayAdapter for AihubmixImageAdapter {
+    fn key(&self) -> &'static str {
+        ADAPTER_KEY
+    }
+
+    /// 同步通路没有已验证的按 trace 恢复能力：不声明可查询计量。
+    fn query_accounting_capability(&self) -> QueryAccountingCapability {
+        QueryAccountingCapability::Unsupported
+    }
+
+    async fn execute(
+        &self,
+        input: Arc<GatewayInput>,
+        context: &dyn ExecutionContext,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderOutput, AdapterError> {
+        // 同步渠道只在响应里体现已受理：没有可持久化、可按 trace 恢复的句柄，
+        // 因此绝不调用 `context.accepted`。
+        let output = match input.branch {
+            ImageBranch::PromptOnly => self.gateway_generate(&input, credential, context).await,
+            ImageBranch::ImageConditioned | ImageBranch::Masked => {
+                self.gateway_edit(&input, credential, context).await
+            }
+        };
+        output.map_err(gateway_error)
+    }
+}
+
+/// 新协议的错误出口（RFC 0017 §4）：Provider 报文自由文本与 reqwest 原始串可能带响应正文、
+/// URL 查询或 multipart，这里只保留平台判出的码与处置，不把原文带出去。
+fn gateway_error(error: AdapterError) -> AdapterError {
+    match error {
+        AdapterError::Provider(mut call) => {
+            call.message = "the provider call failed".to_owned();
+            AdapterError::Provider(call)
+        }
+        other => other,
     }
 }
 

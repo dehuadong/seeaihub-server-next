@@ -1,28 +1,32 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
-    AcceptanceProbe, AccountSummary, ActiveOfferingChannel, ApiKeyView, ApplicationError,
-    AttemptFailure, BalanceChange, ClaimedJob, CompleteJob, CustomerAccountTarget,
-    CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind,
-    CustomerUsageQuery, CustomerUsageScope, CustomerUsageView, CustomerView,
-    GatewayModelCandidateView, GatewayModelView, HoldDisposition, HubRepository, JobView,
+    AcceptanceProbe, AccountSummary, ActiveOfferingChannel, AdmitExecution, AdmitOutcome,
+    AdmittedJob, ApiKeyView, ApplicationError, AttemptFailure, BalanceChange, BeginSubmission,
+    ClaimedJob, ClaimedLateFact, CompleteJob, CustomerAccountTarget, CustomerBillingQuery,
+    CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery,
+    CustomerUsageScope, CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionReplay,
+    ExecutionRepository, FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView,
+    GatewayModelView, HoldDisposition, HubRepository, JobView, LateFacts, LateFactsOutcome,
     LeaseRecovery, LedgerMismatch, LedgerPage, NewFxRate, NormalizedOffering,
     OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView, ProviderFailureKind,
     ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeRequest,
-    ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand, RoutingDecision,
-    SelectableOfferingView, UnacceptedAttempt, customer_usage_status, declared_output_images,
+    ReconciliationCaseView, RecordAcceptance, ReferencedOffering, RefundReconciliationCommand,
+    RoutingDecision, SelectableOfferingView, SettleExecution, SubmissionStarted,
+    TakenOverExecution, UnacceptedAttempt, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
-    AccountId, AttemptId, ChannelId, ConsumerRatesCny, CostBasis, CreateImageGeneration, FxRate,
-    GenerationJob, HitCandidate, ImageBranch, JobId, LedgerEntry, LedgerEntryKind,
+    AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis,
+    CreateImageGeneration, ExecutionProtocol, ExecutionStage, FencingToken, FxRate, GenerationJob,
+    HitCandidate, ImageBranch, JobId, LedgerEntry, LedgerEntryKind, MeteringEvidence,
     OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot, PricingFormula,
-    PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy, RouteStrategy,
-    RuntimeRevisionId, VendorModelId,
+    ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision,
+    RoutePolicy, RouteStrategy, RuntimeRevisionId, VendorModelId,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{AssertSqlSafe, PgPool, Row, postgres::PgPoolOptions};
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::Duration as StdDuration;
 use uuid::Uuid;
 
@@ -4245,6 +4249,1845 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)?;
         Ok(rows.into_iter().map(customer_view_row).collect())
     }
+}
+
+/// 新协议受理的原子实现（RFC 0017 §3）。
+///
+/// 与旧协议的 create_job 共用同一套账本规则：按账户幂等标识的咨询锁、可用额条件更新、
+/// active 预授权、路由判定、每日上限读取方式都不另起一套。差别只在记录本身——新协议不写
+/// 请求正文、幂等明文、承载面或结果信封，JDBC 参数里也没有图片或 Value 请求体。
+#[async_trait]
+impl ExecutionRepository for PgHubRepository {
+    async fn admit(&self, command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError> {
+        let AdmitExecution {
+            account_id,
+            branch,
+            offering,
+            price_snapshot,
+            routing,
+            idempotency_key_digest,
+            idempotency_lookup_key_version,
+            request_digest,
+            request_digest_key_version,
+            max_cost_microusd,
+            max_account_in_flight,
+            max_channel_in_flight,
+        } = command;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 同账户同幂等摘要串行化：唯一索引保证不会有两行；锁让并发的同键请求一个建、其余读它。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("{account_id}:{idempotency_key_digest}"))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        // 键唯一性：只按不可逆摘要查，明文键不进新协议。
+        let existing = sqlx::query(
+            r#"
+            SELECT id, state, request_digest, request_digest_key_version, error_code,
+                   created_at, updated_at
+            FROM generation.jobs
+            WHERE account_id = $1 AND idempotency_key_digest = $2
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(&idempotency_key_digest)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if let Some(row) = existing {
+            let state: String = row.try_get("state").map_err(database_error)?;
+            let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+                ApplicationError::Persistence(format!(
+                    "job state {state} is not a v1 execution stage"
+                ))
+            })?;
+            let stored_digest: String = row.try_get("request_digest").map_err(database_error)?;
+            let stored_version: i16 = row
+                .try_get("request_digest_key_version")
+                .map_err(database_error)?;
+            transaction.rollback().await.map_err(database_error)?;
+            // 版本不同就无法安全比对（旧记录要用它冻结的旧密钥规则重算），按冲突拒绝，不覆盖。
+            if stored_version != request_digest_key_version || stored_digest != request_digest {
+                return Err(ApplicationError::Conflict(
+                    "idempotency key was already used with different input".to_owned(),
+                ));
+            }
+            return Ok(AdmitOutcome::Replayed(ExecutionReplay {
+                job_id: JobId(row.try_get("id").map_err(database_error)?),
+                stage,
+                error_code: row.try_get("error_code").map_err(database_error)?,
+                created_at: row.try_get("created_at").map_err(database_error)?,
+                updated_at: row.try_get("updated_at").map_err(database_error)?,
+            }));
+        }
+        let max_cost = to_i64(max_cost_microusd)?;
+        // 渠道全局容量按渠道串行化：并发的不同账户抢同一条渠道时，计数必须在同一把锁里做，
+        // 否则两边都读到"还没满"、各加一个槽位。加前缀避免与幂等锁的键空间相撞。
+        sqlx::query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))")
+            .bind(format!("channel:{}", offering.channel_id))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        // 资金最终检查：可用额（余额 − 占用）够这次保底额才占住；判据与扣减是同一条语句。
+        // 这条 UPDATE 锁住账户行，下面的在飞计数因此读到的是**上一个同账户事务提交后**的状态。
+        let reserved = sqlx::query(
+            r#"
+            UPDATE ledger.accounts
+            SET held_microusd = held_microusd + $2,
+                version = version + 1,
+                updated_at = now()
+            WHERE id = $1
+              AND kind = 'consumer'
+              AND balance_microusd::numeric - held_microusd::numeric >= $2
+            RETURNING balance_microusd, held_microusd,
+                      balance_microusd - held_microusd AS available_microusd,
+                      version, updated_at
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(max_cost)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or(ApplicationError::InsufficientBalance)?;
+        // 账户在飞名额：新协议的 admitted/executing 与旧协议的三态一起算；对账态不计（沿用既有排除）。
+        // 账户行已被上面那条 UPDATE 锁住，同账户的并发受理在这里排队，计数因此不会漏掉在飞的。
+        let in_flight: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*) FROM generation.jobs
+            WHERE account_id = $1
+              AND state IN ('accepted', 'leased', 'submitting', 'admitted', 'executing')
+            "#,
+        )
+        .bind(account_id.0)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if u64::try_from(in_flight).unwrap_or(u64::MAX) >= max_account_in_flight {
+            return Err(ApplicationError::TooManyInFlight);
+        }
+        // 渠道全局容量：持有的槽位各计一个未决任务；租约过期不证明上游结束，所以只认 released。
+        // 渠道咨询锁已在前面取过，同渠道的并发受理在这里排队。
+        let channel_held: i64 = sqlx::query_scalar(
+            "SELECT count(*) FROM generation.execution_capacity WHERE channel_id = $1 AND state = 'held'",
+        )
+        .bind(offering.channel_id.0)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if u64::try_from(channel_held).unwrap_or(u64::MAX) >= max_channel_in_flight {
+            return Err(ApplicationError::PlatformCapacityExhausted);
+        }
+        let job_id = JobId::new();
+        let hold_id = Uuid::new_v4();
+        let price_snapshot_value = serde_json::to_value(&price_snapshot)
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+        // 最小 Job：不写 idempotency_key / request_hash / native_parameters / carrier_schema，
+        // parameter_mapping 走列默认空对象；记录里只有冻结身份、摘要、保底与状态。
+        let job_row = sqlx::query(
+            r#"
+            INSERT INTO generation.jobs (
+                id, account_id, state, branch, gateway_model,
+                runtime_revision_id, vendor_model_id, offering_id, channel_id,
+                adapter_key, provider_model_id, base_url, credential_env,
+                price_snapshot, max_cost_microusd,
+                execution_protocol, idempotency_key_digest, idempotency_lookup_key_version,
+                request_digest, request_digest_key_version
+            ) VALUES (
+                $1,$2,'admitted',$3,$4,
+                $5,$6,$7,$8,
+                $9,$10,$11,$12,
+                $13,$14,
+                'v1',$15,$16,
+                $17,$18
+            )
+            RETURNING created_at, updated_at
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(account_id.0)
+        .bind(branch_name(branch))
+        .bind(&offering.gateway_model)
+        .bind(offering.runtime_revision_id.0)
+        .bind(offering.vendor_model_id.0)
+        .bind(offering.offering_id.0)
+        .bind(offering.channel_id.0)
+        .bind(&offering.adapter_key)
+        .bind(&offering.provider_model_id)
+        .bind(&offering.base_url)
+        .bind(&offering.credential_env)
+        .bind(&price_snapshot_value)
+        .bind(max_cost)
+        .bind(&idempotency_key_digest)
+        .bind(idempotency_lookup_key_version)
+        .bind(&request_digest)
+        .bind(request_digest_key_version)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        sqlx::query(
+            "INSERT INTO ledger.holds (id, account_id, job_id, amount_microusd, status) VALUES ($1,$2,$3,$4,'active')",
+        )
+        .bind(hold_id)
+        .bind(account_id.0)
+        .bind(job_id.0)
+        .bind(max_cost)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let considered = serde_json::to_value(&routing.considered)
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+        sqlx::query(
+            r#"
+            INSERT INTO generation.routing_decisions
+                (job_id, runtime_revision_id, chosen_offering_id, considered)
+            VALUES ($1, $2, $3, $4)
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(routing.runtime_revision_id.0)
+        .bind(routing.chosen_offering_id.0)
+        .bind(&considered)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 渠道全局容量事实与受理同事务获取；释放只发生在确定终态或可信人工处置。
+        sqlx::query(
+            "INSERT INTO generation.execution_capacity (id, job_id, channel_id, state) VALUES ($1,$2,$3,'held')",
+        )
+        .bind(Uuid::new_v4())
+        .bind(job_id.0)
+        .bind(offering.channel_id.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        let balance = balance_change(&reserved, account_id)?;
+        Ok(AdmitOutcome::Admitted {
+            job: AdmittedJob {
+                job_id,
+                account_id,
+                stage: ExecutionStage::Admitted,
+                branch,
+                offering_id: offering.offering_id,
+                channel_id: offering.channel_id,
+                runtime_revision_id: offering.runtime_revision_id,
+                fencing_token: FencingToken::new(0),
+                max_cost_microusd,
+                created_at: job_row.try_get("created_at").map_err(database_error)?,
+                updated_at: job_row.try_get("updated_at").map_err(database_error)?,
+            },
+            balance,
+        })
+    }
+
+    async fn begin_submission(
+        &self,
+        command: BeginSubmission,
+    ) -> Result<SubmissionStarted, ApplicationError> {
+        let BeginSubmission {
+            job_id,
+            execution_owner,
+            fencing_token,
+            deadline,
+            lease,
+        } = command;
+        let token = to_i64(fencing_token.get())?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 锁 Job 行并一次取齐检查用的事实；期限用数据库时钟判，不认调用方进程时钟。
+        let job = sqlx::query(
+            r#"
+            SELECT state, execution_protocol, execution_owner, fencing_token,
+                   request_digest, clock_timestamp() < $2 AS before_deadline
+            FROM generation.jobs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(deadline)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
+        let protocol: String = job.try_get("execution_protocol").map_err(database_error)?;
+        if protocol != ExecutionProtocol::V1.as_str() {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is not a v1 execution record"
+            )));
+        }
+        let state: String = job.try_get("state").map_err(database_error)?;
+        let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+            ApplicationError::Persistence(format!("job state {state} is not a v1 execution stage"))
+        })?;
+        // 只允许从 admitted 开始或 executing 重投：成功/失败是不可重开的终态，
+        // reconciliation_required 禁止自动重提（Spec 0005 §5）。
+        if !matches!(stage, ExecutionStage::Admitted | ExecutionStage::Executing) {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is {state}, not submittable"
+            )));
+        }
+        let stored_owner: Option<String> =
+            job.try_get("execution_owner").map_err(database_error)?;
+        // 库为空说明这次是首次认领；已经写在别的调用方名下（例如接管之后）一律冲突。
+        if stored_owner
+            .as_deref()
+            .is_some_and(|owner| owner != execution_owner)
+        {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is owned by another execution"
+            )));
+        }
+        let stored_token: i64 = job.try_get("fencing_token").map_err(database_error)?;
+        if stored_token != token {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} fencing token does not match"
+            )));
+        }
+        let before_deadline: bool = job.try_get("before_deadline").map_err(database_error)?;
+        if !before_deadline {
+            return Err(ApplicationError::ExecutionDeadlineExceeded);
+        }
+        // 当前 Attempt 正确：同一台 Job 不能有还没收尾的 Attempt——submitting/accepted 说明提交
+        // 可能已经在飞，unknown 说明结果不明，都不许再发第二次生成请求。
+        let open_attempts: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*) FROM generation.attempts
+            WHERE job_id = $1 AND state IN ('prepared', 'submitting', 'accepted', 'unknown')
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if open_attempts > 0 {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} already has an unfinished attempt"
+            )));
+        }
+        // 号在同一台 Job 的行锁里算（上面的 FOR UPDATE 已锁住），并发提交不会拿到同一个号。
+        let attempt_no: i32 = sqlx::query_scalar(
+            "SELECT coalesce(max(attempt_no), 0) + 1 FROM generation.attempts WHERE job_id = $1",
+        )
+        .bind(job_id.0)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let attempt_no = u32::try_from(attempt_no).map_err(|_| {
+            ApplicationError::Persistence("attempt number overflows the 32-bit range".to_owned())
+        })?;
+        // 旧协议 attempts.request_digest 是 NOT NULL；v1 的 Attempt 记录不另立每次执行的请求摘要
+        // （RFC 0017 §3），落到这里的是这台 Job 冻结的请求指纹——本次执行所依据的那个请求事实。
+        let request_digest: Option<String> =
+            job.try_get("request_digest").map_err(database_error)?;
+        let request_digest = request_digest.ok_or_else(|| {
+            ApplicationError::Persistence(format!("job {job_id} has no request digest"))
+        })?;
+        let attempt_id = AttemptId::new();
+        sqlx::query(
+            r#"
+            INSERT INTO generation.attempts (id, job_id, state, request_digest, attempt_no)
+            VALUES ($1,$2,'submitting',$3,$4)
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .bind(&request_digest)
+        .bind(i32::try_from(attempt_no).map_err(|_| {
+            ApplicationError::Persistence("attempt number is out of range".to_owned())
+        })?)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // Job 进 executing 并写下本次执行的所有权与租约；重投时 owner 与 token 不变。
+        // 与所有权相关的写只认 v1，legacy 记录即使撞上同一 id 也不在这里改。
+        sqlx::query(
+            r#"
+            UPDATE generation.jobs
+            SET state = 'executing', execution_owner = $2,
+                lease_expires_at = now() + ($3::bigint * interval '1 millisecond'),
+                version = version + 1, updated_at = now()
+            WHERE id = $1 AND execution_protocol = 'v1'
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(&execution_owner)
+        .bind(lease.num_milliseconds())
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(SubmissionStarted {
+            job_id,
+            attempt_id,
+            attempt_no,
+        })
+    }
+
+    async fn record_acceptance(&self, command: RecordAcceptance) -> Result<(), ApplicationError> {
+        let RecordAcceptance {
+            job_id,
+            attempt_id,
+            execution_owner,
+            fencing_token,
+            provider_task_handle,
+            provider_trace_id,
+        } = command;
+        let token = to_i64(fencing_token.get())?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 锁序与结算一致：先锁 Job 行，再锁 Attempt 行。
+        let job = sqlx::query(
+            r#"
+            SELECT state, execution_owner, fencing_token, provider_task_handle
+            FROM generation.jobs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
+        let state: String = job.try_get("state").map_err(database_error)?;
+        if state != ExecutionStage::Executing.as_str() {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is {state}, not executing"
+            )));
+        }
+        let stored_owner: Option<String> =
+            job.try_get("execution_owner").map_err(database_error)?;
+        if stored_owner.as_deref() != Some(execution_owner.as_str()) {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is owned by another execution"
+            )));
+        }
+        let stored_token: i64 = job.try_get("fencing_token").map_err(database_error)?;
+        if stored_token != token {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} fencing token does not match"
+            )));
+        }
+        let attempt = sqlx::query(
+            r#"
+            SELECT state, provider_trace_id
+            FROM generation.attempts
+            WHERE id = $1 AND job_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            ApplicationError::Conflict(format!(
+                "attempt {attempt_id} does not belong to job {job_id}"
+            ))
+        })?;
+        let attempt_state: String = attempt.try_get("state").map_err(database_error)?;
+        if attempt_state == AttemptStage::Accepted.as_str() {
+            // 重复事实幂等（RFC 0017 §3）：同一 Attempt 已经记下同一组句柄就返回成功，不重复写；
+            // 换了事实就冲突，不覆盖原记录。
+            let stored_trace: Option<String> = attempt
+                .try_get("provider_trace_id")
+                .map_err(database_error)?;
+            let stored_handle: Option<String> = job
+                .try_get("provider_task_handle")
+                .map_err(database_error)?;
+            if stored_trace == provider_trace_id && stored_handle == provider_task_handle {
+                transaction.rollback().await.map_err(database_error)?;
+                return Ok(());
+            }
+            return Err(ApplicationError::Conflict(format!(
+                "attempt {attempt_id} was already accepted with different facts"
+            )));
+        }
+        if attempt_state != AttemptStage::Submitting.as_str() {
+            return Err(ApplicationError::Conflict(format!(
+                "attempt {attempt_id} is {attempt_state}, not submitting"
+            )));
+        }
+        sqlx::query(
+            r#"
+            UPDATE generation.attempts
+            SET state = 'accepted', provider_trace_id = $2
+            WHERE id = $1 AND job_id = $3
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(&provider_trace_id)
+        .bind(job_id.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 任务句柄落 Job：只有入库确认之后才允许按它查询；同步渠道没有句柄时保持 NULL。
+        sqlx::query(
+            r#"
+            UPDATE generation.jobs
+            SET provider_task_handle = $2, version = version + 1, updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(&provider_task_handle)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(())
+    }
+
+    async fn settle(
+        &self,
+        command: SettleExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        let SettleExecution {
+            job_id,
+            attempt_id,
+            execution_owner,
+            fencing_token,
+            evidence,
+            provider_cost,
+            charge_microusd,
+            provider_trace_id,
+        } = command;
+        // 证据必须指认本次 Attempt：没有有效计量证据不做正式结算（ADR 0006），拿错 Attempt 的证据
+        // 更不能落账。
+        if evidence.attempt_id != attempt_id {
+            return Err(ApplicationError::Persistence(
+                "metering evidence attempt does not match the settled attempt".to_owned(),
+            ));
+        }
+        let token = to_i64(fencing_token.get())?;
+        let charge = to_i64(charge_microusd)?;
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 锁序固定为 Job → Attempt → Hold → 账户：与 begin_submission/record_acceptance 一样先锁 Job，
+        // 同 Job 的并发收尾因此排在同一把行锁后面；settle 与 fail_or_reconcile 的锁序完全一致。
+        let job = sqlx::query(
+            r#"
+            SELECT account_id, state, execution_protocol, execution_owner, fencing_token
+            FROM generation.jobs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
+        let protocol: String = job.try_get("execution_protocol").map_err(database_error)?;
+        if protocol != ExecutionProtocol::V1.as_str() {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is not a v1 execution record"
+            )));
+        }
+        let account_id = AccountId(job.try_get("account_id").map_err(database_error)?);
+        let state: String = job.try_get("state").map_err(database_error)?;
+        let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+            ApplicationError::Persistence(format!("job state {state} is not a v1 execution stage"))
+        })?;
+        let stored_owner: Option<String> =
+            job.try_get("execution_owner").map_err(database_error)?;
+        if stored_owner.as_deref() != Some(execution_owner.as_str()) {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is owned by another execution"
+            )));
+        }
+        let stored_token: i64 = job.try_get("fencing_token").map_err(database_error)?;
+        if stored_token != token {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} fencing token does not match"
+            )));
+        }
+        let attempt = sqlx::query(
+            r#"
+            SELECT state, metering_evidence
+            FROM generation.attempts
+            WHERE id = $1 AND job_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            ApplicationError::Conflict(format!(
+                "attempt {attempt_id} does not belong to job {job_id}"
+            ))
+        })?;
+        let attempt_state: String = attempt.try_get("state").map_err(database_error)?;
+        // 已经成功收尾过的重复结算：同 Attempt 同证据直接回已提交结果，不重复扣费；证据不同则建对账
+        // 案例、不覆盖原结果——钱已经定了，第二次调用不该把已提交的结算当成失败。
+        if stage == ExecutionStage::Succeeded {
+            if attempt_state != AttemptStage::Terminal.as_str() {
+                return Err(ApplicationError::Conflict(format!(
+                    "attempt {attempt_id} is {attempt_state}, not the settled attempt of job {job_id}"
+                )));
+            }
+            let stored_evidence = attempt_metering_evidence(&attempt)?;
+            if stored_evidence.as_ref() == Some(&evidence) {
+                transaction.rollback().await.map_err(database_error)?;
+                return committed_finalization(&self.pool, job_id, attempt_id).await;
+            }
+            sqlx::query(
+                r#"
+                INSERT INTO operations.reconciliation_cases
+                    (id, job_id, attempt_id, account_id, reason)
+                VALUES ($1,$2,$3,$4,'settlement retried with different metering evidence')
+                ON CONFLICT (job_id) DO NOTHING
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(job_id.0)
+            .bind(attempt_id.0)
+            .bind(account_id.0)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            transaction.commit().await.map_err(database_error)?;
+            return committed_finalization(&self.pool, job_id, attempt_id).await;
+        }
+        // 只有执行中与对账态能收成成功：admitted 还没发出请求，failed 是不可重开的终态。
+        if !matches!(
+            stage,
+            ExecutionStage::Executing | ExecutionStage::ReconciliationRequired
+        ) {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is {state}, not settleable"
+            )));
+        }
+        // 预授权行：释放按它自己记下的金额，保证账户占用合计与 active Hold 之和一致。
+        let (hold_id, hold_amount) = lock_active_hold(&mut transaction, job_id).await?;
+        // Attempt 落 terminal 与计量证据/成本事实：成功路径的成本只进毛利口径，不落平台账本。
+        let evidence_json = serde_json::to_value(&evidence)
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+        let (cost_amount, cost_currency, cost_source, cost_cny) =
+            provider_cost_columns(&provider_cost)?;
+        sqlx::query(
+            r#"
+            UPDATE generation.attempts
+            SET state = 'terminal', response_digest = $3, metering_evidence = $4,
+                provider_trace_id = $5, provider_cost_microusd = $6,
+                provider_cost_currency = $7, provider_cost_source = $8,
+                provider_cost_cny_microusd = $9, completed_at = now()
+            WHERE id = $1 AND job_id = $2
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .bind(&evidence.provider_response_digest)
+        .bind(&evidence_json)
+        .bind(&provider_trace_id)
+        .bind(cost_amount)
+        .bind(&cost_currency)
+        .bind(cost_source)
+        .bind(cost_cny)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // Job 进 succeeded 并盖 terminal_at；对账态晚到的证据也在这里收成成功。
+        sqlx::query(
+            r#"
+            UPDATE generation.jobs
+            SET state = 'succeeded', error_code = NULL, error_message = NULL, failure_kind = NULL,
+                terminal_at = now(), version = version + 1, updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(job_id.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 账户：只按实收减少余额，同时按预授权额去掉占用。实收可高于预授权额，差额把余额扣成负数
+        // （透支在结算吸收）；低于预授权额时未花的部分只恢复可用额，不产生退款。
+        let updated = sqlx::query(
+            r#"
+            UPDATE ledger.accounts
+            SET balance_microusd = balance_microusd - $2,
+                held_microusd = held_microusd - $3,
+                version = version + 1,
+                updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(charge)
+        .bind(hold_amount)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        sqlx::query(
+            "UPDATE ledger.holds SET status = 'captured', updated_at = now() WHERE id = $1 AND status = 'active'",
+        )
+        .bind(hold_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 真实收支才记流水、零额不写；每日合计与 capture 同一事务累加（结算日，0013 §4）。
+        if charge > 0 {
+            insert_ledger_entry(
+                &mut transaction,
+                account_id,
+                Some(job_id),
+                "capture",
+                -charge,
+                &format!("job:{job_id}:capture"),
+            )
+            .await?;
+            sqlx::query(
+                r#"
+                INSERT INTO ledger.daily_spend (account_id, day, settled_microusd)
+                VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2)
+                ON CONFLICT (account_id, day) DO UPDATE
+                SET settled_microusd = ledger.daily_spend.settled_microusd + EXCLUDED.settled_microusd,
+                    updated_at = now()
+                "#,
+            )
+            .bind(account_id.0)
+            .bind(charge)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        // 渠道容量槽位随确定终态释放，与终态同事务（RFC 0017 §6）。
+        release_channel_slot(&mut transaction, job_id).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(ExecutionFinalization {
+            job_id,
+            attempt_id,
+            stage: ExecutionStage::Succeeded,
+            charge_microusd,
+        })
+    }
+
+    async fn fail_or_reconcile(
+        &self,
+        command: FailOrReconcileExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        let FailOrReconcileExecution {
+            job_id,
+            attempt_id,
+            execution_owner,
+            fencing_token,
+            error_code,
+            failure_kind,
+            provider_cost,
+            disposition,
+            provider_trace_id,
+        } = command;
+        let token = to_i64(fencing_token.get())?;
+        // 处置决定终态与 Attempt 形态：确定失败释放，结果未知转对账，可重试的中间失败保留 executing。
+        let (target_state, target_attempt_state, release) = match disposition {
+            FailureDisposition::DeterminedFailure => (
+                Some(ExecutionStage::Failed),
+                AttemptStage::Terminal.as_str(),
+                true,
+            ),
+            FailureDisposition::SafeRetry => (None, AttemptStage::Terminal.as_str(), false),
+            FailureDisposition::Unknown => (
+                Some(ExecutionStage::ReconciliationRequired),
+                AttemptStage::Unknown.as_str(),
+                false,
+            ),
+        };
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        let job = sqlx::query(
+            r#"
+            SELECT account_id, state, execution_protocol, execution_owner, fencing_token
+            FROM generation.jobs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
+        let protocol: String = job.try_get("execution_protocol").map_err(database_error)?;
+        if protocol != ExecutionProtocol::V1.as_str() {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is not a v1 execution record"
+            )));
+        }
+        let account_id = AccountId(job.try_get("account_id").map_err(database_error)?);
+        let state: String = job.try_get("state").map_err(database_error)?;
+        let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+            ApplicationError::Persistence(format!("job state {state} is not a v1 execution stage"))
+        })?;
+        let stored_owner: Option<String> =
+            job.try_get("execution_owner").map_err(database_error)?;
+        if stored_owner.as_deref() != Some(execution_owner.as_str()) {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is owned by another execution"
+            )));
+        }
+        let stored_token: i64 = job.try_get("fencing_token").map_err(database_error)?;
+        if stored_token != token {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} fencing token does not match"
+            )));
+        }
+        let attempt = sqlx::query(
+            r#"
+            SELECT state
+            FROM generation.attempts
+            WHERE id = $1 AND job_id = $2
+            FOR UPDATE
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| {
+            ApplicationError::Conflict(format!(
+                "attempt {attempt_id} does not belong to job {job_id}"
+            ))
+        })?;
+        let stored_attempt_state: String = attempt.try_get("state").map_err(database_error)?;
+        // 重复调用幂等：同一处置且 Attempt 已按它收尾，直接回已提交结果，不再释放、不再记成本。
+        match stage {
+            ExecutionStage::Succeeded => {
+                return Err(ApplicationError::Conflict(format!(
+                    "job {job_id} is succeeded, not reconcilable"
+                )));
+            }
+            ExecutionStage::Failed => {
+                if disposition != FailureDisposition::DeterminedFailure
+                    || stored_attempt_state != target_attempt_state
+                {
+                    return Err(ApplicationError::Conflict(format!(
+                        "job {job_id} is already {state} with attempt {stored_attempt_state}"
+                    )));
+                }
+                transaction.rollback().await.map_err(database_error)?;
+                return committed_finalization(&self.pool, job_id, attempt_id).await;
+            }
+            ExecutionStage::ReconciliationRequired => match disposition {
+                // 对账后确认为无需收费的失败：按释放占用收成 failed（RFC 0017 §5）。
+                FailureDisposition::DeterminedFailure => {}
+                FailureDisposition::Unknown => {
+                    if stored_attempt_state != target_attempt_state {
+                        return Err(ApplicationError::Conflict(format!(
+                            "job {job_id} is {state} with attempt {stored_attempt_state}"
+                        )));
+                    }
+                    transaction.rollback().await.map_err(database_error)?;
+                    return committed_finalization(&self.pool, job_id, attempt_id).await;
+                }
+                FailureDisposition::SafeRetry => {
+                    return Err(ApplicationError::Conflict(format!(
+                        "job {job_id} is {state}; a retryable failure needs an executing job"
+                    )));
+                }
+            },
+            // 中间可重试失败只发生在已提交过的执行上；admitted 还没发过请求。
+            ExecutionStage::Admitted => {
+                if disposition == FailureDisposition::SafeRetry {
+                    return Err(ApplicationError::Conflict(format!(
+                        "job {job_id} is admitted; there is no attempt to retry"
+                    )));
+                }
+            }
+            ExecutionStage::Executing => {}
+        }
+        // 成本事实与失败事实一起落：渠道原文不写，四列按来源形状落，成本缺口由 unavailable 标出。
+        let (cost_amount, cost_currency, cost_source, cost_cny) = match &provider_cost {
+            Some(cost) => {
+                let (amount, currency, source, cny) = provider_cost_columns(cost)?;
+                (amount, currency, Some(source), cny)
+            }
+            None => (None, None, None, None),
+        };
+        sqlx::query(
+            r#"
+            UPDATE generation.attempts
+            SET state = $3, provider_trace_id = $4,
+                provider_cost_microusd = $5, provider_cost_currency = $6,
+                provider_cost_source = $7, provider_cost_cny_microusd = $8,
+                completed_at = now()
+            WHERE id = $1 AND job_id = $2
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .bind(target_attempt_state)
+        .bind(&provider_trace_id)
+        .bind(cost_amount)
+        .bind(&cost_currency)
+        .bind(cost_source)
+        .bind(cost_cny)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        match target_state {
+            Some(target) => {
+                sqlx::query(
+                    r#"
+                    UPDATE generation.jobs
+                    SET state = $2, error_code = $3, error_message = $4, failure_kind = $5,
+                        terminal_at = CASE WHEN $2 = 'failed' THEN now() ELSE NULL END,
+                        version = version + 1, updated_at = now()
+                    WHERE id = $1
+                    "#,
+                )
+                .bind(job_id.0)
+                .bind(target.as_str())
+                .bind(error_code.as_str())
+                .bind(error_code.default_message())
+                .bind(failure_kind.as_str())
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            }
+            None => {
+                // 中间可重试失败：Job 仍是 executing，不写错误字段与终态时刻，只推进版本。
+                sqlx::query(
+                    "UPDATE generation.jobs SET version = version + 1, updated_at = now() WHERE id = $1",
+                )
+                .bind(job_id.0)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            }
+        }
+        // 平台自担的成本在收尾这一刻进账本：与预授权怎么处置无关；金额为 0 或没有折算值不写，
+        // 那不是"花掉 0 元"，是"这次没有可记账的成本事实"。
+        if let Some(cny) = provider_cost
+            .as_ref()
+            .and_then(|cost| cost.cny_microusd)
+            .filter(|amount| *amount > 0)
+        {
+            insert_platform_cost(&mut transaction, job_id, attempt_id, to_i64(cny)?).await?;
+        }
+        if release {
+            // 释放占用：锁 Hold 再动账户，与 settle 同一锁序。
+            let (hold_id, hold_amount) = lock_active_hold(&mut transaction, job_id).await?;
+            sqlx::query(
+                "UPDATE ledger.holds SET status = 'released', updated_at = now() WHERE id = $1 AND status = 'active'",
+            )
+            .bind(hold_id)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            // 确定无需收费：只把占用从占用合计里去掉，不动已结算余额、不写对客流水。
+            let updated = sqlx::query(
+                r#"
+                UPDATE ledger.accounts
+                SET held_microusd = held_microusd - $2,
+                    version = version + 1,
+                    updated_at = now()
+                WHERE id = $1
+                "#,
+            )
+            .bind(account_id.0)
+            .bind(hold_amount)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+            if updated.rows_affected() != 1 {
+                return Err(ApplicationError::NotFound(format!("account {account_id}")));
+            }
+            release_channel_slot(&mut transaction, job_id).await?;
+        } else if disposition == FailureDisposition::Unknown {
+            // 结果未知：占用与槽位都保留，只建对账案例。理由用平台生成的有界文案，不含渠道原文。
+            sqlx::query(
+                r#"
+                INSERT INTO operations.reconciliation_cases
+                    (id, job_id, attempt_id, account_id, reason)
+                VALUES ($1,$2,$3,$4,$5)
+                ON CONFLICT (job_id) DO NOTHING
+                "#,
+            )
+            .bind(Uuid::new_v4())
+            .bind(job_id.0)
+            .bind(attempt_id.0)
+            .bind(account_id.0)
+            .bind(format!(
+                "{}: {}",
+                failure_kind.as_str(),
+                error_code.default_message()
+            ))
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(ExecutionFinalization {
+            job_id,
+            attempt_id,
+            stage: target_state.unwrap_or(ExecutionStage::Executing),
+            charge_microusd: 0,
+        })
+    }
+
+    async fn read_finalization(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+    ) -> Result<Option<ExecutionFinalization>, ApplicationError> {
+        // 只读：Attempt 必须属于这台 Job，且已经以 terminal（成功/确定失败）或 unknown（转对账）
+        // 收尾，才谈得上"已提交的收尾"。Job 不是 v1、还没收尾、Attempt 不属于该 Job 一律回答
+        // "未提交"。
+        let row = sqlx::query(
+            r#"
+            SELECT j.execution_protocol, a.state AS attempt_state
+            FROM generation.jobs j
+            JOIN generation.attempts a ON a.id = $2 AND a.job_id = j.id
+            WHERE j.id = $1
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(attempt_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(None);
+        };
+        let protocol: String = row.try_get("execution_protocol").map_err(database_error)?;
+        if protocol != ExecutionProtocol::V1.as_str() {
+            return Ok(None);
+        }
+        let attempt_state: String = row.try_get("attempt_state").map_err(database_error)?;
+        if attempt_state != AttemptStage::Terminal.as_str()
+            && attempt_state != AttemptStage::Unknown.as_str()
+        {
+            return Ok(None);
+        }
+        // 已提交的实收与阶段只有一处读法（committed_finalization）；未收尾时那里也如实报告。
+        let finalization = committed_finalization(&self.pool, job_id, attempt_id).await?;
+        if matches!(
+            finalization.stage,
+            ExecutionStage::Succeeded
+                | ExecutionStage::Failed
+                | ExecutionStage::ReconciliationRequired
+        ) {
+            Ok(Some(finalization))
+        } else {
+            Ok(None)
+        }
+    }
+
+    async fn offer_late_facts(
+        &self,
+        facts: LateFacts,
+    ) -> Result<LateFactsOutcome, ApplicationError> {
+        let LateFacts {
+            job_id,
+            attempt_id,
+            provider_task_handle,
+            provider_trace_id,
+            image_count,
+            evidence,
+            provider_cost,
+        } = facts;
+        let image_count = image_count
+            .map(|count| {
+                i32::try_from(count).map_err(|_| {
+                    ApplicationError::Validation("image count is out of range".to_owned())
+                })
+            })
+            .transpose()?;
+        // 只收有界事实：没有可收内容的调用当成关联不上，不写空行。
+        if provider_task_handle.is_none() && evidence.is_none() && provider_cost.is_none() {
+            return Ok(LateFactsOutcome::Ignored);
+        }
+        if evidence
+            .as_ref()
+            .is_some_and(|evidence| evidence.attempt_id != attempt_id)
+        {
+            return Ok(LateFactsOutcome::Ignored);
+        }
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 关联核对：Job 必须是 v1，Attempt 必须属于该 Job。它只决定收不收，不改所有权、状态或终态。
+        let row = sqlx::query(
+            r#"
+            SELECT j.execution_protocol
+            FROM generation.jobs j
+            JOIN generation.attempts a ON a.id = $2 AND a.job_id = j.id
+            WHERE j.id = $1
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(attempt_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let Some(row) = row else {
+            return Ok(LateFactsOutcome::Ignored);
+        };
+        let protocol: String = row.try_get("execution_protocol").map_err(database_error)?;
+        if protocol != ExecutionProtocol::V1.as_str() {
+            return Ok(LateFactsOutcome::Ignored);
+        }
+        let mut outcome = LateFactsOutcome::Received;
+        if let Some(handle) = provider_task_handle.as_deref() {
+            let digest = late_fact_digest(&[
+                handle.as_bytes(),
+                provider_trace_id.as_deref().unwrap_or("").as_bytes(),
+            ]);
+            match insert_late_fact(
+                &mut transaction,
+                job_id,
+                attempt_id,
+                "task_handle",
+                &digest,
+                Some(handle),
+                provider_trace_id.as_deref(),
+                None,
+                None,
+                None,
+            )
+            .await?
+            {
+                LateFactInsert::Inserted | LateFactInsert::Duplicate => {}
+                LateFactInsert::Conflict => {
+                    open_late_facts_case(&mut transaction, job_id, attempt_id).await?;
+                    outcome = LateFactsOutcome::Conflicted;
+                }
+            }
+        }
+        if evidence.is_some() || provider_cost.is_some() {
+            let evidence_json = evidence
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+            let evidence_bytes = evidence_json
+                .as_ref()
+                .map(serde_json::to_vec)
+                .transpose()
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+            let (cost_amount, cost_currency, cost_source, cost_cny) = match &provider_cost {
+                Some(cost) => provider_cost_columns(cost)?,
+                None => (None, None, "", None),
+            };
+            let amount = cost_amount
+                .map(|value| value.to_string())
+                .unwrap_or_default();
+            let cny = cost_cny.map(|value| value.to_string()).unwrap_or_default();
+            let image_count_text = image_count
+                .map(|count| count.to_string())
+                .unwrap_or_default();
+            let mut parts: Vec<&[u8]> = Vec::new();
+            if let Some(bytes) = evidence_bytes.as_deref() {
+                parts.push(bytes);
+            }
+            parts.push(provider_trace_id.as_deref().unwrap_or("").as_bytes());
+            parts.push(image_count_text.as_bytes());
+            parts.push(amount.as_bytes());
+            parts.push(cost_currency.as_deref().unwrap_or("").as_bytes());
+            parts.push(cost_source.as_bytes());
+            parts.push(cny.as_bytes());
+            let digest = late_fact_digest(&parts);
+            let cost_columns = provider_cost.as_ref().map(|_| LateFactCost {
+                amount_microusd: cost_amount,
+                currency: cost_currency.clone(),
+                source: cost_source,
+                cny_microusd: cost_cny,
+            });
+            match insert_late_fact(
+                &mut transaction,
+                job_id,
+                attempt_id,
+                "accounting",
+                &digest,
+                None,
+                provider_trace_id.as_deref(),
+                image_count,
+                evidence_json,
+                cost_columns,
+            )
+            .await?
+            {
+                LateFactInsert::Inserted | LateFactInsert::Duplicate => {}
+                LateFactInsert::Conflict => {
+                    open_late_facts_case(&mut transaction, job_id, attempt_id).await?;
+                    outcome = LateFactsOutcome::Conflicted;
+                }
+            }
+        }
+        transaction.commit().await.map_err(database_error)?;
+        Ok(outcome)
+    }
+
+    async fn renew_execution_ownership(
+        &self,
+        job_id: JobId,
+        execution_owner: &str,
+        fencing_token: FencingToken,
+        lease: ChronoDuration,
+    ) -> Result<(), ApplicationError> {
+        let token = to_i64(fencing_token.get())?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE generation.jobs
+            SET lease_expires_at = now() + ($4::bigint * interval '1 millisecond'),
+                updated_at = now()
+            WHERE id = $1
+              AND execution_protocol = 'v1'
+              AND execution_owner = $2
+              AND fencing_token = $3
+              AND state IN ('executing', 'reconciliation_required')
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(execution_owner)
+        .bind(token)
+        .bind(lease.num_milliseconds())
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} ownership cannot be renewed"
+            )));
+        }
+        Ok(())
+    }
+
+    async fn takeover_expired_executions(
+        &self,
+        worker_id: &str,
+        lease: ChronoDuration,
+        limit: u32,
+        max_query_attempts: u32,
+    ) -> Result<Vec<TakenOverExecution>, ApplicationError> {
+        // 一条语句完成比较并交换：candidates 用 FOR UPDATE SKIP LOCKED 钉住过期的 v1 执行，
+        // taken 在同一行锁上改所有权并把 token 加一。租约为空（没有有效所有权）与已过期同解。
+        // 查询排期在同一条语句里守门：有未结对账案例且未到 next_query_at、或 attempts 已到
+        // 上限的记录本轮不领走（RFC 0017 §5），没到点的跳过、额度用尽的转人工。
+        let rows = sqlx::query(
+            r#"
+            WITH candidates AS (
+                SELECT id
+                FROM generation.jobs j
+                WHERE execution_protocol = 'v1'
+                  AND state IN ('executing', 'reconciliation_required')
+                  AND (lease_expires_at IS NULL OR lease_expires_at <= now())
+                  AND NOT EXISTS (
+                      SELECT 1
+                      FROM operations.reconciliation_cases rc
+                      WHERE rc.job_id = j.id
+                        AND rc.status = 'open'
+                        AND (
+                            (rc.next_query_at IS NOT NULL AND rc.next_query_at > now())
+                            OR rc.attempts >= $4
+                        )
+                  )
+                ORDER BY lease_expires_at NULLS FIRST, created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $3
+            ),
+            taken AS (
+                UPDATE generation.jobs j
+                SET execution_owner = $1,
+                    fencing_token = j.fencing_token + 1,
+                    lease_expires_at = now() + ($2::bigint * interval '1 millisecond'),
+                    updated_at = now()
+                FROM candidates c
+                WHERE j.id = c.id
+                RETURNING j.id, j.state, j.account_id, j.fencing_token, j.adapter_key,
+                          j.base_url, j.credential_env, j.price_snapshot, j.provider_task_handle,
+                          j.channel_id
+            )
+            SELECT t.id AS job_id, t.state AS job_state, t.account_id, t.fencing_token,
+                   t.adapter_key, t.base_url, t.credential_env, t.price_snapshot,
+                   t.provider_task_handle, c.provider_kind,
+                   a.id AS attempt_id, a.state AS attempt_state, a.provider_trace_id,
+                   COALESCE(rc.attempts, 0) AS query_attempts, rc.next_query_at
+            FROM taken t
+            JOIN supply.channels c ON c.id = t.channel_id
+            LEFT JOIN operations.reconciliation_cases rc
+                ON rc.job_id = t.id AND rc.status = 'open'
+            LEFT JOIN LATERAL (
+                SELECT id, state, provider_trace_id
+                FROM generation.attempts
+                WHERE job_id = t.id
+                ORDER BY attempt_no DESC
+                LIMIT 1
+            ) a ON true
+            ORDER BY t.id
+            "#,
+        )
+        .bind(worker_id)
+        .bind(lease.num_milliseconds())
+        .bind(i64::from(limit))
+        .bind(i64::from(max_query_attempts))
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(taken_over_execution).collect()
+    }
+
+    async fn reap_unsubmitted_admissions(
+        &self,
+        max_age: ChronoDuration,
+        limit: u32,
+    ) -> Result<u64, ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 只领 admitted 且没有任何 Attempt 的 v1 执行：没有提交声明就确定没有外部副作用。
+        // 锁序与结算一致：先 Job 行，再 Hold，最后账户。
+        let rows = sqlx::query(
+            r#"
+            WITH candidates AS (
+                SELECT j.id
+                FROM generation.jobs j
+                WHERE j.execution_protocol = 'v1'
+                  AND j.state = 'admitted'
+                  AND j.created_at <= now() - ($1::bigint * interval '1 millisecond')
+                  AND NOT EXISTS (
+                      SELECT 1 FROM generation.attempts a WHERE a.job_id = j.id
+                  )
+                ORDER BY j.created_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $2
+            ),
+            orphaned AS (
+                UPDATE generation.jobs j
+                SET state = 'failed', terminal_at = now(),
+                    version = version + 1, updated_at = now()
+                FROM candidates c
+                WHERE j.id = c.id
+                RETURNING j.id
+            )
+            SELECT id FROM orphaned
+            "#,
+        )
+        .bind(max_age.num_milliseconds())
+        .bind(i64::from(limit))
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if rows.is_empty() {
+            transaction.commit().await.map_err(database_error)?;
+            return Ok(0);
+        }
+        let job_ids: Vec<Uuid> = rows
+            .iter()
+            .map(|row| row.try_get("id").map_err(database_error))
+            .collect::<Result<_, ApplicationError>>()?;
+        // 释放占用：锁 Hold 行，按每行自己记的金额把占用从账户合计里去掉（与结算同一口径）。
+        let released = sqlx::query(
+            r#"
+            UPDATE ledger.holds
+            SET status = 'released', updated_at = now()
+            WHERE job_id = ANY($1) AND status = 'active'
+            RETURNING account_id, amount_microusd
+            "#,
+        )
+        .bind(&job_ids)
+        .fetch_all(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        let mut by_account: HashMap<Uuid, i64> = HashMap::new();
+        for row in &released {
+            let account_id: Uuid = row.try_get("account_id").map_err(database_error)?;
+            let amount: i64 = row.try_get("amount_microusd").map_err(database_error)?;
+            *by_account.entry(account_id).or_default() += amount;
+        }
+        for (account_id, amount) in by_account {
+            sqlx::query(
+                r#"
+                UPDATE ledger.accounts
+                SET held_microusd = held_microusd - $2,
+                    version = version + 1, updated_at = now()
+                WHERE id = $1
+                "#,
+            )
+            .bind(account_id)
+            .bind(amount)
+            .execute(&mut *transaction)
+            .await
+            .map_err(database_error)?;
+        }
+        // 未被提交的外部请求不再占用渠道全局槽位。
+        sqlx::query(
+            r#"
+            UPDATE generation.execution_capacity
+            SET state = 'released', released_at = now()
+            WHERE job_id = ANY($1) AND state = 'held'
+            "#,
+        )
+        .bind(&job_ids)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
+        u64::try_from(job_ids.len()).map_err(|_| {
+            ApplicationError::Persistence("reaped admission count overflow".to_owned())
+        })
+    }
+
+    async fn claim_unconsumed_late_facts(
+        &self,
+        worker_id: &str,
+        limit: u32,
+        claim_ttl: ChronoDuration,
+    ) -> Result<Vec<ClaimedLateFact>, ApplicationError> {
+        // 领取不是消费：只盖 claimed_by/claimed_at；领取超过 TTL 的行可被另一领取者覆盖，
+        // 所以失败重试不需要手工解锁。consumed_at 只由 mark_late_fact_consumed 写。
+        let rows = sqlx::query(
+            r#"
+            WITH candidates AS (
+                SELECT id
+                FROM generation.late_facts
+                WHERE consumed_at IS NULL
+                  AND (claimed_at IS NULL
+                       OR claimed_at <= now() - ($3::bigint * interval '1 millisecond'))
+                ORDER BY received_at
+                FOR UPDATE SKIP LOCKED
+                LIMIT $2
+            )
+            UPDATE generation.late_facts lf
+            SET claimed_by = $1, claimed_at = now()
+            FROM candidates c
+            WHERE lf.id = c.id
+            RETURNING lf.id, lf.job_id, lf.attempt_id, lf.kind,
+                      lf.provider_task_handle, lf.provider_trace_id, lf.image_count,
+                      lf.metering_evidence, lf.provider_cost_microusd,
+                      lf.provider_cost_currency, lf.provider_cost_source,
+                      lf.provider_cost_cny_microusd
+            "#,
+        )
+        .bind(worker_id)
+        .bind(i64::from(limit))
+        .bind(claim_ttl.num_milliseconds())
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter().map(claimed_late_fact).collect()
+    }
+
+    async fn mark_late_fact_consumed(&self, id: Uuid) -> Result<bool, ApplicationError> {
+        let updated = sqlx::query(
+            "UPDATE generation.late_facts SET consumed_at = now() WHERE id = $1 AND consumed_at IS NULL",
+        )
+        .bind(id)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+
+    async fn record_reconciliation_query_attempt(
+        &self,
+        job_id: JobId,
+        backoff: ChronoDuration,
+    ) -> Result<Option<u32>, ApplicationError> {
+        // 只推进未结案例：没有案例（例如仍在 executing）时 0 行，不新建案例。
+        let attempts: Option<i32> = sqlx::query_scalar(
+            r#"
+            UPDATE operations.reconciliation_cases
+            SET attempts = attempts + 1,
+                next_query_at = now() + ($2::bigint * interval '1 millisecond')
+            WHERE job_id = $1 AND status = 'open'
+            RETURNING attempts
+            "#,
+        )
+        .bind(job_id.0)
+        .bind(backoff.num_milliseconds())
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        attempts
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    ApplicationError::Persistence(
+                        "reconciliation query attempts overflow".to_owned(),
+                    )
+                })
+            })
+            .transpose()
+    }
+
+    async fn record_terminal_provider_cost(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+        cost: &ProviderCostFact,
+    ) -> Result<bool, ApplicationError> {
+        // 只补空位与缺口：真实成本事实不被覆盖，也不会被降成 unavailable。状态与对客金额一律不动。
+        let (amount, currency, source, cny) = provider_cost_columns(cost)?;
+        let updated = sqlx::query(
+            r#"
+            UPDATE generation.attempts
+            SET provider_cost_microusd = $3, provider_cost_currency = $4,
+                provider_cost_source = $5, provider_cost_cny_microusd = $6
+            WHERE id = $1 AND job_id = $2
+              AND state = 'terminal'
+              AND (provider_cost_source IS NULL OR provider_cost_source = 'unavailable')
+            "#,
+        )
+        .bind(attempt_id.0)
+        .bind(job_id.0)
+        .bind(amount)
+        .bind(currency)
+        .bind(source)
+        .bind(cny)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(updated.rows_affected() == 1)
+    }
+}
+
+/// 接管查询的一行 → 只读投影：Attempt 可缺（没有 Attempt 的执行），状态取值未知按持久化错误报出。
+fn taken_over_execution(
+    row: &sqlx::postgres::PgRow,
+) -> Result<TakenOverExecution, ApplicationError> {
+    let attempt_id: Option<Uuid> = row.try_get("attempt_id").map_err(database_error)?;
+    let attempt_state: Option<String> = row.try_get("attempt_state").map_err(database_error)?;
+    let attempt_state = match attempt_state {
+        Some(value) => Some(AttemptStage::parse(&value).ok_or_else(|| {
+            ApplicationError::Persistence(format!(
+                "attempt state {value} is not a v1 attempt stage"
+            ))
+        })?),
+        None => None,
+    };
+    let price_snapshot: Value = row.try_get("price_snapshot").map_err(database_error)?;
+    let price_snapshot: PriceSnapshot = serde_json::from_value(price_snapshot)
+        .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+    let token: i64 = row.try_get("fencing_token").map_err(database_error)?;
+    let job_state: String = row.try_get("job_state").map_err(database_error)?;
+    let stage = ExecutionStage::parse(&job_state).ok_or_else(|| {
+        ApplicationError::Persistence(format!("job state {job_state} is not a v1 execution stage"))
+    })?;
+    Ok(TakenOverExecution {
+        job_id: JobId(row.try_get("job_id").map_err(database_error)?),
+        stage,
+        attempt_id: attempt_id.map(AttemptId),
+        attempt_state,
+        provider_task_handle: row
+            .try_get("provider_task_handle")
+            .map_err(database_error)?,
+        provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
+        query_attempts: u32::try_from(
+            row.try_get::<i32, _>("query_attempts")
+                .map_err(database_error)?,
+        )
+        .map_err(|_| {
+            ApplicationError::Persistence("reconciliation query attempts overflow".to_owned())
+        })?,
+        next_query_at: row.try_get("next_query_at").map_err(database_error)?,
+        adapter_key: row.try_get("adapter_key").map_err(database_error)?,
+        base_url: row.try_get("base_url").map_err(database_error)?,
+        credential_env: row.try_get("credential_env").map_err(database_error)?,
+        provider_kind: row.try_get("provider_kind").map_err(database_error)?,
+        price_snapshot,
+        account_id: AccountId(row.try_get("account_id").map_err(database_error)?),
+        fencing_token: FencingToken::new(to_u64(token)?),
+    })
+}
+
+/// 领取到的一行晚到事实 → 强类型投影：成本四列按来源还原，没有来源表示这行没有成本事实。
+fn claimed_late_fact(row: &sqlx::postgres::PgRow) -> Result<ClaimedLateFact, ApplicationError> {
+    let evidence: Option<Value> = row.try_get("metering_evidence").map_err(database_error)?;
+    let evidence = evidence
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+    let source: Option<String> = row
+        .try_get("provider_cost_source")
+        .map_err(database_error)?;
+    let provider_cost = match source {
+        Some(source) => {
+            let source = ProviderCostSource::parse(&source).ok_or_else(|| {
+                ApplicationError::Persistence(format!(
+                    "provider cost source {source} is not a known value"
+                ))
+            })?;
+            let amount: Option<i64> = row
+                .try_get("provider_cost_microusd")
+                .map_err(database_error)?;
+            let currency: Option<String> = row
+                .try_get("provider_cost_currency")
+                .map_err(database_error)?;
+            let cny: Option<i64> = row
+                .try_get("provider_cost_cny_microusd")
+                .map_err(database_error)?;
+            Some(ProviderCostFact {
+                source,
+                amount_microusd: amount.map(to_u64).transpose()?,
+                currency,
+                cny_microusd: cny.map(to_u64).transpose()?,
+            })
+        }
+        None => None,
+    };
+    Ok(ClaimedLateFact {
+        id: row.try_get("id").map_err(database_error)?,
+        job_id: JobId(row.try_get("job_id").map_err(database_error)?),
+        attempt_id: AttemptId(row.try_get("attempt_id").map_err(database_error)?),
+        kind: row.try_get("kind").map_err(database_error)?,
+        provider_task_handle: row
+            .try_get("provider_task_handle")
+            .map_err(database_error)?,
+        provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
+        image_count: row
+            .try_get::<Option<i32>, _>("image_count")
+            .map_err(database_error)?
+            .map(|value| {
+                u32::try_from(value).map_err(|_| {
+                    ApplicationError::Persistence("late fact image count is negative".to_owned())
+                })
+            })
+            .transpose()?,
+        evidence,
+        provider_cost,
+    })
+}
+
+/// Attempt 上的成本四列：原币种金额、币种、来源、折算后 CNY。来源决定形状，四列同形。
+type ProviderCostColumns = (Option<i64>, Option<String>, &'static str, Option<i64>);
+
+/// 成本事实到 Attempt 四列的投影：来源决定形状，金额/币种与来源同形，库层
+/// attempts_provider_cost_shape 兜底（unavailable 也带来源，四列不半填）。
+fn provider_cost_columns(cost: &ProviderCostFact) -> Result<ProviderCostColumns, ApplicationError> {
+    Ok((
+        cost.amount_microusd.map(to_i64).transpose()?,
+        cost.currency.clone(),
+        cost.source.as_str(),
+        cost.cny_microusd.map(to_i64).transpose()?,
+    ))
+}
+
+/// 从 Attempt 行还原已落库的计量证据；没落过（NULL）时返回 None。
+fn attempt_metering_evidence(
+    row: &sqlx::postgres::PgRow,
+) -> Result<Option<MeteringEvidence>, ApplicationError> {
+    let stored: Option<Value> = row.try_get("metering_evidence").map_err(database_error)?;
+    stored
+        .map(serde_json::from_value)
+        .transpose()
+        .map_err(|error| ApplicationError::Persistence(error.to_string()))
+}
+
+/// 读一台 Job 已提交的收尾结果（Job 阶段 + 账本上的 capture 实收）。
+///
+/// 实收以账本为准而不是另存一份：capture 明细就是账实核对的依据，重复结算与 read_finalization
+/// 因此看到同一个数。
+async fn committed_finalization(
+    pool: &PgPool,
+    job_id: JobId,
+    attempt_id: AttemptId,
+) -> Result<ExecutionFinalization, ApplicationError> {
+    let row = sqlx::query(
+        r#"
+        SELECT j.state,
+               COALESCE((
+                   SELECT -e.amount_microusd
+                   FROM ledger.entries e
+                   WHERE e.job_id = j.id AND e.kind = 'capture'
+                   ORDER BY e.created_at DESC
+                   LIMIT 1
+               ), 0) AS charge_microusd
+        FROM generation.jobs j
+        WHERE j.id = $1
+        "#,
+    )
+    .bind(job_id.0)
+    .fetch_optional(pool)
+    .await
+    .map_err(database_error)?
+    .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
+    let state: String = row.try_get("state").map_err(database_error)?;
+    let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+        ApplicationError::Persistence(format!("job state {state} is not a v1 execution stage"))
+    })?;
+    let charge: i64 = row.try_get("charge_microusd").map_err(database_error)?;
+    Ok(ExecutionFinalization {
+        job_id,
+        attempt_id,
+        stage,
+        charge_microusd: to_u64(charge)?,
+    })
+}
+
+/// 锁定一台 Job 的 active 预授权，返回 (预授权行, 预授权额)；已释放或已 capture 时报冲突。
+///
+/// 结算与确定失败都从这里取"该去掉多少占用"：占用按预授权行自己记下的金额释放，账户占用合计
+/// 因此与 active Hold 之和保持一致，不读 Job 上的保底额另算一遍。
+async fn lock_active_hold(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: JobId,
+) -> Result<(Uuid, i64), ApplicationError> {
+    let hold = sqlx::query(
+        r#"
+        SELECT id, amount_microusd, status
+        FROM ledger.holds
+        WHERE job_id = $1
+        FOR UPDATE
+        "#,
+    )
+    .bind(job_id.0)
+    .fetch_optional(&mut **transaction)
+    .await
+    .map_err(database_error)?
+    .ok_or_else(|| ApplicationError::Persistence(format!("job {job_id} has no hold")))?;
+    let status: String = hold.try_get("status").map_err(database_error)?;
+    if status != "active" {
+        return Err(ApplicationError::Conflict(format!(
+            "job {job_id} hold is {status}, not active"
+        )));
+    }
+    let hold_id: Uuid = hold.try_get("id").map_err(database_error)?;
+    let amount: i64 = hold.try_get("amount_microusd").map_err(database_error)?;
+    Ok((hold_id, amount))
+}
+
+/// 释放一台 Job 的渠道全局容量槽位；同事务，重复调用不报错（已释放则不动行）。
+async fn release_channel_slot(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: JobId,
+) -> Result<(), ApplicationError> {
+    sqlx::query(
+        r#"
+        UPDATE generation.execution_capacity
+        SET state = 'released', released_at = now()
+        WHERE job_id = $1 AND state = 'held'
+        "#,
+    )
+    .bind(job_id.0)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// 收件行上的成本四列（与 attempts 同形）；没有成本事实时整组为空。
+struct LateFactCost {
+    amount_microusd: Option<i64>,
+    currency: Option<String>,
+    source: &'static str,
+    cny_microusd: Option<i64>,
+}
+
+/// 收件行的一次插入结果。
+enum LateFactInsert {
+    Inserted,
+    Duplicate,
+    Conflict,
+}
+
+/// 写一行晚到事实收件：同 Attempt 同形态同内容幂等；已有不同内容即冲突，不覆盖原收件。
+#[allow(clippy::too_many_arguments)]
+async fn insert_late_fact(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: JobId,
+    attempt_id: AttemptId,
+    kind: &str,
+    content_digest: &str,
+    provider_task_handle: Option<&str>,
+    provider_trace_id: Option<&str>,
+    image_count: Option<i32>,
+    metering_evidence: Option<Value>,
+    provider_cost: Option<LateFactCost>,
+) -> Result<LateFactInsert, ApplicationError> {
+    let existing: Vec<String> = sqlx::query_scalar(
+        "SELECT content_digest FROM generation.late_facts WHERE attempt_id = $1 AND kind = $2",
+    )
+    .bind(attempt_id.0)
+    .bind(kind)
+    .fetch_all(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if existing.iter().any(|stored| stored == content_digest) {
+        return Ok(LateFactInsert::Duplicate);
+    }
+    if !existing.is_empty() {
+        return Ok(LateFactInsert::Conflict);
+    }
+    let (amount, currency, source, cny) = match provider_cost {
+        Some(cost) => (
+            cost.amount_microusd,
+            cost.currency,
+            Some(cost.source),
+            cost.cny_microusd,
+        ),
+        None => (None, None, None, None),
+    };
+    let inserted = sqlx::query(
+        r#"
+        INSERT INTO generation.late_facts
+            (id, job_id, attempt_id, kind, content_digest, provider_task_handle,
+             provider_trace_id, image_count, metering_evidence, provider_cost_microusd,
+             provider_cost_currency, provider_cost_source, provider_cost_cny_microusd)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
+        ON CONFLICT (attempt_id, kind, content_digest) DO NOTHING
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(job_id.0)
+    .bind(attempt_id.0)
+    .bind(kind)
+    .bind(content_digest)
+    .bind(provider_task_handle)
+    .bind(provider_trace_id)
+    .bind(image_count)
+    .bind(metering_evidence)
+    .bind(amount)
+    .bind(currency)
+    .bind(source)
+    .bind(cny)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    if inserted.rows_affected() == 0 {
+        return Ok(LateFactInsert::Duplicate);
+    }
+    Ok(LateFactInsert::Inserted)
+}
+
+/// 晚到事实冲突：建一条 Job 级对账案例，原收件与终态都不改。
+async fn open_late_facts_case(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    job_id: JobId,
+    attempt_id: AttemptId,
+) -> Result<(), ApplicationError> {
+    let account_id: Uuid =
+        sqlx::query_scalar("SELECT account_id FROM generation.jobs WHERE id = $1")
+            .bind(job_id.0)
+            .fetch_one(&mut **transaction)
+            .await
+            .map_err(database_error)?;
+    sqlx::query(
+        r#"
+        INSERT INTO operations.reconciliation_cases (id, job_id, attempt_id, account_id, reason)
+        VALUES ($1,$2,$3,$4,'late facts conflict with the recorded execution facts')
+        ON CONFLICT (job_id) DO NOTHING
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(job_id.0)
+    .bind(attempt_id.0)
+    .bind(account_id)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// 有界事实的内容摘要：只用长度前缀串接；它只用于去重与冲突判定，不保密、也不是请求指纹。
+fn late_fact_digest(parts: &[&[u8]]) -> String {
+    let mut hasher = Sha256::new();
+    for part in parts {
+        hasher.update(u64::try_from(part.len()).unwrap_or(u64::MAX).to_be_bytes());
+        hasher.update(part);
+    }
+    hex::encode(hasher.finalize())
 }
 
 /// 一次发布**冻结进条目**的那份技术定义：`runtime_entries` 的八列，加上它们指向的供给、渠道与

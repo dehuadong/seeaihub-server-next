@@ -1,28 +1,36 @@
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Multipart, Path, Query, State, multipart::Field},
+    extract::{
+        DefaultBodyLimit, Extension, Multipart, Path, Query, State, multipart::Field,
+        rejection::JsonRejection,
+    },
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
+use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
+use seeai_adapter_sdk::{DecodedImage, InputImage};
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
     CachePolicy, CreateImageGenerationRequest, CursorPosition, CustomerBillingQuery,
     CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope,
-    CustomerUsageStatus, CustomerView, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
-    GenerationRateLimit, GenerationService, HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream,
-    HubRepository, IdentityService, JobView, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
+    CustomerUsageStatus, CustomerView, DirectExecutionError, DirectExecutionLimits,
+    DirectExecutionRequest, DirectExecutionService, ExecutionRepository, FingerprintKeys,
+    GatewayModelView, GeneratedImage, GenerationDailySpendLimit, GenerationRateLimit,
+    GenerationService, HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository,
+    IdentityService, JobView, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
     NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestTimeoutPolicy,
-    RoutePolicyService, RuntimeService, SelectableOfferingView, decode_history_cursor,
-    encode_history_cursor, invalid_history_cursor, with_admin_id,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RequestCostCeiling,
+    RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
+    decode_history_cursor, encode_history_cursor, invalid_history_cursor, settle_reserve_from_env,
+    with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -41,6 +49,44 @@ use tracing::info;
 use tracing_subscriber::EnvFilter;
 use uuid::Uuid;
 
+mod supervisor;
+use supervisor::{
+    AuthenticatedAccount, ExecutionLease, GuardedResponseStream, OwnershipRenewalConfig, SendLease,
+    SlowRead, Supervisor, SupervisorConfig,
+};
+
+/// 平台直接执行时随进程装配的一份用例与它的 Supervisor。
+///
+/// env 开关默认关闭；关着时这个字段是 `None`，两条图片入口逐字走旧路径（建 Job、Worker 领取、
+/// 轮询结果），不受这里任何代码影响。
+#[derive(Clone)]
+struct DirectGeneration {
+    service: Arc<DirectExecutionService>,
+    supervisor: Arc<Supervisor>,
+}
+
+/// 直接执行的渠道凭证：只从环境变量读，交给 Adapter，不落库、不日志。
+#[derive(Debug, Default)]
+struct EnvironmentCredentialProvider;
+
+impl seeai_application::CredentialProvider for EnvironmentCredentialProvider {
+    fn resolve(
+        &self,
+        reference: &str,
+    ) -> Result<seeai_adapter_sdk::ProviderCredential, ApplicationError> {
+        let value = env::var(reference)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .ok_or_else(|| {
+                ApplicationError::Configuration(format!(
+                    "provider credential environment {reference} is missing"
+                ))
+            })?;
+        seeai_adapter_sdk::ProviderCredential::new(value)
+            .map_err(|error| ApplicationError::Configuration(error.to_string()))
+    }
+}
+
 #[derive(Clone)]
 struct AppState {
     admin_token: Arc<str>,
@@ -56,6 +102,8 @@ struct AppState {
     /// 路由策略的管理员面：读清单与写入（运行期配置，不进不可变修订）。
     route_policies: RoutePolicyService,
     generations: GenerationService,
+    /// 直接同步执行；env 开关默认关闭，关着时为 None，图片入口逐字走旧路径。
+    direct: Option<Arc<DirectGeneration>>,
     /// 同步入口等任务跑完的最长时间。
     sync_wait: Duration,
     /// 健康探测的依赖判据：探一次事实源是否可达（只 `SELECT 1`）。
@@ -163,6 +211,7 @@ async fn main() -> Result<()> {
         undecodable_contracts = undecodable,
         "the timeout chain is consistent"
     );
+    let execution_port: Arc<dyn ExecutionRepository> = repository.clone();
     let repository_port: Arc<dyn HubRepository> = repository;
     // 组合工厂：按 adapter_key 分派到各渠道自己的 Driver（纯装配）。
     let adapters: Arc<dyn seeai_application::AdapterFactory> =
@@ -194,6 +243,74 @@ async fn main() -> Result<()> {
             "no cache service configured; the per-API-key rate limit does not apply in this process"
         );
     }
+
+    // 直接同步执行：env 开关默认关闭。关着时下面的配置一个都不读（缺摘要密钥或渠道凭证不会让
+    // 进程起不来），图片入口逐字走旧路径。开着时本进程自己调 Provider，不建生成 Job、不轮询结果。
+    let direct_execution = if direct_execution_enabled()? {
+        let keys = FingerprintKeys::from_env().map_err(anyhow::Error::from)?;
+        let settle_reserve = settle_reserve_from_env().map_err(anyhow::Error::from)?;
+        // 执行所有权租约：begin_submission 按它落 lease_expires_at，Supervisor 按它的三分之一续约。
+        let ownership_lease = duration_from_env("GENERATION_EXECUTION_LEASE_SECONDS", 60)?;
+        let service = DirectExecutionService::new(
+            repository_port.clone(),
+            execution_port.clone(),
+            adapters.clone(),
+            Arc::new(EnvironmentCredentialProvider),
+            keys,
+            timeouts,
+            DirectExecutionLimits {
+                max_account_in_flight: generation_max_concurrent_jobs()?,
+                max_channel_in_flight: generation_max_channel_in_flight()?,
+                default_hold_microusd: generation_max_cost_microusd()?,
+            },
+        )
+        .with_settle_reserve(settle_reserve)
+        .with_ownership_lease(ownership_lease)
+        // 请求内安全重投沿用旧 Worker 那一组运维取值（次数与退避基），不另立一套。
+        .with_retry_policy(RetryPolicy::from_env().map_err(anyhow::Error::from)?)
+        .with_acceleration(acceleration.clone())
+        .with_cost_ceiling(cost_ceiling()?);
+        let execution_slots = generation_env_usize("GENERATION_EXECUTION_SLOTS", 64)?;
+        let max_memory_bytes =
+            generation_env_usize("GENERATION_MAX_MEMORY_BYTES", 2 * 1024 * 1024 * 1024)?;
+        let send_slots = generation_env_usize("GENERATION_SEND_SLOTS", 64)?;
+        let read_slots = generation_env_usize("GENERATION_READ_SLOTS", 64)?;
+        let supervisor = Supervisor::new(SupervisorConfig {
+            execution_slots,
+            max_memory_bytes,
+            send_slots,
+            read_slots,
+            slow_read_timeout: Duration::from_secs(generation_env_u64(
+                "GENERATION_SLOW_READ_TIMEOUT_SECONDS",
+                30,
+            )?),
+            shutdown_grace: Duration::from_secs(generation_env_u64(
+                "GENERATION_SHUTDOWN_GRACE_SECONDS",
+                25,
+            )?),
+            total_deadline: timeouts.sync_wait,
+            finalization_grace: settle_reserve,
+            send_window: Duration::from_secs(generation_env_u64(
+                "GENERATION_SEND_TIMEOUT_SECONDS",
+                30,
+            )?),
+            ownership: Some(OwnershipRenewalConfig {
+                executions: execution_port.clone(),
+                lease: ownership_lease,
+            }),
+        })
+        .map_err(anyhow::Error::from)?;
+        info!(
+            execution_slots,
+            send_slots, read_slots, max_memory_bytes, "direct synchronous execution is enabled"
+        );
+        Some(Arc::new(DirectGeneration {
+            service: Arc::new(service),
+            supervisor,
+        }))
+    } else {
+        None
+    };
     // 账实核对：比对**账户当前值**与它自己的**明细**。它**不是**上面那个缓存对账——那个问的是
     // "缓存里的值还是不是库里的值"，做法是以库为准覆盖缓存，改的是缓存；这条问的是"库里那个
     // 余额与占用还是不是它自己那本账的和"，两边都是库里的**事实**。它只发现、不改账：不一致就
@@ -241,6 +358,7 @@ async fn main() -> Result<()> {
         session_ttl: session_ttl()?,
         password_reset_ttl: password_reset_ttl()?,
         history_cursor_key: history_cursor_key()?,
+        direct: direct_execution.clone(),
     };
     // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
     seed_admin_account(&state).await?;
@@ -319,6 +437,19 @@ async fn main() -> Result<()> {
             state.clone(),
             require_admin_middleware,
         ));
+    // 图片入口在直接执行开启时挂一层入口中间件：认证、速率与本机读取准入都在**消费正文之前**
+    // 完成，账户放进 request extension，handler 不再自己认证。关着时不挂，行为与旧路径逐字相同。
+    let image_routes = Router::new()
+        .route("/v1/images/generations", post(generate_image))
+        .route("/v1/images/edits", post(edit_image));
+    let image_routes = if direct_execution.is_some() {
+        image_routes.route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_generation_access,
+        ))
+    } else {
+        image_routes
+    };
     // **公开与对客面**：不挂管理认证。登录、退出、凭令牌兑换各自认自己的凭据。
     let public = Router::new()
         .route("/health", get(health))
@@ -332,8 +463,6 @@ async fn main() -> Result<()> {
         )
         .route("/v1/models", get(list_models))
         .route("/v1/account", get(read_own_account))
-        .route("/v1/images/generations", post(generate_image))
-        .route("/v1/images/edits", post(edit_image))
         .route("/v1/customers", post(register_customer))
         .route(
             "/v1/customer/sessions",
@@ -356,7 +485,8 @@ async fn main() -> Result<()> {
         .route("/v1/customer/account/name", put(rename_customer_account))
         .route("/v1/customer/ledger", get(read_customer_ledger))
         .route("/v1/customer/usage", get(read_customer_usage))
-        .route("/v1/customer/billing", get(read_customer_billing));
+        .route("/v1/customer/billing", get(read_customer_billing))
+        .merge(image_routes);
     let app = admin
         .merge(public)
         .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
@@ -382,9 +512,22 @@ async fn main() -> Result<()> {
     };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "api listening");
+    // 停机：先停止新执行并给在飞任务有限收尾，进程退出前再等在飞任务收尾到宽限期上限；到点仍
+    // 有残余时它们的账务事实由应用层的对账路径接管（RFC 0017 §5、§6）。
+    let supervisor_for_shutdown = direct_execution
+        .as_ref()
+        .map(|direct| direct.supervisor.clone());
     axum::serve(listener, app)
-        .with_graceful_shutdown(shutdown_signal())
+        .with_graceful_shutdown(async move {
+            shutdown_signal().await;
+            if let Some(supervisor) = supervisor_for_shutdown {
+                supervisor.begin_drain();
+            }
+        })
         .await?;
+    if let Some(direct) = &direct_execution {
+        direct.supervisor.drain().await;
+    }
     Ok(())
 }
 
@@ -2425,9 +2568,34 @@ struct SyncErrorBody {
 /// 都是合法请求。
 async fn generate_image(
     State(state): State<AppState>,
+    account: Option<Extension<AuthenticatedAccount>>,
+    slow: Option<Extension<SlowRead>>,
     headers: HeaderMap,
-    Json(body): Json<CreateGenerationBody>,
+    body: Result<Json<CreateGenerationBody>, JsonRejection>,
 ) -> Result<Response, ApiError> {
+    let direct = state.direct.clone();
+    let Json(body) = match body {
+        Ok(body) => body,
+        Err(rejection) => {
+            // 直接执行入口的读错误可能是有界慢读超时：那是受理前的 408，不建记录。
+            if direct.is_some() && slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
+                return Err(slow_read_timeout());
+            }
+            // 旧路径逐字保留框架给出的拒绝响应。
+            return Ok(rejection.into_response());
+        }
+    };
+    if let Some(direct) = direct {
+        let account = account.ok_or_else(direct_misconfigured)?;
+        return run_direct_json(
+            direct,
+            account.0.account_id,
+            account.0.received_at,
+            &headers,
+            body.parameters,
+        )
+        .await;
+    }
     let account_id = authenticate(&state, &headers).await?;
     let mut parameters = body.parameters;
     let inputs = take_contract_image_inputs(&mut parameters)?;
@@ -2449,9 +2617,32 @@ async fn generate_image(
 /// 图片字段也可以走文本部件（与 JSON 入口同一套语义），但同一个字段不能既当文件又当文本。
 async fn edit_image(
     State(state): State<AppState>,
+    account: Option<Extension<AuthenticatedAccount>>,
+    slow: Option<Extension<SlowRead>>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
+    let direct = state.direct.clone();
+    if let Some(direct) = direct {
+        let account = account.ok_or_else(direct_misconfigured)?;
+        let parsed = parse_multipart_direct(&mut multipart).await;
+        // 慢读超时不建记录：它发生在受理前，按 408 回应，而不是当成 multipart 格式错误。
+        if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
+            return Err(slow_read_timeout());
+        }
+        let (parameters, reference_images, mask) = parsed?;
+        return run_direct_generation(
+            direct,
+            account.0.account_id,
+            account.0.received_at,
+            &headers,
+            "/v1/images/edits",
+            parameters,
+            reference_images,
+            mask,
+        )
+        .await;
+    }
     let account_id = authenticate(&state, &headers).await?;
     let mut parameters = Map::new();
     let mut file_inputs = ImageInputs::default();
@@ -2535,6 +2726,369 @@ fn form_scalar(name: &str, text: &str) -> Value {
         return Value::from(value);
     }
     Value::String(text.to_owned())
+}
+
+/// 直接执行入口的认证明细放进 request extension；handler 从它取账户，不再自己认证。
+async fn require_generation_access(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    // 总期限 D 从收到请求头起算：认证、速率与读取准入都算在它里面（RFC 0017 §6）。
+    let received_at = tokio::time::Instant::now();
+    let Some(direct) = state.direct.clone() else {
+        return Ok(next.run(request).await);
+    };
+    // 认证与速率在消费正文之前完成；读取准入也在这里取，取不到直接拒绝，不排队。
+    let account_id = authenticate(&state, request.headers()).await?;
+    let read = direct
+        .supervisor
+        .try_reserve_read()
+        .ok_or_else(direct_capacity_unavailable)?;
+    let (mut parts, body) = request.into_parts();
+    parts
+        .extensions
+        .insert(AuthenticatedAccount::new(account_id, received_at, read));
+    let (body, slow) = direct.supervisor.limit_slow_read(body);
+    parts.extensions.insert(slow);
+    let request = axum::extract::Request::from_parts(parts, body);
+    Ok(next.run(request).await)
+}
+
+/// JSON 入口转直接执行请求：图片值分成公网 URL / data URL 两态，model 与图片字段从普通参数里摘掉。
+async fn run_direct_json(
+    direct: Arc<DirectGeneration>,
+    account_id: AccountId,
+    received_at: tokio::time::Instant,
+    headers: &HeaderMap,
+    mut parameters: Map<String, Value>,
+) -> Result<Response, ApiError> {
+    let inputs = take_contract_image_inputs(&mut parameters)?;
+    let reference_images = inputs
+        .reference_images
+        .into_iter()
+        .map(InputImage::from_raw)
+        .collect::<Result<Vec<_>, _>>()
+        .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?;
+    let mask = inputs
+        .mask
+        .map(InputImage::from_raw)
+        .transpose()
+        .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?;
+    run_direct_generation(
+        direct,
+        account_id,
+        received_at,
+        headers,
+        "/v1/images/generations",
+        parameters,
+        reference_images,
+        mask,
+    )
+    .await
+}
+
+/// multipart 图片部件：**直接保留字节**与声明的媒体类型，不再先编码成 data URL 再解码（RFC 0017 §2）。
+async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
+    let media_type = field
+        .content_type()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "image/png".to_owned());
+    let bytes = field
+        .bytes()
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
+    Ok(InputImage::Bytes(DecodedImage { media_type, bytes }))
+}
+
+/// 解析 multipart：文件部件保留字节，文本图片字段按 data URL / 公网 URL 解释；两者不能同给。
+async fn parse_multipart_direct(
+    multipart: &mut Multipart,
+) -> Result<(Map<String, Value>, Vec<InputImage>, Option<InputImage>), ApiError> {
+    let mut parameters = Map::new();
+    let mut file_references: Vec<InputImage> = Vec::new();
+    let mut file_mask: Option<InputImage> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        match contract_image_parameter_kind(&name) {
+            Some(ImageParameterKind::Reference) if field.file_name().is_some() => {
+                file_references.push(form_image_bytes(field).await?);
+            }
+            Some(ImageParameterKind::Mask) if field.file_name().is_some() => {
+                file_mask = Some(form_image_bytes(field).await?);
+            }
+            _ => {
+                let text = field.text().await.map_err(|error| {
+                    ApiError::bad_request("invalid_multipart", error.to_string())
+                })?;
+                parameters.insert(name.clone(), form_scalar(&name, &text));
+            }
+        }
+    }
+    let text_inputs = take_contract_image_inputs(&mut parameters)?;
+    if !text_inputs.reference_images.is_empty() && !file_references.is_empty() {
+        return Err(ApiError::bad_request(
+            "invalid_parameter",
+            "image was given both as a file part and as a text field",
+        ));
+    }
+    if text_inputs.mask.is_some() && file_mask.is_some() {
+        return Err(ApiError::bad_request(
+            "invalid_parameter",
+            "mask was given both as a file part and as a text field",
+        ));
+    }
+    let reference_images = if file_references.is_empty() {
+        text_inputs
+            .reference_images
+            .into_iter()
+            .map(InputImage::from_raw)
+            .collect::<Result<Vec<_>, _>>()
+            .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?
+    } else {
+        file_references
+    };
+    let mask = if file_mask.is_some() {
+        file_mask
+    } else {
+        text_inputs
+            .mask
+            .map(InputImage::from_raw)
+            .transpose()
+            .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?
+    };
+    Ok((parameters, reference_images, mask))
+}
+
+/// 直接执行入口：预留本机许可，起受监督的执行，等一次性结果，按内存载荷构造响应。
+///
+/// 成功时执行许可与发送许可随响应 body 存活到发送完成；失败或断开时它们随本次调用立即释放。
+#[allow(clippy::too_many_arguments)]
+async fn run_direct_generation(
+    direct: Arc<DirectGeneration>,
+    account_id: AccountId,
+    received_at: tokio::time::Instant,
+    headers: &HeaderMap,
+    endpoint: &str,
+    mut parameters: Map<String, Value>,
+    reference_images: Vec<InputImage>,
+    mask: Option<InputImage>,
+) -> Result<Response, ApiError> {
+    let model = parameters
+        .remove("model")
+        .and_then(|value| value.as_str().map(str::to_owned))
+        .ok_or_else(|| ApiError::bad_request("missing_model", "model is required"))?;
+    let request = DirectExecutionRequest {
+        account_id,
+        model,
+        endpoint: endpoint.to_owned(),
+        native_parameters: Value::Object(parameters),
+        reference_images,
+        mask,
+        idempotency_key: idempotency_key(headers),
+    };
+    // 执行与发送许可都在受理前预留：取不到就不执行这次尚未发生费用的请求。
+    let lease = direct
+        .supervisor
+        .try_reserve_execution()
+        .ok_or_else(direct_capacity_unavailable)?;
+    let send = direct
+        .supervisor
+        .try_reserve_send()
+        .ok_or_else(direct_capacity_unavailable)?;
+    // 总期限 D 从收到请求头起算；执行侧与 handler 等的是同一个绝对时刻。
+    let deadline = received_at + direct.supervisor.total_deadline();
+    let receiver = direct
+        .supervisor
+        .spawn(direct.service.clone(), request, lease, deadline);
+    // Handler 等到 D 再加工应用层的收尾宽限：先让应用层把"确定未提交 / 已确认结算 / 事实未知"
+    // 交回来，只有连这个兜底也到点才回 outcome_unknown。
+    let wait = deadline.saturating_duration_since(tokio::time::Instant::now())
+        + direct.supervisor.finalization_grace();
+    let outcome = match tokio::time::timeout(wait, receiver).await {
+        Ok(Ok(outcome)) => outcome,
+        // 执行任务在投递结果前消失（异常）：没有可返回的载荷。
+        Ok(Err(_recv)) => return Err(direct_internal()),
+        // 收尾宽限也过了：执行事实仍未知，保留占用交对账；不谎称未提交（Spec 0005 §4）。
+        Err(_) => return Err(outcome_unknown_timeout()),
+    };
+    match outcome.result {
+        Ok(success) => direct_success_response(
+            success,
+            outcome.lease,
+            send,
+            direct.supervisor.send_window(),
+        ),
+        // 事实未知且总期限已过：这是"期限到达仍未确认"，按 504 回应；期限前的一般未知仍是 502。
+        Err(DirectExecutionError::OutcomeUnknown) if tokio::time::Instant::now() >= deadline => {
+            Err(outcome_unknown_timeout())
+        }
+        Err(error) => Err(map_direct_error(error)),
+    }
+}
+
+/// 成功响应：created 与内存里的 data 直接构造，不读 Job、不重放结果。
+fn direct_success_response(
+    success: seeai_application::DirectExecutionSuccess,
+    lease: ExecutionLease,
+    send: SendLease,
+    window: Duration,
+) -> Result<Response, ApiError> {
+    let body = SyncImageResponse {
+        created: success
+            .payload
+            .created
+            .unwrap_or_else(|| Utc::now().timestamp()),
+        data: success.payload.images,
+    };
+    let payload = serde_json::to_vec(&body).map_err(|error| ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal_error",
+        message: error.to_string(),
+        retry_after: None,
+    })?;
+    let stream = GuardedResponseStream::new(Bytes::from(payload), lease, send, window);
+    Response::builder()
+        .status(StatusCode::OK)
+        .header(header::CONTENT_TYPE, "application/json")
+        .body(axum::body::Body::from_stream(stream))
+        .map_err(|error| ApiError {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: error.to_string(),
+            retry_after: None,
+        })
+}
+
+/// 直接执行的拒绝 → Spec 0005 §4 的对客码：同键四投影、结果未知、确定失败与既有应用错误。
+fn map_direct_error(error: DirectExecutionError) -> ApiError {
+    match error {
+        DirectExecutionError::RequestInProgress { retry_after } => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "request_in_progress",
+            message: "the original request with this idempotency key is still executing".to_owned(),
+            retry_after: Some(retry_after),
+        },
+        DirectExecutionError::ResultNotRetained => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "result_not_retained",
+            message: "the original request completed and its result is not retained; use a new idempotency key for another billable call".to_owned(),
+            retry_after: None,
+        },
+        DirectExecutionError::OutcomeUnknown => ApiError {
+            status: StatusCode::BAD_GATEWAY,
+            code: "outcome_unknown",
+            message: "the platform could not confirm the outcome of this request".to_owned(),
+            retry_after: None,
+        },
+        DirectExecutionError::RequestTimeout => request_timeout(),
+        DirectExecutionError::ResultDeliveryTimeout => result_delivery_timeout(),
+        DirectExecutionError::OriginalFailure { code } => match code {
+            PublicErrorCode::ContentRejected => ApiError {
+                status: StatusCode::BAD_REQUEST,
+                code: "content_rejected",
+                message: "the submitted content was rejected".to_owned(),
+                retry_after: None,
+            },
+            PublicErrorCode::OutcomeUnknown => ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "outcome_unknown",
+                message: "the platform could not confirm the outcome of this request".to_owned(),
+                retry_after: None,
+            },
+            PublicErrorCode::PlatformUnavailable => ApiError {
+                status: StatusCode::BAD_GATEWAY,
+                code: "platform_unavailable",
+                message: "the platform could not complete this request".to_owned(),
+                retry_after: None,
+            },
+        },
+        // 同一把幂等键换了请求指纹：admit 报冲突，按 §4 的 idempotency_conflict 投影。
+        DirectExecutionError::Application(ApplicationError::Conflict(_)) => ApiError {
+            status: StatusCode::CONFLICT,
+            code: "idempotency_conflict",
+            message: "the same idempotency key was used with a different request".to_owned(),
+            retry_after: None,
+        },
+        DirectExecutionError::Application(error) => ApiError::from(error),
+    }
+}
+
+/// 本机执行/发送容量不足：这是平台侧容量，不是调用方发太密（Spec 0005 §3）。
+fn direct_capacity_unavailable() -> ApiError {
+    ApiError {
+        status: StatusCode::SERVICE_UNAVAILABLE,
+        code: "platform_unavailable",
+        message: "the platform has no local execution capacity for this request".to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 总期限到达、事实仍未知：504 outcome_unknown，保留占用交对账；不改写成"确定未提交"。
+fn outcome_unknown_timeout() -> ApiError {
+    ApiError {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        code: "outcome_unknown",
+        message: "the platform could not confirm the outcome of this request within the time limit"
+            .to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 受理前正文慢读超时：408 request_timeout，不建任何执行记录（Spec 0005 §4）。
+fn slow_read_timeout() -> ApiError {
+    ApiError {
+        status: StatusCode::REQUEST_TIMEOUT,
+        code: "request_timeout",
+        message: "the request body was not read within the configured limit".to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 总期限到达时确定未提交生成且占用已释放：504 request_timeout（Spec 0005 §4）。
+fn request_timeout() -> ApiError {
+    ApiError {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        code: "request_timeout",
+        message: "the request timed out before the platform asked the provider to generate"
+            .to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 已确认成功结算但图片来不及准备返回：504 result_delivery_timeout，原请求已完成并收费、
+/// 结果不保留（Spec 0005 §4）。
+fn result_delivery_timeout() -> ApiError {
+    ApiError {
+        status: StatusCode::GATEWAY_TIMEOUT,
+        code: "result_delivery_timeout",
+        message: "the original request completed and was charged, but the result could not be delivered in time".to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 直接执行开着但入口中间件没放账户：配置/装配错误，属于平台自身故障。
+fn direct_misconfigured() -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal_error",
+        message: "the direct execution entry is missing its authenticated account".to_owned(),
+        retry_after: None,
+    }
+}
+
+/// 执行任务异常消失：没有可返回的载荷。
+fn direct_internal() -> ApiError {
+    ApiError {
+        status: StatusCode::INTERNAL_SERVER_ERROR,
+        code: "internal_error",
+        message: "the execution task ended without a result".to_owned(),
+        retry_after: None,
+    }
 }
 
 /// 两个入口共用的受理与响应：内部照旧走 Job 流水线，对外**等它跑到终态**再回图片。
@@ -2801,6 +3355,15 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::TooManyInFlight => {
                 (StatusCode::TOO_MANY_REQUESTS, "too_many_in_flight")
             }
+            // 渠道全局未决任务已满：换账户也进不来，是平台侧不可用（503），不是"你发太密"（429）。
+            ApplicationError::PlatformCapacityExhausted => {
+                (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
+            }
+            // 总期限在提交声明落库前到点：确定没有发出生成请求，按 504 request_timeout 回
+            // （Spec 0005 §4）。
+            ApplicationError::ExecutionDeadlineExceeded => {
+                (StatusCode::GATEWAY_TIMEOUT, "request_timeout")
+            }
             // 速率超限走到这里时（不是入口那条路径），也只说"太密了"：`Retry-After` 在
             // [`ApiError::from`] 的通用路径上没有位置放，因此认证入口自己那条分支才是对客的正常路径。
             ApplicationError::RateLimitExceeded { .. } => {
@@ -2856,6 +3419,8 @@ fn error_category(error: &ApplicationError) -> &'static str {
         | ApplicationError::NameTaken(_)
         | ApplicationError::InsufficientBalance
         | ApplicationError::TooManyInFlight
+        | ApplicationError::PlatformCapacityExhausted
+        | ApplicationError::ExecutionDeadlineExceeded
         | ApplicationError::RateLimitExceeded { .. }
         | ApplicationError::DailySpendLimitExceeded { .. } => "request",
     }
@@ -2930,6 +3495,54 @@ fn generation_max_concurrent_jobs() -> Result<u64> {
             .parse::<u64>()
             .context("GENERATION_MAX_CONCURRENT_JOBS must be an integer"),
         _ => Ok(1),
+    }
+}
+
+/// 直接同步执行的开关：GENERATION_DIRECT_EXECUTION（默认关闭）。
+///
+/// 关着时图片入口走旧 Job 流水线；开着时本进程直接调 Provider。它只认明确的布尔写法，读不懂时
+/// 启动失败——把"以为开了"或"以为关了"的部署混过去，比进程起不来更贵。
+fn direct_execution_enabled() -> Result<bool> {
+    match env::var("GENERATION_DIRECT_EXECUTION") {
+        Ok(value) if !value.trim().is_empty() => match value.trim().to_ascii_lowercase().as_str() {
+            "1" | "true" | "yes" | "on" => Ok(true),
+            "0" | "false" | "no" | "off" => Ok(false),
+            other => bail!("GENERATION_DIRECT_EXECUTION must be a boolean, got {other}"),
+        },
+        _ => Ok(false),
+    }
+}
+
+/// 渠道全局未决任务上限：GENERATION_MAX_CHANNEL_IN_FLIGHT（默认 32），多副本经数据库槽位共同遵守。
+fn generation_max_channel_in_flight() -> Result<u64> {
+    match env::var("GENERATION_MAX_CHANNEL_IN_FLIGHT") {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .context("GENERATION_MAX_CHANNEL_IN_FLIGHT must be an integer"),
+        _ => Ok(32),
+    }
+}
+
+/// 读一个非负整数环境变量，没给或给空取默认值。
+fn generation_env_usize(name: &str, default: usize) -> Result<usize> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be an integer")),
+        _ => Ok(default),
+    }
+}
+
+/// 读一个非负整数环境变量（字节或秒），没给或给空取默认值。
+fn generation_env_u64(name: &str, default: u64) -> Result<u64> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<u64>()
+            .with_context(|| format!("{name} must be an integer")),
+        _ => Ok(default),
     }
 }
 

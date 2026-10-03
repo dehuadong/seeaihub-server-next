@@ -7,6 +7,14 @@ use serde_json::Value;
 use std::fmt::{Debug, Formatter};
 use thiserror::Error;
 
+mod gateway;
+pub use gateway::{
+    AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, Deadline, ExecutionContext,
+    GatewayAdapter, GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage,
+    ProviderOutput, QueryAccountingCapability, ResponsePayload, ensure_external_call_allowed,
+    external_call_timeout, gateway_passthrough_parameters,
+};
+
 #[derive(Clone)]
 pub struct ProviderCredential(String);
 
@@ -341,6 +349,19 @@ pub enum AdapterError {
     UnsupportedInput(String),
     #[error(transparent)]
     Provider(#[from] ProviderCallError),
+    /// 上游已受理、但平台没能把句柄入库：句柄随错误带回，调用方在收尾预算内再试保存；
+    /// 它**不等于**上游未受理，不得据此重发生成请求（RFC 0017 §4）。
+    #[error("provider accepted the request but the handle could not be persisted: {reason}")]
+    AcceptedUnpersisted {
+        handle: gateway::AcceptedHandle,
+        reason: String,
+    },
+    /// 执行所有权失效或停机：停止新的外部副作用。
+    #[error("the execution was cancelled")]
+    Cancelled,
+    /// 这条通路不支持按句柄查询计量。
+    #[error("this adapter cannot query accounting by handle")]
+    QueryAccountingUnsupported,
 }
 
 #[async_trait]

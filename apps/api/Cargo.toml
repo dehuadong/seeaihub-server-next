@@ -9,8 +9,10 @@ license.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 base64.workspace = true
+bytes.workspace = true
 chrono.workspace = true
 dotenvy.workspace = true
+futures-util.workspace = true
 http.workspace = true
 seeai-adapter-aihubmix = { path = "../../crates/adapter-aihubmix" }
 seeai-adapter-apimart = { path = "../../crates/adapter-apimart" }

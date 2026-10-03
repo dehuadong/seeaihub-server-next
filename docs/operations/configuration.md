@@ -38,10 +38,30 @@
 | `PROVIDER_TIMEOUT_BASE_SECONDS` | `180` | 超时链的固定基数 |
 | `PROVIDER_TIMEOUT_INCLUDED_IMAGES` | `4` | 基数里已含的产出张数 |
 | `PROVIDER_TIMEOUT_PER_IMAGE_SECONDS` | `30` | 超出基数后每张追加的秒数 |
-| `GENERATION_RETRY_MAX_ATTEMPTS` | `3` | 安全重投上限。**只在可证明上游没有受理时重投**；状态不确定一律不重投，进对账 |
-| `GENERATION_RETRY_BACKOFF_BASE_MS` | `1000` | 重投退避基数 |
+| `GENERATION_RETRY_MAX_ATTEMPTS` | `3` | 安全重投上限（旧 Worker 与直接同步执行共用）。**只在可证明上游没有受理时重投**；状态不确定一律不重投，进对账 |
+| `GENERATION_RETRY_BACKOFF_BASE_MS` | `1000` | 重投退避基数（同上） |
 
 > 超时链是**启动时校验**的：API 会读已发布合同声明的最大输出张数，算一遍整条链，**不一致就拒绝启动并点名**。所以升级 `PROVIDER_TIMEOUT_*` 时要连同发布侧一起想清楚——它不是"调大就更快"。
+
+### 直接同步执行
+
+`GENERATION_DIRECT_EXECUTION=true` 时，两条图片入口在 API 进程内直连 Provider：认证与读取准入在消费正文前完成，不建生成 Job、Worker 不领取、结果只在本进程内存里。上面的超时链、上游超时与成本护栏继续生效；下表只列这条路自己的开关、容量与期限。
+
+| 变量 | 缺省 | 说明 |
+| --- | --- | --- |
+| `GENERATION_DIRECT_EXECUTION` | `false` | 直接同步执行开关。关着时图片入口逐字走旧路径（建 Job、Worker 领取、轮询结果），下面的变量一个都不读 |
+| `GENERATION_SETTLE_RESERVE_SECONDS` | `10` | 总期限 D 里预留给结算、提交确认与失败收尾的预算 R：上游预算因此是 D 减 R |
+| `GENERATION_EXECUTION_LEASE_SECONDS` | `60` | v1 执行所有权的租约时长（秒）。`begin_submission` 按它落 `lease_expires_at`，API Supervisor 按它的三分之一周期独立续约；续约冲突或所有权失效立即取消该次执行 |
+| `GENERATION_MAX_CHANNEL_IN_FLIGHT` | `32` | **渠道全局**未决任务上限，多副本经数据库槽位共同遵守（不是单机限制） |
+| `GENERATION_EXECUTION_SLOTS` | `64` | 本机同时在执行的生成任务数 |
+| `GENERATION_MAX_MEMORY_BYTES` | `2147483648`（2GiB） | 本机在飞执行可预占的内存总量；每次执行预留 32MiB，配得比它小进程起不来 |
+| `GENERATION_READ_SLOTS` | `64` | 本机同时在读请求正文的准入名额；取不到直接拒绝，不排队 |
+| `GENERATION_SEND_SLOTS` | `64` | 本机同时可持有的响应发送名额；在受理前预留 |
+| `GENERATION_SLOW_READ_TIMEOUT_SECONDS` | `30` | 请求正文从开始接收到读完的上限；超时在受理前返回 408 `request_timeout`，不建记录 |
+| `GENERATION_SEND_TIMEOUT_SECONDS` | `30` | 客户端发送的独立有界期限，不占用 D |
+| `GENERATION_SHUTDOWN_GRACE_SECONDS` | `25` | 停机时给在飞任务有限收尾的宽限期；到点残余交异常对账 |
+
+名额取正数、内存预算至少够一次执行：配不成可用的执行容量时进程启动失败并点名。
 
 ## 3. Worker 租约与轮询
 
@@ -49,6 +69,23 @@
 | --- | --- | --- |
 | `WORKER_POLL_INTERVAL_MS` | `1000` | 轮询间隔 |
 | `WORKER_LEASE_SECONDS` | `PROVIDER_TIMEOUT_SECONDS × 1.2` | 领取租约时长。**必须 ≥ `PROVIDER_TIMEOUT_SECONDS`**；**过短**会让长任务被另一个 worker 抢走，**过长**让崩溃后的 Job 迟迟不恢复 |
+
+### 异常对账查询调度
+
+旧 Worker 的生成领取之外，Worker 每轮还跑异常对账：接管租约过期的 v1 执行、按已知句柄只读查询、按证据幂等结算或建案。查询排期落在 `operations.reconciliation_cases` 的 `next_query_at`/`attempts` 上：同一案例未到下次查询时刻的记录本轮跳过；自动查询到次数上限后转人工并告警，不再自动查询。配置这些值不会改变收费或占用释放语义。
+
+| 变量 | 缺省 | 说明 |
+| --- | --- | --- |
+| `RECONCILIATION_BATCH_LIMIT` | `16` | 每轮接管、回收孤儿与领取晚到事实的批次上限 |
+| `RECONCILIATION_ORPHAN_MAX_AGE_SECONDS` | `900` | 从未写下提交声明的 `admitted` 超过这个年龄才回收（落失败并释放 Hold 与渠道槽位） |
+| `RECONCILIATION_LATE_FACT_CLAIM_TTL_SECONDS` | `300` | 晚到事实的领取 TTL；领取超时可被另一 worker 重领，只有消费成功才标记 |
+| `RECONCILIATION_QUERY_TIMEOUT_SECONDS` | `30` | 单次只读账务查询的期限 |
+| `RECONCILIATION_QUERY_MAX_ATTEMPTS` | `5` | 一个对账案例自动只读查询的次数上限；到上限转人工、不再自动查询 |
+| `RECONCILIATION_QUERY_BACKOFF_BASE_SECONDS` | `30` | 查询退避基：第 n 次查询后排「基 × 2^(n−1)」 |
+| `RECONCILIATION_QUERY_BACKOFF_MAX_SECONDS` | `3600` | 单次退避的上限 |
+| `RECONCILIATION_LEDGER_AUDIT_EVERY_ROUNDS` | `10` | 每多少轮跑一次慢周期账务核对（只建案告警，不改账） |
+| `RECONCILIATION_LEDGER_AUDIT_LIMIT` | `100` | 慢周期一次最多核对几个账户 |
+| `RECONCILIATION_LEDGER_AUDIT_WINDOW_SECONDS` | `3600` | 慢周期按账户更新时刻取的增量窗口 |
 
 ## 4. 加速层（Redis 启用时）
 

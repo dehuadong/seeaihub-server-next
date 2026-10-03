@@ -10,6 +10,8 @@ status: accepted
 
 **两层不要混**：上游是不是任务式（APIMart 的任务 + 轮询）是 ② Adapter 内部的事，与调用方看到的形态无关；平台对消费者永远是同步一次调用。内部的执行/审计记录（`generation.jobs`）因此只是内部 Generation Record——状态机留着做崩溃恢复、对账与运营，job_id 只出现在内部与管理员接口，**不投射成对客的异步任务协议**。
 
+**记录载荷边界由[同步图片网关 Spec](../../docs/specs/0005-synchronous-image-gateway.md)细化**：执行记录只保存执行与账务最小事实，不保存请求正文、图片与结果信封。本 ADR 中"保留内部执行流水线"的部分由该 Spec 接管；原形进原形出、同步形态与不托管资产的结论继续适用。
+
 **理由**：图片是渠道的产物，不是平台的素材库。托管的每一步——上传、绑定、下载、归档——都要平台先持有字节，于是平台不得不替调用方承担素材权限、尺寸、摘要与存储寿命的责任，并在渠道链接失效后继续"拥有"这张图。撤掉这层之后，形态差异（URL / base64、data URL / 公网 URL）留在 ② Adapter 内部，平台不复制、不搬运，也不会把渠道的临时链接语义变成平台承诺。
 
 **可行性备选有两条，都落选**：① **先把结果归档到自有对象存储、再标 Job 成功**（[0008](./0008-own-object-storage-is-the-platform-result.md)，已退役）——落选，托管的每一步都要平台先持有字节，于是平台不得不替调用方承担素材权限、尺寸、摘要与存储寿命的责任，还要在渠道链接失效后继续"拥有"这张图（依据提交 `4f58b74` 与 [`.agents/notes/implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md`](../../.agents/notes/implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md) 的"问题"节）；② **对客提供异步形态**（受理拿 `job_id`、再轮询取结果）——落选，上游是不是任务式是 ② Adapter 内部的事，把内部 Generation Record 投射成对客协议等于让调用方承担一次平台的执行细节（同一条记录的"问题"节把 202 受理与查询路由列在上一版设施里）。

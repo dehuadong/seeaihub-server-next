@@ -1,4 +1,8 @@
 use super::*;
+use async_trait::async_trait;
+use seeai_adapter_sdk::ImageSites;
+use std::sync::{Arc, Mutex};
+use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
 fn envelope(code: i64, message: &str) -> Vec<u8> {
     serde_json::to_vec(&serde_json::json!({
@@ -812,4 +816,452 @@ async fn public_urls_pass_through_without_being_uploaded_or_downloaded() {
         .await
         .expect_err("an unknown shape must be rejected");
     assert!(error.to_string().contains("http(s) url"));
+}
+// ── 同步网关协议：句柄 barrier、期限/取消与只读对账查询（RFC 0017 §4）──────────────
+
+type Route = (&'static str, &'static str, u16, String);
+
+fn submit_body() -> String {
+    serde_json::json!({
+        "code": 200,
+        "data": [{"status": "submitted", "task_id": "task_abc"}]
+    })
+    .to_string()
+}
+
+fn completed_body() -> String {
+    serde_json::json!({
+        "code": 200,
+        "data": {
+            "id": "task_abc",
+            "status": "completed",
+            "usage": full_usage(),
+            "result": {"images": [{"url": ["https://example.invalid/a.png"]}]},
+            "cost": 0.011354
+        }
+    })
+    .to_string()
+}
+
+fn running_body() -> String {
+    serde_json::json!({
+        "code": 200,
+        "data": {"id": "task_abc", "status": "processing", "result": {"images": []}}
+    })
+    .to_string()
+}
+
+/// 一个本地假上游：按方法+路径应答，并逐条记下收到的请求。
+struct FakeProvider {
+    base_url: String,
+    requests: Arc<Mutex<Vec<String>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeProvider {
+    async fn start(routes: Vec<Route>) -> Self {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("the fake provider binds a local port");
+        let port = listener.local_addr().expect("the fake address").port();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let recorded = requests.clone();
+        let routes = Arc::new(routes);
+        let task = tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let recorded = recorded.clone();
+                let routes = routes.clone();
+                tokio::spawn(async move {
+                    let _ = serve(&mut socket, recorded, routes).await;
+                });
+            }
+        });
+        Self {
+            base_url: format!("http://127.0.0.1:{port}"),
+            requests,
+            _task: task,
+        }
+    }
+
+    fn requests(&self) -> Vec<String> {
+        self.requests.lock().expect("requests lock").clone()
+    }
+}
+
+async fn serve(
+    socket: &mut tokio::net::TcpStream,
+    requests: Arc<Mutex<Vec<String>>>,
+    routes: Arc<Vec<Route>>,
+) -> std::io::Result<()> {
+    let mut reader = tokio::io::BufReader::new(&mut *socket);
+    let mut request_line = String::new();
+    reader.read_line(&mut request_line).await?;
+    let mut content_length = 0_usize;
+    loop {
+        let mut header = String::new();
+        if reader.read_line(&mut header).await? == 0 {
+            break;
+        }
+        let header = header.trim_end();
+        if header.is_empty() {
+            break;
+        }
+        if let Some((name, value)) = header.split_once(':')
+            && name.eq_ignore_ascii_case("content-length")
+        {
+            content_length = value.trim().parse().unwrap_or(0);
+        }
+    }
+    if content_length > 0 {
+        let mut body = vec![0_u8; content_length];
+        reader.read_exact(&mut body).await?;
+    }
+    let mut parts = request_line.split_whitespace();
+    let method = parts.next().unwrap_or_default();
+    let path = parts.next().unwrap_or_default();
+    let path = path.split('?').next().unwrap_or(path);
+    requests
+        .lock()
+        .expect("requests lock")
+        .push(format!("{method} {path}"));
+    let (status, body) = routes
+        .iter()
+        .find(|(route_method, route_path, _, _)| *route_method == method && *route_path == path)
+        .map(|(_, _, status, body)| (*status, body.as_str()))
+        .unwrap_or((404, "{\"error\":{\"code\":404,\"message\":\"not found\"}}"));
+    let reason = if status < 400 { "OK" } else { "Error" };
+    let head = format!(
+        "HTTP/1.1 {status} {reason}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
+        body.len()
+    );
+    socket.write_all(head.as_bytes()).await?;
+    socket.write_all(body.as_bytes()).await?;
+    socket.flush().await
+}
+
+/// 假执行上下文：记下 accepted 被调用的时刻，以及那一刻假上游已经收到的请求。
+struct FakeContext {
+    deadline: Deadline,
+    cancelled: bool,
+    request_log: Arc<Mutex<Vec<String>>>,
+    accepted: Mutex<Vec<(AcceptedHandle, Vec<String>)>>,
+    accept_result: Result<(), AcceptanceError>,
+}
+
+impl FakeContext {
+    fn new(
+        request_log: Arc<Mutex<Vec<String>>>,
+        accept_result: Result<(), AcceptanceError>,
+    ) -> Self {
+        Self {
+            deadline: Deadline::after(Duration::from_secs(30)),
+            cancelled: false,
+            request_log,
+            accepted: Mutex::new(Vec::new()),
+            accept_result,
+        }
+    }
+
+    /// 一开始就取消：证明新路径在第一次外部副作用之前停下。
+    fn cancelled(request_log: Arc<Mutex<Vec<String>>>) -> Self {
+        let mut context = Self::new(request_log, Ok(()));
+        context.cancelled = true;
+        context
+    }
+
+    /// 总期限已过：与取消区分开，报的是明确的期限错误。
+    fn expired(request_log: Arc<Mutex<Vec<String>>>) -> Self {
+        let mut context = Self::new(request_log, Ok(()));
+        context.deadline = Deadline::after(Duration::ZERO);
+        context
+    }
+
+    fn accepted_calls(&self) -> Vec<(AcceptedHandle, Vec<String>)> {
+        self.accepted.lock().expect("accepted lock").clone()
+    }
+}
+
+#[async_trait]
+impl ExecutionContext for FakeContext {
+    fn deadline(&self) -> Deadline {
+        self.deadline
+    }
+
+    fn is_cancelled(&self) -> bool {
+        self.cancelled
+    }
+
+    async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError> {
+        let snapshot = self.request_log.lock().expect("request log lock").clone();
+        self.accepted
+            .lock()
+            .expect("accepted lock")
+            .push((handle, snapshot));
+        self.accept_result.clone()
+    }
+}
+
+fn prompt_only_input() -> GatewayInput {
+    GatewayInput {
+        provider_model_id: "gpt-image-2.5-flare".to_owned(),
+        branch: ImageBranch::PromptOnly,
+        native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
+        reference_images: Vec::new(),
+        mask: None,
+        image_sites: ImageSites::default(),
+        cost_currency: "USD".to_owned(),
+    }
+}
+
+fn adapter(provider: &FakeProvider) -> ApimartImageAdapter {
+    ApimartImageAdapter::new(&provider.base_url, Duration::from_secs(30)).expect("adapter config")
+}
+
+/// A6 barrier：accepted 返回 Ok 之前不许有任何 GET task；Ok 之后才轮询，且提交只发一次。
+#[tokio::test]
+async fn the_handle_is_persisted_before_any_task_poll() {
+    let provider = FakeProvider::start(vec![
+        ("POST", "/v1/images/generations", 200, submit_body()),
+        ("GET", "/v1/tasks/task_abc", 200, completed_body()),
+    ])
+    .await;
+    let context = FakeContext::new(provider.requests.clone(), Ok(()));
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let output = GatewayAdapter::execute(
+        &adapter(&provider),
+        Arc::new(prompt_only_input()),
+        &context,
+        &credential,
+    )
+    .await
+    .expect("accepted then completed");
+    assert_eq!(
+        output.response_payload.images,
+        vec![GeneratedImage::from_url(
+            "https://example.invalid/a.png".to_owned()
+        )]
+    );
+    assert_eq!(output.accounting_facts.image_count, 1);
+    assert_eq!(
+        output.accounting_facts.provider_trace_id.as_deref(),
+        Some("task_abc")
+    );
+    let calls = context.accepted_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].0.task_id, "task_abc");
+    assert!(
+        calls[0]
+            .1
+            .iter()
+            .all(|request| !request.starts_with("GET ")),
+        "accepted 返回 Ok 之前不许有 GET task：{:?}",
+        calls[0].1
+    );
+    assert_eq!(calls[0].1, vec!["POST /v1/images/generations".to_owned()]);
+    let requests = provider.requests();
+    assert_eq!(
+        requests.first().map(String::as_str),
+        Some("POST /v1/images/generations")
+    );
+    assert!(
+        requests.iter().any(|request| request.starts_with("GET ")),
+        "句柄确认之后才轮询：{requests:?}"
+    );
+}
+
+/// accepted 失败：上报 AcceptedUnpersisted 并带 task id，绝不进 poll、绝不发第二次 POST。
+#[tokio::test]
+async fn a_failed_handle_persist_never_polls_or_resubmits() {
+    let provider = FakeProvider::start(vec![
+        ("POST", "/v1/images/generations", 200, submit_body()),
+        ("GET", "/v1/tasks/task_abc", 200, completed_body()),
+    ])
+    .await;
+    let context = FakeContext::new(
+        provider.requests.clone(),
+        Err(AcceptanceError::Persist("db down".to_owned())),
+    );
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter(&provider),
+        Arc::new(prompt_only_input()),
+        &context,
+        &credential,
+    )
+    .await
+    .expect_err("the barrier must stop the execution");
+    match error {
+        AdapterError::AcceptedUnpersisted { handle, reason } => {
+            assert_eq!(handle.task_id, "task_abc");
+            assert_eq!(reason, "db down");
+        }
+        other => panic!("expected AcceptedUnpersisted, got {other:?}"),
+    }
+    assert_eq!(
+        provider.requests(),
+        vec!["POST /v1/images/generations".to_owned()],
+        "句柄没入库：不许有第二次 POST，也不许进入 poll"
+    );
+}
+
+/// 只读查询：同一任务端点取终态与账务事实，绝不 submit 或 upload。
+#[tokio::test]
+async fn query_accounting_reads_the_known_task_without_submitting() {
+    let provider = FakeProvider::start(vec![
+        ("POST", "/v1/images/generations", 200, submit_body()),
+        ("GET", "/v1/tasks/task_abc", 200, completed_body()),
+    ])
+    .await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: "task_abc".to_owned(),
+        trace_id: Some("task_abc".to_owned()),
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("the terminal task is queryable");
+    assert!(query.terminal);
+    let facts = query
+        .accounting_facts
+        .expect("a terminal task carries facts");
+    assert_eq!(facts.image_count, 1);
+    assert_eq!(facts.usage.expect("usage").total_tokens, 210);
+    assert_eq!(
+        facts.provider_cost,
+        ProviderCost::Declared(DeclaredCost {
+            amount_microusd: 11_354,
+            currency: "CNY".to_owned(),
+        }),
+        "币种取受理时冻结的成本币种，不硬编码"
+    );
+    assert_eq!(facts.provider_trace_id.as_deref(), Some("task_abc"));
+    let requests = provider.requests();
+    assert!(
+        requests.iter().all(|request| request.starts_with("GET ")),
+        "只读查询绝不 submit 或 upload：{requests:?}"
+    );
+}
+
+/// 非终态：terminal:false，不带账务事实，也不产生任何生成副作用。
+#[tokio::test]
+async fn a_running_task_query_is_not_terminal() {
+    let provider =
+        FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, running_body())]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: "task_abc".to_owned(),
+        trace_id: None,
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("a running task is a valid query result");
+    assert!(!query.terminal);
+    assert!(query.accounting_facts.is_none());
+    assert_eq!(
+        provider.requests(),
+        vec!["GET /v1/tasks/task_abc".to_owned()]
+    );
+}
+/// 取消在 submit 之前生效：没有 POST、没有 accepted，也不会有轮询。
+#[tokio::test]
+async fn a_cancelled_execution_never_submits() {
+    let provider = FakeProvider::start(vec![
+        ("POST", "/v1/images/generations", 200, submit_body()),
+        ("GET", "/v1/tasks/task_abc", 200, completed_body()),
+    ])
+    .await;
+    let context = FakeContext::cancelled(provider.requests.clone());
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter(&provider),
+        Arc::new(prompt_only_input()),
+        &context,
+        &credential,
+    )
+    .await
+    .expect_err("取消必须停下");
+    assert!(matches!(error, AdapterError::Cancelled), "{error:?}");
+    assert!(
+        provider.requests().is_empty(),
+        "取消后不许有上传或 submit：{:?}",
+        provider.requests()
+    );
+    assert!(context.accepted_calls().is_empty());
+}
+
+/// 总期限已到：submit 之前停下，报明确的期限错误而不是笼统的传输失败。
+#[tokio::test]
+async fn an_expired_deadline_stops_before_submit() {
+    let provider = FakeProvider::start(vec![
+        ("POST", "/v1/images/generations", 200, submit_body()),
+        ("GET", "/v1/tasks/task_abc", 200, completed_body()),
+    ])
+    .await;
+    let context = FakeContext::expired(provider.requests.clone());
+    // 期限从构造那一刻起算；推进一点点让"已过期"是确定的。
+    tokio::time::sleep(Duration::from_millis(1)).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter(&provider),
+        Arc::new(prompt_only_input()),
+        &context,
+        &credential,
+    )
+    .await
+    .expect_err("期限已到必须停下");
+    match error {
+        AdapterError::Provider(call) => {
+            assert_eq!(call.code, "execution_deadline_exceeded");
+            assert_eq!(call.retry_safety, RetrySafety::NotRetryable);
+        }
+        other => panic!("expected the deadline error, got {other:?}"),
+    }
+    assert!(
+        provider.requests().is_empty(),
+        "期限已到后不许有上传或 submit：{:?}",
+        provider.requests()
+    );
+}
+
+/// Provider 错误正文与带敏感 URL 的 reqwest 原始串不进新协议的错误。
+#[tokio::test]
+async fn provider_error_bodies_are_not_echoed() {
+    let provider = FakeProvider::start(vec![(
+        "POST",
+        "/v1/images/generations",
+        500,
+        r#"{"error":{"code":500,"message":"SECRET_PROVIDER_BODY https://up.example/x?token=SECRET_TOKEN"}}"#
+            .to_owned(),
+    )])
+    .await;
+    let context = FakeContext::new(provider.requests.clone(), Ok(()));
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter(&provider),
+        Arc::new(prompt_only_input()),
+        &context,
+        &credential,
+    )
+    .await
+    .expect_err("上游 500 必须失败");
+    let rendered = format!("{error:?} {error}");
+    assert!(
+        !rendered.contains("SECRET_PROVIDER_BODY") && !rendered.contains("SECRET_TOKEN"),
+        "Provider 正文与敏感 URL 不得出现在错误里：{rendered}"
+    );
 }

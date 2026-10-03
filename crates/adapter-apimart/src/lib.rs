@@ -16,9 +16,13 @@ use bytes::{Bytes, BytesMut};
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, DeclaredCost, GeneratedImage, ImageAdapter,
-    PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind,
-    ProviderSuccess, RetrySafety, decode_data_url, is_http_url,
+    AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, AdapterDescriptor,
+    AdapterError, Deadline, DeclaredCost, ExecutionContext, GatewayAdapter, GatewayInput,
+    GeneratedImage, ImageAdapter, ImageValueShape, InputImage, PreparedImageRequest,
+    ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput,
+    ProviderSuccess, QueryAccountingCapability, ResponsePayload, RetrySafety, decode_data_url,
+    ensure_external_call_allowed, external_call_timeout, gateway_passthrough_parameters,
+    is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -110,6 +114,23 @@ impl AdapterFactory for ApimartAdapterFactory {
         }
         ApimartImageAdapter::new(base_url, timeout)
             .map(|adapter| Arc::new(adapter) as Arc<dyn ImageAdapter>)
+            .map_err(|error| ApplicationError::Configuration(error.to_string()))
+    }
+
+    /// 同步网关协议：同一条供给换成 [`GatewayAdapter`] 交出同一个 Driver。
+    fn create_gateway(
+        &self,
+        adapter_key: &str,
+        base_url: &str,
+        timeout: Duration,
+    ) -> Result<Arc<dyn GatewayAdapter>, ApplicationError> {
+        if adapter_key != ADAPTER_KEY {
+            return Err(ApplicationError::Configuration(format!(
+                "unsupported adapter {adapter_key}"
+            )));
+        }
+        ApimartImageAdapter::new(base_url, timeout)
+            .map(|adapter| Arc::new(adapter) as Arc<dyn GatewayAdapter>)
             .map_err(|error| ApplicationError::Configuration(error.to_string()))
     }
 }
@@ -293,6 +314,18 @@ impl ApimartImageAdapter {
         media_type: &str,
         credential: &ProviderCredential,
     ) -> Result<String, AdapterError> {
+        self.upload_image_within(bytes, media_type, credential, REQUEST_TIMEOUT)
+            .await
+    }
+
+    /// 带显式单次超时的上传；新协议用总期限剩余夹住它（RFC 0017 §6）。
+    async fn upload_image_within(
+        &self,
+        bytes: &[u8],
+        media_type: &str,
+        credential: &ProviderCredential,
+        timeout: Duration,
+    ) -> Result<String, AdapterError> {
         let part = reqwest::multipart::Part::bytes(bytes.to_vec())
             .file_name(upload_filename(bytes, media_type))
             .mime_str(media_type)
@@ -305,6 +338,7 @@ impl ApimartImageAdapter {
         let response = self
             .client
             .post(self.endpoint("v1/uploads/images")?)
+            .timeout(timeout)
             .bearer_auth(credential.expose())
             .multipart(form)
             .send()
@@ -399,12 +433,31 @@ impl ApimartImageAdapter {
         task_id: &str,
         credential: &ProviderCredential,
     ) -> Result<Bytes, AdapterError> {
+        self.query_task_with(task_id, credential, None).await
+    }
+
+    /// 单次任务查询（含幂等读的有界退避重试）。`context` 给出取消与总期限时，每次尝试前
+    /// 都过闸，单次超时用 min(自身配置, 剩余)（RFC 0017 §6）。
+    async fn query_task_with(
+        &self,
+        task_id: &str,
+        credential: &ProviderCredential,
+        context: Option<&dyn ExecutionContext>,
+    ) -> Result<Bytes, AdapterError> {
         let mut attempt = 0_u32;
         loop {
+            let timeout = match context {
+                Some(context) => {
+                    ensure_external_call_allowed(context)?;
+                    external_call_timeout(REQUEST_TIMEOUT, context)
+                }
+                None => REQUEST_TIMEOUT,
+            };
             let url = self.endpoint(&format!("v1/tasks/{task_id}"))?;
             let outcome = match self
                 .client
                 .get(url)
+                .timeout(timeout)
                 .bearer_auth(credential.expose())
                 .send()
                 .await
@@ -419,7 +472,12 @@ impl ApimartImageAdapter {
                     if attempt > QUERY_RETRY_LIMIT {
                         return Err(error);
                     }
-                    tokio::time::sleep(QUERY_RETRY_BACKOFF * attempt).await;
+                    let backoff = QUERY_RETRY_BACKOFF * attempt;
+                    let backoff = match context {
+                        Some(context) => backoff.min(context.deadline().remaining()),
+                        None => backoff,
+                    };
+                    tokio::time::sleep(backoff).await;
                 }
             }
         }
@@ -1212,6 +1270,421 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
 
 fn sha256_hex(bytes: &[u8]) -> String {
     hex::encode(Sha256::digest(bytes))
+}
+
+// ── 同步网关协议（RFC 0017 §2/§4）──────────────────────────────────────────────
+
+/// 新协议的错误出口（RFC 0017 §4）：Provider 报文自由文本与 reqwest 原始串可能带响应正文、
+/// URL 查询或 multipart，这里只保留平台判出的码与处置，不把原文带出去。
+fn gateway_error(error: AdapterError) -> AdapterError {
+    match error {
+        AdapterError::Provider(mut call) => {
+            call.message = "the provider call failed".to_owned();
+            AdapterError::Provider(call)
+        }
+        other => other,
+    }
+}
+
+/// 新协议的生成请求体：普通参数逐字进顶层字段，图片参数位由 `image_sites` 给出、取值来自
+/// 换算后的公网 URL，名单外的普通参数一个都不改写。
+fn gateway_generation_body(
+    input: &GatewayInput,
+    resolved: &Map<String, Value>,
+) -> Result<Value, AdapterError> {
+    let mut object = Map::new();
+    object.insert(
+        "model".to_owned(),
+        Value::String(input.provider_model_id.clone()),
+    );
+    object.insert(
+        "prompt".to_owned(),
+        required_string(&input.native_parameters, "/prompt")?,
+    );
+    for (name, value) in gateway_passthrough_parameters(input) {
+        object.insert(name.clone(), value.clone());
+    }
+    for (name, value) in resolved {
+        object.insert(name.clone(), value.clone());
+    }
+    Ok(Value::Object(object))
+}
+
+impl ApimartImageAdapter {
+    /// 新协议下内联图片的总量上限：`Bytes` 直接按字节数，`DataUrl` 就地解码后计数，
+    /// 公网 URL 不计（平台不读它、也不上传）。
+    fn gateway_ensure_total_upload_within_limit(input: &GatewayInput) -> Result<(), AdapterError> {
+        let mut total = 0_usize;
+        for image in input.reference_images.iter().chain(input.mask.iter()) {
+            match image {
+                InputImage::Url(_) => {}
+                InputImage::Bytes(bytes) => total = total.saturating_add(bytes.bytes.len()),
+                InputImage::DataUrl(value) => {
+                    if let Ok(decoded) = decode_data_url(value) {
+                        total = total.saturating_add(decoded.bytes.len());
+                    }
+                }
+            }
+        }
+        if total > MAX_TOTAL_UPLOAD_BYTES {
+            return Err(AdapterError::UnsupportedInput(format!(
+                "inline images total {total} bytes, above the provider limit of {MAX_TOTAL_UPLOAD_BYTES} bytes"
+            )));
+        }
+        Ok(())
+    }
+
+    /// 把一份内存输入图换成可发给上游的公网 URL：公网 URL 原样透传，DataUrl/Bytes 走既有上传。
+    async fn gateway_resolve_url(
+        &self,
+        image: &InputImage,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<String, AdapterError> {
+        match image {
+            InputImage::Url(url) => Ok(url.clone()),
+            InputImage::DataUrl(_) | InputImage::Bytes(_) => {
+                let decoded = image.decoded()?;
+                if decoded.bytes.len() > MAX_UPLOAD_BYTES {
+                    return Err(AdapterError::UnsupportedInput(format!(
+                        "an inline image is {} bytes, above the provider upload limit of {MAX_UPLOAD_BYTES} bytes",
+                        decoded.bytes.len()
+                    )));
+                }
+                ensure_external_call_allowed(context)?;
+                self.upload_image_within(
+                    &decoded.bytes,
+                    &decoded.media_type,
+                    credential,
+                    external_call_timeout(REQUEST_TIMEOUT, context),
+                )
+                .await
+            }
+        }
+    }
+
+    /// 按 [`GatewayInput::image_sites`] 换算图片：参考图与遮罩各自的参数名与 wire 形状来自参数位，
+    /// 取值来自强类型图片输入。名单里没有的普通参数一个都不碰。
+    async fn gateway_resolve_images(
+        &self,
+        input: &GatewayInput,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<Map<String, Value>, AdapterError> {
+        if !input.reference_images.is_empty() && input.image_sites.reference.is_none() {
+            return Err(AdapterError::UnsupportedInput(
+                "the offering declares no reference image parameter, so the request cannot carry its reference images"
+                    .to_owned(),
+            ));
+        }
+        if input.mask.is_some() && input.image_sites.mask.is_none() {
+            return Err(AdapterError::UnsupportedInput(
+                "the offering declares no mask parameter, so the request cannot carry its mask"
+                    .to_owned(),
+            ));
+        }
+        let mut resolved = Map::new();
+        if let Some(site) = &input.image_sites.reference
+            && !input.reference_images.is_empty()
+        {
+            let mut urls = Vec::with_capacity(input.reference_images.len());
+            for image in &input.reference_images {
+                urls.push(Value::String(
+                    self.gateway_resolve_url(image, credential, context).await?,
+                ));
+            }
+            // 形状跟候选声明走：数组参数发数组，单值参数只发第一张。
+            let value = match site.shape {
+                ImageValueShape::Array => Value::Array(urls),
+                ImageValueShape::Scalar => urls.into_iter().next().expect("just checked non-empty"),
+            };
+            resolved.insert(site.parameter.clone(), value);
+        }
+        if let Some(site) = &input.image_sites.mask
+            && let Some(mask) = &input.mask
+        {
+            resolved.insert(
+                site.parameter.clone(),
+                Value::String(self.gateway_resolve_url(mask, credential, context).await?),
+            );
+        }
+        Ok(resolved)
+    }
+
+    /// 提交生成请求、返回 `task_id`。与旧入口同一份请求形状与提交收窄，只是输入换成新协议。
+    async fn gateway_submit(
+        &self,
+        input: &GatewayInput,
+        resolved: &Map<String, Value>,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<String, AdapterError> {
+        let body = gateway_generation_body(input, resolved)?;
+        ensure_external_call_allowed(context)?;
+        let response = self
+            .client
+            .post(self.endpoint("v1/images/generations")?)
+            .timeout(external_call_timeout(REQUEST_TIMEOUT, context))
+            .bearer_auth(credential.expose())
+            .json(&body)
+            .send()
+            .await
+            .map_err(ambiguous_transport_error)?;
+        let status = response.status();
+        let body = read_body(response)
+            .await
+            .map_err(|error| narrow_submit_rejection(status, error))?;
+        let parsed: SubmitEnvelope = serde_json::from_slice(&body).map_err(|error| {
+            provider_error(
+                "provider_response_invalid",
+                error.to_string(),
+                RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
+            )
+        })?;
+        parsed
+            .data
+            .into_iter()
+            .next()
+            .map(|item| item.task_id)
+            .ok_or_else(|| {
+                provider_error(
+                    "provider_task_missing",
+                    "submit response carried no task id".to_owned(),
+                    RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
+                )
+            })
+    }
+
+    /// 轮询到终态：截止判据来自 `execution_context` 的绝对期限，每轮先看取消状态。
+    async fn poll_with_context(
+        &self,
+        task_id: &str,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<TaskData, AdapterError> {
+        loop {
+            if context.is_cancelled() {
+                return Err(AdapterError::Cancelled);
+            }
+            if context.deadline().is_expired() {
+                return Err(provider_error(
+                    "provider_task_timeout",
+                    format!("task {task_id} did not reach a terminal state in time"),
+                    RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
+                ));
+            }
+            let body = match self
+                .query_task_with(task_id, credential, Some(context))
+                .await
+            {
+                Ok(body) => body,
+                Err(error) => return Err(after_acceptance(error)),
+            };
+            let parsed: TaskEnvelope = serde_json::from_slice(&body).map_err(|error| {
+                provider_error(
+                    "provider_response_invalid",
+                    error.to_string(),
+                    RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
+                )
+            })?;
+            match parsed.data.status.as_str() {
+                "completed" => return Ok(parsed.data),
+                "failed" | "cancelled" => {
+                    let (code, message) = parsed
+                        .data
+                        .error
+                        .as_ref()
+                        .map(|error| {
+                            (
+                                error.code.map_or_else(
+                                    || "provider_task_failed".to_owned(),
+                                    |c| c.to_string(),
+                                ),
+                                error.message.clone(),
+                            )
+                        })
+                        .unwrap_or_else(|| {
+                            (
+                                "provider_task_failed".to_owned(),
+                                parsed.data.status.clone(),
+                            )
+                        });
+                    return Err(provider_error(
+                        &code,
+                        message,
+                        RetrySafety::NotRetryable,
+                        ProviderFailureKind::Unknown,
+                    ));
+                }
+                _ => {
+                    let remaining = context.deadline().remaining();
+                    tokio::time::sleep(POLL_INTERVAL.min(remaining)).await;
+                }
+            }
+        }
+    }
+
+    /// 提交已成功、句柄也已确认入库之后的部分：轮询到终态 → 抽计量与成本 → 内存结果 + 账务事实。
+    async fn gateway_finish(
+        &self,
+        task_id: &str,
+        cost_currency: &str,
+        credential: &ProviderCredential,
+        context: &dyn ExecutionContext,
+    ) -> Result<ProviderOutput, AdapterError> {
+        let task = self.poll_with_context(task_id, credential, context).await?;
+        let provider_cost = task.provider_cost(cost_currency);
+        let usage = task
+            .usage()
+            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?;
+        let digest = task.response_digest(task_id);
+        let images = task
+            .image_urls()
+            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?
+            .into_iter()
+            .map(GeneratedImage::from_url)
+            .collect::<Vec<_>>();
+        if images.is_empty() {
+            return Err(with_provider_cost(
+                provider_error(
+                    "provider_result_empty",
+                    "provider returned no images".to_owned(),
+                    RetrySafety::AcceptanceUnknown,
+                    ProviderFailureKind::Unknown,
+                ),
+                provider_cost,
+            ));
+        }
+        let image_count = u32::try_from(images.len()).unwrap_or(u32::MAX);
+        Ok(ProviderOutput {
+            response_payload: ResponsePayload {
+                // 应用层按自己的时钟兜底 `created`；任务面不提供它。
+                created: None,
+                images,
+            },
+            accounting_facts: AccountingFacts {
+                usage: Some(usage),
+                provider_cost,
+                image_count,
+                response_digest: digest,
+                provider_trace_id: Some(task_id.to_owned()),
+            },
+        })
+    }
+}
+
+#[async_trait]
+impl GatewayAdapter for ApimartImageAdapter {
+    fn key(&self) -> &'static str {
+        ADAPTER_KEY
+    }
+
+    /// 任务式上游有已知的同一任务状态端点：可按句柄只读查询计量。
+    fn query_accounting_capability(&self) -> QueryAccountingCapability {
+        QueryAccountingCapability::Supported
+    }
+
+    async fn execute(
+        &self,
+        input: Arc<GatewayInput>,
+        context: &dyn ExecutionContext,
+        credential: &ProviderCredential,
+    ) -> Result<ProviderOutput, AdapterError> {
+        // 0) 参考图与遮罩先换算成公网 URL。失败时生成任务尚未提交 ⇒ 可证明未受理。
+        Self::gateway_ensure_total_upload_within_limit(&input)?;
+        let resolved = self
+            .gateway_resolve_images(&input, credential, context)
+            .await
+            .map_err(gateway_error)?;
+        // 1) 提交。这一步之后绝不重发；后续任何失败都进对账。
+        let task_id = self
+            .gateway_submit(&input, &resolved, credential, context)
+            .await
+            .map_err(gateway_error)?;
+        // 2) A6 barrier：拿到 task id 后先让应用层确认句柄入库，成功之前绝不轮询。
+        //    task id 同时是这条通路已知的逐请求对账标识。
+        let handle = AcceptedHandle {
+            task_id: task_id.clone(),
+            trace_id: Some(task_id.clone()),
+        };
+        if let Err(error) = context.accepted(handle.clone()).await {
+            let reason = match error {
+                AcceptanceError::Persist(message) => message,
+                AcceptanceError::Cancelled => "the execution was cancelled".to_owned(),
+            };
+            return Err(AdapterError::AcceptedUnpersisted { handle, reason });
+        }
+        // 3) 句柄已入库：轮询到终态并交回内存结果与账务事实。
+        self.gateway_finish(&task_id, &input.cost_currency, credential, context)
+            .await
+            .map_err(|error| with_task_id(error, &task_id))
+            .map_err(gateway_error)
+    }
+
+    /// 只读同一任务的终态与账务事实：绝不 submit 或 upload，也不取结果图正文。
+    async fn query_accounting(
+        &self,
+        handle: &AcceptedHandle,
+        cost_currency: &str,
+        deadline: Deadline,
+        credential: &ProviderCredential,
+    ) -> Result<AccountingQuery, AdapterError> {
+        let task_id = handle.task_id.as_str();
+        if task_id.is_empty() {
+            return Err(provider_error(
+                "provider_task_missing",
+                "accepted handle carries no task id to query".to_owned(),
+                RetrySafety::NotRetryable,
+                ProviderFailureKind::Unknown,
+            ));
+        }
+        if deadline.is_expired() {
+            return Err(provider_error(
+                "provider_task_timeout",
+                format!("task {task_id} query deadline has expired"),
+                RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
+            ));
+        }
+        let body = self
+            .query_task(task_id, credential)
+            .await
+            .map_err(after_acceptance)?;
+        let parsed: TaskEnvelope = serde_json::from_slice(&body).map_err(|error| {
+            provider_error(
+                "provider_response_invalid",
+                error.to_string(),
+                RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
+            )
+        })?;
+        let task = parsed.data;
+        if !matches!(task.status.as_str(), "completed" | "failed" | "cancelled") {
+            return Ok(AccountingQuery {
+                terminal: false,
+                accounting_facts: None,
+            });
+        }
+        let image_count = u32::try_from(task.image_urls().map(|urls| urls.len()).unwrap_or(0))
+            .unwrap_or(u32::MAX);
+        Ok(AccountingQuery {
+            terminal: true,
+            accounting_facts: Some(AccountingFacts {
+                // 终态不一定带得回计量：查询只如实交回拿得到的部分，缺的留空而不是猜。
+                usage: task.usage().ok(),
+                // 金额与结果无关：终态读到就先报走。上游金额不带币种，币种取受理时冻结的
+                // `cost_currency`；上游确实没给或读不出时才落 `unavailable`（不猜、不硬编码币种）。
+                provider_cost: task.provider_cost(cost_currency),
+                image_count,
+                response_digest: task.response_digest(task_id),
+                provider_trace_id: Some(task_id.to_owned()),
+            }),
+        })
+    }
 }
 
 #[cfg(test)]

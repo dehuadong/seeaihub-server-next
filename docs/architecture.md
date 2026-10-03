@@ -14,7 +14,7 @@
                   │ 依赖
                   ▼
  应用层       crates/application
-             用例（Service）+ 端口（trait：HubRepository /
+             用例（Service）+ 端口（trait：HubRepository / ExecutionRepository /
              AdapterFactory / CredentialProvider / CacheStore）；发布校验与归一；错误→处置映射
                   │ 依赖
                   ▼
@@ -156,9 +156,11 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给、优先级与**档内权重**（`routing_priority` 是档位，同档允许多条候选，档内按 `weight` 分摊）；修订上另记这次发布定义的是哪个**网关模型**（对客名）与它指向哪一行厂商模型合同，以及**定价**（修订级 `markup_bps` + **按候选键**的参考成本、成本币种、对客四档 CNY 费率向量、**对客计价形态**、成本来源、档位价目表、保底表）；旧修订的定价列留 NULL ⇒ 受理与结算走旧口径 | `RuntimeService::publish` |
 | `routing.route_policies` | **路由策略**：在已发布的合格候选里"挑哪一条"的运行期配置（全局一条 + 按网关模型覆盖），含**折扣率表**（只作 `least_cost` 的比较输入，不进成本）与**标签映射**（供 `user_tag`）。**运营配置，不进不可变修订**；改它即刻影响之后的受理，已受理 Job 不受影响 | `RoutePolicyService::upsert`（`PUT /api/v1/route-policies`）、受理时取生效那条 |
 | `publication.gateway_models` | 网关模型的**运维开关**：这个名字现在开着吗、谁在什么时候改的。**定义不在这里**（候选集、合同、定价只在不可变修订里） | `RuntimeService::publish`（首次发布落行）、`set_gateway_model_enabled` |
-| `generation.jobs` | 受理时的请求事实、所选供给、**冻结的定价快照**（对客费率向量、保底额与来源、命中的候选、折算率）、结果信封（渠道给的 `url` 或 `b64_json`）、对客错误码与平台侧失败类别，以及**终态时刻**（`terminal_at`：成功/失败/人工解除对账时与那次状态变更同事务落；对账态不是终态，留空）；**对客不可见** | `GenerationService::create`、`complete_job`、`fail_job`、`refund_reconciliation`、`recover_expired_leases` |
+| `generation.jobs` | 受理时的请求事实、所选供给、**冻结的定价快照**（对客费率向量、保底额与来源、命中的候选、折算率）、结果信封（渠道给的 `url` 或 `b64_json`）、对客错误码与平台侧失败类别，以及**终态时刻**（`terminal_at`：成功/失败/人工解除对账时与那次状态变更同事务落；对账态不是终态，留空）。v1 记录另有执行所有权与租约（`execution_owner` / `fencing_token` / `lease_expires_at`）与上游任务句柄（`provider_task_handle`）；**对客不可见** | `GenerationService::create`、`complete_job`、`fail_job`、`refund_reconciliation`、`recover_expired_leases`、`ExecutionRepository::begin_submission` / `renew_execution_ownership` / `takeover_expired_executions` / `reap_unsubmitted_admissions` |
 | `generation.routing_decisions` | 受理时为什么选了它（候选、档位、**权重**、是否合格、本次**分流落点**） | 与 Job 同事务写入 |
 | `generation.attempts` | 一次执行尝试：状态、**渠道原始错误码与原文**、对账标识、**计量证据**、**渠道成本事实**（来源 `computed`/`declared`/`unavailable` + 原币种金额 + 该渠道声明的币种 + **按冻结汇率折算后 CNY**）。成功、"结果交付失败进对账"、Driver 在终态之后判定失败三条路径都写成本事实（拿不到事实时写 `unavailable`）；只有请求根本没交到渠道的执行四列留空 | `begin_attempt`、`complete_job`、`fail_job` |
+| `generation.execution_capacity` | **渠道全局未决任务槽位**：与受理同事务获取，唯一关联 Job；确定终态或可信人工处置才释放（账户执行名额不在此表，沿用既有在飞计数） | `ExecutionRepository::admit`（获取）、`settle` / `fail_or_reconcile`（释放） |
+| `generation.late_facts` | **晚到事实收件箱**：原提交者在执行 token 失效后交付的有界 task handle 或计量/成本事实，只存 Spec 0005 §2 允许的最小事实；`claimed_by` / `claimed_at` 是领取标记（领取超时可重领），只有消费成功才写 `consumed_at` | `ExecutionRepository::offer_late_facts`（写入）、`claim_unconsumed_late_facts` / `mark_late_fact_consumed`（异常对账领取与消费） |
 | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 已结算余额、占用、预授权与账目。账户行另存**占用合计**（`held_microusd`，= active 预授权之和）与**版本**（`version`，每次金额变化 +1）；可用额 = 余额 − 占用合计，不落第三份。账户分**消费者**与**平台**两类（`kind`）：消费者账户有 API Key 与余额缓存；平台账户只有一行（`migrations/0019_ledger_platform_cost.sql` 种下的固定 id），承载**平台自担的上游成本**，无缓存、无预授权。**余额与可用额可为负**（透支发生在结算：实收超过保底额时差额把余额扣成负数；平台账户的余额就是它承担的累计成本），**保底额可为 0**。资金流水科目：`credit` / `capture` / `adjustment` / `cost`——预授权只留在 `ledger.holds`（`active` / `captured` / `released`），不进流水 | `create_job`（占用：`held += 保底额`）、`complete_job`（`balance -= 实收`、`held -= 保底额`）、`fail_job`（`held -= 保底额`，以及**成本条目**：终态失败且这次执行有折算后 CNY 成本时，记一条 `cost` 挂平台账户）、`refund_reconciliation`（`held -= 保底额`） |
 | `ledger.daily_spend` | **每账户每 UTC 自然日一行的已完成实收合计**（正数）：每日消费限额的判据——受理只读当天一行，不扫历史流水 | `complete_job`（与 `capture` 同事务累加） |
 | `identity.api_keys` | API Key 摘要 | `IdentityService` |
@@ -171,12 +173,18 @@ Worker（独立进程，循环领活）                            apps/worker/s
 | 文件 | 负责什么 | 明确不负责 |
 | --- | --- | --- |
 | `apps/api/src/main.rs` | HTTP 路由与 handler、鉴权中间件、请求/响应形状、启动时跑迁移、装配加速层并挂起缓存对账循环 | 业务规则、SQL、上游调用 |
+| `apps/api/src/supervisor.rs` | 直接同步执行的本机所有权与许可：执行 slot、内存字节预算、读/发送 permit、one-shot 结果通道、断开释放图片、正文慢读期限、停机排空；成功响应的许可随 body 持有到发送完成；每次执行另起独立续约任务（间隔为租约的三分之一），续约冲突立即取消该次执行 | 业务规则、SQL、上游调用、期限预算与结算（在应用层） |
 | `apps/worker/src/main.rs` | 进程外壳：读环境变量、装配端口实现（含加速层与告警出口）、循环 `run_once`、优雅退出 | 生成流程本身（在 `WorkerService`） |
 | `apps/api/tests/http_contract/` | 端到端合同测试：真实空库 + 真实 API/Worker 进程 + **进程内假上游**与**进程内假 Redis**（零外部费用）。`main.rs` 是模块根，`harness.rs` 是共享装置，`cases_*.rs` 是按主题分的用例，`harness_check.rs` 是夹具自身的检查（不启进程、不用库） | 单元测试（在各 crate 内） |
 | `crates/*/src/tests.rs`、`crates/*/src/<模块>/tests.rs`、`crates/application/src/tests/` | 各 crate 的单元测试（`crates/application` 的按主题分在 `src/tests/` 下）。落点约定见根 [`AGENTS.md`](../AGENTS.md) 的「通用约定」 | 端到端合同测试（在 `apps/api/tests/http_contract/`） |
+| `crates/domain/src/execution_protocol.rs` | 同步网关执行协议的最小事实：`ExecutionProtocol`、`ExecutionStage`（admitted/executing/succeeded/failed/reconciliation_required）、`AttemptStage`（prepared/submitting/accepted/terminal/unknown）与 `FencingToken` | 持久化、HTTP 与 Provider 细节 |
+| `crates/application/src/request_fingerprint.rs` | 幂等键不可逆标识与请求指纹：带密钥 HMAC-SHA256、稳定 lookup 密钥、按版本轮换的指纹密钥与规范化（端点/型号/已识别参数/参考图与 mask/n） | 具体请求解析与选路 |
+| `crates/adapter-sdk/src/gateway.rs` | 新协议 Adapter 生命周期接口：`InputImage`/`GatewayInput`、`ExecutionContext`/`AcceptedHandle`、`GatewayAdapter`、`ProviderOutput`/`AccountingFacts` | 具体渠道协议与平台财务规则 |
 | `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PricingFormula`（计价形态：按 token 计量量 / 按张 / 按次 / 上游直接给金额）、`PriceSnapshot`（成本计价形态与其成本单价、对客计价形态与对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
 | `crates/domain/src/image_parameters.rs` | 图片参数的**唯一**一份规则：调用方契约字段（`image`/`image_urls`/`mask`）、候选声明参数名的判定（名字以 `image` 开头＝参考图、含 `mask`＝遮罩）、`null`/空串＝这一处没有图、把调用方的图落到候选声明的参数名上 | IO；也不认识任何**具体渠道**（参数名本身按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G1） |
 | `crates/application/src/lib.rs` | 用例（`IdentityService` / `RuntimeService` / `GenerationService` / `WorkerService` / `ReconciliationService` / `PricingService` / `AccountsService`）、端口 trait（含 `CacheStore`）、发布期校验（含"限制只能收窄"与定价"全有或全无"）、**成本护栏**（`cost_ceiling.rs`：发布期按合同允许的最大输出张数判、受理期按本次请求兜底判）、候选选择（**先按档位取第一个有合格候选的档，再在档内按权重确定性分摊**）、**受理时冻结定价与保底额**、结算与成本折算、错误→处置映射与对客错误码派生、加速层语义（`AccelerationService`：键名与值形状、候选集的修订标识比对、写穿与来源标记、新鲜度判定与**版本闸门**（低版本快照不得覆盖高版本）、缓存对账、**每把 API Key 的速率计数**） | SQL、HTTP、上游协议、Redis 命令 |
+| `crates/application/src/direct_execution.rs` | 同步网关直接执行用例：指纹/幂等摘要 → 选路与冻价 → admit → begin_submission → GatewayAdapter::execute → 结算或处置；请求内 SafeBeforeAcceptance 有界重投、结算提交未知先 read_finalization 确认、收尾提交后写穿余额；预算 D 减 R 与 SupervisedExecutionContext；首次提交声明落库后经 ExecutionOwnershipRegistrar 把所有权交给调用方起续约 | SQL、HTTP、渠道协议 |
+| `crates/application/src/execution_reconciliation.rs` | 异常对账 Worker 用例：接管过期 v1 执行，按 `operations.reconciliation_cases` 的 `next_query_at`/`attempts` 做退避与重试上限内的有界只读查询，按证据幂等结算或建缺口/案例，回收未提交孤儿，领取并消费晚到事实、补终态后的成本缺口，慢周期账务核对 | SQL、HTTP、渠道协议、生成请求 |
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射；余额变更一律用 `RETURNING` 把**提交后**的余额带回给用例（供写穿缓存） | 业务判定（只执行用例给出的结论） |
 | `crates/cache-redis/src/lib.rs` | 加速层的 Redis 实现：`GET` / `SET … PX` / `DEL` 三条命令、惰性连接与单次操作超时；连不上或命令报错一律返回错误，由用例层当"未命中"处理。`REDIS_URL` 为空时不构造（`from_env` 返回 `None`） | 键名、值形状、新鲜度与版本判定（都在 `crates/application`） |
 | `crates/alert-webhook/src/lib.rs` | 平台故障告警出口的 HTTP 实现：把一条 `PlatformAlert` 以 POST JSON 发出、有界超时与重试。`PROVIDER_ALERT_WEBHOOK` 为空时不构造（`from_env` 返回 `None`），地址不可用时构造即失败 | 何时告警、告警内容、发送失败如何收口（都在 `crates/application` 的 `PlatformAlerter`） |

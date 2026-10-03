@@ -1,0 +1,916 @@
+//! begin_submission / record_acceptance 的提交声明、执行所有权与重复事实要对着**真库**验：
+//! 未终结、所有权、fencing、总期限和当前 Attempt 都是行锁内的库层判据，重复事实幂等也是；
+//! 这些无法用内存替身模拟（Spec 0005 §3、§5；RFC 0017 §3）。
+//!
+//! 用例从 HTTP_CONTRACT_DATABASE_URL 派生一次性库，跑完整迁移后受理一台 Job，再走提交声明与
+//! 接受入库；分别覆盖正常落列、所有权/fencing/期限/对账态被拒、以及同一 Attempt 重复接受的
+//! 幂等与冲突。跑完删掉这个库，不动基库。
+
+use chrono::{Duration as ChronoDuration, Utc};
+use seeai_application::{
+    AdmitExecution, AdmitOffering, AdmitOutcome, ApplicationError, BeginSubmission,
+    ExecutionRepository, RecordAcceptance, RoutingDecision,
+};
+use seeai_domain::{
+    AccountId, AttemptStage, ChannelId, ExecutionStage, FencingToken, ImageBranch, JobId,
+    OfferingId, PriceSnapshot, RuntimeRevisionId, VendorModelId,
+};
+use seeai_persistence::PgHubRepository;
+use serde_json::json;
+use sqlx::{AssertSqlSafe, PgPool, Row};
+use uuid::Uuid;
+
+async fn isolated_database_url() -> (String, String) {
+    let base = std::env::var("HTTP_CONTRACT_DATABASE_URL")
+        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored submission test");
+    let admin = PgPool::connect(&base)
+        .await
+        .expect("connect to the provided contract database");
+    let name = format!("seeai_submit_{}", Uuid::new_v4().simple());
+    sqlx::query(AssertSqlSafe(format!("CREATE DATABASE \"{name}\"")))
+        .execute(&admin)
+        .await
+        .expect("create an isolated submission database");
+    admin.close().await;
+    let url = match base.rfind('/') {
+        Some(index) => format!("{}/{}", &base[..index], name),
+        None => panic!("HTTP_CONTRACT_DATABASE_URL must include a database name"),
+    };
+    (url, name)
+}
+
+async fn drop_isolated_database(name: &str) {
+    let base = std::env::var("HTTP_CONTRACT_DATABASE_URL").expect("the contract database url");
+    let Ok(admin) = PgPool::connect(&base).await else {
+        return;
+    };
+    let _ = sqlx::query(AssertSqlSafe(format!(
+        "DROP DATABASE IF EXISTS \"{name}\" WITH (FORCE)"
+    )))
+    .execute(&admin)
+    .await;
+    admin.close().await;
+}
+
+async fn connect() -> (PgHubRepository, String) {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 4)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    (repository, database_name)
+}
+
+/// 受理需要的那几行外键目标：账户、渠道、厂商模型、供给与修订。
+struct Fixture {
+    account_id: AccountId,
+    channel_id: ChannelId,
+    vendor_model_id: VendorModelId,
+    offering_id: OfferingId,
+    runtime_revision_id: RuntimeRevisionId,
+}
+
+async fn seed_fixture(pool: &PgPool) -> Fixture {
+    let fixture = Fixture {
+        account_id: AccountId::new(),
+        channel_id: ChannelId::new(),
+        vendor_model_id: VendorModelId::new(),
+        offering_id: OfferingId::new(),
+        runtime_revision_id: RuntimeRevisionId::new(),
+    };
+    // 余额刻意放大：一个用例里会有多台 Job 各占一份预授权，别让资金闸门挡住后面的受理。
+    sqlx::query(
+        "INSERT INTO ledger.accounts (id, balance_microusd, held_microusd, version, kind, name)
+         VALUES ($1, 1000000, 0, 0, 'consumer', 'submission test account')",
+    )
+    .bind(fixture.account_id.0)
+    .execute(pool)
+    .await
+    .expect("seed account");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1, 'fake', 'http://127.0.0.1:9', 'FAKE_PROVIDER_KEY')",
+    )
+    .bind(fixture.channel_id.0)
+    .execute(pool)
+    .await
+    .expect("seed channel");
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1, 'fake-vendor', 'fake-model', 'v1', '{}'::jsonb)",
+    )
+    .bind(fixture.vendor_model_id.0)
+    .execute(pool)
+    .await
+    .expect("seed vendor model");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
+              carrier_schema, parameter_mapping)
+         VALUES ($1, $2, $3, 'fake', 'fake-model', '{}'::jsonb, '{}'::jsonb)",
+    )
+    .bind(fixture.offering_id.0)
+    .bind(fixture.vendor_model_id.0)
+    .bind(fixture.channel_id.0)
+    .execute(pool)
+    .await
+    .expect("seed offering");
+    sqlx::query(
+        "INSERT INTO publication.runtime_revisions
+             (id, snapshot, published_by, gateway_model, vendor_model_id)
+         VALUES ($1, '{}'::jsonb, 'submission-test', 'fake-gateway', $2)",
+    )
+    .bind(fixture.runtime_revision_id.0)
+    .bind(fixture.vendor_model_id.0)
+    .execute(pool)
+    .await
+    .expect("seed runtime revision");
+    fixture
+}
+
+fn snapshot() -> PriceSnapshot {
+    serde_json::from_value(json!({
+        "captured_at": "2026-10-03T00:00:00Z",
+        "hold_microusd": 1000,
+        "hold_source": "platform_default",
+        "formula": "token_rates"
+    }))
+    .expect("a frozen price snapshot")
+}
+
+fn admit_command(fixture: &Fixture, key: &str) -> AdmitExecution {
+    AdmitExecution {
+        account_id: fixture.account_id,
+        branch: ImageBranch::PromptOnly,
+        offering: AdmitOffering {
+            runtime_revision_id: fixture.runtime_revision_id,
+            vendor_model_id: fixture.vendor_model_id,
+            offering_id: fixture.offering_id,
+            channel_id: fixture.channel_id,
+            gateway_model: "fake-gateway".to_owned(),
+            adapter_key: "fake".to_owned(),
+            provider_model_id: "fake-model".to_owned(),
+            base_url: "http://127.0.0.1:9".to_owned(),
+            credential_env: "FAKE_PROVIDER_KEY".to_owned(),
+        },
+        price_snapshot: snapshot(),
+        routing: RoutingDecision {
+            runtime_revision_id: fixture.runtime_revision_id,
+            chosen_offering_id: fixture.offering_id,
+            considered: Vec::new(),
+        },
+        idempotency_key_digest: format!("digest-{key}"),
+        idempotency_lookup_key_version: 1,
+        request_digest: format!("request-{key}"),
+        request_digest_key_version: 1,
+        max_cost_microusd: 1000,
+        max_account_in_flight: 8,
+        max_channel_in_flight: 8,
+    }
+}
+
+async fn admit_one(repository: &PgHubRepository, fixture: &Fixture, key: &str) -> JobId {
+    let outcome = repository
+        .admit(admit_command(fixture, key))
+        .await
+        .expect("the admit");
+    let AdmitOutcome::Admitted { job, .. } = outcome else {
+        panic!("a fresh key must be admitted");
+    };
+    assert_eq!(job.stage, ExecutionStage::Admitted);
+    job.job_id
+}
+
+fn begin(
+    job_id: JobId,
+    owner: &str,
+    token: u64,
+    deadline: chrono::DateTime<Utc>,
+) -> BeginSubmission {
+    BeginSubmission {
+        job_id,
+        execution_owner: owner.to_owned(),
+        fencing_token: FencingToken::new(token),
+        deadline,
+        lease: ChronoDuration::minutes(5),
+    }
+}
+
+async fn count(pool: &PgPool, sql: &'static str, id: Uuid) -> i64 {
+    sqlx::query_scalar(sql)
+        .bind(id)
+        .fetch_one(pool)
+        .await
+        .expect("count")
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn submission_declaration_then_acceptance_persist_the_minimal_facts() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "submit").await;
+
+    let started = repository
+        .begin_submission(begin(
+            job_id,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+    assert_eq!(started.attempt_no, 1, "the first submission is attempt 1");
+
+    let job = sqlx::query(
+        "SELECT state, execution_owner, provider_task_handle, request_digest
+         FROM generation.jobs WHERE id = $1",
+    )
+    .bind(job_id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("the job row");
+    assert_eq!(
+        job.try_get::<String, _>("state").expect("state"),
+        "executing"
+    );
+    assert_eq!(
+        job.try_get::<Option<String>, _>("execution_owner")
+            .expect("owner")
+            .as_deref(),
+        Some("supervisor-a")
+    );
+    assert_eq!(
+        job.try_get::<Option<String>, _>("provider_task_handle")
+            .expect("handle"),
+        None,
+        "the task handle is not known before the provider accepts"
+    );
+    let job_digest: String = job.try_get("request_digest").expect("job digest");
+
+    let attempt = sqlx::query(
+        "SELECT state, attempt_no, provider_trace_id, request_digest
+         FROM generation.attempts WHERE id = $1",
+    )
+    .bind(started.attempt_id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("the attempt row");
+    assert_eq!(
+        attempt
+            .try_get::<String, _>("state")
+            .expect("attempt state"),
+        "submitting"
+    );
+    assert_eq!(attempt.try_get::<i32, _>("attempt_no").expect("no"), 1);
+    assert_eq!(
+        attempt
+            .try_get::<Option<String>, _>("provider_trace_id")
+            .expect("trace"),
+        None
+    );
+    assert_eq!(
+        attempt
+            .try_get::<String, _>("request_digest")
+            .expect("digest"),
+        job_digest,
+        "the v1 attempt reuses the job request fingerprint"
+    );
+
+    repository
+        .record_acceptance(RecordAcceptance {
+            job_id,
+            attempt_id: started.attempt_id,
+            execution_owner: "supervisor-a".to_owned(),
+            fencing_token: FencingToken::new(0),
+            provider_task_handle: Some("task-42".to_owned()),
+            provider_trace_id: Some("trace-42".to_owned()),
+        })
+        .await
+        .expect("record_acceptance");
+
+    let job = sqlx::query("SELECT state, provider_task_handle FROM generation.jobs WHERE id = $1")
+        .bind(job_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("the job after acceptance");
+    assert_eq!(
+        job.try_get::<String, _>("state").expect("state"),
+        "executing",
+        "acceptance keeps the job executing"
+    );
+    assert_eq!(
+        job.try_get::<Option<String>, _>("provider_task_handle")
+            .expect("handle")
+            .as_deref(),
+        Some("task-42")
+    );
+    let attempt =
+        sqlx::query("SELECT state, provider_trace_id FROM generation.attempts WHERE id = $1")
+            .bind(started.attempt_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the attempt after acceptance");
+    assert_eq!(
+        attempt.try_get::<String, _>("state").expect("state"),
+        "accepted"
+    );
+    assert_eq!(
+        attempt
+            .try_get::<Option<String>, _>("provider_trace_id")
+            .expect("trace")
+            .as_deref(),
+        Some("trace-42")
+    );
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn begin_submission_fences_ownership_tokens_deadlines_and_open_attempts() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+
+    // 所有权已属别的调用方：认领失败，不写任何行。
+    let owned = admit_one(&repository, &fixture, "owned").await;
+    sqlx::query("UPDATE generation.jobs SET execution_owner = 'supervisor-b' WHERE id = $1")
+        .bind(owned.0)
+        .execute(&pool)
+        .await
+        .expect("plant another owner");
+    let rejected = repository
+        .begin_submission(begin(
+            owned,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await;
+    assert!(
+        matches!(rejected, Err(ApplicationError::Conflict(_))),
+        "a foreign owner must conflict, got {rejected:?}"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM generation.attempts WHERE job_id = $1",
+            owned.0
+        )
+        .await,
+        0,
+        "a rejected submission writes no attempt"
+    );
+
+    // fencing token 不匹配：同样拒绝。
+    sqlx::query(
+        "UPDATE generation.jobs SET execution_owner = NULL, fencing_token = 9 WHERE id = $1",
+    )
+    .bind(owned.0)
+    .execute(&pool)
+    .await
+    .expect("bump the token");
+    let rejected = repository
+        .begin_submission(begin(
+            owned,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await;
+    assert!(
+        matches!(rejected, Err(ApplicationError::Conflict(_))),
+        "a stale fencing token must conflict, got {rejected:?}"
+    );
+
+    // 总期限已到：明确报告，且不写任何行、不改状态。
+    sqlx::query("UPDATE generation.jobs SET fencing_token = 0 WHERE id = $1")
+        .bind(owned.0)
+        .execute(&pool)
+        .await
+        .expect("restore the token");
+    let expired = repository
+        .begin_submission(begin(
+            owned,
+            "supervisor-a",
+            0,
+            Utc::now() - ChronoDuration::seconds(1),
+        ))
+        .await;
+    assert!(
+        matches!(expired, Err(ApplicationError::ExecutionDeadlineExceeded)),
+        "an expired deadline must be reported, got {expired:?}"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+        .bind(owned.0)
+        .fetch_one(&pool)
+        .await
+        .expect("state");
+    assert_eq!(
+        state, "admitted",
+        "an expired deadline leaves the job admitted"
+    );
+
+    // 正常开始之后，同一台 Job 不能再来一次：上一个 Attempt 还没收尾。
+    repository
+        .begin_submission(begin(
+            owned,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("a fresh submission");
+    let open = repository
+        .begin_submission(begin(
+            owned,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await;
+    assert!(
+        matches!(open, Err(ApplicationError::Conflict(_))),
+        "an unfinished attempt must block a second submission, got {open:?}"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM generation.attempts WHERE job_id = $1",
+            owned.0
+        )
+        .await,
+        1,
+        "only one attempt exists"
+    );
+
+    // 对账态禁止开始提交（Spec 0005 §5）。
+    let reconciling = admit_one(&repository, &fixture, "reconciling").await;
+    sqlx::query("UPDATE generation.jobs SET state = 'reconciliation_required' WHERE id = $1")
+        .bind(reconciling.0)
+        .execute(&pool)
+        .await
+        .expect("move to reconciliation");
+    let rejected = repository
+        .begin_submission(begin(
+            reconciling,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await;
+    assert!(
+        matches!(rejected, Err(ApplicationError::Conflict(_))),
+        "a reconciliation job must not submit, got {rejected:?}"
+    );
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM generation.attempts WHERE job_id = $1",
+            reconciling.0
+        )
+        .await,
+        0
+    );
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn acceptance_is_idempotent_for_same_facts_and_conflicts_on_different_ones() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "idempotent").await;
+    let started = repository
+        .begin_submission(begin(
+            job_id,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+
+    let acceptance = |trace: &str| RecordAcceptance {
+        job_id,
+        attempt_id: started.attempt_id,
+        execution_owner: "supervisor-a".to_owned(),
+        fencing_token: FencingToken::new(0),
+        provider_task_handle: Some("task-1".to_owned()),
+        provider_trace_id: Some(trace.to_owned()),
+    };
+
+    repository
+        .record_acceptance(acceptance("trace-1"))
+        .await
+        .expect("the first acceptance");
+    repository
+        .record_acceptance(acceptance("trace-1"))
+        .await
+        .expect("repeating the same facts is idempotent");
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM generation.attempts WHERE job_id = $1",
+            job_id.0
+        )
+        .await,
+        1,
+        "an idempotent acceptance does not add a row"
+    );
+
+    // 同一 Attempt 换了事实：冲突，原事实不被覆盖。
+    let conflict = repository.record_acceptance(acceptance("trace-2")).await;
+    assert!(
+        matches!(conflict, Err(ApplicationError::Conflict(_))),
+        "different facts on the same attempt must conflict, got {conflict:?}"
+    );
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE id = $1")
+            .bind(started.attempt_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the stored trace");
+    assert_eq!(
+        stored.as_deref(),
+        Some("trace-1"),
+        "the conflict must not overwrite the stored fact"
+    );
+
+    // 旧 token 不能改写已经入库的接受事实。
+    let stale = repository
+        .record_acceptance(RecordAcceptance {
+            fencing_token: FencingToken::new(5),
+            ..acceptance("trace-1")
+        })
+        .await;
+    assert!(
+        matches!(stale, Err(ApplicationError::Conflict(_))),
+        "a stale token must not record acceptance, got {stale:?}"
+    );
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn ownership_renewal_extends_only_the_lease_and_conflicts_when_fenced() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "renew").await;
+    repository
+        .begin_submission(begin(
+            job_id,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+
+    let before: chrono::DateTime<Utc> =
+        sqlx::query_scalar("SELECT lease_expires_at FROM generation.jobs WHERE id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the initial lease");
+
+    repository
+        .renew_execution_ownership(
+            job_id,
+            "supervisor-a",
+            FencingToken::new(0),
+            ChronoDuration::minutes(30),
+        )
+        .await
+        .expect("renew");
+
+    let job = sqlx::query(
+        "SELECT execution_owner, fencing_token, lease_expires_at FROM generation.jobs WHERE id = $1",
+    )
+    .bind(job_id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("the renewed job");
+    assert_eq!(
+        job.try_get::<Option<String>, _>("execution_owner")
+            .expect("owner")
+            .as_deref(),
+        Some("supervisor-a"),
+        "renewal keeps the owner"
+    );
+    assert_eq!(
+        job.try_get::<i64, _>("fencing_token").expect("token"),
+        0,
+        "renewal never changes the fencing token"
+    );
+    let after: chrono::DateTime<Utc> = job.try_get("lease_expires_at").expect("lease");
+    assert!(
+        after >= before + ChronoDuration::minutes(20),
+        "renewal must push the lease forward, before {before}, after {after}"
+    );
+
+    // 别的所有者不能续约。
+    assert!(matches!(
+        repository
+            .renew_execution_ownership(
+                job_id,
+                "supervisor-b",
+                FencingToken::new(0),
+                ChronoDuration::minutes(5)
+            )
+            .await,
+        Err(ApplicationError::Conflict(_))
+    ));
+    // 旧 token 不能续约。
+    assert!(matches!(
+        repository
+            .renew_execution_ownership(
+                job_id,
+                "supervisor-a",
+                FencingToken::new(1),
+                ChronoDuration::minutes(5)
+            )
+            .await,
+        Err(ApplicationError::Conflict(_))
+    ));
+    // 已终态不能续约。
+    sqlx::query("UPDATE generation.jobs SET state = 'succeeded' WHERE id = $1")
+        .bind(job_id.0)
+        .execute(&pool)
+        .await
+        .expect("finish the job");
+    assert!(matches!(
+        repository
+            .renew_execution_ownership(
+                job_id,
+                "supervisor-a",
+                FencingToken::new(0),
+                ChronoDuration::minutes(5)
+            )
+            .await,
+        Err(ApplicationError::Conflict(_))
+    ));
+    // legacy 记录即使同 id 也不能走 v1 续约。
+    sqlx::query("UPDATE generation.jobs SET state = 'executing', execution_protocol = 'legacy' WHERE id = $1")
+        .bind(job_id.0)
+        .execute(&pool)
+        .await
+        .expect("make it legacy");
+    assert!(matches!(
+        repository
+            .renew_execution_ownership(
+                job_id,
+                "supervisor-a",
+                FencingToken::new(0),
+                ChronoDuration::minutes(5)
+            )
+            .await,
+        Err(ApplicationError::Conflict(_))
+    ));
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn takeover_swaps_ownership_and_increments_the_fencing_token() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "takeover").await;
+    let started = repository
+        .begin_submission(begin(
+            job_id,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+    repository
+        .record_acceptance(RecordAcceptance {
+            job_id,
+            attempt_id: started.attempt_id,
+            execution_owner: "supervisor-a".to_owned(),
+            fencing_token: FencingToken::new(0),
+            provider_task_handle: Some("task-7".to_owned()),
+            provider_trace_id: Some("trace-7".to_owned()),
+        })
+        .await
+        .expect("record_acceptance");
+
+    // 租约还没过期：不能被接管。
+    assert!(
+        repository
+            .takeover_expired_executions("worker-1", ChronoDuration::minutes(5), 10, 5)
+            .await
+            .expect("takeover")
+            .is_empty(),
+        "a live lease must not be taken over"
+    );
+
+    sqlx::query(
+        "UPDATE generation.jobs SET lease_expires_at = now() - interval '1 second' WHERE id = $1",
+    )
+    .bind(job_id.0)
+    .execute(&pool)
+    .await
+    .expect("expire the lease");
+
+    let taken = repository
+        .takeover_expired_executions("worker-1", ChronoDuration::minutes(5), 10, 5)
+        .await
+        .expect("takeover");
+    assert_eq!(taken.len(), 1, "exactly the expired job is taken over");
+    let taken = &taken[0];
+    assert_eq!(taken.job_id, job_id);
+    assert_eq!(taken.account_id, fixture.account_id);
+    assert_eq!(
+        taken.fencing_token,
+        FencingToken::new(1),
+        "only takeover increments the token"
+    );
+    assert_eq!(taken.attempt_id, Some(started.attempt_id));
+    assert_eq!(taken.attempt_state, Some(AttemptStage::Accepted));
+    assert_eq!(taken.provider_task_handle.as_deref(), Some("task-7"));
+    assert_eq!(taken.provider_trace_id.as_deref(), Some("trace-7"));
+    assert_eq!(taken.adapter_key, "fake");
+    assert_eq!(taken.base_url, "http://127.0.0.1:9");
+    assert_eq!(taken.credential_env, "FAKE_PROVIDER_KEY");
+    assert_eq!(taken.price_snapshot.hold_microusd, Some(1000));
+    assert_eq!(taken.stage, ExecutionStage::Executing);
+    assert_eq!(taken.provider_kind, "fake");
+
+    let job =
+        sqlx::query("SELECT execution_owner, fencing_token FROM generation.jobs WHERE id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the taken job");
+    assert_eq!(
+        job.try_get::<Option<String>, _>("execution_owner")
+            .expect("owner")
+            .as_deref(),
+        Some("worker-1")
+    );
+    assert_eq!(job.try_get::<i64, _>("fencing_token").expect("token"), 1);
+
+    // 旧 token 不再被接受；新 token 可以续约。
+    assert!(matches!(
+        repository
+            .renew_execution_ownership(
+                job_id,
+                "worker-1",
+                FencingToken::new(0),
+                ChronoDuration::minutes(5)
+            )
+            .await,
+        Err(ApplicationError::Conflict(_))
+    ));
+    repository
+        .renew_execution_ownership(
+            job_id,
+            "worker-1",
+            FencingToken::new(1),
+            ChronoDuration::minutes(5),
+        )
+        .await
+        .expect("renew with the taken token");
+
+    // legacy 记录不被 v1 接管领走。
+    let legacy = admit_one(&repository, &fixture, "legacy-takeover").await;
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET execution_protocol = 'legacy', state = 'executing', lease_expires_at = now() - interval '1 second'
+         WHERE id = $1",
+    )
+    .bind(legacy.0)
+    .execute(&pool)
+    .await
+    .expect("make a legacy executing job");
+    assert!(
+        repository
+            .takeover_expired_executions("worker-2", ChronoDuration::minutes(5), 10, 5)
+            .await
+            .expect("takeover")
+            .is_empty(),
+        "legacy executions are never taken over by v1"
+    );
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn reaping_an_unsubmitted_admission_releases_hold_and_channel_slot() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "orphan").await;
+
+    // 还没超龄：不回收。
+    assert_eq!(
+        repository
+            .reap_unsubmitted_admissions(ChronoDuration::days(1), 10)
+            .await
+            .expect("reap"),
+        0
+    );
+
+    sqlx::query("UPDATE generation.jobs SET created_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(job_id.0)
+        .execute(&pool)
+        .await
+        .expect("age the admission");
+    assert_eq!(
+        repository
+            .reap_unsubmitted_admissions(ChronoDuration::minutes(30), 10)
+            .await
+            .expect("reap"),
+        1
+    );
+
+    let job = sqlx::query("SELECT state, terminal_at FROM generation.jobs WHERE id = $1")
+        .bind(job_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("the reaped job");
+    assert_eq!(job.try_get::<String, _>("state").expect("state"), "failed");
+    assert!(
+        job.try_get::<Option<chrono::DateTime<Utc>>, _>("terminal_at")
+            .expect("terminal_at")
+            .is_some(),
+        "reaping stamps the terminal moment"
+    );
+    let hold: String = sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+        .bind(job_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("hold");
+    assert_eq!(hold, "released");
+    let capacity: String =
+        sqlx::query_scalar("SELECT state FROM generation.execution_capacity WHERE job_id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("capacity");
+    assert_eq!(capacity, "released");
+    let held: i64 = sqlx::query_scalar("SELECT held_microusd FROM ledger.accounts WHERE id = $1")
+        .bind(fixture.account_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("held");
+    assert_eq!(held, 0, "the reservation is given back");
+
+    // 已经有 Attempt 的执行不是孤儿：即使超龄也不回收。
+    let submitted = admit_one(&repository, &fixture, "submitted-orphan").await;
+    repository
+        .begin_submission(begin(
+            submitted,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+    sqlx::query("UPDATE generation.jobs SET created_at = now() - interval '1 hour' WHERE id = $1")
+        .bind(submitted.0)
+        .execute(&pool)
+        .await
+        .expect("age the submitted job");
+    assert_eq!(
+        repository
+            .reap_unsubmitted_admissions(ChronoDuration::minutes(30), 10)
+            .await
+            .expect("reap"),
+        0,
+        "a job with a submission declaration is not an orphan"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+        .bind(submitted.0)
+        .fetch_one(&pool)
+        .await
+        .expect("state");
+    assert_eq!(state, "executing");
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
