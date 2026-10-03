@@ -143,7 +143,8 @@
 | `GET` | `/v1/customer/api-keys` | 客户会话 | — | `200 {keys:[{key_id, label, created_at, revoked_at}]}`（**无明文**） |
 | `POST` | `/v1/customer/api-keys` | 客户会话 | `{label}` | `201 {key_id, api_key}`（明文只此一次） |
 | `DELETE` | `/v1/customer/api-keys/{key_id}` | 客户会话 | — | `204`；不属于自己 ⇒ `404` |
-| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示一个「余额」数字（取 `available_microusd`） |
+| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {name, balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示一个「余额」数字（取 `available_microusd`），`name` 是客户可改的账户名称 |
+| `PUT` | `/v1/customer/account/name` | 客户会话 | `{name}` | 客户改自己账户的名称：账户由会话确定，不能清空，非法名称 400；改的是资料，不动余额、标签与凭据（规则见 [账户名称 Spec](../specs/0003-account-names-and-login-identities.md)） |
 | `GET` | `/v1/customer/ledger` | 客户会话 | 资金记录查询 | 按账户和时间区间读真实收支；筛选、翻页和响应见[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
 | `GET` | `/v1/customer/usage` | 客户会话 | 调用记录查询 | 对客状态、终态时刻、分组和翻页见[客户控制台设计](0014-customer-console-navigation-and-history.md) §2 |
 | `GET` | `/v1/customer/billing` | 客户会话 | 时间区间 | 区间汇总与金额展示见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5 与[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
