@@ -253,13 +253,14 @@ export interface PublicModelsResponse {
 }
 
 /// 对客账户面：已结算余额、持有中与可用额分开给，三者在同一时点满足
-/// `available = balance − held`。客户控制台只渲染 `balance_microusd`（"已结算余额"），
-/// 不显示持有中、可用额或单笔预授权额（账户资金 Spec `0002` §4；控制台 Spec `0001` C7）。
+/// `available = balance − held`。客户控制台只把这个数字显示成一个「余额」——取
+/// `available_microusd`（客户现在能用的钱），不分别展示已结算余额、持有中或可用额，也不显示单笔
+/// 预授权额（账户资金 Spec `0002` §4；控制台 Spec `0001` C7、V-D5）。
 export interface OwnAccount {
   balance_microusd: number;
-  /// 已受理未结清的占用合计。接口返回，但客户页面不展示。
+  /// 已受理未结清的占用合计。接口返回，但客户页面不作为单独的数展示。
   held_microusd: number;
-  /// 可用额 = 已结算余额 − 持有中。接口返回，但客户页面不展示。
+  /// 可用额 = 已结算余额 − 持有中。客户页面那个「余额」取的就是它。
   available_microusd: number;
   updated_at: string;
 }

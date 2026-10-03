@@ -2,12 +2,13 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 import { adminApiUrl, portalUrl, settings } from './settings';
 import { captureActiveHold, releaseActiveHold } from './account-state';
 
-/// 客户概览只显示**已结算余额**：预授权建立或释放都不改变这个读数，页面也不出现可用额、持有中或
-/// 单笔预授权金额（账户资金 Spec A7 的客户那半、控制台 Spec C7）。
+/// 客户概览只显示**一个「余额」**——客户现在能用的钱（`available_microusd`）：请求受理时按占住的
+/// 额度减少，结算后按实际扣费多退少补；页面不出现已结算余额、持有中、可用额三个分项，也不出现单笔
+/// 预授权金额（账户资金 Spec A7 的客户那半、控制台 Spec C7、V-D5）。
 ///
 /// "预授权 30"是**真跑**出来的：e2e 不起 Worker，同步入口在窗口后超时（504），请求停在持有中，
-/// 已结算余额不变——这正是 Spec 的受理语义。实收扣减与释放预授权是 Worker 的结算/收尾事务，
-/// 浏览器用例里跑不出来，由 `account-state.ts` 把**结果**摆进 e2e 库；事务本身由
+/// 页面读数因此从 100 掉到 70。实收扣减与释放预授权是 Worker 的结算/收尾事务，浏览器用例里跑不出来，
+/// 由 `account-state.ts` 把**结果**摆进 e2e 库；事务本身由
 /// `apps/api/tests/http_contract/cases_lifecycle.rs` 用真 Worker + 假上游覆盖。
 ///
 /// 夹具供给用内联发布形状造（与 `platform-model-publish.spec.ts` 同一条路）：e2e 是空库、没有素材
@@ -15,7 +16,7 @@ import { captureActiveHold, releaseActiveHold } from './account-state';
 /// 归到 2K 档，所以预授权额就是 30 元。
 
 const PORTAL = portalUrl;
-const FORBIDDEN = ['可用余额', '可用额', '持有中', '预授权'];
+const FORBIDDEN = ['已结算余额', '可用余额', '可用额', '持有中', '预授权'];
 
 function unique(prefix: string): string {
   return `${prefix}-${Date.now()}-${Math.floor(Math.random() * 10_000)}`;
@@ -127,7 +128,7 @@ async function signIn(page: Page, email: string, password: string): Promise<void
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(password);
   await page.getByTestId('portal-submit').click();
-  await expect(page.getByTestId('portal-settled-balance')).toContainText('已结算余额');
+  await expect(page.getByTestId('portal-balance')).toContainText('余额');
 }
 
 /// 受理一次并让它停在持有中：没有 Worker，同步入口在窗口后超时。
@@ -150,42 +151,47 @@ async function createHold(
   expect(generation.status(), `没有 Worker 时同步入口超时：${await generation.text()}`).toBe(504);
 }
 
-/// 接口确认这次受理真的占用了 30 元，而已结算余额仍是 100 元。
+/// 接口确认这次受理真的占用了 30 元：已结算余额仍是 100，可用额掉到 70。
 async function expectHold(request: APIRequestContext, apiKey: string): Promise<void> {
   const own = await request.get(`http://127.0.0.1:${settings.port}/v1/account`, {
     headers: { Authorization: `Bearer ${apiKey}` },
   });
-  const body = (await own.json()) as { balance_microusd: number; held_microusd: number };
+  const body = (await own.json()) as {
+    balance_microusd: number;
+    held_microusd: number;
+    available_microusd: number;
+  };
   expect(body.balance_microusd).toBe(100_000_000);
   expect(body.held_microusd).toBe(30_000_000);
+  expect(body.available_microusd).toBe(70_000_000);
 }
 
-/// 页面只显示已结算余额：读数正确，且不出现可用额、持有中或预授权金额。
-async function expectSettledBalance(page: Page, text: string): Promise<void> {
-  await expect(page.getByTestId('portal-settled-balance')).toContainText('已结算余额');
-  await expect(page.getByTestId('portal-settled-balance')).toContainText(text);
+/// 页面只显示一个「余额」：读数正确，且不出现内部三分解的名字或预授权金额。
+async function expectBalance(page: Page, text: string): Promise<void> {
+  await expect(page.getByTestId('portal-balance')).toContainText('余额');
+  await expect(page.getByTestId('portal-balance')).toContainText(text);
   for (const forbidden of FORBIDDEN) {
     await expect(page.getByText(forbidden)).toHaveCount(0);
   }
 }
 
-test('充值 100 后预授权 30：概览仍显示已结算余额 100', async ({ page, request }) => {
+test('充值 100 后受理占住 30：概览显示余额 70', async ({ page, request }) => {
   const gatewayModel = unique('e2e-settled');
   await publishHoldFixture(request, gatewayModel, unique('e2e-settled-vendor'));
   const { email, password, apiKey } = await fundedCustomer(request);
 
   await signIn(page, email, password);
-  await expectSettledBalance(page, '100 元');
+  await expectBalance(page, '100 元');
 
   await createHold(request, gatewayModel, apiKey);
   await expectHold(request, apiKey);
 
-  // 刷新后读数不变：预授权建立不改变客户页面的余额。
+  // 页面读的就是客户现在能用的钱：占住 30 之后显示 70，不是 100。
   await page.reload();
-  await expectSettledBalance(page, '100 元');
+  await expectBalance(page, '70 元');
 });
 
-test('仅释放预授权：不改变已结算余额读数', async ({ page, request }) => {
+test('仅释放预授权：余额回到 100', async ({ page, request }) => {
   const gatewayModel = unique('e2e-settled');
   await publishHoldFixture(request, gatewayModel, unique('e2e-settled-vendor'));
   const { accountId, email, password, apiKey } = await fundedCustomer(request);
@@ -193,15 +199,17 @@ test('仅释放预授权：不改变已结算余额读数', async ({ page, reque
   await signIn(page, email, password);
   await createHold(request, gatewayModel, apiKey);
   await expectHold(request, apiKey);
-  await expectSettledBalance(page, '100 元');
+  // 页面不轮询：受理之后要用概览上的刷新入口自己取一次，读数才是 70。
+  await page.getByTestId('portal-balance-reload').click();
+  await expectBalance(page, '70 元');
 
-  // 释放占用（结果由合同用例的真事务覆盖）：余额读数不变。
+  // 释放占用（结果由合同用例的真事务覆盖）：占住的钱退回可用，读数回到 100。
   await releaseActiveHold(accountId);
   await page.reload();
-  await expectSettledBalance(page, '100 元');
+  await expectBalance(page, '100 元');
 });
 
-test('实收 20 后：概览显示已结算余额 80', async ({ page, request }) => {
+test('实收 20 结算后：概览显示余额 80', async ({ page, request }) => {
   const gatewayModel = unique('e2e-settled');
   await publishHoldFixture(request, gatewayModel, unique('e2e-settled-vendor'));
   const { accountId, email, password, apiKey } = await fundedCustomer(request);
@@ -209,10 +217,11 @@ test('实收 20 后：概览显示已结算余额 80', async ({ page, request })
   await signIn(page, email, password);
   await createHold(request, gatewayModel, apiKey);
   await expectHold(request, apiKey);
-  await expectSettledBalance(page, '100 元');
+  await page.getByTestId('portal-balance-reload').click();
+  await expectBalance(page, '70 元');
 
-  // 成功结算扣 20 元（结果由合同用例的真事务覆盖）：读数变成 80，仍不出现预授权金额。
+  // 成功结算扣 20 元（结果由合同用例的真事务覆盖）：占住的钱按实收结清，读数变成 80，仍不出现预授权金额。
   await captureActiveHold(accountId, 20_000_000);
   await page.reload();
-  await expectSettledBalance(page, '80 元');
+  await expectBalance(page, '80 元');
 });

@@ -10,7 +10,7 @@ import {
   uniqueEmail,
 } from './portal';
 
-/// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进概览、概览只显示已结算余额、密钥
+/// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进概览、概览只有一个「余额」、密钥
 /// 明文只显示一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
 ///
 /// 这些行为的接口契约由 `apps/api/tests/http_contract/cases_identity.rs` 管；这里验的是"人在浏览器里
@@ -18,19 +18,19 @@ import {
 ///
 /// 地址从 `./portal` 取（与 `playwright.config.ts` 同源）：端口写死在这里的话 `SEEAI_E2E_PORT` 就失效了。
 
-test('注册后进概览：首屏只有已结算余额 + 五页固定导航', async ({ page }) => {
+test('注册后进概览：首屏只有一个「余额」 + 五页固定导航', async ({ page }) => {
   await registerCustomer(page, uniqueEmail('portal-e2e'));
 
-  // **首屏**（不滚动、不切页）就该看到余额，且标题是"已结算余额"。
-  await expect(page.getByTestId('portal-settled-balance')).toContainText('已结算余额');
-  await expect(page.getByTestId('portal-settled-balance')).toContainText('0 元');
+  // **首屏**（不滚动、不切页）就该看到余额，标题就是「余额」。
+  await expect(page.getByTestId('portal-balance')).toContainText('余额');
+  await expect(page.getByTestId('portal-balance')).toContainText('0 元');
   // 概览只有一个数：没有"扣费总额（全部）"，也没有无区间说明的平均扣费（V-D14）。
   expect(await page.locator('.ant-statistic').count()).toBe(1);
   for (const forbidden of ['扣费总额', '平均每次扣费']) {
     await expect(page.getByText(forbidden)).toHaveCount(0);
   }
-  // 客户页面不出现可用额、持有中或预授权金额（Spec C7）。
-  for (const forbidden of ['可用余额', '可用额', '持有中', '预授权']) {
+  // 客户页面只有一个「余额」：不出现内部三分解的任何一个名字，也不出现预授权金额（Spec C7、V-D5）。
+  for (const forbidden of ['已结算余额', '可用余额', '可用额', '持有中', '预授权']) {
     await expect(page.getByText(forbidden)).toHaveCount(0);
   }
 
@@ -99,7 +99,7 @@ test('调用记录页与账单与资金记录页各自给出内容，不堆在�
   await expect(panel(page, '调用记录')).toBeVisible();
   await expect(page.locator('.ant-table').first()).toBeVisible();
   // 概览的余额不在这一页。
-  await expect(page.getByTestId('portal-settled-balance')).toHaveCount(0);
+  await expect(page.getByTestId('portal-balance')).toHaveCount(0);
 
   await nav(page, '账单与资金记录');
   expect(pathnameOf(page)).toBe('/billing');
@@ -197,5 +197,5 @@ test('凭运营签发的重置令牌设置新口令，之后能用新口令登�
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(next);
   await page.getByTestId('portal-submit').click();
-  await expect(page.getByTestId('portal-settled-balance')).toBeVisible();
+  await expect(page.getByTestId('portal-balance')).toBeVisible();
 });

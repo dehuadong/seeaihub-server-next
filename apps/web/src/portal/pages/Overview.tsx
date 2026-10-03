@@ -10,12 +10,14 @@ import { portalPath } from '../routes';
 import { whenText, yuanText } from '../../shared/format';
 import { useLoadable } from '../../shared/ui';
 
-/// 概览：**首屏只有一个数**——已结算余额，外加通往其余四页的入口。
+/// 概览：**首屏只有一个数**——「余额」，外加通往其余四页的入口。
 ///
-/// 余额只渲染 `balance_microusd`（已结算余额）：预授权建立或释放不改变它，持有中、可用额与单笔
-/// 预授权额都不在客户页面出现（[账户资金 Spec](../../../../../docs/specs/0002-account-funds-and-reservations.md) §4、[控制台 Spec](../../../../../docs/specs/0001-admin-and-customer-consoles.md) C7）。
-/// 概览只请求当前账户金额，不请求账单、历史用量或资金流水，也不显示没有区间限定的"扣费总额"或平均
-/// 扣费（控制台 Spec V-D14）。
+/// 这个数是客户**现在能用的钱**（`available_microusd` = 已结算余额 − 持有中）：请求受理时按占住的
+/// 额度减少，结算后按实际扣费多退少补。内部那套"已结算余额／持有中／可用额"的分法只在管理员面出现，
+/// 客户页面只有一个数、一个名字（[控制台 Spec](../../../../../docs/specs/0001-admin-and-customer-consoles.md)
+/// C7、V-D5；[账户资金 Spec](../../../../../docs/specs/0002-account-funds-and-reservations.md) §4、A7）。
+/// 取数失败显示错误、不把缺失值画成 0，加载中不显示数字（控制台 Spec V-D14 的口径）。概览只请求当前
+/// 账户金额，不请求账单、历史用量或资金流水，也不显示没有区间限定的"扣费总额"或平均扣费。
 export function OverviewPage({
   client,
   onOpen,
@@ -38,15 +40,24 @@ export function OverviewPage({
         {account.error ? (
           <Alert style={{ marginBottom: 8 }} type="error" showIcon message={account.error} />
         ) : null}
-        <Statistic
-          data-testid="portal-settled-balance"
-          title="已结算余额"
-          value={account.data ? yuanText(account.data.balance_microusd) : '—'}
-          loading={account.loading}
-        />
+        <Flex justify="space-between" align="flex-start" gap={8}>
+          <Statistic
+            data-testid="portal-balance"
+            title="余额"
+            value={account.data ? yuanText(account.data.available_microusd) : '—'}
+            loading={account.loading}
+          />
+          {/* 受理与结算都会动这个数：给客户一个自己取准数的地方。 */}
+          <Button data-testid="portal-balance-reload" onClick={account.reload}>
+            刷新
+          </Button>
+        </Flex>
+        <Typography.Paragraph type="secondary" style={{ fontSize: 12 }}>
+          正在处理的请求会先占住一部分额度，结算后按实际扣费多退少补。
+        </Typography.Paragraph>
         {account.data ? (
           <Typography.Text type="secondary" style={{ fontSize: 12 }}>
-            余额写入时刻：{whenText(account.data.updated_at)}
+            更新于 {whenText(account.data.updated_at)}
           </Typography.Text>
         ) : null}
       </Card>

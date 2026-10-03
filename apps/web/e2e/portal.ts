@@ -40,7 +40,7 @@ export async function registerCustomer(page: Page, email: string): Promise<void>
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(PORTAL_PASSWORD);
   await page.getByTestId('portal-submit').click();
-  await expect(page.getByTestId('portal-settled-balance')).toBeVisible();
+  await expect(page.getByTestId('portal-balance')).toBeVisible();
 }
 
 /// 在已经打开的登录/注册页上登录（不切换模式）。

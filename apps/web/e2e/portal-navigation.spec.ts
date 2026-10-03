@@ -28,7 +28,7 @@ async function expectRoute(page: Page, path: string): Promise<void> {
   if (card) {
     await expect(panel(page, card)).toBeVisible();
   } else {
-    await expect(page.getByTestId('portal-settled-balance')).toBeVisible();
+    await expect(page.getByTestId('portal-balance')).toBeVisible();
   }
 }
 
@@ -131,7 +131,7 @@ test('未知客户路径显示客户侧 404，不回落到概览', async ({ page
   await page.goto(portalAt('/no-such-page'));
 
   await expect(page.getByTestId('portal-not-found')).toBeVisible();
-  await expect(page.getByTestId('portal-settled-balance')).toHaveCount(0);
+  await expect(page.getByTestId('portal-balance')).toHaveCount(0);
   await expect(page.getByRole('menuitem', { name: '概览' })).toBeVisible();
 });
 
