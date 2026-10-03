@@ -15,13 +15,13 @@
 | A4 | persistence `execution_admit`（同键/异指纹/并发名额）、`execution_finalization`（不重复扣费）、application `direct_execution` 同键四投影与轮换后重放（`a_rotated_fingerprint_key_replays_the_same_request`、`a_replay_without_the_recorded_key_version_is_an_idempotency_conflict`、`a_replay_survives_a_disabled_candidate`） | 通过 |
 | A5–A6 | persistence `execution_submission`（句柄先入库再轮询、fencing、期限）、application `execution_reconciliation`（只读查询、缺口建案、孤儿回收、晚到事实） | 通过 |
 | A7 | 真库 408 慢读用例；application `direct_execution` 期限与断开处置；`execution_reconciliation::api_and_worker_finalizations_charge_at_most_once`（S3 与 Worker 竞争不重复收费） | 通过 |
-| A8 | 直接执行不再每 250ms 查询（A1 用例不启 Worker）；`direct_sql_count_does_not_grow_with_provider_wait`（长短等待的事务增量不随等待增长）；`direct_slow_provider_does_not_occupy_a_database_connection` 与 `direct_slow_provider_keeps_more_requests_than_pool_connections_in_flight`（等待期间连接池空闲）；`direct_memory_budget_rejects_a_second_concurrent_execution`（字节预算拒绝第二个在飞执行）与 `direct_peak_rss_stays_within_the_memory_budget`（8MiB 大图请求后 VmHWM 在预算内，实测 76–84MiB）；adapter 共享 Client 复用单测；执行/读取/发送许可单测 | 部分（两态吞吐/延迟基线待做） |
+| A8 | 直接执行不再每 250ms 查询（A1 用例不启 Worker）；`direct_sql_count_does_not_grow_with_provider_wait`（长短等待的事务增量不随等待增长）；`direct_slow_provider_does_not_occupy_a_database_connection` 与 `direct_slow_provider_keeps_more_requests_than_pool_connections_in_flight`（等待期间连接池空闲）；`direct_memory_budget_rejects_a_second_concurrent_execution`（字节预算拒绝第二个在飞执行）与 `direct_peak_rss_stays_within_the_memory_budget`（8MiB 大图请求后 VmHWM 在预算内，实测 76–84MiB）；adapter 共享 Client 复用单测；执行/读取/发送许可单测；两态吞吐/延迟基线见「验收记录」 | 部分（两态基线已记，其余 A8 项见左列） |
 | A9–A10 | A9：`admit` 渠道容量并入 legacy 在飞 Job + `execution_admit::legacy_in_flight_jobs_count_toward_the_channel_capacity`；A10：`cases_migrations` 增量迁移用例与 metadata 投影的既有用例 | 部分（A10 旧库清理证据待 S5） |
 
 ## 待做
 
 - **A8 剩余**：账务行大小不随图片增长与候选不复制大图已有代码路径结论，可补测量。
-- **性能基线**：同一棵树两态对比——`GENERATION_DIRECT_EXECUTION=false` 是整改前的旧 Worker 路径，`true` 是整改后的直接执行；记录吞吐、网关新增延迟、Provider 耗时、峰值 RSS、SQL 次数与连接等待。
+- **性能基线剩余**：两态的总耗时、平均与 p95 延迟、吞吐见「验收记录」；网关新增延迟拆分（p50/p95/p99）、Provider 耗时、WAL 字节/请求与对账延迟尚无本机观测。
 - **S5 破坏性清理与生产切换**：受控窗口、核账后执行，另具执行记录；历史未清完不宣称清除完成。
 
 ## 结构性判断（非测量，供复核代码路径）
@@ -29,8 +29,27 @@
 - 直接执行路径的事务只包仓库端口内的写，Provider 等待发生在端口之外，因此没有事务跨 Provider 等待；A1 用例不启 Worker 即返回 200，说明没有结果轮询。
 - 账务行只由强类型列与快照组成，图片不进任何持久列（A2 的列断言），因此账务行大小不随图片增长。
 - 图片在内存里以 `Bytes` 或原字符串按 `Arc<GatewayInput>` 共享一次、重试复用同一份，不产生逐候选大图副本。
-- 以上是**代码路径的结论**；SQL 次数、等待期间连接占用与峰值 RSS 已有测量用例，两态吞吐/延迟基线仍需专门夹具。
+- 以上是**代码路径的结论**；SQL 次数、等待期间连接占用、峰值 RSS 与两态吞吐/延迟基线已有测量用例（后者见「验收记录」）。
 
 ## 验收记录
 
-（执行后在此填结论。）
+### A8 两态性能基线（2026-10-04）
+
+同一棵树、同一台机器、同一份假上游延迟下的**单次**本机观测，只作记录，不构成性能门槛。
+
+| 项 | 取值 |
+| --- | --- |
+| 用例 | `cases_performance_baseline::direct_execution_two_state_throughput_baseline` |
+| 命令 | `HTTP_CONTRACT_DATABASE_URL=<本机 .env 的 DATABASE_URL> cargo test -p seeai-api --test http_contract cases_performance_baseline -- --ignored --nocapture` |
+| 构建 | `cargo test` 测试 profile（未优化 + debuginfo） |
+| 机器 | 11th Gen Intel Core i7-11700 @ 2.50GHz（16 逻辑核）、约 15.5GiB 内存、WSL2 x86_64；rustc/cargo 1.99.0 |
+| 负载 | 并发 8、每态 48 个成功请求（预热 1 次不计）；假上游每次生成请求固定延迟 200ms |
+| 两态 | 关：`GENERATION_DIRECT_EXECUTION` 关闭，夹具起一个真实 Worker 领任务（旧路径）；开：直接执行，不启 Worker |
+| 夹具 | 两态各用一份独立一次性库与 1e9 微美元余额账户；每态延迟只统计成功请求，任何非 200 会让用例失败 |
+
+| 态 | 总耗时 | 平均延迟 | p95 延迟 | 每秒完成数 |
+| --- | --- | --- | --- | --- |
+| 关（旧 Worker 路径） | 12.442s | 1939.0ms | 2313.4ms | 3.86 |
+| 开（同步直接执行） | 2.384s | 370.1ms | 528.2ms | 20.13 |
+
+用例不写性能断言；吞吐倍数与延迟阈值由整改前基线与部署目标确定（RFC 0017 §8）。

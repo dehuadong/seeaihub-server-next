@@ -61,6 +61,8 @@ mod cases_migrations;
 mod cases_parameter_mapping;
 #[path = "cases_parameters.rs"]
 mod cases_parameters;
+#[path = "cases_performance_baseline.rs"]
+mod cases_performance_baseline;
 #[path = "cases_pricing.rs"]
 mod cases_pricing;
 #[path = "cases_public_surface.rs"]
