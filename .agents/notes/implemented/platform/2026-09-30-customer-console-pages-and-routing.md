@@ -19,7 +19,7 @@ verification: 见正文「验证」。`apps/web` 的 `npm run typecheck`、`npm 
 - **路由守卫只控制渲染，不动地址。** 没有会话时只挂载 `AuthPage`，账户、密钥与账务组件不挂载、不发取数请求；地址保留，登录成功后按当前地址渲染对应页面，这就是"登录后回跳"。
 - **会话清屏有两条触发。** 服务端回 401（退出、被吊销、过期）时 `CustomerClient` 集中回调清掉本地会话；登录响应里的 `expires_at` 到点也清。清屏即回登录页，旧账务与密钥不留可见页面。
 - **五个页面各自取数。** 概览只请求 `/v1/customer/account`；调用记录、账单与资金记录、API Key、账户设置各请求自己需要的端点，互不加载对方的数据（C15）。
-- **概览只放已结算余额与入口。** 移除原来的"扣费总额（全部）"与账单请求；账单页移除"平均每次扣费"，把有符号净额解释为净支出/净返还/收支相抵（Spec §4.3、V-D14）。
+- **概览只放一个「余额」与入口。** 余额的口径后由[客户侧余额改为「现在能用的钱」](../domain/2026-10-02-customer-balance-is-available.md)改成"客户现在能用的钱"；移除原来的"扣费总额（全部）"与账单请求；账单页移除"平均每次扣费"，把有符号净额解释为净支出/净返还/收支相抵（Spec §4.3、V-D14）。
 - **开发服务补同一条深链回退。** 生产由 API 静态兜底把无扩展名路径回 `portal.html`；`vite.config.ts` 的 `portal-dev-deep-links` 在本机做同一件事，两条落回同一组地址（设计 0014 §5）。
 
 ## 备选方案
@@ -42,6 +42,6 @@ verification: 见正文「验证」。`apps/web` 的 `npm run typecheck`、`npm 
 - `npm run typecheck` 通过；`npm run build`（含 `check-bundle-isolation.mjs`）通过，两份产物互不引用。
 - `npx playwright test` 连跑两次，各 **42 passed**。新增/改写的用例：
   - `portal-navigation.spec.ts`：未登录直达五条地址只显示登录且不取账户数据、未登录直达 `/billing` 登录后回 `/billing`、五条地址直接打开与刷新都落在对应页、前进后退按地址恢复、凭据不进 URL、退出清屏、未知路径显示客户侧 404。
-  - `portal-self-service.spec.ts`：概览首屏只有已结算余额与五页导航、页面拆分各自取数、密钥明文只出现一次、改口令与重置令牌。
+  - `portal-self-service.spec.ts`：概览首屏只有一个「余额」与五页导航、页面拆分各自取数、密钥明文只出现一次、改口令与重置令牌。
   - `ui-uses-antd.spec.ts`：客户外壳与五个页面都渲染 Ant Design 组件。
 - 未改客户业务 API，未跑 Rust 合同套件；Rust 全量门禁交 CI。

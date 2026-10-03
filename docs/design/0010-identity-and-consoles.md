@@ -143,7 +143,7 @@
 | `GET` | `/v1/customer/api-keys` | 客户会话 | — | `200 {keys:[{key_id, label, created_at, revoked_at}]}`（**无明文**） |
 | `POST` | `/v1/customer/api-keys` | 客户会话 | `{label}` | `201 {key_id, api_key}`（明文只此一次） |
 | `DELETE` | `/v1/customer/api-keys/{key_id}` | 客户会话 | — | `204`；不属于自己 ⇒ `404` |
-| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示已结算余额 |
+| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示一个「余额」数字（取 `available_microusd`） |
 | `GET` | `/v1/customer/ledger` | 客户会话 | 资金记录查询 | 按账户和时间区间读真实收支；筛选、翻页和响应见[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
 | `GET` | `/v1/customer/usage` | 客户会话 | 调用记录查询 | 对客状态、终态时刻、分组和翻页见[客户控制台设计](0014-customer-console-navigation-and-history.md) §2 |
 | `GET` | `/v1/customer/billing` | 客户会话 | 时间区间 | 区间汇总与金额展示见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5 与[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
@@ -164,7 +164,7 @@
 
 ### 4.3 账户读与流水端点
 
-`GET /api/v1/accounts/{id}/entries`（管理员流水）保留分页与区间查询，条目只含实际收支；对客流水在 §4.2 的 `ledger` 里按 `WHERE account_id = <会话账户>` 收窄，不展示预授权或释放。`/v1/account` 返回已结算余额，客户控制台只渲染该金额；内部占用与可用额仍用于受理判定。
+`GET /api/v1/accounts/{id}/entries`（管理员流水）保留分页与区间查询，条目只含实际收支；对客流水在 §4.2 的 `ledger` 里按 `WHERE account_id = <会话账户>` 收窄，不展示预授权或释放。`/v1/account` 返回三个金额字段，客户控制台只渲染 `available_microusd` 为一个「余额」数字；内部占用与已结算余额仍用于受理判定与对账。
 
 ### 4.4 页面 → 端点（逐页承接 Spec M1–M6、C5–C12）
 
