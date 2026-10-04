@@ -301,7 +301,7 @@ impl ProviderFailureKind {
 ///
 /// 这些是 Driver 实际会接受/产出的上界，写成一份共享声明，调用方才能算出"一次执行最坏要预留
 /// 多少内存"。各段单独相加会低估：上游原始响应、解析出的图片字符串与编码后的正文可能同时
-/// 存活，编码还要算转义膨胀（RFC 0018 §2）。
+/// 存活（RFC 0018 §2.1）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GatewayByteLimits {
     /// 入口请求 wire 上界：认证之后才解析，解析结果与它同时存活。
@@ -310,12 +310,83 @@ pub struct GatewayByteLimits {
     pub provider_response_bytes: usize,
 }
 
-/// 编码后正文相对上游原始响应的保守倍数：JSON 转义会把 `"`、`\` 与控制字符放大，
-/// base64 图片是 4/3，再用信封与解析副本的余量收口。
-pub const ENCODED_RESPONSE_EXPANSION: usize = 6;
-
 /// 入口请求 wire 的上限：与 API 的正文上限同一口径，解析结果与它同时存活。
 pub const GATEWAY_REQUEST_WIRE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 实测：贴住 [`GATEWAY_REQUEST_WIRE_BYTES`] 的**已支持输入形态**（一个 data URL 参考图加普通
+/// 参数）经 API 真实解析路径（`CreateGenerationBody`）之后，解析结构在峰值时额外持有的字节数，
+/// 不含 wire 本身。
+///
+/// 测量命令（Linux、dev profile、一条用例一个进程，`VmHWM` 前后差值）：
+///
+/// ```text
+/// cargo test -p seeai-api --bin seeai-api -- --ignored --nocapture --test-threads=1 \
+///   memory_request_parse_peak_image
+/// ```
+///
+/// 实测：wire 16777216 字节，额外峰值 17544–17992 KiB（四次）；取 18 MiB 收口。
+///
+/// **已知缺口（T1 剩余项，必须知道）**：节点密集的 JSON 在 §2.2 的节点/字段计数落地前不受这个
+/// 常数约束。同一命令下的 `memory_request_parse_peak_small_object_nodes`（16 MiB 的
+/// `[{"a":0},…]`）实测解析结构峰值 2065756 KiB（约 2.0 GiB），
+/// `memory_request_parse_peak_scalar_nodes`（`[0,0,…]`）实测 526036 KiB。也就是说：在节点计数
+/// 落地前，一份 16 MiB 的请求能把堆抬到远超本常数——那时这份预留不再是内存保证。这里是按
+/// **已支持输入形态**实测的最大值钉的，节点/字段计数是收口这一缺口的既定机制。
+pub const GATEWAY_REQUEST_PARSE_BYTES: usize = 18 * 1024 * 1024;
+
+/// 实测：解析结构提升为 Adapter 输入（取参考图/遮罩并构造强类型 [`InputImage`]）时的额外峰值。
+///
+/// 测量命令：
+///
+/// ```text
+/// cargo test -p seeai-api --bin seeai-api -- --ignored --nocapture --test-threads=1 \
+///   memory_mapped_parameter_peak
+/// ```
+///
+/// 实测：额外峰值 16472–16540 KiB（四次）；取 17 MiB 收口。其中约 16 MiB 是
+/// `seeai_domain::take_contract_image_inputs` 对图片值的那一次拷贝——它与 map 里的原值在峰值时
+/// 同时存活（RFC 0018 §2.2 要求图片输入共享，落地后应重测收窄）。
+pub const GATEWAY_MAPPED_PARAMETER_BYTES: usize = 17 * 1024 * 1024;
+
+/// 实测：上游响应阶段（原始响应缓冲峰值 + 解析出的图片字符串之和）相对声明响应上限的**百分比**。
+///
+/// 测量命令：
+///
+/// ```text
+/// cargo test -p seeai-api --bin seeai-api -- --ignored --nocapture --test-threads=1 \
+///   memory_provider_response_and_parsed_image_peak
+/// ```
+///
+/// 实测（AIHubMix 128 MiB 响应上限）：正文 134213632 字节、解析出的图片字符串 134213380 字节、
+/// 额外峰值 263236 / 262864 / 263116 KiB（三次）＝2.0084 / 2.0056 / 2.0083 × 正文；取 201% 收口。两个原因叠加成
+/// 这两倍：读缓冲是 `BytesMut` 逐段扩容（上限是声明值的 2 的幂，所以最终容量正好等于正文长度，
+/// 峰值里最坏再多一份），解析出的图片字符串又是一份独立副本。
+///
+/// 注意：Adapter 侧没有按 `Content-Length` 预分配读缓冲，扩容的瞬时峰值因此是"几何倍数"而不是
+/// "正文长度"；声明上限都是 2 的幂（128 MiB / 8 MiB），实测落在 2.01 倍。换成非 2 的幂的上限时
+/// 这个比例会变（`BytesMut` 会多跳一级容量），届时必须重测。
+///
+/// 测量只在 AIHubMix（128 MiB）上做过；APIMart（8 MiB）用同一段 `BytesMut` 逐段扩容读取，按同一
+/// 常数计——8 MiB 那一档**没有单独实测**，换读取实现时要重测。
+pub const GATEWAY_PROVIDER_STAGE_PERCENT: usize = 201;
+
+/// 实测：对客编码正文在图片字符串之外的固定开销（信封）。
+///
+/// 测量命令：
+///
+/// ```text
+/// cargo test -p seeai-api --bin seeai-api -- --ignored --nocapture --test-threads=1 \
+///   memory_encoded_client_body_peak
+/// ```
+///
+/// 实测：一张 134213380 字节的图编码后是 134213679 字节（比例 1.0000004），编码那一步本身的额外
+/// 峰值 132292–132676 KiB（三次，约等于编码正文本身）；合同允许的产出张数上限
+/// （`NO_CONTRACT_MAX_OUTPUT_IMAGES = 10`）下、图片字符串全为空时信封是 191 字节。
+///
+/// 编码后正文因此是**实测出来的 ≈ 1 倍上游正文加这个有界信封**，不再是猜测的倍数：客户端正文
+/// 是对上游响应里那些字符串的再序列化，而 JSON 转义只会比原始转义更短或等长（`"`/`\`/控制字符
+/// 在原始正文里本来就是转义形式），所以"1 倍 + 信封"是有依据的上界。
+pub const GATEWAY_ENCODED_ENVELOPE_BYTES: usize = 191;
 
 /// 只读对账查询响应上限的缺省值（1 MiB）。
 ///
@@ -362,16 +433,41 @@ impl GatewayByteLimits {
             .max(1)
     }
 
-    /// 一次执行的最坏占用上界（字节）。用饱和加法，配置极大时退化为 `usize::MAX` 而不是回绕。
+    /// 一次执行的最坏占用上界（字节），由**实测常数**逐项相加（RFC 0018 §2.1）：
+    ///
+    /// ```text
+    /// R = I                 入口 wire（声明的正文上限）
+    ///   + GATEWAY_REQUEST_PARSE_BYTES            解析结构（实测）
+    ///   + GATEWAY_MAPPED_PARAMETER_BYTES         提升为 Adapter 输入（实测）
+    ///   + U × GATEWAY_PROVIDER_STAGE_PERCENT/100 原始响应缓冲峰值 + 解析出的图片字符串（实测）
+    ///   + U + GATEWAY_ENCODED_ENVELOPE_BYTES     编码后的对客正文（实测信封）
+    ///   + T                  transport 用户态缓冲（配置上界，见下）
+    /// ```
+    ///
+    /// `U` 是本通路声明的上游响应上限。图片只在必要处计一次：请求侧的图片值按"已支持输入形态"
+    /// 的实测常数计（[`GATEWAY_REQUEST_PARSE_BYTES`] 与 [`GATEWAY_MAPPED_PARAMETER_BYTES`] 已经
+    /// 含了它），上游侧的图片字符串与编码正文各计一次——它们在峰值时确实是两份独立字节。
+    ///
+    /// `transport_buffer_bytes` 由调用方按 **transport 配置的上界**传入（HTTP/1 解析缓冲 +
+    /// HTTP/2 发送缓冲，见运维配置的「连接与断开监视」）。它**没有独立实测峰值**：这里的取值是
+    /// 配置写死的上限，不是估出来的峰值——Hyper 在用户态的写缓冲不会超过它。
+    ///
+    /// 用饱和加法，配置极大时退化为 `usize::MAX` 而不是回绕。
     #[must_use]
-    pub const fn max_bytes_per_execution(self) -> usize {
+    pub const fn max_bytes_per_execution(self, transport_buffer_bytes: usize) -> usize {
+        let provider_stage = self
+            .provider_response_bytes
+            .saturating_mul(GATEWAY_PROVIDER_STAGE_PERCENT)
+            / 100;
         let encoded = self
             .provider_response_bytes
-            .saturating_mul(ENCODED_RESPONSE_EXPANSION);
-        // 同一时刻在飞的：入口请求与解析副本、上游原始响应、编码后正文。
+            .saturating_add(GATEWAY_ENCODED_ENVELOPE_BYTES);
         self.request_wire_bytes
-            .saturating_add(self.provider_response_bytes)
+            .saturating_add(GATEWAY_REQUEST_PARSE_BYTES)
+            .saturating_add(GATEWAY_MAPPED_PARAMETER_BYTES)
+            .saturating_add(provider_stage)
             .saturating_add(encoded)
+            .saturating_add(transport_buffer_bytes)
     }
 }
 

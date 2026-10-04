@@ -266,9 +266,8 @@ async fn main() -> Result<()> {
         .with_daily_spend_limit(generation_daily_spend_limit()?)
         .with_acceleration(acceleration.clone())
         .with_cost_ceiling(cost_ceiling()?);
-        let execution_slots = generation_env_usize("GENERATION_EXECUTION_SLOTS", 64)?;
         let max_memory_bytes =
-            generation_env_usize("GENERATION_MAX_MEMORY_BYTES", 2 * 1024 * 1024 * 1024)?;
+            generation_env_usize("GENERATION_MAX_MEMORY_BYTES", DEFAULT_MAX_MEMORY_BYTES)?;
         // 单次执行的预留按各 Driver 声明的字节上限算：入口 wire、上游响应与编码膨胀可能同时存活，
         // 不能再用一个与真实响应无关的固定值（RFC 0018 §2）。读不到任何 Driver 的字节上限时
         // **拒绝启动**：静默退回一个更小的固定值，正是"把预算改小还装作没发生"。
@@ -294,9 +293,22 @@ async fn main() -> Result<()> {
                 );
             }
         }
+        // transport 用户态缓冲的上界：单次执行最多牵动的两类连接缓冲（HTTP/1 解析缓冲、HTTP/2
+        // 发送缓冲）。它进单次预留，取值就是**配置自己的上限**，不是这里估出来的峰值——Hyper 在
+        // 用户态的写缓冲不会超过这两项。
+        let transport_buffer_bytes =
+            generation_env_usize("API_MAX_BUFFER_BYTES", DEFAULT_HTTP1_MAX_BUF_BYTES)?
+                .saturating_add(generation_env_usize(
+                    "API_H2_MAX_SEND_BUFFER_BYTES",
+                    DEFAULT_HTTP2_MAX_SEND_BUF_BYTES,
+                )?);
         let execution_memory_bytes = descriptors
             .iter()
-            .map(|descriptor| descriptor.byte_limits.max_bytes_per_execution())
+            .map(|descriptor| {
+                descriptor
+                    .byte_limits
+                    .max_bytes_per_execution(transport_buffer_bytes)
+            })
             .max()
             .ok_or_else(|| {
                 anyhow::anyhow!(
@@ -306,6 +318,28 @@ async fn main() -> Result<()> {
             })?;
         let send_slots = generation_env_usize("GENERATION_SEND_SLOTS", 64)?;
         let read_slots = generation_env_usize("GENERATION_READ_SLOTS", 64)?;
+        let max_connections = generation_env_usize("API_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS)?;
+        let h2_max_concurrent_streams = generation_env_usize(
+            "API_H2_MAX_CONCURRENT_STREAMS",
+            DEFAULT_H2_MAX_CONCURRENT_STREAMS,
+        )?;
+        // 执行名额：显式配置的按它自己校验；没配时按"内存预算 ÷ 单次预留"推导。推导出来的组合必然
+        // 自洽，而显式配得比预算能覆盖的还多会被下面的组合校验拒绝——不静默把上限改小，也不让
+        // 进程带着一份"有名额但永远取不到"的配置跑起来（RFC 0018 §2.3）。
+        let execution_slots = match generation_env_usize_optional("GENERATION_EXECUTION_SLOTS")? {
+            Some(slots) => slots,
+            None => (max_memory_bytes / execution_memory_bytes).max(1),
+        };
+        validate_capacity_combination(&CapacityCombination {
+            execution_slots,
+            execution_memory_bytes,
+            max_memory_bytes,
+            read_slots,
+            send_slots,
+            max_connections,
+            h2_max_concurrent_streams,
+        })
+        .map_err(anyhow::Error::msg)?;
         let supervisor = Supervisor::new(SupervisorConfig {
             execution_slots,
             max_memory_bytes,
@@ -336,6 +370,8 @@ async fn main() -> Result<()> {
             execution_slots,
             send_slots,
             read_slots,
+            max_connections,
+            h2_max_concurrent_streams,
             max_memory_bytes,
             execution_memory_bytes,
             reconciliation_read_bytes,
@@ -601,7 +637,7 @@ fn spawn_budget_observability(
 /// 连接驱动的容量与期限：每一项都是明确上限，默认值按单机 64 路执行容量给出。
 #[cfg(target_os = "linux")]
 fn transport_config() -> Result<TransportConfig> {
-    let max_connections = generation_env_usize("API_MAX_CONNECTIONS", 1024)?;
+    let max_connections = generation_env_usize("API_MAX_CONNECTIONS", DEFAULT_MAX_CONNECTIONS)?;
     let max_connection_tasks = generation_env_usize("API_MAX_CONNECTION_TASKS", 64)?;
     let control_queue_capacity = generation_env_usize("API_MONITOR_CONTROL_QUEUE", 1024)?;
     Ok(TransportConfig {
@@ -625,13 +661,19 @@ fn transport_config() -> Result<TransportConfig> {
             25,
         )?),
         http1_max_headers: generation_env_usize("API_MAX_HEADERS", 128)?,
-        http1_max_buf_size: generation_env_usize("API_MAX_BUFFER_BYTES", 64 * 1024)?,
+        http1_max_buf_size: generation_env_usize(
+            "API_MAX_BUFFER_BYTES",
+            DEFAULT_HTTP1_MAX_BUF_BYTES,
+        )?,
         http2_max_concurrent_streams: u32::try_from(generation_env_usize(
             "API_H2_MAX_CONCURRENT_STREAMS",
-            128,
+            DEFAULT_H2_MAX_CONCURRENT_STREAMS,
         )?)
         .context("API_H2_MAX_CONCURRENT_STREAMS must fit in 32 bits")?,
-        http2_max_send_buf_size: generation_env_usize("API_H2_MAX_SEND_BUFFER_BYTES", 1024 * 1024)?,
+        http2_max_send_buf_size: generation_env_usize(
+            "API_H2_MAX_SEND_BUFFER_BYTES",
+            DEFAULT_HTTP2_MAX_SEND_BUF_BYTES,
+        )?,
         http2_max_header_list_size: u32::try_from(generation_env_usize(
             "API_H2_MAX_HEADER_LIST_BYTES",
             64 * 1024,
@@ -3438,6 +3480,123 @@ fn generation_env_usize(name: &str, default: usize) -> Result<usize> {
             .with_context(|| format!("{name} must be an integer")),
         _ => Ok(default),
     }
+}
+
+/// 读一个可缺省的非负整数环境变量：**没配**与**配了但读不出来**是两回事。
+///
+/// 没配返回 `None`（调用方据此推导一个自洽的缺省），配了但不是一个非负整数就拒绝启动——那是个
+/// 配错的部署，不是一个可以替它拿主意的缺省。
+fn generation_env_usize_optional(name: &str) -> Result<Option<usize>> {
+    match env::var(name) {
+        Ok(value) if !value.trim().is_empty() => value
+            .trim()
+            .parse::<usize>()
+            .with_context(|| format!("{name} must be an integer"))
+            .map(Some),
+        _ => Ok(None),
+    }
+}
+
+/// 本机在飞执行可预占的内存总量缺省值（2 GiB）。
+const DEFAULT_MAX_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// 连接驱动的缺省容量。启动组合校验与 [`transport_config`] 共用这一份，不各写一个数。
+const DEFAULT_MAX_CONNECTIONS: usize = 1024;
+const DEFAULT_H2_MAX_CONCURRENT_STREAMS: usize = 128;
+/// 连接缓冲的缺省上限（字节）：HTTP/1 解析缓冲与 HTTP/2 发送缓冲。单次执行的预留把它们按配置
+/// 计入 transport 那一项，`transport_config()` 与预留用的是同一份缺省。
+const DEFAULT_HTTP1_MAX_BUF_BYTES: usize = 64 * 1024;
+const DEFAULT_HTTP2_MAX_SEND_BUF_BYTES: usize = 1024 * 1024;
+
+/// 直接执行的容量组合：名额之间必须自洽，否则有些名额永远取不到（RFC 0018 §2.3）。
+///
+/// 字段就是各自环境变量的取值；这里只判它们之间的关系，不判某个值本身对不对（那由各自的读取处判）。
+struct CapacityCombination {
+    /// `GENERATION_EXECUTION_SLOTS`：显式配的，或按内存预算推导出来的。
+    execution_slots: usize,
+    /// 单次执行的字节预留，由各 Driver 声明的字节上限算出。
+    execution_memory_bytes: usize,
+    /// `GENERATION_MAX_MEMORY_BYTES`。
+    max_memory_bytes: usize,
+    /// `GENERATION_READ_SLOTS`。
+    read_slots: usize,
+    /// `GENERATION_SEND_SLOTS`。
+    send_slots: usize,
+    /// `API_MAX_CONNECTIONS`。
+    max_connections: usize,
+    /// `API_H2_MAX_CONCURRENT_STREAMS`。
+    h2_max_concurrent_streams: usize,
+}
+
+/// 启动时的组合校验：不自洽就**拒绝启动并点名那两个/三个配置**。
+///
+/// 三条判据都问同一件事——"配置出来的名额，上层资源盖得住吗"：
+///
+/// 1. 内存预算至少够一次执行（否则一次都跑不了）；
+/// 2. 执行名额 × 单次预留 ≤ 内存预算（否则多出来的执行名额是空的：`try_reserve_execution` 先拿
+///    名额再拿字节，预算不够时那次执行会被内存拒绝）；
+/// 3. 读取/发送名额 ≤ 连接容量（每条连接最多 `API_H2_MAX_CONCURRENT_STREAMS` 条流；HTTP/1 是 1，
+///    所以这是**保守可达**下界：比这还多出来的名额不可能被任何连接持有）。
+///
+/// 这里**不**把任何上限改小：调小 `GENERATION_EXECUTION_SLOTS` 或抬高
+/// `GENERATION_MAX_MEMORY_BYTES` 是运维的决定，进程只负责说出来。
+fn validate_capacity_combination(capacity: &CapacityCombination) -> Result<(), String> {
+    if capacity.execution_slots == 0 {
+        return Err("GENERATION_EXECUTION_SLOTS must be positive".to_owned());
+    }
+    if capacity.read_slots == 0 {
+        return Err("GENERATION_READ_SLOTS must be positive".to_owned());
+    }
+    if capacity.send_slots == 0 {
+        return Err("GENERATION_SEND_SLOTS must be positive".to_owned());
+    }
+    if capacity.execution_memory_bytes == 0 {
+        return Err("the per-execution memory reservation must be positive".to_owned());
+    }
+    if capacity.max_memory_bytes < capacity.execution_memory_bytes {
+        return Err(format!(
+            "GENERATION_MAX_MEMORY_BYTES is {} bytes, below the {} bytes one execution needs; \
+             the memory budget must cover at least one execution",
+            capacity.max_memory_bytes, capacity.execution_memory_bytes
+        ));
+    }
+    let slots_fit = capacity
+        .execution_slots
+        .checked_mul(capacity.execution_memory_bytes);
+    if slots_fit.is_none_or(|needed| needed > capacity.max_memory_bytes) {
+        return Err(format!(
+            "GENERATION_EXECUTION_SLOTS ({}) times the {} bytes one execution needs exceeds \
+             GENERATION_MAX_MEMORY_BYTES ({} bytes); those execution slots can never be reserved, \
+             so raise the memory budget or lower the slot count",
+            capacity.execution_slots, capacity.execution_memory_bytes, capacity.max_memory_bytes
+        ));
+    }
+    let connection_capacity = capacity
+        .max_connections
+        .saturating_mul(capacity.h2_max_concurrent_streams);
+    if capacity.read_slots > connection_capacity {
+        return Err(format!(
+            "GENERATION_READ_SLOTS ({}) exceeds what API_MAX_CONNECTIONS ({}) times \
+             API_H2_MAX_CONCURRENT_STREAMS ({}) can hold ({}); raise the connection capacity or \
+             lower the read slot count",
+            capacity.read_slots,
+            capacity.max_connections,
+            capacity.h2_max_concurrent_streams,
+            connection_capacity
+        ));
+    }
+    if capacity.send_slots > connection_capacity {
+        return Err(format!(
+            "GENERATION_SEND_SLOTS ({}) exceeds what API_MAX_CONNECTIONS ({}) times \
+             API_H2_MAX_CONCURRENT_STREAMS ({}) can hold ({}); a send permit is held until its \
+             connection is destroyed, so raise the connection capacity or lower the send slot count",
+            capacity.send_slots,
+            capacity.max_connections,
+            capacity.h2_max_concurrent_streams,
+            connection_capacity
+        ));
+    }
+    Ok(())
 }
 
 /// 读一个非负整数环境变量（字节或秒），没给或给空取默认值。

@@ -52,17 +52,17 @@
 | `GENERATION_SETTLE_RESERVE_SECONDS` | `10` | 总期限 D 里预留给结算、提交确认与失败收尾的预算 R：上游预算因此是 D 减 R |
 | `GENERATION_EXECUTION_LEASE_SECONDS` | `60` | v1 执行所有权的租约时长（秒）。`begin_submission` 按它落 `lease_expires_at`，API Supervisor 按它的三分之一周期独立续约；续约冲突或所有权失效立即取消该次执行 |
 | `GENERATION_MAX_CHANNEL_IN_FLIGHT` | `32` | **渠道全局**未决任务上限，多副本经数据库槽位共同遵守（不是单机限制） |
-| `GENERATION_EXECUTION_SLOTS` | `64` | 本机同时在执行的生成任务数 |
-| `GENERATION_MAX_MEMORY_BYTES` | `2147483648`（2GiB） | 本机在飞执行可预占的内存总量；每次执行的预留按各 Driver 声明的字节上限算出（入口 wire、上游响应与编码膨胀同时计），配得比它小进程起不来 |
-| `GENERATION_READ_SLOTS` | `64` | 本机同时在读请求正文的准入名额；取不到直接拒绝，不排队 |
-| `GENERATION_SEND_SLOTS` | `64` | 本机同时可持有的响应发送名额；在受理前预留 |
+| `GENERATION_EXECUTION_SLOTS` | 按预算推导 | 本机同时在执行的生成任务数。**缺省不写**：按「内存预算 ÷ 单次预留」推导（缺省预算 2GiB 下是 4）。显式写下的值必须装得进预算，否则进程拒绝启动并点名它与 `GENERATION_MAX_MEMORY_BYTES` |
+| `GENERATION_MAX_MEMORY_BYTES` | `2147483648`（2GiB） | 本机在飞执行可预占的内存总量。单次预留由各 Driver 声明的字节上限按**实测常数**算出：入口 wire 16MiB、解析结构 18MiB、提升为 Adapter 输入 17MiB、上游响应原始缓冲与解析出的图片字符串 2.01×响应上限、编码后的对客正文（1×响应上限 + 191 字节信封）、transport 用户态缓冲（`API_MAX_BUFFER_BYTES` + `API_H2_MAX_SEND_BUFFER_BYTES`）。AIHubMix（响应上限 128MiB）当前是 458587040 字节≈437MiB。常数与测量命令写在 `crates/adapter-sdk` 的 `GATEWAY_*` 常量注释里；配得比一次预留小、或装不下所配名额时进程拒绝启动 |
+| `GENERATION_READ_SLOTS` | `64` | 本机同时在读请求正文的准入名额；取不到直接拒绝，不排队。它不能超过连接容量 |
+| `GENERATION_SEND_SLOTS` | `64` | 本机同时可持有的响应发送名额；在受理前预留。发送许可活到连接销毁，因此它同样不能超过连接容量 |
 | `GENERATION_SLOW_READ_TIMEOUT_SECONDS` | `30` | 请求正文从开始接收到读完的上限；超时在受理前返回 408 `request_timeout`，不建记录 |
 | `GENERATION_SEND_TIMEOUT_SECONDS` | `30` | 客户端发送的独立有界期限，不占用 D |
 | `GENERATION_SHUTDOWN_GRACE_SECONDS` | `25` | 停机时给在飞任务有限收尾的宽限期；到点残余交异常对账 |
 | `GENERATION_RECONCILIATION_READ_BYTES` | `1048576`（1MiB） | 只读对账查询的响应上限（字节）。它独立于生成响应上限，超限的响应只留下证据缺口、不无界读图；配得比任何 Adapter 声明的生成响应上限还大时进程启动失败 |
 | `GENERATION_OBSERVABILITY_INTERVAL_SECONDS` | `30` | 预算观测记录周期（秒）；`0` 表示不做周期记录，逐次容量拒绝仍在拒绝点记录 |
 
-名额取正数、内存预算至少够一次执行：配不成可用的执行容量时进程启动失败并点名。
+启动时校验容量组合，不自洽就拒绝启动并点名相关配置：名额都取正数，内存预算至少够一次执行，执行名额 × 单次预留不超过内存预算，读取/发送名额不超过 `API_MAX_CONNECTIONS × API_H2_MAX_CONCURRENT_STREAMS`。组合校验不替运维调小任何上限。
 
 预算观测每周期记一次已预留字节、实际缓冲字节、活跃读取/执行/发送、连接数与各段拒绝次数（只记数量，不记图片或参数）；容量拒绝当场各记一条。两者都走 `tracing`，不引入独立的指标库。
 
@@ -77,8 +77,8 @@ API 自己驱动连接（accept loop + Hyper 连接 future），图片响应的�
 | `API_MONITOR_CONTROL_QUEUE` | `1024` | 断开监视控制队列容量，其中 64 个槽位固定留给清理；配得不大于 64 进程启动失败 |
 | `API_MONITOR_CONFIRM_MILLIS` | `2000` | 等待监视注册、清理确认的上限；注册拿不到确认的连接不启动 |
 | `API_MAX_HEADERS` | `128` | HTTP/1 每次请求的 header 条数上限 |
-| `API_MAX_BUFFER_BYTES` | `65536` | HTTP/1 解析缓冲上限（也限制已缓存的流水线字节） |
-| `API_H2_MAX_CONCURRENT_STREAMS` | `128` | HTTP/2 每连接最大并发流 |
+| `API_MAX_BUFFER_BYTES` | `65536` | HTTP/1 解析缓冲上限（也限制已缓存的流水线字节）。它与 `API_H2_MAX_SEND_BUFFER_BYTES` 一起按配置计入单次执行预留的 transport 那一项 |
+| `API_H2_MAX_CONCURRENT_STREAMS` | `128` | HTTP/2 每连接最大并发流；它与 `API_MAX_CONNECTIONS` 的乘积是读取/发送名额的上限 |
 | `API_H2_MAX_SEND_BUFFER_BYTES` | `1048576` | HTTP/2 发送缓冲上限 |
 | `API_H2_MAX_HEADER_LIST_BYTES` | `65536` | HTTP/2 header 列表上限 |
 

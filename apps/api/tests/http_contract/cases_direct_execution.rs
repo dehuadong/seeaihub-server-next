@@ -569,17 +569,22 @@ async fn direct_slow_provider_keeps_more_requests_than_pool_connections_in_fligh
 /// A8 与 Spec 0005 §3：本机字节预算被在飞执行占满时，新请求按容量不足拒（503
 /// platform_unavailable），不建执行记录、不调上游；预算释放后同样的请求正常工作。
 ///
-/// 为什么用并发构造"超过预算"：每次执行固定预留 32MiB（EXECUTION_MEMORY_BYTES），预算配到比它小
-/// 进程直接拒绝启动（Supervisor::new），所以单个请求永远在预算内；能压出来的边界只有"又一个执行
-/// 要预留，而预算已被在飞执行占满"。执行、发送、读取名额都保持默认 64，唯一被压小的是字节预算，
-/// 因此这次 503 只能归因于内存预算，不会与并发名额超限混淆。
+/// 为什么用并发构造"超过预算"：单次执行的预留是按 Driver 字节上限实测钉出来的（见
+/// `GatewayByteLimits::max_bytes_per_execution`），预算配到比它小进程直接拒绝启动（启动组合
+/// 校验），所以单个请求永远在预算内；能压出来的边界只有"又一个执行要预留，而预算已被在飞执行
+/// 占满"。字节预算被压到刚好一次执行时，执行名额按预算推导出来也是 1（见 `apps/api/src/main.rs`），
+/// 因此这次 503 是"本机执行容量不足"，不会与读/发送名额超限混淆。
 /// 单次执行的内存预留：与网关按 Driver 字节上限算出的口径一致（见 `apps/api/src/main.rs`）。
 fn one_execution_reservation_bytes() -> usize {
     let response = seeai_adapter_aihubmix::MAX_PROVIDER_RESPONSE_BYTES
         .max(seeai_adapter_apimart::MAX_PROVIDER_RESPONSE_BYTES);
-    seeai_adapter_sdk::GATEWAY_REQUEST_WIRE_BYTES
-        + response
-        + response * seeai_adapter_sdk::ENCODED_RESPONSE_EXPANSION
+    seeai_adapter_sdk::GatewayByteLimits {
+        request_wire_bytes: seeai_adapter_sdk::GATEWAY_REQUEST_WIRE_BYTES,
+        provider_response_bytes: response,
+    }
+    // 夹具不配 transport 的两个缓冲上限，进程用 API 的缺省值（HTTP/1 解析缓冲 64 KiB +
+    // HTTP/2 发送缓冲 1 MiB）。这两个缺省写在 `apps/api/src/main.rs`，测试二进制读不到，只能同值。
+    .max_bytes_per_execution(1024 * 1024 + 64 * 1024)
 }
 
 #[tokio::test]
@@ -688,8 +693,8 @@ fn peak_rss_kib(pid: u32) -> u64 {
 /// A8 与 RFC 0017 §8：一次大图请求后，API 进程的峰值 RSS 落在预先配置的字节预算内。
 ///
 /// 预算在这里是进程级上界而不是"每执行预留"：RFC §8 要求最大合法输入与慢发送下 RSS 落在配置的
-/// 预算内。夹具把预算压到 256MiB（8 个执行预留）——既容得下一次请求，又比生产默认的 2GiB 紧，
-/// 断言才有判别力。抖动来源：进程基线与 tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的内存
+/// 预算内。夹具把预算压到**刚好一次执行的预留**（按 Driver 字节上限实测钉出来的那个数），断言
+/// 才有判别力。抖动来源：进程基线与 tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的内存
 /// 留在 arena 里不还给内核、以及 data URL 解码与 multipart 编码的同尺寸副本。VmHWM 是内核对整段
 /// 生命周期的最高水位，只单调上升，不会漏记峰值。
 #[cfg(target_os = "linux")]
@@ -736,6 +741,55 @@ async fn direct_peak_rss_stays_within_the_memory_budget() {
     assert!(
         peak_kib < budget_kib,
         "大图请求后 API 峰值 RSS {peak_kib} KiB 超出配置预算 {budget_kib} KiB"
+    );
+    harness.cleanup().await;
+}
+
+/// R1 与 RFC 0018 §2.1：上游响应顶到 Driver 声明的上限（AIHubMix 128 MiB）时，API 进程的峰值
+/// RSS 仍落在"一次执行预留"以内。
+///
+/// 与 A8 那条大图请求互补：那条压请求侧，这条压响应侧——原始响应缓冲、解析出的图片字符串与
+/// 编码后的对客正文在峰值时确实同时存在，正是单次预留要罩住的部分。预算压到刚好一次预留，
+/// 因此这条用例的判别力就是"实测预留常数罩不罩得住最大响应"。
+#[cfg(target_os = "linux")]
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_max_provider_response_peak_rss_stays_within_the_memory_budget() {
+    let memory_budget_bytes = one_execution_reservation_bytes();
+    let harness = Harness::start_direct_with(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        UpstreamBehaviour {
+            sync_image_b64_bytes: seeai_adapter_aihubmix::MAX_PROVIDER_RESPONSE_BYTES - 8192,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Base64)
+        },
+        1,
+        30,
+        ApiProcessSettings {
+            max_memory_bytes: Some(memory_budget_bytes),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await;
+    let key = format!("direct-max-response-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "a max provider response"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert!(
+        body["data"][0]["b64_json"].is_string(),
+        "渠道给什么就原样回什么，got {body}"
+    );
+    let peak_kib = peak_rss_kib(harness.api_pid());
+    let budget_kib = (memory_budget_bytes / 1024) as u64;
+    println!("最大上游响应后 API 子进程峰值 RSS: {peak_kib} KiB（配置预算 {budget_kib} KiB）");
+    assert!(
+        peak_kib < budget_kib,
+        "128 MiB 上游响应后 API 峰值 RSS {peak_kib} KiB 超出配置预算 {budget_kib} KiB"
     );
     harness.cleanup().await;
 }
@@ -869,4 +923,46 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
 
     drop(peer);
     harness.cleanup().await;
+}
+
+/// RFC 0018 §2.3：容量组合不自洽时进程**拒绝启动并点名那两个配置**。
+///
+/// 8 个执行名额 × 单次预留装在 2 份预算里：多出来的名额永远取不到字节，是配置错误，不是运行时
+/// 的"内存拒绝"——所以判据是进程根本没起来，而且 stderr 里能读到该改哪两个变量。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn an_inconsistent_execution_capacity_combination_refuses_to_start_by_name() {
+    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
+        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let reservation = one_execution_reservation_bytes();
+    let (running, stderr) =
+        probe_api_startup_with_execution_capacity(&database_url, Some(8), Some(reservation * 2))
+            .await;
+    assert!(
+        !running,
+        "8 个执行名额装不进 2 份预算，进程必须拒绝启动；stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("GENERATION_EXECUTION_SLOTS"),
+        "报错要点名名额配置；stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("GENERATION_MAX_MEMORY_BYTES"),
+        "报错要点名内存预算；stderr: {stderr}"
+    );
+}
+
+/// 同一个探针，把组合换成刚好自洽的那一档：进程必须能起来。
+///
+/// 两条用例共用一份探针，才排除得了"是不是别的必填项没配"这种混淆。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_smallest_consistent_execution_capacity_combination_starts() {
+    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
+        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let reservation = one_execution_reservation_bytes();
+    let (running, stderr) =
+        probe_api_startup_with_execution_capacity(&database_url, Some(2), Some(reservation * 2))
+            .await;
+    assert!(running, "刚好自洽的组合必须起得来；stderr: {stderr}");
 }

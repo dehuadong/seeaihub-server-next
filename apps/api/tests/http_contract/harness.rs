@@ -156,6 +156,10 @@ struct UpstreamBehaviour {
     create_rejection_times: usize,
     submit: SubmitBehaviour,
     sync_image: SyncImageShape,
+    /// base64 结果图的**载荷字节数**（0 表示用夹具那张小图）。
+    ///
+    /// 内存观测用例用它把上游响应顶到 Driver 声明的上限，验证单次预留真的罩得住最大响应。
+    sync_image_b64_bytes: usize,
     /// 任务终态里声明的成本：`None` 表示响应里**根本没有这个字段**（渠道没给），
     /// 负数与非数字则覆盖"声明了却拿不到"的形态。取值是实测样例。
     declared_cost: Option<Value>,
@@ -180,6 +184,7 @@ impl UpstreamBehaviour {
             create_rejection_times: 0,
             submit: SubmitBehaviour::Accepted,
             sync_image: SyncImageShape::Url,
+            sync_image_b64_bytes: 0,
             declared_cost: Some(json!(0.011354)),
             terminal_without_images: false,
             delay_ms: 0,
@@ -343,8 +348,12 @@ async fn serve_fake_upstream(
         && method == "POST"
         && (path.ends_with("/images/generations") || path.ends_with("/images/edits"))
     {
-        let payload =
-            serde_json::to_vec(&sync_image_payload(behaviour.sync_image, port)).expect("sync body");
+        let payload = serde_json::to_vec(&sync_image_payload(
+            behaviour.sync_image,
+            port,
+            behaviour.sync_image_b64_bytes,
+        ))
+        .expect("sync body");
         return write_response(socket, 200, "OK", "application/json", &payload).await;
     }
 
@@ -433,9 +442,12 @@ async fn serve_fake_upstream(
 }
 
 /// 同步渠道的成功响应：`data[0]` 是要么 `url`、要么 `b64_json`，外加计量证据。
-fn sync_image_payload(shape: SyncImageShape, port: u16) -> Value {
+///
+/// `b64_bytes` 非 0 时把 base64 载荷顶到该字节数（内存观测用例用），否则用夹具那张小图。
+fn sync_image_payload(shape: SyncImageShape, port: u16, b64_bytes: usize) -> Value {
     let image = match shape {
         SyncImageShape::Url => json!({"url": format!("http://127.0.0.1:{port}/result.png")}),
+        SyncImageShape::Base64 if b64_bytes > 0 => json!({"b64_json": "A".repeat(b64_bytes)}),
         SyncImageShape::Base64 => json!({"b64_json": STANDARD.encode(PNG_FIXTURE)}),
     };
     json!({
@@ -792,6 +804,55 @@ async fn probe_api_startup_with_cursor_key(
     if let Some(key) = key {
         command.env("CUSTOMER_HISTORY_CURSOR_KEY", key);
     }
+    probe_running_and_stderr(command).await
+}
+
+/// 起一个 API 进程，只给**执行容量组合**这两个可选项，回报"还在跑吗"与它的 stderr。
+///
+/// 直接执行的其他必填项都配齐，因此进程要么带着这份容量组合起来，要么就是被组合校验挡下——
+/// 正好用来验证"不自洽时拒绝启动并点名配置"与"刚好自洽时起得来"。
+async fn probe_api_startup_with_execution_capacity(
+    database_url: &str,
+    execution_slots: Option<usize>,
+    max_memory_bytes: Option<usize>,
+) -> (bool, String) {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    command
+        .env("DATABASE_URL", database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", "capacity-probe-token")
+        .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
+        // 供给素材的导入与这条判据无关，显式关掉，探针只探容量组合。
+        .env("SUPPLY_MATERIAL_DIR", "")
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
+        .env("GENERATION_SYNC_WAIT_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
+        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
+        .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
+        .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
+        .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
+        .current_dir(std::env::temp_dir())
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    if let Some(slots) = execution_slots {
+        command.env("GENERATION_EXECUTION_SLOTS", slots.to_string());
+    }
+    if let Some(bytes) = max_memory_bytes {
+        command.env("GENERATION_MAX_MEMORY_BYTES", bytes.to_string());
+    }
+    probe_running_and_stderr(command).await
+}
+
+/// 起一个已经装配好的命令，等它要么退出一场配置错误、要么真的开始服务，并回报 stderr。
+///
+/// 只用于"启动该失败/该成功"这一类判据：不查 `/health`、不写夹具，也不会把一个还在跑的探针
+/// 进程留在后面。
+async fn probe_running_and_stderr(mut command: Command) -> (bool, String) {
     let mut child = command.spawn().expect("API process should start");
     tokio::time::sleep(Duration::from_millis(1_800)).await;
     let running = child.try_wait().expect("try_wait").is_none();

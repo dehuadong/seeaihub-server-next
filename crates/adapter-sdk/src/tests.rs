@@ -105,19 +105,48 @@ fn concurrent_cancel_and_generation_have_one_consistent_winner() {
     }
 }
 
-/// 一次执行的内存预留必须同时覆盖入口、上游原始响应与编码后的正文，不能只算一份。
+/// 一次执行的内存预留必须同时覆盖入口、解析结构、提升后的输入、上游原始响应、解析出的图片
+/// 字符串与编码后的正文，不能只算一份。
 #[test]
 fn the_per_execution_envelope_covers_input_response_and_encoding() {
     let limits = GatewayByteLimits {
-        request_wire_bytes: 16 * 1024 * 1024,
+        request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
         provider_response_bytes: 128 * 1024 * 1024,
     };
-    let expected = (16 + 128 + 128 * ENCODED_RESPONSE_EXPANSION) * 1024 * 1024;
-    assert_eq!(limits.max_bytes_per_execution(), expected);
+    // 默认 transport 配置的上界：HTTP/1 解析缓冲 64 KiB + HTTP/2 发送缓冲 1 MiB。
+    let transport = 1024 * 1024 + 64 * 1024;
+    let response = 128 * 1024 * 1024;
+    let expected = GATEWAY_REQUEST_WIRE_BYTES
+        + GATEWAY_REQUEST_PARSE_BYTES
+        + GATEWAY_MAPPED_PARAMETER_BYTES
+        + response * GATEWAY_PROVIDER_STAGE_PERCENT / 100
+        + response
+        + GATEWAY_ENCODED_ENVELOPE_BYTES
+        + transport;
+    assert_eq!(limits.max_bytes_per_execution(transport), expected);
     assert!(
-        limits.max_bytes_per_execution() > 32 * 1024 * 1024,
+        limits.max_bytes_per_execution(transport) > 32 * 1024 * 1024,
         "旧的固定 32 MiB 预留装不下最大上游响应与副本"
     );
+    // 实测钉下来的两项与猜测的差别：编码那一段是"上游正文 + 有界信封"，不是 6 倍膨胀。
+    assert!(
+        limits.max_bytes_per_execution(transport) < 1024 * 1024 * 1024,
+        "按实测常数，AIHubMix 的单次预留应在 1 GiB 以内"
+    );
+    // 换成 8 MiB 的响应上限时，响应那两段跟着收窄，固定的入口项不变。
+    let narrow = GatewayByteLimits {
+        request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
+        provider_response_bytes: 8 * 1024 * 1024,
+    };
+    let narrow_expected = GATEWAY_REQUEST_WIRE_BYTES
+        + GATEWAY_REQUEST_PARSE_BYTES
+        + GATEWAY_MAPPED_PARAMETER_BYTES
+        + 8 * 1024 * 1024 * GATEWAY_PROVIDER_STAGE_PERCENT / 100
+        + 8 * 1024 * 1024
+        + GATEWAY_ENCODED_ENVELOPE_BYTES
+        + transport;
+    assert_eq!(narrow.max_bytes_per_execution(transport), narrow_expected);
+    assert!(narrow.max_bytes_per_execution(transport) < limits.max_bytes_per_execution(transport));
 }
 
 #[test]
@@ -126,7 +155,7 @@ fn an_extreme_envelope_saturates_instead_of_wrapping() {
         request_wire_bytes: usize::MAX,
         provider_response_bytes: usize::MAX,
     };
-    assert_eq!(huge.max_bytes_per_execution(), usize::MAX);
+    assert_eq!(huge.max_bytes_per_execution(usize::MAX), usize::MAX);
 }
 
 /// 对账读取上限是独立的一条，并且**不大于**该 Adapter 声明的生成响应上限。
