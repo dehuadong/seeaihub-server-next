@@ -1,6 +1,4 @@
 use super::*;
-use crate::{HoldDisposition, PublicErrorCode};
-use seeai_adapter_sdk::RetrySafety;
 use std::sync::Mutex;
 
 /// 一个只记账、不真发信的出口：用例要验的是"失败怎么收口"，不是 HTTP。
@@ -40,21 +38,6 @@ impl AlertSink for RecordingSink {
     }
 }
 
-fn failure(kind: ProviderFailureKind, target_state: JobState) -> AttemptFailure {
-    AttemptFailure {
-        provider_code: "channel_code".to_owned(),
-        public_code: PublicErrorCode::PlatformUnavailable,
-        message: "channel message".to_owned(),
-        trace_id: None,
-        kind,
-        // 告警这条路径与重投无关：这里给一个不确定态，正是"不许重投"的那一态。
-        retry_safety: RetrySafety::AcceptanceUnknown,
-        target_state,
-        hold_disposition: HoldDisposition::Release,
-        provider_cost: None,
-    }
-}
-
 fn alert() -> PlatformAlert {
     PlatformAlert::Execution(ExecutionAlert {
         job_id: JobId::new(),
@@ -62,38 +45,6 @@ fn alert() -> PlatformAlert {
         failure_kind: ProviderFailureKind::PlatformFunding,
         occurred_at: Utc::now(),
     })
-}
-
-/// 平台欠费与凭证类是**既有的失败类别**，不需要另立一套判据；这两类之外只有"这次失败把 Job
-/// 推成对账"才算平台侧事件——渠道限流、消费者内容被拒都不是运维要去修的事。
-#[test]
-fn only_platform_events_are_alerted_by_the_failure_itself() {
-    for kind in [
-        ProviderFailureKind::PlatformFunding,
-        ProviderFailureKind::PlatformCredential,
-    ] {
-        assert!(
-            is_platform_event(&failure(kind, JobState::Failed)),
-            "{kind:?} 是平台侧事件"
-        );
-    }
-    for kind in [
-        ProviderFailureKind::UpstreamRejected,
-        ProviderFailureKind::UpstreamUnavailable,
-        ProviderFailureKind::UpstreamRateLimited,
-        ProviderFailureKind::ConsumerContent,
-        ProviderFailureKind::Unknown,
-    ] {
-        assert!(
-            !is_platform_event(&failure(kind, JobState::Failed)),
-            "{kind:?} 自己不是平台侧事件"
-        );
-    }
-    // 进对账与类别无关：它就是"新建了一条对账案例"的那条路径。
-    assert!(is_platform_event(&failure(
-        ProviderFailureKind::UpstreamUnavailable,
-        JobState::ReconciliationRequired
-    )));
 }
 
 /// 发送失败**收口在出口里**：调用点拿到的是 `()`，所以它没有机会把一次外发失败变成对主流程的
@@ -195,13 +146,4 @@ fn the_ledger_mismatch_payload_is_its_own_locating_fields() {
     assert_eq!(object["balance_microusd"], serde_json::json!(999_999));
     assert_eq!(object["holds_total_microusd"], serde_json::json!(30_000));
     assert_eq!(object["held_microusd"], serde_json::json!(29_000));
-}
-
-/// 阈值是配置项：往回看多少次由它决定，而它不接受 0（0 会把"每一次失败"都当成长度足够的连续段）。
-#[test]
-fn the_streak_threshold_is_the_configured_one() {
-    let alerter = Arc::new(PlatformAlerter::new(Arc::new(RecordingSink::accepting())));
-    let exit = PlatformAlertExit::new(alerter, NonZeroU64::new(4).expect("non-zero"));
-    assert_eq!(exit.threshold(), 4);
-    assert_eq!(exit.window(), 4);
 }

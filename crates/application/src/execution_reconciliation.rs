@@ -5,7 +5,8 @@
 //! 转人工、不再自动查询（见 `ReconciliationPolicy`）。
 //!
 //! 它与旧 Worker 的生成队列路径分开：绝不重新提交生成请求，也不读请求或响应正文。每轮有界、
-//! 可空转，动作顺序固定：接管 → 只读查询并结算或建案 → 孤儿回收 → 晚到事实消费 → 慢周期账务核对。
+//! 可空转，动作顺序固定：接管 → 只读查询并按渠道状态结算、按确定失败释放或建案 → 孤儿回收 →
+//! 晚到事实消费 → 慢周期账务核对。
 //! 结算与失败提交之后把余额写穿缓存；平台侧事件只经 PlatformAlert::Execution 外发。
 //!
 //! 接管与查询都要求执行所有权：API 仍持有效租约时 Worker 不动它，只等租约过期后由数据库比较并
@@ -14,7 +15,7 @@
 
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
-    AcceptedHandle, AccountingFacts, AdapterError, Deadline, ProviderCost,
+    AcceptedHandle, AccountingFacts, AdapterError, Deadline, ProviderCost, ProviderTaskHandle,
     QueryAccountingCapability,
 };
 use seeai_domain::{
@@ -200,6 +201,8 @@ pub struct ReconciliationReport {
     pub queried: u64,
     pub settled: u64,
     pub reconciled: u64,
+    /// 按渠道确定的失败或取消释放的条数：这些执行实收为零，也不建对账案例。
+    pub failed: u64,
     pub reaped_orphans: u64,
     pub late_facts_consumed: u64,
     pub ledger_accounts_audited: u64,
@@ -213,6 +216,7 @@ impl ReconciliationReport {
             || self.queried > 0
             || self.settled > 0
             || self.reconciled > 0
+            || self.failed > 0
             || self.reaped_orphans > 0
             || self.late_facts_consumed > 0
             || self.ledger_accounts_audited > 0
@@ -379,7 +383,7 @@ impl ExecutionReconciliationService {
         Ok(report)
     }
 
-    /// 处置一台刚接管的 v1 执行：有可信句柄走只读查询，否则保留占用并建案。
+    /// 处置一台刚接管的执行：有可信句柄走只读查询，否则保留占用并建案。
     async fn reconcile_taken_over(
         &self,
         execution: &TakenOverExecution,
@@ -389,7 +393,7 @@ impl ExecutionReconciliationService {
             // executing/reconciliation_required 理应有 Attempt；真没有时无从收尾，留到下一轮。
             tracing::warn!(
                 job_id = %execution.job_id,
-                "a v1 execution was taken over with no attempt; leaving it for the next round"
+                "an execution was taken over with no attempt; leaving it for the next round"
             );
             return Ok(());
         };
@@ -438,12 +442,64 @@ impl ExecutionReconciliationService {
             }
             QueryOutcome::Transient => return Ok(()),
         };
-        if !query.terminal {
+        match query_disposition(query.state) {
             // 任务仍在跑：不结算、不建案、不消费任何事实；租约到期后再接管重查。
-            return Ok(());
+            QueryDisposition::Retain => Ok(()),
+            // 渠道终态不能确认：保留资金与渠道占用，进入对账。
+            QueryDisposition::Reconcile => {
+                self.reconcile_unknown(execution, attempt_id, None, report)
+                    .await
+            }
+            QueryDisposition::Settle => {
+                self.settle_query_facts(execution, attempt_id, query.accounting_facts, report)
+                    .await
+            }
+            QueryDisposition::Fail => {
+                self.fail_query_task(execution, attempt_id, query.accounting_facts, report)
+                    .await
+            }
         }
-        self.settle_query_facts(execution, attempt_id, query.accounting_facts, report)
-            .await
+    }
+
+    /// 渠道确认失败或取消：按既有失败规则释放消费者占用与渠道容量，实收为零。
+    ///
+    /// 渠道捎带返回的用量与成本只用于记录平台成本，不构成向消费者收费的依据——失败不是成功，
+    /// 有计量也不能把终态翻过来（Spec 0005 §5）。
+    async fn fail_query_task(
+        &self,
+        execution: &TakenOverExecution,
+        attempt_id: AttemptId,
+        facts: Option<AccountingFacts>,
+        report: &mut ReconciliationReport,
+    ) -> Result<(), ApplicationError> {
+        let provider_cost = failure_provider_cost(
+            &execution.price_snapshot,
+            facts.as_ref().map(|facts| &facts.provider_cost),
+        );
+        let provider_trace_id = facts
+            .as_ref()
+            .and_then(|facts| facts.provider_trace_id.clone())
+            .or_else(|| execution.provider_trace_id.clone());
+        let command = FailOrReconcileExecution::for_failure(
+            execution.job_id,
+            attempt_id,
+            self.worker_id.clone(),
+            execution.fencing_token,
+            // 与同步执行看到同一终态时的分类保持一致，不因为观察时机不同而另判一套。
+            ProviderFailureKind::Unknown,
+            FailureDisposition::DeterminedFailure,
+            Some(provider_cost),
+            provider_trace_id,
+        );
+        let finalization = self.fail_with_confirmation(command).await?;
+        report.failed += 1;
+        self.refresh_balance(execution.account_id).await;
+        tracing::info!(
+            job_id = %execution.job_id,
+            stage = %finalization.stage,
+            "the reconciliation confirmed an upstream failure or cancellation; the consumer is not charged"
+        );
+        Ok(())
     }
 
     /// 按只读查询结果收尾：有效计量证据结算一次，证据缺失或算不出对客价就保留占用并建案。
@@ -504,6 +560,7 @@ impl ExecutionReconciliationService {
             },
             provider_cost,
             charge_microusd,
+            image_count: Some(facts.image_count),
             provider_trace_id: facts.provider_trace_id.clone(),
         };
         let finalization = self.settle_with_confirmation(command).await?;
@@ -562,6 +619,15 @@ impl ExecutionReconciliationService {
         trace_id: Option<String>,
         report: &mut ReconciliationReport,
     ) -> QueryOutcome {
+        // 存量里可能有不是标识的旧句柄（URL、data URL、超长值）：拿它去拼上游查询 URL 等于把
+        // 一段正文当任务名发出去。这类执行不具备只读查询条件，保留占用并建案（Spec 0005 §5）。
+        if !seeai_domain::is_bounded_provider_identifier(handle) {
+            tracing::warn!(
+                job_id = %execution.job_id,
+                "the stored provider task handle is not a bounded identifier; the read-only query is refused"
+            );
+            return QueryOutcome::Unavailable;
+        }
         let adapter = match self.adapters.create_gateway(
             &execution.adapter_key,
             &execution.base_url,
@@ -601,10 +667,11 @@ impl ExecutionReconciliationService {
                 return QueryOutcome::Unavailable;
             }
         };
-        let handle = AcceptedHandle {
-            task_id: handle.to_owned(),
-            trace_id,
+        // 上面的有界校验已经把不是标识的值拦下；这里把同一条不变量变成类型。
+        let Ok(task_id) = ProviderTaskHandle::parse(handle.to_owned()) else {
+            return QueryOutcome::Unavailable;
         };
+        let handle = AcceptedHandle { task_id, trace_id };
         let deadline = Deadline::after(self.policy.query_timeout);
         report.queried += 1;
         // 记一次查询尝试并排下次退避（RFC 0017 §5）。没有未结案例（仍在 executing）时不落任何
@@ -706,6 +773,24 @@ impl ExecutionReconciliationService {
             }
             return Ok(LateFactAction::Consumed);
         };
+        // 收件只说明上游给过什么，不能凭"有 usage"推断成功：没有成功终态就没有向消费者收费的
+        // 依据。缺失或未知一律保留占用并进对账；但已核实的上游成本照记——带证据与张数时按冻结
+        // 单价能算出来，就不能把它降级成"拿不到"（Spec 0005 §5、RFC 0018 §7）。
+        if fact.provider_state != Some(seeai_domain::ProviderTaskState::Succeeded) {
+            let provider_cost = match (&fact.provider_cost, fact.evidence.as_ref()) {
+                (Some(cost), _) => cost.clone(),
+                (None, Some(evidence)) => {
+                    let images = fact
+                        .image_count
+                        .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
+                    self_computed_late_cost(&execution.price_snapshot, &evidence.usage, images)
+                }
+                (None, None) => failure_provider_cost(&execution.price_snapshot, None),
+            };
+            self.reconcile_unknown(execution, fact.attempt_id, Some(provider_cost), report)
+                .await?;
+            return Ok(LateFactAction::Consumed);
+        }
         let Some(evidence) = fact.evidence.as_ref() else {
             // 没有计量证据不结算；成本事实照落缺口并转对账。
             let provider_cost = fact
@@ -743,6 +828,8 @@ impl ExecutionReconciliationService {
             evidence: evidence.clone(),
             provider_cost,
             charge_microusd,
+            // 收件带来张数就记它；没带就是没带，留 NULL，不拿 0（RFC 0019 §5.3）。
+            image_count: fact.image_count,
             provider_trace_id: fact.provider_trace_id.clone(),
         };
         match self.settle_with_confirmation(command).await {
@@ -797,13 +884,25 @@ impl ExecutionReconciliationService {
             }
             QueryOutcome::Transient => return Ok(LateFactAction::Keep),
         };
-        if !query.terminal {
-            // 未到终态：不 mark。
-            return Ok(LateFactAction::Keep);
+        match query_disposition(query.state) {
+            // 未到终态：不 mark，等下一轮重查。
+            QueryDisposition::Retain => Ok(LateFactAction::Keep),
+            QueryDisposition::Reconcile => {
+                self.reconcile_unknown(execution, fact.attempt_id, None, report)
+                    .await?;
+                Ok(LateFactAction::Consumed)
+            }
+            QueryDisposition::Settle => {
+                self.settle_query_facts(execution, fact.attempt_id, query.accounting_facts, report)
+                    .await?;
+                Ok(LateFactAction::Consumed)
+            }
+            QueryDisposition::Fail => {
+                self.fail_query_task(execution, fact.attempt_id, query.accounting_facts, report)
+                    .await?;
+                Ok(LateFactAction::Consumed)
+            }
         }
-        self.settle_query_facts(execution, fact.attempt_id, query.accounting_facts, report)
-            .await?;
-        Ok(LateFactAction::Consumed)
     }
 
     /// 这台执行是否已经收成终态（成功或确定失败）。
@@ -998,6 +1097,27 @@ impl ExecutionReconciliationService {
                 );
             }
         }
+    }
+}
+
+/// 查询状态决定该走哪条收尾路径：只有渠道明确成功才允许结算，确定的失败/取消按确定失败释放，
+/// 状态不可信时保留占用并进入对账，仍在跑则留给下一次重查。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum QueryDisposition {
+    Retain,
+    Settle,
+    Fail,
+    Reconcile,
+}
+
+fn query_disposition(state: seeai_adapter_sdk::ProviderTaskState) -> QueryDisposition {
+    use seeai_adapter_sdk::ProviderTaskState;
+    match state {
+        ProviderTaskState::Pending => QueryDisposition::Retain,
+        // 渠道终态不能确认（未列出的状态，或响应无法与句柄关联）：不猜、不结算，进入对账。
+        ProviderTaskState::Unknown => QueryDisposition::Reconcile,
+        ProviderTaskState::Succeeded => QueryDisposition::Settle,
+        ProviderTaskState::Failed | ProviderTaskState::Cancelled => QueryDisposition::Fail,
     }
 }
 

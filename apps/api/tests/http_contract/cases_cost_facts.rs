@@ -1,5 +1,4 @@
 use super::*;
-use seeai_application::RefundReconciliationCommand;
 
 /// 渠道声明了会给金额，这次却**拿不到**（终态里没有这个字段）⇒ 不猜：
 /// 金额与币种留空、来源记 `unavailable`，缺口查得出来；对客结算照常完成。
@@ -22,7 +21,7 @@ async fn a_declared_cost_that_never_arrives_is_recorded_as_a_gap_not_guessed() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("成本缺口", &body);
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "成本缺口不是执行失败：对客结算照常完成");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(source.as_deref(), Some("unavailable"));
@@ -69,7 +68,7 @@ async fn a_terminal_without_images_still_records_the_cost_it_already_declared() 
         "没有结果图的那次执行是失败的：{body}"
     );
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     // 失败件的处置不变：受理状态不明仍然进对账。成本事实与这条处置无关，只是不再跟着结果丢。
     assert_eq!(state, "reconciliation_required", "没有结果图不该算成功");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
@@ -114,7 +113,7 @@ async fn a_terminal_without_images_or_amount_lands_in_the_cost_gap_list() {
         "没有结果图的那次执行是失败的：{body}"
     );
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_ne!(state, "succeeded", "没有结果图不该算成功");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(source.as_deref(), Some("unavailable"));
@@ -153,7 +152,7 @@ async fn a_cost_the_channel_never_reports_is_computed_from_the_actual_usage() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("自算成本", &body);
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(source.as_deref(), Some("computed"));
@@ -215,7 +214,7 @@ async fn an_upstream_declared_supply_needs_no_rate_card_and_takes_the_upstream_a
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("上游直接给金额", &body);
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "受理与结算照常");
 
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
@@ -285,7 +284,7 @@ async fn a_channel_declared_currency_other_than_usd_is_accepted_and_recorded() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("按声明币种", &body);
 
-    let (job_id, _, _) = harness.job(&key).await;
+    let (job_id, _) = harness.job(&key).await;
     let (amount, currency, source, _) = harness.attempt_cost(job_id).await;
     assert_eq!(source.as_deref(), Some("declared"));
     assert_eq!(amount, Some(11_354));
@@ -334,7 +333,6 @@ async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
 
     let (_, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let _worker = harness.spawn_worker();
     let key = format!("declared-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,
@@ -345,7 +343,7 @@ async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(amount, Some(11_354), "上游给了金额就直接取它，不自己算");
@@ -418,7 +416,7 @@ async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("同币种按张", &body);
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
 
     let snapshot = frozen_snapshot(&harness.pool, &key).await;
@@ -435,6 +433,27 @@ async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
     assert_eq!(currency.as_deref(), Some("CNY"));
     assert_eq!(source.as_deref(), Some("computed"));
     assert_eq!(cny, Some(300_000), "率 1 折出来逐位不变");
+
+    // 产出张数落在 `image_count`，用量读的就是它：按张计价的这次执行记下的是**实际**张数
+    // （假上游一张），不是请求的 `n`，也不是 0。
+    let usage = client
+        .get(format!(
+            "{}/api/v1/accounts/{}/usage",
+            harness.base_url, harness.account_id
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("usage read");
+    assert_eq!(usage.status(), StatusCode::OK);
+    let usage: Value = usage.json().await.expect("usage body");
+    let row = &usage["usage"][0];
+    assert_eq!(row["job_id"], json!(job_id.to_string()), "{usage}");
+    assert_eq!(
+        row["image_count"],
+        json!(1),
+        "per_image 请求的用量张数必须等于实际张数：{usage}"
+    );
 
     harness.cleanup().await;
 }
@@ -459,7 +478,7 @@ async fn a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconc
         )
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "成本缺口不是执行失败");
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
     assert_eq!(source.as_deref(), Some("unavailable"));
@@ -535,7 +554,7 @@ async fn the_platform_cost_is_queryable_under_its_own_kind_on_the_platform_accou
         StatusCode::OK,
         "没有结果图的那次执行是失败的：{body}"
     );
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "reconciliation_required", "金额到手、结果没交付");
 
     let client = Client::new();
@@ -594,415 +613,12 @@ async fn the_platform_cost_is_queryable_under_its_own_kind_on_the_platform_accou
     harness.cleanup().await;
 }
 
-/// **进对账那条路径也落成本事实**：执行已经发生、上游成本也拿得到，成本必须有去处。
-///
-/// 直接调仓库端口的 `fail_job`：结果交付失败在端到端里很难构造（假上游总会给图），而这条路径
-/// 的写入本来就是库层的事。同时验"没有成本事实时四列留空"——那是"这次没有成本事实可落"，
-/// 与"成本是 0"不是一回事。
-///
-/// 同一批写入的另一半在账本上：平台自担的成本记成 `cost` 条目、挂在平台账户上（两种预授权处置
-/// 各一条），对账退款只释放消费者的预授权、**不补记**成本，消费者的余额从头到尾没有它。
-/// 对管理员面可见的那一条另见 `the_platform_cost_is_queryable_under_its_own_kind_on_the_platform_account`。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn the_reconciliation_path_records_the_cost_fact_it_already_has() {
-    let (database_url, database_name) = isolated_database_url().await;
-    let repository = PgHubRepository::connect(&database_url, 2)
-        .await
-        .expect("repository");
-    repository.migrate().await.expect("migrations");
-    let pool = repository.pool().clone();
-
-    let account = Uuid::new_v4();
-    let vendor_model = Uuid::new_v4();
-    let channel = Uuid::new_v4();
-    let offering = Uuid::new_v4();
-    let price_plan = Uuid::new_v4();
-    let revision = Uuid::new_v4();
-    let contract = json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["model", "prompt"],
-        "properties": {
-            "model": {"const": "cost-path"},
-            "prompt": {"type": "string"}
-        }
-    });
-    sqlx::query("INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 100000)")
-        .bind(account)
-        .bind("成本夹具账户")
-        .execute(&pool)
-        .await
-        .expect("account fixture");
-    sqlx::query(
-        "INSERT INTO catalog.vendor_models
-             (id, vendor_id, native_model_id, native_revision, capability_schema)
-         VALUES ($1,'OpenAI','cost-path','rev-1',$2)",
-    )
-    .bind(vendor_model)
-    .bind(&contract)
-    .execute(&pool)
-    .await
-    .expect("contract fixture");
-    sqlx::query(
-        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
-         VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')",
-    )
-    .bind(channel)
-    .execute(&pool)
-    .await
-    .expect("channel fixture");
-    sqlx::query(
-        "INSERT INTO supply.offerings
-             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions,
-              carrier_schema, parameter_mapping)
-         VALUES ($1,$2,$3,'aihubmix-image-v1','cost-path','{}'::jsonb,$4,'{}'::jsonb)",
-    )
-    .bind(offering)
-    .bind(vendor_model)
-    .bind(channel)
-    .bind(&contract)
-    .execute(&pool)
-    .await
-    .expect("offering fixture");
-    sqlx::query(
-        "INSERT INTO pricing.price_plans
-             (id, offering_id, currency, text_input_microusd_per_million, image_input_microusd_per_million,
-              text_output_microusd_per_million, image_output_microusd_per_million, source_url, approved_by)
-         VALUES ($1,$2,'USD',5,8,10,30,'https://example.invalid/price','cost-path-test')",
-    )
-    .bind(price_plan)
-    .bind(offering)
-    .execute(&pool)
-    .await
-    .expect("price plan fixture");
-    sqlx::query(
-        "INSERT INTO publication.runtime_revisions
-             (id, snapshot, published_by, gateway_model, vendor_model_id)
-         VALUES ($1,'{}'::jsonb,'cost-path-test','cost-path',$2)",
-    )
-    .bind(revision)
-    .bind(vendor_model)
-    .execute(&pool)
-    .await
-    .expect("runtime revision fixture");
-    sqlx::query(
-        "INSERT INTO publication.runtime_entries
-             (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active,
-              adapter_key, provider_model_id, carrier_schema, parameter_mapping, restrictions,
-              provider_kind, base_url, credential_env)
-         SELECT $1, $2, $3, $4, 'cost-path', true,
-                o.adapter_key, o.provider_model_id, o.carrier_schema, o.parameter_mapping, o.restrictions,
-                c.provider_kind, c.base_url, c.credential_env
-         FROM supply.offerings o JOIN supply.channels c ON c.id = o.channel_id
-         WHERE o.id = $3",
-    )
-    .bind(revision)
-    .bind(vendor_model)
-    .bind(offering)
-    .bind(price_plan)
-    .execute(&pool)
-    .await
-    .expect("runtime entry fixture");
-
-    // 三条停在"正在调上游"、持有租约的 Job：两条带成本事实（一条进对账，一条终态失败释放预
-    // 授权），一条不带成本事实。
-    let mut jobs = Vec::new();
-    for key in ["with-cost-retained", "with-cost-released", "without-cost"] {
-        let job_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO generation.jobs
-                 (id, account_id, idempotency_key, request_hash, state, branch, gateway_model,
-                  native_parameters, carrier_schema, parameter_mapping, adapter_key, provider_model_id,
-                  base_url, credential_env,
-                  runtime_revision_id, vendor_model_id, offering_id, channel_id, price_snapshot,
-                  max_cost_microusd, lease_owner, lease_expires_at)
-             VALUES ($1,$2,$3,'hash','submitting','prompt_only','cost-path',
-                     '{}'::jsonb,'{}'::jsonb,'{}'::jsonb,'aihubmix-image-v1','cost-path',
-                     'https://api.inferera.com','AIHUBMIX_API_KEY',
-                     $4,$5,$6,$7,'{}'::jsonb,20000,'worker-x', now() + interval '1 hour')",
-        )
-        .bind(job_id)
-        .bind(account)
-        .bind(key)
-        .bind(revision)
-        .bind(vendor_model)
-        .bind(offering)
-        .bind(channel)
-        .execute(&pool)
-        .await
-        .expect("job fixture");
-        let attempt_id = Uuid::new_v4();
-        sqlx::query(
-            "INSERT INTO generation.attempts (id, job_id, state, request_digest)
-             VALUES ($1,$2,'submitting','digest')",
-        )
-        .bind(attempt_id)
-        .bind(job_id)
-        .execute(&pool)
-        .await
-        .expect("attempt fixture");
-        // 预授权行：释放与对账退款都要它，账上那笔成本才对应得到一次真发生过的执行。
-        sqlx::query(
-            "INSERT INTO ledger.holds (id, account_id, job_id, amount_microusd, status)
-             VALUES ($1,$2,$3,20000,'active')",
-        )
-        .bind(Uuid::new_v4())
-        .bind(account)
-        .bind(job_id)
-        .execute(&pool)
-        .await
-        .expect("hold fixture");
-        jobs.push((JobId(job_id), AttemptId(attempt_id)));
-    }
-
-    // 夹具直接插了 Job 与 Hold：账户的**占用合计**要跟着补上（`0013` §1：held = active holds 之和）。
-    // 少了这一步，释放路径减占用就会把 `held_microusd` 减成负数、撞上非负约束。
-    sqlx::query(
-        "UPDATE ledger.accounts SET held_microusd = COALESCE((SELECT SUM(h.amount_microusd) FROM ledger.holds h WHERE h.account_id = $1 AND h.status = 'active'), 0) WHERE id = $1",
-    )
-    .bind(account)
-    .execute(&pool)
-    .await
-    .expect("account held fixture");
-
-    let cost_fact = || ProviderCostFact {
-        source: ProviderCostSource::Computed,
-        amount_microusd: Some(5_950),
-        currency: Some("USD".to_owned()),
-        cny_microusd: Some(42_245),
-    };
-    let failure = |provider_cost, (target_state, hold_disposition)| AttemptFailure {
-        provider_code: "result_delivery_failed".to_owned(),
-        public_code: PublicErrorCode::OutcomeUnknown,
-        message: "provider returned no image".to_owned(),
-        trace_id: Some("task-1".to_owned()),
-        kind: ProviderFailureKind::PlatformInternal,
-        // 结果已经生成、只是交付不了：这一态在重投判据里是"绝不重投"的那一态。
-        retry_safety: seeai_adapter_sdk::RetrySafety::AcceptanceUnknown,
-        target_state,
-        hold_disposition,
-        provider_cost,
-    };
-    let retained_failure = || {
-        failure(
-            Some(cost_fact()),
-            (
-                seeai_domain::JobState::ReconciliationRequired,
-                HoldDisposition::RetainForReconciliation,
-            ),
-        )
-    };
-    let released_failure = || {
-        failure(
-            Some(cost_fact()),
-            (seeai_domain::JobState::Failed, HoldDisposition::Release),
-        )
-    };
-    let (retained, retained_attempt) = jobs[0];
-    repository
-        .fail_job(
-            retained,
-            "worker-x",
-            Some(retained_attempt),
-            retained_failure(),
-        )
-        .await
-        .expect("the reconciliation path must record the cost it already has");
-
-    let row = sqlx::query(
-        "SELECT provider_cost_microusd, provider_cost_currency, provider_cost_source,
-                provider_cost_cny_microusd, provider_trace_id
-         FROM generation.attempts WHERE id = $1",
-    )
-    .bind(retained_attempt.0)
-    .fetch_one(&pool)
-    .await
-    .expect("attempt after failure");
-    assert_eq!(
-        row.get::<Option<i64>, _>("provider_cost_microusd"),
-        Some(5_950)
-    );
-    assert_eq!(
-        row.get::<Option<String>, _>("provider_cost_currency")
-            .as_deref(),
-        Some("USD")
-    );
-    assert_eq!(
-        row.get::<Option<String>, _>("provider_cost_source")
-            .as_deref(),
-        Some("computed")
-    );
-    assert_eq!(
-        row.get::<Option<i64>, _>("provider_cost_cny_microusd"),
-        Some(42_245)
-    );
-    assert_eq!(
-        row.get::<Option<String>, _>("provider_trace_id").as_deref(),
-        Some("task-1")
-    );
-    let cases: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
-    )
-    .bind(retained.0)
-    .fetch_one(&pool)
-    .await
-    .expect("cases");
-    assert_eq!(cases, 1, "结果交付失败仍然进对账（与成本缺口不同）");
-
-    // **平台自担的成本进了账本**：这笔钱上游已经扣了，账上必须看得见，而且记在平台账户上——
-    // 消费者那一侧的余额由它自己的 `capture` / `release` 说了算，成本不进那只口袋。
-    let platform = platform_account(&pool).await;
-    assert_ne!(platform, account, "平台账户与消费者账户是两个账户");
-    assert_eq!(
-        platform_cost_count(&pool, platform).await,
-        1,
-        "进对账那条路也要在账上留一条成本记录"
-    );
-    assert_eq!(
-        platform_cost_of(&pool, platform, retained).await,
-        Some(-42_245),
-        "金额为负，就是上游实扣的那笔折算额"
-    );
-
-    // 终态失败、释放预授权那条路：同一笔成本、不同的预授权处置，账上照样一条。
-    let (released, released_attempt) = jobs[1];
-    repository
-        .fail_job(
-            released,
-            "worker-x",
-            Some(released_attempt),
-            released_failure(),
-        )
-        .await
-        .expect("a released failure with a cost fact still records the cost");
-    assert_eq!(
-        platform_cost_of(&pool, platform, released).await,
-        Some(-42_245),
-        "两种处置各留一条成本记录，互不合并"
-    );
-
-    // 没有成本事实（连用量都算不出）：四列留空，不写成 0；账上也不该凭空多一条成本条目。
-    let (without_cost, without_cost_attempt) = jobs[2];
-    repository
-        .fail_job(
-            without_cost,
-            "worker-x",
-            Some(without_cost_attempt),
-            failure(
-                None,
-                (
-                    seeai_domain::JobState::ReconciliationRequired,
-                    HoldDisposition::RetainForReconciliation,
-                ),
-            ),
-        )
-        .await
-        .expect("a failure without a cost fact is still recorded");
-    let row = sqlx::query(
-        "SELECT provider_cost_microusd, provider_cost_currency, provider_cost_source,
-                provider_cost_cny_microusd
-         FROM generation.attempts WHERE id = $1",
-    )
-    .bind(without_cost_attempt.0)
-    .fetch_one(&pool)
-    .await
-    .expect("attempt after failure");
-    assert!(
-        row.get::<Option<i64>, _>("provider_cost_microusd")
-            .is_none()
-    );
-    assert!(
-        row.get::<Option<String>, _>("provider_cost_currency")
-            .is_none()
-    );
-    assert!(
-        row.get::<Option<String>, _>("provider_cost_source")
-            .is_none()
-    );
-    assert!(
-        row.get::<Option<i64>, _>("provider_cost_cny_microusd")
-            .is_none()
-    );
-    assert_eq!(
-        platform_cost_count(&pool, platform).await,
-        2,
-        "没有成本事实就一条都不记：'没有' 不是 '0'"
-    );
-
-    // 对账退款结案：退的是**消费者**的预授权，成本在上面那次事务里已经记过了——同一笔成本不
-    // 记两次（业务键按执行唯一，真记两次会被库直接挡下）。
-    repository
-        .refund_reconciliation(RefundReconciliationCommand {
-            job_id: retained,
-            note: "upstream never delivered a result".to_owned(),
-            business_key: format!("refund-{retained}"),
-            actor: "operator".to_owned(),
-        })
-        .await
-        .expect("the refund settles the case");
-    assert_eq!(
-        platform_cost_count(&pool, platform).await,
-        2,
-        "退款只释放消费者的预授权，成本条目一条都不多"
-    );
-
-    // 平台账户的余额就是它承担的成本总额（负数）：账实核对比的就是这个等式。
-    assert_eq!(
-        account_balance(&pool, platform).await,
-        -84_490,
-        "两笔成本都落在平台账户的余额上"
-    );
-    // 消费者账户**一点成本都没沾**，**释放也不改已结算余额**（`0002` §2.4/§3）：仍是初始 100000。
-    assert_eq!(
-        account_balance(&pool, account).await,
-        100_000,
-        "成本只动平台账户；解除预授权不改已结算余额"
-    );
-
-    pool.close().await;
-    drop_isolated_database(&database_name).await;
-}
-
 /// 平台账户那一行的 id：按 `kind` 找，不写死任何常量——账户是数据，迁移种下它。
 async fn platform_account(pool: &PgPool) -> Uuid {
     sqlx::query_scalar("SELECT id FROM ledger.accounts WHERE kind = 'platform'")
         .fetch_one(pool)
         .await
         .expect("the migrations seed exactly one platform account")
-}
-
-/// 平台账户上成本条目的条数。
-async fn platform_cost_count(pool: &PgPool, platform: Uuid) -> i64 {
-    sqlx::query_scalar(
-        "SELECT count(*) FROM ledger.entries WHERE account_id = $1 AND kind = 'cost'",
-    )
-    .bind(platform)
-    .fetch_one(pool)
-    .await
-    .expect("platform cost count")
-}
-
-/// 某次执行落在平台账户上的成本金额（负数）；这次执行没记成本条目时是 `None`。
-async fn platform_cost_of(pool: &PgPool, platform: Uuid, job_id: JobId) -> Option<i64> {
-    sqlx::query_scalar(
-        "SELECT amount_microusd FROM ledger.entries
-         WHERE account_id = $1 AND kind = 'cost' AND job_id = $2",
-    )
-    .bind(platform)
-    .bind(job_id.0)
-    .fetch_optional(pool)
-    .await
-    .expect("platform cost of a job")
-}
-
-/// 一个账户当前的余额，直接读库（余额的权威只有这一处）。
-async fn account_balance(pool: &PgPool, account: Uuid) -> i64 {
-    sqlx::query_scalar("SELECT balance_microusd FROM ledger.accounts WHERE id = $1")
-        .bind(account)
-        .fetch_one(pool)
-        .await
-        .expect("account balance")
 }
 
 /// **每日扣费上限**：账户当天已经从账本上扣掉的钱达到运营设的上限时，新的受理在**受理前**被拒
@@ -1070,7 +686,7 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("每日额度之内的那一笔", &body);
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "第一笔必须真的跑完并结算");
     let captured = -harness.captured_microusd(job_id).await;
     assert!(captured > 0, "结算必须真的扣了钱，实得 {captured}");
@@ -1131,7 +747,7 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("历史流水不参与限额", &body);
-    let (_, second_state, _) = harness.job(&second_key).await;
+    let (_, second_state) = harness.job(&second_key).await;
     assert_eq!(second_state, "succeeded", "第二笔必须真的跑完并结算");
     let second_captured = daily_total(&harness.pool, account_id).await - captured;
     assert!(second_captured > 0, "第二笔结算必须真的加了当天合计");

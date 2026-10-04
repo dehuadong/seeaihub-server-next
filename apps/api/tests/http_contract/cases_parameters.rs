@@ -225,7 +225,7 @@ async fn upload_failure_fails_the_job_before_the_create_request() {
     assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
     assert_public_only("上传失败", &body);
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(
         state, "failed",
         "an upload failure happens before the create request, so the job is simply failed"
@@ -323,12 +323,13 @@ async fn post_acceptance_failure_keeps_the_task_id_for_reconciliation() {
     assert_eq!(body["error"]["code"].as_str(), Some("outcome_unknown"));
     assert_public_only("受理状态不明", &body);
 
-    let (job_id, state, images) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(
         state, "reconciliation_required",
         "a post-acceptance failure must go to reconciliation"
     );
-    assert!(images.is_none(), "对账中的记录没有结果信封");
+    // 对账中的执行没有结果载荷：载荷从来不落库，这条路径连响应里也没有。
+    assert_eq!(body["error"]["code"].as_str(), Some("outcome_unknown"));
     assert_eq!(
         harness.count("POST", "/v1/images/generations"),
         1,
@@ -492,19 +493,8 @@ async fn an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum() {
         json!(4),
         "上线文里必须是这条候选声明的上限，不是调用方给的 6：{submit}"
     );
-    let (job_id, state, _) = harness.job(&key).await;
+    let (_, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "夹过的请求照常跑完");
-    let frozen: Value =
-        sqlx::query_scalar("SELECT native_parameters FROM generation.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("the accepted job keeps the parameter face");
-    assert_eq!(
-        frozen["n"],
-        json!(4),
-        "冻结进 Job 的就是夹后的张数：超时窗口与成本护栏都按它算：{frozen}"
-    );
 
     harness.cleanup().await;
 }

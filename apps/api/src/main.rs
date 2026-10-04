@@ -18,19 +18,18 @@ use seeai_adapter_sdk::{DecodedImage, InputImage};
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
-    CachePolicy, CreateImageGenerationRequest, CursorPosition, CustomerBillingQuery,
-    CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope,
-    CustomerUsageStatus, CustomerView, DirectExecutionError, DirectExecutionLimits,
-    DirectExecutionRequest, DirectExecutionService, ExecutionRepository, GatewayModelView,
-    GeneratedImage, GenerationDailySpendLimit, GenerationRateLimit, GenerationService,
-    HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository, IdentityService, JobView,
-    LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES,
-    NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeCommand,
-    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestFingerprintKeys,
-    RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
-    decode_history_cursor, encode_history_cursor, invalid_history_cursor, settle_reserve_from_env,
-    with_admin_id,
+    CachePolicy, CursorPosition, CustomerBillingQuery, CustomerLedgerQuery, CustomerUsageKind,
+    CustomerUsageQuery, CustomerUsageScope, CustomerUsageStatus, CustomerView,
+    DirectExecutionError, DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService,
+    ExecutionRepository, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
+    GenerationRateLimit, HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository,
+    IdentityService, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
+    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RequestCostCeiling,
+    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService,
+    SelectableOfferingView, decode_history_cursor, encode_history_cursor, invalid_history_cursor,
+    settle_reserve_from_env, with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -101,11 +100,8 @@ struct AppState {
     accounts: AccountsService,
     /// 路由策略的管理员面：读清单与写入（运行期配置，不进不可变修订）。
     route_policies: RoutePolicyService,
-    generations: GenerationService,
-    /// 直接同步执行；env 开关默认关闭，关着时为 None，图片入口逐字走旧路径。
-    direct: Option<Arc<DirectGeneration>>,
-    /// 同步入口等任务跑完的最长时间。
-    sync_wait: Duration,
+    /// 同步直接执行：唯一执行路径，没有开关。
+    direct: Arc<DirectGeneration>,
     /// 健康探测的依赖判据：探一次事实源是否可达（只 `SELECT 1`）。
     repository: Arc<dyn HubRepository>,
     /// 会话有效期（管理员与客户同一档）：部署期配置，缺省 12 小时。
@@ -189,18 +185,15 @@ async fn main() -> Result<()> {
         );
     }
     // 超时链整条校验：输出张数上限取自**合同自己声明的取值面**（读库，所以要连库之后才知道），
-    // 两条链的比较因此比的是"合同允许的最大一档请求"。这一进程持有**对客同步等待窗口**——窗口
-    // 短于上游超时就是"消费者拿到 504、而上游还在生成、照样计费"那条路；租约在 Worker 上，但两个
-    // 进程读同一组变量，所以这里也看得到、也一起校验。校验不过就点名报错退出，不让服务带着一条
-    // 断链跑起来。
+    // 比较因此比的是"合同允许的最大一档请求"。这一进程持有**对客同步等待窗口**——窗口短于上游
+    // 超时就是"消费者拿到 504、而上游还在生成、照样计费"那条路。校验不过就点名报错退出，不让
+    // 服务带着一条断链跑起来。
     let (max_output_images, declared_by, undecodable) =
         max_declared_output_images(repository.pool(), NO_CONTRACT_MAX_OUTPUT_IMAGES).await?;
     let timeouts =
         RequestTimeoutPolicy::from_env(max_output_images).map_err(anyhow::Error::from)?;
     timeouts.validate().map_err(anyhow::Error::from)?;
-    let sync_wait = timeouts.sync_wait;
     info!(
-        worker_lease_seconds = timeouts.worker_lease.as_secs(),
         sync_wait_seconds = timeouts.sync_wait.as_secs(),
         provider_timeout_seconds = timeouts.provider_timeout.as_secs(),
         base_seconds = timeouts.base.as_secs(),
@@ -244,9 +237,9 @@ async fn main() -> Result<()> {
         );
     }
 
-    // 直接同步执行：env 开关默认关闭。关着时下面的配置一个都不读（缺摘要密钥或渠道凭证不会让
-    // 进程起不来），图片入口逐字走旧路径。开着时本进程自己调 Provider，不建生成 Job、不轮询结果。
-    let direct_execution = if direct_execution_enabled()? {
+    // 图片生成只有这一条执行路径：本进程直接调 Provider，不建生成 Job、不轮询结果。指纹密钥与
+    // 渠道凭证在这里无条件读取，缺任何一项都拒绝启动——不存在"关掉它就走旧路径"的开关。
+    let direct_execution = {
         let keys = RequestFingerprintKeys::from_env().map_err(anyhow::Error::from)?;
         let settle_reserve = settle_reserve_from_env().map_err(anyhow::Error::from)?;
         // 执行所有权租约：begin_submission 按它落 lease_expires_at，Supervisor 按它的三分之一续约。
@@ -268,16 +261,36 @@ async fn main() -> Result<()> {
         .with_ownership_lease(ownership_lease)
         // 请求内安全重投沿用旧 Worker 那一组运维取值（次数与退避基），不另立一套。
         .with_retry_policy(RetryPolicy::from_env().map_err(anyhow::Error::from)?)
+        // 每日扣费上限：GENERATION_MAX_DAILY_SPEND_MICROUSD，受理前按账户当日已花判定。
+        .with_daily_spend_limit(generation_daily_spend_limit()?)
         .with_acceleration(acceleration.clone())
         .with_cost_ceiling(cost_ceiling()?);
         let execution_slots = generation_env_usize("GENERATION_EXECUTION_SLOTS", 64)?;
         let max_memory_bytes =
             generation_env_usize("GENERATION_MAX_MEMORY_BYTES", 2 * 1024 * 1024 * 1024)?;
+        // 单次执行的预留按各 Driver 声明的字节上限算：入口 wire、上游响应与编码膨胀可能同时存活，
+        // 不能再用一个与真实响应无关的固定值（RFC 0018 §2）。读不到任何 Driver 的字节上限时
+        // **拒绝启动**：静默退回一个更小的固定值，正是"把预算改小还装作没发生"。
+        let execution_memory_bytes = [
+            seeai_adapter_aihubmix::ADAPTER_KEY,
+            seeai_adapter_apimart::ADAPTER_KEY,
+        ]
+        .iter()
+        .filter_map(|key| adapters.descriptor(key))
+        .map(|descriptor| descriptor.byte_limits.max_bytes_per_execution())
+        .max()
+        .ok_or_else(|| {
+            anyhow::anyhow!(
+                "no registered adapter declared its byte limits; the per-execution memory \
+                 reservation cannot be derived, so direct execution must not start"
+            )
+        })?;
         let send_slots = generation_env_usize("GENERATION_SEND_SLOTS", 64)?;
         let read_slots = generation_env_usize("GENERATION_READ_SLOTS", 64)?;
         let supervisor = Supervisor::new(SupervisorConfig {
             execution_slots,
             max_memory_bytes,
+            execution_memory_bytes,
             send_slots,
             read_slots,
             slow_read_timeout: Duration::from_secs(generation_env_u64(
@@ -304,12 +317,10 @@ async fn main() -> Result<()> {
             execution_slots,
             send_slots, read_slots, max_memory_bytes, "direct synchronous execution is enabled"
         );
-        Some(Arc::new(DirectGeneration {
+        Arc::new(DirectGeneration {
             service: Arc::new(service),
             supervisor,
-        }))
-    } else {
-        None
+        })
     };
     // 账实核对：比对**账户当前值**与它自己的**明细**。它**不是**上面那个缓存对账——那个问的是
     // "缓存里的值还是不是库里的值"，做法是以库为准覆盖缓存，改的是缓存；这条问的是"库里那个
@@ -342,18 +353,7 @@ async fn main() -> Result<()> {
         accounts: AccountsService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
         route_policies: RoutePolicyService::new(repository_port.clone()),
-        sync_wait,
-        repository: repository_port.clone(),
-        generations: GenerationService::new(
-            repository_port,
-            generation_max_cost_microusd()?,
-            generation_max_concurrent_jobs()?,
-        )
-        // 每日扣费上限：定额度是运维取值，判定每次回账本读（见 `GenerationService::create`）。
-        .with_daily_spend_limit(generation_daily_spend_limit()?)
-        // 成本护栏：发布期与受理期判的是同一个数（见 `RequestCostCeiling`）。
-        .with_cost_ceiling(cost_ceiling()?)
-        .with_acceleration(acceleration),
+        repository: repository_port,
         // 会话与重置令牌的有效期：部署期取值（缺省 12 小时 / 30 分钟）。
         session_ttl: session_ttl()?,
         password_reset_ttl: password_reset_ttl()?,
@@ -437,19 +437,15 @@ async fn main() -> Result<()> {
             state.clone(),
             require_admin_middleware,
         ));
-    // 图片入口在直接执行开启时挂一层入口中间件：认证、速率与本机读取准入都在**消费正文之前**
-    // 完成，账户放进 request extension，handler 不再自己认证。关着时不挂，行为与旧路径逐字相同。
+    // 图片入口的入口中间件：认证、速率与本机读取准入都在**消费正文之前**完成，账户放进 request
+    // extension，handler 不再自己认证。
     let image_routes = Router::new()
         .route("/v1/images/generations", post(generate_image))
-        .route("/v1/images/edits", post(edit_image));
-    let image_routes = if direct_execution.is_some() {
-        image_routes.route_layer(axum::middleware::from_fn_with_state(
+        .route("/v1/images/edits", post(edit_image))
+        .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_generation_access,
-        ))
-    } else {
-        image_routes
-    };
+        ));
     // **公开与对客面**：不挂管理认证。登录、退出、凭令牌兑换各自认自己的凭据。
     let public = Router::new()
         .route("/health", get(health))
@@ -489,7 +485,9 @@ async fn main() -> Result<()> {
         .merge(image_routes);
     let app = admin
         .merge(public)
-        .layer(DefaultBodyLimit::max(16 * 1024 * 1024))
+        .layer(DefaultBodyLimit::max(
+            seeai_adapter_sdk::GATEWAY_REQUEST_WIRE_BYTES,
+        ))
         .layer(tower_http::request_id::SetRequestIdLayer::new(
             header::HeaderName::from_static("x-request-id"),
             MakeRequestUuid,
@@ -514,20 +512,14 @@ async fn main() -> Result<()> {
     info!(%bind, "api listening");
     // 停机：先停止新执行并给在飞任务有限收尾，进程退出前再等在飞任务收尾到宽限期上限；到点仍
     // 有残余时它们的账务事实由应用层的对账路径接管（RFC 0017 §5、§6）。
-    let supervisor_for_shutdown = direct_execution
-        .as_ref()
-        .map(|direct| direct.supervisor.clone());
+    let supervisor_for_shutdown = direct_execution.supervisor.clone();
     axum::serve(listener, app)
         .with_graceful_shutdown(async move {
             shutdown_signal().await;
-            if let Some(supervisor) = supervisor_for_shutdown {
-                supervisor.begin_drain();
-            }
+            supervisor_for_shutdown.begin_drain();
         })
         .await?;
-    if let Some(direct) = &direct_execution {
-        direct.supervisor.drain().await;
-    }
+    direct_execution.supervisor.drain().await;
     Ok(())
 }
 
@@ -2548,20 +2540,6 @@ struct SyncImageResponse {
     data: Vec<GeneratedImage>,
 }
 
-/// 对客的错误信封（沿用 OpenAI 的形状），对客码仍是平台那三个。
-#[derive(Debug, Serialize)]
-struct SyncErrorResponse {
-    error: SyncErrorBody,
-}
-
-#[derive(Debug, Serialize)]
-struct SyncErrorBody {
-    message: &'static str,
-    #[serde(rename = "type")]
-    error_type: &'static str,
-    code: &'static str,
-}
-
 /// generations 入口（JSON）：与 edits 入口**是同一个能力**，只是请求编码不同。
 ///
 /// 分支只看请求里有没有参考图 / 遮罩，不由端点断言——带图的 generations、不带图的 edits
@@ -2577,35 +2555,20 @@ async fn generate_image(
     let Json(body) = match body {
         Ok(body) => body,
         Err(rejection) => {
-            // 直接执行入口的读错误可能是有界慢读超时：那是受理前的 408，不建记录。
-            if direct.is_some() && slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
+            // 入口的读错误可能是有界慢读超时：那是受理前的 408，不建记录。
+            if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
                 return Err(slow_read_timeout());
             }
-            // 旧路径逐字保留框架给出的拒绝响应。
             return Ok(rejection.into_response());
         }
     };
-    if let Some(direct) = direct {
-        let account = account.ok_or_else(direct_misconfigured)?;
-        return run_direct_json(
-            direct,
-            account.0.account_id,
-            account.0.received_at,
-            &headers,
-            body.parameters,
-        )
-        .await;
-    }
-    let account_id = authenticate(&state, &headers).await?;
-    let mut parameters = body.parameters;
-    let inputs = take_contract_image_inputs(&mut parameters)?;
-    run_sync_generation(
-        &state,
-        account_id,
+    let account = account.ok_or_else(generation_account_missing)?;
+    run_direct_json(
+        direct,
+        account.0.account_id,
+        account.0.received_at,
         &headers,
-        parameters,
-        inputs.reference_images,
-        inputs.mask,
+        body.parameters,
     )
     .await
 }
@@ -2623,98 +2586,24 @@ async fn edit_image(
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
     let direct = state.direct.clone();
-    if let Some(direct) = direct {
-        let account = account.ok_or_else(direct_misconfigured)?;
-        let parsed = parse_multipart_direct(&mut multipart).await;
-        // 慢读超时不建记录：它发生在受理前，按 408 回应，而不是当成 multipart 格式错误。
-        if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
-            return Err(slow_read_timeout());
-        }
-        let (parameters, reference_images, mask) = parsed?;
-        return run_direct_generation(
-            direct,
-            account.0.account_id,
-            account.0.received_at,
-            &headers,
-            "/v1/images/edits",
-            parameters,
-            reference_images,
-            mask,
-        )
-        .await;
+    let account = account.ok_or_else(generation_account_missing)?;
+    let parsed = parse_multipart_direct(&mut multipart).await;
+    // 慢读超时不建记录：它发生在受理前，按 408 回应，而不是当成 multipart 格式错误。
+    if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
+        return Err(slow_read_timeout());
     }
-    let account_id = authenticate(&state, &headers).await?;
-    let mut parameters = Map::new();
-    let mut file_inputs = ImageInputs::default();
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
-    {
-        let name = field.name().unwrap_or_default().to_owned();
-        // 只有契约字段名才是平台自己管的图片部件，带文件名的就当图片字节；其余名字按文本参数
-        // 留在请求里，等选路后按候选的声明面处置（渠道文档里的一手参数不会被"像图片"就截走，
-        // 没被候选声明的名字也不会跟着请求走去上游）。
-        match contract_image_parameter_kind(&name) {
-            Some(ImageParameterKind::Reference) if field.file_name().is_some() => {
-                file_inputs
-                    .reference_images
-                    .push(form_image_data_url(field).await?);
-            }
-            Some(ImageParameterKind::Mask) if field.file_name().is_some() => {
-                file_inputs.mask = Some(form_image_data_url(field).await?);
-            }
-            _ => {
-                let text = field.text().await.map_err(|error| {
-                    ApiError::bad_request("invalid_multipart", error.to_string())
-                })?;
-                parameters.insert(name.clone(), form_scalar(&name, &text));
-            }
-        }
-    }
-    let text_inputs = take_contract_image_inputs(&mut parameters)?;
-    if !text_inputs.reference_images.is_empty() && !file_inputs.reference_images.is_empty() {
-        return Err(ApiError::bad_request(
-            "invalid_parameter",
-            "image was given both as a file part and as a text field",
-        ));
-    }
-    if text_inputs.mask.is_some() && file_inputs.mask.is_some() {
-        return Err(ApiError::bad_request(
-            "invalid_parameter",
-            "mask was given both as a file part and as a text field",
-        ));
-    }
-    let reference_images = if file_inputs.reference_images.is_empty() {
-        text_inputs.reference_images
-    } else {
-        file_inputs.reference_images
-    };
-    run_sync_generation(
-        &state,
-        account_id,
+    let (parameters, reference_images, mask) = parsed?;
+    run_direct_generation(
+        direct,
+        account.0.account_id,
+        account.0.received_at,
         &headers,
+        "/v1/images/edits",
         parameters,
         reference_images,
-        file_inputs.mask.or(text_inputs.mask),
+        mask,
     )
     .await
-}
-
-/// 把 multipart 的图片部件转成 `data:` URL：字节只在内存里过一手，平台不保存。
-async fn form_image_data_url(field: Field<'_>) -> Result<String, ApiError> {
-    let media_type = field
-        .content_type()
-        .map(str::to_owned)
-        .unwrap_or_else(|| "image/png".to_owned());
-    let bytes = field
-        .bytes()
-        .await
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
-    Ok(format!(
-        "data:{media_type};base64,{}",
-        STANDARD.encode(&bytes)
-    ))
 }
 
 /// 表单里除文件外的部件都是字符串；只有整数型参数还原成数字（`n`），其余保持字符串
@@ -2736,9 +2625,7 @@ async fn require_generation_access(
 ) -> Result<axum::response::Response, ApiError> {
     // 总期限 D 从收到请求头起算：认证、速率与读取准入都算在它里面（RFC 0017 §6）。
     let received_at = tokio::time::Instant::now();
-    let Some(direct) = state.direct.clone() else {
-        return Ok(next.run(request).await);
-    };
+    let direct = state.direct.clone();
     // 认证与速率在消费正文之前完成；读取准入也在这里取，取不到直接拒绝，不排队。
     let account_id = authenticate(&state, request.headers()).await?;
     let read = direct
@@ -3072,7 +2959,7 @@ fn result_delivery_timeout() -> ApiError {
 }
 
 /// 直接执行开着但入口中间件没放账户：配置/装配错误，属于平台自身故障。
-fn direct_misconfigured() -> ApiError {
+fn generation_account_missing() -> ApiError {
     ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,
         code: "internal_error",
@@ -3089,110 +2976,6 @@ fn direct_internal() -> ApiError {
         message: "the execution task ended without a result".to_owned(),
         retry_after: None,
     }
-}
-
-/// 两个入口共用的受理与响应：内部照旧走 Job 流水线，对外**等它跑到终态**再回图片。
-///
-/// 同步门面：等不到就按失败回 504——对客只说"这次没在时限内拿到结果"，不提内部的执行记录、
-/// 也不指路任何查询接口（对客没有这样的接口）。
-async fn run_sync_generation(
-    state: &AppState,
-    account_id: AccountId,
-    headers: &HeaderMap,
-    mut parameters: Map<String, Value>,
-    reference_images: Vec<String>,
-    mask: Option<String>,
-) -> Result<Response, ApiError> {
-    let model = parameters
-        .remove("model")
-        .and_then(|value| value.as_str().map(str::to_owned))
-        .ok_or_else(|| ApiError::bad_request("missing_model", "model is required"))?;
-    let job = state
-        .generations
-        .create(CreateImageGenerationRequest {
-            account_id,
-            model,
-            native_parameters: Value::Object(parameters),
-            reference_images,
-            mask,
-            idempotency_key: idempotency_key(headers),
-        })
-        .await?;
-    let job_id = job.id;
-    let deadline = tokio::time::Instant::now() + state.sync_wait;
-    loop {
-        let view = state.generations.get(account_id, job_id).await?;
-        match view.state.as_str() {
-            "succeeded" => return Ok(sync_image_response(view)),
-            "failed" | "reconciliation_required" => {
-                let code = view.error_code.as_deref().unwrap_or("platform_unavailable");
-                return Ok(sync_error_response(code));
-            }
-            _ if tokio::time::Instant::now() >= deadline => {
-                return Ok(sync_error_response_with(
-                    StatusCode::GATEWAY_TIMEOUT,
-                    "result_pending",
-                    "server_error",
-                    "the request did not finish within the time limit; it is treated as failed",
-                ));
-            }
-            _ => tokio::time::sleep(Duration::from_millis(250)).await,
-        }
-    }
-}
-
-/// 成功：`{created, data:[{url|b64_json}]}`——渠道给什么就是什么，平台不下载、不转码。
-fn sync_image_response(view: JobView) -> Response {
-    Json(SyncImageResponse {
-        created: view.updated_at.timestamp(),
-        data: view.data.unwrap_or_default(),
-    })
-    .into_response()
-}
-
-/// 失败：仍用 OpenAI 的错误信封，对客码沿用平台那三个。
-///
-/// 落库的 `error_code` 有 CHECK 约束保证只可能是这三个；认不出的按平台侧故障说。
-fn sync_error_response(public_code: &str) -> Response {
-    match public_code {
-        "content_rejected" => sync_error_response_with(
-            StatusCode::BAD_REQUEST,
-            "content_rejected",
-            "invalid_request_error",
-            "the submitted content was rejected",
-        ),
-        "outcome_unknown" => sync_error_response_with(
-            StatusCode::BAD_GATEWAY,
-            "outcome_unknown",
-            "server_error",
-            "the platform could not confirm the outcome of this request",
-        ),
-        _ => sync_error_response_with(
-            StatusCode::BAD_GATEWAY,
-            "platform_unavailable",
-            "server_error",
-            "the platform could not complete this request",
-        ),
-    }
-}
-
-fn sync_error_response_with(
-    status: StatusCode,
-    code: &'static str,
-    error_type: &'static str,
-    message: &'static str,
-) -> Response {
-    (
-        status,
-        Json(SyncErrorResponse {
-            error: SyncErrorBody {
-                message,
-                error_type,
-                code,
-            },
-        }),
-    )
-        .into_response()
 }
 
 async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId, ApiError> {
@@ -3495,21 +3278,6 @@ fn generation_max_concurrent_jobs() -> Result<u64> {
             .parse::<u64>()
             .context("GENERATION_MAX_CONCURRENT_JOBS must be an integer"),
         _ => Ok(1),
-    }
-}
-
-/// 直接同步执行的开关：GENERATION_DIRECT_EXECUTION（默认关闭）。
-///
-/// 关着时图片入口走旧 Job 流水线；开着时本进程直接调 Provider。它只认明确的布尔写法，读不懂时
-/// 启动失败——把"以为开了"或"以为关了"的部署混过去，比进程起不来更贵。
-fn direct_execution_enabled() -> Result<bool> {
-    match env::var("GENERATION_DIRECT_EXECUTION") {
-        Ok(value) if !value.trim().is_empty() => match value.trim().to_ascii_lowercase().as_str() {
-            "1" | "true" | "yes" | "on" => Ok(true),
-            "0" | "false" | "no" | "off" => Ok(false),
-            other => bail!("GENERATION_DIRECT_EXECUTION must be a boolean, got {other}"),
-        },
-        _ => Ok(false),
     }
 }
 

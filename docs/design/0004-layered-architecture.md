@@ -19,7 +19,7 @@
 
 | 层 | 负责什么 | 由谁拥有 | 如何更新 | 在本仓库的落点 |
 | --- | --- | --- | --- | --- |
-| **① Model Protocol** | 对外路由、请求/响应外壳、同步/异步**对外形态** | 应用层 | 代码发版 | `apps/api` 的 HTTP 适配层；`CreateImageGeneration` 命令；`docs/design/0002` §4 |
+| **① Model Protocol** | 对外路由、请求/响应外壳、同步/异步**对外形态** | 应用层 | 代码发版 | `apps/api` 的 HTTP 适配层；`CreateImageGenerationRequest` 接收入口与 `DirectExecutionService`；`docs/design/0002` §4 |
 | **② Adapter Driver** | 上游路径、封装格式、响应解析、Evidence 提取、错误分类、轮询与取图 | Adapter crate | 代码发版 | `crates/adapter-sdk` + `crates/adapter-*` |
 | **③ Model Profile** | 型号的**调用方参数合同**（Vendor Model 级，唯一一份），以及**该 Offering 能承载的面**（能力子集）：支持参数、值域、默认值、组合规则、说明 | 目录 | **运行时版本发布** | `catalog.vendor_models.capability_schema`（随 Runtime Revision 发布）。**当前实现仍是"每候选各带一份合同"——合同与承载面尚未拆开，见 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 与工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 的 G5** |
 | **④ Offering** | Provider、上游模型名、用哪个 Driver、渠道限制、优先级 | 供给面 | 运行时发布 | `supply.offerings` + `publication.runtime_entries` |

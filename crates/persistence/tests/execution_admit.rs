@@ -14,7 +14,7 @@ use seeai_domain::{
     RuntimeRevisionId, VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
-use serde_json::{Value, json};
+use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool, Row};
 use std::sync::Arc;
 use uuid::Uuid;
@@ -204,55 +204,42 @@ async fn admit_is_atomic_idempotent_and_owns_a_channel_slot() {
     );
 
     let job_row = sqlx::query(
-        "SELECT execution_protocol, state, idempotency_key, request_hash,
-                native_parameters, carrier_schema, result_images
-         FROM generation.jobs WHERE id = $1",
+        "SELECT state, idempotency_key_digest, image_count FROM generation.jobs WHERE id = $1",
     )
     .bind(job.job_id.0)
     .fetch_one(&pool)
     .await
     .expect("the admitted job row");
     assert_eq!(
-        job_row
-            .try_get::<String, _>("execution_protocol")
-            .expect("protocol"),
-        "v1"
-    );
-    assert_eq!(
         job_row.try_get::<String, _>("state").expect("state"),
         "admitted"
     );
-    // 业务载荷列必须为空：明文键、请求哈希、原生参数、承载面与结果都不进新协议记录。
     assert_eq!(
         job_row
-            .try_get::<Option<String>, _>("idempotency_key")
-            .expect("key"),
-        None
+            .try_get::<Option<String>, _>("idempotency_key_digest")
+            .expect("digest")
+            .as_deref(),
+        Some("key-a"),
+        "明文键不再落库，摘要就是防重依据本身"
     );
     assert_eq!(
         job_row
-            .try_get::<Option<String>, _>("request_hash")
-            .expect("hash"),
-        None
+            .try_get::<Option<i32>, _>("image_count")
+            .expect("image count"),
+        None,
+        "还没结算就没有产出张数：留 NULL，不拿 0 顶替"
     );
-    assert_eq!(
-        job_row
-            .try_get::<Option<Value>, _>("native_parameters")
-            .expect("params"),
-        None
-    );
-    assert_eq!(
-        job_row
-            .try_get::<Option<Value>, _>("carrier_schema")
-            .expect("carrier"),
-        None
-    );
-    assert_eq!(
-        job_row
-            .try_get::<Option<Value>, _>("result_images")
-            .expect("result"),
-        None
-    );
+    // 业务载荷列在收口迁移之后**根本不存在**：不是"写了空值"，是没有落点。
+    let payload_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'generation' AND table_name = 'jobs'
+           AND column_name IN ('native_parameters', 'result_images', 'carrier_schema',
+                               'parameter_mapping', 'idempotency_key', 'request_hash')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("payload column probe");
+    assert_eq!(payload_columns, 0, "业务载荷列必须已经删除");
     let holds = scalar(
         &pool,
         "SELECT count(*) FROM ledger.holds WHERE job_id = $1 AND status = 'active'",
@@ -349,65 +336,6 @@ async fn admit_is_atomic_idempotent_and_owns_a_channel_slot() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 切换前已在飞的旧协议 Job 同样占用渠道上游并发：即使没有任何 v1 槽位也要计入渠道上限；
-/// 旧 Job 进终态后不再计入（RFC 0017 §7、Spec 0005 A9）。
-#[tokio::test]
-#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
-async fn legacy_in_flight_jobs_count_toward_the_channel_capacity() {
-    let (database_url, database_name) = isolated_database_url().await;
-    let repository = PgHubRepository::connect(&database_url, 4)
-        .await
-        .expect("the isolated database");
-    repository.migrate().await.expect("the migrations apply");
-    let pool = repository.pool().clone();
-    let fixture = seed_fixture(&pool).await;
-
-    sqlx::query(
-        "INSERT INTO generation.jobs
-             (id, account_id, state, branch, gateway_model, runtime_revision_id, vendor_model_id,
-              offering_id, channel_id, adapter_key, provider_model_id, base_url, credential_env,
-              price_snapshot, max_cost_microusd)
-         VALUES ($1,$2,'submitting','prompt_only','fake-gateway',$3,$4,$5,$6,'fake','fake-model',
-                 'http://127.0.0.1:9','FAKE_PROVIDER_KEY','{}'::jsonb,1000)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(fixture.account_id.0)
-    .bind(fixture.runtime_revision_id.0)
-    .bind(fixture.vendor_model_id.0)
-    .bind(fixture.offering_id.0)
-    .bind(fixture.channel_id.0)
-    .execute(&pool)
-    .await
-    .expect("seed a legacy in-flight job");
-
-    let mut blocked = command(&fixture, "legacy-slot", "legacy-slot-digest");
-    blocked.max_channel_in_flight = 1;
-    let rejected = repository.admit(blocked).await;
-    assert!(
-        matches!(rejected, Err(ApplicationError::PlatformCapacityExhausted)),
-        "a legacy in-flight job must consume the channel capacity, got {rejected:?}"
-    );
-
-    // 旧 Job 进终态后不再计入，同一渠道可以再受理。
-    sqlx::query(
-        "UPDATE generation.jobs SET state = 'succeeded' WHERE account_id = $1 AND execution_protocol = 'legacy'",
-    )
-    .bind(fixture.account_id.0)
-    .execute(&pool)
-    .await
-    .expect("finish the legacy job");
-    let mut allowed = command(&fixture, "legacy-slot-2", "legacy-slot-digest-2");
-    allowed.max_channel_in_flight = 1;
-    let admitted = repository
-        .admit(allowed)
-        .await
-        .expect("after the legacy job finished");
-    assert!(matches!(admitted, AdmitOutcome::Admitted { .. }));
-
-    drop(pool);
-    drop(repository);
-    drop_isolated_database(&database_name).await;
-}
 /// 并发受理共同遵守同一份账户名额：四个不同键同时进来，名额只允许一个通过。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]

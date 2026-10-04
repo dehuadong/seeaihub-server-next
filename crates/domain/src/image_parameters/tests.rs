@@ -569,3 +569,36 @@ fn the_contract_side_does_not_use_the_shape_of_the_name() {
         assert!(image_parameter_kind(name).is_some(), "{name}");
     }
 }
+
+/// 只校验不复制：结论必须与 `place_image_inputs` 的接受/拒绝完全一致。
+#[test]
+fn validating_image_inputs_matches_placing_them_without_copying() {
+    let vendor = schema(serde_json::json!({
+        "model": {"const": "m"},
+        "prompt": {"type": "string"},
+        "image_urls": {"type": "array", "items": {"type": "string"}, "maxItems": 2},
+        "mask_url": {"type": "string"}
+    }));
+    assert!(validate_image_inputs(&vendor, 2, true).is_ok());
+    assert!(validate_image_inputs(&vendor, 0, true).is_ok());
+    assert!(
+        validate_image_inputs(&vendor, 3, false).is_err(),
+        "more images than the declared capacity is not carriable"
+    );
+
+    let single = schema(serde_json::json!({
+        "model": {"const": "m"},
+        "prompt": {"type": "string"},
+        "image": {"type": "string"}
+    }));
+    assert!(validate_image_inputs(&single, 1, false).is_ok());
+    assert!(validate_image_inputs(&single, 2, false).is_err());
+
+    let text_only = schema(serde_json::json!({
+        "model": {"const": "m"},
+        "prompt": {"type": "string"}
+    }));
+    assert!(validate_image_inputs(&text_only, 1, false).is_err());
+    assert!(validate_image_inputs(&text_only, 0, true).is_err());
+    assert!(validate_image_inputs(&text_only, 0, false).is_ok());
+}

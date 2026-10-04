@@ -196,6 +196,7 @@ fn facts(job_id: JobId, attempt_id: AttemptId) -> LateFacts {
         image_count: None,
         evidence: None,
         provider_cost: None,
+        provider_state: None,
     }
 }
 
@@ -511,6 +512,30 @@ async fn claimed_accounting_late_facts_carry_the_evidence_and_cost() {
     assert_eq!(cost.amount_microusd, Some(200));
     assert_eq!(cost.currency.as_deref(), Some("USD"));
     assert_eq!(cost.cny_microusd, Some(150));
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 不是有界标识的"句柄"不能从收件口子回到库里：它既不是任务标识，也可能带着正文。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_late_handle_that_is_not_an_identifier_is_not_stored() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "late-bad-handle").await;
+    let attempt_id = begin(&repository, job_id).await;
+
+    let mut late = facts(job_id, attempt_id);
+    // 只有无效句柄、没有其它事实：按无可收内容处理，不写空行。
+    late.provider_task_handle = Some("data:image/png;base64,AAAA".to_owned());
+    assert_eq!(
+        repository.offer_late_facts(late).await.expect("offer"),
+        LateFactsOutcome::Ignored
+    );
+    assert_eq!(count_facts(&pool, job_id.0, "task_handle").await, 0);
 
     drop(pool);
     drop(repository);

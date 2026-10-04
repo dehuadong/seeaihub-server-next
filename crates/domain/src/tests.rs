@@ -788,3 +788,29 @@ fn a_legacy_snapshot_reads_the_consumer_form_as_the_cost_form() {
     snapshot.consumer_formula = None;
     assert_eq!(snapshot.consumer_formula(), PricingFormula::TokenRates);
 }
+
+#[test]
+fn provider_identifiers_are_bounded_and_never_urls_or_payloads() {
+    assert!(is_bounded_provider_identifier("task_abc-123.4:x"));
+    assert!(is_bounded_provider_identifier(
+        "9f1c2d3e-4a5b-6c7d-8e9f-0a1b2c3d4e5f"
+    ));
+
+    for bad in [
+        "",
+        "https://example.invalid/a.png",
+        "data:image/png;base64,AAAA",
+        "task id with spaces",
+        "line\nbreak",
+        "任务标识",
+    ] {
+        assert!(
+            !is_bounded_provider_identifier(bad),
+            "{bad:?} must not pass as a provider identifier"
+        );
+    }
+    assert!(
+        !is_bounded_provider_identifier(&"a".repeat(MAX_PROVIDER_IDENTIFIER_BYTES + 1)),
+        "an over-long value is not an identifier"
+    );
+}

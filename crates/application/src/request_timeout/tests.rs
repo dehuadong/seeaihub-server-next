@@ -7,7 +7,6 @@ fn policy() -> RequestTimeoutPolicy {
         included_images: 4,
         per_image: Duration::from_secs(30),
         provider_timeout: Duration::from_secs(360),
-        worker_lease: Duration::from_secs(432),
         sync_wait: Duration::from_secs(390),
         max_output_images: 10,
     }
@@ -125,7 +124,7 @@ fn the_sync_window_default_covers_the_ceiling_and_a_little_more() {
     );
 }
 
-/// 链的下半条第一段：上游超时小于"最大 `n` 下的按请求上限"就拒绝，且点名这条链与当前值。
+/// 链的下半条：上游超时小于"最大 `n` 下的按请求上限"就拒绝，且点名这条链与当前值。
 #[test]
 fn a_ceiling_below_the_largest_n_is_rejected_with_both_values_named() {
     let broken = RequestTimeoutPolicy {
@@ -142,22 +141,6 @@ fn a_ceiling_below_the_largest_n_is_rejected_with_both_values_named() {
     assert!(
         message.contains("n = 10") && message.contains("= 360s"),
         "the error must name the largest n and its bound: {message}"
-    );
-}
-
-/// 链的下半条第二段：租约短于上游超时就拒绝——租约过期会让同一个 Job 再调一次上游。
-#[test]
-fn a_lease_below_the_upstream_timeout_is_rejected_with_both_values_named() {
-    let broken = RequestTimeoutPolicy {
-        worker_lease: Duration::from_secs(300),
-        ..policy()
-    };
-    let error = broken.validate().expect_err("the chain must be rejected");
-    let message = error.to_string();
-    assert!(
-        message.contains("WORKER_LEASE_SECONDS (300s)")
-            && message.contains("PROVIDER_TIMEOUT_SECONDS (360s)"),
-        "the error must name both ends of the lease chain: {message}"
     );
 }
 
@@ -182,7 +165,6 @@ fn a_consistent_chain_is_accepted_at_its_boundaries() {
     assert!(policy().validate().is_ok());
     let boundary = RequestTimeoutPolicy {
         provider_timeout: Duration::from_secs(360),
-        worker_lease: Duration::from_secs(360),
         sync_wait: Duration::from_secs(360),
         ..policy()
     };

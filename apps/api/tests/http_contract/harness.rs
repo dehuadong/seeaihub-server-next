@@ -1,5 +1,7 @@
-//! 端到端合同测试的共享装置：进程内假上游与假 Redis、真实 API / Worker 进程的启停、独立空库、
+//! 端到端合同测试的共享装置：进程内假上游与假 Redis、真实 API 进程的启停、独立空库、
 //! `Harness` 驱动、管理员与对客 HTTP 辅助，以及跨用例共用的断言。
+//!
+//! 图片入口只有**直接执行**这一条：API 进程自己连假上游，没有 Worker、没有作业队列。
 //!
 //! 各 `cases_*.rs` 用 `#[path]` 声明为本模块的子模块：装置条目因此不必对外可见——这是这批文件
 //! 从单文件搬运过来能不动一行可见性的前提。代价是模块拓扑不能只看目录名，新增一个用例文件
@@ -7,15 +9,8 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode};
-use seeai_application::{
-    AttemptFailure, DEFAULT_SETTLE_RESERVE_SECONDS, HoldDisposition, HubRepository,
-    ProviderFailureKind, PublicErrorCode,
-};
-use seeai_domain::{
-    AccountId, AttemptId, JobId, ProviderCostFact, ProviderCostSource,
-    replace_contract_model_identity,
-};
-use seeai_persistence::PgHubRepository;
+use seeai_application::{DEFAULT_SETTLE_RESERVE_SECONDS, idempotency_key_digest};
+use seeai_domain::replace_contract_model_identity;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
 use sqlx::{PgPool, Row};
@@ -589,19 +584,6 @@ async fn serve_alert(
     socket.write_all(head.as_bytes()).await?;
     socket.flush().await
 }
-
-/// 一条告警载荷的**键**（排序后）：用例据此钉住"外发的就是那四个定位字段"。
-fn alert_keys(alert: &Value) -> Vec<String> {
-    let mut keys: Vec<String> = alert
-        .as_object()
-        .expect("an alert payload is a JSON object")
-        .keys()
-        .cloned()
-        .collect();
-    keys.sort();
-    keys
-}
-
 fn body_contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
     !needle.is_empty()
         && haystack
@@ -615,49 +597,6 @@ fn body_contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
 /// `name="image[]"` 不会被算成单值 `image`——这正是"多张时不许退回单值"要判的事。
 fn part_name_count(rendered: &str, name: &str) -> usize {
     rendered.matches(&format!("name=\"{name}\"")).count()
-}
-
-/// 定位 `seeai-worker` 二进制，**并保证它是当前源码构建的**。
-///
-/// 它是**独立包**，因此有两件事需要注意：
-/// 1. Cargo 不为它提供 `CARGO_BIN_EXE_*`，路径只能从当前测试可执行文件推导；
-/// 2. `cargo test -p seeai-api` 只会重建 `seeai-api` 与测试本身，**不会重建 `seeai-worker`**。
-///    于是测试可能在验证一个陈旧二进制——这曾真实导致一次误判。所以在返回路径前**先构建一次**。
-fn worker_binary() -> PathBuf {
-    // 注意 profile 名的坑：`debug` 是保留名，构建 profile 叫 `dev`，
-    // 但它的产物目录是 `target/debug`。
-    let profile = if cfg!(debug_assertions) {
-        "dev"
-    } else {
-        "release"
-    };
-    let status = Command::new(env!("CARGO"))
-        .args(["build", "-p", "seeai-worker", "--profile", profile])
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .status()
-        .expect("cargo must be runnable from the test");
-    assert!(
-        status.success(),
-        "failed to build seeai-worker for the driver contract test"
-    );
-
-    let test_binary = std::env::current_exe().expect("current test executable");
-    let profile_dir = test_binary
-        .parent()
-        .and_then(|deps| deps.parent())
-        .expect("target profile directory");
-    let candidate = profile_dir.join(if cfg!(windows) {
-        "seeai-worker.exe"
-    } else {
-        "seeai-worker"
-    });
-    assert!(
-        candidate.is_file(),
-        "worker binary not found at {}",
-        candidate.display()
-    );
-    candidate
 }
 
 /// 为本次测试创建**独立的空库**。
@@ -792,7 +731,9 @@ async fn probe_api_startup_with_seed(
         .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
         .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
-        .env("WORKER_LEASE_SECONDS", "30")
+        .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
+        .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
+        .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
         // 引导只认**显式给的**环境变量：在无 `.env` 的目录起进程，本地检出的 `.env` 才不会
         // 替"只给邮箱"补上一个口令，把这条判据变成看天吃饭。
         .current_dir(std::env::temp_dir())
@@ -840,7 +781,10 @@ async fn probe_api_startup_with_cursor_key(
         .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
         .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
-        .env("WORKER_LEASE_SECONDS", "30")
+        // 直接执行的必填项先配齐："没配"的那个才只剩这次要探的那个变量。
+        .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
+        .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
+        .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
         // 与 [`probe_api_startup_with_seed`] 同理：在无 `.env` 的目录起进程，"没配"才是真的没配。
         .current_dir(std::env::temp_dir())
         .stdout(Stdio::null())
@@ -910,8 +854,6 @@ struct ApiProcessSettings {
     admin_credentials: Option<(String, String)>,
     /// 会话有效期（秒）：用例要验"过期凭据被拒"时把它压到等得起的量级。
     session_ttl_seconds: Option<u64>,
-    /// 开着时两条图片入口走进程内直接执行，并配上摘要密钥与渠道凭证的假值；不启 Worker 也能出图。
-    direct_execution: bool,
     /// 结算预留 R（秒）：直接执行的总期限 D 减去它才是上游预算。缺省取应用层的
     /// [`DEFAULT_SETTLE_RESERVE_SECONDS`]，不在这里另写一个数。
     settle_reserve_seconds: Option<u64>,
@@ -926,18 +868,19 @@ struct ApiProcessSettings {
     /// 渠道全局未决任务上限（GENERATION_MAX_CHANNEL_IN_FLIGHT）：用例要观察"账户名额还空着、
     /// 但渠道名额已被另一个副本占住"那条 503 时把它压到最小。缺省不配，进程用生产默认值（32）。
     channel_max_in_flight: Option<u64>,
+    /// 请求内安全重投的运维取值（次数与退避基）：直接执行在受理路径上读 `GENERATION_RETRY_*`。
+    retry: RetrySettings,
 }
 
-/// 一次用例的全部进程配置：API 进程那一套、发布时的修订级加价系数、以及 Worker 的重投策略。
+/// 一次用例的全部进程配置：API 进程那一套与发布时的修订级加价系数。
 ///
-/// 三件事装在一起，只是因为它们都是"这次用例怎么起这套服务"的参数：分成三个参数传下去会让
+/// 两件事装在一起，只是因为它们都是"这次用例怎么起这套服务"的参数：分成两个参数传下去会让
 /// `Harness::build` 的参数表长到读不出哪一项管什么。
 #[derive(Default)]
 struct CaseSettings {
     api: ApiProcessSettings,
     /// 发布时的**修订级**加价系数（按张 / 按次 / 上游给金额的候选要靠它算对客价）。
     markup_bps: Option<i32>,
-    retry: RetrySettings,
 }
 
 impl ApiProcessSettings {
@@ -994,9 +937,9 @@ async fn start_api_with(
         // "窗口 ≥ 上游超时"，而生产那套按张算超时的**取值**在这里压不到 1s：APIMart 的 Driver 每 3s
         // 轮询一次任务，而"上游超时"同时是这一次执行的**总期限**，压到 1s 会让"提交 + 轮询到终态"
         // 必然超时（实测两条用例因此变成"结果不明"）。所以窗口与上游超时都取 10s 与用例窗口里较大
-        // 的那个：1s / 2s 那些用例要观察的"窗口先到期"仍然成立——它们不跑 Worker，Job 一直停在受理
-        // 态，窗口一到就回 504。生产取值（300s 级）不能搬进用例：每条都要等上几分钟，而且会逼着
-        // 校验放宽。
+        // 的那个：1s / 2s 那些用例要观察的"窗口先到期"仍然成立——窗口一到，这一次执行就按
+        // `request_timeout` 回 504。生产取值（300s 级）不能搬进用例：每条都要等上几分钟，而且会
+        // 逼着校验放宽。
         let test_chain_seconds = sync_wait_seconds.max(10);
         let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
         command
@@ -1023,10 +966,6 @@ async fn start_api_with(
             .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "4")
             .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
             .env("PROVIDER_TIMEOUT_SECONDS", test_chain_seconds.to_string())
-            // 租约是链的下半条（租约 ≥ 上游超时），所以它跟着同一条下限走，不能写成一个固定数——
-            // 用例给的窗口有 60s 的，写 30s 就把链断在启动校验上。租约同时要够把一条 Job 跑完一次：
-            // 比上游超时短会让它在任务执行中途到期，回收循环于是把同一条 Job 再跑一遍。
-            .env("WORKER_LEASE_SECONDS", test_chain_seconds.to_string())
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         apply_cache_env(&mut command, settings.cache.as_ref());
@@ -1067,25 +1006,33 @@ async fn start_api_with(
         if let Some(seconds) = settings.session_ttl_seconds {
             command.env("SESSION_TTL_SECONDS", seconds.to_string());
         }
-        if settings.direct_execution {
-            command
-                .env("GENERATION_DIRECT_EXECUTION", "true")
-                .env(
-                    "GENERATION_SETTLE_RESERVE_SECONDS",
-                    settings
-                        .settle_reserve_seconds
-                        .unwrap_or(DEFAULT_SETTLE_RESERVE_SECONDS)
-                        .to_string(),
-                )
-                .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
-                .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
-                .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY);
-            if let Some(seconds) = settings.slow_read_timeout_seconds {
-                command.env("GENERATION_SLOW_READ_TIMEOUT_SECONDS", seconds.to_string());
-            }
-            if let Some(bytes) = settings.max_memory_bytes {
-                command.env("GENERATION_MAX_MEMORY_BYTES", bytes.to_string());
-            }
+        // 图片生成只有直接执行这一条路：指纹密钥与渠道凭证是**必须配**的（缺任何一项进程都拒绝
+        // 启动），所以每个用例都配上假值；取值只在这个用例的假上游上用过，不写入配置、日志或响应。
+        command
+            .env(
+                "GENERATION_SETTLE_RESERVE_SECONDS",
+                settings
+                    .settle_reserve_seconds
+                    .unwrap_or(DEFAULT_SETTLE_RESERVE_SECONDS)
+                    .to_string(),
+            )
+            .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
+            .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
+            .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
+            // 请求内安全重投的运维取值：用例按自己等得起的量级给（生产缺省是 3 次 / 1 秒起步）。
+            .env(
+                "GENERATION_RETRY_MAX_ATTEMPTS",
+                settings.retry.max_attempts.to_string(),
+            )
+            .env(
+                "GENERATION_RETRY_BACKOFF_BASE_MS",
+                settings.retry.backoff_base_ms.to_string(),
+            );
+        if let Some(seconds) = settings.slow_read_timeout_seconds {
+            command.env("GENERATION_SLOW_READ_TIMEOUT_SECONDS", seconds.to_string());
+        }
+        if let Some(bytes) = settings.max_memory_bytes {
+            command.env("GENERATION_MAX_MEMORY_BYTES", bytes.to_string());
         }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
@@ -1121,19 +1068,11 @@ async fn start_api_with(
     panic!("API did not become ready after {ATTEMPTS} attempts; last: {last_failure}");
 }
 
-/// 起一个真实 Worker 进程（丢弃返回值即结束它）。
+/// 一次用例给**请求内安全重投**配的运维取值：一次请求最多调几次上游、第一次重投前等多久。
 ///
-/// 环境变量只有一份，两个调用点（[`Harness`] 与直接起进程的用例）共用：两家渠道的凭证都写在
-/// 测试进程的环境里，取值只在进程内假上游上用过，不写入配置、日志或响应。
-fn spawn_worker_process(database_url: &str) -> WorkerProcess {
-    spawn_worker_process_with(database_url, None, None, RetrySettings::default())
-}
-
-/// 一次用例给 Worker 配的**重投策略**：一次请求最多调几次上游、第一次重投前等多久。
-///
-/// 字段直接就是那两个环境变量的值。重投只在**可证明未受理**时发生，而"证明"来自假上游怎么
-/// 应答（见 [`UpstreamBehaviour::create_rejection_status`]）——所以用例能精确地构造出
-/// "第一次没被受理、第二次成功"与"一直被拒直到用完额度"这两种形态。
+/// 字段直接就是那两个环境变量的值，由 API 进程在受理路径上读。重投只在**可证明未受理**时发生，
+/// 而"证明"来自假上游怎么应答（见 [`UpstreamBehaviour::create_rejection_status`]）——所以用例能
+/// 精确地构造出"第一次没被受理、第二次成功"与"一直被拒直到用完额度"这两种形态。
 ///
 /// 缺省那套（[`Self::default`]）把退避压到毫秒级、上限给 3：用例跑得快，而"重投发生过"仍然
 /// 看得见。把它们当成"测试专用的一套语义"是错的——它们本来就是运维配置，生产缺省是 3 次 /
@@ -1163,77 +1102,6 @@ impl RetrySettings {
     }
 }
 
-/// 一次用例给 Worker 配的**平台故障告警出口**。
-///
-/// 字段直接就是那两个环境变量的值；`PROVIDER_ALERT_WEBHOOK` 没配（`None`）就是今天的路径——
-/// 一条都不外发。超时用生产缺省：它是配置项，用例不该为了跑得快把它改成另一套语义。
-struct WorkerAlerts {
-    webhook: String,
-    /// 某候选连续失败几次才外发。
-    consecutive_failures: u64,
-}
-
-/// 同 [`spawn_worker_process`]，但可以给 Worker 也配上加速层：结算与失败收尾都改余额，
-/// 提交后要把新余额写穿缓存，所以两个进程必须看同一个缓存服务。
-fn spawn_worker_process_with(
-    database_url: &str,
-    cache: Option<&CacheFixture>,
-    alerts: Option<&WorkerAlerts>,
-    retry: RetrySettings,
-) -> WorkerProcess {
-    let mut command = Command::new(worker_binary());
-    command
-        .env("DATABASE_URL", database_url)
-        .env("WORKER_ID", "driver-contract-worker")
-        .env("WORKER_POLL_INTERVAL_MS", "200")
-        // 与 API 进程同一组超时取值（见 `start_api_with`）：10s 的秒级下限让 APIMart 每 3s 一次的
-        // 轮询跑得完，链上三环（窗口 ≥ 上限、租约 ≥ 上限）因此都成；租约同值，一条 Job 跑得完一次
-        // 而不被回收循环中途领走。
-        .env("WORKER_LEASE_SECONDS", "10")
-        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "10")
-        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "4")
-        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
-        .env("PROVIDER_TIMEOUT_SECONDS", "10")
-        // 重投策略：只在**可证明未受理**时才会用上它，所以这条配置不影响"状态不确定"那类用例
-        // （那些一次上游调用都不会多发）。用例用自己的量级，不占用生产缺省的分钟级退避。
-        .env(
-            "GENERATION_RETRY_MAX_ATTEMPTS",
-            retry.max_attempts.to_string(),
-        )
-        .env(
-            "GENERATION_RETRY_BACKOFF_BASE_MS",
-            retry.backoff_base_ms.to_string(),
-        )
-        .env("APIMART_API_KEY", "contract-test-key")
-        .env("AIHUBMIX_API_KEY", "contract-test-key")
-        .stdout(Stdio::null())
-        .stderr(Stdio::inherit());
-    apply_cache_env(&mut command, cache);
-    if let Some(alerts) = alerts {
-        command.env("PROVIDER_ALERT_WEBHOOK", &alerts.webhook).env(
-            "PROVIDER_ALERT_CONSECUTIVE_FAILURES",
-            alerts.consecutive_failures.to_string(),
-        );
-    }
-    let child = command.spawn().expect("worker process should start");
-    WorkerProcess { child }
-}
-
-/// 一个真实 Worker 进程。
-///
-/// `Drop` 时结束它：断言失败也不会留下孤儿 Worker 把二进制锁住（那会让下一次
-/// `cargo build -p seeai-worker` 失败，看起来像代码错）。
-struct WorkerProcess {
-    child: Child,
-}
-
-impl Drop for WorkerProcess {
-    fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
-    }
-}
-
 /// 驱动端到端验证的公共装置：假上游 + API 进程 + 一条发布的供给。
 struct Harness {
     model: &'static str,
@@ -1260,10 +1128,8 @@ struct Harness {
     _api: ApiProcess,
     /// 保持假上游的监听任务存活。
     _upstream: FakeUpstream,
-    /// 这次用例给 API 与 Worker 配的加速层（假 Redis）；没配就是"没有缓存"的那条路径。
+    /// 这次用例给 API 与对账配的加速层（假 Redis）；没配就是"没有缓存"的那条路径。
     cache: Option<CacheFixture>,
-    /// 这次用例给 Worker 配的重投策略；默认那套是生产缺省（3 次、1 秒起步）。
-    retry: RetrySettings,
 }
 
 impl Harness {
@@ -1382,9 +1248,9 @@ impl Harness {
         .await
     }
 
-    /// 同 [`Self::start_with_draft`]，但给 Worker 定下**重投策略**（上限与退避基）。
+    /// 同 [`Self::start_with_draft`]，但给**请求内安全重投**定下运维取值（上限与退避基）。
     ///
-    /// 用例要能观察到"重投了几次"就必须把退避压到秒级：生产缺省是 1 秒起步、指数增长，靠它
+    /// 用例要能观察到"重投了几次"就必须把退避压到毫秒级：生产缺省是 1 秒起步、指数增长，靠它
     /// 跑重投会把每条用例拖成分钟级。这两项本来就是运维配置，用例按自己等得起的量级给。
     async fn start_with_retry(
         draft: Value,
@@ -1399,7 +1265,10 @@ impl Harness {
             max_concurrent_jobs,
             30,
             CaseSettings {
-                retry,
+                api: ApiProcessSettings {
+                    retry,
+                    ..ApiProcessSettings::default()
+                },
                 ..CaseSettings::default()
             },
         )
@@ -1554,13 +1423,7 @@ impl Harness {
             behaviour,
             max_concurrent_jobs,
             sync_wait_seconds,
-            CaseSettings {
-                api: ApiProcessSettings {
-                    direct_execution: true,
-                    ..ApiProcessSettings::default()
-                },
-                ..CaseSettings::default()
-            },
+            CaseSettings::default(),
         )
         .await
     }
@@ -1674,26 +1537,7 @@ impl Harness {
             _api: process,
             _upstream: upstream,
             cache: settings.api.cache,
-            retry: settings.retry,
         }
-    }
-
-    /// 起一个真实 Worker 进程（丢弃返回值即结束它）。
-    ///
-    /// Worker 与 API 共用同一个缓存服务：结算改余额之后要把新余额写穿，否则缓存会留着一个
-    /// 刚写过、但偏高的余额。
-    fn spawn_worker(&self) -> WorkerProcess {
-        spawn_worker_process_with(&self.database_url, self.cache.as_ref(), None, self.retry)
-    }
-
-    /// 同 [`Self::spawn_worker`]，但给这个 Worker 配上告警出口。
-    fn spawn_worker_with_alerts(&self, alerts: &WorkerAlerts) -> WorkerProcess {
-        spawn_worker_process_with(
-            &self.database_url,
-            self.cache.as_ref(),
-            Some(alerts),
-            self.retry,
-        )
     }
 
     /// 起**第二个**连同一数据库的 API 副本：多副本容量竞争与"缓存通知丢失"的验收靠它。
@@ -1724,19 +1568,17 @@ impl Harness {
             .expect("this test must run with the cache fixture")
     }
 
-    /// 走同步入口发一次 JSON 请求，并起真实 Worker 把它跑到终态。
+    /// 走同步入口发一次 JSON 请求：这一次执行在本进程内跑完才返回。
     async fn sync_json(&self, path: &str, key: &str, body: Value) -> (StatusCode, Value) {
-        let _worker = self.spawn_worker();
         post_json(&self.base_url, &self.api_key, path, key, &body).await
     }
 
-    /// 走同步入口发一次 multipart 请求（edits 路径），并起真实 Worker 跑完。
+    /// 走同步入口发一次 multipart 请求（edits 路径）：这一次执行在本进程内跑完才返回。
     async fn sync_multipart(
         &self,
         key: &str,
         form: reqwest::multipart::Form,
     ) -> (StatusCode, Value) {
-        let _worker = self.spawn_worker();
         let response = Client::new()
             .post(format!("{}/v1/images/edits", self.base_url))
             .bearer_auth(&self.api_key)
@@ -1754,21 +1596,21 @@ impl Harness {
         )
     }
 
-    /// 按幂等键取回这次请求内部的执行记录：`(job_id, state, result_images)`。
+    /// 按幂等键取回这次请求内部的执行记录：`(job_id, state)`。
     ///
-    /// 这是**内部**事实，对客响应里没有它——同步入口不返回 job_id。
-    async fn job(&self, key: &str) -> (Uuid, String, Option<Value>) {
-        let row = sqlx::query(
-            "SELECT id, state, result_images FROM generation.jobs WHERE idempotency_key = $1",
-        )
-        .bind(key)
-        .fetch_one(&self.pool)
-        .await
-        .expect("the request must have created a job record");
+    /// 这是**内部**事实，对客响应里没有它——同步入口不返回 job_id。v1 记录只存幂等键的**摘要**，
+    /// 明文键不进库，所以这里按摘要查。载荷（结果图片、参数）**不在库里**：要看结果就读这一次的
+    /// 对客响应。
+    async fn job(&self, key: &str) -> (Uuid, String) {
+        let row =
+            sqlx::query("SELECT id, state FROM generation.jobs WHERE idempotency_key_digest = $1")
+                .bind(idempotency_key_digest(key))
+                .fetch_one(&self.pool)
+                .await
+                .expect("the request must have created a job record");
         (
             row.try_get("id").expect("job id"),
             row.try_get("state").expect("job state"),
-            row.try_get("result_images").expect("result images"),
         )
     }
 
@@ -1997,10 +1839,10 @@ fn assert_sync_success(what: &str, body: &Value) {
 }
 
 /// 只要走通一次真实执行，内部就必须留下一条跑完的记录：内部有记录，对客看不见。
-async fn assert_job_succeeded(harness: &Harness, key: &str) -> Value {
-    let (_, state, images) = harness.job(key).await;
+async fn assert_job_succeeded(harness: &Harness, key: &str) -> Uuid {
+    let (job_id, state) = harness.job(key).await;
     assert_eq!(state, "succeeded", "内部执行记录必须跑到终态");
-    images.expect("a successful job keeps the result envelope")
+    job_id
 }
 
 struct DriverOutcome {
@@ -2010,7 +1852,7 @@ struct DriverOutcome {
     harness: Harness,
 }
 
-/// 起 API + 假上游 + 真实 Worker，让一个文生图 Job 走完整个驱动流程，返回它的结局。
+/// 起 API + 假上游，让一次文生图请求走完整个执行流程，返回它的结局。
 async fn run_driver_attempt(behaviour: UpstreamBehaviour) -> DriverOutcome {
     let harness = Harness::start(behaviour).await;
     let key = format!("driver-{}", Uuid::new_v4());
@@ -2021,7 +1863,7 @@ async fn run_driver_attempt(behaviour: UpstreamBehaviour) -> DriverOutcome {
             route_request(harness.model, "driver prompt"),
         )
         .await;
-    let (_, job_state, _) = harness.job(&key).await;
+    let (_, job_state) = harness.job(&key).await;
     DriverOutcome {
         job_state,
         submits: harness.count("POST", "/v1/images/generations"),
@@ -2154,12 +1996,7 @@ fn count_calls(calls: &UpstreamCalls, method: &str, path: &str) -> usize {
 
 /// 这次请求的**选路判定**：`(选中的候选, 完整取舍画面)`。内部事实，对客看不见。
 async fn routing_of(pool: &PgPool, key: &str) -> (Uuid, Vec<Value>) {
-    let job_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(key)
-            .fetch_one(pool)
-            .await
-            .expect("the request must have created a job");
+    let job_id = job_id_of(pool, key).await;
     let row = sqlx::query(
         "SELECT chosen_offering_id, considered FROM generation.routing_decisions WHERE job_id = $1",
     )
@@ -2555,34 +2392,25 @@ async fn funded_account(
 
 /// 这次受理冻结下来的**定价快照**（`generation.jobs.price_snapshot`）。
 async fn frozen_snapshot(pool: &PgPool, key: &str) -> Value {
-    sqlx::query_scalar("SELECT price_snapshot FROM generation.jobs WHERE idempotency_key = $1")
-        .bind(key)
+    sqlx::query_scalar(
+        "SELECT price_snapshot FROM generation.jobs WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(key))
+    .fetch_one(pool)
+    .await
+    .expect("the request must have created a job with a frozen snapshot")
+}
+
+/// 按幂等键（明文）找这次请求内部那条执行记录的标识。
+///
+/// 库里只存摘要，所以这里先算摘要再查；调用方拿它去读别的内部事实（选路判定、成本四列…）。
+async fn job_id_of(pool: &PgPool, key: &str) -> Uuid {
+    sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key_digest = $1")
+        .bind(idempotency_key_digest(key))
         .fetch_one(pool)
         .await
-        .expect("the request must have created a job with a frozen snapshot")
+        .expect("the request must have created a job")
 }
-
-/// 合同里的文生图请求体（bootstrap 素材的模型名）。
-fn generation_request_body(prompt: &str) -> Value {
-    json!({"model": "gpt-image-2.5-flare", "prompt": prompt, "n": 1, "quality": "low"})
-}
-
-/// 带幂等键的测试构造体：受理时把它提到 `Idempotency-Key` 请求头。
-fn generation_request(idempotency_key: &str, prompt: &str) -> Value {
-    let mut body = generation_request_body(prompt);
-    body["idempotency_key"] = Value::String(idempotency_key.to_owned());
-    body
-}
-
-/// 去掉构造体里的幂等键：它对客不该出现在请求体里。
-fn strip_key(body: &Value) -> Value {
-    let mut body = body.clone();
-    if let Some(object) = body.as_object_mut() {
-        object.remove("idempotency_key");
-    }
-    body
-}
-
 /// 单次探活的超时。
 ///
 /// 占住端口的也可能是**只完成握手、从不作答**的监听者：没有超时，一次探活会永远等下去，
@@ -2726,92 +2554,40 @@ async fn publish_bootstrap(client: &Client, base_url: &str, admin_token: &str) {
     assert_eq!(response.status(), StatusCode::OK);
 }
 
-/// 型号身份对不上时必须被发布期拒掉：把合同里的 `model.const` 与 `native_model_id` 拆开。
-async fn reject_mismatched_model_identity(client: &Client, base_url: &str, admin_token: &str) {
-    let mut config: Value = serde_json::from_str(include_str!(
-        "../../../../config/bootstrap/gpt-image-2.5-flare.json"
-    ))
-    .expect("bootstrap config");
-    config["native_model_id"] = Value::String("different-model".to_owned());
-    let response = client
-        .post(format!("{base_url}/api/v1/runtime-revisions"))
-        .bearer_auth(admin_token)
-        .json(&config)
-        .send()
-        .await
-        .expect("mismatched publication");
-    assert_eq!(response.status(), StatusCode::BAD_REQUEST);
-}
-
-async fn verify_reconciliation_contract(
-    client: &Client,
-    base_url: &str,
-    admin_token: &str,
-    api_key: &str,
-    database_url: &str,
-) {
+/// 走一次**结果不明**的执行，验对账案例的列出与退款处置。
+///
+/// v1 自己在 `fail_or_reconcile` 里建案、保留占用与渠道槽位，所以这条夹具不再人工造状态：
+/// 假上游在受理后拒绝，这次执行就落在 `reconciliation_required`。
+async fn verify_reconciliation_contract(harness: &Harness) {
+    let client = Client::new();
     let key = format!("reconciliation-{}", Uuid::new_v4());
-    // 没有 Worker：同步入口等到超时，但内部记录已经建好了——正是这里的夹具。
-    let (status, body) = post_json(
-        base_url,
-        api_key,
-        "/v1/images/generations",
-        &key,
-        &generation_request_body("reconciliation contract"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
-    let pool = PgPool::connect(database_url)
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "reconciliation contract"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "got {body}");
+    assert_eq!(body["error"]["code"].as_str(), Some("outcome_unknown"));
+    let job_id = job_id_of(&harness.pool, &key).await;
+    let state: String = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+        .bind(job_id)
+        .fetch_one(&harness.pool)
         .await
-        .expect("contract database");
-    let job_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(&key)
-            .fetch_one(&pool)
-            .await
-            .expect("reconciliation job");
-    let attempt_id = Uuid::new_v4();
-    let case_id = Uuid::new_v4();
-    let account_id: Uuid =
-        sqlx::query_scalar("SELECT account_id FROM generation.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("reconciliation account");
+        .expect("reconciliation job state");
+    assert_eq!(state, "reconciliation_required");
+    // 占用**保留**：受理的那一刻扣下的预授权一直占着，直到对账给出结论。
     let balance_after_hold: i64 = sqlx::query_scalar(
         "SELECT a.balance_microusd FROM ledger.accounts a JOIN generation.jobs j ON j.account_id = a.id WHERE j.id = $1",
     )
     .bind(job_id)
-    .fetch_one(&pool)
+    .fetch_one(&harness.pool)
     .await
     .expect("balance after hold");
-    sqlx::query("UPDATE generation.jobs SET state = 'reconciliation_required' WHERE id = $1")
-        .bind(job_id)
-        .execute(&pool)
-        .await
-        .expect("job reconciliation state");
-    sqlx::query(
-        "INSERT INTO generation.attempts (id, job_id, state, request_digest) VALUES ($1,$2,'reconciliation_required','contract')",
-    )
-    .bind(attempt_id)
-    .bind(job_id)
-    .execute(&pool)
-    .await
-    .expect("attempt fixture");
-    sqlx::query(
-        "INSERT INTO operations.reconciliation_cases (id, job_id, attempt_id, account_id, reason) VALUES ($1,$2,$3,$4,'contract')",
-    )
-    .bind(case_id)
-    .bind(job_id)
-    .bind(attempt_id)
-    .bind(account_id)
-    .execute(&pool)
-    .await
-    .expect("case fixture");
-
     let cases: Value = client
-        .get(format!("{base_url}/api/v1/reconciliation-cases"))
-        .bearer_auth(admin_token)
+        .get(format!("{}/api/v1/reconciliation-cases", harness.base_url))
+        .bearer_auth(&harness.admin_token)
         .send()
         .await
         .expect("case list")
@@ -2833,9 +2609,10 @@ async fn verify_reconciliation_contract(
     });
     let response = client
         .post(format!(
-            "{base_url}/api/v1/reconciliation-cases/{job_id}/refund"
+            "{}/api/v1/reconciliation-cases/{job_id}/refund",
+            harness.base_url
         ))
-        .bearer_auth(admin_token)
+        .bearer_auth(&harness.admin_token)
         .json(&legacy_charge)
         .send()
         .await
@@ -2848,9 +2625,10 @@ async fn verify_reconciliation_contract(
     for _ in 0..2 {
         let response = client
             .post(format!(
-                "{base_url}/api/v1/reconciliation-cases/{job_id}/refund"
+                "{}/api/v1/reconciliation-cases/{job_id}/refund",
+                harness.base_url
             ))
-            .bearer_auth(admin_token)
+            .bearer_auth(&harness.admin_token)
             .json(&refund)
             .send()
             .await
@@ -2861,7 +2639,7 @@ async fn verify_reconciliation_contract(
         "SELECT j.state, j.error_code, j.failure_kind, h.status, h.amount_microusd, a.balance_microusd FROM generation.jobs j JOIN ledger.holds h ON h.job_id = j.id JOIN ledger.accounts a ON a.id = j.account_id WHERE j.id = $1",
     )
     .bind(job_id)
-    .fetch_one(&pool)
+    .fetch_one(&harness.pool)
     .await
     .expect("resolved state");
     assert_eq!(row.get::<String, _>("state"), "failed");
@@ -2880,152 +2658,17 @@ async fn verify_reconciliation_contract(
         "SELECT count(*) FROM ledger.entries WHERE job_id = $1 AND kind = 'capture'",
     )
     .bind(job_id)
-    .fetch_one(&pool)
+    .fetch_one(&harness.pool)
     .await
     .expect("capture count");
     assert_eq!(capture_count, 0);
     let removed_charge_columns: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.columns WHERE table_schema = 'operations' AND table_name = 'reconciliation_cases' AND column_name IN ('resolution', 'charge_microusd')",
     )
-    .fetch_one(&pool)
+    .fetch_one(&harness.pool)
     .await
     .expect("reconciliation schema");
     assert_eq!(removed_charge_columns, 0);
-    pool.close().await;
-}
-
-async fn verify_lease_recovery_contract(
-    client: &Client,
-    base_url: &str,
-    admin_token: &str,
-    api_key: &str,
-    database_url: &str,
-) {
-    // 两台任务：一台停在"已领取"，一台停在"已提交"。都没有 Worker。
-    let mut jobs = Vec::new();
-    for prompt in [
-        "lease recovery before submit",
-        "lease recovery after submit",
-    ] {
-        let key = format!("lease-{}-{}", Uuid::new_v4(), jobs.len());
-        let (status, body) = post_json(
-            base_url,
-            api_key,
-            "/v1/images/generations",
-            &key,
-            &generation_request_body(prompt),
-        )
-        .await;
-        assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
-        let pool = PgPool::connect(database_url)
-            .await
-            .expect("contract database");
-        let job_id: Uuid =
-            sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
-                .bind(&key)
-                .fetch_one(&pool)
-                .await
-                .expect("recovery job");
-        pool.close().await;
-        jobs.push(job_id);
-    }
-    let leased_job_id = jobs[0];
-    let submitted_job_id = jobs[1];
-    let submitted_attempt_id = Uuid::new_v4();
-    let pool = PgPool::connect(database_url)
-        .await
-        .expect("contract database");
-    sqlx::query(
-        "UPDATE generation.jobs SET state = 'leased', lease_owner = 'expired-worker', lease_expires_at = now() - interval '1 second' WHERE id = $1",
-    )
-    .bind(leased_job_id)
-    .execute(&pool)
-    .await
-    .expect("expired leased fixture");
-    sqlx::query(
-        "UPDATE generation.jobs SET state = 'submitting', lease_owner = 'expired-worker', lease_expires_at = now() - interval '1 second' WHERE id = $1",
-    )
-    .bind(submitted_job_id)
-    .execute(&pool)
-    .await
-    .expect("expired submission fixture");
-    sqlx::query(
-        "INSERT INTO generation.attempts (id, job_id, state, request_digest) VALUES ($1,$2,'submitting','lease-contract')",
-    )
-    .bind(submitted_attempt_id)
-    .bind(submitted_job_id)
-    .execute(&pool)
-    .await
-    .expect("submitted attempt fixture");
-
-    let repository = PgHubRepository::connect(database_url, 2)
-        .await
-        .expect("recovery repository");
-    let recovered = repository
-        .recover_expired_leases()
-        .await
-        .expect("lease recovery");
-    assert_eq!(recovered.returned_to_queue, 1);
-    assert_eq!(recovered.sent_to_reconciliation, 1);
-    let leased_state: String =
-        sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
-            .bind(leased_job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("leased recovery state");
-    assert_eq!(leased_state, "accepted");
-    let submitted_state: String =
-        sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
-            .bind(submitted_job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("submitted recovery state");
-    assert_eq!(submitted_state, "reconciliation_required");
-    let case_count: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
-    )
-    .bind(submitted_job_id)
-    .fetch_one(&pool)
-    .await
-    .expect("recovery case count");
-    assert_eq!(case_count, 1);
-
-    // 租约过期是平台自己的事件，不是渠道事件：它同样必须出现在平台侧失败清单里。
-    let failure_kind: Option<String> =
-        sqlx::query_scalar("SELECT failure_kind FROM generation.jobs WHERE id = $1")
-            .bind(submitted_job_id)
-            .fetch_one(&pool)
-            .await
-            .expect("recovery failure kind");
-    assert_eq!(failure_kind.as_deref(), Some("platform_internal"));
-    let internal: Value = client
-        .get(format!(
-            "{base_url}/api/v1/provider-failures?kind=platform_internal"
-        ))
-        .bearer_auth(admin_token)
-        .send()
-        .await
-        .expect("platform internal failures")
-        .json()
-        .await
-        .expect("platform internal failures JSON");
-    let entry = internal
-        .get("failures")
-        .and_then(Value::as_array)
-        .and_then(|list| {
-            list.iter()
-                .find(|entry| entry["job_id"].as_str() == Some(&submitted_job_id.to_string()))
-        })
-        .unwrap_or_else(|| panic!("租约过期的 Job 必须能被按类别查到：{internal}"));
-    assert_eq!(entry["error_code"].as_str(), Some("outcome_unknown"));
-
-    let repeated = repository
-        .recover_expired_leases()
-        .await
-        .expect("repeated lease recovery");
-    assert_eq!(repeated.returned_to_queue, 0);
-    assert_eq!(repeated.sent_to_reconciliation, 0);
-    pool.close().await;
 }
 
 /// 取一次对客目录（`GET /v1/models`）。
@@ -3384,13 +3027,12 @@ struct CacheEntry {
 
 /// 进程内假 Redis：只实现加速层用到的那几条命令。
 ///
-/// 它不是"另一个实现"，而是**测试用的可观测替身**：用例可以读它、改它、让它拒绝写入，从而构造
-/// "缓存被改错""失效没成功""缓存服务停掉"这三种现实里会发生、但没法靠真实 Redis 稳定复现的情形。
+/// 它不是"另一个实现"，而是**测试用的可观测替身**：用例可以读它、改它、关掉它，从而构造
+/// "缓存被改错""缓存服务停掉"这两种现实里会发生、但没法靠真实 Redis 稳定复现的情形。
 struct CacheFixture {
     url: String,
     settings: CacheSettings,
     state: Arc<Mutex<BTreeMap<String, CacheEntry>>>,
-    fail_writes: Arc<std::sync::atomic::AtomicBool>,
     connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
@@ -3402,12 +3044,10 @@ impl CacheFixture {
             .expect("fake redis binds");
         let port = listener.local_addr().expect("addr").port();
         let state: Arc<Mutex<BTreeMap<String, CacheEntry>>> = Arc::new(Mutex::new(BTreeMap::new()));
-        let fail_writes = Arc::new(std::sync::atomic::AtomicBool::new(false));
         let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Arc::new(Mutex::new(Vec::new()));
         let handle = {
             let state = state.clone();
-            let fail_writes = fail_writes.clone();
             let connections = connections.clone();
             tokio::spawn(async move {
                 loop {
@@ -3415,9 +3055,8 @@ impl CacheFixture {
                         break;
                     };
                     let state = state.clone();
-                    let fail_writes = fail_writes.clone();
                     let served = tokio::spawn(async move {
-                        let _ = serve_fake_redis(socket, state, fail_writes).await;
+                        let _ = serve_fake_redis(socket, state).await;
                     });
                     if let Ok(mut connections) = connections.lock() {
                         connections.push(served);
@@ -3429,7 +3068,6 @@ impl CacheFixture {
             url: format!("redis://127.0.0.1:{port}"),
             settings,
             state,
-            fail_writes,
             connections,
             listener: Mutex::new(Some(handle)),
         }
@@ -3445,17 +3083,6 @@ impl CacheFixture {
 
     /// 给**第二个 API 副本**用的缓存句柄：共享同一台假 Redis 的 URL、状态与写入闸门，但不持有
     /// 监听任务——停止与否仍由原夹具决定，第二个副本只借它读写同一台缓存。
-    fn share(&self) -> Self {
-        Self {
-            url: self.url.clone(),
-            settings: self.settings,
-            state: self.state.clone(),
-            fail_writes: self.fail_writes.clone(),
-            connections: Arc::new(Mutex::new(Vec::new())),
-            listener: Mutex::new(None),
-        }
-    }
-
     /// 缓存里的原文（不看 TTL）。
     fn raw(&self, key: &str) -> Option<String> {
         self.state
@@ -3486,12 +3113,6 @@ impl CacheFixture {
         self.state.lock().expect("cache state lock").remove(key);
     }
 
-    /// 让后续的 `SET` / `DEL` 全部失败：模拟"发布之后的失效没成功"。
-    fn set_fail_writes(&self, fail: bool) {
-        self.fail_writes
-            .store(fail, std::sync::atomic::Ordering::SeqCst);
-    }
-
     /// 关掉这个缓存服务：监听与已建立的连接一起断，客户端会看到连接被重置。
     fn stop(&self) {
         if let Ok(mut listener) = self.listener.lock()
@@ -3508,10 +3129,6 @@ impl CacheFixture {
 
     fn balance(&self, account_id: &str) -> Option<Value> {
         self.json(&format!("user_balance:{account_id}"))
-    }
-
-    fn route(&self, gateway_model: &str) -> Option<Value> {
-        self.json(&format!("route:{gateway_model}"))
     }
 
     /// 把缓存里的余额改成一个错值（写入时间与来源由用例指定）。
@@ -3593,7 +3210,6 @@ fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
 async fn serve_fake_redis(
     socket: tokio::net::TcpStream,
     state: Arc<Mutex<BTreeMap<String, CacheEntry>>>,
-    fail_writes: Arc<std::sync::atomic::AtomicBool>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -3625,7 +3241,7 @@ async fn serve_fake_redis(
             reader.read_exact(&mut buffer).await?;
             args.push(String::from_utf8_lossy(&buffer[..length]).into_owned());
         }
-        let reply = fake_redis_command(&args, &state, &fail_writes);
+        let reply = fake_redis_command(&args, &state);
         writer.write_all(reply.as_bytes()).await?;
     }
 }
@@ -3634,11 +3250,7 @@ async fn serve_fake_redis(
 /// 会让"命令名写错了"这种错误在用例里悄悄通过，而真实 Redis 会直接拒绝它。
 ///
 /// `CLIENT` 要放行：客户端建连接时会发两条 `CLIENT SETINFO`，它们的应答内容没人看。
-fn fake_redis_command(
-    args: &[String],
-    state: &Arc<Mutex<BTreeMap<String, CacheEntry>>>,
-    fail_writes: &Arc<std::sync::atomic::AtomicBool>,
-) -> String {
+fn fake_redis_command(args: &[String], state: &Arc<Mutex<BTreeMap<String, CacheEntry>>>) -> String {
     let name = args
         .first()
         .map(|value| value.to_ascii_uppercase())
@@ -3662,9 +3274,6 @@ fn fake_redis_command(
             }
         }
         "SET" => {
-            if fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-                return "-ERR writes are disabled in this test\r\n".to_owned();
-            }
             let (Some(key), Some(value)) = (args.get(1), args.get(2)) else {
                 return "-ERR wrong number of arguments\r\n".to_owned();
             };
@@ -3690,9 +3299,6 @@ fn fake_redis_command(
             "+OK\r\n".to_owned()
         }
         "DEL" => {
-            if fail_writes.load(std::sync::atomic::Ordering::SeqCst) {
-                return "-ERR writes are disabled in this test\r\n".to_owned();
-            }
             let mut state = state.lock().expect("cache state lock");
             let mut removed = 0_i64;
             for key in args.iter().skip(1) {
@@ -3876,21 +3482,6 @@ async fn audit_events(harness: &Harness, action: &str) -> Vec<Value> {
     .fetch_all(&harness.pool)
     .await
     .expect("audit events")
-}
-
-/// 等内部执行记录跑到某个状态：起了 Worker 之后，Job 是被异步领走的，读一次不够。
-async fn wait_for_job_state(harness: &Harness, key: &str, expected: &str) {
-    for _ in 0..300 {
-        if harness.job(key).await.1 == expected {
-            return;
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-    assert_eq!(
-        harness.job(key).await.1,
-        expected,
-        "内部执行记录必须跑到这个状态"
-    );
 }
 
 /// 对客响应里**可比对**的那部分：图片项各有哪些字段、是不是本机假上游给的 `url`。

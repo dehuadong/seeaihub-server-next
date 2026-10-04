@@ -27,8 +27,8 @@
 - **档位怎么表达**：候选可以显式给出 `routing_priority`，**缺省等于数组下标**（§1 的现状）；**显式给值才能让两条候选同档**。下一条的索引调整以它为前提——没有它，"同档多候选"在发布形状里根本表达不出来，档内分流也就永远走不到。
 - **档内定序**：同一档里按 `weight` 分摊要划分区间，**区间划分按 `offering_id` 升序**，不按数据库返回的行序——落点是哈希出来的一个数，行序不稳定的话同一请求换个取数顺序就会分到另一条候选，"可重放"就成了空话。定序键必须是**与请求无关的发布数据**，`offering_id` 满足这一点。
 - **分摊用确定性哈希，输入是 `(account_id, idempotency_key)`**：`hash(account_id ‖ idempotency_key)` 映射到 `[0, Σweight)`，落在哪条候选的区间就选哪条。不用随机数发生器。理由：判定可复现、离线可断言分布、`routing_decisions` 事后能重建"为什么是它"（`ADR-0009` 要求判定记录可重建）。
-- **为什么不是 job id**：选路发生在生成 JobId **之前**——`GenerationService::create` 先 `select_candidate`、再 `create_job`，JobId 是在 `create_job` 里才 `JobId::new()` 出来的（`crates/persistence`）。拿一个当时还不存在的值当哈希输入是因果倒置；而 `(account_id, idempotency_key)` 在受理前就已知。
-- **重放语义**：同一个 `(account_id, idempotency_key)` 的**重放必然分到同一条候选**——哈希输入相同 ⇒ 分流结果相同；而 `create_job` 本来就把同键重发去重成原 Job（`UNIQUE (account_id, idempotency_key)`），所以重放既不改选路、也不新建 Job、不重复计费。**不同幂等键各自独立分摊**，哪怕在同一个账户下。`account_id` 也进哈希：幂等键只在自己账户内唯一，不同账户用同一个键时不该相关。
+- **为什么不是 job id**：选路发生在生成 JobId **之前**——直接执行先 `select_candidate` 与冻价、再 `admit`，JobId 是在 `admit` 里才 `JobId::new()` 出来的（`crates/persistence`）。拿一个当时还不存在的值当哈希输入是因果倒置；而 `(account_id, idempotency_key)` 在受理前就已知。
+- **重放语义**：同一个 `(account_id, idempotency_key)` 的**重放必然分到同一条候选**——哈希输入相同 ⇒ 分流结果相同；而 `admit` 本来就把同键重发去重成原 Job（`UNIQUE (account_id, idempotency_key_digest)`），所以重放既不改选路、也不新建 Job、不重复计费。**不同幂等键各自独立分摊**，哪怕在同一个账户下。`account_id` 也进哈希：幂等键只在自己账户内唯一，不同账户用同一个键时不该相关。
 - **权重不做的事**：不改变档位顺序、不看价格、不看健康度/延迟/成功率。因此它**不是** `ADR-0015`/`ADR-0009` 禁止的"核心服务内置价格、优先级或健康度择优"——它只是发布者给出的**分流比**，与 `routing_priority` 同为发布数据。
 - **`weight` 是策略的输入**（§6.4）：它只在生效策略消费它时起作用；**未配置策略时默认 `priority_failover`，权重按本节口径在同档内分流**（＝今天的行为）。
 - **索引调整**：现有 `one_active_entry_per_model_and_priority`（`(gateway_model, routing_priority) WHERE active`）不允许同档多候选，与"档内分流"冲突 ⇒ 换成 `(gateway_model, offering_id) WHERE active`。**这一处直接改动 `ADR-0009` 的操作性条款**（原文写的是"数字小者优先**且同一型号内唯一**"）。用户**已确认**该口径（§8）；`ADR-0009` 已追加"**部分被取代**"标注，其操作性条款**已就地修订**（2026-09-22）：`ADR-0009` 追加了"预授权/上限条款"修订说明，"部分被取代"标注里也点明了"同一型号内唯一"已由 `ADR-0020` 取代——见 §8 与 [`0007`](./0007-pricing-floor-and-settlement.md) §10。

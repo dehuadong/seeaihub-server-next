@@ -1,31 +1,28 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, AdapterError, GatewayAdapter, ImageAdapter, PreparedImageRequest,
-    ProviderCost, ProviderCredential, ProviderSuccess, RetrySafety,
+    AdapterDescriptor, GatewayAdapter, ImageAdapter, ProviderCost, ProviderCredential, RetrySafety,
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
-    AccountId, AttemptId, AttemptStage, ChannelId, ChargeFacts, ConsumerRatesCny, CostBasis,
-    CreateImageGeneration, ExecutionStage, FencingToken, FloorTable, FxRate, GenerationJob,
-    HoldSource, ImageBranch, ImageParameterKind, JobId, JobState, LedgerEntry, LedgerEntryKind,
-    MeteringEvidence, OfferingCandidate, OfferingId, ParameterRenames, PriceRates, PriceSnapshot,
-    PricingFormula, ProviderCostFact, ProviderCostSource, PublishedModel, PublishedOffering,
-    PublishedRevision, RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, VendorModelId,
-    apply_enum_maps, apply_parameter_defaults, apply_parameter_renames, apply_size_mapping,
-    carries_parameter, contract_image_parameter_kind, contract_model_identity, declared_defaults,
-    declared_enum_maps, declared_field_names, declared_parameter_names,
-    declared_reference_image_limit, declared_renames, declared_size_mapping,
-    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
-    is_used_parameter_value, literal_parameter_text, place_image_inputs, platform_image_parameters,
-    resolve_size_tier, unit_amount_microusd, wire_parameter_name,
+    AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
+    FencingToken, FloorTable, FxRate, HoldSource, ImageBranch, ImageParameterKind, JobId,
+    LedgerEntry, LedgerEntryKind, MeteringEvidence, OfferingCandidate, OfferingId,
+    ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
+    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
+    RouteStrategy, RuntimeRevisionId, TokenUsage, VendorModelId, apply_enum_maps,
+    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
+    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
+    declared_field_names, declared_parameter_names, declared_reference_image_limit,
+    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
+    declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
+    place_image_inputs, resolve_size_tier, unit_amount_microusd, wire_parameter_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     collections::{BTreeMap, BTreeSet, HashSet},
-    num::NonZeroU64,
     sync::Arc,
     time::Duration,
 };
@@ -34,8 +31,7 @@ use uuid::Uuid;
 
 mod alerts;
 pub use alerts::{
-    AlertCounters, AlertSink, ExecutionAlert, LedgerMismatchAlert, PlatformAlert,
-    PlatformAlertExit, PlatformAlerter, is_platform_event,
+    AlertCounters, AlertSink, ExecutionAlert, LedgerMismatchAlert, PlatformAlert, PlatformAlerter,
 };
 
 mod auth;
@@ -999,6 +995,9 @@ fn select_candidate_with_strategy(
     let contract_parameters = contract_parameter_face(request, &candidates[0].capability_schema)?;
     // 把每个候选连它的取舍结果一起算出来。`considered` 要记录**完整**的取舍画面，
     // 而不是"评估到命中为止"的部分清单——它是判定记录，不是求值轨迹。
+    // 候选判定不复制图片：用同样张数的空占位走完同一条映射管线，图片内容留给选中那条物化。
+    let plan_images = vec![String::new(); request.reference_images.len()];
+    let plan_mask = request.mask.as_deref().map(|_| "");
     let evaluated: Vec<(PublishedOffering, Value, ConsideredCandidate)> = candidates
         .iter()
         .map(|candidate| {
@@ -1012,7 +1011,12 @@ fn select_candidate_with_strategy(
             if reviewed_as_disabled(candidate, enabled_offerings) {
                 skip_reason = Some(DISABLED_OFFERING_REASON.to_owned());
             } else {
-                match prepare_carrier_parameters(&contract_parameters, request, &published) {
+                match prepare_carrier_parameters_with(
+                    &contract_parameters,
+                    &published,
+                    &plan_images,
+                    plan_mask,
+                ) {
                     Err(reason) => skip_reason = Some(reason),
                     Ok(prepared) => {
                         if let Err(error) = validate_restrictions(
@@ -1066,10 +1070,17 @@ fn select_candidate_with_strategy(
             ..considered.clone()
         })
         .collect::<Vec<_>>();
-    let (published, parameters, _) = evaluated
+    let (published, _, _) = evaluated
         .into_iter()
         .nth(chosen)
         .expect("index just computed");
+    // 只有选中的候选才复制图片：判定阶段用的是空占位（RFC 0018 §3）。
+    let parameters = prepare_carrier_parameters(&contract_parameters, request, &published)
+        .map_err(|reason| {
+            ApplicationError::NoEligibleOffering(format!(
+                "the chosen offering cannot carry this request: {reason}"
+            ))
+        })?;
     let decision = RoutingDecision {
         runtime_revision_id: revision_id,
         chosen_offering_id: published.offering_id,
@@ -1260,16 +1271,16 @@ fn weight_split_draw(account_id: AccountId, idempotency_key: &str) -> u64 {
 
 /// 对客受理请求：调用方按**合同**给字段，图片直接给公网 URL 或 data URL。
 ///
-/// 这是**接收入口**的形状，与落库的 [`CreateImageGeneration`] 分开：后者的 `native_parameters`
-/// 里图片已经落在被选中候选自己的参数名上（`image`、`image_urls`、`mask`、`mask_url`…），
-/// 落库与 Worker 只看后者。两者之间的换算就是 Offering Parameter Mapping 的第一块。
+/// 这是**接收入口**的形状，直接执行就在它上面工作：调用方只给 `image` / `image_urls` / `mask`，
+/// 选中候选之后由 Offering Parameter Mapping 在内存里把图片落到该候选声明的参数名上
+/// （`image`、`image_urls`、`mask`、`mask_url`…），这些值不落库。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CreateImageGenerationRequest {
     pub account_id: AccountId,
     /// **对外的模型字段**：平台型号名（发布时的型号标识）。它与厂商原生名、
     /// 以及真正发给渠道的模型名是三个分开的角色。
     pub model: String,
-    /// 合同里的模型参数（扁平，不再有 `native_parameters` 外壳；图片不走这里）。
+    /// 合同里的模型参数（扁平放在顶层；图片不走这里）。
     pub native_parameters: Value,
     /// 参考图：调用方给的 `image` / `image_urls`（同义）归一到这里，每项是公网 URL 或 data URL。
     #[serde(default)]
@@ -1436,35 +1447,6 @@ impl CreateImageGenerationRequest {
     }
 }
 
-/// **内部**的 Job 视图：同步门面等终态时读它，管理员面与测试也从这里看结果。
-///
-/// 它不是对客的异步任务协议——对客只有同步入口，不会拿到 `job_id`，也没有可查询的任务接口；
-/// Job 是内部的执行与审计记录（状态机服务于崩溃恢复与运营处置）。
-///
-/// `data` 只在成功时出现、`error_code` 只在失败时出现——两者不会同时在场。
-#[derive(Debug, Clone, Serialize, Deserialize)]
-pub struct JobView {
-    pub job_id: JobId,
-    pub state: String,
-    pub branch: ImageBranch,
-    /// 对外的模型字段：平台型号名。
-    pub model: String,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub error_code: Option<String>,
-    /// 当次结果的信封：每项只有渠道给的 `url` 或 `b64_json`，平台不改写、不下载。
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub data: Option<Vec<GeneratedImage>>,
-}
-
-#[derive(Debug, Clone)]
-pub struct ClaimedJob {
-    pub job: GenerationJob,
-    pub lease_owner: String,
-    pub lease_expires_at: DateTime<Utc>,
-}
-
 /// 对客错误码：**消费者能看到的只有这三种**。渠道的 HTTP 状态码、错误码与原文一律不出现在对客响应里。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -1524,87 +1506,11 @@ pub fn public_error_code(kind: ProviderFailureKind, retry_safety: RetrySafety) -
 }
 
 #[derive(Debug, Clone)]
-pub struct AttemptFailure {
-    /// 渠道原始码或平台内部码：**只留内部**（Attempt 与对账），不进对客响应。
-    pub provider_code: String,
-    /// 对客码：写进 Job，消费者能看到的唯一一种错误码。
-    pub public_code: PublicErrorCode,
-    /// 渠道原文或平台说明：只留内部。
-    pub message: String,
-    pub trace_id: Option<String>,
-    /// 平台侧失败类别：决定对客码与"是否属平台侧事件"。
-    pub kind: ProviderFailureKind,
-    /// 这次失败在**上游受理**这件事上的可判定性（Driver 如实区分的那一态）。
-    ///
-    /// 落库不需要它（Attempt 的状态由 `target_state` 决定），但重投的判据只有它：
-    /// `SafeBeforeAcceptance` 是"可证明上游没有受理"，重投不会付两次上游成本；其余两态一律
-    /// 不重投。放在这里而不是在编排层按错误码再猜一遍——能用哪一态只有 Driver 手里的报文说得清。
-    pub retry_safety: RetrySafety,
-    pub target_state: JobState,
-    pub hold_disposition: HoldDisposition,
-    /// 这次执行**已经看到**的成本事实（成本平面）。
-    ///
-    /// 执行已经发生、上游成本也拿得到，成本事实就必须有去处——只有成功路径才落成本，等于把
-    /// "这笔到底花了多少钱"丢在一条已经付过钱的路径上。Driver 在终态之后判定失败时把已读到的
-    /// 成本附在错误上，这里原样落库；Driver 没报回来时记 `unavailable`（来源可辨、进缺口清单）。
-    /// 只有"请求根本没交到渠道"的执行（凭证取不到、Driver 装不起来、参数被挡在请求之外）才是
-    /// `None`：那时的 NULL 说的是"根本没采"，不是"成本是 0"。
-    pub provider_cost: Option<ProviderCostFact>,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum HoldDisposition {
-    Release,
-    RetainForReconciliation,
-}
-
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
-pub struct LeaseRecovery {
-    pub returned_to_queue: u64,
-    pub sent_to_reconciliation: u64,
-}
-
-#[derive(Debug, Clone)]
-pub struct CompleteJob {
-    pub job_id: JobId,
-    pub worker_id: String,
-    pub attempt_id: AttemptId,
-    /// 当次结果的信封：渠道给什么就是什么。
-    pub images: Vec<GeneratedImage>,
-    pub evidence: MeteringEvidence,
-    pub charge_microusd: u64,
-    /// 上游逐请求标识，写入 `attempts.provider_trace_id` 供人工对账。
-    pub provider_trace_id: Option<String>,
-    /// 这次执行看到的**成本事实**（成本平面，原币种）。与 `evidence` 并列但**不是同一件事**：
-    /// 计量事实是上游给的分项 token，成本只进毛利口径，不改对客金额。
-    pub provider_cost: ProviderCostFact,
-}
-
-#[derive(Debug, Clone)]
 pub struct RefundReconciliationCommand {
     pub job_id: JobId,
     pub note: String,
     pub business_key: String,
     pub actor: String,
-}
-
-/// 一次"可证明未受理"的失败：把这次执行收尾，并让同一台 Job 在稍后重投。
-///
-/// 与 [`AttemptFailure`] 分开，是因为它**不是终态处置**：预授权在重投期间原样保留
-/// （不释放、不重新扣一遍），Job 回到"等执行"，只结算一次——也就是这台 Job 最后成功或
-/// 用尽额度失败的那一次。把它塞进 [`AttemptFailure`] 会让"失败处置"同时有两种意思
-/// （终态 / 还要再来一次），而这两种意思在账上的后果完全不同。
-#[derive(Debug, Clone)]
-pub struct UnacceptedAttempt {
-    pub job_id: JobId,
-    pub worker_id: String,
-    pub attempt_id: AttemptId,
-    /// 这次是第几次执行（`attempt_no`），用来算退避与判定还有没有额度。
-    pub attempt_no: u32,
-    /// 这次执行自己的失败事实（渠道码、原文、成本四列）——**逐次归**，与终态那次一样。
-    pub failure: AttemptFailure,
-    /// 下一次允许领取这台 Job 的时刻（由编排层按退避算好）。
-    pub next_attempt_at: DateTime<Utc>,
 }
 
 /// 新协议受理时冻结的**供给身份**。
@@ -1653,9 +1559,9 @@ pub struct AdmitExecution {
     pub max_channel_in_flight: u64,
 }
 
-/// 一次新协议受理落库后的最小 Job 投影。
+/// 一次受理落库后的最小 Job 投影。
 ///
-/// 它不是旧协议那条 GenerationJob：没有请求参数、没有结果信封，也不回明文幂等键。
+/// 只有最小执行事实：没有请求参数、没有结果信封，也不回明文幂等键。
 #[derive(Debug, Clone)]
 pub struct AdmittedJob {
     pub job_id: JobId,
@@ -1702,7 +1608,7 @@ pub struct ExecutionLookup {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 一台过期 v1 执行被接管后的只读投影：Worker 只按它做只读查询与收尾。
+/// 一台过期执行被接管后的只读投影：Worker 只按它做只读查询与收尾。
 ///
 /// 它只带最小执行事实（身份、当前 Attempt 与任务句柄、适配器与凭证引用、冻结价格与账户），
 /// 不含请求正文、结果图片或渠道响应；`fencing_token` 是**本次接管后**的新 token。
@@ -1727,7 +1633,7 @@ pub struct TakenOverExecution {
     pub adapter_key: String,
     pub base_url: String,
     pub credential_env: String,
-    /// 渠道类别：**读时 join 渠道表**，不新增冻结列（用于 v1 告警）。
+    /// 渠道类别：**读时 join 渠道表**，不新增冻结列（用于告警）。
     pub provider_kind: String,
     pub price_snapshot: PriceSnapshot,
     pub account_id: AccountId,
@@ -1770,7 +1676,7 @@ pub struct BeginSubmission {
 pub struct SubmissionStarted {
     pub job_id: JobId,
     pub attempt_id: AttemptId,
-    /// 同一台 Job 内的第几次执行，从 1 起（与旧协议同名同义）。
+    /// 同一台 Job 内的第几次执行，从 1 起。
     pub attempt_no: u32,
 }
 
@@ -1804,6 +1710,11 @@ pub struct SettleExecution {
     pub provider_cost: ProviderCostFact,
     /// 按冻结快照算出的实收（CNY 微单位）。
     pub charge_microusd: u64,
+    /// 这次执行**实际产出**的图片张数；上游没给张数时是 `None`，落库留 NULL。
+    ///
+    /// 它是用量明细与账单汇总里"几张"的唯一来源（RFC 0019 §5.3）；缺失就是缺失，
+    /// 不拿请求的 `n`、token 数或 0 顶替。
+    pub image_count: Option<u32>,
     /// 上游逐请求标识；写入 Attempt 供人工对账。
     pub provider_trace_id: Option<String>,
 }
@@ -1918,6 +1829,8 @@ pub struct LateFacts {
     pub evidence: Option<MeteringEvidence>,
     /// 成本事实或成本缺口。
     pub provider_cost: Option<ProviderCostFact>,
+    /// 上游任务的终态快照；对账只认 `Succeeded` 才可能按证据结算。
+    pub provider_state: Option<seeai_adapter_sdk::ProviderTaskState>,
 }
 
 /// 晚到事实的收件结果。
@@ -1927,7 +1840,7 @@ pub enum LateFactsOutcome {
     Received,
     /// 同一 Attempt 同一形态已有不同内容：建对账案例，不改原收件。
     Conflicted,
-    /// 关联不上（Job 不是 v1、Attempt 不属于该 Job、或没有可收的有界事实）：不收件，也不改任何状态。
+    /// 关联不上（Attempt 不属于该 Job、或没有可收的有界事实）：不收件，也不改任何状态。
     Ignored,
 }
 
@@ -1980,6 +1893,8 @@ pub struct ClaimedLateFact {
     pub evidence: Option<MeteringEvidence>,
     /// 成本事实或成本缺口；收件形态不包含它时为 None。
     pub provider_cost: Option<ProviderCostFact>,
+    /// 收件行记下的上游终态快照；缺失表示当时没拿到可信终态。
+    pub provider_state: Option<seeai_adapter_sdk::ProviderTaskState>,
 }
 
 /// 待录入的一行折算率：`effective_at` 为 `None` 表示"立即生效"，**由数据库盖章**。
@@ -2569,24 +2484,6 @@ pub trait HubRepository: Send + Sync {
         limit: u32,
     ) -> Result<Vec<ProviderCostGapView>, ApplicationError>;
 
-    /// 受理前的**轻量读**：网关模型开关、当前生效的修订标识与数据库时钟。
-    ///
-    /// 它只服务加速层：route 缓存里的值带着写它那次发布的修订标识，与这里读到的比对，不一致就
-    /// 回源；开关必须**单独**读，因为 `PATCH enabled` 不改变修订标识——交给缓存判定的话，关掉的
-    /// 模型会在缓存的有效期内继续被受理。时钟也一起取，好让"缓存值新不新鲜"用**同一个时钟**判。
-    ///
-    /// 账户与幂等键只用来判**这次是不是重放**（同一个键已经建过 Job）：重放不新建、不扣款，
-    /// 因此余额预检不该管它。这一项折在同一条查询里读，受理不会因此多一次往返。
-    ///
-    /// 没有这个网关模型时返回 `enabled = false` 与 `None`，不是错误：受理侧对它的处置与
-    /// "取不到任何候选"一样（对客是"模型不存在"）。
-    async fn acceptance_probe(
-        &self,
-        gateway_model: &str,
-        account_id: AccountId,
-        idempotency_key: &str,
-    ) -> Result<AcceptanceProbe, ApplicationError>;
-
     /// 对账用的增量取数：`updated_at` 落在最近 `window` 内的账户与它们的余额。
     ///
     /// 窗口在**库侧**用 `now() - interval` 算：受理、对账、缓存里的写入时间取的都是数据库的
@@ -2769,93 +2666,6 @@ pub trait HubRepository: Send + Sync {
     async fn api_key_identity(&self, key_hash: &str)
     -> Result<(Uuid, AccountId), ApplicationError>;
 
-    /// 创建 Job，并与 Job **同事务**写入路由判定记录。
-    ///
-    /// 返回 Job 与**预授权扣减之后**的余额：受理的预授权扣减同样要写穿缓存，否则缓存会滞后
-    /// 一个预授权额。幂等重放（没有扣减）也返回当前余额——把缓存刷成数据库的值不会有坏处。
-    async fn create_job(
-        &self,
-        command: CreateImageGeneration,
-        branch: ImageBranch,
-        offering: PublishedOffering,
-        request_hash: String,
-        routing: RoutingDecision,
-    ) -> Result<(GenerationJob, BalanceChange), ApplicationError>;
-
-    async fn get_job(
-        &self,
-        account_id: AccountId,
-        job_id: JobId,
-    ) -> Result<JobView, ApplicationError>;
-
-    async fn claim_next_job(
-        &self,
-        worker_id: &str,
-        lease_duration: ChronoDuration,
-    ) -> Result<Option<ClaimedJob>, ApplicationError>;
-
-    async fn recover_expired_leases(&self) -> Result<LeaseRecovery, ApplicationError>;
-
-    /// 开始一次执行：把 Job 推成"提交中"，并**为这次执行写一行 Attempt**。
-    ///
-    /// `attempt_no` 是同一台 Job 内的第几次（从 1 起）：重投出来的每一次执行都占一行、各记
-    /// 自己的用量与成本，所以"这是第几次"必须是落库时确定的序号，不是一个可以事后重排的排序。
-    /// **返回值就是这次执行落库的号**——调用方拿它判重投额度，所以定号与写入必须是同一个动作。
-    async fn begin_attempt(
-        &self,
-        job_id: JobId,
-        worker_id: &str,
-        attempt_id: AttemptId,
-        request_digest: &str,
-    ) -> Result<u32, ApplicationError>;
-
-    /// 可证明未受理的失败：这次执行收尾，同一台 Job 稍后重投。
-    ///
-    /// **预授权原样保留**（`ledger.holds` 不动、余额不动）：这次失败上游没开始计费，重投的不是
-    /// 一笔新业务，重新预授权等于把同一笔钱扣两遍。余额因此也没有变化，调用方不必写穿缓存。
-    ///
-    /// Job 回到"等执行"（`state = 'accepted'`）并把 `next_attempt_at` 推到退避之后：领取那条
-    /// 查询本来就按 `next_attempt_at <= now()` 取，退避因此不需要另外的调度器。
-    ///
-    /// 执行到上限仍失败时**不走这里**：那时按既有失败处置（[`Self::fail_job`]）落终态与释放。
-    async fn requeue_after_unaccepted(
-        &self,
-        command: UnacceptedAttempt,
-    ) -> Result<(), ApplicationError>;
-
-    async fn renew_lease(
-        &self,
-        job_id: JobId,
-        worker_id: &str,
-        lease_duration: ChronoDuration,
-    ) -> Result<(), ApplicationError>;
-
-    /// 结算（`release` + `capture`）。返回结算**之后**的余额，供调用方写穿缓存。
-    async fn complete_job(
-        &self,
-        completion: CompleteJob,
-    ) -> Result<BalanceChange, ApplicationError>;
-
-    /// 失败收尾。释放预授权的那些分支会改动余额，因此同样返回提交后的余额供写穿缓存——
-    /// 不写的话，缓存里会留着一个"刚写过、但偏高"的余额，那正是能被用来误拒的那类值。
-    async fn fail_job(
-        &self,
-        job_id: JobId,
-        worker_id: &str,
-        attempt_id: Option<AttemptId>,
-        failure: AttemptFailure,
-    ) -> Result<BalanceChange, ApplicationError>;
-
-    /// 该账户当前**在跑**的 Job 数（`accepted`/`leased`/`submitting`）。
-    ///
-    /// `except_idempotency_key` 那个不算在内：同一个键重发时，`create_job` 会把它去重成
-    /// 原来那个 Job，并发上限不该把这个重发拒掉。
-    async fn count_in_flight_jobs(
-        &self,
-        account_id: AccountId,
-        except_idempotency_key: &str,
-    ) -> Result<u64, ApplicationError>;
-
     /// 该账户**当天（UTC 自然日）已完成实收**的合计（microusd）。
     ///
     /// 与在飞计数不同，这里问的是**事实**而不是计数：判据是 PostgreSQL 里每账户每 UTC 自然日
@@ -2876,19 +2686,6 @@ pub trait HubRepository: Send + Sync {
         &self,
         query: ProviderFailureQuery,
     ) -> Result<Vec<ProviderFailureView>, ApplicationError>;
-
-    /// 某条候选（供给）**最近** `window` 次已定终态的执行里，开头连续失败了几次。
-    ///
-    /// 判据只看终态：`failed` 与 `reconciliation_required` 都算失败（都不是"结果交付成功"），
-    /// `succeeded` 截断连续段；还没定终态的执行既不计入也不截断——它们还没有结论。
-    ///
-    /// 这只是**现有执行记录的读法**：计数从 Job 的终态现算，不新增表、也不落一份会漂移的计数。
-    /// 读失败按平台侧故障抛出，由调用方决定"这一次不外发"。
-    async fn consecutive_offering_failures(
-        &self,
-        offering_id: OfferingId,
-        window: u32,
-    ) -> Result<u64, ApplicationError>;
 
     /// 对账退款（释放预授权）。返回**账户**与退款后的余额：调用方要按账户把余额写穿缓存。
     async fn refund_reconciliation(
@@ -3153,11 +2950,10 @@ pub trait HubRepository: Send + Sync {
     async fn list_customers(&self, limit: u32) -> Result<Vec<CustomerView>, ApplicationError>;
 }
 
-/// 新协议（execution_protocol = v1）的执行事实端口。
+/// API 直接执行的执行事实端口。
 ///
-/// 与 HubRepository 分开，而不是把方法挂进那一条：旧协议路径（API 建 Job、Worker 领取执行、
-/// 正文与结果落库）保持原样，新端口只接最小事实与摘要，SQL 输入类型里没有图片、也没有
-/// serde_json::Value 请求正文（Spec 0005 §2，RFC 0017 §3）。每个操作是一个事务边界，
+/// 与 HubRepository 分开，而不是把方法挂进那一条：这里只接最小事实与摘要，SQL 输入类型里没有
+/// 图片、也没有 serde_json::Value 请求正文（Spec 0005 §2，RFC 0017 §3）。每个操作是一个事务边界，
 /// 实现不得在事务里跨 Provider 等待，也不得把业务载荷带进端口参数。
 #[async_trait]
 pub trait ExecutionRepository: Send + Sync {
@@ -3218,8 +3014,11 @@ pub trait ExecutionRepository: Send + Sync {
     /// （ADR 0006）。同一 Attempt 同事实重复调用返回已提交结果且不重复扣费；同 Attempt 冲突证据
     /// 建对账案例、不覆盖原结果，返回的仍是原已提交结果。事务失败不留下部分写入。
     ///
-    /// 失败：Job 或 Attempt 不存在、Attempt 不属于该 Job、所有权或 fencing token 不匹配、Job 不是
-    /// v1 记录、以及 Job 已是 failed 等不可重开的终态时返回 ApplicationError::Conflict。
+    /// Job 上的 `image_count` 与终态同事务写入：它是用量明细与账单汇总里"几张"的唯一来源
+    /// （RFC 0019 §5.3）。上游没给张数时写 NULL，读取按 0，子句不拿请求的 `n` 顶替。
+    ///
+    /// 失败：Job 或 Attempt 不存在、Attempt 不属于该 Job、所有权或 fencing token 不匹配、
+    /// 以及 Job 已是 failed 等不可重开的终态时返回 ApplicationError::Conflict。
     /// `reconciliation_required` 允许晚到证据收成成功。
     async fn settle(
         &self,
@@ -3257,11 +3056,11 @@ pub trait ExecutionRepository: Send + Sync {
         facts: LateFacts,
     ) -> Result<LateFactsOutcome, ApplicationError>;
 
-    /// 续约一台 v1 执行的所有权：同一所有者名下只把租约推到 `now() + lease`，**不改 fencing token**。
+    /// 续约一台执行的所有权：同一所有者名下只把租约推到 `now() + lease`，**不改 fencing token**。
     ///
-    /// 只有 `execution_owner` 与 `fencing_token` 都与库里一致、Job 仍是 v1 的
-    /// executing/reconciliation_required 才续约；否则（已终态、所有权已属他人、token 已被接管、
-    /// 不是 v1 记录）返回 ApplicationError::Conflict，调用方据此立即取消该执行。它不写 Attempt、不改状态。
+    /// 只有 `execution_owner` 与 `fencing_token` 都与库里一致、Job 仍是
+    /// executing/reconciliation_required 才续约；否则（已终态、所有权已属他人、token 已被接管）
+    /// 返回 ApplicationError::Conflict，调用方据此立即取消该执行。它不写 Attempt、不改状态。
     async fn renew_execution_ownership(
         &self,
         job_id: JobId,
@@ -3270,12 +3069,12 @@ pub trait ExecutionRepository: Send + Sync {
         lease: ChronoDuration,
     ) -> Result<(), ApplicationError>;
 
-    /// 领取过期所有权：在一条 `FOR UPDATE SKIP LOCKED` 语句里比较并交换一批 v1 执行的所有权，
+    /// 领取过期所有权：在一条 `FOR UPDATE SKIP LOCKED` 语句里比较并交换一批执行的所有权，
     /// **只有接管把 fencing_token 加一**，并续上 `lease`；返回只读投影。
     ///
-    /// 硬过滤 `execution_protocol = 'v1'` 且状态为 executing/reconciliation_required；租约为空或已过期
-    /// 才算过期。已终结与 legacy 记录不会被领走。返回的 `fencing_token` 是接管后的新值，旧所有者
-    /// 凭旧 token 的提交与收尾一律冲突。最多返回 `limit` 条。
+    /// 硬过滤状态为 executing/reconciliation_required；租约为空或已过期才算过期。已终结的执行
+    /// 不会被领走。返回的 `fencing_token` 是接管后的新值，旧所有者凭旧 token 的提交与收尾
+    /// 一律冲突。最多返回 `limit` 条。
     ///
     /// 查询排期在**同一条语句**里守门（RFC 0017 §5）：该 Job 有未结对账案例且
     /// `next_query_at` 未到、或 `attempts` 已达 `max_query_attempts` 时不领走——
@@ -3288,7 +3087,7 @@ pub trait ExecutionRepository: Send + Sync {
         max_query_attempts: u32,
     ) -> Result<Vec<TakenOverExecution>, ApplicationError>;
 
-    /// 回收超龄的未提交孤儿：v1 的 admitted、没有任何 Attempt、受理时间早于 `now() - max_age`。
+    /// 回收超龄的未提交孤儿：状态仍是 admitted、没有任何 Attempt、受理时间早于 `now() - max_age`。
     ///
     /// 这些执行从未写下提交声明，确定没有外部副作用：落 failed 并释放它的 Hold 与渠道槽位。
     /// 不写对客错误码（没有对客结论，也没有重开路径）。返回回收条数，最多 `limit` 条。
@@ -6480,244 +6279,6 @@ fn validate_adapter_compatibility(
     Ok(())
 }
 
-#[derive(Clone)]
-pub struct GenerationService {
-    repository: Arc<dyn HubRepository>,
-    /// 预授权额（microusd）：**服务端定的固定数**，不由调用方自报。
-    ///
-    /// 现状是"一个固定数"，属粗判：它够跑通，也是上限。按 Price Snapshot 算出这次请求
-    /// 最坏要花多少、并在低于该成本时于受理前拒绝，是后续优化——那时这项才会变准。
-    max_cost_microusd: u64,
-    /// 该账户同时能有多少个**在跑**的生成任务（默认 1）。
-    ///
-    /// 这是最初的并发设计：一个账户同时只跑一个，超出的直接拒（429），
-    /// 免得一次提交一堆把上游额度与平台成本一起打满。
-    max_concurrent_jobs: u64,
-    /// 该账户**当天**最多能花掉多少（microusd，运营取值，见 [`GenerationDailySpendLimit`]）。
-    ///
-    /// 它与并发上限守的不是同一件事：并发上限守的是"同时在跑几个"，钱烧光的形态却是**串行**
-    /// 的——一个接一个地跑、每一个都合规，照样能在一天里把余额花完。所以这里问的是当日合计里
-    /// "今天已经扣掉多少"，而不是任何计数器。
-    max_daily_spend_microusd: u64,
-    /// 加速层：候选集从缓存取、受理后把余额快照写穿、以及**只在新鲜时**的不足提示。
-    acceleration: Arc<AccelerationService>,
-    /// 成本护栏：单次请求可能花掉的上游成本上限（运营取值）。
-    cost_ceiling: RequestCostCeiling,
-}
-
-impl GenerationService {
-    #[must_use]
-    pub fn new(
-        repository: Arc<dyn HubRepository>,
-        max_cost_microusd: u64,
-        max_concurrent_jobs: u64,
-    ) -> Self {
-        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
-        Self {
-            repository,
-            max_cost_microusd,
-            max_concurrent_jobs,
-            max_daily_spend_microusd: GenerationDailySpendLimit::default_limit()
-                .max_daily_spend_microusd,
-            acceleration,
-            cost_ceiling: RequestCostCeiling::default_ceiling(),
-        }
-    }
-
-    /// 装上运维给的**单次请求成本上限**。
-    ///
-    /// 上限是配置项：它随部署形态与上游价格变，所以由调用方给，而不是写死在这里。
-    #[must_use]
-    pub fn with_cost_ceiling(mut self, ceiling: RequestCostCeiling) -> Self {
-        self.cost_ceiling = ceiling;
-        self
-    }
-
-    /// 装上运维给的**每日扣费上限**。
-    ///
-    /// 上限是配置项：它随部署形态与客户分级变，所以由调用方给，而不是写死在这里。
-    #[must_use]
-    pub fn with_daily_spend_limit(mut self, limit: GenerationDailySpendLimit) -> Self {
-        self.max_daily_spend_microusd = limit.max_daily_spend_microusd;
-        self
-    }
-
-    /// 装上加速层。
-    #[must_use]
-    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
-        self.acceleration = acceleration;
-        self
-    }
-
-    pub async fn create(
-        &self,
-        request: CreateImageGenerationRequest,
-    ) -> Result<GenerationJob, ApplicationError> {
-        validate_idempotency_key(&request.idempotency_key)?;
-        if self.max_cost_microusd == 0 {
-            return Err(ApplicationError::Configuration(
-                "generation max cost must be positive".to_owned(),
-            ));
-        }
-        let branch = request.branch()?;
-        // 并发上限：一个账户同时只跑这么多个，多出来的在受理前就拒掉。
-        // 同一个幂等键的重发不占名额：那种请求会去重成原来那个 Job（见 `create_job`）。
-        if self
-            .repository
-            .count_in_flight_jobs(request.account_id, &request.idempotency_key)
-            .await?
-            >= self.max_concurrent_jobs
-        {
-            return Err(ApplicationError::TooManyInFlight);
-        }
-        // 每日扣费上限：与上面那条并发判定是**两道不同的门**——那是"同时在跑几个"（保护上游
-        // 与渠道），这是"今天已经花掉多少钱"（保护钱）；花钱可以是完全串行的，并发计数看不见
-        // 它。判据与口径见 [`HubRepository::daily_spend_microusd`]。放在受理路径上、紧挨并发
-        // 判定：两者都是"这次请求进不进得来"的门，进门之前判。
-        let spent_microusd = self
-            .repository
-            .daily_spend_microusd(request.account_id)
-            .await?;
-        if let Some(rejected) =
-            daily_spend_limit_error(self.max_daily_spend_microusd, spent_microusd, Utc::now())
-        {
-            return Err(rejected);
-        }
-        // 加速层开着时先做一次轻量读（生效修订标识 + 开关 + 数据库时钟），候选集再从缓存取；
-        // 关着时这一步不做，取数路径与没有这一层时逐字相同。
-        let probe = if self.acceleration.is_enabled() {
-            Some(
-                self.repository
-                    .acceptance_probe(&request.model, request.account_id, &request.idempotency_key)
-                    .await?,
-            )
-        } else {
-            None
-        };
-        let candidates = match &probe {
-            Some(probe) => self.acceleration.candidates(&request.model, probe).await?,
-            None => CandidateSet {
-                candidates: self.repository.active_offering(&request.model).await?,
-                // 没有缓存：候选刚由数据库给出，取数时已经判过供给与渠道的启用状态。
-                enabled_offerings: None,
-            },
-        };
-        // 复核结果只在缓存给出的候选集上是 `Some`（见 [`CandidateSet`]）：停用因此不依赖那次失效
-        // 有没有成功——被停用的供给或渠道在这一步变成不合格候选，一条都不合格时按平台侧故障处置。
-        let enabled_offerings = candidates.enabled_offerings.as_ref();
-        let candidates = &candidates.candidates;
-        // 这次受理用哪条策略：按模型覆盖优先、其次全局那条。**一条策略都没有时走原来的选路
-        // 函数**——零配置下的行为由构造保证与策略层引入之前逐位相同，而不是靠某个默认参数"应该
-        // 等价"。策略是运行期配置，改它不影响已经受理的 Job：那些 Job 的候选早已固定在快照里。
-        let policy = self.repository.route_policy(&request.model).await?;
-        let (mut offering, native_parameters, routing) = match policy {
-            Some(policy) => {
-                // 标签只有 `user_tag` 消费：别的策略下不为它多查一次库。
-                let account_tag = if policy.strategy == RouteStrategy::UserTag {
-                    self.repository.account_tag(request.account_id).await?
-                } else {
-                    None
-                };
-                let choice = RouteChoice {
-                    strategy: policy.strategy,
-                    discount_rates: &policy.discount_rates,
-                    tag_channel_map: &policy.tag_channel_map,
-                    account_tag: account_tag.as_deref(),
-                };
-                select_candidate_with_strategy(
-                    &request,
-                    branch,
-                    candidates,
-                    enabled_offerings,
-                    &choice,
-                )?
-            }
-            None => select_candidate(&request, branch, candidates, enabled_offerings)?,
-        };
-        // 受理时把定价随快照冻结，并算定这次的预授权额（保底额）。策略在受理时已经定下候选，
-        // 所以售价**不必等上游回来**；冻结之后结算只读那份快照，受理之后改汇率、改加价系数、
-        // 重发修订都不影响这一个 Job。
-        let hold_microusd = self.freeze_pricing(&request, &mut offering).await?;
-        // 成本护栏（兜底）：发布期已经按"这条供给最坏能花多少"判过一次，这里按**这一次请求**再判
-        // 一次——上限被调小、或折算率变差之后，**已经发布出去的**供给不会自己重判，而它此刻真的
-        // 会花掉这么多。判在预检与建 Job 之前：不建 Job、不扣款、不留预授权。
-        //
-        // 判的是**成本**，不是售价、也不是客户余额：对客是平台侧故障（503），不是"你余额不足"。
-        if let Some(cost_cny) = single_request_cost_cny(
-            offering.price_snapshot.formula,
-            offering.price_snapshot.cost_unit_price_microusd,
-            offering.price_snapshot.reference_cost_microusd,
-            offering.price_snapshot.cost_currency.as_deref(),
-            offering.price_snapshot.fx_rate.as_ref(),
-            requested_image_count(&native_parameters),
-        ) && self.cost_ceiling.exceeded_by(cost_cny)
-        {
-            return Err(ApplicationError::RequestCostCeilingExceeded(format!(
-                "model {} offering {} could cost up to {cost_cny} microusd of upstream cost for \
-                 this request, over the ceiling of {} microusd set by \
-                 GENERATION_MAX_REQUEST_COST_MICROUSD",
-                request.model,
-                offering.offering_id,
-                self.cost_ceiling.max_request_cost_microusd()
-            )));
-        }
-        // 预检：读缓存里的可用额作提示（新鲜且不足时记一条日志）。它**不决定受理**：缓存不足
-        // 也要由下面的数据库条件更新确认才回 402（`0013` §3）。
-        if let Some(probe) = &probe {
-            self.acceleration
-                .precheck_balance(request.account_id, hold_microusd, &request.model, probe)
-                .await;
-        }
-        // 幂等哈希取**调用方看到的那份请求**（不含按候选解析出的参数名，也不含按承载面过滤的结果）：
-        // 上游目录变了、或另一个候选的承载面更窄，都不该让同一个幂等键算出不同的哈希。
-        let request_hash = request_hash(&request)?;
-        let (job, balance) = self
-            .repository
-            .create_job(
-                CreateImageGeneration {
-                    account_id: request.account_id,
-                    gateway_model: request.model,
-                    native_parameters,
-                    idempotency_key: request.idempotency_key,
-                    max_cost_microusd: hold_microusd,
-                },
-                branch,
-                offering,
-                request_hash,
-                routing,
-            )
-            .await?;
-        // 预授权扣减已经提交：把扣减后的余额写进缓存，否则缓存会滞后一个预授权额。
-        self.acceleration
-            .write_balance(&balance, BalanceSource::DbCommit)
-            .await;
-        Ok(job)
-    }
-
-    /// 受理路径的定价冻结：预授权额与汇率都由 [`freeze_offering_pricing`] 按同一条规则算定。
-    async fn freeze_pricing(
-        &self,
-        request: &CreateImageGenerationRequest,
-        offering: &mut PublishedOffering,
-    ) -> Result<u64, ApplicationError> {
-        freeze_offering_pricing(
-            self.repository.as_ref(),
-            self.max_cost_microusd,
-            &request.native_parameters,
-            offering,
-        )
-        .await
-    }
-
-    pub async fn get(
-        &self,
-        account_id: AccountId,
-        job_id: JobId,
-    ) -> Result<JobView, ApplicationError> {
-        self.repository.get_job(account_id, job_id).await
-    }
-}
-
 /// 受理时把定价随 Job 冻结，并算定这次的**预授权额**（保底额）。
 ///
 /// 两件事都依赖这次请求，发布侧算不出来：
@@ -6805,461 +6366,6 @@ pub(crate) async fn freeze_offering_pricing(
     offering.price_snapshot.hold_microusd = Some(hold_microusd);
     offering.price_snapshot.hold_source = Some(hold_source);
     Ok(hold_microusd)
-}
-
-pub struct WorkerService {
-    repository: Arc<dyn HubRepository>,
-    adapters: Arc<dyn AdapterFactory>,
-    credentials: Arc<dyn CredentialProvider>,
-    worker_id: String,
-    lease_duration: ChronoDuration,
-    /// 一次上游调用的超时**取值口径**：按本次请求的张数算，封顶在上限。
-    ///
-    /// 为什么不是固定值：对客是同步接口，`n` 张图就是一次上游调用，耗时随 `n` 增长；固定超时会
-    /// 在 `n` 大时把还在生成的上游调用掐断——上游照样计费，我们却拿不到结果。
-    timeouts: RequestTimeoutPolicy,
-    /// 可证明未受理时的重投策略（上限与退避）。见 [`RetryPolicy`]。
-    retry_policy: RetryPolicy,
-    /// 加速层：结算与失败收尾都改余额，提交后要把新余额写穿缓存。
-    acceleration: Arc<AccelerationService>,
-    /// 平台故障告警出口：**配了才有**。没配时连候选的连续失败计数都不读。
-    alerts: Option<PlatformAlertExit>,
-}
-
-impl WorkerService {
-    pub fn new(
-        repository: Arc<dyn HubRepository>,
-        adapters: Arc<dyn AdapterFactory>,
-        credentials: Arc<dyn CredentialProvider>,
-        worker_id: String,
-        lease_duration: ChronoDuration,
-        timeouts: RequestTimeoutPolicy,
-    ) -> Result<Self, ApplicationError> {
-        if worker_id.trim().is_empty() {
-            return Err(ApplicationError::Configuration(
-                "worker_id must not be empty".to_owned(),
-            ));
-        }
-        let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
-        Ok(Self {
-            repository,
-            adapters,
-            credentials,
-            worker_id,
-            lease_duration,
-            timeouts,
-            // 缺省策略就是**开着**的重投（次数有限、退避有上限）：这条能力不靠部署时记得配开关，
-            // 而"关掉重投"是显式配 `GENERATION_RETRY_MAX_ATTEMPTS=1`。
-            retry_policy: RetryPolicy::default(),
-            acceleration,
-            alerts: None,
-        })
-    }
-
-    /// 装上运维给的重投策略（上限与退避基）。
-    ///
-    /// 它是配置项：最坏情况下一个请求会占用对客同步窗口多久，由这两项决定，而窗口与上游的
-    /// 抖动程度都随部署形态变，写死在代码里就只能靠改代码调。
-    #[must_use]
-    pub fn with_retry_policy(mut self, retry_policy: RetryPolicy) -> Self {
-        self.retry_policy = retry_policy;
-        self
-    }
-
-    /// 装上加速层：结算与失败收尾之后要把余额写穿缓存。
-    #[must_use]
-    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
-        self.acceleration = acceleration;
-        self
-    }
-
-    /// 装上平台故障告警出口。
-    ///
-    /// `consecutive_failures` 是配置项：某条候选连续失败到这个次数才外发。不装这个出口就是今天的
-    /// 路径——不告警，也不为告警多读一次库。
-    #[must_use]
-    pub fn with_platform_alerts(
-        mut self,
-        alerter: Arc<PlatformAlerter>,
-        consecutive_failures: NonZeroU64,
-    ) -> Self {
-        self.alerts = Some(PlatformAlertExit::new(alerter, consecutive_failures));
-        self
-    }
-
-    /// 失败收尾 + 写穿余额。
-    ///
-    /// 释放预授权的那些分支会改动余额，**不写穿的话缓存里会留着一个刚写过、但偏高的余额**——
-    /// 那正好是"看起来新鲜、其实已经不对"的那类值，下一次受理就可能凭它误拒。
-    ///
-    /// 告警外发在**处置提交之后**：那时 Job 的终态与这条失败已经落库，告警是旁路，读的是已提交的
-    /// 事实，也不会反过来改它。
-    async fn fail_and_refresh(
-        &self,
-        job: &GenerationJob,
-        attempt_id: AttemptId,
-        failure: AttemptFailure,
-    ) -> Result<(), ApplicationError> {
-        let change = self
-            .repository
-            .fail_job(job.id, &self.worker_id, Some(attempt_id), failure.clone())
-            .await?;
-        self.acceleration
-            .write_balance(&change, BalanceSource::DbCommit)
-            .await;
-        self.raise_platform_alerts(job, &failure).await;
-        Ok(())
-    }
-
-    /// 这次执行**可证明上游没有受理**，还有额度 ⇒ 稍后重投；否则按既有失败处置。
-    ///
-    /// 判据只有一条，来自 Driver 如实区分的失败分类（[`RetrySafety`]）：
-    ///
-    /// - `SafeBeforeAcceptance`：可证明未受理（连不上、上传失败、参考图取不到、上游明确拒绝
-    ///   受理），上游**没开始计费**——重投不会付两次，且还有额度时重投；
-    /// - `AcceptanceUnknown`（超时、5xx、响应读不出）：状态不确定，**一律不重投**，按既有口径
-    ///   进对账。宁可进对账，也不重投——这是"不会为同一个请求付两次上游成本"的保证；
-    /// - `NotRetryable`（参数/凭证类确定性拒绝）：重投同一份请求只会得到同一个答复，不重投。
-    ///
-    /// 重投**不重新预授权**：预授权在重投期间原样保留，到最后那次成功（结算一次）或用尽额度
-    /// 失败（释放一次）才动。所以这里只把这次执行收尾、把 Job 推回可领取。
-    ///
-    /// 额度用尽时走 [`Self::fail_and_refresh`]：不新增任何对账态语义，这一次失败的处置与今天
-    /// 逐位相同（释放预授权、Job 落 `failed`）。
-    async fn retry_or_fail(
-        &self,
-        job: &GenerationJob,
-        attempt_id: AttemptId,
-        attempt_no: u32,
-        failure: AttemptFailure,
-    ) -> Result<(), ApplicationError> {
-        let unaccepted = failure.retry_safety == RetrySafety::SafeBeforeAcceptance;
-        if !unaccepted || !self.retry_policy.allows_another_attempt(attempt_no) {
-            return self.fail_and_refresh(job, attempt_id, failure).await;
-        }
-        let backoff = self.retry_policy.backoff_for(attempt_no);
-        tracing::info!(
-            job_id = %job.id,
-            attempt_no,
-            backoff_ms = backoff.as_millis(),
-            max_attempts = self.retry_policy.max_attempts,
-            "the provider provably did not accept this request; the job will be retried"
-        );
-        self.repository
-            .requeue_after_unaccepted(UnacceptedAttempt {
-                job_id: job.id,
-                worker_id: self.worker_id.clone(),
-                attempt_id,
-                attempt_no,
-                failure,
-                // 退避的时刻用**进程时钟**算，但落库之后一律由库的 `now()` 比较：领取那条查询
-                // 判的是 `next_attempt_at <= now()`，所以这个值只是"从现在起等这么久"。
-                next_attempt_at: Utc::now()
-                    + ChronoDuration::from_std(backoff).map_err(|_| {
-                        ApplicationError::Configuration(
-                            "GENERATION_RETRY_BACKOFF_BASE_MS is out of range".to_owned(),
-                        )
-                    })?,
-            })
-            .await
-    }
-
-    /// 这次失败要不要外发一条平台故障告警。
-    ///
-    /// 三个触发条件都是**平台侧事件**，同一次失败**最多外发一条**：平台欠费或凭证类失败、对账
-    /// 案例新增、某候选连续失败 N 次。前两条看这次失败本身，第三条才去数这条候选最近的终态——
-    /// 前两条成立时不再数，是因为再发一条逐字相同的告警没有信息量（聚合与静默期是接入方的事，
-    /// 但这里连重复都不产生）。
-    ///
-    /// 全程不返回错误：读不到计数只记日志，这一次失败就不外发——旁路出问题不改主流程的结论。
-    async fn raise_platform_alerts(&self, job: &GenerationJob, failure: &AttemptFailure) {
-        let Some(exit) = &self.alerts else {
-            return;
-        };
-        if is_platform_event(failure) {
-            exit.notify(PlatformAlert::of(job, failure.kind)).await;
-            return;
-        }
-        match self
-            .repository
-            .consecutive_offering_failures(job.offering.offering_id, exit.window())
-            .await
-        {
-            Ok(count) if count >= exit.threshold() => {
-                exit.notify(PlatformAlert::of(job, failure.kind)).await;
-            }
-            Ok(_) => {}
-            Err(error) => tracing::warn!(
-                job_id = %job.id,
-                offering_id = %job.offering.offering_id,
-                error = %error,
-                "could not count the candidate's consecutive failures; no alert is sent for this failure"
-            ),
-        }
-    }
-
-    pub async fn run_once(&self) -> Result<bool, ApplicationError> {
-        self.repository.recover_expired_leases().await?;
-        let Some(claimed) = self
-            .repository
-            .claim_next_job(&self.worker_id, self.lease_duration)
-            .await?
-        else {
-            return Ok(false);
-        };
-        self.execute(claimed).await?;
-        Ok(true)
-    }
-
-    async fn execute(&self, claimed: ClaimedJob) -> Result<(), ApplicationError> {
-        let attempt_id = AttemptId::new();
-        // 图片输入已经在 Job 的原生参数里（受理期落在候选自己的参数名上，未声明的名字那时就被
-        // 丢掉了），这里只是把它交给 Driver：平台不读字节、不核对摘要。
-        //
-        // 一并把"哪些名字是平台自己装好的"算出来交给 Driver：归属由**候选承载面 + 分支**决定，
-        // 两者都在 Job 里冻结了，所以这份名单是确定的、与调用方这一次恰好给了什么取值无关。
-        // Driver 不自己按取值的形状猜归属——那样会把一个像图的普通参数误当成平台的图。
-        let prepared = PreparedImageRequest {
-            provider_model_id: claimed.job.offering.provider_model_id.clone(),
-            branch: claimed.job.branch,
-            native_parameters: claimed.job.native_parameters.clone(),
-            platform_parameters: platform_image_parameters(
-                &claimed.job.offering.carrier_schema,
-                claimed.job.branch,
-            ),
-            // 成本币种是**受理时冻结的那份渠道声明**（价格快照里就有）：上游报出来的金额不带
-            // 币种，Driver 拿不到"这个数是什么钱"，只能把这份声明原样带回来。取值只经这一个
-            // 访问点——受理、执行、落账三处各拼一遍链，改一处就会漏一处。
-            cost_currency: claimed
-                .job
-                .offering
-                .price_snapshot
-                .cost_currency()
-                .ok_or_else(|| {
-                    ApplicationError::Configuration(
-                        "this job's snapshot carries no cost currency to hand the driver"
-                            .to_owned(),
-                    )
-                })?
-                .to_owned(),
-        };
-        let request_digest = request_digest(&prepared)?;
-        // 这次是同一台 Job 内的第几次执行：**由库在写入那一刻定号**（现有行数 + 1），返回值就是
-        // 这次执行的号。不在这里读一次行数再自己加一——两次执行并发时读到的行数会同时是同一个，
-        // 而重投的次数上限正是拿这个号比的，号重复等于上限失效。
-        let attempt_no = self
-            .repository
-            .begin_attempt(claimed.job.id, &self.worker_id, attempt_id, &request_digest)
-            .await?;
-        let credential = match self
-            .credentials
-            .resolve(&claimed.job.offering.credential_env)
-        {
-            Ok(credential) => credential,
-            Err(error) => {
-                self.fail_and_refresh(
-                    &claimed.job,
-                    attempt_id,
-                    AttemptFailure {
-                        provider_code: "credential_unavailable".to_owned(),
-                        public_code: PublicErrorCode::PlatformUnavailable,
-                        message: error.to_string(),
-                        trace_id: None,
-                        kind: ProviderFailureKind::PlatformInternal,
-                        // 取不到凭证确实"请求没交出去"，但重投同一份配置只会得到同一个结果：
-                        // 这是平台自己的配置问题，重投解决不了，按确定性失败处置。
-                        retry_safety: RetrySafety::NotRetryable,
-                        target_state: JobState::Failed,
-                        hold_disposition: HoldDisposition::Release,
-                        // 请求还没交出去：这次执行没有成本可采。
-                        provider_cost: None,
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        // 这次上游调用要用多久：按**冻结在这条 Job 上的张数**算（缺 `n` 就是一张），不是配置里
-        // 那个固定值。取 Job 上的那份，而不是本次执行恰好带进来的什么值——受理时定下的请求形状
-        // 才是这次要在上游生成几张的依据。
-        let provider_timeout = self
-            .timeouts
-            .upstream_timeout_for(requested_image_count(&claimed.job.native_parameters));
-        let adapter = match self.adapters.create(
-            &claimed.job.offering.adapter_key,
-            &claimed.job.offering.base_url,
-            provider_timeout,
-        ) {
-            Ok(adapter) => adapter,
-            Err(error) => {
-                self.fail_and_refresh(
-                    &claimed.job,
-                    attempt_id,
-                    AttemptFailure {
-                        provider_code: "adapter_configuration_failed".to_owned(),
-                        public_code: PublicErrorCode::PlatformUnavailable,
-                        message: error.to_string(),
-                        trace_id: None,
-                        kind: ProviderFailureKind::PlatformInternal,
-                        // 同上：装不起来是我们自己的配置问题，重投不会有别的结果。
-                        retry_safety: RetrySafety::NotRetryable,
-                        target_state: JobState::Failed,
-                        hold_disposition: HoldDisposition::Release,
-                        // 请求还没交出去：这次执行没有成本可采。
-                        provider_cost: None,
-                    },
-                )
-                .await?;
-                return Ok(());
-            }
-        };
-        match self
-            .execute_with_heartbeat(claimed.job.id, adapter, prepared, &credential)
-            .await
-        {
-            Ok(success) => {
-                // 成本事实**先算出来**再结算：结算失败进对账那条路径也要落成本——执行已经发生、
-                // 上游成本也拿得到，把成本留在成功路径上等于"这一笔付过钱却没有成本事实"。
-                let provider_cost = provider_cost_fact(
-                    &claimed.job.offering.price_snapshot,
-                    &success.provider_cost,
-                    CostInputs::Succeeded {
-                        usage: &success.usage,
-                        images: success.images.len(),
-                    },
-                );
-                if let Err(error) = self
-                    .complete_success(&claimed.job, attempt_id, &success, provider_cost.clone())
-                    .await
-                {
-                    self.fail_and_refresh(
-                        &claimed.job,
-                        attempt_id,
-                        AttemptFailure {
-                            provider_code: "result_delivery_failed".to_owned(),
-                            public_code: PublicErrorCode::OutcomeUnknown,
-                            message: error.to_string(),
-                            trace_id: None,
-                            kind: ProviderFailureKind::PlatformInternal,
-                            // 结果已经生成、只是交付不了：这不是"未受理"，绝不重投
-                            // （重投等于为同一个请求再付一次上游成本）。
-                            retry_safety: RetrySafety::AcceptanceUnknown,
-                            target_state: JobState::ReconciliationRequired,
-                            hold_disposition: HoldDisposition::RetainForReconciliation,
-                            provider_cost: Some(provider_cost),
-                        },
-                    )
-                    .await?;
-                }
-            }
-            Err(error) => {
-                let failure = failure_from_adapter(&claimed.job.offering.price_snapshot, error);
-                self.retry_or_fail(&claimed.job, attempt_id, attempt_no, failure)
-                    .await?;
-            }
-        }
-        Ok(())
-    }
-
-    async fn execute_with_heartbeat(
-        &self,
-        job_id: JobId,
-        adapter: Arc<dyn ImageAdapter>,
-        prepared: PreparedImageRequest,
-        credential: &ProviderCredential,
-    ) -> Result<ProviderSuccess, AdapterError> {
-        let heartbeat_seconds = (self.lease_duration.num_seconds() / 3).max(1);
-        let mut interval = tokio::time::interval(Duration::from_secs(
-            u64::try_from(heartbeat_seconds).unwrap_or(1),
-        ));
-        interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
-        let call = adapter.execute(prepared, credential);
-        tokio::pin!(call);
-        let mut heartbeat_failure = None;
-        loop {
-            tokio::select! {
-                result = &mut call => {
-                    if let Some(message) = heartbeat_failure {
-                        return Err(seeai_adapter_sdk::ProviderCallError {
-                            code: "lease_heartbeat_failed".to_owned(),
-                            message,
-                            trace_id: None,
-                            retry_safety: RetrySafety::AcceptanceUnknown,
-                            kind: ProviderFailureKind::PlatformInternal,
-                            // 心跳掉了是我们自己的问题，与这次执行的成本事实无关。
-                            provider_cost: None,
-                        }.into());
-                    }
-                    return result;
-                },
-                _ = interval.tick() => {
-                    if let Err(error) = self.repository
-                        .renew_lease(job_id, &self.worker_id, self.lease_duration)
-                        .await
-                    {
-                        heartbeat_failure.get_or_insert_with(|| error.to_string());
-                    }
-                }
-            }
-        }
-    }
-
-    async fn complete_success(
-        &self,
-        job: &GenerationJob,
-        attempt_id: AttemptId,
-        success: &ProviderSuccess,
-        provider_cost: ProviderCostFact,
-    ) -> Result<(), ApplicationError> {
-        // 对客扣费（对客平面）：读受理时冻结的那份快照，只决定向消费者收多少。
-        //
-        // 快照按**这条供给的计价形态**算对客价：按 token 计量量的读那份随修订发布的对客费率向量；
-        // 按张 / 按次 / 上游给金额的由成本单价 × 倍率 × 折算率算出来（见领域侧的 charge_microusd）。
-        // 倍率与折算率都取自受理时冻结的那一份，所以受理之后改价、改汇率都不影响这一个 Job。
-        //
-        // **不封顶在预授权额**：预授权只是保底，实收按实际算，超出部分由余额透支吸收
-        // （透支发生在结算，不在受理）。所以这里没有"超过预授权就进对账"这一条——那是旧口径，
-        // 而旧口径会把一笔正常完成的生成扣在对账里。
-        let charge = job
-            .offering
-            .price_snapshot
-            .charge_microusd(ChargeFacts {
-                usage: &success.usage,
-                images: success.images.len(),
-                // 上游这次声明的金额就是**成本单价**（原币种）——只有上游直接给金额的候选读它。
-                // 上游没声明时是 `None`：那条路算不出对客价，按平台侧故障处置，不按 0 收。
-                declared_cost_microusd: provider_cost.amount_microusd,
-            })
-            .map_err(|error| ApplicationError::Reconciliation(error.to_string()))?;
-        // 结果只是"当次信封"：渠道给 url 就留 url、给 base64 就留 base64，平台不看内容。
-        if success.images.is_empty() {
-            return Err(ApplicationError::Reconciliation(
-                "provider returned no image".to_owned(),
-            ));
-        }
-        let change = self
-            .repository
-            .complete_job(CompleteJob {
-                job_id: job.id,
-                worker_id: self.worker_id.clone(),
-                attempt_id,
-                images: success.images.clone(),
-                evidence: MeteringEvidence {
-                    attempt_id,
-                    provider_response_digest: success.response_digest.clone(),
-                    usage: success.usage.clone(),
-                },
-                charge_microusd: charge,
-                provider_trace_id: success.provider_trace_id.clone(),
-                provider_cost,
-            })
-            .await?;
-        // 结算已经提交：把实收之后的余额写进缓存（用户要求：扣减成功后立即同步）。
-        self.acceleration
-            .write_balance(&change, BalanceSource::DbCommit)
-            .await;
-        Ok(())
-    }
 }
 
 /// 把 Driver 报出来的成本事实定成落库口径（成本平面：原币种原值 + 币种 + 折算后 CNY）。
@@ -7637,6 +6743,24 @@ fn prepare_carrier_parameters(
     request: &CreateImageGenerationRequest,
     offering: &PublishedOffering,
 ) -> Result<Value, String> {
+    prepare_carrier_parameters_with(
+        contract_parameters,
+        offering,
+        &request.reference_images,
+        request.mask.as_deref(),
+    )
+}
+
+/// 同一条映射管线的内部形态：图片与遮罩由调用方给。
+///
+/// 选路对**每条**候选只问"表达得了吗"，用的是一组同形状的空占位；图片内容只在选中那条上
+/// 复制一次（RFC 0018 §3）。判定与物化必须走同一条管线，否则"候选能不能承载"会在两处各判一遍。
+fn prepare_carrier_parameters_with(
+    contract_parameters: &Map<String, Value>,
+    offering: &PublishedOffering,
+    reference_images: &[String],
+    mask: Option<&str>,
+) -> Result<Value, String> {
     let mapping = &offering.parameter_mapping;
     let renames = declared_renames(mapping)?;
     let enum_maps = declared_enum_maps(mapping)?;
@@ -7665,8 +6789,8 @@ fn prepare_carrier_parameters(
     place_image_inputs(
         &offering.carrier_schema,
         &mut parameters,
-        &request.reference_images,
-        request.mask.as_deref(),
+        reference_images,
+        mask,
     )?;
     apply_parameter_defaults(
         &offering.capability_schema,
@@ -7715,31 +6839,6 @@ fn prepare_carrier_parameters(
     Ok(Value::Object(parameters))
 }
 
-fn request_hash<T: Serialize>(value: &T) -> Result<String, ApplicationError> {
-    let mut value = serde_json::to_value(value)
-        .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-    canonicalize_json(&mut value);
-    let encoded = serde_json::to_vec(&value)
-        .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-    Ok(sha256_hex(&encoded))
-}
-
-fn request_digest(request: &PreparedImageRequest) -> Result<String, ApplicationError> {
-    // 摘要是"这一次请求"的身份，所以连平台自己装好的参数名一起纳入：名单决定了 Driver 把哪些
-    // 名字当图片、哪些按原样交给上游，它变了就是另一次请求。名单由受理时的候选面与分支算出，
-    // 因此同一份 Job 重复执行得到的摘要稳定可比。
-    let mut value = serde_json::json!({
-        "provider_model_id": request.provider_model_id,
-        "branch": request.branch,
-        "native_parameters": request.native_parameters,
-        "platform_parameters": request.platform_parameters,
-    });
-    canonicalize_json(&mut value);
-    let bytes = serde_json::to_vec(&value)
-        .map_err(|error| ApplicationError::Validation(error.to_string()))?;
-    Ok(sha256_hex(&bytes))
-}
-
 fn canonicalize_json(value: &mut Value) {
     match value {
         Value::Object(object) => {
@@ -7753,82 +6852,6 @@ fn canonicalize_json(value: &mut Value) {
         }
         Value::Array(items) => items.iter_mut().for_each(canonicalize_json),
         Value::Null | Value::Bool(_) | Value::Number(_) | Value::String(_) => {}
-    }
-}
-
-/// Driver 报回来的失败 → 失败件的落库事实。
-///
-/// 成本事实与成功件**同源同形**：Driver 在终态之后判定失败时把已经读到的成本一起报回来，
-/// 这里用与成功路径**同一处映射**把它定成落库口径。没有报回来时按 `unavailable` 落——来源可辨、
-/// 进成本缺口清单，而不是留一个 NULL 让这笔成本在账上与缺口两头都看不见。
-fn failure_from_adapter(snapshot: &PriceSnapshot, error: AdapterError) -> AttemptFailure {
-    match error {
-        AdapterError::Provider(provider) => AttemptFailure {
-            public_code: public_error_code(provider.kind, provider.retry_safety),
-            provider_code: provider.code,
-            message: provider.message,
-            trace_id: provider.trace_id,
-            kind: provider.kind,
-            // 失败分类**原样带过来**：它是 Driver 对"上游有没有可能已经受理"的唯一判定，编排层
-            // 只消费它、不再按状态码或错误码猜一遍（猜一遍就等于平台自己另立了一套判据）。
-            retry_safety: provider.retry_safety,
-            target_state: if provider.retry_safety == RetrySafety::AcceptanceUnknown {
-                JobState::ReconciliationRequired
-            } else {
-                JobState::Failed
-            },
-            hold_disposition: if provider.retry_safety == RetrySafety::AcceptanceUnknown {
-                HoldDisposition::RetainForReconciliation
-            } else {
-                HoldDisposition::Release
-            },
-            provider_cost: Some(failure_provider_cost(
-                snapshot,
-                provider.provider_cost.as_ref(),
-            )),
-        },
-        // 平台自己的配置或参数问题：请求在交给渠道之前就被 Driver 挡下，这次执行**没有成本
-        // 可采**——四列留 NULL 说的是"根本没采"，与"采了没拿到"（`unavailable`）不是一件事。
-        // 这类也不重投：同一份参数与配置再交一次，Driver 会以同样的方式挡下。
-        AdapterError::Configuration(message) | AdapterError::UnsupportedInput(message) => {
-            AttemptFailure {
-                provider_code: "adapter_rejected".to_owned(),
-                public_code: PublicErrorCode::PlatformUnavailable,
-                message,
-                trace_id: None,
-                kind: ProviderFailureKind::PlatformInternal,
-                retry_safety: RetrySafety::NotRetryable,
-                target_state: JobState::Failed,
-                hold_disposition: HoldDisposition::Release,
-                provider_cost: None,
-            }
-        }
-        // 新协议的接受结果不会出现在旧 Worker 路径上；真出现时按"结果不确定"进对账，
-        // 绝不凭它重发生成请求（RFC 0017 §4）。
-        AdapterError::AcceptedUnpersisted { reason, .. } => AttemptFailure {
-            provider_code: "accepted_unpersisted".to_owned(),
-            public_code: PublicErrorCode::OutcomeUnknown,
-            message: reason,
-            trace_id: None,
-            kind: ProviderFailureKind::PlatformInternal,
-            retry_safety: RetrySafety::AcceptanceUnknown,
-            target_state: JobState::ReconciliationRequired,
-            hold_disposition: HoldDisposition::RetainForReconciliation,
-            provider_cost: None,
-        },
-        // 取消与查询能力不支持同样不该出现在旧路径的一次性 execute 里；防御性地按平台故障释放。
-        AdapterError::Cancelled | AdapterError::QueryAccountingUnsupported => AttemptFailure {
-            provider_code: "adapter_rejected".to_owned(),
-            public_code: PublicErrorCode::PlatformUnavailable,
-            message: "the adapter reported an outcome the legacy execution path does not produce"
-                .to_owned(),
-            trace_id: None,
-            kind: ProviderFailureKind::PlatformInternal,
-            retry_safety: RetrySafety::NotRetryable,
-            target_state: JobState::Failed,
-            hold_disposition: HoldDisposition::Release,
-            provider_cost: None,
-        },
     }
 }
 

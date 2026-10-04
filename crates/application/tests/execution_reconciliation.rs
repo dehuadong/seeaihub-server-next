@@ -19,7 +19,7 @@ use chrono::{Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
     AccountingFacts, AccountingQuery, AdapterDescriptor, AdapterError, Deadline, DeclaredCost,
     ExecutionContext, GatewayAdapter, GatewayInput, ImageAdapter, ProviderCost, ProviderCredential,
-    ProviderOutput, QueryAccountingCapability,
+    ProviderOutput, ProviderTaskState, QueryAccountingCapability,
 };
 use seeai_application::{
     AdapterFactory, AdmitExecution, AdmitOffering, AdmitOutcome, ApplicationError, BeginSubmission,
@@ -77,6 +77,9 @@ enum FakeQuery {
     Terminal(AccountingFacts),
     TerminalWithoutFacts,
     NotTerminal,
+    Untrusted,
+    Failed(AccountingFacts),
+    Cancelled(AccountingFacts),
     Unsupported,
 }
 
@@ -146,16 +149,30 @@ impl GatewayAdapter for FakeGateway {
             .clone()
         {
             FakeQuery::Terminal(facts) => Ok(AccountingQuery {
-                terminal: true,
+                state: ProviderTaskState::Succeeded,
                 accounting_facts: Some(facts),
             }),
             FakeQuery::TerminalWithoutFacts => Ok(AccountingQuery {
-                terminal: true,
+                state: ProviderTaskState::Succeeded,
                 accounting_facts: None,
             }),
             FakeQuery::NotTerminal => Ok(AccountingQuery {
-                terminal: false,
+                state: ProviderTaskState::Pending,
                 accounting_facts: None,
+            }),
+            // 渠道状态不可信（未列出的状态，或响应无法与句柄关联）：既不结算也不释放。
+            FakeQuery::Untrusted => Ok(AccountingQuery {
+                state: ProviderTaskState::Unknown,
+                accounting_facts: None,
+            }),
+            // 失败与取消也可能带回用量和成本：状态决定收尾，不能被"有事实"翻成成功。
+            FakeQuery::Failed(facts) => Ok(AccountingQuery {
+                state: ProviderTaskState::Failed,
+                accounting_facts: Some(facts),
+            }),
+            FakeQuery::Cancelled(facts) => Ok(AccountingQuery {
+                state: ProviderTaskState::Cancelled,
+                accounting_facts: Some(facts),
             }),
             FakeQuery::Unsupported => Err(AdapterError::QueryAccountingUnsupported),
         }
@@ -565,6 +582,148 @@ async fn a_taken_over_handle_is_queried_read_only_and_settled_once() {
     drop_isolated_database(&database_name).await;
 }
 
+async fn cost_source(pool: &PgPool, attempt_id: AttemptId) -> Option<String> {
+    sqlx::query_scalar("SELECT provider_cost_source FROM generation.attempts WHERE id = $1")
+        .bind(attempt_id.0)
+        .fetch_one(pool)
+        .await
+        .expect("the attempt cost source")
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_taken_over_failed_task_releases_the_hold_without_charging() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-failed").await;
+    let attempt_id = begin(&repository, job_id).await;
+    accept(&repository, job_id, attempt_id, "task-failed").await;
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    factory.set(FakeQuery::Failed(terminal_facts()));
+    let service = reconciliation(&repository, factory.clone());
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(
+        report.settled, 0,
+        "an upstream failure is never settled as a success, even with usage attached"
+    );
+    assert_eq!(
+        report.reconciled, 0,
+        "a confirmed failure is not an unknown outcome"
+    );
+    assert_eq!(state(&pool, job_id).await, "failed");
+    assert_eq!(attempt_state(&pool, attempt_id).await, "terminal");
+    assert_eq!(
+        captures(&pool, job_id).await,
+        0,
+        "the consumer is not charged"
+    );
+    assert_eq!(
+        held(&pool, fixture.account_id).await,
+        0,
+        "the hold is released"
+    );
+    assert_eq!(capacity_state(&pool, job_id).await, "released");
+    assert_eq!(
+        cost_source(&pool, attempt_id).await.as_deref(),
+        Some("declared"),
+        "the upstream cost the failure carried is still recorded"
+    );
+    assert_eq!(
+        factory.executes.load(Ordering::SeqCst),
+        0,
+        "the worker never resubmits a generation request"
+    );
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_taken_over_cancelled_task_releases_the_hold_without_charging() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-cancelled").await;
+    let attempt_id = begin(&repository, job_id).await;
+    accept(&repository, job_id, attempt_id, "task-cancelled").await;
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    factory.set(FakeQuery::Cancelled(terminal_facts()));
+    let service = reconciliation(&repository, factory.clone());
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.settled, 0);
+    assert_eq!(state(&pool, job_id).await, "failed");
+    assert_eq!(
+        captures(&pool, job_id).await,
+        0,
+        "the consumer is not charged"
+    );
+    assert_eq!(
+        held(&pool, fixture.account_id).await,
+        0,
+        "the hold is released"
+    );
+    assert_eq!(capacity_state(&pool, job_id).await, "released");
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn an_untrusted_task_state_opens_a_case_and_keeps_the_hold() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-untrusted").await;
+    let attempt_id = begin(&repository, job_id).await;
+    accept(&repository, job_id, attempt_id, "task-untrusted").await;
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    factory.set(FakeQuery::Untrusted);
+    let service = reconciliation(&repository, factory);
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(
+        report.reconciled, 1,
+        "a state that cannot be tied to the handle must enter reconciliation, not settle"
+    );
+    assert_eq!(report.settled, 0);
+    assert_eq!(
+        report.failed, 0,
+        "an untrusted state is not a confirmed failure"
+    );
+    assert_eq!(state(&pool, job_id).await, "reconciliation_required");
+    assert_eq!(attempt_state(&pool, attempt_id).await, "unknown");
+    assert_eq!(cases(&pool, job_id).await, 1, "a case is opened");
+    assert_eq!(
+        held(&pool, fixture.account_id).await,
+        1_000,
+        "the hold is retained"
+    );
+    assert_eq!(capacity_state(&pool, job_id).await, "held");
+    assert_eq!(captures(&pool, job_id).await, 0);
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn a_taken_over_execution_without_a_handle_opens_a_case_and_keeps_the_hold() {
@@ -707,6 +866,7 @@ async fn a_late_accounting_fact_settles_and_is_consumed() {
                 provider_response_digest: "resp-late".to_owned(),
                 usage: usage(),
             }),
+            provider_state: Some(ProviderTaskState::Succeeded),
             provider_cost: Some(ProviderCostFact {
                 source: ProviderCostSource::Declared,
                 amount_microusd: Some(200),
@@ -758,6 +918,7 @@ async fn an_unfinished_late_handle_is_not_consumed_and_is_reclaimable_after_the_
             image_count: None,
             evidence: None,
             provider_cost: None,
+            provider_state: None,
         })
         .await
         .expect("offer the late task handle");
@@ -805,23 +966,52 @@ async fn an_unfinished_late_handle_is_not_consumed_and_is_reclaimable_after_the_
 
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
-async fn the_legacy_worker_never_claims_a_v1_record() {
+async fn a_late_handle_whose_task_failed_releases_the_hold_without_charging() {
     let (repository, database_name) = connect().await;
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
-    let job_id = admit_one(&repository, &fixture, "recon-legacy-claim").await;
-
-    let claimed = repository
-        .claim_next_job("legacy-worker", ChronoDuration::minutes(5))
+    let job_id = admit_one(&repository, &fixture, "recon-late-failed").await;
+    let attempt_id = begin(&repository, job_id).await;
+    repository
+        .offer_late_facts(LateFacts {
+            job_id,
+            attempt_id,
+            provider_task_handle: Some("task-failed".to_owned()),
+            provider_trace_id: Some("trace-failed".to_owned()),
+            image_count: None,
+            evidence: None,
+            provider_cost: None,
+            provider_state: None,
+        })
         .await
-        .expect("claim_next_job");
-    assert!(
-        claimed.is_none(),
-        "the legacy queue must not hand out a v1 admission"
+        .expect("offer the late task handle");
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    factory.set(FakeQuery::Failed(terminal_facts()));
+    let service = reconciliation(&repository, factory);
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.settled, 0, "a failed task is never charged");
+    assert_eq!(
+        report.late_facts_consumed, 1,
+        "once the outcome is known the handle fact is consumed"
     );
-    assert_eq!(state(&pool, job_id).await, "admitted");
+    assert_eq!(state(&pool, job_id).await, "failed");
+    assert_eq!(
+        captures(&pool, job_id).await,
+        0,
+        "the consumer is not charged"
+    );
+    assert_eq!(
+        held(&pool, fixture.account_id).await,
+        0,
+        "the hold is released"
+    );
 
     drop(pool);
+    drop(service);
     drop(repository);
     drop_isolated_database(&database_name).await;
 }
@@ -916,6 +1106,7 @@ async fn late_handle_queries_back_off_and_stop_at_the_retry_cap() {
             image_count: None,
             evidence: None,
             provider_cost: None,
+            provider_state: None,
         })
         .await
         .expect("offer the late handle");
@@ -997,6 +1188,7 @@ async fn a_terminal_late_cost_lands_in_the_cost_gap_without_reopening_the_job() 
             provider_trace_id: Some("trace-terminal".to_owned()),
             image_count: None,
             evidence: None,
+            provider_state: None,
             provider_cost: Some(ProviderCostFact {
                 source: ProviderCostSource::Unavailable,
                 amount_microusd: None,
@@ -1072,6 +1264,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
                 usage: usage(),
             }),
             provider_cost: None,
+            provider_state: None,
         })
         .await
         .expect("offer the gapped late fact");
@@ -1122,6 +1315,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
                 usage: usage(),
             }),
             provider_cost: None,
+            provider_state: None,
         })
         .await
         .expect("offer the counted late fact");
@@ -1186,6 +1380,7 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
                 declared_cost_microusd: Some(2_000),
             })
             .expect("the API charge"),
+        image_count: Some(1),
         provider_trace_id: Some("trace-api".to_owned()),
     };
 
@@ -1311,6 +1506,50 @@ async fn a_taken_over_execution_reports_settlement_latency() {
 
     drop(pool);
     drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 不是标识的句柄在存储层就写不进去（0036 的 CHECK）：即使绕过应用直接 UPDATE 也会被拒。
+///
+/// 对账的读侧另有一道校验，服务的是**约束生效之前**写入的旧行；约束生效后新值不可能非法，
+/// 因此这里断言的是数据库这一层，而不是同一条不可达的读路径。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_stored_handle_that_is_not_an_identifier_cannot_be_written() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-bad-handle").await;
+    let attempt_id = begin(&repository, job_id).await;
+    accept(&repository, job_id, attempt_id, "task-legacy").await;
+
+    for bad in [
+        "https://example.invalid/a.png",
+        "data:image/png;base64,AAAA",
+        "task id with spaces",
+    ] {
+        let refused =
+            sqlx::query("UPDATE generation.jobs SET provider_task_handle = $2 WHERE id = $1")
+                .bind(job_id.0)
+                .bind(bad)
+                .execute(&pool)
+                .await;
+        assert!(refused.is_err(), "{bad:?} must not be storable as a handle");
+    }
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT provider_task_handle FROM generation.jobs WHERE id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the stored handle");
+    assert_eq!(
+        stored.as_deref(),
+        Some("task-legacy"),
+        "a refused write leaves the original value untouched"
+    );
+
+    drop(pool);
     drop(repository);
     drop_isolated_database(&database_name).await;
 }

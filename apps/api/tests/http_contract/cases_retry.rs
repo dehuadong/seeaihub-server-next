@@ -49,7 +49,7 @@ async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
     assert_eq!(status, StatusCode::OK, "第二次成功之后对客是成功：{body}");
     assert_sync_success("重投之后成功", &body);
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "重投成功之后 Job 落成功终态");
 
     // 上游被调了两次：第一次上传失败（生成请求没发出去）、第二次成功。
@@ -74,8 +74,8 @@ async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
     .expect("attempt rows");
     assert_eq!(
         attempts,
-        vec![(1, "failed".to_owned()), (2, "succeeded".to_owned())],
-        "一次重投留下两行，各自带自己的状态"
+        vec![(1, "terminal".to_owned()), (2, "terminal".to_owned())],
+        "一次重投留下两行，两行各自收尾（v1 的 Attempt 终态名是 terminal）"
     );
 
     // 结算只发生一次：capture 分录只有一条。
@@ -152,7 +152,7 @@ async fn an_uncertain_failure_is_never_retried() {
     assert_eq!(body["error"]["code"].as_str(), Some("outcome_unknown"));
     assert_public_only("受理状态不明", &body);
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(
         state, "reconciliation_required",
         "状态不确定按既有口径进对账，不重投"
@@ -224,7 +224,7 @@ async fn a_deterministic_rejection_is_not_retried() {
     assert_eq!(status, StatusCode::BAD_GATEWAY, "got {body}");
     assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "failed", "确定性拒绝按既有失败处置落失败终态");
     assert_eq!(
         harness.create_calls(),
@@ -283,7 +283,7 @@ async fn retries_stop_at_the_configured_limit() {
         .await;
     assert_eq!(status, StatusCode::BAD_GATEWAY, "got {body}");
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(
         state, "failed",
         "用尽额度之后按既有失败处置：不新增对账态语义"
@@ -347,7 +347,7 @@ async fn a_plain_success_still_leaves_exactly_one_attempt() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("成功路径", &body);
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     let attempts: Vec<(i32, String)> =
         sqlx::query_as("SELECT attempt_no, state FROM generation.attempts WHERE job_id = $1")
@@ -357,7 +357,7 @@ async fn a_plain_success_still_leaves_exactly_one_attempt() {
             .expect("attempt rows");
     assert_eq!(
         attempts,
-        vec![(1, "succeeded".to_owned())],
+        vec![(1, "terminal".to_owned())],
         "成功路径只留一行执行记录，号从 1 起"
     );
     assert_eq!(harness.create_calls(), 1, "成功路径只调一次上游");

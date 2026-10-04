@@ -6,11 +6,12 @@ use crate::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use seeai_domain::{ImageBranch, TokenUsage};
+use seeai_domain::{ImageBranch, TokenUsage, is_bounded_provider_identifier};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
 /// 一处输入图片的形态：公网 URL、未解码的 data URL，或已解码的字节。
@@ -190,11 +191,39 @@ impl Deadline {
     }
 }
 
+/// Provider 任务句柄：**有界标识**，只能经 [`ProviderTaskHandle::parse`] 构造。
+///
+/// 它是对账的唯一入口，也是唯一会被拼进上游查询 URL 的值。字段私有，URL、data URL、控制字符与
+/// 超长正文在这里就被挡下，不能靠"记得先校验"绕过去（Spec 0005 §2、RFC 0018 §6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderTaskHandle(String);
+
+impl ProviderTaskHandle {
+    /// 按标识白名单构造：不是有界标识就拒绝，且不保留原值。
+    pub fn parse(value: String) -> Result<Self, String> {
+        if is_bounded_provider_identifier(&value) {
+            Ok(Self(value))
+        } else {
+            Err("the provider task handle is not a bounded identifier".to_owned())
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
 /// 上游已受理的可信标识。不含上传地址：上传 URL 只用于当次内存执行（RFC 0017 §4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedHandle {
-    /// 任务式渠道的任务标识；只有任务式渠道会调用 `accepted`。
-    pub task_id: String,
+    /// 任务式渠道的任务标识；只有任务式渠道会调用 `accepted`。类型保证它是有界标识。
+    pub task_id: ProviderTaskHandle,
     /// 逐请求标识。
     pub trace_id: Option<String>,
 }
@@ -217,15 +246,84 @@ pub trait ExecutionContext: Send + Sync {
     /// 执行所有权失效或停机：Adapter 应停止新的提交、重试与轮询。
     fn is_cancelled(&self) -> bool;
 
+    /// 生成发送的最后资格检查：与取消共用同一状态，二者只有一个先成功。
+    ///
+    /// 返回 `true` 表示这次生成发送可以开始（此后即使取消也只能按"可能已提交"处理）；
+    /// 返回 `false` 表示取消先发生，调用方绝不能发出生成请求。轮询、上传等非生成调用不需要
+    /// 也不能调用它。
+    fn try_begin_generation(&self) -> bool;
+
     /// 上游已受理：只有平台确认句柄入库后返回 Ok，之后才允许按句柄查询。
     async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError>;
 }
 
-/// 新的外部调用之前必须过的闸：已取消返回 [`AdapterError::Cancelled`]；总期限已到返回
-/// `execution_deadline_exceeded`（未提交的调用按平台侧失败分类，RFC 0017 §6）。
-pub fn ensure_external_call_allowed(context: &dyn ExecutionContext) -> Result<(), AdapterError> {
+/// 取消与"生成发送已经开始"的**线性化**状态。
+///
+/// 两个事实放在同一个原子字里：[`Self::cancel`] 与 [`Self::try_begin_generation`] 竞争同一个
+/// compare-exchange，因此只有两种可观察结局——取消先赢（这次 Attempt 没有发出生成请求），
+/// 或发送先赢（此后只能按"可能已提交"处理）。拆成两个独立标志会让两边各自"成功"，
+/// 从而把可能已提交的执行误判成确定未提交（RFC 0018 §4.1）。
+#[derive(Debug, Default)]
+pub struct DispatchGate {
+    state: AtomicU8,
+}
+
+const CANCELLED: u8 = 0b01;
+const GENERATION_STARTED: u8 = 0b10;
+
+impl DispatchGate {
+    #[must_use]
+    pub fn new() -> Self {
+        Self {
+            state: AtomicU8::new(0),
+        }
+    }
+
+    /// 取消：无论生成是否已经开始都记录取消；已经开始的事实不回退。
+    pub fn cancel(&self) {
+        self.state.fetch_or(CANCELLED, Ordering::SeqCst);
+    }
+
+    /// 取消是否已经发生：用于停止后续上传、重试与轮询。生成已经开始本身不算取消。
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & CANCELLED != 0
+    }
+
+    /// 生成发送是否已经开始：开始之后即使取消，也只能按"可能已提交"收尾。
+    #[must_use]
+    pub fn generation_started(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & GENERATION_STARTED != 0
+    }
+
+    /// 生成发送前的最后资格：与取消线性化，二者只有一个先成功。
+    #[must_use]
+    pub fn try_begin_generation(&self) -> bool {
+        let mut current = self.state.load(Ordering::SeqCst);
+        loop {
+            if current & CANCELLED != 0 {
+                return false;
+            }
+            match self.state.compare_exchange_weak(
+                current,
+                current | GENERATION_STARTED,
+                Ordering::SeqCst,
+                Ordering::SeqCst,
+            ) {
+                Ok(_) => return true,
+                Err(observed) => current = observed,
+            }
+        }
+    }
+}
+
+/// 调用之前的公共闸：已取消按给定错误返回；总期限已到返回 `execution_deadline_exceeded`。
+fn ensure_call_allowed(
+    context: &dyn ExecutionContext,
+    cancelled: AdapterError,
+) -> Result<(), AdapterError> {
     if context.is_cancelled() {
-        return Err(AdapterError::Cancelled);
+        return Err(cancelled);
     }
     if context.deadline().is_expired() {
         return Err(AdapterError::Provider(ProviderCallError {
@@ -238,6 +336,37 @@ pub fn ensure_external_call_allowed(context: &dyn ExecutionContext) -> Result<()
         }));
     }
     Ok(())
+}
+
+/// 生成之前的外部调用（上传、下载素材、提交生成）之前的闸：取消返回
+/// [`AdapterError::CancelledBeforeSend`]，因为此时生成请求确实还没有发出。
+///
+/// 生成请求自身的最后资格由 [`begin_generation_send`] 判定；**接受之后的只读轮询必须改用**
+/// [`ensure_read_call_allowed`]。
+pub fn ensure_external_call_allowed(context: &dyn ExecutionContext) -> Result<(), AdapterError> {
+    ensure_call_allowed(context, AdapterError::CancelledBeforeSend)
+}
+
+/// 只读调用（按已知句柄轮询、查询任务）之前的闸：取消返回 [`AdapterError::Cancelled`]。
+///
+/// 这类调用可能发生在**上游已经受理之后**，取消不能证明上游未受理，因此绝不能报成
+/// [`AdapterError::CancelledBeforeSend`]，否则调用方会把已提交的执行当成"可证明未发送"而释放占用。
+pub fn ensure_read_call_allowed(context: &dyn ExecutionContext) -> Result<(), AdapterError> {
+    ensure_call_allowed(context, AdapterError::Cancelled)
+}
+
+/// 生成类请求发送前的**最后**一道闸：与取消线性化，二者只有一个先成功。
+///
+/// 必须在真正 poll 发送 future 之前调用，且此后到发送之间不能再有可取消的等待：
+/// - 返回 `Ok(())`：这次生成发送可以开始；此后即使收到取消，也只能按"可能已提交"处理。
+/// - 返回 [`AdapterError::CancelledBeforeSend`]：取消先发生，**绝不能**发出生成请求，
+///   调用方可以按"确定未提交"释放占用与渠道名额。
+pub fn begin_generation_send(context: &dyn ExecutionContext) -> Result<(), AdapterError> {
+    if context.try_begin_generation() {
+        Ok(())
+    } else {
+        Err(AdapterError::CancelledBeforeSend)
+    }
 }
 
 /// 单次外部调用的超时上界：`min(自身配置超时, 总期限剩余)`（RFC 0017 §6）。
@@ -293,10 +422,15 @@ pub struct ProviderOutput {
     pub accounting_facts: AccountingFacts,
 }
 
-/// 按已知句柄只读查询的结果：是否终态，以及终态时的账务事实。
+pub use seeai_domain::ProviderTaskState;
+
+/// 按已知句柄只读查询的结果：渠道状态，以及可得时的账务事实。
+///
+/// `accounting_facts` 与状态相互独立：失败的任务也可能带回用量与成本，收尾按 `state` 决定，
+/// 不能由"有没有事实"反推成功。
 #[derive(Debug, Clone)]
 pub struct AccountingQuery {
-    pub terminal: bool,
+    pub state: ProviderTaskState,
     pub accounting_facts: Option<AccountingFacts>,
 }
 

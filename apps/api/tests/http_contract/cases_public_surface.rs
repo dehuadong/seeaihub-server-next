@@ -74,7 +74,6 @@ async fn health_reports_unhealthy_once_the_database_is_gone() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn public_surface_has_no_async_task_protocol() {
     let (database_url, database_name) = isolated_database_url().await;
-    // 这个用例不起 Worker：同步入口必然等到超时，正好用来验"等不到时对客怎么说"。
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
@@ -129,83 +128,33 @@ async fn public_surface_has_no_async_task_protocol() {
         );
     }
 
-    // 素材带保底表，受理闸门是"余额 ≥ 保底额"：这个用例看的是"等不到结果时对客怎么说"，
-    // 所以账户要付得起那份保底额，别让 402 抢在超时前面。
-    let account = create_account_with_credit(&client, &base_url, &admin_token, 1_000_000).await;
-    let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
-    publish_bootstrap(&client, &base_url, &admin_token).await;
-    reject_mismatched_model_identity(&client, &base_url, &admin_token).await;
-
-    // ── 等不到结果时：普通的超时错误，不提 job、不指路查询接口 ──
-    let key = format!("pending-{}", Uuid::new_v4());
-    let request = generation_request(&key, "contract prompt");
-    let (status, body) = post_json(
-        &base_url,
-        &api_key,
-        "/v1/images/generations",
-        &key,
-        &strip_key(&request),
-    )
-    .await;
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
-    assert_public_only("超时", &body);
-    assert_eq!(body["error"]["code"].as_str(), Some("result_pending"));
-
-    // 同一个幂等键重发：仍然只留下**一条**内部记录（重发不是新任务）。
-    let (again_status, again) = post_json(
-        &base_url,
-        &api_key,
-        "/v1/images/generations",
-        &key,
-        &strip_key(&request),
-    )
-    .await;
-    assert_eq!(again_status, StatusCode::GATEWAY_TIMEOUT);
-    assert_public_only("超时重发", &again);
-    let job_count: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(&key)
-            .fetch_one(&PgPool::connect(&database_url).await.expect("pool"))
-            .await
-            .expect("job count");
-    assert_eq!(job_count, 1, "幂等键重发必须去重成同一条内部记录");
-
-    // 同一个幂等键、不同的请求体：冲突。
-    let conflict = post_json(
-        &base_url,
-        &api_key,
-        "/v1/images/generations",
-        &key,
-        &generation_request_body("changed prompt"),
-    )
-    .await;
-    assert_eq!(conflict.0, StatusCode::CONFLICT, "got {}", conflict.1);
-
-    // ── 跨账户隔离（内部接口层）：别的账户看不到这条记录 ──
-    let pool = PgPool::connect(&database_url).await.expect("pool");
-    let job_id: Uuid =
-        sqlx::query_scalar("SELECT id FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(&key)
-            .fetch_one(&pool)
-            .await
-            .expect("job id");
-    let other_account = create_account(&client, &base_url, &admin_token).await;
-    let other_id = Uuid::parse_str(&other_account).expect("account id");
-    let repository = PgHubRepository::connect(&database_url, 2)
-        .await
-        .expect("repository");
-    assert!(
-        repository
-            .get_job(AccountId(other_id), seeai_domain::JobId(job_id))
-            .await
-            .is_err(),
-        "别的账户不许看到这条记录"
-    );
-
-    verify_reconciliation_contract(&client, &base_url, &admin_token, &api_key, &database_url).await;
-    verify_lease_recovery_contract(&client, &base_url, &admin_token, &api_key, &database_url).await;
-    pool.close().await;
     drop_isolated_database(&database_name).await;
+}
+
+/// 对账案例的管理面：列出未结案的那一条，退款按平台侧处置收成失败并释放占用。
+///
+/// 夹具是**真实跑出来的一次结果不明执行**（假上游在受理后拒绝），所以这里验的是 v1 自己建的案。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_reconciliation_case_is_listed_and_refunded_by_the_admin() {
+    let harness = Harness::start_with(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only"],
+        None,
+        UpstreamBehaviour {
+            // 受理状态不确定：按既有口径保留占用并进对账。
+            submit: SubmitBehaviour::Rejected {
+                status: 429,
+                body: json!({"error": {"code": "upstream_rate_limited", "message": "slow down"}}),
+            },
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
+        64,
+    )
+    .await;
+    verify_reconciliation_contract(&harness).await;
+    harness.cleanup().await;
 }
 
 /// 客户吊销自己的 API Key 之后它**立刻**不能再用来受理：同一条请求、同一个 API 进程，吊销前成功、
@@ -301,7 +250,6 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
     );
 
     // ── 吊销前：这把密钥能受理并跑完一次生成（进程内假上游，不产生任何外部调用）──
-    let worker = harness.spawn_worker();
     let (status, body) = post_json(
         &harness.base_url,
         &api_key,
@@ -310,7 +258,6 @@ async fn revoked_api_key_stops_working_immediately_and_revoke_is_idempotent() {
         &route_request(harness.model, "before revocation"),
     )
     .await;
-    drop(worker);
     assert_eq!(status, StatusCode::OK, "吊销前这把密钥必须可用：{body}");
     assert_sync_success("吊销前", &body);
 

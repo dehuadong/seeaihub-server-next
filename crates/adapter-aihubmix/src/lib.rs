@@ -4,11 +4,12 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
     AccountingFacts, AdapterDescriptor, AdapterError, DecodedImage, ExecutionContext,
-    GatewayAdapter, GatewayInput, GeneratedImage, ImageAdapter, InputImage, PreparedImageRequest,
-    ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput,
-    ProviderSuccess, QueryAccountingCapability, ResponsePayload, RetrySafety, decode_data_url,
-    ensure_external_call_allowed, external_call_timeout, gateway_passthrough_parameters,
-    is_http_url,
+    GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage,
+    ImageAdapter, InputImage, PreparedImageRequest, ProviderCallError, ProviderCost,
+    ProviderCredential, ProviderFailureKind, ProviderOutput, ProviderSuccess,
+    QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
+    decode_data_url, ensure_external_call_allowed, external_call_timeout,
+    gateway_passthrough_parameters, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -24,7 +25,8 @@ use std::time::Duration;
 use url::Url;
 
 pub const ADAPTER_KEY: &str = "aihubmix-image-v1";
-const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
+/// 上游响应正文上限：调用方据此计算一次执行的内存预留。
+pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 /// 单张输入图（参考图或遮罩）在内存里的上限：data URL 就地解码、公网 URL 自己下载，
 /// 两种形态都不落盘，因此必须有上限兜住内存。
 const MAX_INPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
@@ -60,6 +62,10 @@ impl AdapterFactory for AihubmixAdapterFactory {
             // AIHubMix 只回四分项 `usage`，金额由平台按费率自算：声明"上游给金额"的候选
             // （成本或对客）在这条通路上发布期就拒。
             declares_cost: false,
+            byte_limits: GatewayByteLimits {
+                request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
+                provider_response_bytes: MAX_PROVIDER_RESPONSE_BYTES,
+            },
         })
     }
 
@@ -664,6 +670,8 @@ impl AihubmixImageAdapter {
     ) -> Result<ProviderOutput, AdapterError> {
         let body = gateway_generation_body(input)?;
         ensure_external_call_allowed(context)?;
+        // 生成发送的最后资格：与取消线性化。此后到 .send() 之间没有可取消的等待。
+        begin_generation_send(context)?;
         let response = self
             .client
             .post(self.endpoint(ImageBranch::PromptOnly)?)
@@ -686,6 +694,8 @@ impl AihubmixImageAdapter {
     ) -> Result<ProviderOutput, AdapterError> {
         let form = self.gateway_edit_form(input, context).await?;
         ensure_external_call_allowed(context)?;
+        // 生成发送的最后资格：与取消线性化。此后到 .send() 之间没有可取消的等待。
+        begin_generation_send(context)?;
         let response = self
             .client
             .post(self.endpoint(input.branch)?)

@@ -249,6 +249,7 @@ fn settle_command(
             cny_microusd: Some(1500),
         },
         charge_microusd: charge,
+        image_count: Some(1),
         provider_trace_id: Some("trace-1".to_owned()),
     }
 }
@@ -344,16 +345,23 @@ async fn settle_commits_the_ledger_once_and_releases_the_channel_slot() {
             .is_some()
     );
 
-    // Job 落 succeeded 并盖 terminal_at。
-    let job =
-        sqlx::query("SELECT state, terminal_at, error_code FROM generation.jobs WHERE id = $1")
-            .bind(job_id.0)
-            .fetch_one(&pool)
-            .await
-            .expect("the settled job");
+    // Job 落 succeeded 并盖 terminal_at，产出张数落在 image_count（用量与账单的分母）。
+    let job = sqlx::query(
+        "SELECT state, terminal_at, error_code, image_count FROM generation.jobs WHERE id = $1",
+    )
+    .bind(job_id.0)
+    .fetch_one(&pool)
+    .await
+    .expect("the settled job");
     assert_eq!(
         job.try_get::<String, _>("state").expect("state"),
         "succeeded"
+    );
+    assert_eq!(
+        job.try_get::<Option<i32>, _>("image_count")
+            .expect("image count"),
+        Some(1),
+        "结算写入本次实际产出张数"
     );
     assert!(
         job.try_get::<Option<chrono::DateTime<Utc>>, _>("terminal_at")

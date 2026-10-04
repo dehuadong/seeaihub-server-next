@@ -6,19 +6,17 @@
 
 use super::*;
 use crate::{
-    AcceptanceProbe, AccountSummary, ActiveOfferingChannel, AlertSink, ApiKeyView, AttemptFailure,
-    BalanceChange, ClaimedJob, CompleteJob, CustomerAccountTarget, CustomerBillingQuery,
-    CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageQuery, CustomerUsageView,
-    CustomerView, GatewayModelView, JobView, LeaseRecovery, LedgerEntry, LedgerPage, NewFxRate,
-    ProviderCostGapView, ProviderFailureQuery, ProviderFailureView, PublishRuntimeRequest,
-    ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand, RoutingDecision,
-    SelectableOfferingView, UnacceptedAttempt,
+    AccountSummary, ActiveOfferingChannel, AlertSink, ApiKeyView, BalanceChange,
+    CustomerAccountTarget, CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery,
+    CustomerUsageQuery, CustomerUsageView, CustomerView, GatewayModelView, LedgerEntry, LedgerPage,
+    NewFxRate, ProviderCostGapView, ProviderFailureQuery, ProviderFailureView,
+    PublishRuntimeRequest, ReconciliationCaseView, ReferencedOffering, RefundReconciliationCommand,
+    SelectableOfferingView,
 };
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use seeai_domain::{
-    AccountId, AttemptId, ChannelId, CreateImageGeneration, FxRate, GenerationJob, ImageBranch,
-    JobId, OfferingCandidate, OfferingId, PublishedModel, PublishedOffering, PublishedRevision,
+    AccountId, ChannelId, FxRate, OfferingCandidate, OfferingId, PublishedModel, PublishedRevision,
     RoutePolicy,
 };
 use serde_json::Value;
@@ -394,15 +392,6 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn acceptance_probe(
-        &self,
-        _gateway_model: &str,
-        _account_id: AccountId,
-        _idempotency_key: &str,
-    ) -> Result<AcceptanceProbe, ApplicationError> {
-        unused_repository()
-    }
-
     async fn accounts_updated_within(
         &self,
         _window: Duration,
@@ -557,88 +546,6 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn create_job(
-        &self,
-        _command: CreateImageGeneration,
-        _branch: ImageBranch,
-        _offering: PublishedOffering,
-        _request_hash: String,
-        _routing: RoutingDecision,
-    ) -> Result<(GenerationJob, BalanceChange), ApplicationError> {
-        unused_repository()
-    }
-
-    async fn get_job(
-        &self,
-        _account_id: AccountId,
-        _job_id: JobId,
-    ) -> Result<JobView, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn claim_next_job(
-        &self,
-        _worker_id: &str,
-        _lease_duration: chrono::Duration,
-    ) -> Result<Option<ClaimedJob>, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn recover_expired_leases(&self) -> Result<LeaseRecovery, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn begin_attempt(
-        &self,
-        _job_id: JobId,
-        _worker_id: &str,
-        _attempt_id: AttemptId,
-        _request_digest: &str,
-    ) -> Result<u32, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn requeue_after_unaccepted(
-        &self,
-        _command: UnacceptedAttempt,
-    ) -> Result<(), ApplicationError> {
-        unused_repository()
-    }
-
-    async fn renew_lease(
-        &self,
-        _job_id: JobId,
-        _worker_id: &str,
-        _lease_duration: chrono::Duration,
-    ) -> Result<(), ApplicationError> {
-        unused_repository()
-    }
-
-    async fn complete_job(
-        &self,
-        _completion: CompleteJob,
-    ) -> Result<BalanceChange, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn fail_job(
-        &self,
-        _job_id: JobId,
-        _worker_id: &str,
-        _attempt_id: Option<AttemptId>,
-        _failure: AttemptFailure,
-    ) -> Result<BalanceChange, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn count_in_flight_jobs(
-        &self,
-        _account_id: AccountId,
-        _except_idempotency_key: &str,
-    ) -> Result<u64, ApplicationError> {
-        unused_repository()
-    }
-
     async fn daily_spend_microusd(&self, _account_id: AccountId) -> Result<u64, ApplicationError> {
         unused_repository()
     }
@@ -653,14 +560,6 @@ impl HubRepository for AuditRepository {
         &self,
         _query: ProviderFailureQuery,
     ) -> Result<Vec<ProviderFailureView>, ApplicationError> {
-        unused_repository()
-    }
-
-    async fn consecutive_offering_failures(
-        &self,
-        _offering_id: OfferingId,
-        _window: u32,
-    ) -> Result<u64, ApplicationError> {
         unused_repository()
     }
 

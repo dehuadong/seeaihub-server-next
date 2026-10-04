@@ -17,12 +17,11 @@
 //! 住它，否则它被掐断时那一边还在等一个永远不会来的结果。
 //!
 //! ```text
-//! worker 租约 ≥ 上游超时上限 ≤ 对客同步等待窗口
+//! 上游超时上限 ≤ 对客同步等待窗口
 //! ```
 //!
-//! **worker 租约 ≥ 上限**：租约先到期，另一个 worker 会领走同一个 Job 再调一次上游——付两次钱。
 //! **对客同步等待窗口 ≥ 上限**：窗口先到期，消费者拿到 504，而上游还在生成、照样计费——就是上面
-//! 那个最坏结果。两处比较的都是**上限**，即"允许的最大 `n` 下算出来的那个值"：只保证某个小 `n`
+//! 那个最坏结果。比较的是**上限**，即"允许的最大 `n` 下算出来的那个值"：只保证某个小 `n`
 //! 够用不算够，能发出的最大请求必须落在链内。
 //!
 //! 最大输出张数 **来自合同自己声明的取值面**（`capability_schema.properties.n.maximum`），不是代码
@@ -96,8 +95,6 @@ pub struct RequestTimeoutPolicy {
     pub per_image: Duration,
     /// 上游调用的上限（秒）：算出来的值封顶在这里。
     pub provider_timeout: Duration,
-    /// worker 租约：必须覆盖上游调用。
-    pub worker_lease: Duration,
     /// 对客同步等待窗口：必须覆盖上游调用。
     pub sync_wait: Duration,
     /// **输出张数**上限：对客参数 `n` 在合同里声明的最大值。
@@ -142,8 +139,8 @@ impl RequestTimeoutPolicy {
     /// 校验超时链。任何一条不满足都返回点名到具体那条链与两边当前值的配置错误。
     ///
     /// 输出张数上限在合同里，环境变量读不到它，所以这条约束只能在连库之后、进程起来之前判——
-    /// 判不过就不启动。两条比较的先后顺序就是链自下而上的顺序，报错先报最下面那条：先修根因，
-    /// 一次改一层；上限比"最大输出张数下的按请求上限"小是根因，上限一旦成立两条链的比较才有
+    /// 判不过就不启动。比较的先后顺序就是链自下而上的顺序，报错先报最下面那条：先修根因，
+    /// 一次改一层；上限比"最大输出张数下的按请求上限"小是根因，上限一旦成立窗口那条比较才有
     /// 意义。
     pub fn validate(&self) -> Result<(), ApplicationError> {
         let ceiling = self.provider_timeout.as_secs();
@@ -161,14 +158,6 @@ impl RequestTimeoutPolicy {
                 self.per_image.as_secs()
             )));
         }
-        let lease = self.worker_lease.as_secs();
-        if self.worker_lease < self.provider_timeout {
-            return Err(ApplicationError::Configuration(format!(
-                "WORKER_LEASE_SECONDS ({lease}s) is below PROVIDER_TIMEOUT_SECONDS ({ceiling}s): \
-                 the lease would expire while the upstream call is still running, another worker \
-                 would pick the same job up and pay the upstream twice"
-            )));
-        }
         let sync_wait = self.sync_wait.as_secs();
         if self.sync_wait < self.provider_timeout {
             return Err(ApplicationError::Configuration(format!(
@@ -181,15 +170,14 @@ impl RequestTimeoutPolicy {
     }
 
     /// 从环境变量读整条链，**输出张数**上限取合同声明里的那份（见
-    /// [`crate::declared_output_images`]）。**两个进程读的是同一组变量**："窗口在上限之上、租约
-    /// 在超时之上"这条链横跨 API 与 Worker，各读各的、各校验各的，两边才看得到对方的值。
+    /// [`crate::declared_output_images`]）。API 与对账 Worker 读的是同一组变量：**窗口在上限
+    /// 之上**这条链横跨两个进程，各读各的、各校验各的，两边才看得到对方的值。
     ///
-    /// 六个变量，都是运维取值：
+    /// 五个变量，都是运维取值：
     /// - `PROVIDER_TIMEOUT_BASE_SECONDS`（默认 [`DEFAULT_BASE_SECONDS`]）
     /// - `PROVIDER_TIMEOUT_INCLUDED_IMAGES`（默认 [`DEFAULT_INCLUDED_IMAGES`]）
     /// - `PROVIDER_TIMEOUT_PER_IMAGE_SECONDS`（默认 [`DEFAULT_PER_IMAGE_SECONDS`]）
     /// - `PROVIDER_TIMEOUT_SECONDS`（默认按最大输出张数算出来的值——默认值下最大请求正好不超时）
-    /// - `WORKER_LEASE_SECONDS`（默认 `PROVIDER_TIMEOUT_SECONDS × 1.2` 向上取整到秒）
     /// - `GENERATION_SYNC_WAIT_SECONDS`（默认 `PROVIDER_TIMEOUT_SECONDS +`
     ///   [`SYNC_WAIT_OVERHEAD_SECONDS`]）
     pub fn from_env(max_output_images: u64) -> Result<Self, ApplicationError> {
@@ -202,8 +190,6 @@ impl RequestTimeoutPolicy {
         )?;
         let computed = upstream_timeout(base, included_images, per_image, max_output_images);
         let provider_timeout = seconds_env("PROVIDER_TIMEOUT_SECONDS", computed.as_secs())?;
-        let default_lease = provider_timeout.as_secs() + provider_timeout.as_secs().div_ceil(5);
-        let worker_lease = seconds_env("WORKER_LEASE_SECONDS", default_lease)?;
         let default_sync_wait = Self::default_sync_wait(provider_timeout).as_secs();
         let sync_wait = seconds_env("GENERATION_SYNC_WAIT_SECONDS", default_sync_wait)?;
         Ok(Self {
@@ -211,7 +197,6 @@ impl RequestTimeoutPolicy {
             included_images,
             per_image,
             provider_timeout,
-            worker_lease,
             sync_wait,
             max_output_images,
         })

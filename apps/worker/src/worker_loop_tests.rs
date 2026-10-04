@@ -8,16 +8,12 @@ use serde_json::Value;
 use std::{future::Future, pin::Pin};
 use uuid::Uuid;
 
-/// 一个**空队列**的仓储：`claim_next_job` 先按住一会儿再回 `None`，把"一轮"拉长成一个可观察的
-/// 窗口。两个标志让用例能精确地把停机请求投在"这一轮已经开始、还没跑完"的那一刻。
+/// 一个**没有对账工作**的仓储：这一层只服务"停机时序"用例，真被调到就是用例写错了。
 ///
-/// 其余方法一律 `unimplemented!()`：这条用例只走"领取下一轮"这一条路，别的路径真被调到就是用例
-/// 写错了，不该悄悄返回一个假值让它看起来跑通了。
+/// 其余方法一律 `unimplemented!()`：别的路径真被调到就是用例写错了，不该悄悄返回一个假值让它
+/// 看起来跑通了。
 #[derive(Default)]
-struct EmptyQueueRepository {
-    iteration_started: Arc<std::sync::atomic::AtomicBool>,
-    iteration_finished: Arc<std::sync::atomic::AtomicBool>,
-}
+struct EmptyQueueRepository;
 
 #[async_trait]
 impl HubRepository for EmptyQueueRepository {
@@ -262,23 +258,6 @@ impl HubRepository for EmptyQueueRepository {
         unimplemented!()
     }
 
-    async fn claim_next_job(
-        &self,
-        _worker_id: &str,
-        _lease_duration: ChronoDuration,
-    ) -> Result<Option<ClaimedJob>, ApplicationError> {
-        self.iteration_started
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        tokio::time::sleep(Duration::from_millis(200)).await;
-        self.iteration_finished
-            .store(true, std::sync::atomic::Ordering::SeqCst);
-        Ok(None)
-    }
-
-    async fn recover_expired_leases(&self) -> Result<LeaseRecovery, ApplicationError> {
-        Ok(LeaseRecovery::default())
-    }
-
     async fn publish_runtime(
         &self,
         _request: PublishRuntimeRequest,
@@ -354,19 +333,12 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<Vec<ProviderCostGapView>, ApplicationError> {
         unimplemented!()
     }
-    async fn acceptance_probe(
-        &self,
-        _gateway_model: &str,
-        _account_id: AccountId,
-        _idempotency_key: &str,
-    ) -> Result<AcceptanceProbe, ApplicationError> {
-        unimplemented!()
-    }
     async fn accounts_updated_within(
         &self,
         _window: Duration,
     ) -> Result<Vec<BalanceChange>, ApplicationError> {
-        unimplemented!()
+        // 慢周期账务核对按增量窗口取账户：这条夹具没有任何账户，回空表示"没有要核对的"。
+        Ok(Vec::new())
     }
     async fn insert_audit_event(
         &self,
@@ -498,68 +470,6 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<(Uuid, AccountId), ApplicationError> {
         unimplemented!()
     }
-    async fn create_job(
-        &self,
-        _command: CreateImageGeneration,
-        _branch: ImageBranch,
-        _offering: PublishedOffering,
-        _request_hash: String,
-        _routing: RoutingDecision,
-    ) -> Result<(GenerationJob, BalanceChange), ApplicationError> {
-        unimplemented!()
-    }
-    async fn get_job(
-        &self,
-        _account_id: AccountId,
-        _job_id: JobId,
-    ) -> Result<JobView, ApplicationError> {
-        unimplemented!()
-    }
-    async fn begin_attempt(
-        &self,
-        _job_id: JobId,
-        _worker_id: &str,
-        _attempt_id: AttemptId,
-        _request_digest: &str,
-    ) -> Result<u32, ApplicationError> {
-        unimplemented!()
-    }
-    async fn requeue_after_unaccepted(
-        &self,
-        _command: UnacceptedAttempt,
-    ) -> Result<(), ApplicationError> {
-        unimplemented!()
-    }
-    async fn renew_lease(
-        &self,
-        _job_id: JobId,
-        _worker_id: &str,
-        _lease_duration: ChronoDuration,
-    ) -> Result<(), ApplicationError> {
-        unimplemented!()
-    }
-    async fn complete_job(
-        &self,
-        _completion: CompleteJob,
-    ) -> Result<BalanceChange, ApplicationError> {
-        unimplemented!()
-    }
-    async fn fail_job(
-        &self,
-        _job_id: JobId,
-        _worker_id: &str,
-        _attempt_id: Option<AttemptId>,
-        _failure: AttemptFailure,
-    ) -> Result<BalanceChange, ApplicationError> {
-        unimplemented!()
-    }
-    async fn count_in_flight_jobs(
-        &self,
-        _account_id: AccountId,
-        _except_idempotency_key: &str,
-    ) -> Result<u64, ApplicationError> {
-        unimplemented!()
-    }
     async fn daily_spend_microusd(&self, _account_id: AccountId) -> Result<u64, ApplicationError> {
         unimplemented!()
     }
@@ -572,13 +482,6 @@ impl HubRepository for EmptyQueueRepository {
         &self,
         _query: ProviderFailureQuery,
     ) -> Result<Vec<ProviderFailureView>, ApplicationError> {
-        unimplemented!()
-    }
-    async fn consecutive_offering_failures(
-        &self,
-        _offering_id: OfferingId,
-        _window: u32,
-    ) -> Result<u64, ApplicationError> {
         unimplemented!()
     }
     async fn refund_reconciliation(
@@ -596,6 +499,135 @@ impl HubRepository for EmptyQueueRepository {
     async fn open_ledger_reconciliation_case(
         &self,
         _command: OpenLedgerCaseCommand,
+    ) -> Result<bool, ApplicationError> {
+        unimplemented!()
+    }
+}
+
+/// 对账仓储替身：**第一件事是接管过期所有权**，这里就按住一会儿再回空，把"一轮"拉长成一个
+/// 可观察的窗口。两个标志让用例能精确地把停机请求投在"这一轮已经开始、还没跑完"的那一刻。
+///
+/// 其余方法一律 `unimplemented!()`：一轮对账在接管之后还有孤儿回收与晚到事实消费，这条夹具
+/// 只验停机时序，真被调到别的端口就是用例写错了。
+#[derive(Default)]
+struct BlockedReconciliationRepository {
+    iteration_started: Arc<std::sync::atomic::AtomicBool>,
+    iteration_finished: Arc<std::sync::atomic::AtomicBool>,
+}
+
+#[async_trait]
+impl ExecutionRepository for BlockedReconciliationRepository {
+    async fn takeover_expired_executions(
+        &self,
+        _worker_id: &str,
+        _lease: ChronoDuration,
+        _limit: u32,
+        _max_query_attempts: u32,
+    ) -> Result<Vec<TakenOverExecution>, ApplicationError> {
+        self.iteration_started
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        self.iteration_finished
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        Ok(Vec::new())
+    }
+
+    async fn reap_unsubmitted_admissions(
+        &self,
+        _max_age: ChronoDuration,
+        _limit: u32,
+    ) -> Result<u64, ApplicationError> {
+        Ok(0)
+    }
+
+    async fn claim_unconsumed_late_facts(
+        &self,
+        _worker_id: &str,
+        _limit: u32,
+        _claim_ttl: ChronoDuration,
+    ) -> Result<Vec<ClaimedLateFact>, ApplicationError> {
+        Ok(Vec::new())
+    }
+
+    async fn admit(&self, _command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn lookup_execution(
+        &self,
+        _account_id: AccountId,
+        _idempotency_key_digest: &str,
+    ) -> Result<Option<ExecutionLookup>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn begin_submission(
+        &self,
+        _command: BeginSubmission,
+    ) -> Result<SubmissionStarted, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn record_acceptance(&self, _command: RecordAcceptance) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn settle(
+        &self,
+        _command: SettleExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn fail_or_reconcile(
+        &self,
+        _command: FailOrReconcileExecution,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn read_finalization(
+        &self,
+        _job_id: JobId,
+        _attempt_id: AttemptId,
+    ) -> Result<Option<ExecutionFinalization>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn offer_late_facts(
+        &self,
+        _facts: LateFacts,
+    ) -> Result<LateFactsOutcome, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn renew_execution_ownership(
+        &self,
+        _job_id: JobId,
+        _execution_owner: &str,
+        _fencing_token: FencingToken,
+        _lease: ChronoDuration,
+    ) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn mark_late_fact_consumed(&self, _id: Uuid) -> Result<bool, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn record_reconciliation_query_attempt(
+        &self,
+        _job_id: JobId,
+        _backoff: ChronoDuration,
+    ) -> Result<Option<u32>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn record_terminal_provider_cost(
+        &self,
+        _job_id: JobId,
+        _attempt_id: AttemptId,
+        _cost: &ProviderCostFact,
     ) -> Result<bool, ApplicationError> {
         unimplemented!()
     }
@@ -676,25 +708,17 @@ impl TestInterrupt {
     }
 }
 
-fn drain_worker(repository: Arc<EmptyQueueRepository>) -> WorkerService {
-    WorkerService::new(
-        repository,
+fn drain_worker(
+    executions: Arc<BlockedReconciliationRepository>,
+) -> ExecutionReconciliationService {
+    ExecutionReconciliationService::new(
+        Arc::new(EmptyQueueRepository),
+        executions,
         Arc::new(NoAdapterFactory),
         Arc::new(NoCredentials),
         "drain-test-worker".to_owned(),
         ChronoDuration::seconds(30),
-        // 只要一条自洽的链即可：这条用例不跑 Driver，超时取值不参与判定。
-        RequestTimeoutPolicy {
-            base: Duration::from_secs(1),
-            included_images: 1,
-            per_image: Duration::ZERO,
-            provider_timeout: Duration::from_secs(1),
-            worker_lease: Duration::from_secs(30),
-            sync_wait: Duration::from_secs(1),
-            max_output_images: 1,
-        },
     )
-    .expect("the fixture policy must be a consistent chain")
 }
 
 /// 一份"还没人要求停机"的输入：排空开关是关的，终止信号由用例自己决定什么时候投。
@@ -723,9 +747,9 @@ fn quiet_signals() -> (
 /// 而不是在半路把它丢掉。
 #[tokio::test]
 async fn a_drain_request_waits_for_the_in_flight_iteration() {
-    let repository = Arc::new(EmptyQueueRepository::default());
+    let repository = Arc::new(BlockedReconciliationRepository::default());
     let finished_flag = repository.iteration_finished.clone();
-    let worker = drain_worker(repository);
+    let service = drain_worker(repository);
     let (signals, control, _interrupt) = quiet_signals();
 
     tokio::spawn(async move {
@@ -733,9 +757,7 @@ async fn a_drain_request_waits_for_the_in_flight_iteration() {
         let _ = control.send(true);
     });
 
-    run_until_shutdown(&worker, None, signals, Duration::from_secs(3_600))
-        .await
-        .expect("draining must not fail");
+    run_until_shutdown(Some(&service), signals, Duration::from_secs(3_600)).await;
 
     assert!(
         finished_flag.load(std::sync::atomic::Ordering::SeqCst),
@@ -746,9 +768,9 @@ async fn a_drain_request_waits_for_the_in_flight_iteration() {
 /// 终止信号同样等手上这一轮跑完才退：信号只决定"不再领下一轮"。
 #[tokio::test]
 async fn an_interrupt_waits_for_the_in_flight_iteration() {
-    let repository = Arc::new(EmptyQueueRepository::default());
+    let repository = Arc::new(BlockedReconciliationRepository::default());
     let finished_flag = repository.iteration_finished.clone();
-    let worker = drain_worker(repository);
+    let service = drain_worker(repository);
     let (signals, _control, interrupt) = quiet_signals();
 
     tokio::spawn(async move {
@@ -756,9 +778,7 @@ async fn an_interrupt_waits_for_the_in_flight_iteration() {
         interrupt.send();
     });
 
-    run_until_shutdown(&worker, None, signals, Duration::from_secs(3_600))
-        .await
-        .expect("draining must not fail");
+    run_until_shutdown(Some(&service), signals, Duration::from_secs(3_600)).await;
 
     assert!(
         finished_flag.load(std::sync::atomic::Ordering::SeqCst),
@@ -771,15 +791,15 @@ async fn an_interrupt_waits_for_the_in_flight_iteration() {
 /// 这是"重复的停机请求"必须具备的性质：不然每次都会被当成一条新的停机要求，再去领一轮。
 #[tokio::test]
 async fn an_already_draining_worker_does_not_claim_another_iteration() {
-    let repository = Arc::new(EmptyQueueRepository::default());
+    let repository = Arc::new(BlockedReconciliationRepository::default());
     let started_flag = repository.iteration_started.clone();
-    let worker = drain_worker(repository);
+    let service = drain_worker(repository);
     let (signals, control, _interrupt) = quiet_signals();
     let _ = control.send(true);
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(500),
-        run_until_shutdown(&worker, None, signals, Duration::from_secs(3_600)),
+        run_until_shutdown(Some(&service), signals, Duration::from_secs(3_600)),
     )
     .await;
 
@@ -800,13 +820,13 @@ async fn an_already_draining_worker_does_not_claim_another_iteration() {
 /// 在慢机器上偶发（而它证明不了更多东西）。
 #[tokio::test]
 async fn the_loop_keeps_working_while_no_stop_is_requested() {
-    let repository = Arc::new(EmptyQueueRepository::default());
-    let worker = drain_worker(repository);
+    let repository = Arc::new(BlockedReconciliationRepository::default());
+    let service = drain_worker(repository);
     let (signals, _control, _interrupt) = quiet_signals();
 
     let outcome = tokio::time::timeout(
         Duration::from_millis(600),
-        run_until_shutdown(&worker, None, signals, Duration::from_millis(100)),
+        run_until_shutdown(Some(&service), signals, Duration::from_millis(100)),
     )
     .await;
 

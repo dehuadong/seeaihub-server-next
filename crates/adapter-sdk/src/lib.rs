@@ -9,9 +9,10 @@ use thiserror::Error;
 
 mod gateway;
 pub use gateway::{
-    AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, Deadline, ExecutionContext,
-    GatewayAdapter, GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage,
-    ProviderOutput, QueryAccountingCapability, ResponsePayload, ensure_external_call_allowed,
+    AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, Deadline, DispatchGate,
+    ExecutionContext, GatewayAdapter, GatewayInput, ImageSite, ImageSites, ImageValueShape,
+    InputImage, ProviderOutput, ProviderTaskHandle, ProviderTaskState, QueryAccountingCapability,
+    ResponsePayload, begin_generation_send, ensure_external_call_allowed, ensure_read_call_allowed,
     external_call_timeout, gateway_passthrough_parameters,
 };
 
@@ -295,6 +296,40 @@ impl ProviderFailureKind {
     }
 }
 
+/// 一次执行要覆盖的**字节上限**：入口 wire、上游响应、编码后的对客正文。
+///
+/// 这些是 Driver 实际会接受/产出的上界，写成一份共享声明，调用方才能算出"一次执行最坏要预留
+/// 多少内存"。各段单独相加会低估：上游原始响应、解析出的图片字符串与编码后的正文可能同时
+/// 存活，编码还要算转义膨胀（RFC 0018 §2）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct GatewayByteLimits {
+    /// 入口请求 wire 上界：认证之后才解析，解析结果与它同时存活。
+    pub request_wire_bytes: usize,
+    /// 上游响应正文上界：一次读进内存以后再解析。
+    pub provider_response_bytes: usize,
+}
+
+/// 编码后正文相对上游原始响应的保守倍数：JSON 转义会把 `"`、`\` 与控制字符放大，
+/// base64 图片是 4/3，再用信封与解析副本的余量收口。
+pub const ENCODED_RESPONSE_EXPANSION: usize = 6;
+
+/// 入口请求 wire 的上限：与 API 的正文上限同一口径，解析结果与它同时存活。
+pub const GATEWAY_REQUEST_WIRE_BYTES: usize = 16 * 1024 * 1024;
+
+impl GatewayByteLimits {
+    /// 一次执行的最坏占用上界（字节）。用饱和加法，配置极大时退化为 `usize::MAX` 而不是回绕。
+    #[must_use]
+    pub const fn max_bytes_per_execution(self) -> usize {
+        let encoded = self
+            .provider_response_bytes
+            .saturating_mul(ENCODED_RESPONSE_EXPANSION);
+        // 同一时刻在飞的：入口请求与解析副本、上游原始响应、编码后正文。
+        self.request_wire_bytes
+            .saturating_add(self.provider_response_bytes)
+            .saturating_add(encoded)
+    }
+}
+
 /// 一个 Driver 的**传输能力**声明：它在线上能写什么。
 ///
 /// `supported_top_level_parameters` 的语义是"这个 Driver 能写上线文的**字段名**"，
@@ -318,6 +353,8 @@ pub struct AdapterDescriptor {
     /// 金额 × 倍率）发得出去。`false`：上游只回四分项 `usage`，金额由平台按费率自算，声明
     /// `upstream_declared` 的候选发布期就拒——否则受理时收不到金额，结算只能记成本缺口。
     pub declares_cost: bool,
+    /// 这条通路的字节上限：调用方据此计算一次执行的内存预留。
+    pub byte_limits: GatewayByteLimits,
 }
 
 #[derive(Debug, Clone, Error)]
@@ -356,7 +393,13 @@ pub enum AdapterError {
         handle: gateway::AcceptedHandle,
         reason: String,
     },
-    /// 执行所有权失效或停机：停止新的外部副作用。
+    /// 执行所有权失效或停机，且发生在**生成请求发出之前**：可证明这次执行没有提交生成，
+    /// 占用与渠道名额可以按确定失败释放（RFC 0018 §4）。
+    #[error("the execution was cancelled before the generation request was sent")]
+    CancelledBeforeSend,
+    /// 执行所有权失效或停机：**已经在等待上游结果的阶段**收到取消。
+    ///
+    /// 它不能证明上游未受理，只能按"可能已提交"有限收尾（RFC 0017 §5）。
     #[error("the execution was cancelled")]
     Cancelled,
     /// 这条通路不支持按句柄查询计量。

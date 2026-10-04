@@ -23,7 +23,6 @@ async fn direct_slow_read_is_408_and_creates_no_record() {
         4,
         30,
         ApiProcessSettings {
-            direct_execution: true,
             slow_read_timeout_seconds: Some(1),
             ..ApiProcessSettings::default()
         },
@@ -401,7 +400,6 @@ async fn direct_sql_count_does_not_grow_with_provider_wait() {
         4,
         30,
         ApiProcessSettings {
-            direct_execution: true,
             ..ApiProcessSettings::default()
         },
     )
@@ -424,7 +422,6 @@ async fn direct_sql_count_does_not_grow_with_provider_wait() {
         4,
         30,
         ApiProcessSettings {
-            direct_execution: true,
             ..ApiProcessSettings::default()
         },
     )
@@ -459,7 +456,6 @@ async fn direct_slow_provider_does_not_occupy_a_database_connection() {
         4,
         30,
         ApiProcessSettings {
-            direct_execution: true,
             ..ApiProcessSettings::default()
         },
     )
@@ -525,7 +521,7 @@ async fn direct_slow_provider_keeps_more_requests_than_pool_connections_in_fligh
         32,
         30,
         ApiProcessSettings {
-            direct_execution: true,
+            max_memory_bytes: Some(one_execution_reservation_bytes() * CONCURRENT),
             ..ApiProcessSettings::default()
         },
     )
@@ -577,11 +573,19 @@ async fn direct_slow_provider_keeps_more_requests_than_pool_connections_in_fligh
 /// 进程直接拒绝启动（Supervisor::new），所以单个请求永远在预算内；能压出来的边界只有"又一个执行
 /// 要预留，而预算已被在飞执行占满"。执行、发送、读取名额都保持默认 64，唯一被压小的是字节预算，
 /// 因此这次 503 只能归因于内存预算，不会与并发名额超限混淆。
+/// 单次执行的内存预留：与网关按 Driver 字节上限算出的口径一致（见 `apps/api/src/main.rs`）。
+fn one_execution_reservation_bytes() -> usize {
+    let response = seeai_adapter_aihubmix::MAX_PROVIDER_RESPONSE_BYTES
+        .max(seeai_adapter_apimart::MAX_PROVIDER_RESPONSE_BYTES);
+    seeai_adapter_sdk::GATEWAY_REQUEST_WIRE_BYTES
+        + response
+        + response * seeai_adapter_sdk::ENCODED_RESPONSE_EXPANSION
+}
+
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn direct_memory_budget_rejects_a_second_concurrent_execution() {
-    // EXECUTION_MEMORY_BYTES 的值：一次执行的固定预留（生产常量见 apps/api/src/supervisor.rs）。
-    const ONE_EXECUTION_RESERVATION_BYTES: usize = 32 * 1024 * 1024;
+    // 预算刚好够一次执行：网关按 Driver 字节上限算出的那份预留。
     let harness = Harness::start_direct_with(
         candidate(
             "AIHubMix",
@@ -595,8 +599,7 @@ async fn direct_memory_budget_rejects_a_second_concurrent_execution() {
         64,
         30,
         ApiProcessSettings {
-            direct_execution: true,
-            max_memory_bytes: Some(ONE_EXECUTION_RESERVATION_BYTES),
+            max_memory_bytes: Some(one_execution_reservation_bytes()),
             ..ApiProcessSettings::default()
         },
     )
@@ -693,7 +696,7 @@ fn peak_rss_kib(pid: u32) -> u64 {
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn direct_peak_rss_stays_within_the_memory_budget() {
-    const MEMORY_BUDGET_BYTES: usize = 256 * 1024 * 1024;
+    let memory_budget_bytes = one_execution_reservation_bytes();
     const REFERENCE_IMAGE_BYTES: usize = 6 * 1024 * 1024;
     let harness = Harness::start_direct_with(
         candidate(
@@ -705,8 +708,7 @@ async fn direct_peak_rss_stays_within_the_memory_budget() {
         4,
         30,
         ApiProcessSettings {
-            direct_execution: true,
-            max_memory_bytes: Some(MEMORY_BUDGET_BYTES),
+            max_memory_bytes: Some(memory_budget_bytes),
             ..ApiProcessSettings::default()
         },
     )
@@ -729,7 +731,7 @@ async fn direct_peak_rss_stays_within_the_memory_budget() {
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     let peak_kib = peak_rss_kib(harness.api_pid());
-    let budget_kib = (MEMORY_BUDGET_BYTES / 1024) as u64;
+    let budget_kib = (memory_budget_bytes / 1024) as u64;
     println!("API 子进程峰值 RSS: {peak_kib} KiB（配置预算 {budget_kib} KiB）");
     assert!(
         peak_kib < budget_kib,
@@ -767,7 +769,6 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
         1,  // 账户在飞上限
         30, // 总期限：要盖过 3s 的上游等待
         ApiProcessSettings {
-            direct_execution: true,
             channel_max_in_flight: Some(1),
             ..ApiProcessSettings::default()
         },
@@ -779,7 +780,6 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
             1,
             30,
             &ApiProcessSettings {
-                direct_execution: true,
                 channel_max_in_flight: Some(1),
                 ..ApiProcessSettings::default()
             },
@@ -866,104 +866,6 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("释放后另一账户在副本上的请求", &body);
-
-    drop(peer);
-    harness.cleanup().await;
-}
-
-/// A8：一个副本先按旧修订写下 route 缓存，随后库里发布新修订、失效通知丢失；另一个副本受理时
-/// 必须回源数据库用新修订，不选陈旧缓存里的旧候选。
-///
-/// route 缓存住在 Redis、由各副本共享，所以"通知丢失"就是缓存里留着旧修订那份。这里让主进程
-/// 写入旧值，副本在**不刷新缓存**的情况下受理，用冻结快照里的对客费率判它用的是哪一版。
-///
-/// 这条走**旧 Job 流水线**：直接执行那条路每次受理都直读 `active_offering`，根本不读 route
-/// 缓存，验不到"陈旧缓存"这个形态；缓存命中与回源只发生在 `GenerationService` 的受理前选路里。
-#[tokio::test]
-#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_peer_replica_falls_back_to_the_database_when_the_route_cache_is_stale() {
-    let cache = CacheFixture::start(CacheSettings::default()).await;
-    let harness = Harness::start_with_cache(
-        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
-        64,
-        30,
-        cache,
-    )
-    .await;
-    let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
-    let (_, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-
-    // 副本与主进程共用同一台假 Redis，因此也会读到后面那份没有被失效掉的旧修订。它在旧值写进
-    // 缓存**之前**起来，免得它启动时那轮对账把还没写的缓存当成陈旧项去清。
-    let (peer_base, peer) = harness
-        .start_replica(
-            64,
-            30,
-            &ApiProcessSettings {
-                cache: Some(harness.cache().share()),
-                ..ApiProcessSettings::default()
-            },
-        )
-        .await;
-    // 一个 Worker 覆盖两次受理：Job 记在库里，哪个 API 进程受理的都能被执行。
-    let _worker = harness.spawn_worker();
-
-    // 先在主进程上受理一次，把 route 缓存按修订 A 写起来。
-    let first_key = format!("replica-route-first-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &first_key,
-        &route_request(harness.model, "warm the route cache"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    let stale = harness.cache().route(harness.model).expect("route 缓存");
-
-    // 发布新修订并让失效失败：缓存里留着的是修订 A 那份候选集。
-    harness.cache().set_fail_writes(true);
-    let mut higher = priced_consumer_rates();
-    higher["image_output_micros_per_million"] = json!(440_000_000);
-    assert_eq!(
-        publish_cache_priced(&harness, higher.clone()).await,
-        StatusCode::OK
-    );
-    harness.cache().set_fail_writes(false);
-    assert_eq!(
-        harness.cache().route(harness.model).expect("旧值还在"),
-        stale,
-        "失效失败后缓存里仍是旧修订那份"
-    );
-
-    // 在**副本**上受理：它必须按数据库当前修订回源，用新定价。
-    let second_key = format!("replica-route-second-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &peer_base,
-        &api_key,
-        "/v1/images/generations",
-        &second_key,
-        &route_request(harness.model, "the peer must not use the stale route"),
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_eq!(
-        frozen_snapshot(&harness.pool, &second_key).await["consumer_rates_cny"],
-        higher,
-        "副本必须采用数据库当前修订的定价，而不是陈旧缓存里的旧修订"
-    );
-    assert_ne!(
-        harness.cache().route(harness.model).expect("重建后的缓存"),
-        stale,
-        "副本回源后缓存被重建成新修订那一份"
-    );
 
     drop(peer);
     harness.cleanup().await;

@@ -38,18 +38,17 @@
 | `PROVIDER_TIMEOUT_BASE_SECONDS` | `180` | 超时链的固定基数 |
 | `PROVIDER_TIMEOUT_INCLUDED_IMAGES` | `4` | 基数里已含的产出张数 |
 | `PROVIDER_TIMEOUT_PER_IMAGE_SECONDS` | `30` | 超出基数后每张追加的秒数 |
-| `GENERATION_RETRY_MAX_ATTEMPTS` | `3` | 安全重投上限（旧 Worker 与直接同步执行共用）。**只在可证明上游没有受理时重投**；状态不确定一律不重投，进对账 |
+| `GENERATION_RETRY_MAX_ATTEMPTS` | `3` | 一次请求内的安全重投上限。**只在可证明上游没有受理时重投**；状态不确定一律不重投，进对账 |
 | `GENERATION_RETRY_BACKOFF_BASE_MS` | `1000` | 重投退避基数（同上） |
 
 > 超时链是**启动时校验**的：API 会读已发布合同声明的最大输出张数，算一遍整条链，**不一致就拒绝启动并点名**。所以升级 `PROVIDER_TIMEOUT_*` 时要连同发布侧一起想清楚——它不是"调大就更快"。
 
 ### 直接同步执行
 
-`GENERATION_DIRECT_EXECUTION=true` 时，两条图片入口在 API 进程内直连 Provider：认证与读取准入在消费正文前完成，不建生成 Job、Worker 不领取、结果只在本进程内存里。上面的超时链、上游超时与成本护栏继续生效；下表只列这条路自己的开关、容量与期限。
+两条图片入口在 API 进程内直连 Provider：认证与读取准入在消费正文前完成，不建生成 Job、Worker 不领取、结果只在本进程内存里。上面的超时链、上游超时与成本护栏继续生效；下表只列这条路自己的容量与期限。
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
-| `GENERATION_DIRECT_EXECUTION` | `false` | 直接同步执行开关。关着时图片入口逐字走旧路径（建 Job、Worker 领取、轮询结果），下面的变量一个都不读 |
 | `GENERATION_SETTLE_RESERVE_SECONDS` | `10` | 总期限 D 里预留给结算、提交确认与失败收尾的预算 R：上游预算因此是 D 减 R |
 | `GENERATION_EXECUTION_LEASE_SECONDS` | `60` | v1 执行所有权的租约时长（秒）。`begin_submission` 按它落 `lease_expires_at`，API Supervisor 按它的三分之一周期独立续约；续约冲突或所有权失效立即取消该次执行 |
 | `GENERATION_MAX_CHANNEL_IN_FLIGHT` | `32` | **渠道全局**未决任务上限，多副本经数据库槽位共同遵守（不是单机限制） |
@@ -63,16 +62,15 @@
 
 名额取正数、内存预算至少够一次执行：配不成可用的执行容量时进程启动失败并点名。
 
-## 3. Worker 租约与轮询
+## 3. Worker 轮询
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
-| `WORKER_POLL_INTERVAL_MS` | `1000` | 轮询间隔 |
-| `WORKER_LEASE_SECONDS` | `PROVIDER_TIMEOUT_SECONDS × 1.2` | 领取租约时长。**必须 ≥ `PROVIDER_TIMEOUT_SECONDS`**；**过短**会让长任务被另一个 worker 抢走，**过长**让崩溃后的 Job 迟迟不恢复 |
+| `WORKER_POLL_INTERVAL_MS` | `1000` | 没有活可干时的轮询间隔 |
 
 ### 异常对账查询调度
 
-旧 Worker 的生成领取之外，Worker 每轮还跑异常对账：接管租约过期的 v1 执行、按已知句柄只读查询、按证据幂等结算或建案。查询排期落在 `operations.reconciliation_cases` 的 `next_query_at`/`attempts` 上：同一案例未到下次查询时刻的记录本轮跳过；自动查询到次数上限后转人工并告警，不再自动查询。配置这些值不会改变收费或占用释放语义。
+Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄只读查询、按证据幂等结算或建案。查询排期落在 `operations.reconciliation_cases` 的 `next_query_at`/`attempts` 上：同一案例未到下次查询时刻的记录本轮跳过；自动查询到次数上限后转人工并告警，不再自动查询。配置这些值不会改变收费或占用释放语义。
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
@@ -105,7 +103,7 @@
 | --- | --- |
 | `AIHUBMIX_API_KEY` / `APIMART_API_KEY` | 变量名由发布素材里的 `credential_env` 指定 |
 
-**凭证只从环境变量读**，数据库只存变量名，日志与响应里不出现。缺哪个渠道的密钥，那个渠道的 Job 会失败——不是在启动时失败。worker 在每个 Job 执行时按该渠道的 `credential_env` 现场读取，API 不调上游、不需要它们。
+**凭证只从环境变量读**，数据库只存变量名，日志与响应里不出现。缺哪个渠道的密钥，那一次执行会失败——不是在启动时失败。API 在受理之后、发出外部请求之前按该渠道的 `credential_env` 现场读取；对账 Worker 只在需要重查上游状态时读同一份。
 
 **怎么送进去**：生产用 systemd 的 `EnvironmentFile`（或由密钥系统在启动前渲染它），文件属服务账号、`chmod 600`；本地可以 `export` 或写开发机 `.env`。手动 `export` 只活在当前 shell，**机器重启后要重新 set**，所以它只适合本地，不是生产手段（见[生产环境](production.md) §2.4）。
 

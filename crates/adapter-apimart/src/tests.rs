@@ -964,6 +964,8 @@ async fn serve(
 struct FakeContext {
     deadline: Deadline,
     cancelled: bool,
+    /// 取消恰好落在生成发送闸口：`is_cancelled()` 仍为 false，但最后资格检查失败。
+    gate_closed: bool,
     request_log: Arc<Mutex<Vec<String>>>,
     accepted: Mutex<Vec<(AcceptedHandle, Vec<String>)>>,
     accept_result: Result<(), AcceptanceError>,
@@ -977,6 +979,7 @@ impl FakeContext {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
             cancelled: false,
+            gate_closed: false,
             request_log,
             accepted: Mutex::new(Vec::new()),
             accept_result,
@@ -987,6 +990,13 @@ impl FakeContext {
     fn cancelled(request_log: Arc<Mutex<Vec<String>>>) -> Self {
         let mut context = Self::new(request_log, Ok(()));
         context.cancelled = true;
+        context
+    }
+
+    /// 取消落在最后一道闸：前面的取消检查都通过，但生成发送必须被拦下。
+    fn gate_closed(request_log: Arc<Mutex<Vec<String>>>) -> Self {
+        let mut context = Self::new(request_log, Ok(()));
+        context.gate_closed = true;
         context
     }
 
@@ -1010,6 +1020,10 @@ impl ExecutionContext for FakeContext {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    fn try_begin_generation(&self) -> bool {
+        !self.cancelled && !self.gate_closed
     }
 
     async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError> {
@@ -1069,7 +1083,7 @@ async fn the_handle_is_persisted_before_any_task_poll() {
     );
     let calls = context.accepted_calls();
     assert_eq!(calls.len(), 1);
-    assert_eq!(calls[0].0.task_id, "task_abc");
+    assert_eq!(calls[0].0.task_id.as_str(), "task_abc");
     assert!(
         calls[0]
             .1
@@ -1113,7 +1127,7 @@ async fn a_failed_handle_persist_never_polls_or_resubmits() {
     .expect_err("the barrier must stop the execution");
     match error {
         AdapterError::AcceptedUnpersisted { handle, reason } => {
-            assert_eq!(handle.task_id, "task_abc");
+            assert_eq!(handle.task_id.as_str(), "task_abc");
             assert_eq!(reason, "db down");
         }
         other => panic!("expected AcceptedUnpersisted, got {other:?}"),
@@ -1135,7 +1149,7 @@ async fn query_accounting_reads_the_known_task_without_submitting() {
     .await;
     let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
     let handle = AcceptedHandle {
-        task_id: "task_abc".to_owned(),
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
         trace_id: Some("task_abc".to_owned()),
     };
     let query = adapter(&provider)
@@ -1147,7 +1161,7 @@ async fn query_accounting_reads_the_known_task_without_submitting() {
         )
         .await
         .expect("the terminal task is queryable");
-    assert!(query.terminal);
+    assert_eq!(query.state, ProviderTaskState::Succeeded);
     let facts = query
         .accounting_facts
         .expect("a terminal task carries facts");
@@ -1169,14 +1183,14 @@ async fn query_accounting_reads_the_known_task_without_submitting() {
     );
 }
 
-/// 非终态：terminal:false，不带账务事实，也不产生任何生成副作用。
+/// 非终态：状态是 Pending，不带账务事实，也不产生任何生成副作用。
 #[tokio::test]
 async fn a_running_task_query_is_not_terminal() {
     let provider =
         FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, running_body())]).await;
     let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
     let handle = AcceptedHandle {
-        task_id: "task_abc".to_owned(),
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
         trace_id: None,
     };
     let query = adapter(&provider)
@@ -1188,12 +1202,181 @@ async fn a_running_task_query_is_not_terminal() {
         )
         .await
         .expect("a running task is a valid query result");
-    assert!(!query.terminal);
+    assert_eq!(query.state, ProviderTaskState::Pending);
     assert!(query.accounting_facts.is_none());
     assert_eq!(
         provider.requests(),
         vec!["GET /v1/tasks/task_abc".to_owned()]
     );
+}
+
+fn failed_body() -> String {
+    serde_json::json!({
+        "code": 200,
+        "data": {
+            "id": "task_abc",
+            "status": "failed",
+            "usage": full_usage(),
+            "error": {"code": 400, "message": "the content was rejected"},
+            "cost": 0.011354
+        }
+    })
+    .to_string()
+}
+
+/// 失败任务也带得回用量与成本：状态必须如实报成 Failed，不能被"有事实"翻成成功。
+#[tokio::test]
+async fn a_failed_task_query_reports_failure_with_its_cost() {
+    let provider =
+        FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, failed_body())]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
+        trace_id: None,
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("a failed task is a valid query result");
+    assert_eq!(query.state, ProviderTaskState::Failed);
+    let facts = query.accounting_facts.expect("the failure carried facts");
+    assert_eq!(facts.image_count, 0);
+    assert_eq!(
+        facts.provider_cost,
+        ProviderCost::Declared(DeclaredCost {
+            amount_microusd: 11_354,
+            currency: "CNY".to_owned(),
+        })
+    );
+    assert_eq!(
+        provider.requests(),
+        vec!["GET /v1/tasks/task_abc".to_owned()],
+        "查询失败任务也绝不 submit"
+    );
+}
+
+fn cancelled_body() -> String {
+    serde_json::json!({
+        "code": 200,
+        "data": {"id": "task_abc", "status": "cancelled", "usage": full_usage()}
+    })
+    .to_string()
+}
+
+#[tokio::test]
+async fn a_cancelled_task_query_reports_cancellation() {
+    let provider =
+        FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, cancelled_body())]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
+        trace_id: None,
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("a cancelled task is a valid query result");
+    assert_eq!(query.state, ProviderTaskState::Cancelled);
+}
+
+/// 未列出的状态取值不能当终态、更不能当成功：标成不可信，由收尾方保留占用。
+#[tokio::test]
+async fn an_unlisted_task_status_is_not_treated_as_success() {
+    let body = serde_json::json!({
+        "code": 200,
+        "data": {"id": "task_abc", "status": "some_new_state", "usage": full_usage()}
+    })
+    .to_string();
+    let provider = FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, body)]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
+        trace_id: None,
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("an unlisted status is a valid query result");
+    assert_eq!(query.state, ProviderTaskState::Unknown);
+    assert!(query.accounting_facts.is_none());
+}
+
+/// 响应里的任务标识与句柄不一致：整份响应都不可信，不能把它的状态或计量算到已知任务头上。
+#[tokio::test]
+async fn a_task_query_whose_identifier_differs_is_untrusted() {
+    let body = serde_json::json!({
+        "code": 200,
+        "data": {
+            "id": "task_other",
+            "status": "completed",
+            "usage": full_usage(),
+            "cost": 0.011354
+        }
+    })
+    .to_string();
+    let provider = FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, body)]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
+        trace_id: None,
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("a mismatched response is still a valid transport result");
+    assert_eq!(
+        query.state,
+        ProviderTaskState::Unknown,
+        "a completed status for another task must never be read as this task's success"
+    );
+    assert!(query.accounting_facts.is_none());
+}
+
+/// 响应没有任务标识：同样无法证明状态属于已知任务，按不可信处理。
+#[tokio::test]
+async fn a_task_query_without_an_identifier_is_untrusted() {
+    let body = serde_json::json!({
+        "code": 200,
+        "data": {"status": "completed", "usage": full_usage()}
+    })
+    .to_string();
+    let provider = FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, body)]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
+        trace_id: None,
+    };
+    let query = adapter(&provider)
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("a response without an identifier is a valid transport result");
+    assert_eq!(query.state, ProviderTaskState::Unknown);
+    assert!(query.accounting_facts.is_none());
 }
 /// 取消在 submit 之前生效：没有 POST、没有 accepted，也不会有轮询。
 #[tokio::test]
@@ -1213,10 +1396,67 @@ async fn a_cancelled_execution_never_submits() {
     )
     .await
     .expect_err("取消必须停下");
-    assert!(matches!(error, AdapterError::Cancelled), "{error:?}");
+    assert!(
+        matches!(error, AdapterError::CancelledBeforeSend),
+        "发送前的取消必须与接受后的取消区分：{error:?}"
+    );
     assert!(
         provider.requests().is_empty(),
         "取消后不许有上传或 submit：{:?}",
+        provider.requests()
+    );
+    assert!(context.accepted_calls().is_empty());
+}
+
+/// 接受之后的只读轮询遇到取消：必须报成"不能证明未受理"的取消。
+///
+/// 这条用例挡住把读路径误用发送前闸的回归——那会让已提交的执行被当成"可证明未发送"而释放占用。
+#[tokio::test]
+async fn a_cancellation_while_reading_a_task_is_not_a_before_send_cancellation() {
+    let provider =
+        FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, running_body())]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = adapter(&provider)
+        .query_task_with(
+            "task_abc",
+            &credential,
+            Some(&FakeContext::cancelled(provider.requests.clone())),
+        )
+        .await
+        .expect_err("取消必须停下");
+    assert!(
+        matches!(error, AdapterError::Cancelled),
+        "读路径的取消不能报成发送前取消：{error:?}"
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "取消后不许发查询：{:?}",
+        provider.requests()
+    );
+}
+
+/// 取消恰好落在最后一道闸：前面的取消检查都通过，生成请求仍必须被拦下，且不产生任何提交。
+#[tokio::test]
+async fn a_cancellation_at_the_generation_gate_blocks_the_submit() {
+    let provider =
+        FakeProvider::start(vec![("POST", "/v1/images/generations", 200, submit_body())]).await;
+    let context = FakeContext::gate_closed(provider.requests.clone());
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter(&provider),
+        Arc::new(prompt_only_input()),
+        &context,
+        &credential,
+    )
+    .await
+    .expect_err("闸口关闭必须停下");
+    assert!(
+        matches!(error, AdapterError::CancelledBeforeSend),
+        "闸口拒绝必须与接受后的取消区分：{error:?}"
+    );
+    assert!(
+        provider.requests().is_empty(),
+        "闸口拒绝后不许有 submit：{:?}",
         provider.requests()
     );
     assert!(context.accepted_calls().is_empty());

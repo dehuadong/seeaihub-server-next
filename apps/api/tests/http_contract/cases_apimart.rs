@@ -14,11 +14,11 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("任务式流程", &body);
 
-    let (job_id, state, images) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "the driver flow must settle the job");
     assert_eq!(
-        images,
-        Some(json!([{"url": format!("{}/result.png", harness.upstream_base_url)}])),
+        body["data"],
+        json!([{"url": format!("{}/result.png", harness.upstream_base_url)}]),
         "结果信封里只有上游给的那个地址"
     );
     assert_eq!(harness.count("GET", "/result.png"), 0, "平台不许下载结果图");
@@ -35,8 +35,8 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     assert_eq!(evidence["usage"]["output_image_tokens"], 196);
     assert_eq!(evidence["usage"]["total_tokens"], 210);
 
-    // 对账标识落到**已存在**的 attempts.provider_trace_id 列：
-    // 该列此前只有 fail_job 在写，成功路径不写。
+    // 对账标识落到 attempts.provider_trace_id 列：上游确认受理（`record_acceptance`）时
+    // 随任务句柄一起写下，人工对账据此能找回同一个上游任务。
     let trace_id: Option<String> =
         sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE job_id = $1")
             .bind(job_id)
@@ -121,15 +121,6 @@ async fn apimart_passes_public_urls_through_and_uploads_inline_images() {
         0,
         "平台不下载调用方给的公网参考图"
     );
-    // 参考图落在该候选自己的参数名上（受理期完成映射）。
-    let stored: Value = sqlx::query_scalar(
-        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
-    )
-    .bind(&key)
-    .fetch_one(&harness.pool)
-    .await
-    .expect("native parameters");
-    assert_eq!(stored["image_urls"], json!([reference_url]));
     harness.assert_only_declared_fields(&request);
 
     // 2) 内联 data URL + 遮罩：各自上传一次换 URL，再填进 `image_urls` / `mask_url`。

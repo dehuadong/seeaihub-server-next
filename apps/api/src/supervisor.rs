@@ -26,6 +26,7 @@ use axum::body::Body;
 use bytes::Bytes;
 use chrono::Duration as ChronoDuration;
 use futures_util::Stream;
+use seeai_adapter_sdk::DispatchGate;
 use seeai_application::{
     ApplicationError, DirectExecutionCall, DirectExecutionError, DirectExecutionRequest,
     DirectExecutionService, DirectExecutionSuccess, ExecutionOwnershipRegistrar,
@@ -34,12 +35,6 @@ use seeai_application::{
 use seeai_domain::{AccountId, FencingToken, JobId};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
 use uuid::Uuid;
-
-/// 每个在飞执行预留的内存字节：请求正文上限（16 MiB）加结果缓冲与解析/编码副本。
-///
-/// 这是**预留**不是实测分配：RFC 0017 §6 要求配置的字节预算覆盖最大请求、最大响应与解析副本，
-/// 超载时拒绝而不是等到进程被撑爆。预算不够一个执行时进程起不来。
-pub const EXECUTION_MEMORY_BYTES: usize = 32 * 1024 * 1024;
 
 /// 执行所有权续约的装配：续约端口与租约时长。没有它就不起续约任务。
 #[derive(Clone)]
@@ -57,6 +52,8 @@ pub struct SupervisorConfig {
     pub execution_slots: usize,
     /// 本机在飞执行可预占的内存总量（字节）。
     pub max_memory_bytes: usize,
+    /// 单次执行要预留的字节：由各 Driver 声明的字节上限算出的最坏占用。
+    pub execution_memory_bytes: usize,
     /// 本机同时可持有的响应发送名额。
     pub send_slots: usize,
     /// 本机同时在读请求正文的准入名额。
@@ -191,9 +188,12 @@ pub struct Supervisor {
     send_slots: Arc<Semaphore>,
     read_slots: Arc<Semaphore>,
     memory: Arc<ByteBudget>,
-    cancelled: Arc<AtomicBool>,
-    /// 每次执行各自的取消标志；续约冲突只置它自己那一份。Weak 不延命执行任务。
-    live_executions: Arc<Mutex<HashMap<u64, Weak<AtomicBool>>>>,
+    /// 单次执行预留的字节数（构造时校验过的取值）。
+    execution_memory_bytes: usize,
+    /// 停机取消的根闸；每次执行从它派生自己的取消/发送闸。
+    gate: Arc<DispatchGate>,
+    /// 每次执行各自的取消/发送闸；续约失败只置它自己那一份。Weak 不延命执行任务。
+    live_executions: Arc<Mutex<HashMap<u64, Weak<DispatchGate>>>>,
     next_execution_id: AtomicU64,
     ownership: Option<OwnershipRenewalConfig>,
     active: Arc<AtomicUsize>,
@@ -213,10 +213,16 @@ impl Supervisor {
                 "direct execution slot counts must be positive".to_owned(),
             ));
         }
-        if config.max_memory_bytes < EXECUTION_MEMORY_BYTES {
+        if config.execution_memory_bytes == 0 {
+            return Err(ApplicationError::Configuration(
+                "the per-execution memory reservation must be positive".to_owned(),
+            ));
+        }
+        if config.max_memory_bytes < config.execution_memory_bytes {
             return Err(ApplicationError::Configuration(format!(
                 "GENERATION_MAX_MEMORY_BYTES must cover at least one execution reservation of \
-                 {EXECUTION_MEMORY_BYTES} bytes"
+                 {} bytes",
+                config.execution_memory_bytes
             )));
         }
         Ok(Arc::new(Self {
@@ -225,7 +231,8 @@ impl Supervisor {
             send_slots: Arc::new(Semaphore::new(config.send_slots)),
             read_slots: Arc::new(Semaphore::new(config.read_slots)),
             memory: ByteBudget::new(config.max_memory_bytes),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            execution_memory_bytes: config.execution_memory_bytes,
+            gate: Arc::new(DispatchGate::new()),
             live_executions: Arc::new(Mutex::new(HashMap::new())),
             next_execution_id: AtomicU64::new(0),
             ownership: config.ownership,
@@ -279,7 +286,7 @@ impl Supervisor {
     #[must_use]
     pub fn try_reserve_execution(&self) -> Option<ExecutionLease> {
         let slot = self.execution_slots.clone().try_acquire_owned().ok()?;
-        let memory = self.memory.try_acquire(EXECUTION_MEMORY_BYTES)?;
+        let memory = self.memory.try_acquire(self.execution_memory_bytes)?;
         Some(ExecutionLease {
             _slot: slot,
             _memory: memory,
@@ -299,26 +306,29 @@ impl Supervisor {
     ) -> oneshot::Receiver<ExecutionOutcome> {
         let (sender, receiver) = oneshot::channel();
         // 每次执行一份取消标志：初值取当前停机状态，续约冲突只置这一份，不波及其它在飞执行。
-        let cancelled = Arc::new(AtomicBool::new(self.cancelled.load(Ordering::SeqCst)));
+        let gate = Arc::new(DispatchGate::new());
+        if self.gate.is_cancelled() {
+            gate.cancel();
+        }
         let execution_id = self.next_execution_id.fetch_add(1, Ordering::Relaxed);
         let live = self.live_executions.clone();
         if let Ok(mut live_map) = live.lock() {
             live_map.retain(|_, flag| flag.strong_count() > 0);
-            live_map.insert(execution_id, Arc::downgrade(&cancelled));
+            live_map.insert(execution_id, Arc::downgrade(&gate));
         }
         let stopped = Arc::new(AtomicBool::new(false));
         let ownership = self.ownership.as_ref().map(|renewal| {
             Arc::new(RenewingOwnership {
-                executions: renewal.executions.clone(),
+                renewal: Arc::new(RepositoryRenewal(renewal.executions.clone())),
                 owner_id: self.owner_id.clone(),
                 lease: renewal.lease,
-                cancelled: cancelled.clone(),
+                gate: gate.clone(),
                 stopped: stopped.clone(),
             }) as Arc<dyn ExecutionOwnershipRegistrar>
         });
         let call = DirectExecutionCall {
             execution_owner: self.owner_id.clone(),
-            cancelled: cancelled.clone(),
+            gate: gate.clone(),
             total_deadline: deadline,
             ownership,
         };
@@ -342,11 +352,11 @@ impl Supervisor {
 
     /// 停机开始：停止新的外部副作用，交给在飞任务有限收尾。
     pub fn begin_drain(&self) {
-        self.cancelled.store(true, Ordering::SeqCst);
+        self.gate.cancel();
         if let Ok(live) = self.live_executions.lock() {
             for flag in live.values() {
                 if let Some(flag) = flag.upgrade() {
-                    flag.store(true, Ordering::SeqCst);
+                    flag.cancel();
                 }
             }
         }
@@ -469,21 +479,56 @@ impl Stream for GuardedResponseStream {
     }
 }
 
-/// 一次执行的所有权续约：按租约的三分之一周期在独立任务里续约，冲突即取消这次执行。
+/// 续约执行所有权的最小端口：只暴露"续约一次"，让续约失败策略可独立测试。
+trait OwnershipRenewal: Send + Sync {
+    fn renew(
+        &self,
+        job_id: JobId,
+        owner: String,
+        fencing_token: FencingToken,
+        lease: ChronoDuration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationError>> + Send>>;
+}
+
+/// 生产实现：直接调用 Repository 的续约端口。
+struct RepositoryRenewal(Arc<dyn ExecutionRepository>);
+
+impl OwnershipRenewal for RepositoryRenewal {
+    fn renew(
+        &self,
+        job_id: JobId,
+        owner: String,
+        fencing_token: FencingToken,
+        lease: ChronoDuration,
+    ) -> Pin<Box<dyn Future<Output = Result<(), ApplicationError>> + Send>> {
+        let executions = self.0.clone();
+        Box::pin(async move {
+            executions
+                .renew_execution_ownership(job_id, &owner, fencing_token, lease)
+                .await
+        })
+    }
+}
+
+/// 一次执行的所有权续约：按租约的三分之一周期在独立任务里续约。
+///
+/// **任何**续约失败或一次续约超过一个续约周期都立即取消这次执行并停止新的外部动作：所有权冲突、
+/// 数据库不可用、超时都同样意味着"不能再证明还持有所有权"，继续生成就可能与接管方重复收费
+/// （RFC 0017 §5）。已到达的句柄或账务事实仍由执行路径有限收尾，不因取消而丢弃。
 struct RenewingOwnership {
-    executions: Arc<dyn ExecutionRepository>,
+    renewal: Arc<dyn OwnershipRenewal>,
     owner_id: String,
     lease: ChronoDuration,
-    cancelled: Arc<AtomicBool>,
+    gate: Arc<DispatchGate>,
     stopped: Arc<AtomicBool>,
 }
 
 impl ExecutionOwnershipRegistrar for RenewingOwnership {
     fn registered(&self, job_id: JobId, fencing_token: FencingToken) {
-        let executions = self.executions.clone();
+        let renewal = self.renewal.clone();
         let owner = self.owner_id.clone();
         let lease = self.lease;
-        let cancelled = self.cancelled.clone();
+        let gate = self.gate.clone();
         let stopped = self.stopped.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(renewal_interval(lease));
@@ -491,30 +536,28 @@ impl ExecutionOwnershipRegistrar for RenewingOwnership {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if stopped.load(Ordering::SeqCst) || cancelled.load(Ordering::SeqCst) {
+                if stopped.load(Ordering::SeqCst) || gate.is_cancelled() {
                     return;
                 }
-                match executions
-                    .renew_execution_ownership(job_id, &owner, fencing_token, lease)
-                    .await
-                {
-                    Ok(()) => {}
-                    Err(ApplicationError::Conflict(_)) => {
-                        // 所有权已被接管或执行已收尾：停止这次执行的新外部副作用。
-                        cancelled.store(true, Ordering::SeqCst);
-                        tracing::warn!(
-                            job_id = %job_id,
-                            "execution ownership is no longer valid; cancelling this execution"
-                        );
-                        return;
-                    }
-                    Err(error) => {
-                        // 数据库瞬时故障不夺走所有权：下一次续约再试。
+                let attempt = renewal.renew(job_id, owner.clone(), fencing_token, lease);
+                match tokio::time::timeout(renewal_interval(lease), attempt).await {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => {
+                        gate.cancel();
                         tracing::warn!(
                             job_id = %job_id,
                             error = %error,
-                            "execution ownership renewal failed; retrying next interval"
+                            "execution ownership renewal failed; stopping new external actions"
                         );
+                        return;
+                    }
+                    Err(_elapsed) => {
+                        gate.cancel();
+                        tracing::warn!(
+                            job_id = %job_id,
+                            "execution ownership renewal did not finish within one renewal period; stopping new external actions"
+                        );
+                        return;
                     }
                 }
             }

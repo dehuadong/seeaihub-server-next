@@ -1,6 +1,6 @@
-//! A8 两态性能基线：直接执行关（旧 Worker 路径）与开（同步直接执行）的有界吞吐与延迟观测。
+//! A8 单态性能基线：唯一执行路径（API 直接执行）的有界吞吐与延迟观测。
 //!
-//! 这不是性能断言：两态跑同一份假上游、同一并发与请求数，只把本机这一次的观测打出来，供
+//! 这不是性能断言：跑同一份假上游、同一并发与请求数，只把本机这一次的观测打出来，供
 //! docs/verification/synchronous-gateway.md 的验收记录引用。性能阈值由整改前基线与部署目标
 //! 决定，这里不虚构提升百分比。
 //!
@@ -8,7 +8,7 @@
 
 use super::*;
 
-/// 排序后的样本在 percentile（0–1）处的取值：取向上取整那一档（两态基线与耗时拆分同一口径）。
+/// 排序后的样本在 percentile（0–1）处的取值：取向上取整那一档（基线与耗时拆分同一口径）。
 fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
     let index = (sorted.len() as f64 * percentile).ceil() as usize - 1;
     sorted[index.min(sorted.len() - 1)]
@@ -22,7 +22,7 @@ fn mean_and_p95(mut samples: Vec<Duration>) -> (Duration, Duration) {
     (mean, percentile(&samples, 0.95))
 }
 
-/// 两态各自一次有界负载的观测结果。
+/// 一次有界负载的观测结果。
 ///
 /// `total` 是从第一个请求发出到最后一个成功请求返回的墙钟时间；延迟分布只统计成功请求——
 /// 任何非 200 都会让用例直接断言失败，不会混进统计。
@@ -47,46 +47,35 @@ impl BaselineObservation {
     }
 }
 
-/// A8：同一棵树、同一台机器上先后跑直接执行关与开两态，各记总耗时、平均与 p95 延迟、每秒完成数。
+/// A8：同一棵树、同一台机器上量直接执行那一条路的吞吐，记总耗时、平均与 p95 延迟、每秒完成数。
 ///
-/// 关态是整改前的旧 Worker 路径：夹具起**一个**真实 Worker 进程在整个测量期间领任务，API 侧
-/// 同步入口等结果；开态不启 Worker，由 API 进程内直连假上游。两态都先预热一次，让首请求冷的
-/// 选路与余额缓存转热，两态才可比。
+/// 图片入口只有直接执行这一条：夹具不起 Worker，API 进程内直连假上游。先预热一次，让首请求冷的
+/// 选路与余额缓存转热，测量才可比。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn direct_execution_two_state_throughput_baseline() {
+async fn direct_execution_throughput_baseline() {
     const CONCURRENCY: usize = 8;
     const REQUESTS: usize = 48;
-    // 假上游收到生成请求后固定压这么久，两态共用：本机观测里两态的差就来自网关与执行路径，
-    // 不来自上游耗时。
+    // 假上游收到生成请求后固定压这么久：本机观测里的差就来自网关与执行路径，不来自上游耗时。
     const UPSTREAM_DELAY_MS: u64 = 200;
 
-    let off = measure_baseline(
-        "direct-off",
-        false,
-        CONCURRENCY,
-        REQUESTS,
-        UPSTREAM_DELAY_MS,
-    )
-    .await;
-    println!("{}", off.summary());
-    let on = measure_baseline("direct-on", true, CONCURRENCY, REQUESTS, UPSTREAM_DELAY_MS).await;
-    println!("{}", on.summary());
+    let baseline = measure_baseline("direct", CONCURRENCY, REQUESTS, UPSTREAM_DELAY_MS).await;
+    println!("{}", baseline.summary());
 }
 
-/// 跑一态并返回观测：`direct` 为 true 时开直接执行且不启 Worker，为 false 时起一个真实 Worker
-/// 走旧路径。
+/// 跑一轮并返回观测。
 async fn measure_baseline(
     label: &'static str,
-    direct: bool,
     concurrency: usize,
     requests: usize,
     upstream_delay_ms: u64,
 ) -> BaselineObservation {
-    // 两态取同一组窗口与上游超时，只有执行路径不同。30s 足够 8 并发的 48 个请求跑完。
+    // 取同一组窗口与上游超时。30s 足够 8 并发的 48 个请求跑完。
     const SYNC_WAIT_SECONDS: u64 = 30;
-    // 夹具的账户在飞上限必须大于并发，否则两态都被容量闸门排队，测到的是闸门而不是执行路径。
+    // 夹具的账户在飞上限必须大于并发，否则测量被容量闸门排队，测到的是闸门而不是执行路径。
     const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
+    // 渠道全局名额同理：直接执行在整个上游调用期间占着它。
+    const CHANNEL_IN_FLIGHT: u64 = 128;
     // 测量用一份单独的大余额账户，不依赖夹具发布账户的余额是否够 48 次扣费。
     const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;
 
@@ -99,11 +88,22 @@ async fn measure_baseline(
         delay_ms: upstream_delay_ms,
         ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
     };
-    let harness = if direct {
-        Harness::start_direct(draft, behaviour, MAX_ACCOUNT_IN_FLIGHT, SYNC_WAIT_SECONDS).await
-    } else {
-        Harness::start_with_draft(draft, None, behaviour, MAX_ACCOUNT_IN_FLIGHT).await
-    };
+    // 并发测量要同时占住那么多渠道名额：默认的渠道全局上限会先把请求挡成 503，
+    // 量到的就不是执行路径了。
+    let harness = Harness::start_direct_with(
+        draft,
+        behaviour,
+        MAX_ACCOUNT_IN_FLIGHT,
+        SYNC_WAIT_SECONDS,
+        ApiProcessSettings {
+            channel_max_in_flight: Some(CHANNEL_IN_FLIGHT),
+            // 在飞执行的字节预算是**按 Driver 声明的上限**预留的（AIHubMix 一次约 912MiB）：
+            // 默认 2GiB 只够两次并发，量到的会是容量闸门而不是执行路径。这里按并发数抬开。
+            max_memory_bytes: Some(8 * 1024 * 1024 * 1024),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await;
     let (_, api_key) = funded_account(
         &Client::new(),
         &harness.base_url,
@@ -111,10 +111,6 @@ async fn measure_baseline(
         MEASURE_ACCOUNT_CREDIT_MICROUSD,
     )
     .await;
-    // 旧路径必须有 Worker 领任务；直接执行不启 Worker，这正是要对比的那一点。一个 Worker 覆盖
-    // 整段测量，避免每个请求各起一个进程把进程启动成本算进延迟。
-    let worker = (!direct).then(|| harness.spawn_worker());
-
     let (status, body) = post_json(
         &harness.base_url,
         &api_key,
@@ -162,7 +158,6 @@ async fn measure_baseline(
         latencies.push(latency);
     }
     let total = started.elapsed();
-    drop(worker);
     harness.cleanup().await;
 
     let (mean, p95) = mean_and_p95(latencies);
@@ -241,7 +236,7 @@ async fn direct_execution_gateway_overhead_split() {
     // 样本数按 p99 留出余量：n=120 时 p99 取第 119 个样本，不再是最大值。
     const REQUESTS: usize = 120;
     const UPSTREAM_DELAY_MS: u64 = 200;
-    // 与两态基线同一组窗口、上游超时与账户在飞上限，只有"顺序发"这一点不同。
+    // 与基线同一组窗口、上游超时与账户在飞上限，只有"顺序发"这一点不同。
     const SYNC_WAIT_SECONDS: u64 = 30;
     const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
     const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;

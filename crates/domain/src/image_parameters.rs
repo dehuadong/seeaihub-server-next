@@ -213,17 +213,16 @@ pub fn declared_reference_image_limit(schema: &Value) -> Option<u64> {
     }
 }
 
-/// 把调用方的参考图与遮罩写进该候选**自己声明的参数名**上（数组赋值 / 标量赋值）。
+/// 校验这份声明面装不装得下这次图片输入，**不做任何复制**。
 ///
-/// 找不到装图片的参数、或者图片张数超过该参数装得下的数量，都返回 `Err`：这类候选表达不了
-/// 这次请求，选路据此判它不合格——不静默丢掉一张图。
-pub fn place_image_inputs(
+/// 选路要为**每条**候选判断它能否承载请求里的图片，真正写入只在选中候选上做一次；把校验与写入
+/// 分开，候选判定就不会为每条候选复制一份图片字符串（RFC 0018 §3）。
+pub fn validate_image_inputs(
     schema: &Value,
-    object: &mut Map<String, Value>,
-    reference_images: &[String],
-    mask: Option<&str>,
+    reference_image_count: usize,
+    has_mask: bool,
 ) -> Result<(), String> {
-    if !reference_images.is_empty() {
+    if reference_image_count > 0 {
         let (name, field) = reference_image_parameter(schema)
             .ok_or_else(|| "this offering declares no reference image parameter".to_owned())?;
         let is_array = field.get("type").and_then(Value::as_str) == Some("array")
@@ -233,11 +232,40 @@ pub fn place_image_inputs(
                 .get("maxItems")
                 .and_then(Value::as_u64)
                 .unwrap_or(u64::MAX);
-            if u64::try_from(reference_images.len()).unwrap_or(u64::MAX) > capacity {
+            if u64::try_from(reference_image_count).unwrap_or(u64::MAX) > capacity {
                 return Err(format!(
                     "this offering accepts at most {capacity} reference image(s)"
                 ));
             }
+        } else if reference_image_count > 1 {
+            return Err(format!(
+                "this offering takes a single reference image in {name}"
+            ));
+        }
+    }
+    if has_mask && mask_parameter(schema).is_none() {
+        return Err("this offering declares no mask parameter".to_owned());
+    }
+    Ok(())
+}
+
+/// 把调用方的参考图与遮罩写进该候选**自己声明的参数名**上（数组赋值 / 标量赋值）。
+///
+/// 找不到装图片的参数、或者图片张数超过该参数装得下的数量，都返回 `Err`：这类候选表达不了
+/// 这次请求，选路据此判它不合格——不静默丢掉一张图。校验规则见 [`validate_image_inputs`]。
+pub fn place_image_inputs(
+    schema: &Value,
+    object: &mut Map<String, Value>,
+    reference_images: &[String],
+    mask: Option<&str>,
+) -> Result<(), String> {
+    validate_image_inputs(schema, reference_images.len(), mask.is_some())?;
+    if !reference_images.is_empty() {
+        let (name, field) = reference_image_parameter(schema)
+            .expect("validation already proved the reference image parameter exists");
+        let is_array = field.get("type").and_then(Value::as_str) == Some("array")
+            || field.get("items").is_some();
+        if is_array {
             object.insert(
                 name.to_owned(),
                 Value::Array(
@@ -248,17 +276,12 @@ pub fn place_image_inputs(
                 ),
             );
         } else {
-            if reference_images.len() > 1 {
-                return Err(format!(
-                    "this offering takes a single reference image in {name}"
-                ));
-            }
             object.insert(name.to_owned(), Value::String(reference_images[0].clone()));
         }
     }
     if let Some(mask) = mask {
-        let (name, _) = mask_parameter(schema)
-            .ok_or_else(|| "this offering declares no mask parameter".to_owned())?;
+        let (name, _) =
+            mask_parameter(schema).expect("validation already proved the mask parameter exists");
         object.insert(name.to_owned(), Value::String(mask.to_owned()));
     }
     Ok(())

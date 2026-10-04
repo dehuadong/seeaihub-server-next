@@ -40,7 +40,7 @@ sequenceDiagram
 | 模块 | 拥有的职责与接口变化 |
 | --- | --- |
 | [API 入口](../../apps/api/src/main.rs) | Body 前认证和读取准入；JSON/multipart 解析；调用直接执行用例；有界结果发送；不读取数据库结果列、不轮询 Job。 |
-| [Application](../../crates/application/src/lib.rs) | `GenerationService` 拆分为请求准备、直接执行和异常对账三个用例；编排合同、路由、占用、所有权、证据与收尾；Repository 参数不接受业务载荷。 |
+| [Application](../../crates/application/src/lib.rs) | 直接执行与异常对账两个用例：编排合同、路由、占用、所有权、证据与收尾；Repository 参数不接受业务载荷。 |
 | [Domain](../../crates/domain/src/lib.rs) | 最小 Job/Attempt 状态规则、证据、财务处置和容量事实；不依赖 HTTP、Tokio 或图片传输类型。 |
 | [Persistence](../../crates/persistence/src/lib.rs) | 原子受理/占用、提交声明、句柄更新、幂等结算、过期所有权扫描、异常查询和元数据投影；生成载荷写入与读取接口退出新协议。 |
 | [Adapter SDK](../../crates/adapter-sdk/src/lib.rs) | 只管 Provider 传输、接受阶段、查询能力、结构归一和计量/成本提取；不选路、不算平台售价、不决定占用。 |
@@ -69,7 +69,7 @@ Runtime Revision 作为不可变 `Arc` 缓存复用，构建该修订时编译�
 
 | 记录 | 事实字段组 | 不进入记录的内容 |
 | --- | --- | --- |
-| Job | `execution_protocol`、账户/API Key、幂等摘要与指纹版本、冻结模型/修订/供给/Channel、价格与汇率快照、保底、状态、计量概要、时间、平台错误码、账本关联 | native parameters、参考图/mask、结果信封、任意用户参数或自由诊断正文 |
+| Job | 账户/API Key、幂等摘要与指纹版本、冻结模型/修订/供给/Channel、价格与汇率快照、保底、状态、计量概要、产出张数、时间、平台错误码、账本关联 | native parameters、参考图/mask、结果信封、任意用户参数或自由诊断正文 |
 | Attempt | 编号、执行所有者和 fencing token、阶段、任务/trace 标识、提交/接受时间、计量证据、Provider Cost、有界失败类别 | 原始 request/response/error 文本、上游图片地址、上传地址 |
 | 执行容量 | Job/Channel/账户、所有权状态、到期时间及唯一关联 | 请求与响应内容 |
 | 异常对账 | 原 Job/Attempt、缺失事实类别、查询调度、处置事实、人工解除关联 | Provider 结果附件、原始错误正文 |
@@ -102,7 +102,7 @@ Provider 失败与成功都附带可用计量、成本及接受事实；自由 `
 
 ## 5. 状态、所有权与进程异常
 
-新协议 Job 阶段使用 `admitted → executing → succeeded/failed/reconciliation_required`；Attempt 区分 `prepared/submitting/accepted/terminal/unknown`。它们映射到 Domain 明确枚举，存储约束与账务投影同时迁移，不让旧 Worker 将 `admitted` 当可领取队列。执行记录有协议版本，新 Worker 对新协议禁止生成领取。
+Job 阶段使用 `admitted → executing → succeeded/failed/reconciliation_required`；Attempt 区分 `prepared/submitting/accepted/terminal/unknown`。它们映射到 Domain 明确枚举，存储约束与账务投影一致。Worker 不领取生成任务，`admitted` 不是可领取队列。
 
 API Supervisor 拥有每个新执行任务、token、内存输入、permit 与 one-shot 结果通道。Handler 等待结果，断开仅关闭接收端。Supervisor 接收到关闭后：尚未提交时停止并释放；可能已提交时有限继续收尾，结果无人接收立即释放图片。后台任务总数受执行上限约束，不把 detached spawn 当作无限可靠队列。
 

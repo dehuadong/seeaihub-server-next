@@ -2,15 +2,6 @@ use super::*;
 use crate::DomainError;
 
 #[test]
-fn protocol_round_trips_through_storage_text() {
-    for protocol in [ExecutionProtocol::Legacy, ExecutionProtocol::V1] {
-        assert_eq!(ExecutionProtocol::parse(protocol.as_str()), Some(protocol));
-        assert_eq!(protocol.to_string(), protocol.as_str());
-    }
-    assert_eq!(ExecutionProtocol::parse("v2"), None);
-}
-
-#[test]
 fn stage_round_trips_through_storage_text() {
     for stage in [
         ExecutionStage::Admitted,

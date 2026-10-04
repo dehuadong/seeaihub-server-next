@@ -17,10 +17,11 @@ use std::time::Duration;
 use async_trait::async_trait;
 use chrono::Duration as ChronoDuration;
 use seeai_adapter_sdk::{
-    AcceptedHandle, AccountingFacts, AdapterDescriptor, AdapterError, DeclaredCost,
-    ExecutionContext, GatewayAdapter, GatewayInput, GeneratedImage, ImageAdapter,
-    ProviderCallError, ProviderCost, ProviderCredential, QueryAccountingCapability,
-    ResponsePayload, RetrySafety,
+    AcceptedHandle, AccountingFacts, AdapterDescriptor, AdapterError, DeclaredCost, DispatchGate,
+    ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput,
+    GeneratedImage, ImageAdapter, ProviderCallError, ProviderCost, ProviderCredential,
+    ProviderTaskHandle, QueryAccountingCapability, ResponsePayload, RetrySafety,
+    begin_generation_send,
 };
 use seeai_application::{
     AdapterFactory, AdmitExecution, AdmitOutcome, ApplicationError, BeginSubmission,
@@ -81,6 +82,10 @@ enum FakeBehavior {
         kind: ProviderFailureKind,
     },
     AcceptedUnpersisted,
+    /// 取消落在生成发送之前：可证明没有提交生成。
+    CancelledBeforeSend,
+    /// 取消发生在等待上游结果的阶段：不能证明是否已受理。
+    CancelledAfterAcceptance,
     /// 第一次调用报可证明未受理，之后成功：验证请求内重投会换新 Attempt 并成功。
     SafeBeforeAcceptanceOnce,
     /// 睡这么多毫秒再成功：把总期限推到结算之后，验证交付超时。
@@ -88,6 +93,7 @@ enum FakeBehavior {
 }
 
 struct FakeGateway {
+    send_gate: Arc<Mutex<Option<Arc<DispatchGate>>>>,
     behavior: Arc<Mutex<FakeBehavior>>,
     calls: Arc<AtomicUsize>,
 }
@@ -105,7 +111,7 @@ impl GatewayAdapter for FakeGateway {
     async fn execute(
         &self,
         _input: Arc<GatewayInput>,
-        _context: &dyn ExecutionContext,
+        context: &dyn ExecutionContext,
         _credential: &ProviderCredential,
     ) -> Result<seeai_adapter_sdk::ProviderOutput, AdapterError> {
         let call = self.calls.fetch_add(1, Ordering::SeqCst) + 1;
@@ -138,11 +144,22 @@ impl GatewayAdapter for FakeGateway {
             }
             FakeBehavior::AcceptedUnpersisted => Err(AdapterError::AcceptedUnpersisted {
                 handle: AcceptedHandle {
-                    task_id: "task-1".to_owned(),
+                    task_id: ProviderTaskHandle::parse("task-1".to_owned()).expect("test handle"),
                     trace_id: Some("trace-1".to_owned()),
                 },
                 reason: "the fake could not persist the handle".to_owned(),
             }),
+            FakeBehavior::CancelledBeforeSend => {
+                // 取消恰好落在发送前：先关闸，再问发送资格——真实竞态的等价模型。
+                if let Some(gate) = self.send_gate.lock().expect("the send gate lock").clone() {
+                    gate.cancel();
+                }
+                begin_generation_send(context)?;
+                Err(AdapterError::Configuration(
+                    "the generation gate unexpectedly allowed a send in this test".to_owned(),
+                ))
+            }
+            FakeBehavior::CancelledAfterAcceptance => Err(AdapterError::Cancelled),
         }
     }
 }
@@ -150,6 +167,9 @@ impl GatewayAdapter for FakeGateway {
 struct FakeFactory {
     behavior: Arc<Mutex<FakeBehavior>>,
     calls: Arc<AtomicUsize>,
+    /// 让用例把真实取消闸交给假渠道：`CancelledBeforeSend` 会在发送资格之前先关闸，
+    /// 模拟"取消恰好落在发送前"这一竞态（而不是在执行之前就取消）。
+    send_gate: Arc<Mutex<Option<Arc<DispatchGate>>>>,
 }
 
 impl FakeFactory {
@@ -157,7 +177,13 @@ impl FakeFactory {
         Self {
             behavior: Arc::new(Mutex::new(FakeBehavior::Success)),
             calls: Arc::new(AtomicUsize::new(0)),
+            send_gate: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// 把这次执行的取消闸交给假渠道，让它在发送资格之前关闸。
+    fn set_send_gate(&self, gate: Arc<DispatchGate>) {
+        *self.send_gate.lock().expect("the send gate lock") = Some(gate);
     }
 
     fn set(&self, behavior: FakeBehavior) {
@@ -178,6 +204,10 @@ impl AdapterFactory for FakeFactory {
             ],
             max_reference_images: 1,
             declares_cost: true,
+            byte_limits: GatewayByteLimits {
+                request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
+                provider_response_bytes: 8 * 1024 * 1024,
+            },
         })
     }
 
@@ -217,6 +247,7 @@ impl AdapterFactory for FakeFactory {
             )));
         }
         Ok(Arc::new(FakeGateway {
+            send_gate: self.send_gate.clone(),
             behavior: self.behavior.clone(),
             calls: self.calls.clone(),
         }))
@@ -309,7 +340,6 @@ fn test_timeouts() -> RequestTimeoutPolicy {
         included_images: 1,
         per_image: Duration::from_secs(1),
         provider_timeout: Duration::from_secs(10),
-        worker_lease: Duration::from_secs(10),
         sync_wait: Duration::from_secs(30),
         max_output_images: 4,
     }
@@ -532,6 +562,8 @@ struct Fixture {
     factory: Arc<FakeFactory>,
     calls: Arc<AtomicUsize>,
     owner: String,
+    /// 这次执行共用一份取消/发送闸，测试可以直接在闸口前取消。
+    gate: Arc<DispatchGate>,
 }
 
 async fn setup() -> Fixture {
@@ -590,6 +622,7 @@ async fn setup_with_keys(
         factory,
         calls,
         owner: "supervisor-a".to_owned(),
+        gate: Arc::new(DispatchGate::new()),
     }
 }
 
@@ -653,7 +686,7 @@ impl Fixture {
     fn call_within(&self, budget: Duration) -> DirectExecutionCall {
         DirectExecutionCall {
             execution_owner: self.owner.clone(),
-            cancelled: Arc::new(AtomicBool::new(false)),
+            gate: self.gate.clone(),
             total_deadline: tokio::time::Instant::now() + budget,
             ownership: None,
         }
@@ -928,6 +961,64 @@ async fn an_unknown_acceptance_reconciles_and_keeps_the_hold() {
 
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_cancellation_before_the_send_releases_the_hold() {
+    let fixture = setup().await;
+    fixture.factory.set(FakeBehavior::CancelledBeforeSend);
+    // 取消先赢：假渠道在发送资格之前关闸，因此这次 Attempt 确实没有发出生成请求，
+    // 但受理已经发生——这正是"已受理、未发送"的那一段。
+    fixture.factory.set_send_gate(fixture.gate.clone());
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-cancel-pre"), &fixture.call())
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::RequestTimeout)),
+        "a cancellation before the send is a proven non-submission, reported as a timeout"
+    );
+    assert!(
+        !fixture.gate.generation_started(),
+        "the gate refused, so no generation was started"
+    );
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.job_state().await, "failed");
+    assert_eq!(fixture.held_microusd().await, 0, "the hold is released");
+    assert_eq!(fixture.captures(job_id).await, 0);
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "a proven non-submission is not retried"
+    );
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_cancellation_after_acceptance_keeps_the_hold() {
+    let fixture = setup().await;
+    fixture.factory.set(FakeBehavior::CancelledAfterAcceptance);
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-cancel-post"), &fixture.call())
+        .await;
+    assert!(matches!(result, Err(DirectExecutionError::OutcomeUnknown)));
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.job_state().await, "reconciliation_required");
+    assert_eq!(fixture.reconciliation_cases(job_id).await, 1);
+    assert_eq!(
+        fixture.held_microusd().await,
+        1_000,
+        "a cancellation while waiting for the provider cannot prove non-acceptance"
+    );
+    assert_eq!(fixture.captures(job_id).await, 0);
+
+    fixture.cleanup().await;
+}
+
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn accepted_unpersisted_offers_late_facts_and_reconciles() {
     let fixture = setup().await;
     fixture.factory.set(FakeBehavior::AcceptedUnpersisted);
@@ -1138,6 +1229,39 @@ async fn a_replay_survives_a_disabled_candidate() {
         1,
         "the replay never reaches the provider"
     );
+
+    fixture.cleanup().await;
+}
+
+/// 受理之前就取消：不建 Job、不占 Hold 与渠道名额，也不调用 Provider。
+///
+/// 这比"建一条记录再立刻失败"更好：同键重试仍能作为一次正常的新请求处理，而不是命中一条
+/// 被取消写死的失败记录。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_cancellation_before_admission_creates_nothing() {
+    let fixture = setup().await;
+    fixture.gate.cancel();
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-cancel-pre-admit"), &fixture.call())
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::RequestTimeout)),
+        "a cancellation before admission is a proven non-submission"
+    );
+    let jobs: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
+        .fetch_one(fixture.pool())
+        .await
+        .expect("the job count");
+    assert_eq!(jobs, 0, "no job record is created");
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        0,
+        "the provider is never called"
+    );
+    assert_eq!(fixture.held_microusd().await, 0, "no hold is taken");
 
     fixture.cleanup().await;
 }

@@ -1,5 +1,22 @@
 use super::*;
 
+/// 把迁移目录里版本号小于 `before` 的 `.sql` 拷进一个临时目录，供"先造老库、再升上来"的用例用。
+///
+/// 收口迁移 `0038` 会拒绝任何旧协议记录，所以造了旧行（旧协议 Job、旧载荷列）的用例只能升到它
+/// 之前；载荷删除与守卫本身由 `synchronous_gateway_migration...` 两条用例覆盖。
+fn stage_migrations(migrations: &std::path::Path, before: &str, label: &str) -> PathBuf {
+    let staged = std::env::temp_dir().join(format!("seeai-{label}-migrations-{}", Uuid::new_v4()));
+    std::fs::create_dir_all(&staged).expect("staging directory");
+    for entry in std::fs::read_dir(migrations).expect("migrations directory") {
+        let entry = entry.expect("migration entry");
+        let name = entry.file_name().to_string_lossy().to_string();
+        if name.ends_with(".sql") && name.as_str() < before {
+            std::fs::copy(entry.path(), staged.join(&name)).expect("copy earlier migration");
+        }
+    }
+    staged
+}
+
 /// 增量迁移必须在**已经建过库**的环境里跑得通。
 ///
 /// 早期迁移是以"建表"方式被应用的，改它们不会更新已建好的库；本次改动按新迁移增量修改，
@@ -51,7 +68,14 @@ async fn images_pass_through_migration_applies_on_an_existing_database() {
             count == 1
         }
     };
-    assert!(column_exists("jobs", "result_images").await);
+    assert!(
+        !column_exists("jobs", "result_images").await,
+        "0038 之后结果图片不再是落点"
+    );
+    assert!(
+        column_exists("jobs", "image_count").await,
+        "0038 之后产出张数落在 image_count"
+    );
     assert!(!column_exists("jobs", "result_asset_ids").await);
     assert!(!column_exists("jobs", "asset_bindings").await);
     let assets_table: i64 = sqlx::query_scalar(
@@ -203,8 +227,10 @@ async fn vendor_model_contract_migration_merges_existing_duplicate_rows() {
     .await
     .expect("legacy job fixture");
 
-    // 3) 再应用完整迁移集：合并必须自己跑通，不能因为已有重复行就失败。
-    sqlx::migrate::Migrator::new(migrations)
+    // 3) 再升到 0038 之前：合并必须自己跑通，不能因为已有重复行就失败。本用例断言的是老 Job
+    //    行上的载荷列，这些列正是 0038 要删的，所以它停在收口之前。
+    let up_to_gateway = stage_migrations(&migrations, "0038", "merge");
+    sqlx::migrate::Migrator::new(up_to_gateway.clone())
         .await
         .expect("migrator")
         .run(&pool)
@@ -335,6 +361,7 @@ async fn vendor_model_contract_migration_merges_existing_duplicate_rows() {
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(&up_to_gateway);
     drop_isolated_database(&database_name).await;
 }
 
@@ -640,8 +667,10 @@ async fn the_pricing_migration_relaxes_the_balance_checks_on_an_existing_databas
         .await
         .expect("account fixture");
 
-    // 3) 补上整批迁移：定价列、汇率表与三处放宽都必须自己跑通。
-    sqlx::migrate::Migrator::new(migrations)
+    // 3) 补到 0038 之前：定价列、汇率表与三处放宽都必须自己跑通。本用例还要按明文幂等键与
+    //    旧载荷列造一条零保底 Job，这些列正是 0038 要删的。
+    let up_to_gateway = stage_migrations(&migrations, "0038", "pricing");
+    sqlx::migrate::Migrator::new(up_to_gateway.clone())
         .await
         .expect("migrator")
         .run(&pool)
@@ -738,6 +767,7 @@ async fn the_pricing_migration_relaxes_the_balance_checks_on_an_existing_databas
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);
+    let _ = std::fs::remove_dir_all(&up_to_gateway);
     drop_isolated_database(&database_name).await;
 }
 
@@ -1333,9 +1363,10 @@ async fn the_account_name_migration_deduplicates_names_and_adds_a_unique_index()
     let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
 }
-/// 同步网关最小事实（迁移 0031）必须在既有库上增量生效：协议版本、幂等摘要与请求指纹列、
-/// 执行所有权与 fencing、上游任务句柄与渠道容量事实表都在场，旧正文列对新协议放宽为可空，
-/// 两套协议的阶段取值都进 state 的 CHECK。
+/// 同步网关最小事实在既有库上增量生效：0031 加列、0038 收口。
+///
+/// 收口之后 `generation.jobs` 只剩最小执行与账务事实——协议列、载荷列与旧领取列都不在，产出张数
+/// 落在 `image_count`，两条执行索引去掉协议条件后保留，状态 CHECK 收窄到存活路径真正写的取值。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_database() {
@@ -1346,15 +1377,7 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
     let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
 
     // 1) 先只应用 0031 之前的迁移，构造一个已经建过库的现场。
-    let staged = std::env::temp_dir().join(format!("seeai-gateway-migrations-{}", Uuid::new_v4()));
-    std::fs::create_dir_all(&staged).expect("staging directory");
-    for entry in std::fs::read_dir(&migrations).expect("migrations directory") {
-        let entry = entry.expect("migration entry");
-        let name = entry.file_name().to_string_lossy().to_string();
-        if name.ends_with(".sql") && name.as_str() < "0031" {
-            std::fs::copy(entry.path(), staged.join(&name)).expect("copy earlier migration");
-        }
-    }
+    let staged = stage_migrations(&migrations, "0031", "gateway");
     sqlx::migrate::Migrator::new(staged.clone())
         .await
         .expect("earlier migrator")
@@ -1362,15 +1385,15 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
         .await
         .expect("earlier migrations apply");
 
-    // 2) 再应用完整迁移集：0031 必须能在既有库上升上来。
+    // 2) 再应用完整迁移集：0031 与 0038 都必须能在既有库上升上来。
     sqlx::migrate::Migrator::new(migrations)
         .await
         .expect("migrator")
         .run(&pool)
         .await
-        .expect("the gateway migration must apply on an already-built database");
+        .expect("the gateway migrations must apply on an already-built database");
 
-    // 3) 最小事实列与渠道容量事实表在场。
+    // 3) 存活的最小事实列在场，载荷列与协议列不在。
     let column_exists = |table: &'static str, column: &'static str| {
         let pool = pool.clone();
         async move {
@@ -1386,20 +1409,39 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
         }
     };
     for column in [
-        "execution_protocol",
         "idempotency_key_digest",
         "request_digest",
         "request_digest_key_version",
         "execution_owner",
         "fencing_token",
         "provider_task_handle",
+        "lease_expires_at",
+        "image_count",
     ] {
         assert!(column_exists("jobs", column).await, "缺失列 jobs.{column}");
     }
     assert!(
-        !column_exists("jobs", "idempotency_lookup_key_version").await,
-        "0035 之后查找摘要不再有密钥版本列"
+        column_exists("attempts", "provider_error_message").await,
+        "Attempt 上平台生成的有界错误文本必须在场"
     );
+    for column in [
+        "execution_protocol",
+        "native_parameters",
+        "result_images",
+        "carrier_schema",
+        "parameter_mapping",
+        "idempotency_key",
+        "request_hash",
+        "lease_owner",
+        "next_attempt_at",
+        "version",
+        "idempotency_lookup_key_version",
+    ] {
+        assert!(
+            !column_exists("jobs", column).await,
+            "收口之后 jobs.{column} 必须已经删除"
+        );
+    }
     let capacity_table: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'generation' AND table_name = 'execution_capacity'",
     )
@@ -1408,27 +1450,68 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
     .expect("table probe");
     assert_eq!(capacity_table, 1, "渠道容量事实表必须在场");
 
-    // 4) 新协议不写 native_parameters，该列必须对新协议可空。
+    // 4) 明文幂等键删除后，摘要就是唯一的防重依据：必须无条件必填。
     let nullable: String = sqlx::query_scalar(
-        "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'generation' AND table_name = 'jobs' AND column_name = 'native_parameters'",
+        "SELECT is_nullable FROM information_schema.columns WHERE table_schema = 'generation' AND table_name = 'jobs' AND column_name = 'idempotency_key_digest'",
     )
     .fetch_one(&pool)
     .await
     .expect("nullable probe");
-    assert_eq!(
-        nullable, "YES",
-        "新协议不写 native_parameters，该列必须可空"
+    assert_eq!(nullable, "NO", "幂等摘要必须非空");
+
+    // 5) 索引：旧 Worker 的领取索引不在；两条执行索引保留且不再带协议条件。
+    let index_definition = |name: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, String>(
+                "SELECT indexdef FROM pg_indexes WHERE schemaname = 'generation' AND indexname = $1",
+            )
+            .bind(name)
+            .fetch_optional(&pool)
+            .await
+            .expect("index probe")
+        }
+    };
+    assert!(
+        index_definition("jobs_claimable").await.is_none(),
+        "旧 Worker 的领取索引必须删除"
+    );
+    let takeover = index_definition("jobs_v1_takeover")
+        .await
+        .expect("接管索引必须保留");
+    assert!(
+        !takeover.contains("execution_protocol") && takeover.contains("executing"),
+        "接管索引只按状态过滤：{takeover}"
+    );
+    let admitted = index_definition("jobs_v1_admitted")
+        .await
+        .expect("孤儿回收索引必须保留");
+    assert!(
+        !admitted.contains("execution_protocol") && admitted.contains("admitted"),
+        "孤儿回收索引只按状态过滤：{admitted}"
     );
 
-    // 5) 两套协议的阶段都进 state 的 CHECK。
+    // 6) 状态 CHECK 收窄到存活路径真正写的取值。
     let jobs_check: String = sqlx::query_scalar(
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'generation.jobs'::regclass AND conname = 'jobs_state_check'",
     )
     .fetch_one(&pool)
     .await
     .expect("jobs state check");
-    for value in ["admitted", "executing"] {
+    for value in [
+        "admitted",
+        "executing",
+        "succeeded",
+        "failed",
+        "reconciliation_required",
+    ] {
         assert!(jobs_check.contains(value), "jobs.state CHECK 缺 {value}");
+    }
+    for value in ["accepted", "leased", "submitting", "canceled"] {
+        assert!(
+            !jobs_check.contains(value),
+            "jobs.state CHECK 不该再有旧协议取值 {value}：{jobs_check}"
+        );
     }
     let attempts_check: String = sqlx::query_scalar(
         "SELECT pg_get_constraintdef(oid) FROM pg_constraint WHERE conrelid = 'generation.attempts'::regclass AND conname = 'attempts_state_check'",
@@ -1436,12 +1519,244 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
     .fetch_one(&pool)
     .await
     .expect("attempts state check");
-    for value in ["prepared", "accepted", "terminal", "unknown"] {
+    for value in ["prepared", "submitting", "accepted", "terminal", "unknown"] {
         assert!(
             attempts_check.contains(value),
             "attempts.state CHECK 缺 {value}"
         );
     }
+    for value in ["succeeded", "failed", "reconciliation_required"] {
+        assert!(
+            !attempts_check.contains(value),
+            "attempts.state CHECK 不该再有旧协议取值 {value}：{attempts_check}"
+        );
+    }
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 收口迁移的守卫：库里还留着旧协议的未决执行、已收尾 Attempt，或没有幂等摘要的 Job 时，
+/// **整条迁移失败**且一行都不改；逐条处置掉这些行之后，同一条迁移必须能升上来。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_gateway_close_out_migration_refuses_legacy_rows_and_leaves_them_alone() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 单连接池：这个用例会反复让迁移以守卫报错收场，sqlx 的迁移排他锁是会话级的，
+    // 多连接池下下一次 run 可能落到另一条连接上而被前一次留下的锁挡住。
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用收口之前的迁移，造出旧协议的现场。
+    let staged = stage_migrations(&migrations, "0038", "close-out");
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("earlier migrator")
+        .run(&pool)
+        .await
+        .expect("earlier migrations apply");
+
+    // 2) 旧 Job 需要的那几行外键目标：账户、渠道、厂商模型、供给与修订。
+    let account = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let vendor_model = Uuid::new_v4();
+    let offering = Uuid::new_v4();
+    let revision = Uuid::new_v4();
+    let job = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO ledger.accounts (id, balance_microusd, name) VALUES ($1, 0, 'close-out fixture')",
+    )
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("account fixture");
+    sqlx::query(
+        "INSERT INTO supply.channels (id, provider_kind, base_url, credential_env)
+         VALUES ($1, 'fake', 'http://127.0.0.1:9', 'FAKE_PROVIDER_KEY')",
+    )
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("channel fixture");
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1, 'fake-vendor', 'legacy-model', 'v1', '{}'::jsonb)",
+    )
+    .bind(vendor_model)
+    .execute(&pool)
+    .await
+    .expect("vendor model fixture");
+    sqlx::query(
+        "INSERT INTO supply.offerings
+             (id, vendor_model_id, channel_id, adapter_key, provider_model_id, carrier_schema)
+         VALUES ($1,$2,$3,'fake','legacy-model','{}'::jsonb)",
+    )
+    .bind(offering)
+    .bind(vendor_model)
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("offering fixture");
+    sqlx::query(
+        "INSERT INTO publication.runtime_revisions
+             (id, snapshot, published_by, gateway_model, vendor_model_id)
+         VALUES ($1,'{}'::jsonb,'migration-test','legacy-model',$2)",
+    )
+    .bind(revision)
+    .bind(vendor_model)
+    .execute(&pool)
+    .await
+    .expect("runtime revision fixture");
+    // 旧协议 Job：`execution_protocol` 走列默认的 legacy，明文幂等键还在，摘要在这一版还没有。
+    sqlx::query(
+        "INSERT INTO generation.jobs
+             (id, account_id, state, branch, gateway_model, runtime_revision_id, vendor_model_id,
+              offering_id, channel_id, adapter_key, provider_model_id, base_url, credential_env,
+              carrier_schema, price_snapshot, max_cost_microusd)
+         VALUES ($1,$2,'accepted','prompt_only','legacy-model',$3,$4,$5,$6,'fake','legacy-model',
+                 'http://127.0.0.1:9','FAKE_PROVIDER_KEY','{}'::jsonb,'{}'::jsonb,1)",
+    )
+    .bind(job)
+    .bind(account)
+    .bind(revision)
+    .bind(vendor_model)
+    .bind(offering)
+    .bind(channel)
+    .execute(&pool)
+    .await
+    .expect("legacy in-flight job fixture");
+
+    // 3) 在飞的旧协议 Job：整条迁移失败，且那行原样留着（守卫不替人做处置决定）。
+    let refused = sqlx::migrate::Migrator::new(migrations.clone())
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await;
+    let message = format!(
+        "{}",
+        refused.expect_err("an in-flight legacy job must stop the close-out migration")
+    );
+    assert!(
+        message.contains("migration 0038 refuses to run")
+            && message.contains("legacy job(s) are still in flight"),
+        "守卫必须点名失败原因：{message}"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM generation.jobs WHERE id = $1")
+        .bind(job)
+        .fetch_one(&pool)
+        .await
+        .expect("the refused row is still there");
+    assert_eq!(state, "accepted", "守卫不改任何行");
+
+    // 4) 旧 Attempt 已收尾：同样整条失败。
+    sqlx::query("UPDATE generation.jobs SET state = 'succeeded' WHERE id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .expect("finish the legacy job");
+    sqlx::query(
+        "INSERT INTO generation.attempts (id, job_id, state, request_digest, attempt_no)
+         VALUES ($1,$2,'succeeded','legacy-digest',1)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(job)
+    .execute(&pool)
+    .await
+    .expect("legacy terminal attempt fixture");
+    let refused = sqlx::migrate::Migrator::new(migrations.clone())
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await;
+    let message = format!(
+        "{}",
+        refused.expect_err("a legacy terminal attempt must stop the close-out migration")
+    );
+    assert!(
+        message.contains("attempt(s) carry a state outside the v1 stages"),
+        "守卫必须点名失败原因：{message}"
+    );
+
+    // 5) 没有幂等摘要的 Job：收口后摘要是唯一防重依据，同样不能升。
+    sqlx::query("DELETE FROM generation.attempts WHERE job_id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .expect("drop the legacy attempt");
+    let refused = sqlx::migrate::Migrator::new(migrations.clone())
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await;
+    let message = format!(
+        "{}",
+        refused.expect_err("a job without an idempotency digest must stop the close-out migration")
+    );
+    assert!(
+        message.contains("no idempotency_key_digest"),
+        "守卫必须点名失败原因：{message}"
+    );
+
+    // 5b) 收窄后的取值面之外的终态旧行（如 canceled）：同样整条失败，且报错点名。
+    sqlx::query("UPDATE generation.jobs SET state = 'canceled' WHERE id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .expect("a terminal legacy state outside the v1 set");
+    let refused = sqlx::migrate::Migrator::new(migrations.clone())
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await;
+    let message = format!(
+        "{}",
+        refused.expect_err("a job state outside the v1 stages must stop the close-out migration")
+    );
+    assert!(
+        message.contains("state outside the v1 stages"),
+        "守卫必须点名失败原因：{message}"
+    );
+    sqlx::query("UPDATE generation.jobs SET state = 'succeeded' WHERE id = $1")
+        .bind(job)
+        .execute(&pool)
+        .await
+        .expect("restore the terminal state");
+
+    // 6) 逐条处置：补上摘要与请求指纹之后，同一条迁移升上来，载荷列不再存在。
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET idempotency_key_digest = 'legacy-disposed-digest',
+             request_digest = 'legacy-disposed-request',
+             request_digest_key_version = 1
+         WHERE id = $1",
+    )
+    .bind(job)
+    .execute(&pool)
+    .await
+    .expect("dispose of the legacy row");
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the close-out migration applies once the legacy rows are disposed of");
+    let payload_columns: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM information_schema.columns
+         WHERE table_schema = 'generation' AND table_name = 'jobs'
+           AND column_name IN ('native_parameters', 'result_images', 'carrier_schema',
+                               'parameter_mapping', 'idempotency_key', 'request_hash',
+                               'execution_protocol')",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("payload column probe");
+    assert_eq!(payload_columns, 0, "收口之后载荷列必须全部删除");
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);

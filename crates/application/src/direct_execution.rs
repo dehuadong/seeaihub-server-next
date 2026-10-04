@@ -16,9 +16,9 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
-    AcceptanceError, AcceptedHandle, AdapterError, Deadline, ExecutionContext, GatewayInput,
-    ImageSite, ImageSites, ImageValueShape, InputImage, ProviderFailureKind, ProviderOutput,
-    ResponsePayload, RetrySafety,
+    AcceptanceError, AcceptedHandle, AdapterError, Deadline, DispatchGate, ExecutionContext,
+    GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage, ProviderFailureKind,
+    ProviderOutput, ResponsePayload, RetrySafety,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
@@ -26,10 +26,7 @@ use seeai_domain::{
     PublishedOffering, RouteStrategy, image_parameter_kind, platform_image_parameters,
 };
 use serde_json::Value;
-use std::sync::{
-    Arc,
-    atomic::{AtomicBool, Ordering},
-};
+use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
 
@@ -38,9 +35,10 @@ use crate::{
     ApplicationError, BalanceSource, BeginSubmission, CostInputs, CreateImageGenerationRequest,
     CredentialProvider, DirectExecutionLimits, ExecutionFinalization, ExecutionLookup,
     ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
-    HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling, RequestFingerprintInput,
-    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision,
-    SettleExecution, contract_parameter_face, failure_provider_cost, freeze_offering_pricing,
+    GenerationDailySpendLimit, HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling,
+    RequestFingerprintInput, RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy,
+    RouteChoice, RoutingDecision, SettleExecution, contract_parameter_face,
+    daily_spend_limit_error, failure_provider_cost, freeze_offering_pricing,
     idempotency_key_digest, provider_cost_fact, public_error_code, requested_image_count,
     select_candidate, select_candidate_with_strategy, single_request_cost_cny,
     validate_idempotency_key,
@@ -98,13 +96,14 @@ pub trait ExecutionOwnershipRegistrar: Send + Sync {
     fn registered(&self, job_id: JobId, fencing_token: FencingToken);
 }
 
-/// 调用方（API Supervisor）提供的执行身份与取消标志。
+/// 调用方（API Supervisor）提供的执行身份与取消/发送闸。
 ///
-/// 取消标志由调用方持有并可随时置位：Adapter 在每次新的外部调用前读它，停止提交、重试与轮询；
-/// 已经发出的请求不因它被证明取消。
+/// 取消由调用方持有并可随时置位：Adapter 在每次新的外部调用前读它，停止提交、重试与轮询。
+/// 生成发送的开始与取消竞争同一个原子状态，因此二者只有一个先成功：取消先赢时可证明这次
+/// Attempt 没有发出生成请求，发送先赢时只能按"可能已提交"收尾（RFC 0018 §4）。
 pub struct DirectExecutionCall {
     pub execution_owner: String,
-    pub cancelled: Arc<AtomicBool>,
+    pub gate: Arc<DispatchGate>,
     /// 本次请求**收到头部时刻**起算的绝对总期限 `D`。
     ///
     /// 上层预算 `D − R` 由这里算，不许从"进入 handler"或"开始执行"重新起算：认证、读取准入与
@@ -167,7 +166,7 @@ pub fn failure_disposition_for(retry_safety: RetrySafety) -> FailureDisposition 
     }
 }
 
-/// Adapter 能看到的执行上下文：绝对期限、调用方取消标志与异步接受确认。
+/// Adapter 能看到的执行上下文：绝对期限、取消/发送闸与异步接受确认。
 pub struct SupervisedExecutionContext {
     executions: Arc<dyn ExecutionRepository>,
     job_id: JobId,
@@ -175,7 +174,7 @@ pub struct SupervisedExecutionContext {
     execution_owner: String,
     fencing_token: FencingToken,
     deadline: Deadline,
-    cancelled: Arc<AtomicBool>,
+    gate: Arc<DispatchGate>,
 }
 
 impl SupervisedExecutionContext {
@@ -188,7 +187,7 @@ impl SupervisedExecutionContext {
         execution_owner: String,
         fencing_token: FencingToken,
         deadline: Deadline,
-        cancelled: Arc<AtomicBool>,
+        gate: Arc<DispatchGate>,
     ) -> Self {
         Self {
             executions,
@@ -197,8 +196,14 @@ impl SupervisedExecutionContext {
             execution_owner,
             fencing_token,
             deadline,
-            cancelled,
+            gate,
         }
+    }
+
+    /// 这次 Attempt 的生成发送是否已经开始：用于区分"闸口拒绝"与"发送已开始后才收到取消"。
+    #[must_use]
+    pub fn generation_started(&self) -> bool {
+        self.gate.generation_started()
     }
 }
 
@@ -209,21 +214,24 @@ impl ExecutionContext for SupervisedExecutionContext {
     }
 
     fn is_cancelled(&self) -> bool {
-        self.cancelled.load(Ordering::Relaxed)
+        self.gate.is_cancelled()
+    }
+
+    fn try_begin_generation(&self) -> bool {
+        self.gate.try_begin_generation()
     }
 
     async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError> {
-        // 已取消就不再确认句柄：确认之后 Adapter 才会按句柄轮询，而取消的意思是停止副作用。
-        if self.is_cancelled() {
-            return Err(AcceptanceError::Cancelled);
-        }
+        // 取消只停止新的外部副作用，不阻止已经到达的句柄入库：句柄丢掉就再也对不了账，
+        // 而记录它不产生新的渠道调用（RFC 0018 §4.2）。落库后 Adapter 会去看取消状态，
+        // 已取消时立刻停止轮询。
         self.executions
             .record_acceptance(crate::RecordAcceptance {
                 job_id: self.job_id,
                 attempt_id: self.attempt_id,
                 execution_owner: self.execution_owner.clone(),
                 fencing_token: self.fencing_token,
-                provider_task_handle: Some(handle.task_id),
+                provider_task_handle: Some(handle.task_id.into_string()),
                 provider_trace_id: handle.trace_id,
             })
             .await
@@ -247,6 +255,12 @@ pub struct DirectExecutionService {
     cost_ceiling: RequestCostCeiling,
     /// 可证明上游未受理时的请求内重投策略（次数与退避），与旧路径共用同一组配置。
     retry_policy: RetryPolicy,
+    /// 该账户**当天**最多能花掉多少（microusd，运营取值，见 [`GenerationDailySpendLimit`]）。
+    ///
+    /// 它与两个容量名额守的不是同一件事：名额守的是"同时在跑几个"，钱烧光的形态却是**串行**的
+    /// ——一个接一个地跑、每一个都合规，照样能在一天里把余额花完。判据见
+    /// [`HubRepository::daily_spend_microusd`]：问的是当日已完成实收的合计，不是任何计数器。
+    max_daily_spend_microusd: u64,
     /// 加速层：受理、结算与失败收尾都改余额，提交后要把新余额写穿缓存。
     acceleration: Arc<AccelerationService>,
 }
@@ -279,8 +293,19 @@ impl DirectExecutionService {
             // 缺省就是开着的请求内重投（次数有限、退避有上限）：关掉要显式配
             // GENERATION_RETRY_MAX_ATTEMPTS=1，与旧路径同一条纪律。
             retry_policy: RetryPolicy::default(),
+            max_daily_spend_microusd: GenerationDailySpendLimit::default_limit()
+                .max_daily_spend_microusd,
             acceleration,
         }
+    }
+
+    /// 装上运维给的**每日扣费上限**。
+    ///
+    /// 上限是配置项：它随部署形态与客户分级变，所以由调用方给，而不是写死在这里。
+    #[must_use]
+    pub fn with_daily_spend_limit(mut self, limit: GenerationDailySpendLimit) -> Self {
+        self.max_daily_spend_microusd = limit.max_daily_spend_microusd;
+        self
     }
 
     /// 装上运维给的结算预留预算 `R`。
@@ -425,6 +450,30 @@ impl DirectExecutionService {
         {
             return Err(DirectExecutionError::RequestTimeout);
         }
+        // 受理之前就已经取消（停机、所有权失效，或调用方已经离开）：这次执行还没有任何记录、
+        // 也没有发出过请求，直接按"确定未提交"回应，不建 Job、不占 Hold、不占渠道名额。
+        // 这也让同键重试能作为一次正常的新请求处理，而不是命中一条被取消写死的失败记录。
+        if call.gate.is_cancelled() {
+            return Err(DirectExecutionError::RequestTimeout);
+        }
+        // 每日扣费上限：与两个容量名额是**三道不同的门**——账户名额守"同时在跑几个"、渠道名额守
+        // "上游未决任务有几个"，这道守的是"今天已经花掉多少钱"（花钱可以是完全串行的，两个计数
+        // 都看不见它）。判据见 [`HubRepository::daily_spend_microusd`]，超限按既有的 429 语义回。
+        //
+        // 它**放在 admit 事务之外**，理由是这道门与那笔扣减本来就不可能原子：当日合计只在**结算**
+        // 那一笔里累加，而结算发生在受理之后很久，任何事务边界都圈不住"受理到结算"这段窗口；
+        // 事务内再读一次不会让判定更准，只会把"到次日零点还有多久"这条对客事实（由
+        // [`daily_spend_limit_error`] 按唯一一处规则算出）搬进 SQL 再写一遍。读的仍是已提交的
+        // 权威事实，位置取在**受理之前**：不建 Job、不占 Hold、不占渠道名额。
+        let spent_microusd = self
+            .repository
+            .daily_spend_microusd(request.account_id)
+            .await?;
+        if let Some(rejected) =
+            daily_spend_limit_error(self.max_daily_spend_microusd, spent_microusd, Utc::now())
+        {
+            return Err(rejected.into());
+        }
 
         let outcome = self
             .executions
@@ -521,7 +570,7 @@ impl DirectExecutionService {
                 call.execution_owner.clone(),
                 fencing_token,
                 deadline,
-                call.cancelled.clone(),
+                call.gate.clone(),
             );
             let output = adapter.execute(input.clone(), &context, &credential).await;
             match output {
@@ -550,7 +599,7 @@ impl DirectExecutionService {
                         let backoff = self.retry_policy.backoff_for(started.attempt_no);
                         let can_retry =
                             self.retry_policy.allows_another_attempt(started.attempt_no)
-                                && !call.cancelled.load(Ordering::Relaxed)
+                                && !call.gate.is_cancelled()
                                 && !deadline.is_expired()
                                 && deadline.remaining() > backoff;
                         if can_retry {
@@ -574,7 +623,7 @@ impl DirectExecutionService {
                                 "the provider provably did not accept this request; retrying in-request"
                             );
                             tokio::time::sleep(backoff).await;
-                            if call.cancelled.load(Ordering::Relaxed) || deadline.is_expired() {
+                            if call.gate.is_cancelled() || deadline.is_expired() {
                                 self.record_failure(
                                     request.account_id,
                                     job_id,
@@ -593,7 +642,7 @@ impl DirectExecutionService {
                         }
                         // 终局：释放占用与渠道名额。期限截止（或退避放不下）按 504 request_timeout，
                         // 次数耗尽按确定失败返回原平台错误码（Spec 0005 §4）。
-                        let timed_out = call.cancelled.load(Ordering::Relaxed)
+                        let timed_out = call.gate.is_cancelled()
                             || deadline.is_expired()
                             || deadline.remaining() <= backoff;
                         self.record_failure(
@@ -638,11 +687,13 @@ impl DirectExecutionService {
                     let late = LateFacts {
                         job_id,
                         attempt_id,
-                        provider_task_handle: Some(handle.task_id),
+                        provider_task_handle: Some(handle.task_id.into_string()),
                         provider_trace_id: handle.trace_id,
                         image_count: None,
                         evidence: None,
                         provider_cost: None,
+                        // 只交付句柄：这一刻还不知道上游终态，收件行如实记「没有终态」。
+                        provider_state: None,
                     };
                     if let Err(error) = self.executions.offer_late_facts(late).await {
                         tracing::warn!(
@@ -686,8 +737,38 @@ impl DirectExecutionService {
                         code: PublicErrorCode::PlatformUnavailable,
                     });
                 }
+                Err(AdapterError::CancelledBeforeSend) => {
+                    // 闸口拒绝只有在生成发送确实没开始过时才等价于"确定未提交"。取消与发送竞争
+                    // 同一个原子状态，发送先赢时闸口的拒绝可能来自更早的调用点，此时必须按
+                    // 可能已提交收尾（Spec 0005 §5、RFC 0018 §4）。
+                    let (disposition, outcome) = if context.generation_started() {
+                        (
+                            FailureDisposition::Unknown,
+                            DirectExecutionError::OutcomeUnknown,
+                        )
+                    } else {
+                        (
+                            FailureDisposition::DeterminedFailure,
+                            DirectExecutionError::RequestTimeout,
+                        )
+                    };
+                    self.record_failure(
+                        request.account_id,
+                        job_id,
+                        attempt_id,
+                        &call.execution_owner,
+                        fencing_token,
+                        ProviderFailureKind::PlatformInternal,
+                        disposition,
+                        None,
+                        None,
+                    )
+                    .await?;
+                    return Err(outcome);
+                }
                 Err(AdapterError::Cancelled) => {
-                    // 取消不能证明上游未受理：保留占用与渠道名额，交异常对账处置（RFC 0017 §5）。
+                    // 已经在等待上游结果的阶段收到取消，不能证明上游未受理：保留占用与渠道
+                    // 名额，交异常对账处置（RFC 0017 §5）。
                     self.record_failure(
                         request.account_id,
                         job_id,
@@ -853,6 +934,11 @@ impl DirectExecutionService {
             .await?;
             return Err(DirectExecutionError::OutcomeUnknown);
         }
+        // 产出张数是落库事实：用量明细与账单汇总按它报"几张"，所以取内存里的实际张数，
+        // 不取请求的 `n`（RFC 0019 §5.3）。
+        let image_count = u32::try_from(images).map_err(|_| {
+            ApplicationError::Validation("the produced image count is out of range".to_owned())
+        })?;
         let provider_cost = provider_cost_fact(
             snapshot,
             &output.accounting_facts.provider_cost,
@@ -882,6 +968,7 @@ impl DirectExecutionService {
                 },
                 provider_cost,
                 charge_microusd: charge,
+                image_count: Some(image_count),
                 provider_trace_id: output.accounting_facts.provider_trace_id.clone(),
             })
             .await?;

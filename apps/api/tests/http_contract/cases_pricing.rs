@@ -31,7 +31,6 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
 
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let _worker = harness.spawn_worker();
     let key = format!("pricing-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "pricing contract");
     request["size"] = json!("2K");
@@ -67,7 +66,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     assert_eq!(snapshot["fx_rate"]["currency"], json!("USD"));
     assert_eq!(snapshot["fx_rate"]["rate_micros"], json!(7_100_000));
 
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     let offering_id: Uuid =
         sqlx::query_scalar("SELECT offering_id FROM generation.jobs WHERE id = $1")
@@ -112,7 +111,8 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     let row = &usage["usage"][0];
     assert_eq!(row["job_id"], json!(job_id.to_string()), "{usage}");
     assert_eq!(row["gateway_model"], json!(harness.model));
-    assert_eq!(row["image_count"], json!(1));
+    // 产出张数落在 `image_count`：假上游只回一张，这里就是这次执行的实际张数。
+    assert_eq!(row["image_count"], json!(1), "{usage}");
     // 账本里的 `capture` 是负数（钱从账上出去），明细直接给这个和；界面上按"扣费"显示绝对值。
     assert_eq!(row["charged_microusd"], json!(-43_680));
     // **账本读能按类别过滤**：充值记录只看 `credit`；未知类别**拒**而不是静默回空。
@@ -314,7 +314,6 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
 
     let (_, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let _worker = harness.spawn_worker();
     let mut request = route_request(harness.model, "hit candidate");
     request["quality"] = json!("low");
     let key = format!("hit-candidate-{}", Uuid::new_v4());
@@ -327,7 +326,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
 
     let snapshot = frozen_snapshot(&harness.pool, &key).await;
@@ -389,7 +388,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (next_job, state, _) = harness.job(&next_key).await;
+    let (next_job, state) = harness.job(&next_key).await;
     assert_eq!(state, "succeeded");
     let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
     assert_eq!(
@@ -446,7 +445,6 @@ async fn the_hold_resolves_the_tier_then_walks_the_supply_floor_chain() {
         100_000_000,
     )
     .await;
-    let _worker = harness.spawn_worker();
 
     // 档位查表：2K = ¥0.25。
     assert_eq!(
@@ -541,7 +539,6 @@ async fn an_unpriced_revision_and_an_empty_floor_table_fall_back_to_the_platform
     let client = Client::new();
     let (_, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let _worker = harness.spawn_worker();
 
     // 1) 没有定价的修订：快照里没有对客费率向量，预授权回落平台兜底数，结算按已发布费率。
     let key = format!("unpriced-{}", Uuid::new_v4());
@@ -554,7 +551,7 @@ async fn an_unpriced_revision_and_an_empty_floor_table_fall_back_to_the_platform
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     let snapshot = frozen_snapshot(&harness.pool, &key).await;
     assert!(
@@ -620,7 +617,6 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
     );
     let (_, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000).await;
-    let _worker = harness.spawn_worker();
 
     let key = format!("overdraft-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "overdraft");
@@ -638,7 +634,7 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
         StatusCode::OK,
         "受理闸门是'余额 ≥ 保底额'：1000 ≥ 1000，照常受理。got {body}"
     );
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     assert_eq!(harness.captured_microusd(job_id).await, -43_680);
     let balance = account_balance(&harness, job_id).await;
@@ -665,12 +661,13 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
     .await;
     assert_eq!(status, StatusCode::PAYMENT_REQUIRED, "got {body}");
     assert_eq!(body["error"]["code"], json!("insufficient_balance"));
-    let created: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(&refused_key)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("refused jobs");
+    let created: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.jobs WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(&refused_key))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("refused jobs");
     assert_eq!(created, 0, "被拒的受理不产生 Job");
     assert_eq!(
         account_balance(&harness, job_id).await,
@@ -781,7 +778,6 @@ async fn the_admin_view_lists_the_published_pricing() {
 async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouched() {
     let harness = Harness::start(UpstreamBehaviour::apimart()).await;
     let client = Client::new();
-    let _worker = harness.spawn_worker();
     let (_, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
 
@@ -823,7 +819,7 @@ async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouche
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (first_job, state, _) = harness.job(&key).await;
+    let (first_job, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
     let first_snapshot = frozen_snapshot(&harness.pool, &key).await;
     assert_eq!(first_snapshot["consumer_formula"], json!("token_rates"));
@@ -860,7 +856,7 @@ async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouche
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (next_job, state, _) = harness.job(&next_key).await;
+    let (next_job, state) = harness.job(&next_key).await;
     assert_eq!(state, "succeeded");
     let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
     assert_eq!(

@@ -598,15 +598,3 @@ fn branch_follows_the_images_the_caller_sent() {
     request.reference_images.clear();
     assert!(request.branch().is_err());
 }
-
-#[test]
-fn canonical_request_hash_ignores_object_key_order() {
-    let first = image_request(serde_json::json!({"prompt":"x", "n":1}));
-    let mut second = first.clone();
-    second.native_parameters =
-        serde_json::from_str(r#"{"n":1,"prompt":"x"}"#).expect("fixture should parse");
-    assert_eq!(
-        request_hash(&first).expect("hash"),
-        request_hash(&second).expect("hash")
-    );
-}

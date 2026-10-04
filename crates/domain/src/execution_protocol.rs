@@ -1,8 +1,8 @@
-//! 同步网关执行协议的最小事实：协议版本、Job/Attempt 阶段与执行所有权。
+//! 同步网关执行的最小事实：Job/Attempt 阶段与执行所有权。
 //!
-//! 新旧协议共用 generation.jobs / generation.attempts，用 ExecutionProtocol 区分：
-//! 旧协议由 Worker 领取生成队列，新协议由 API 在内存里直接执行。两套阶段名互不复用，
-//! 存储列直接存字符串；新协议记录只保存最小执行与账务事实，不保存请求或响应业务载荷。
+//! 记录落在 generation.jobs / generation.attempts：由 API 在内存里直接执行，图片与请求参数只在
+//! 内存里经过。阶段名与 JobState 互不复用，存储列直接存字符串；记录只保存最小执行与账务事实，
+//! 不保存请求或响应业务载荷。
 //!
 //! 规则见 docs/specs/0005-synchronous-image-gateway.md 的 §2–§6 与
 //! docs/design/0017-synchronous-image-gateway.md 的 §3、§5。
@@ -12,50 +12,9 @@ use std::fmt::{Display, Formatter};
 
 use crate::DomainError;
 
-/// 执行记录的协议版本。
+/// Job 阶段：受理 → 执行中 → 终态（成功 / 失败 / 需对账）。
 ///
-/// 它决定这条记录按哪套阶段与收尾规则解释，也决定旧 Worker 能不能领取它——
-/// 新协议记录不落在旧协议的可领取条件里。
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum ExecutionProtocol {
-    /// 切换前的旧协议：API 建 Job、Worker 领取执行，正文与结果信封随 Job 落库。
-    Legacy,
-    /// 同步网关协议：API 内存直接执行，记录只留最小事实。
-    V1,
-}
-
-impl ExecutionProtocol {
-    /// 落库取值，与 generation.jobs.execution_protocol 的 CHECK 约束同一份取值面。
-    #[must_use]
-    pub fn as_str(self) -> &'static str {
-        match self {
-            Self::Legacy => "legacy",
-            Self::V1 => "v1",
-        }
-    }
-
-    /// 从落库取值还原。数据库 CHECK 保证取值面；解析不到说明存储被绕过，按错误处理。
-    #[must_use]
-    pub fn parse(value: &str) -> Option<Self> {
-        match value {
-            "legacy" => Some(Self::Legacy),
-            "v1" => Some(Self::V1),
-            _ => None,
-        }
-    }
-}
-
-impl Display for ExecutionProtocol {
-    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str(self.as_str())
-    }
-}
-
-/// 新协议 Job 阶段：受理 → 执行中 → 终态（成功 / 失败 / 需对账）。
-///
-/// 与旧的 JobState 分开：旧协议有 leased（Worker 租约）这个阶段，新协议没有领取这回事，
-/// 只有 API 自己持有的执行所有权；两套阶段名不复用同一批取值。
+/// 没有"领取"这个阶段：执行所有权由发起执行的 API 进程自己持有。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ExecutionStage {
@@ -187,6 +146,22 @@ impl Display for AttemptStage {
     }
 }
 
+/// Provider 任务句柄与 trace 标识的字节上限。
+pub const MAX_PROVIDER_IDENTIFIER_BYTES: usize = 128;
+
+/// Provider 任务句柄或 trace 标识是不是有界标识。
+///
+/// 句柄会进入持久层、对账查询与告警：URL、data URL、控制字符、任意正文与超长值都不是标识，
+/// 必须在写入前拒绝，否则业务载荷会从"任务标识"这个口子回到数据库（Spec 0005 §2、RFC 0018 §6）。
+#[must_use]
+pub fn is_bounded_provider_identifier(value: &str) -> bool {
+    !value.is_empty()
+        && value.len() <= MAX_PROVIDER_IDENTIFIER_BYTES
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
 /// 执行所有权的 fencing token：每次提交与持久收尾都核验它。
 ///
 /// **续约只延期所有权，不改变 token；只有接管让 token 加一**：续约在同一所有者名下把
@@ -227,3 +202,48 @@ impl Display for FencingToken {
 
 #[cfg(test)]
 mod tests;
+
+/// Provider 任务的**供应商状态**：查询与后续晚到事实共用同一判据。
+///
+/// 只判"能不能按证据向消费者结算"不够：失败与取消是确定的终态，必须释放占用并按失败成本口径
+/// 记录，绝不能因为捎带返回了计量就被当成成功（Spec 0005 §5、ADR 0006）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ProviderTaskState {
+    /// 渠道仍在执行：不结算、不释放、不建案，按原预算继续只读查询。
+    Pending,
+    /// 渠道确认成功：这是唯一允许按计量证据正式结算的状态。
+    Succeeded,
+    /// 渠道确认失败：按确定失败释放消费者占用，实收为零；上游声明的成本照记。
+    Failed,
+    /// 渠道确认取消：处置同失败。
+    Cancelled,
+    /// 状态缺失或不可信：不结算、不释放、不按成功处理；保留占用，由后续重查或对账处置。
+    Unknown,
+}
+
+impl ProviderTaskState {
+    /// 存储与线路上的稳定表示。
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::Succeeded => "succeeded",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+            Self::Unknown => "unknown",
+        }
+    }
+
+    /// 解析稳定表示；未列出的取值返回 `None`，由调用方按"不可信"处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        match value {
+            "pending" => Some(Self::Pending),
+            "succeeded" => Some(Self::Succeeded),
+            "failed" => Some(Self::Failed),
+            "cancelled" => Some(Self::Cancelled),
+            "unknown" => Some(Self::Unknown),
+            _ => None,
+        }
+    }
+}

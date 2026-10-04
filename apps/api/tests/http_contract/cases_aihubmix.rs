@@ -26,12 +26,8 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         Some(STANDARD.encode(PNG_FIXTURE).as_str()),
         "上游给 base64，平台必须原样交回"
     );
-    let stored = assert_job_succeeded(&harness, &key).await;
-    assert_eq!(
-        stored,
-        json!([{"b64_json": STANDARD.encode(PNG_FIXTURE)}]),
-        "内部记录里存的也是渠道给的那份信封"
-    );
+    // 结果载荷**不落库**：它只在这条对客响应里，所以上面那条断言就是"原样交回"的全部判据。
+    assert_job_succeeded(&harness, &key).await;
 
     // 2) 参考图走**公网 URL**：这个渠道要字节，所以由 Adapter 自己去取。
     let reference_url = format!("{}/inputs/ref.png", harness.upstream_base_url);
@@ -75,7 +71,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         body_contains_bytes(&edits, PNG_FIXTURE),
         "data URL 必须就地解码进文件部件"
     );
-    let (_, state, _) = harness.job(&key).await;
+    let (_, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
 
     // 4) edits 入口（multipart 文件部件）：与 generations 是**同一个能力**。
@@ -107,25 +103,8 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         body_contains_bytes(&edits, PNG_FIXTURE),
         "两个文件部件的字节都必须到上游"
     );
-    // 文件部件在受理期被转成 data URL 语义，落在该候选自己的参数名上。
-    let stored: Value = sqlx::query_scalar(
-        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
-    )
-    .bind(&key)
-    .fetch_one(&harness.pool)
-    .await
-    .expect("native parameters");
-    assert!(
-        stored["image"]
-            .as_str()
-            .is_some_and(|v| v.starts_with("data:image/")),
-        "文件部件必须以 data URL 语义留在内部参数里，got {stored}"
-    );
-    assert!(
-        stored["mask"]
-            .as_str()
-            .is_some_and(|v| v.starts_with("data:image/"))
-    );
+    // 文件部件在受理期被转成 data URL 语义、落在候选声明的参数名上；这一步的可见判据就是
+    // 上面那条"字节原样进文件部件"——载荷本身不落库。
 
     // 5) 同义字段只能给一个；只给遮罩是结构性错误。
     let key = format!("sync-conflict-{}", Uuid::new_v4());
@@ -209,20 +188,6 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
     assert!(
         body_contains_bytes(&edits, PNG_FIXTURE),
         "参考图的字节必须原样进文件部件"
-    );
-
-    // 两张都留在了这次请求的参数面里，且都落在候选声明的名字上：不是只留下第一张。
-    let stored: Value = sqlx::query_scalar(
-        "SELECT native_parameters FROM generation.jobs WHERE idempotency_key = $1",
-    )
-    .bind(&key)
-    .fetch_one(&harness.pool)
-    .await
-    .expect("native parameters");
-    assert_eq!(
-        stored["image"].as_array().map(Vec::len),
-        Some(2),
-        "两张参考图都要留在内部参数里，got {stored}"
     );
 
     // 2) 一张参考图：同一份声明面下仍是单值 `image`——列表形态只属于多张。

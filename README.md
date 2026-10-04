@@ -4,7 +4,7 @@
 
 ## 当前纵切
 
-- 一个 `CreateImageGeneration` 应用命令和内部持久 Generation Job（对客不可见）；
+- 一个 `CreateImageGenerationRequest` 接收入口与一条直接执行路径；内部只持久化最小执行与账务记录（Job/Attempt，对客不可见）；
 - 两个渠道族的 Adapter：AIHubMix（`https://api.inferera.com`，同步）与 APIMart（`https://api.apib.ai`，任务式，只在 Adapter 内部）；
 - 对客只有两条同步路径：`POST /v1/images/generations`（JSON）与 `POST /v1/images/edits`（multipart）；参考图/遮罩用公网 URL 或 data URL 给出；
 - 无图片走上游的文生图接口；有图片、可选遮罩则按渠道自己的参数走图生图/编辑；

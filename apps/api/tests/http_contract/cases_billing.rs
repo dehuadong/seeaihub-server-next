@@ -43,7 +43,6 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
     assert_eq!(opened.status(), StatusCode::CREATED);
 
     // 跑通一笔请求：Worker 在同步窗口内把它做到终态。
-    let _worker = harness.spawn_worker();
     let key = format!("usage-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,
@@ -92,7 +91,8 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
     let row = &rows[0];
     assert_eq!(row["status"], json!("succeeded"));
     assert_eq!(row["kind"], json!("generation"));
-    assert_eq!(row["image_count"], json!(1));
+    // 产出张数落在 `image_count`：这一笔实际产出一张，用量读的就是那个落点。
+    assert_eq!(row["image_count"], json!(1), "{usage}");
     assert_eq!(row["gateway_model"], json!(harness.model));
     // **对客不可见**：不出现任务号与内部状态取值。
     let rendered = usage.to_string();
@@ -180,7 +180,6 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
         StatusCode::CREATED
     );
 
-    let _worker = harness.spawn_worker();
     for index in 0..2 {
         let key = format!("billing-{index}-{}", Uuid::new_v4());
         let (status, body) = post_json(
@@ -231,7 +230,11 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
         .await
         .expect("billing body");
     assert_eq!(billing["requests"], json!(2), "汇总不随明细页大小变化");
-    assert_eq!(billing["images"], json!(2));
+    assert_eq!(
+        billing["images"],
+        json!(2),
+        "两次请求各产出一张，汇总按落点算"
+    );
 
     let all = client
         .get(format!("{}/v1/customer/usage?limit=100", harness.base_url))
@@ -252,6 +255,17 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
         billing["charged_microusd"],
         json!(summed),
         "汇总的扣费总额必须等于全量明细的求和"
+    );
+    let summed_images: i64 = all["usage"]
+        .as_array()
+        .expect("usage array")
+        .iter()
+        .map(|row| row["image_count"].as_i64().expect("image count"))
+        .sum();
+    assert_eq!(
+        billing["images"],
+        json!(summed_images),
+        "汇总的产出张数必须等于全量明细的求和"
     );
 
     harness.cleanup().await;
@@ -382,7 +396,6 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
 
     // 窗口边界取在请求的**前**与**后**：请求之后再取一次"现在"，用它当 `until` 就该是 0 条。
     let before = chrono::Utc::now();
-    let _worker = harness.spawn_worker();
     let key = format!("window-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,
@@ -625,7 +638,6 @@ async fn a_customer_revoked_key_is_rejected_at_the_generation_entry() {
     let key_id = issued["key_id"].as_str().expect("key id").to_owned();
 
     // 吊销之前先跑通一笔：这个账户的钱与这条路由到这里都不再是拒绝的理由。
-    let _worker = harness.spawn_worker();
     let (status, body) = post_json(
         &harness.base_url,
         &api_key,
@@ -726,7 +738,7 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         StatusCode::CREATED
     );
 
-    // 先受理、不结算：没有 Worker 时同步入口等到超时回 504，但 Job 与预授权已经落地。
+    // 受理与结算在同一次请求里完成（直接执行）；跨天形态由**回填受理时刻**造出来。
     let key = format!("cross-day-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,
@@ -736,16 +748,12 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         &route_request(harness.model, "settles after midnight"),
     )
     .await;
-    assert_eq!(
-        status,
-        StatusCode::GATEWAY_TIMEOUT,
-        "没有 Worker 时同步入口超时：{body}"
-    );
-    let (job_id, state, _) = harness.job(&key).await;
-    assert_eq!(state, "accepted", "夹具必须停在受理态：{body}");
+    assert_eq!(status, StatusCode::OK, "直接执行必须跑完并结算：{body}");
+    let (job_id, state) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "夹具必须已经结算：{body}");
 
-    // 受理时刻改到**前天 23:50**。这一步必须在**结算之前**：结算时数据库看到的受理时刻与结算
-    // 时刻因此真的跨了 UTC 自然日，按受理日入桶与按结算日入桶才会落到不同的行。
+    // 受理时刻改到**前天 23:50**：结算已经发生（终态时刻与 capture 同事务落库），受理时刻与
+    // 结算时刻因此真的跨了 UTC 自然日，按受理日入桶与按结算日入桶才会落到不同的行。
     sqlx::query(
         "UPDATE generation.jobs
          SET created_at = ((date_trunc('day', now() AT TIME ZONE 'UTC') - interval '2 days')
@@ -756,10 +764,6 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
     .execute(&harness.pool)
     .await
     .expect("backdate the acceptance time before settling");
-
-    // 现在才起 Worker：它在**今天**把这一笔结算掉。
-    let _worker = harness.spawn_worker();
-    wait_for_job_state(&harness, &key, "succeeded").await;
 
     let (terminal_at, capture_at): (chrono::DateTime<chrono::Utc>, chrono::DateTime<chrono::Utc>) =
         sqlx::query_as(
@@ -829,6 +833,11 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         "跨天结算的那一笔不该落在受理日：{request_day_billing}"
     );
     assert_eq!(request_day_billing["charged_microusd"], json!(0));
+    assert_eq!(
+        request_day_billing["images"],
+        json!(0),
+        "受理日还没有产出事实：张数按结算日入桶"
+    );
 
     let settled_day_billing = read_billing(&settled_day, &next_day).await;
     assert_eq!(
@@ -836,7 +845,11 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         json!(1),
         "跨天结算的那一笔必须落在结算日：{settled_day_billing}"
     );
-    assert_eq!(settled_day_billing["images"], json!(1));
+    assert_eq!(
+        settled_day_billing["images"],
+        json!(1),
+        "结算日的那笔产出一张，随终态时刻入桶"
+    );
     assert_eq!(
         settled_day_billing["charged_microusd"],
         json!(capture),
@@ -963,7 +976,7 @@ async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
         )
         .await;
     assert_ne!(status, StatusCode::OK, "这次执行不该成功：{body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(
         state, "reconciliation_required",
         "夹具必须留下一个未完成的 Job"
@@ -1135,7 +1148,6 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
         StatusCode::CREATED
     );
 
-    let _worker = harness.spawn_worker();
     let mut keys = Vec::new();
     for index in 0..2 {
         let key = format!("capture-sum-{index}-{}", Uuid::new_v4());
@@ -1154,7 +1166,7 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
     // 真实路径上终态时刻与 `capture` 入账时刻由同一事务确定、逐位相等；这里把其中一笔**人为错开**
     // ——终态落在昨天，capture 落在前天。不这样错开，"逐笔扣费退回按流水入账时刻过滤"这条回归
     // 也能通过；错开之后，下面按结算日窗口读用量就能把回归逼出来（`0013` §5）。
-    let (shifted_job_id, shifted_state, _) = harness.job(&keys[0]).await;
+    let (shifted_job_id, shifted_state) = harness.job(&keys[0]).await;
     assert_eq!(shifted_state, "succeeded", "错开时刻的那一笔必须已结算");
     let shifted_capture = harness.captured_microusd(shifted_job_id).await;
     assert!(

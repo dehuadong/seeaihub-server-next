@@ -8,7 +8,7 @@ use seeai_application::{
     AccelerationService, AdapterRegistry, ApplicationError, CachePolicy, CredentialProvider,
     DEFAULT_EXECUTION_LEASE_SECONDS, ExecutionReconciliationService, ExecutionRepository,
     HubRepository, NO_CONTRACT_MAX_OUTPUT_IMAGES, PlatformAlerter, ReconciliationPolicy,
-    RequestTimeoutPolicy, RetryPolicy, WorkerService,
+    RequestTimeoutPolicy, RetryPolicy,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_persistence::{PgHubRepository, max_declared_output_images};
@@ -44,17 +44,15 @@ async fn main() -> Result<()> {
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
     // 超时链整条校验：输出张数上限取自**合同自己声明的取值面**（读库，所以要连库之后才知道），
-    // 两条链的比较因此比的是"合同允许的最大一档请求"。租约短于上游超时会让同一个 Job 被另一个
-    // worker 领走再调一次上游（付两次钱），而对客窗口短于上游超时是消费者拿到 504、上游照样计费
-    // 的那条路——窗口在 API 进程上，所以这个进程也要看到它、也校验它。校验不通过就带着点名到
-    // 具体那条链与两边当前值的报错退出，不让进程带着一条断链的服务跑起来。
+    // 比较因此比的是"合同允许的最大一档请求"。对客窗口短于上游超时是消费者拿到 504、上游照样
+    // 计费的那条路——窗口在 API 进程上，所以这个进程也要看到它、也校验它。校验不通过就带着点名
+    // 到具体那条链与两边当前值的报错退出，不让进程带着一条断链的服务跑起来。
     let (max_output_images, declared_by, undecodable) =
         max_declared_output_images(repository.pool(), NO_CONTRACT_MAX_OUTPUT_IMAGES).await?;
     let timeouts =
         RequestTimeoutPolicy::from_env(max_output_images).map_err(anyhow::Error::from)?;
     timeouts.validate().map_err(anyhow::Error::from)?;
     info!(
-        worker_lease_seconds = timeouts.worker_lease.as_secs(),
         sync_wait_seconds = timeouts.sync_wait.as_secs(),
         provider_timeout_seconds = timeouts.provider_timeout.as_secs(),
         base_seconds = timeouts.base.as_secs(),
@@ -65,12 +63,9 @@ async fn main() -> Result<()> {
         undecodable_contracts = undecodable,
         "the timeout chain is consistent"
     );
-    let lease_seconds = i64::try_from(timeouts.worker_lease.as_secs())
-        .context("WORKER_LEASE_SECONDS is out of range")?;
     // 重投策略也是运维取值：**上限**决定最坏情况下一个请求会用掉几次上游调用（也就决定了最坏
-    // 情况下多花多少钱），**退避基**决定这几次调用摊在多长的窗口里。两者都随上游的抖动程度与
-    // 对客的同步窗口变，所以既不在代码里写死，也不给一个"看起来合理"的隐藏取值：读不到就用
-    // 缺省值，读到不合法就带着点名到那个变量的报错退出。
+    // 情况下多花多少钱），**退避基**决定这几次调用摊在多长的窗口里。对账 Worker 只在"可证明未
+    // 受理"时按它重投。
     let retry_policy = RetryPolicy::from_env().map_err(anyhow::Error::from)?;
     info!(
         max_attempts = retry_policy.max_attempts,
@@ -86,8 +81,8 @@ async fn main() -> Result<()> {
             Arc::new(AihubmixAdapterFactory),
             Arc::new(ApimartAdapterFactory),
         ]));
-    // 加速层：Worker 只用到它的一半——结算与失败收尾都改余额，提交后要把新余额写穿缓存。
-    // `REDIS_URL` 没配时它是空操作，结算路径与没有它时逐位相同。
+    // 加速层：对账的结算与失败收尾都改余额，提交后要把新余额写穿缓存。`REDIS_URL` 没配时
+    // 它是空操作，对账路径与没有它时逐位相同。
     let acceleration = match RedisCache::from_env()? {
         Some(cache) => Arc::new(AccelerationService::new(
             repository_port.clone(),
@@ -96,16 +91,6 @@ async fn main() -> Result<()> {
         )),
         None => Arc::new(AccelerationService::disabled(repository_port.clone())),
     };
-    let worker = WorkerService::new(
-        repository_port.clone(),
-        adapters.clone(),
-        Arc::new(EnvironmentCredentialProvider),
-        worker_id.clone(),
-        ChronoDuration::seconds(lease_seconds),
-        timeouts,
-    )?
-    .with_acceleration(acceleration.clone())
-    .with_retry_policy(retry_policy);
     // 平台故障告警出口是**配置项**：`PROVIDER_ALERT_WEBHOOK` 没配就没有出口，一条也不外发；
     // 阈值（某候选连续失败几次才告警）只在有出口时才读。地址写错在这里就失败，不让进程带着一个
     // "永远发不出去"的出口跑起来。
@@ -125,15 +110,8 @@ async fn main() -> Result<()> {
         }
         None => None,
     };
-    let worker = match &alerting {
-        Some((alerter, consecutive_failures)) => {
-            worker.with_platform_alerts(alerter.clone(), *consecutive_failures)
-        }
-        None => worker,
-    };
-    // 新协议的异常对账循环：只接管过期所有权、只读查询、按证据幂等结算或建案。它绝不领取
-    // 生成任务、也不读正文；旧 Worker 路径（run_once / claim_next_job / recover_expired_leases /
-    // renew_lease）逐位不变。
+    // 异常对账循环：只接管过期所有权、只读查询、按证据幂等结算或建案。它绝不领取生成任务、
+    // 不重发生成请求，也不读正文。
     let execution_lease_seconds = parse_env(
         "GENERATION_EXECUTION_LEASE_SECONDS",
         DEFAULT_EXECUTION_LEASE_SECONDS,
@@ -166,18 +144,17 @@ async fn main() -> Result<()> {
         drain_control,
         interrupt: shutdown_signal(),
     };
-    run_until_shutdown(&worker, Some(&reconciliation), signals, poll_interval).await
+    run_until_shutdown(Some(&reconciliation), signals, poll_interval).await;
+    Ok(())
 }
 
-/// 跑一轮：先跑异常对账（有界、快），再跑旧 Worker 的生成领取。
+/// 跑一轮异常对账。
 ///
-/// 对账出错不阻断生成路径：记账旁路的问题不该让旧协议的执行停摆。生成路径的错误照旧向上报。
-/// `reconciliation` 为空表示这轮循环不带对账（只验停机时序的用例用它）；生产里始终给 `Some`。
-async fn run_round(
-    worker: &WorkerService,
-    reconciliation: Option<&ExecutionReconciliationService>,
-) -> Result<bool, ApplicationError> {
-    let reconciled = match reconciliation {
+/// 对账出错不向上抛：一个轮次的失败不该让进程退出，下一轮再试；错误在这里记日志，返回"这一轮
+/// 没干活"让主循环按空闲退避。`reconciliation` 为空表示这轮不带对账（只验停机时序的用例用它）；
+/// 生产里始终给 `Some`。
+async fn run_round(reconciliation: Option<&ExecutionReconciliationService>) -> bool {
+    match reconciliation {
         Some(service) => match service.run_once().await {
             Ok(report) => report.did_work(),
             Err(error) => {
@@ -186,9 +163,7 @@ async fn run_round(
             }
         },
         None => false,
-    };
-    let worked = worker.run_once().await?;
-    Ok(reconciled || worked)
+    }
 }
 
 /// 主循环等的终止信号 future。
@@ -229,41 +204,40 @@ fn shutdown_signal() -> ShutdownFuture {
     }))
 }
 
-/// 停机输入：一个"停止领新任务"的开关，以及一个"进程要退了"的终止信号。
+/// 停机输入：一个"停止跑下一轮对账"的开关，以及一个"进程要退了"的终止信号。
 struct ShutdownSignals {
-    /// 由别处置位（例如编排系统的排水接口）；置位之后不再领下一轮。`watch` 可以反复轮询。
+    /// 由别处置位（例如编排系统的排水接口）；置位之后不再跑下一轮。`watch` 可以反复轮询。
     drain_control: tokio::sync::watch::Receiver<bool>,
     /// 终止信号（SIGINT / SIGTERM）。钉成 `Pin<Box<..>>` 是因为它只在**一个**地方被轮询：每轮现造一个会把"监听"
     /// 反复注册一遍，而"等停机"这件事不需要它对每个轮次都重新就绪。
     interrupt: ShutdownFuture,
 }
 
-/// 领任务的主循环：直到停机条件成立为止。
+/// 对账的主循环：直到停机条件成立为止。
 ///
-/// 停机分两级，**在飞的那一轮都不许丢**（丢了 Job 会留在提交中直到租约过期才被回收）：
-/// - `drain_control` 置位 = **排空**：不再领下一轮，手上这一轮跑完；
+/// 停机分两级，**在飞的那一轮都不许丢**（丢了 Job 会留在提交中直到所有权过期才被回收）：
+/// - `drain_control` 置位 = **排空**：不再跑下一轮，手上这一轮跑完；
 /// - `interrupt` 就绪（SIGINT / SIGTERM）= **终止**：同样不打断在飞的那一轮，等它跑完再退。
 ///
-/// 领任务与"等停机"**同时**推进：停机请求不必等到某一轮结束才被看见，而停机一旦成立也不再领
-/// 下一轮——手上那一轮仍旧完整跑完（`select!` 只让停机**先被看见**，取消的是"再领一轮"，
-/// 不是那次上游调用）。
+/// 对账一轮与"等停机"**同时**推进：停机请求不必等到某一轮结束才被看见，而停机一旦成立也不再跑
+/// 下一轮——手上那一轮仍旧完整跑完（`select!` 只让停机**先被看见**，取消的是"再跑一轮"，
+/// 不是那一轮里已经发出的那次上游查询）。
 ///
 /// 停机输入当参数传进来，是为了让这条合同能在测试里**确定地**验：真信号没法在进程内精确投递，
 /// 而"什么时候停、停的时候在飞的那一轮怎么办"与信号从哪来无关。
 async fn run_until_shutdown(
-    worker: &WorkerService,
     reconciliation: Option<&ExecutionReconciliationService>,
     mut signals: ShutdownSignals,
     poll_interval: Duration,
-) -> Result<()> {
+) {
     let mut interrupted = false;
     loop {
         // 已经在排空、或已经收到终止信号：一轮都不再领。
         if interrupted || *signals.drain_control.borrow_and_update() {
             info!("worker stopped");
-            return Ok(());
+            return;
         }
-        let iteration = run_round(worker, reconciliation);
+        let iteration = run_round(reconciliation);
         tokio::pin!(iteration);
         let mut draining = false;
         let handled = loop {
@@ -277,18 +251,12 @@ async fn run_until_shutdown(
                 result = &mut iteration => break result,
             }
         };
-        let idle = match handled {
-            Ok(handled) => !handled,
-            Err(error) => {
-                error!(error = %error, "worker iteration failed");
-                true
-            }
-        };
+        let idle = !handled;
         // 跑完先看要不要停，再谈退避：退避是"没活干、也没人要求停"时的事，排在停机判定之前
         // 会让一次停机白等一个退避周期（运维取值可以是分钟级）。
         if draining || interrupted || *signals.drain_control.borrow_and_update() {
             info!("worker stopped");
-            return Ok(());
+            return;
         }
         if idle {
             tokio::time::sleep(poll_interval).await;

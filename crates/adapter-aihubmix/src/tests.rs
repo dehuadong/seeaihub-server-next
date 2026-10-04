@@ -31,6 +31,8 @@ fn a_different_transport_policy_gets_its_own_client() {
 struct FakeContext {
     deadline: Deadline,
     cancelled: bool,
+    /// 取消恰好落在生成发送闸口：`is_cancelled()` 仍为 false，但最后资格检查失败。
+    gate_closed: bool,
 }
 
 impl FakeContext {
@@ -38,6 +40,7 @@ impl FakeContext {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
             cancelled: false,
+            gate_closed: false,
         }
     }
 
@@ -45,6 +48,16 @@ impl FakeContext {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
             cancelled: true,
+            gate_closed: false,
+        }
+    }
+
+    /// 取消落在最后一道闸：前面的取消检查都通过，但生成发送必须被拦下。
+    fn gate_closed() -> Self {
+        Self {
+            deadline: Deadline::after(Duration::from_secs(30)),
+            cancelled: false,
+            gate_closed: true,
         }
     }
 
@@ -52,6 +65,7 @@ impl FakeContext {
         Self {
             deadline: Deadline::after(Duration::ZERO),
             cancelled: false,
+            gate_closed: false,
         }
     }
 }
@@ -64,6 +78,10 @@ impl ExecutionContext for FakeContext {
 
     fn is_cancelled(&self) -> bool {
         self.cancelled
+    }
+
+    fn try_begin_generation(&self) -> bool {
+        !self.cancelled && !self.gate_closed
     }
 
     async fn accepted(&self, _handle: AcceptedHandle) -> Result<(), AcceptanceError> {
@@ -922,7 +940,41 @@ async fn a_cancelled_gateway_execution_never_sends() {
     )
     .await
     .expect_err("取消必须停下");
-    assert!(matches!(error, AdapterError::Cancelled), "{error:?}");
+    assert!(
+        matches!(error, AdapterError::CancelledBeforeSend),
+        "发送前的取消必须与接受后的取消区分：{error:?}"
+    );
+}
+
+/// 取消恰好落在最后一道闸：前面的取消检查都通过，发送仍必须被拦下。
+///
+/// 基址上没有服务在听：如果闸口没拦住，这里会先报连接失败而不是 `CancelledBeforeSend`。
+#[tokio::test]
+async fn a_cancellation_at_the_generation_gate_blocks_the_send() {
+    let adapter =
+        AihubmixImageAdapter::new("http://127.0.0.1:1/", Duration::from_secs(10)).expect("config");
+    let input = GatewayInput {
+        provider_model_id: "gpt-image-2.5-flare".to_owned(),
+        branch: ImageBranch::PromptOnly,
+        native_parameters: serde_json::json!({"prompt": "test"}),
+        reference_images: Vec::new(),
+        mask: None,
+        image_sites: ImageSites::default(),
+        cost_currency: "USD".to_owned(),
+    };
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let error = GatewayAdapter::execute(
+        &adapter,
+        Arc::new(input),
+        &FakeContext::gate_closed(),
+        &credential,
+    )
+    .await
+    .expect_err("闸口关闭必须停下");
+    assert!(
+        matches!(error, AdapterError::CancelledBeforeSend),
+        "闸口拒绝必须与传输失败区分：{error:?}"
+    );
 }
 
 /// 总期限已到：生成请求之前停下，报明确的期限错误而不是传输失败。

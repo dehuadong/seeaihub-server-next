@@ -663,24 +663,6 @@ async fn ownership_renewal_extends_only_the_lease_and_conflicts_when_fenced() {
             .await,
         Err(ApplicationError::Conflict(_))
     ));
-    // legacy 记录即使同 id 也不能走 v1 续约。
-    sqlx::query("UPDATE generation.jobs SET state = 'executing', execution_protocol = 'legacy' WHERE id = $1")
-        .bind(job_id.0)
-        .execute(&pool)
-        .await
-        .expect("make it legacy");
-    assert!(matches!(
-        repository
-            .renew_execution_ownership(
-                job_id,
-                "supervisor-a",
-                FencingToken::new(0),
-                ChronoDuration::minutes(5)
-            )
-            .await,
-        Err(ApplicationError::Conflict(_))
-    ));
-
     drop(pool);
     drop(repository);
     drop_isolated_database(&database_name).await;
@@ -792,26 +774,6 @@ async fn takeover_swaps_ownership_and_increments_the_fencing_token() {
         .await
         .expect("renew with the taken token");
 
-    // legacy 记录不被 v1 接管领走。
-    let legacy = admit_one(&repository, &fixture, "legacy-takeover").await;
-    sqlx::query(
-        "UPDATE generation.jobs
-         SET execution_protocol = 'legacy', state = 'executing', lease_expires_at = now() - interval '1 second'
-         WHERE id = $1",
-    )
-    .bind(legacy.0)
-    .execute(&pool)
-    .await
-    .expect("make a legacy executing job");
-    assert!(
-        repository
-            .takeover_expired_executions("worker-2", ChronoDuration::minutes(5), 10, 5)
-            .await
-            .expect("takeover")
-            .is_empty(),
-        "legacy executions are never taken over by v1"
-    );
-
     drop(pool);
     drop(repository);
     drop_isolated_database(&database_name).await;
@@ -874,7 +836,7 @@ async fn concurrent_takeovers_partition_expired_executions_without_overlap_or_lo
     sqlx::query(
         "UPDATE generation.jobs
          SET lease_expires_at = now() - interval '1 second'
-         WHERE execution_protocol = 'v1' AND state = 'executing'",
+         WHERE state = 'executing'",
     )
     .execute(&pool)
     .await
@@ -939,8 +901,7 @@ async fn concurrent_takeovers_partition_expired_executions_without_overlap_or_lo
     // 库里的落定事实：owner 是领走它的一方，token 恰好 +1。
     let rows = sqlx::query(
         "SELECT id, execution_owner, fencing_token
-         FROM generation.jobs
-         WHERE execution_protocol = 'v1'",
+         FROM generation.jobs",
     )
     .fetch_all(&pool)
     .await
@@ -1065,6 +1026,71 @@ async fn reaping_an_unsubmitted_admission_releases_hold_and_channel_slot() {
         .await
         .expect("state");
     assert_eq!(state, "executing");
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 不是标识的句柄不能入库：接受确认失败、Attempt 不落 accepted、原值不写库；
+/// 换成合法句柄重试仍然成功——拒绝不能把这次提交卡死。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_handle_that_is_not_an_identifier_is_refused_at_acceptance() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "bad-handle").await;
+    let started = repository
+        .begin_submission(begin(
+            job_id,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+
+    let acceptance = |handle: &str, trace: &str| RecordAcceptance {
+        job_id,
+        attempt_id: started.attempt_id,
+        execution_owner: "supervisor-a".to_owned(),
+        fencing_token: FencingToken::new(0),
+        provider_task_handle: Some(handle.to_owned()),
+        provider_trace_id: Some(trace.to_owned()),
+    };
+
+    let refused = repository
+        .record_acceptance(acceptance("data:image/png;base64,AAAA", "trace-bad"))
+        .await;
+    assert!(
+        matches!(refused, Err(ApplicationError::Validation(_))),
+        "a non-identifier handle must be refused, got {refused:?}"
+    );
+    let stored: Option<String> =
+        sqlx::query_scalar("SELECT provider_task_handle FROM generation.jobs WHERE id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the stored handle");
+    assert!(
+        stored.is_none(),
+        "the raw value must never reach the database"
+    );
+    let state: String = sqlx::query_scalar("SELECT state FROM generation.attempts WHERE id = $1")
+        .bind(started.attempt_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("the attempt state");
+    assert_ne!(
+        state, "accepted",
+        "a refused acceptance must not mark the attempt accepted"
+    );
+
+    repository
+        .record_acceptance(acceptance("task-good", "trace-good"))
+        .await
+        .expect("a valid handle is still accepted after a refusal");
 
     drop(pool);
     drop(repository);

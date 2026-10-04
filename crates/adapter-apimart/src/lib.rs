@@ -17,12 +17,13 @@ use futures_util::StreamExt;
 use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, AdapterDescriptor,
-    AdapterError, Deadline, DeclaredCost, ExecutionContext, GatewayAdapter, GatewayInput,
-    GeneratedImage, ImageAdapter, ImageValueShape, InputImage, PreparedImageRequest,
-    ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput,
-    ProviderSuccess, QueryAccountingCapability, ResponsePayload, RetrySafety, decode_data_url,
-    ensure_external_call_allowed, external_call_timeout, gateway_passthrough_parameters,
-    is_http_url,
+    AdapterError, Deadline, DeclaredCost, ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES,
+    GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage, ImageAdapter, ImageValueShape,
+    InputImage, PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential,
+    ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTaskHandle, ProviderTaskState,
+    QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
+    decode_data_url, ensure_external_call_allowed, ensure_read_call_allowed, external_call_timeout,
+    gateway_passthrough_parameters, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -39,7 +40,8 @@ use url::Url;
 
 pub const ADAPTER_KEY: &str = "apimart-image-v1";
 
-const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+/// 上游响应正文上限：调用方据此计算一次执行的内存预留。
+pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
 /// 轮询间隔。文档建议 2~5 秒，取偏小值以缩短 Job 驻留时间。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// 单次任务查询的瞬时失败重试次数上限（幂等读才允许重试）。
@@ -87,6 +89,10 @@ impl AdapterFactory for ApimartAdapterFactory {
             // APIMart 的终态另带 `cost`（实扣金额，含渠道侧折扣）：声明"上游给金额"的候选
             // 在这条通路上成立。
             declares_cost: true,
+            byte_limits: GatewayByteLimits {
+                request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
+                provider_response_bytes: MAX_PROVIDER_RESPONSE_BYTES,
+            },
         })
     }
 
@@ -473,7 +479,8 @@ impl ApimartImageAdapter {
         loop {
             let timeout = match context {
                 Some(context) => {
-                    ensure_external_call_allowed(context)?;
+                    // 轮询可能发生在上游已经受理之后：这里的取消不证明未受理。
+                    ensure_read_call_allowed(context)?;
                     external_call_timeout(REQUEST_TIMEOUT, context)
                 }
                 None => REQUEST_TIMEOUT,
@@ -569,8 +576,8 @@ impl ApimartImageAdapter {
                         ProviderFailureKind::Unknown,
                     ));
                 }
-                // 文档两份取值集合不一致（`submitted`/`processing`/`pending`/`in_progress`），
-                // 且可能出现未列出的取值——**未知取值继续轮询，不得当失败**。
+                // 渠道事实里的任务状态是 pending/processing/completed/failed/cancelled；
+                // 出现集合外的取值时不能当失败、更不能当成功，继续按未完成轮询。
                 _ => {
                     tokio::time::sleep(POLL_INTERVAL).await;
                 }
@@ -781,6 +788,9 @@ struct TaskEnvelope {
 
 #[derive(Debug, Deserialize)]
 struct TaskData {
+    /// 上游报告的任务标识：查询结果必须与句柄一致才算可信关联。
+    #[serde(default)]
+    id: Option<String>,
     status: String,
     #[serde(default)]
     result: Option<TaskResult>,
@@ -1446,6 +1456,8 @@ impl ApimartImageAdapter {
     ) -> Result<String, AdapterError> {
         let body = gateway_generation_body(input, resolved)?;
         ensure_external_call_allowed(context)?;
+        // 生成发送的最后资格：与取消线性化。此后到 .send() 之间没有可取消的等待。
+        begin_generation_send(context)?;
         let response = self
             .client
             .post(self.endpoint("v1/images/generations")?)
@@ -1632,8 +1644,18 @@ impl GatewayAdapter for ApimartImageAdapter {
             .map_err(gateway_error)?;
         // 2) A6 barrier：拿到 task id 后先让应用层确认句柄入库，成功之前绝不轮询。
         //    task id 同时是这条通路已知的逐请求对账标识。
+        // 上游受理了，但它给的任务标识必须是有界标识：不是就既不保存原值、也不按它轮询，
+        // 按"已受理但取不到可信标识"转未知对账（Spec 0005 §2、RFC 0018 §6）。
+        let Ok(typed_task_id) = ProviderTaskHandle::parse(task_id.clone()) else {
+            return Err(provider_error(
+                "provider_task_unusable",
+                "the submitted task id is not a bounded identifier".to_owned(),
+                RetrySafety::AcceptanceUnknown,
+                ProviderFailureKind::Unknown,
+            ));
+        };
         let handle = AcceptedHandle {
-            task_id: task_id.clone(),
+            task_id: typed_task_id,
             trace_id: Some(task_id.clone()),
         };
         if let Err(error) = context.accepted(handle.clone()).await {
@@ -1688,16 +1710,38 @@ impl GatewayAdapter for ApimartImageAdapter {
             )
         })?;
         let task = parsed.data;
-        if !matches!(task.status.as_str(), "completed" | "failed" | "cancelled") {
+        // 响应必须自证是这次句柄指向的那个任务：读不到标识、或标识与句柄不一致时整份响应
+        // 都不可信。把它的状态或计量算到已知任务头上，正是"不可信关联"被当成成功结算的入口
+        // （Spec 0005 §5、RFC 0018 §7）。这里不记录上游原值，只把状态降为不可信交给收尾方。
+        if task.id.as_deref() != Some(task_id) {
             return Ok(AccountingQuery {
-                terminal: false,
+                state: ProviderTaskState::Unknown,
+                accounting_facts: None,
+            });
+        }
+        let state = match task.status.as_str() {
+            "completed" => ProviderTaskState::Succeeded,
+            "failed" => ProviderTaskState::Failed,
+            "cancelled" => ProviderTaskState::Cancelled,
+            // 未完成状态按仍在执行处理；其余未列出的取值不能当终态、更不能当成功——
+            // 标成不可信，由收尾方保留占用，按原预算重查或转对账（渠道事实的任务状态只有
+            // pending/processing/completed/failed/cancelled）。
+            "pending" | "processing" => ProviderTaskState::Pending,
+            _ => ProviderTaskState::Unknown,
+        };
+        if matches!(
+            state,
+            ProviderTaskState::Pending | ProviderTaskState::Unknown
+        ) {
+            return Ok(AccountingQuery {
+                state,
                 accounting_facts: None,
             });
         }
         let image_count = u32::try_from(task.image_urls().map(|urls| urls.len()).unwrap_or(0))
             .unwrap_or(u32::MAX);
         Ok(AccountingQuery {
-            terminal: true,
+            state,
             accounting_facts: Some(AccountingFacts {
                 // 终态不一定带得回计量：查询只如实交回拿得到的部分，缺的留空而不是猜。
                 usage: task.usage().ok(),

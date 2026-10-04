@@ -11,16 +11,13 @@
 
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use seeai_domain::{AccountId, GenerationJob, JobId, JobState};
-use std::{
-    num::NonZeroU64,
-    sync::{
-        Arc,
-        atomic::{AtomicU64, Ordering},
-    },
+use seeai_domain::{AccountId, JobId};
+use std::sync::{
+    Arc,
+    atomic::{AtomicU64, Ordering},
 };
 
-use crate::{ApplicationError, AttemptFailure, ProviderFailureKind};
+use crate::{ApplicationError, ProviderFailureKind};
 
 /// 一条外发的平台侧告警：**给定位所需的最小集**，字段名就是它的线上表示。
 ///
@@ -69,20 +66,8 @@ pub struct LedgerMismatchAlert {
 }
 
 impl PlatformAlert {
-    /// 就这一次失败外发的那条告警。时间取**观测到它的时刻**：这是一条外发的运维消息，
-    /// 与库里的业务时刻不是同一件事。
-    #[must_use]
-    pub fn of(job: &GenerationJob, failure_kind: ProviderFailureKind) -> Self {
-        Self::Execution(ExecutionAlert {
-            job_id: job.id,
-            provider_kind: job.offering.provider_kind.clone(),
-            failure_kind,
-            occurred_at: Utc::now(),
-        })
-    }
-
     /// 新协议（v1）执行上的那条告警：没有 [`GenerationJob`]，渠道类别由对账 Worker 从只读
-    /// 投影读到的渠道事实给出。时间同样取**观测到它的时刻**（见 [`Self::of`]）。
+    /// 投影读到的渠道事实给出。时间取**观测到它的时刻**。
     #[must_use]
     pub fn execution(
         job_id: JobId,
@@ -97,7 +82,7 @@ impl PlatformAlert {
         })
     }
 
-    /// 一次账实不符外发的那条告警。时间同样是**观测到它的时刻**（见 [`Self::of`]）。
+    /// 一次账实不符外发的那条告警。时间同样是**观测到它的时刻**。
     #[must_use]
     pub fn ledger_mismatch(
         account_id: AccountId,
@@ -168,18 +153,6 @@ impl PlatformAlert {
     }
 }
 
-/// 这次失败**本身**是不是平台侧事件：第 1、2 个触发条件看的就是它。
-///
-/// 平台欠费 / 凭证类失败用**既有的失败类别**判定，不另立一套类别；对账案例新增看的是终态——
-/// 把 Job 写成 `reconciliation_required` 就是建案的那条路径，与失败类别无关。
-#[must_use]
-pub fn is_platform_event(failure: &AttemptFailure) -> bool {
-    matches!(
-        failure.kind,
-        ProviderFailureKind::PlatformFunding | ProviderFailureKind::PlatformCredential
-    ) || failure.target_state == JobState::ReconciliationRequired
-}
-
 /// 告警的发送端口。
 ///
 /// 返回 `Err` 表示**这一次没送出去**。实现方可以有界重试，但失败不必吞掉——收口在
@@ -236,41 +209,6 @@ impl PlatformAlerter {
             delivered: self.delivered.load(Ordering::Relaxed),
             failed: self.failed.load(Ordering::Relaxed),
         }
-    }
-}
-
-/// Worker 上的告警出口：**配了才有**。
-///
-/// 没配时调用点连"这个候选连续失败了几次"都不去读——那是告警才需要的判据，为它每次都查一次库
-/// 等于让一条旁路给主流程加成本。
-pub struct PlatformAlertExit {
-    alerter: Arc<PlatformAlerter>,
-    consecutive_failures: NonZeroU64,
-}
-
-impl PlatformAlertExit {
-    #[must_use]
-    pub fn new(alerter: Arc<PlatformAlerter>, consecutive_failures: NonZeroU64) -> Self {
-        Self {
-            alerter,
-            consecutive_failures,
-        }
-    }
-
-    /// 数连续失败时往回看多少次：阈值是 N，就只需要看最近 N 次终态。
-    #[must_use]
-    pub fn window(&self) -> u32 {
-        u32::try_from(self.consecutive_failures.get()).unwrap_or(u32::MAX)
-    }
-
-    /// 某候选连续失败到这个次数才外发。它是**配置项**，不是常量。
-    #[must_use]
-    pub fn threshold(&self) -> u64 {
-        self.consecutive_failures.get()
-    }
-
-    pub async fn notify(&self, alert: PlatformAlert) {
-        self.alerter.notify(alert).await;
     }
 }
 

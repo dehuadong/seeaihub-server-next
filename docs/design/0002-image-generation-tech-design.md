@@ -34,7 +34,7 @@ Provider 与 Vendor 不合并：以后其他 Provider 也供应 `gpt-image-2` �
 
 ## 3. 统一应用命令与生命周期
 
-文生图、图生图以及厂商支持时的 mask 编辑是同一个图片生成业务能力的不同输入分支，共用一个 Command、Job、Attempt、Evidence 和结算流程。决策依据见 `docs/adr/0001-unified-image-generation-command.md`。
+文生图、图生图以及厂商支持时的 mask 编辑是同一个图片生成业务能力的不同输入分支，共用一个接收入口 `CreateImageGenerationRequest`、内部 Job/Attempt 记录、Evidence 与结算流程。决策依据见 `docs/adr/0001-unified-image-generation-command.md`。
 
 ```text
 CreateImageGenerationRequest {        // 调用方看到的形状（对客接口）
@@ -44,16 +44,9 @@ CreateImageGenerationRequest {        // 调用方看到的形状（对客接口
   mask,                              // 可选；PNG data URL
   // 幂等键走 `Idempotency-Key` 请求头；预授权额由服务端定，调用方不报
 }
-
-CreateImageGeneration {               // 落库与 Worker 看到的形状（已落到某个候选的装载面）
-  gateway_model,                     // 库里这一列装的也是平台型号名；三方命名的收口另做
-  native_parameters,                  // 同上，但图片已按该候选声明映射成具体参数名
-  idempotency_key,
-  max_cost_microusd,                  // 服务端按固定数给的预授权额
-}
 ```
 
-两者的换算就是 Offering Parameter Mapping 的起点：调用方只给 `image` / `mask`，平台按选中候选声明的参数面决定装到 `/image`、`/image_urls/0` 还是 `/mask_url`；候选表达不了就是不合格，选路据此判定。图片**只是参数值**——平台不持有字节、不给它独立身份，因此没有"资产绑定"这一层（`docs/adr/0019`）。
+调用方给的图到候选装载面的换算就是 Offering Parameter Mapping 的起点：调用方只给 `image` / `mask`，平台按选中候选声明的参数面在**内存里**决定装到 `/image`、`/image_urls/0` 还是 `/mask_url`；候选表达不了就是不合格，选路据此判定。图片**只是参数值**——平台不持有字节、不给它独立身份，因此没有"资产绑定"这一层（`docs/adr/0019`）。
 
 请求分支判定（发布期/请求期派生结果，不是客户端字段）：
 
@@ -67,12 +60,12 @@ CreateImageGeneration {               // 落库与 Worker 看到的形状（已�
 Job 状态机（所有分支共用）：
 
 ```text
-accepted → leased → submitting → submitted/running → succeeded
-                                      ├→ failed
-                                      └→ reconciliation_required
+admitted → executing → succeeded
+                    ├→ failed
+                    └→ reconciliation_required
 ```
 
-Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、Native Parameters 摘要与 Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
+没有领取阶段：执行由发起这次请求的 API 进程直接持有并完成。Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、请求指纹与幂等摘要、Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
 HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations`（JSON）与 `/v1/images/edits`（`multipart/form-data`，`image`/`mask` 是文件部件）。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。multipart 上 `image`/`mask` 既可以是文件部件（字节只在内存里转成 data URL 语义），也可以是文本部件（值按 URL/data URL 读）——两者同一套语义，但同一个字段不能既当文件又当文本。
 
@@ -82,23 +75,23 @@ HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能�
 
 ```text
 平台调用方
-  → CreateImageGeneration
-  → 持久 Generation Job
+  → CreateImageGenerationRequest
+  → DirectExecutionService 直接执行：短事务受理最小 Job + Hold + 渠道槽位，载荷只在内存
   → AIHubMix Adapter
        ├─ 无 image/images → POST /v1/images/generations
        └─ 有 image/images → POST /v1/images/edits
                               └─ mask 可选
   → 上游给的 url / b64_json 原样成为结果信封
   → usage → MeteringEvidence
-  → Price Snapshot 结算
+  → settle 按冻结的 Price Snapshot 结算
 ```
 
 结论：
 
-- 平台应用层仍只有一个 Command、一个 Job 和一个结算流程；
+- 平台应用层仍只有一个接收入口、一个 Job 和一个结算流程；
 - 文生图/图生图判定仍来自原生图片参数，不新增平台 `operation` 字段；
 - `generations`/`edits` 的 endpoint 与 JSON/multipart 差异只存在于 Adapter；
-- Job 的推进仍是后台的（Worker 领活、租约与心跳），但**对客没有异步形态**：调用方在一次请求里等结果；
+- Job 的推进就在这次请求里完成（短事务 + 内存执行，所有权用租约续约），**对客也没有异步形态**：调用方在一次请求里等结果；
 - 以后是否增加同步等待型公开 API，不影响这个执行模型。
 
 这正好落实「`image.generations.sync.v1` 与 task 协议不应成为领域拆分，生命周期差异由 Adapter 处理」的方向。决策依据见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
@@ -136,15 +129,15 @@ attempt_id
 
 Adapter 从 `/v1` 成功响应提取这些字段；结算模块只读取强类型 Evidence 和 Job 固化的 Price Snapshot。价格仍是运行时配置，当前公开候选为文本输入 `$5/M`、图片输入 `$8/M`、图片输出 `$30/M`。
 
-响应字段与总量必须满足内部一致性校验；缺字段、负数、总量不一致或响应解析失败时，不得猜测费用，进入对账。结果**不再解码归档**：上游给什么形态就存什么形态（`url` 或 `b64_json`），随后把 Job 标为成功。结算门槛见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
+响应字段与总量必须满足内部一致性校验；缺字段、负数、总量不一致或响应解析失败时，不得猜测费用，进入对账。结果**不解码、不归档**：上游给什么形态就回什么形态（`url` 或 `b64_json`），结算后把 Job 标为成功。结算门槛见 `docs/adr/0006-no-settlement-without-metering-evidence.md`。
 
 ## 7. 同步 Provider 调用的可靠性边界
 
-AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务列表，因此从请求发出到完整响应落库之间存在「上游可能已生成、平台却没有结果」的不确定窗口。首期明确接受这一 Provider 限制，并采用失败关闭策略：
+AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务列表，因此从请求发出到完整结果交付之间存在「上游可能已生成、平台却没有结果」的不确定窗口。首期明确接受这一 Provider 限制，并采用失败关闭策略：
 
-- 本地幂等键和数据库唯一约束保证一个 Job 只建立一个 Attempt；
-- Worker 提交前写入 `submitting` 并持续维护租约，通用重试器不得重放 Provider POST；
-- 明确的连接前失败可以重试；请求可能已发出、响应超时、连接中断、进程崩溃或解析失败，全部进入 `reconciliation_required`；
+- 幂等键摘要的唯一约束保证同键只受理出一个 Job；同一 Job 内每次提交建一行 Attempt（`attempt_no` 递增）；
+- 提交前先持久化 `submitting` 提交声明并持续维护租约，任何重试都不得重放 Provider POST；
+- 可证明未受理的连接前失败可以在同一请求内重投；请求可能已发出、响应超时、连接中断、进程崩溃或解析失败，全部进入 `reconciliation_required`；
 - 不自动切换 Channel/Offering，不重新生成；
 - 人工通过 AIHubMix 账单/支持渠道核查，不能恢复结果时按运营规则退款或释放预授权；
 - 监控该类事件率。如果实际故障率不可接受，再评估 Provider 账单 API、幂等能力或 `/ai/v1` usage，而不是削弱安全规则。
@@ -185,11 +178,11 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 
 ## 12. 验收条件
 
-- 无图和有图请求进入同一 Command/Job，Adapter 分别调用 generations/edits；
+- 无图和有图请求进入同一接收入口与 Job，Adapter 分别调用 generations/edits；
 - 两条成功响应均能生成强类型 token Evidence，并按相同 Price Snapshot 机制结算；
-- Worker 可以安全承载长时间同步调用，客户端连接不等待 Provider；
+- 执行在应用层持有总期限 `D`，等待 Provider 期间不占用数据库连接；
 - 进程在提交中断开后 Job 进入 reconciliation，不发生第二次 Provider POST；
-- 结果信封（`url` 或 `b64_json`）写回 Job 后才完成 Job；平台不归档字节，`b64_json` 会原样出现在对客响应里；
+- 结果按渠道原形（`url` 或 `b64_json`）回到对客响应；平台不归档字节，也不把图片写进任何记录；
 - 首期 Offering 拒绝未经发布的多图和冲突参数；
 - 新模型、Schema、Offering 和 Price Plan 仍通过 Runtime Revision 动态发布，不重编译数据面；
 - 没有可核验 Metering Evidence 时禁止正式结算发布。

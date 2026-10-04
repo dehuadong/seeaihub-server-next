@@ -1,5 +1,11 @@
 use super::*;
 
+/// 占用是**同一次请求内**的中间态：上游压这么久，用例才有窗口观察到 `active` 的预授权。
+const SLOW_UPSTREAM_MS: u64 = 3_000;
+
+/// 对客同步窗口：要盖住上面那段上游延迟与结算预留，否则请求会先被总期限收成 504。
+const SLOW_SYNC_WAIT_SECONDS: u64 = 30;
+
 /// 账户读必须同时给出三项，且 `available = balance − held`（账户资金 Spec `0002` §4、A7）。
 fn assert_account_triplet(what: &str, body: &Value, balance: i64, held: i64) {
     assert_eq!(
@@ -43,9 +49,9 @@ async fn wait_for_active_hold(harness: &Harness, key: &str) -> Uuid {
         let job: Option<Uuid> = sqlx::query_scalar(
             "SELECT j.id FROM generation.jobs j
              JOIN ledger.holds h ON h.job_id = j.id AND h.status = 'active'
-             WHERE j.idempotency_key = $1",
+             WHERE j.idempotency_key_digest = $1",
         )
-        .bind(key)
+        .bind(idempotency_key_digest(key))
         .fetch_optional(&harness.pool)
         .await
         .expect("active hold lookup");
@@ -94,11 +100,15 @@ async fn accept_without_worker(
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn account_reads_return_settled_balance_held_and_available_together() {
+    // 直接执行里预授权是**同一次请求内**的中间态：上游慢下来，占用才有可观察的窗口。
     let harness = Harness::start_with_sync_wait(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        UpstreamBehaviour {
+            delay_ms: SLOW_UPSTREAM_MS,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         64,
-        2,
+        SLOW_SYNC_WAIT_SECONDS,
     )
     .await;
     let client = Client::new();
@@ -191,11 +201,15 @@ async fn account_reads_return_settled_balance_held_and_available_together() {
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() {
+    // 直接执行里预授权是**同一次请求内**的中间态：上游慢下来，占用才有可观察的窗口。
     let harness = Harness::start_with_sync_wait(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        UpstreamBehaviour {
+            delay_ms: SLOW_UPSTREAM_MS,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         64,
-        5,
+        SLOW_SYNC_WAIT_SECONDS,
     )
     .await;
     let client = Client::new();
@@ -257,11 +271,8 @@ async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() 
     assert_eq!(jobs, 1, "第二笔没有建 Job");
 
     let (first_status, first_body) = first.await.expect("first request");
-    assert_eq!(
-        first_status,
-        StatusCode::GATEWAY_TIMEOUT,
-        "第一笔受理后等不到 Worker：{first_body}"
-    );
+    assert_eq!(first_status, StatusCode::OK, "第一笔自己跑完：{first_body}");
+    assert_sync_success("慢上游上的第一笔", &first_body);
     harness.cleanup().await;
 }
 
@@ -272,11 +283,15 @@ async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() 
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_replayed_idempotency_key_does_not_reserve_again() {
+    // 直接执行里预授权是**同一次请求内**的中间态：上游慢下来，占用才有可观察的窗口。
     let harness = Harness::start_with_sync_wait(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        UpstreamBehaviour {
+            delay_ms: SLOW_UPSTREAM_MS,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         64,
-        2,
+        SLOW_SYNC_WAIT_SECONDS,
     )
     .await;
     let client = Client::new();
@@ -367,7 +382,6 @@ async fn a_settlement_with_zero_charge_writes_no_capture_entry() {
     );
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000).await;
-    let _worker = harness.spawn_worker();
     let key = format!("funds-zero-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,
@@ -379,7 +393,7 @@ async fn a_settlement_with_zero_charge_writes_no_capture_entry() {
     .await;
     assert_eq!(status, StatusCode::OK, "零实收不影响这次请求成功：{body}");
     assert_sync_success("零实收结算", &body);
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "结算要走到成功终态");
 
     let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM ledger.entries WHERE job_id = $1")
@@ -439,7 +453,6 @@ async fn a_charge_below_the_authorized_hold_only_restores_available_without_a_re
     );
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let _worker = harness.spawn_worker();
     let key = format!("funds-under-hold-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "charge below hold");
     request["size"] = json!("2K");
@@ -453,7 +466,7 @@ async fn a_charge_below_the_authorized_hold_only_restores_available_without_a_re
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
 
     let hold: i64 =

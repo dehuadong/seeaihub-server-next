@@ -75,7 +75,7 @@ async fn settle_one_generation(harness: &Harness, api_key: &str, prompt: &str) -
     )
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
+    let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "这一笔必须跑到终态");
     sqlx::query_scalar(
         "SELECT COALESCE(SUM(amount_microusd), 0)::bigint FROM ledger.entries
@@ -113,7 +113,6 @@ async fn completed_usage_pages_by_cursor_without_gaps_or_repeats() {
     let session =
         customer_session(&client, &harness, "history-usage@example.com", &account_id).await;
 
-    let _worker = harness.spawn_worker();
     for prompt in ["first", "second", "third"] {
         settle_one_generation(&harness, &api_key, prompt).await;
     }
@@ -243,7 +242,6 @@ async fn ledger_pages_by_cursor_and_filters_by_kind() {
         .expect("admin credit");
     assert!(credited.status().is_success(), "{}", credited.status());
 
-    let _worker = harness.spawn_worker();
     settle_one_generation(&harness, &api_key, "ledger first").await;
     settle_one_generation(&harness, &api_key, "ledger second").await;
 
@@ -339,7 +337,6 @@ async fn a_cursor_from_another_query_or_account_is_rejected() {
     let second =
         customer_session(&client, &harness, "history-b@example.com", &second_account).await;
 
-    let _worker = harness.spawn_worker();
     for prompt in ["a first", "a second"] {
         settle_one_generation(&harness, &first_key, prompt).await;
     }
@@ -435,7 +432,6 @@ async fn the_window_lower_bound_counts_in_both_detail_and_summary() {
     let session =
         customer_session(&client, &harness, "history-edge@example.com", &account_id).await;
 
-    let _worker = harness.spawn_worker();
     let charged = settle_one_generation(&harness, &api_key, "edge").await;
     assert!(charged < 0, "扣费是负数：{charged}");
 
@@ -537,7 +533,6 @@ async fn completed_usage_is_attributed_to_the_terminal_day() {
     )
     .await;
 
-    let _worker = harness.spawn_worker();
     settle_one_generation(&harness, &api_key, "cross day").await;
 
     // 把这一笔的终态时刻挪到**昨天**：受理时刻不动，所以它只可能出现在按终态时刻取的区间里。
@@ -606,7 +601,6 @@ async fn finished_requests_page_within_a_pinned_window() {
     let session =
         customer_session(&client, &harness, "history-window@example.com", &account_id).await;
 
-    let _worker = harness.spawn_worker();
     for prompt in ["window first", "window second", "window third"] {
         settle_one_generation(&harness, &api_key, prompt).await;
     }

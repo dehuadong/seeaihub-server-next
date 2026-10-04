@@ -10,13 +10,16 @@ mod execution_protocol;
 mod image_parameters;
 mod parameter_mapping;
 mod size_spec;
-pub use execution_protocol::{AttemptStage, ExecutionProtocol, ExecutionStage, FencingToken};
+pub use execution_protocol::{
+    AttemptStage, ExecutionStage, FencingToken, MAX_PROVIDER_IDENTIFIER_BYTES, ProviderTaskState,
+    is_bounded_provider_identifier,
+};
 pub use image_parameters::{
     ImageInputs, ImageParameterKind, contract_image_parameter_kind, declared_parameter_names,
     declared_reference_image_limit, declares_mask_parameter, declares_reference_image_parameter,
     image_inputs, image_parameter_kind, image_parameter_values, is_mask_parameter,
     is_reference_image_parameter, mask_value, place_image_inputs, platform_image_parameter,
-    platform_image_parameters, take_contract_image_inputs,
+    platform_image_parameters, take_contract_image_inputs, validate_image_inputs,
 };
 pub use parameter_mapping::{
     ParameterEnumMaps, ParameterRenames, SizeMapping, apply_enum_maps, apply_parameter_defaults,
@@ -125,19 +128,6 @@ impl Display for JobState {
         };
         formatter.write_str(value)
     }
-}
-
-/// 一次图片生成的受理结果（落库前的形态）。
-///
-/// 图片输入已经在 `native_parameters` 里**落到被选中候选自己的参数名上**：受理期把调用方给的
-/// 参考图与遮罩换算成该候选声明的字段，此后平台不再有资产引用，Worker 与 Driver 只看这一份。
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct CreateImageGeneration {
-    pub account_id: AccountId,
-    pub gateway_model: String,
-    pub native_parameters: Value,
-    pub idempotency_key: String,
-    pub max_cost_microusd: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -1258,22 +1248,6 @@ pub fn replace_contract_model_identity(contract: &mut Value, model: &str) {
     if let Some(slot) = contract.pointer_mut(CONTRACT_MODEL_POINTER) {
         *slot = Value::String(model.to_owned());
     }
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct GenerationJob {
-    pub id: JobId,
-    pub account_id: AccountId,
-    pub state: JobState,
-    pub branch: ImageBranch,
-    pub gateway_model: String,
-    pub native_parameters: Value,
-    pub offering: PublishedOffering,
-    pub idempotency_key: String,
-    pub request_hash: String,
-    pub max_cost_microusd: u64,
-    pub created_at: DateTime<Utc>,
-    pub updated_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Error, Clone, PartialEq, Eq)]

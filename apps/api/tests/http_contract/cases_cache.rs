@@ -189,12 +189,16 @@ async fn the_ledger_view_and_the_consumer_account_read_the_database_not_the_cach
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn cache_write_through_makes_the_balance_visible_after_every_write() {
+    // 预授权是同一次请求内的中间态：上游慢下来，占用才有可观察的窗口。
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        UpstreamBehaviour {
+            delay_ms: 3_000,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         64,
-        1,
+        30,
         CacheFixture::start(CacheSettings::default()).await,
     )
     .await;
@@ -235,22 +239,36 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         "缓存里的值与数据库逐位一致"
     );
 
-    // ② 受理（预授权扣减）：不跑 Worker，同步入口 1 秒后超时；Job 已受理、保底额已扣。
+    // ② 受理（预授权扣减）：这一次执行还在飞（上游慢），预授权已经占着、余额还没被结算动过。
     let key = format!("cache-hold-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "cache contract");
     request["size"] = json!("2K");
     request["quality"] = json!("low");
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &key,
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
-    let (job_id, state, _) = harness.job(&key).await;
-    assert_eq!(state, "accepted");
+    let in_flight = tokio::spawn({
+        let base_url = harness.base_url.clone();
+        let api_key = api_key.clone();
+        let key = key.clone();
+        let body = request.clone();
+        async move { post_json(&base_url, &api_key, "/v1/images/generations", &key, &body).await }
+    });
+    let mut job_id = None;
+    for _ in 0..200 {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT j.id FROM generation.jobs j
+             JOIN ledger.holds h ON h.job_id = j.id AND h.status = 'active'
+             WHERE j.idempotency_key_digest = $1",
+        )
+        .bind(idempotency_key_digest(&key))
+        .fetch_optional(&harness.pool)
+        .await
+        .expect("active hold lookup");
+        if let Some(id) = found {
+            job_id = Some(id);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    let job_id = job_id.expect("受理之后必须看得到 active 的预授权");
     let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
     assert_eq!(
         cached["balance_microusd"],
@@ -277,26 +295,12 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         "受理把版本推进到数据库那一行：{cached}"
     );
 
-    // route 缓存也建起来了，且带着**当前生效修订**的标识。
-    let cached_route = harness
-        .cache()
-        .route(harness.model)
-        .expect("受理之后 route 缓存必须建起来");
-    let effective: Uuid =
-        sqlx::query_scalar("SELECT runtime_revision_id FROM generation.jobs WHERE id = $1")
-            .bind(job_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("job revision");
-    assert_eq!(
-        cached_route["runtime_revision_id"],
-        json!(effective.to_string()),
-        "route 缓存带的是写它那次发布的修订标识"
-    );
-
-    // ③ 结算：起 Worker 把同一个 Job 跑完，缓存变成实收之后的余额。
-    let _worker = harness.spawn_worker();
-    wait_for_job_state(&harness, &key, "succeeded").await;
+    // ③ 结算：这一次请求自己跑完，缓存变成实收之后的余额。
+    let (status, body) = in_flight.await.expect("the in-flight request");
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let (_, state) = harness.job(&key).await;
+    assert_eq!(state, "succeeded");
+    let _ = job_id;
     let settled = database_balance(&harness, &account_id).await;
     assert_eq!(settled, 1_000_000 - 43_680, "实收按对客费率向量算");
     let cached = harness.cache().balance(&account_id).expect("结算之后缓存");
@@ -363,7 +367,6 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
             assert!(cache.balance(&account_id).is_some());
             cache.stop();
         }
-        let _worker = harness.spawn_worker();
         let key = format!("cache-down-{}", Uuid::new_v4());
         let mut request = route_request(harness.model, "cache down contract");
         request["size"] = json!("2K");
@@ -377,7 +380,7 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
         )
         .await;
         assert_eq!(status, StatusCode::OK, "got {body}");
-        let (job_id, state, _) = harness.job(&key).await;
+        let (job_id, state) = harness.job(&key).await;
         let captured = harness.captured_microusd(job_id).await;
         let balance = database_balance(&harness, &account_id).await;
         let shape = comparable_response(&body);
@@ -393,112 +396,6 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
     );
     assert_eq!(with_cache.0, -43_680, "实收按对客费率向量算");
     assert_eq!(with_cache.1, 1_000_000 - 43_680);
-}
-
-/// **route 缓存陈旧不可用**：发布新修订之后让失效失败（或手工把值里的修订标识改旧）→ 受理
-/// **回源数据库**读到新候选集，选路与定价都用新修订那一份。
-///
-/// 这条验的是"陈旧可检"：正确性不依赖"发布后的失效一定成功"。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_stale_route_cache_falls_back_to_the_database() {
-    let harness = Harness::start_with_cache(
-        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
-        64,
-        30,
-        CacheFixture::start(CacheSettings::default()).await,
-    )
-    .await;
-    let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
-    let (_, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-
-    // 先受理一次，把 route 缓存写起来（带着第一版修订的标识）。
-    let first_key = format!("cache-route-{}", Uuid::new_v4());
-    let mut request = route_request(harness.model, "route cache contract");
-    request["size"] = json!("2K");
-    request["quality"] = json!("low");
-    let _worker = harness.spawn_worker();
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &first_key,
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    let stale = harness.cache().route(harness.model).expect("route 缓存");
-    assert_eq!(
-        frozen_snapshot(&harness.pool, &first_key).await["consumer_rates_cny"],
-        priced_consumer_rates()
-    );
-
-    // 换一份对客费率重发修订，并让**失效失败**：缓存里留着的还是第一版那份候选集。
-    harness.cache().set_fail_writes(true);
-    let mut higher = priced_consumer_rates();
-    higher["image_output_micros_per_million"] = json!(440_000_000);
-    assert_eq!(
-        publish_cache_priced(&harness, higher.clone()).await,
-        StatusCode::OK
-    );
-    harness.cache().set_fail_writes(false);
-    assert_eq!(
-        harness.cache().route(harness.model).expect("旧值还在"),
-        stale,
-        "失效失败了，缓存里留着的还是旧值（这正是要检出的情形）"
-    );
-
-    // 再受理一次：修订标识对不上 ⇒ 回源数据库，用新修订的定价。
-    let second_key = format!("cache-route-next-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &second_key,
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_eq!(
-        frozen_snapshot(&harness.pool, &second_key).await["consumer_rates_cny"],
-        higher,
-        "陈旧缓存必须回源，用新修订那一份定价"
-    );
-    assert_ne!(
-        harness.cache().route(harness.model).expect("重建后的缓存"),
-        stale,
-        "回源之后缓存被重建成新修订那一份"
-    );
-
-    // 第二种陈旧形态：手工把值里的修订标识改旧，结果同样回源。
-    let mut forged = harness.cache().route(harness.model).expect("缓存");
-    forged["runtime_revision_id"] = json!(Uuid::new_v4().to_string());
-    harness
-        .cache()
-        .put(&format!("route:{}", harness.model), &forged);
-    let third_key = format!("cache-route-forged-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &third_key,
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_eq!(
-        frozen_snapshot(&harness.pool, &third_key).await["consumer_rates_cny"],
-        higher
-    );
-
-    harness.cleanup().await;
 }
 
 /// **陈旧缓存不得拒绝**：缓存里的余额偏低，且超出新鲜窗口（或来源是对账写回）→ 不提示、不拒绝，
@@ -530,7 +427,6 @@ async fn a_stale_balance_entry_never_rejects() {
     harness
         .cache()
         .corrupt_balance(&account_id, 1, "reconciler", written_at);
-    let _worker = harness.spawn_worker();
     let mut request = route_request(harness.model, "stale cache contract");
     request["size"] = json!("2K");
     request["quality"] = json!("low");
@@ -606,7 +502,6 @@ async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
         .cache()
         .corrupt_balance(&account_id, 1, "db_commit", written_at);
 
-    let _worker = harness.spawn_worker();
     let key = format!("cache-short-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "fresh cache shortfall");
     request["size"] = json!("2K");
@@ -688,12 +583,13 @@ async fn a_cache_that_says_there_is_enough_still_lets_the_database_refuse() {
         "数据库条件更新确认不足：{body}"
     );
     assert_eq!(body["error"]["code"], json!("insufficient_balance"));
-    let jobs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(&key)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("job count");
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.jobs WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(&key))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job count");
     assert_eq!(jobs, 0, "被拒的受理不建 Job");
     assert_eq!(
         database_balance(&harness, &account_id).await,
@@ -781,9 +677,12 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        UpstreamBehaviour {
+            delay_ms: 3_000,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         64,
-        1,
+        30,
         CacheFixture::start(settings).await,
     )
     .await;
@@ -800,16 +699,33 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
     let mut request = route_request(harness.model, "replay contract");
     request["size"] = json!("2K");
     request["quality"] = json!("low");
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &key,
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::GATEWAY_TIMEOUT, "got {body}");
-    // 新口径下受理**不改变已结算余额**（占用记在 `held`），所以缓存里仍是 300000。
+    // 第一笔在飞（上游慢）：预授权已经占着，重放要在这个窗口里发生。
+    let first = tokio::spawn({
+        let base_url = harness.base_url.clone();
+        let api_key = api_key.clone();
+        let key = key.clone();
+        let body = request.clone();
+        async move { post_json(&base_url, &api_key, "/v1/images/generations", &key, &body).await }
+    });
+    let mut in_flight = false;
+    for _ in 0..200 {
+        let found: Option<Uuid> = sqlx::query_scalar(
+            "SELECT j.id FROM generation.jobs j
+             JOIN ledger.holds h ON h.job_id = j.id AND h.status = 'active'
+             WHERE j.idempotency_key_digest = $1",
+        )
+        .bind(idempotency_key_digest(&key))
+        .fetch_optional(&harness.pool)
+        .await
+        .expect("active hold lookup");
+        if found.is_some() {
+            in_flight = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
+    }
+    assert!(in_flight, "第一笔必须在飞，重放才有意义");
+    // 受理**不改变已结算余额**（占用记在 `held`），所以缓存里仍是 300000。
     let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
     assert_eq!(
         cached["balance_microusd"],
@@ -821,7 +737,7 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
         .cache()
         .corrupt_balance(&account_id, 1, "db_commit", cached["written_at"].clone());
 
-    // 同一个键立刻重发：去重成原来那个 Job，不因为缓存说"不够"而被拒。
+    // 同一个键立刻重发：它命中原记录、不重新占用，所以不因为缓存说"不够"而被拒（也不是 402）。
     let (status, body) = post_json(
         &harness.base_url,
         &api_key,
@@ -830,16 +746,21 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
         &request,
     )
     .await;
-    assert_eq!(
+    assert_ne!(
         status,
-        StatusCode::GATEWAY_TIMEOUT,
+        StatusCode::PAYMENT_REQUIRED,
         "重放不得被预检拒：{body}"
     );
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "原记录还在执行，重放回 request_in_progress：{body}"
+    );
     let jobs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM generation.jobs WHERE account_id = $1 AND idempotency_key = $2",
+        "SELECT count(*) FROM generation.jobs WHERE account_id = $1 AND idempotency_key_digest = $2",
     )
     .bind(Uuid::parse_str(&account_id).expect("account id"))
-    .bind(&key)
+    .bind(idempotency_key_digest(&key))
     .fetch_one(&harness.pool)
     .await
     .expect("job count");
@@ -856,6 +777,7 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
         "重放没有发生凭缓存的拒绝"
     );
 
+    first.abort();
     harness.cleanup().await;
 }
 
@@ -884,8 +806,7 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
 
-    // 先受理一次把 route 缓存写起来，再把余额与候选集都改错。
-    let _worker = harness.spawn_worker();
+    // 跑一次受理与结算，再把缓存里的余额改错。
     let key = format!("cache-reconcile-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "reconcile contract");
     request["size"] = json!("2K");
@@ -904,12 +825,6 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     harness
         .cache()
         .corrupt_balance(&account_id, 1, "db_commit", fresh["written_at"].clone());
-    let mut forged_route = harness.cache().route(harness.model).expect("route 缓存");
-    forged_route["runtime_revision_id"] = json!(Uuid::new_v4().to_string());
-    harness
-        .cache()
-        .put(&format!("route:{}", harness.model), &forged_route);
-
     let corrected = harness
         .cache()
         .wait_for_balance(&account_id, settled)
@@ -922,18 +837,6 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     );
     assert_eq!(corrected["balance_microusd"], json!(settled));
 
-    // 候选集那条：对账校正它以当前生效修订为准（这里直接把它拿掉，下一次受理回源重建）。
-    for _ in 0..200 {
-        if harness.cache().route(harness.model).is_none() {
-            break;
-        }
-        tokio::time::sleep(Duration::from_millis(50)).await;
-    }
-    assert!(
-        harness.cache().route(harness.model).is_none(),
-        "对账必须把陈旧候选集拿掉"
-    );
-
     let balance_events = audit_events(&harness, "cache.balance_corrected").await;
     assert!(
         !balance_events.is_empty(),
@@ -944,237 +847,7 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
         balance_events[0]["database_balance_microusd"],
         json!(settled)
     );
-    assert!(
-        !audit_events(&harness, "cache.route_invalidated")
-            .await
-            .is_empty(),
-        "候选集被校正也要留审计"
-    );
-
     harness.cleanup().await;
-}
-
-/// **停用立刻生效，且不依赖那次失效**：route 缓存里留着"停用前"那份候选集（修订标识也没变，
-/// 下一次受理照样命中它），停用的那条照样取不到。
-///
-/// 两条候选（优先级 0 的 AIHubMix、优先级 1 的 APIMart）：停用前者的**供给**之后必须落到后者；
-/// 再停掉后者的**渠道**，两条就全不合格，对客是 503 平台侧故障——不是"模型不存在"（缓存里那份
-/// 候选集还列着它们）。全程不跑 Worker：选路发生在调用上游之前，结论从判定记录读，零外部调用。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_disabled_offering_is_not_routed_to_while_the_route_cache_still_lists_it() {
-    let harness = Harness::start_with_cache(
-        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
-        64,
-        1,
-        CacheFixture::start(CacheSettings::default()).await,
-    )
-    .await;
-    let client = Client::new();
-    // 地址都指向夹具那台假上游；这次不跑 Worker，所以没有任何请求真的发出去。
-    let mut primary = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
-    primary["base_url"] = json!(harness.upstream_base_url);
-    let mut secondary = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
-    secondary["base_url"] = json!(harness.upstream_base_url);
-    assert_eq!(
-        publish_candidates(
-            &client,
-            &harness.base_url,
-            &harness.admin_token,
-            harness.model,
-            None,
-            vec![primary, secondary],
-        )
-        .await,
-        StatusCode::OK,
-        "两条候选的发布必须成功"
-    );
-    let candidates: Vec<(Uuid, i32, Uuid)> = sqlx::query(
-        "SELECT re.offering_id, re.routing_priority, o.channel_id
-         FROM publication.runtime_entries re
-         JOIN supply.offerings o ON o.id = re.offering_id
-         WHERE re.active AND re.gateway_model = $1 ORDER BY re.routing_priority ASC",
-    )
-    .bind(harness.model)
-    .fetch_all(&harness.pool)
-    .await
-    .expect("这次发布的两条候选必须可读")
-    .iter()
-    .map(|row| {
-        (
-            row.try_get("offering_id").expect("offering id"),
-            row.try_get("routing_priority").expect("priority"),
-            row.try_get("channel_id").expect("channel id"),
-        )
-    })
-    .collect();
-    assert_eq!(candidates.len(), 2, "这次发布写入两条候选");
-    let (primary_offering, secondary_offering) = (candidates[0].0, candidates[1].0);
-    let secondary_channel = candidates[1].2;
-    assert_ne!(
-        candidates[0].2, secondary_channel,
-        "两条候选必须落在两个渠道上，否则下面那一支验不到渠道的开关"
-    );
-
-    // ① 先受理一次：route 缓存因此写下"停用前"那份候选集（两条都在）。
-    let first_key = format!("cache-disable-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &harness.api_key,
-        "/v1/images/generations",
-        &first_key,
-        &route_request(harness.model, "before the switch"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::GATEWAY_TIMEOUT,
-        "没有 Worker，受理之后只会等到超时：{body}"
-    );
-    assert_eq!(
-        chosen_offering(&harness, &first_key).await,
-        primary_offering,
-        "停用之前走优先级最小的那条"
-    );
-    let cached = harness
-        .cache()
-        .route(harness.model)
-        .expect("受理之后候选集必须在缓存里");
-    assert_eq!(cached["candidates"].as_array().expect("候选集").len(), 2);
-
-    // ② 停用优先级 0 那条，并让这次**失效失败**：缓存里留着的仍是"停用前"那份候选集，修订标识
-    //    也没变 ⇒ 下一次受理照样命中它。停用能不能生效，因此与这次失效无关。
-    harness.cache().set_fail_writes(true);
-    assert_eq!(
-        patch_offering(
-            &client,
-            &harness.base_url,
-            &harness.admin_token,
-            primary_offering,
-            false
-        )
-        .await,
-        StatusCode::NO_CONTENT
-    );
-    harness.cache().set_fail_writes(false);
-    let stale = harness
-        .cache()
-        .route(harness.model)
-        .expect("失效没成功，缓存里那份还在");
-    assert_eq!(
-        stale["runtime_revision_id"], cached["runtime_revision_id"],
-        "启停不改变修订标识，缓存里那份仍然'看起来是新的'"
-    );
-    assert_eq!(
-        stale["candidates"].as_array().expect("候选集").len(),
-        2,
-        "缓存里仍然列着刚被停用的那条"
-    );
-
-    // ③ 立刻受理：被停用的那条不进合格集合，落到另一条；判定记录写明它为什么落选。
-    let second_key = format!("cache-disable-next-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &harness.api_key,
-        "/v1/images/generations",
-        &second_key,
-        &route_request(harness.model, "after the switch"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::GATEWAY_TIMEOUT,
-        "受理必须成功（落到另一条合格候选）：{body}"
-    );
-    assert_eq!(
-        chosen_offering(&harness, &second_key).await,
-        secondary_offering,
-        "被停用的那条不得被选中"
-    );
-    let (second_job, _, _) = harness.job(&second_key).await;
-    let considered: Value =
-        sqlx::query_scalar("SELECT considered FROM generation.routing_decisions WHERE job_id = $1")
-            .bind(second_job)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("受理必然写下判定记录");
-    let considered = considered.as_array().expect("considered is an array");
-    assert_eq!(considered.len(), 2, "两条候选都要进判定记录");
-    assert_eq!(considered[0]["eligible"], json!(false));
-    assert_eq!(
-        considered[0]["skip_reason"],
-        json!("this offering or its channel is disabled"),
-        "落选原因要写明是停用"
-    );
-    assert_eq!(considered[1]["eligible"], json!(true));
-
-    // ④ 停掉另一条候选的**渠道**（同样让失效失败）：判据是"供给自己启用且它的渠道也启用"，
-    //    渠道这一列同样在这条复核里判。两条候选于是全不合格 —— 缓存里那份还列着它们，对客是
-    //    平台侧故障 503，不是"模型不存在"。
-    harness.cache().set_fail_writes(true);
-    assert_eq!(
-        patch_channel(
-            &client,
-            &harness.base_url,
-            &harness.admin_token,
-            secondary_channel,
-            false
-        )
-        .await,
-        StatusCode::NO_CONTENT
-    );
-    harness.cache().set_fail_writes(false);
-    assert_eq!(
-        harness
-            .cache()
-            .route(harness.model)
-            .expect("失效没成功，缓存里那份还在")["candidates"]
-            .as_array()
-            .expect("候选集")
-            .len(),
-        2,
-        "缓存里仍然列着两条候选"
-    );
-    let jobs_before: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
-        .fetch_one(&harness.pool)
-        .await
-        .expect("job count");
-    let third_key = format!("cache-disable-none-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &harness.api_key,
-        "/v1/images/generations",
-        &third_key,
-        &route_request(harness.model, "every candidate is disabled"),
-    )
-    .await;
-    assert_eq!(
-        status,
-        StatusCode::SERVICE_UNAVAILABLE,
-        "一条合格的都没有是平台侧故障：{body}"
-    );
-    assert_eq!(body["error"]["code"], json!("platform_unavailable"));
-    let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")
-        .fetch_one(&harness.pool)
-        .await
-        .expect("job count");
-    assert_eq!(jobs_after, jobs_before, "被拒的受理不该留下 Job");
-
-    harness.cleanup().await;
-}
-
-/// 这次受理最终选了哪条供给（判定记录与 Job 同事务写入）。
-async fn chosen_offering(harness: &Harness, key: &str) -> Uuid {
-    let (job_id, _, _) = harness.job(key).await;
-    sqlx::query_scalar(
-        "SELECT chosen_offering_id FROM generation.routing_decisions WHERE job_id = $1",
-    )
-    .bind(job_id)
-    .fetch_one(&harness.pool)
-    .await
-    .expect("受理必然写下判定记录")
 }
 
 /// **每把密钥的每分钟请求数**：窗口内超过上限 ⇒ 429 且带 `Retry-After`；到了别的窗口恢复正常。
@@ -1291,10 +964,9 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
         &route_request(harness.model, "the next window"),
     )
     .await;
-    assert_eq!(
-        next.0,
-        StatusCode::GATEWAY_TIMEOUT,
-        "别的窗口里照常受理（不跑 Worker，所以同步窗口超时）：{}",
+    assert!(
+        next.0.is_server_error(),
+        "别的窗口里照常受理（受理之后在上游那一步失败）：{}",
         next.1
     );
 
@@ -1306,7 +978,9 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
             .fetch_one(&harness.pool)
             .await
             .expect("受理必然记下这次的预授权额");
-    // 两次受理各占一笔预授权；已结算余额**不动**（占用记在 `held`），被限流拒的那次连占用都没有。
+    // 预授权是同一次请求内的中间态：两次受理最后都收尾了，所以占用归零、余额没被预授权动过
+    // （实收按对客费率向量结算，两次都失败在上游时实收为零）。被限流拒的那次连 Job 都没有。
+    let _ = hold;
     assert_eq!(database_balance(&harness, &account_id).await, 1_000_000);
     let held_total: i64 =
         sqlx::query_scalar("SELECT held_microusd FROM ledger.accounts WHERE id = $1")
@@ -1314,7 +988,7 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
             .fetch_one(&harness.pool)
             .await
             .expect("account held");
-    assert_eq!(held_total, 2 * hold, "两次受理各占一笔预授权");
+    assert_eq!(held_total, 0, "在飞结束后占用应当归零");
     let jobs: i64 =
         sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
             .bind(Uuid::parse_str(&account_id).expect("account id"))
@@ -1415,12 +1089,13 @@ async fn an_unavailable_cache_lets_requests_through_instead_of_rate_limiting_the
         json!("insufficient_balance"),
         "它必须真的走到扣款那一步：{body}"
     );
-    let jobs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE idempotency_key = $1")
-            .bind(&key)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("job count");
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.jobs WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(&key))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job count");
     assert_eq!(
         jobs, 0,
         "余额不够的受理不建 Job，但它是被钱拒的，不是被限流拒的"
