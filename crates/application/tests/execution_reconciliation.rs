@@ -455,7 +455,7 @@ fn reconciliation_with_policy(
         factory,
         Arc::new(FakeCredentials),
         "recon-worker".to_owned(),
-        ChronoDuration::minutes(5),
+        takeover_lease(),
     )
     .with_policy(policy)
     .with_retry_policy(RetryPolicy {
@@ -1221,6 +1221,94 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
         .await
         .expect("the repeated finalization returns the committed result");
     assert_eq!(captures(&pool, duplicate_job).await, 1);
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 对账 Worker 的接管租约：服务的租赁时长，也用来把 `lease_expires_at` 反解成接管时刻。
+fn takeover_lease() -> ChronoDuration {
+    ChronoDuration::minutes(5)
+}
+
+/// 一组对账延迟样本的均值与 p50/p95（排序后取向上取整那一档，与性能基线同一口径）。
+fn latency_summary(
+    mut samples: Vec<ChronoDuration>,
+) -> (ChronoDuration, ChronoDuration, ChronoDuration) {
+    samples.sort();
+    let count = i32::try_from(samples.len()).expect("the sample count fits");
+    let mean = samples.iter().copied().sum::<ChronoDuration>() / count;
+    let percentile = |p: f64| {
+        let index = (samples.len() as f64 * p).ceil() as usize - 1;
+        samples[index.min(samples.len() - 1)]
+    };
+    (mean, percentile(0.50), percentile(0.95))
+}
+
+/// A8：一次「Worker 接管到结算完成」的本机观测（对账延迟）。
+///
+/// 用现有接管夹具跑 [`ROUNDS`] 轮：每轮受理一条 v1 执行、记受理句柄、把租约置为过期，再跑一轮
+/// `run_once`。接管把 `lease_expires_at` 写成「接管事务开始 + 租约」，结算把 `terminal_at` 写成
+/// 结算事务开始，所以 `terminal_at − (lease_expires_at − 租约)` 就是接管到结算的数据库时钟差；
+/// 结算不清 `lease_expires_at`，一轮里也只有一次接管。墙钟耗时是交叉核对，含 `run_once` 的外围
+/// 扫描。只记录，不断言阈值。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_taken_over_execution_reports_settlement_latency() {
+    const ROUNDS: usize = 20;
+
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let factory = Arc::new(FakeFactory::new());
+    let service = reconciliation(&repository, factory);
+
+    let mut database_latencies = Vec::with_capacity(ROUNDS);
+    let mut wall_latencies = Vec::with_capacity(ROUNDS);
+    for index in 0..ROUNDS {
+        let job_id = admit_one(&repository, &fixture, &format!("recon-latency-{index}")).await;
+        let attempt_id = begin(&repository, job_id).await;
+        accept(&repository, job_id, attempt_id, "task-latency").await;
+        expire_lease(&pool, job_id).await;
+
+        let began = std::time::Instant::now();
+        let report = service.run_once().await.expect("the reconciliation round");
+        wall_latencies.push(
+            ChronoDuration::from_std(began.elapsed())
+                .expect("the round finishes within the chrono range"),
+        );
+        assert_eq!(
+            report.taken_over, 1,
+            "round {index} takes over one execution"
+        );
+        assert_eq!(report.settled, 1, "round {index} settles the execution");
+
+        let lease_expires_at: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT lease_expires_at FROM generation.jobs WHERE id = $1")
+                .bind(job_id.0)
+                .fetch_one(&pool)
+                .await
+                .expect("the takeover lease");
+        let terminal_at: chrono::DateTime<Utc> =
+            sqlx::query_scalar("SELECT terminal_at FROM generation.jobs WHERE id = $1")
+                .bind(job_id.0)
+                .fetch_one(&pool)
+                .await
+                .expect("the settlement timestamp");
+        database_latencies.push(terminal_at - (lease_expires_at - takeover_lease()));
+    }
+
+    let (mean, p50, p95) = latency_summary(database_latencies);
+    let (wall_mean, _, _) = latency_summary(wall_latencies);
+    println!(
+        "reconciliation-takeover-to-settlement: n={ROUNDS} mean={:.1}ms p50={:.1}ms p95={:.1}ms wall_mean={:.1}ms",
+        mean.as_seconds_f64() * 1_000.0,
+        p50.as_seconds_f64() * 1_000.0,
+        p95.as_seconds_f64() * 1_000.0,
+        wall_mean.as_seconds_f64() * 1_000.0,
+    );
 
     drop(pool);
     drop(service);

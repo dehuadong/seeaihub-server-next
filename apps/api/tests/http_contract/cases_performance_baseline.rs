@@ -8,13 +8,18 @@
 
 use super::*;
 
-/// 一组样本的均值与 p95：p95 取向上取整那一档（两态基线与耗时拆分同一口径）。
+/// 排序后的样本在 percentile（0–1）处的取值：取向上取整那一档（两态基线与耗时拆分同一口径）。
+fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
+    let index = (sorted.len() as f64 * percentile).ceil() as usize - 1;
+    sorted[index.min(sorted.len() - 1)]
+}
+
+/// 一组样本的均值与 p95。
 fn mean_and_p95(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort();
     let count = u32::try_from(samples.len()).expect("the sample count fits a u32");
     let mean = samples.iter().sum::<Duration>() / count;
-    let p95_index = (samples.len() as f64 * 0.95).ceil() as usize - 1;
-    (mean, samples[p95_index.min(samples.len() - 1)])
+    (mean, percentile(&samples, 0.95))
 }
 
 /// 两态各自一次有界负载的观测结果。
@@ -170,6 +175,38 @@ async fn measure_baseline(
     }
 }
 
+/// 一组耗时样本的均值与 p50/p95/p99。
+struct LatencySummary {
+    mean: Duration,
+    p50: Duration,
+    p95: Duration,
+    p99: Duration,
+}
+
+impl LatencySummary {
+    /// 排序后按时延分位取值；样本为空会让上游先断言失败，这里只接非空样本。
+    fn of(mut samples: Vec<Duration>) -> Self {
+        samples.sort();
+        let count = u32::try_from(samples.len()).expect("the sample count fits a u32");
+        Self {
+            mean: samples.iter().sum::<Duration>() / count,
+            p50: percentile(&samples, 0.50),
+            p95: percentile(&samples, 0.95),
+            p99: percentile(&samples, 0.99),
+        }
+    }
+
+    fn render(&self) -> String {
+        format!(
+            "mean={:.1}ms p50={:.1}ms p95={:.1}ms p99={:.1}ms",
+            self.mean.as_secs_f64() * 1_000.0,
+            self.p50.as_secs_f64() * 1_000.0,
+            self.p95.as_secs_f64() * 1_000.0,
+            self.p99.as_secs_f64() * 1_000.0,
+        )
+    }
+}
+
 /// 顺序直接执行下的一次观测：每次总耗时，以及扣掉固定上游延迟后的网关净耗时。
 ///
 /// 「净耗时」= 总耗时 − D，含受理事务与写回、选路、参数映射与序列化、连接获取、响应序列化，
@@ -177,35 +214,32 @@ async fn measure_baseline(
 struct GatewayOverheadObservation {
     requests: usize,
     upstream_delay: Duration,
-    total_mean: Duration,
-    total_p95: Duration,
-    net_mean: Duration,
-    net_p95: Duration,
+    total: LatencySummary,
+    net: LatencySummary,
 }
 
 impl GatewayOverheadObservation {
     fn summary(&self) -> String {
         format!(
-            "sequential-direct: n={} upstream_delay={}ms total_mean={:.1}ms total_p95={:.1}ms net_mean={:.1}ms net_p95={:.1}ms",
+            "sequential-direct: n={} upstream_delay={}ms total[{}] net[{}]",
             self.requests,
             self.upstream_delay.as_millis(),
-            self.total_mean.as_secs_f64() * 1_000.0,
-            self.total_p95.as_secs_f64() * 1_000.0,
-            self.net_mean.as_secs_f64() * 1_000.0,
-            self.net_p95.as_secs_f64() * 1_000.0,
+            self.total.render(),
+            self.net.render(),
         )
     }
 }
 
 /// A8：关闭并发（一次只发一个），顺序发 [`REQUESTS`] 个成功的直接执行请求，假上游固定延迟 D。
 ///
-/// 逐个记录墙钟总耗时，再报告总耗时与「网关净耗时 = 总耗时 − D」的均值与 p95。净耗时里混着
-/// 受理与结算的数据库往返、参数映射与序列化、连接获取、响应序列化，以及顺序循环自身的调度与
-/// 排队——上游那一段 D 被减掉，剩下的就是这个网关与执行路径给一次请求加的时间。只记录，不断言。
+/// 逐个记录墙钟总耗时，再报告总耗时与「网关净耗时 = 总耗时 − D」的均值与 p50/p95/p99。净耗时里
+/// 混着受理与结算的数据库往返、参数映射与序列化、连接获取、响应序列化，以及顺序循环自身的调度
+/// 与排队——上游那一段 D 被减掉，剩下的就是这个网关与执行路径给一次请求加的时间。只记录，不断言。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn direct_execution_gateway_overhead_split() {
-    const REQUESTS: usize = 10;
+    // 样本数按 p99 留出余量：n=120 时 p99 取第 119 个样本，不再是最大值。
+    const REQUESTS: usize = 120;
     const UPSTREAM_DELAY_MS: u64 = 200;
     // 与两态基线同一组窗口、上游超时与账户在飞上限，只有"顺序发"这一点不同。
     const SYNC_WAIT_SECONDS: u64 = 30;
@@ -270,19 +304,109 @@ async fn direct_execution_gateway_overhead_split() {
     harness.cleanup().await;
 
     let upstream_delay = Duration::from_millis(UPSTREAM_DELAY_MS);
-    let (total_mean, total_p95) = mean_and_p95(totals.clone());
     let net: Vec<Duration> = totals
         .iter()
         .map(|total| total.saturating_sub(upstream_delay))
         .collect();
-    let (net_mean, net_p95) = mean_and_p95(net);
     let observation = GatewayOverheadObservation {
         requests: REQUESTS,
         upstream_delay,
-        total_mean,
-        total_p95,
-        net_mean,
-        net_p95,
+        total: LatencySummary::of(totals),
+        net: LatencySummary::of(net),
     };
     println!("{}", observation.summary());
+}
+
+/// 当前集群范围的 WAL 插入位置（文本形式，供 `pg_wal_lsn_diff` 再解析）。
+async fn wal_insert_lsn(harness: &Harness) -> String {
+    sqlx::query_scalar("SELECT pg_current_wal_insert_lsn()::text")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the current WAL insert position")
+}
+
+/// 从 `start` 到现在的 WAL 插入字节数。
+///
+/// `pg_current_wal_insert_lsn()` 是**集群范围**的插入位置，所以差值含这段时间里同集群其他后端
+/// （其他库、autovacuum、checkpoint）写的 WAL；它是本机单次观测的一部分，不当作请求的净写入。
+async fn wal_bytes_since(harness: &Harness, start: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT pg_wal_lsn_diff(pg_current_wal_insert_lsn(), $1::text::pg_lsn)::bigint",
+    )
+    .bind(start)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("the WAL bytes written since the given position")
+}
+
+/// 发一次成功的直接执行请求，返回它前后测到的 WAL 字节增量。
+async fn wal_bytes_of_one_request(harness: &Harness, api_key: &str, label: &str) -> i64 {
+    let start = wal_insert_lsn(harness).await;
+    let (status, body) = post_json(
+        &harness.base_url,
+        api_key,
+        "/v1/images/generations",
+        &format!("wal-{label}-{}", Uuid::new_v4()),
+        &route_request(harness.model, label),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "WAL 测量请求失败: {body}");
+    wal_bytes_since(harness, &start).await
+}
+
+/// A8：一次成功直接执行请求前后读 `pg_current_wal_insert_lsn()`，报告请求窗口里的 WAL 字节。
+///
+/// 先测一次请求的差值，再连测 [`BATCH`] 次取平均以弱化单窗口噪声。差值口径是集群范围的插入位置，
+/// 不是这条请求独占的写入；本机单次观测，只作记录，不设阈值。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_execution_wal_bytes_per_request() {
+    const BATCH: usize = 5;
+    // 与顺序耗时拆分同一组窗口与账户在飞上限，只有测量对象换成 WAL 字节。
+    const SYNC_WAIT_SECONDS: u64 = 30;
+    const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
+    const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;
+
+    let draft = candidate(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only", "image_conditioned", "masked"],
+    );
+    let harness = Harness::start_direct(
+        draft,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        MAX_ACCOUNT_IN_FLIGHT,
+        SYNC_WAIT_SECONDS,
+    )
+    .await;
+    let (_, api_key) = funded_account(
+        &Client::new(),
+        &harness.base_url,
+        &harness.admin_token,
+        MEASURE_ACCOUNT_CREDIT_MICROUSD,
+    )
+    .await;
+
+    // 预热一次，让受理事务的首次页面/索引分配不混进被测窗口。
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &format!("wal-warmup-{}", Uuid::new_v4()),
+        &route_request(harness.model, "warm the route and balance caches"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "预热失败: {body}");
+
+    let single = wal_bytes_of_one_request(&harness, &api_key, "single").await;
+    let mut batch_total: i64 = 0;
+    for index in 0..BATCH {
+        batch_total +=
+            wal_bytes_of_one_request(&harness, &api_key, &format!("batch-{index}")).await;
+    }
+    println!(
+        "direct-execution-wal: single={single}B batch_n={BATCH} batch_total={batch_total}B batch_mean={:.0}B/request",
+        batch_total as f64 / BATCH as f64,
+    );
+    harness.cleanup().await;
 }
