@@ -150,6 +150,8 @@
 | `REQUEST_FINGERPRINT_KEY_V<n>` | 无（**必填**，`n` 从 1 到当前版本） | 32 字节 base64 HMAC 密钥，按版本号命名。查到旧记录后要用记录里的版本重算指纹才能比较（[RFC 0017](../design/0017-synchronous-image-gateway.md) §2），所以**旧版本密钥保留到相应记录退出保证范围** |
 | `REQUEST_FINGERPRINT_KEY_VERSION` | `1` | 当前请求指纹版本；`1..=该值` 每一档都必须给出密钥 |
 
+**最小配置**：没有轮换时只需 `IDEMPOTENCY_LOOKUP_KEY` 与 `REQUEST_FINGERPRINT_KEY_V1` 两个值，两个 `..._VERSION` 缺省为 1。下面的轮换规则只在**真的换密钥**时用到。
+
 两把密钥都只从环境变量读，**32 字节 base64**（`openssl rand -base64 32`），不进仓库、日志、响应或测试夹具，也不与渠道凭证混用。缺失、长度不对、或当前版本没有对应密钥时**启动即失败**，不让进程带着不完整的去重能力跑。
 
 **轮换**：把 `..._VERSION` 抬到新值并加上新一档密钥，旧的保留；已有记录继续按自己的版本复核。移除旧版本密钥会让那批记录无法安全比对，同键调用返回 409 `idempotency_conflict`，而不是当成新请求。
