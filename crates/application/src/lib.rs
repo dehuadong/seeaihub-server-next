@@ -1269,7 +1269,7 @@ pub struct CreateImageGenerationRequest {
     /// 参考图：调用方给的 `image` / `image_urls`（同义）归一到这里，每项是公网 URL 或 data URL。
     #[serde(default)]
     pub reference_images: Vec<String>,
-    /// 遮罩：PNG data URL。
+    /// 遮罩：公网 URL 或 data URL。
     #[serde(default)]
     pub mask: Option<String>,
     /// 幂等键：来自 `Idempotency-Key` 请求头，缺省时由接口层生成一个。

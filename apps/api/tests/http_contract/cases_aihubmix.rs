@@ -2,9 +2,7 @@ use super::*;
 
 /// AIHubMix：两条同步路径都能跑通，且**渠道给什么就返回什么**。
 ///
-/// 覆盖 data URL 输入、公网 URL 输入与 `url` / `b64_json` 两种上游形态。生成入口收敛为只收公网 URL
-/// 后，这里的 data URL 与文件部件用例要改成公网 URL（Spec 0005 §3、Design 0021 分片实施顺序的第 5 片，生成入口收敛）；
-/// multipart 解析仍产出字节，但只供既有记录的重放比对。
+/// 覆盖 data URL 输入、公网 URL 输入与 `url` / `b64_json` 两种上游形态。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() {
@@ -105,8 +103,8 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         body_contains_bytes(&edits, PNG_FIXTURE),
         "两个文件部件的字节都必须到上游"
     );
-    // 这一步的可见判据就是上面那条"字节原样进文件部件"——载荷本身不落库。生成入口收敛后文件部件会在
-    // 受理前被拒（Spec 0005 §3），当前用例走的仍是收敛前的形态。
+    // 文件部件的字节在受理期原样保留、落到候选声明的参数名上；可见判据就是上面那条"字节原样进
+    // 文件部件"——载荷本身不落库。
 
     // 5) 同义字段只能给一个；只给遮罩是结构性错误。
     let key = format!("sync-conflict-{}", Uuid::new_v4());
