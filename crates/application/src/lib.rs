@@ -3031,14 +3031,16 @@ pub trait ExecutionRepository: Send + Sync {
     /// 同一事务里原子释放该 Job 的 active Hold（并按预授权额去掉账户占用）、账户执行名额与渠道
     /// 容量槽位，把 Job 写成 failed 并盖 `terminal_at`；不写对客错误码（没有对客结论，也不需要
     /// 重开路径）。它**不建 Attempt**：没有提交声明的执行本来就没有 Attempt，已有已收尾 Attempt
-    /// 的重投也无法再证明"没发过"。若库里存在未收尾的 Attempt（prepared/submitting/accepted/
-    /// unknown），说明提交可能已经在飞，一律冲突，不释放。
+    /// 的重投也无法再证明"没发过"。调用方凭带 fencing 的 token 声称这次生成确实没发出，端口据此
+    /// 把已有的提交声明（prepared/submitting）收成 terminal；已经 accepted/unknown 的 Attempt
+    /// 说明提交可能已经在飞，一律冲突，不释放。
     ///
     /// 事务结果未知时不能声称释放成功：COMMIT 的响应丢失时这次取消可能已经提交，调用方按
     /// [`Self::read_finalization`] 的确认结果判断，不先假定失败也不重复释放。
     ///
-    /// 失败：Job 不存在返回 ApplicationError::NotFound；已成功、已是对账态、所有权或 fencing token
-    /// 不匹配、存在未收尾的 Attempt 返回 ApplicationError::Conflict。
+    /// 失败：Job 不存在返回 ApplicationError::NotFound；已成功、所有权或 fencing token 不匹配、
+    /// 存在 accepted/unknown 的 Attempt 返回 ApplicationError::Conflict；已经是确定失败或对账态时
+    /// 按已提交结论幂等返回，不重复释放。
     async fn cancel_unsubmitted(
         &self,
         command: CancelUnsubmitted,

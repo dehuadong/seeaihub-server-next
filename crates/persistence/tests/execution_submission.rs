@@ -1066,8 +1066,9 @@ async fn reaping_an_unsubmitted_admission_releases_hold_and_channel_slot() {
 
 /// 带 fencing 的"确定未提交"取消：原子释放 Hold、账户占用与渠道容量，且**不建 Attempt**。
 ///
-/// 未收尾的 Attempt 是这条端口的硬边界：有它就不能释放（提交可能已经在飞），已收尾的历史 Attempt
-/// 不影响同一次执行的重投取消。这些判据都在行锁内，只有真库验得到（RFC 0018 §4.1）。
+/// 硬边界是**已经交给渠道**的 Attempt（`accepted`/`unknown`，提交可能已经在飞），不是还没发出的
+/// 提交声明：声明落下但生成发送未开始时按确定未提交释放，并把它收成 `terminal`。这些判据都在
+/// 行锁内，只有真库验得到（RFC 0018 §4.1）。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn cancelling_an_unsubmitted_execution_releases_without_creating_an_attempt() {
@@ -1145,31 +1146,90 @@ async fn cancelling_an_unsubmitted_execution_releases_without_creating_an_attemp
         .expect("a repeated cancellation is idempotent");
     assert_eq!(again.stage, ExecutionStage::Failed);
 
-    // 已有未收尾的 Attempt：提交可能已经在飞，不许按确定未提交释放。
-    let submitted = admit_one(&repository, &fixture, "cancel-with-attempt").await;
-    repository
+    // 提交声明落下但生成尚未开始：调用方凭带 fencing 的取消把这次声明收成 terminal 并释放，
+    // 不把它伪装成可能已提交（RFC 0018 §4.1）。
+    let declared = admit_one(&repository, &fixture, "cancel-with-declaration").await;
+    let started = repository
         .begin_submission(begin(
-            submitted,
+            declared,
             "supervisor-a",
             0,
             Utc::now() + ChronoDuration::minutes(5),
         ))
         .await
         .expect("begin_submission");
-    let refused = repository
-        .cancel_unsubmitted(cancel(submitted, "supervisor-a", 0))
+    let released = repository
+        .cancel_unsubmitted(cancel(declared, "supervisor-a", 0))
         .await
-        .expect_err("an unfinished attempt must not be released as unsubmitted");
+        .expect("a declaration that never reached the provider is releasable");
+    assert_eq!(released.stage, ExecutionStage::Failed);
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM generation.attempts WHERE id = $1")
+            .bind(started.attempt_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the collected declaration"),
+        "terminal",
+        "the release closes the declaration instead of leaving it open"
+    );
+
+    // 已经交给渠道的 Attempt 是硬边界：提交可能已经在飞，不许释放。
+    let accepted_job = admit_one(&repository, &fixture, "cancel-with-acceptance").await;
+    let accepted = repository
+        .begin_submission(begin(
+            accepted_job,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+    repository
+        .record_acceptance(RecordAcceptance {
+            job_id: accepted_job,
+            attempt_id: accepted.attempt_id,
+            execution_owner: "supervisor-a".to_owned(),
+            fencing_token: FencingToken::new(0),
+            provider_task_handle: None,
+            provider_trace_id: None,
+        })
+        .await
+        .expect("record_acceptance");
+    let refused = repository
+        .cancel_unsubmitted(cancel(accepted_job, "supervisor-a", 0))
+        .await
+        .expect_err("an attempt that reached the provider must not be released as unsubmitted");
     assert!(matches!(refused, ApplicationError::Conflict(_)));
     assert_eq!(
         sqlx::query_scalar::<_, String>("SELECT state FROM generation.jobs WHERE id = $1")
-            .bind(submitted.0)
+            .bind(accepted_job.0)
             .fetch_one(&pool)
             .await
             .expect("the still executing job"),
         "executing",
         "a refused cancellation changes nothing"
     );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM generation.attempts WHERE id = $1")
+            .bind(accepted.attempt_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the still executing attempt"),
+        "accepted",
+        "a refused cancellation leaves the accepted attempt untouched"
+    );
+
+    // `unknown`（结果不明）与 accepted 是同一条硬边界：同样不许按确定未提交释放。
+    sqlx::query("UPDATE generation.attempts SET state = 'unknown' WHERE id = $1")
+        .bind(accepted.attempt_id.0)
+        .execute(&pool)
+        .await
+        .expect("mark the attempt unknown");
+    let still_refused = repository
+        .cancel_unsubmitted(cancel(accepted_job, "supervisor-a", 0))
+        .await
+        .expect_err("an attempt with an unknown outcome must not be released");
+    assert!(matches!(still_refused, ApplicationError::Conflict(_)));
 
     drop(pool);
     drop(repository);
