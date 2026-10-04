@@ -368,7 +368,6 @@ async fn admit_with_snapshot(
                 considered: Vec::new(),
             },
             idempotency_key_digest: format!("digest-{key}"),
-            idempotency_lookup_key_version: 1,
             request_digest: format!("request-{key}"),
             request_digest_key_version: 1,
             max_cost_microusd: 1000,

@@ -26,9 +26,9 @@ use seeai_application::{
     AdapterFactory, AdmitExecution, AdmitOutcome, ApplicationError, BeginSubmission,
     ClaimedLateFact, CredentialProvider, DirectExecutionCall, DirectExecutionError,
     DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService, ExecutionFinalization,
-    ExecutionLookup, ExecutionRepository, FailOrReconcileExecution, FingerprintKeys, HubRepository,
-    LateFacts, LateFactsOutcome, OfferingDraft, PricePlanDraft, ProviderFailureKind,
-    PublishRuntimeCommand, RecordAcceptance, RequestTimeoutPolicy, RetryPolicy, RuntimeService,
+    ExecutionLookup, ExecutionRepository, FailOrReconcileExecution, HubRepository, LateFacts,
+    LateFactsOutcome, OfferingDraft, PricePlanDraft, ProviderFailureKind, PublishRuntimeCommand,
+    RecordAcceptance, RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RuntimeService,
     SettleExecution, SubmissionStarted, TakenOverExecution,
 };
 use seeai_domain::{
@@ -282,26 +282,25 @@ fn usage() -> TokenUsage {
     }
 }
 
-fn test_keys() -> FingerprintKeys {
+fn test_keys() -> RequestFingerprintKeys {
     let mut request_keys = BTreeMap::new();
     request_keys.insert(1, vec![7_u8; 32]);
-    FingerprintKeys::new(vec![9_u8; 32], 1, request_keys, 1).expect("the test fingerprint keys")
+    RequestFingerprintKeys::new(request_keys, 1).expect("the test fingerprint keys")
 }
 
 /// 轮换后的密钥：当前版本 v2，v1 仍保留——旧记录要用它比对（RFC 0017 §2）。
-fn test_keys_rotated_to_v2() -> FingerprintKeys {
+fn test_keys_rotated_to_v2() -> RequestFingerprintKeys {
     let mut request_keys = BTreeMap::new();
     request_keys.insert(1, vec![7_u8; 32]);
     request_keys.insert(2, vec![8_u8; 32]);
-    FingerprintKeys::new(vec![9_u8; 32], 1, request_keys, 2).expect("the rotated fingerprint keys")
+    RequestFingerprintKeys::new(request_keys, 2).expect("the rotated fingerprint keys")
 }
 
 /// 轮换后旧版本已从配置移除：记录的版本取不到密钥，无法安全比对。
-fn test_keys_without_v1() -> FingerprintKeys {
+fn test_keys_without_v1() -> RequestFingerprintKeys {
     let mut request_keys = BTreeMap::new();
     request_keys.insert(2, vec![8_u8; 32]);
-    FingerprintKeys::new(vec![9_u8; 32], 1, request_keys, 2)
-        .expect("the rotated fingerprint keys without v1")
+    RequestFingerprintKeys::new(request_keys, 2).expect("the rotated fingerprint keys without v1")
 }
 
 fn test_timeouts() -> RequestTimeoutPolicy {
@@ -543,7 +542,10 @@ async fn setup_with(flaky_settle: Option<Arc<AtomicBool>>) -> Fixture {
     setup_with_keys(flaky_settle, test_keys()).await
 }
 
-async fn setup_with_keys(flaky_settle: Option<Arc<AtomicBool>>, keys: FingerprintKeys) -> Fixture {
+async fn setup_with_keys(
+    flaky_settle: Option<Arc<AtomicBool>>,
+    keys: RequestFingerprintKeys,
+) -> Fixture {
     let (database_url, database_name) = isolated_database_url().await;
     let repository = Arc::new(
         PgHubRepository::connect(&database_url, 4)
@@ -596,7 +598,7 @@ fn build_service(
     repository: Arc<PgHubRepository>,
     executions: Arc<dyn ExecutionRepository>,
     factory: Arc<FakeFactory>,
-    keys: FingerprintKeys,
+    keys: RequestFingerprintKeys,
 ) -> DirectExecutionService {
     DirectExecutionService::new(
         repository,

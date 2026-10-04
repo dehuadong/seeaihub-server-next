@@ -154,7 +154,6 @@ fn command(
             considered: Vec::new(),
         },
         idempotency_key_digest: idempotency_key_digest.to_owned(),
-        idempotency_lookup_key_version: 1,
         request_digest: request_digest.to_owned(),
         request_digest_key_version: 1,
         max_cost_microusd: 1000,

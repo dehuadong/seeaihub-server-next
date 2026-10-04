@@ -21,13 +21,13 @@ use seeai_application::{
     CachePolicy, CreateImageGenerationRequest, CursorPosition, CustomerBillingQuery,
     CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope,
     CustomerUsageStatus, CustomerView, DirectExecutionError, DirectExecutionLimits,
-    DirectExecutionRequest, DirectExecutionService, ExecutionRepository, FingerprintKeys,
-    GatewayModelView, GeneratedImage, GenerationDailySpendLimit, GenerationRateLimit,
-    GenerationService, HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository,
-    IdentityService, JobView, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
-    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
-    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RequestCostCeiling,
+    DirectExecutionRequest, DirectExecutionService, ExecutionRepository, GatewayModelView,
+    GeneratedImage, GenerationDailySpendLimit, GenerationRateLimit, GenerationService,
+    HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository, IdentityService, JobView,
+    LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES,
+    NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeCommand,
+    ReconciliationService, RefundReconciliationCommand, RequestCostCeiling, RequestFingerprintKeys,
     RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
     decode_history_cursor, encode_history_cursor, invalid_history_cursor, settle_reserve_from_env,
     with_admin_id,
@@ -247,7 +247,7 @@ async fn main() -> Result<()> {
     // 直接同步执行：env 开关默认关闭。关着时下面的配置一个都不读（缺摘要密钥或渠道凭证不会让
     // 进程起不来），图片入口逐字走旧路径。开着时本进程自己调 Provider，不建生成 Job、不轮询结果。
     let direct_execution = if direct_execution_enabled()? {
-        let keys = FingerprintKeys::from_env().map_err(anyhow::Error::from)?;
+        let keys = RequestFingerprintKeys::from_env().map_err(anyhow::Error::from)?;
         let settle_reserve = settle_reserve_from_env().map_err(anyhow::Error::from)?;
         // 执行所有权租约：begin_submission 按它落 lease_expires_at，Supervisor 按它的三分之一续约。
         let ownership_lease = duration_from_env("GENERATION_EXECUTION_LEASE_SECONDS", 60)?;

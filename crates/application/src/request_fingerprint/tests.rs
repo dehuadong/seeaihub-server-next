@@ -120,27 +120,22 @@ fn each_recognized_field_changes_the_fingerprint() {
 }
 
 #[test]
-fn the_idempotency_digest_is_stable_across_request_key_versions() {
-    let lookup = key(1);
-    let mut first_keys = BTreeMap::new();
-    first_keys.insert(1, key(2));
-    let first = FingerprintKeys::new(lookup.clone(), 1, first_keys, 1).expect("keys");
-    let mut second_keys = BTreeMap::new();
-    second_keys.insert(1, key(5));
-    second_keys.insert(2, key(6));
-    let second = FingerprintKeys::new(lookup, 1, second_keys, 2).expect("keys");
+fn the_idempotency_digest_is_keyless_and_stable() {
+    let digest = idempotency_key_digest("order-42");
     assert_eq!(
-        first.idempotency_key_digest("order-42"),
-        second.idempotency_key_digest("order-42"),
-        "the lookup digest must not move when the request fingerprint key rotates"
+        digest,
+        idempotency_key_digest("order-42"),
+        "同一幂等键必须得到同一摘要"
     );
+    assert_eq!(digest.len(), 64, "SHA-256 renders as 64 hex characters");
+    assert_ne!(digest, idempotency_key_digest("order-43"));
 }
 
 #[test]
 fn an_unknown_request_key_version_reports_no_fingerprint() {
     let mut request_keys = BTreeMap::new();
     request_keys.insert(1, key(2));
-    let keys = FingerprintKeys::new(key(1), 1, request_keys, 1).expect("keys");
+    let keys = RequestFingerprintKeys::new(request_keys, 1).expect("keys");
     let parameters = json!({"prompt": "a cat"});
     let images: Vec<String> = Vec::new();
     assert!(
@@ -160,7 +155,7 @@ fn short_keys_are_rejected() {
     let mut request_keys = BTreeMap::new();
     request_keys.insert(1, vec![0u8; 4]);
     assert!(matches!(
-        FingerprintKeys::new(key(1), 1, request_keys, 1),
+        RequestFingerprintKeys::new(request_keys, 1),
         Err(ApplicationError::Configuration(_))
     ));
 }

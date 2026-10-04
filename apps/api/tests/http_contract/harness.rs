@@ -81,10 +81,9 @@ mod harness_check;
 /// 客户历史游标密钥（32 字节的 base64）：**必须配**，缺了 API 进程起不来，所以夹具给一份固定的。
 const CONTRACT_CURSOR_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 
-/// 直接执行要的摘要密钥（32 字节 base64）：幂等 lookup 与请求指纹各一份。
+/// 直接执行要的请求指纹密钥（32 字节 base64）。
 ///
 /// 夹具里只是让进程起得来、让摘要可复现；真实部署的密钥来自环境变量，不进仓库。
-const CONTRACT_LOOKUP_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=";
 const CONTRACT_FINGERPRINT_KEY: &str = "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
 /// 直接执行时渠道凭证的假值：只在本机假上游上用过，不写配置、日志或响应。
 const CONTRACT_PROVIDER_KEY: &str = "contract-test-key";
@@ -1078,7 +1077,6 @@ async fn start_api_with(
                         .unwrap_or(DEFAULT_SETTLE_RESERVE_SECONDS)
                         .to_string(),
                 )
-                .env("IDEMPOTENCY_LOOKUP_KEY", CONTRACT_LOOKUP_KEY)
                 .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
                 .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
                 .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY);

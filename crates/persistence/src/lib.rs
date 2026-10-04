@@ -4323,7 +4323,6 @@ impl ExecutionRepository for PgHubRepository {
             price_snapshot,
             routing,
             idempotency_key_digest,
-            idempotency_lookup_key_version,
             request_digest,
             request_digest_key_version,
             max_cost_microusd,
@@ -4459,15 +4458,15 @@ impl ExecutionRepository for PgHubRepository {
                 runtime_revision_id, vendor_model_id, offering_id, channel_id,
                 adapter_key, provider_model_id, base_url, credential_env,
                 price_snapshot, max_cost_microusd,
-                execution_protocol, idempotency_key_digest, idempotency_lookup_key_version,
+                execution_protocol, idempotency_key_digest,
                 request_digest, request_digest_key_version
             ) VALUES (
                 $1,$2,'admitted',$3,$4,
                 $5,$6,$7,$8,
                 $9,$10,$11,$12,
                 $13,$14,
-                'v1',$15,$16,
-                $17,$18
+                'v1',$15,
+                $16,$17
             )
             RETURNING created_at, updated_at
             "#,
@@ -4487,7 +4486,6 @@ impl ExecutionRepository for PgHubRepository {
         .bind(&price_snapshot_value)
         .bind(max_cost)
         .bind(&idempotency_key_digest)
-        .bind(idempotency_lookup_key_version)
         .bind(&request_digest)
         .bind(request_digest_key_version)
         .fetch_one(&mut *transaction)

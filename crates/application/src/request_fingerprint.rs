@@ -1,8 +1,9 @@
-//! 请求指纹与幂等键摘要：带密钥摘要与稳定规范化（RFC 0017 §2，Spec 0005 §2、§4）。
+//! 请求指纹与幂等键摘要：无密钥查找标识、带密钥请求指纹与稳定规范化（RFC 0017 §2，Spec 0005 §2、§4）。
 //!
-//! 两类摘要分开：幂等键只做**不可逆标识**，用稳定的 lookup 密钥，跨 API 副本一致、不随请求指纹
-//! 密钥轮换；请求指纹覆盖端点、平台型号、已识别参数、参考图与 mask 内容及 n，用按版本轮换的密钥。
-//! 两者都只从环境变量取密钥，缺失或非法一律配置错误——摘要必须可复现，不能用默认或随机值。
+//! 两类摘要分开：幂等键只做**不可逆标识**，用无密钥 SHA-256（固定领域前缀 || 幂等键）——查找只要求
+//! 跨 API 副本稳定一致、不可逆，不需要也不轮换密钥；请求指纹覆盖端点、平台型号、已识别参数、参考图
+//! 与 mask 内容及 n，用按版本轮换的 HMAC 密钥，避免库泄露后从摘要反推提示词或图片内容。
+//! 请求指纹密钥只从环境变量取，缺失或非法一律配置错误——摘要必须可复现，不能用默认或随机值。
 
 use std::collections::BTreeMap;
 use std::fmt::{Debug, Formatter};
@@ -63,45 +64,41 @@ impl RequestFingerprintInput<'_> {
     }
 }
 
-/// 幂等键的不可逆标识：用**稳定 lookup 密钥**，所有 API 副本一致，不随请求指纹密钥轮换。
-/// 明文键不进新协议记录（Spec 0005 §2）。
+/// 幂等键的不可逆标识：无密钥 SHA-256，输入是固定领域前缀与幂等键的拼接。
+///
+/// 固定前缀把幂等键摘要与其他 SHA-256 用途隔开；无密钥让所有 API 副本、任何轮换前后都得到同一
+/// 摘要，查找域不依赖配置。明文键不进新协议记录（Spec 0005 §2、§4）。
 #[must_use]
-pub fn idempotency_key_digest(key: &[u8], idempotency_key: &str) -> String {
-    digest_hex(key, LOOKUP_DOMAIN, &[idempotency_key.as_bytes()])
+pub fn idempotency_key_digest(idempotency_key: &str) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(LOOKUP_DOMAIN);
+    hasher.update(idempotency_key.as_bytes());
+    hex::encode(hasher.finalize())
 }
 
-/// 请求指纹与幂等键的密钥配置：一份稳定 lookup 密钥加一组按版本轮换的请求指纹密钥。
+/// 请求指纹的密钥配置：一组按版本轮换的 HMAC 密钥与当前版本。
 ///
 /// 旧版本密钥保留在配置里直到相应记录退出保证范围：查到旧记录后用记录的版本重算才能比较
 /// （RFC 0017 §2）。密钥只从环境变量读，不得与 Provider 凭证混用。
 #[derive(Clone)]
-pub struct FingerprintKeys {
-    lookup_key: Vec<u8>,
-    lookup_key_version: i16,
+pub struct RequestFingerprintKeys {
     request_keys: BTreeMap<i16, Vec<u8>>,
     current_request_key_version: i16,
 }
 
-impl Debug for FingerprintKeys {
+impl Debug for RequestFingerprintKeys {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        formatter.write_str("FingerprintKeys([REDACTED])")
+        formatter.write_str("RequestFingerprintKeys([REDACTED])")
     }
 }
 
-impl FingerprintKeys {
-    /// 构造并校验：两把密钥都必须是 FINGERPRINT_KEY_LEN 字节，版本必须为正，当前版本必须在表里。
+impl RequestFingerprintKeys {
+    /// 构造并校验：至少一个密钥，版本必须为正，每个密钥 FINGERPRINT_KEY_LEN 字节，当前版本必须在表里。
     pub fn new(
-        lookup_key: Vec<u8>,
-        lookup_key_version: i16,
         request_keys: BTreeMap<i16, Vec<u8>>,
         current_request_key_version: i16,
     ) -> Result<Self, ApplicationError> {
-        if lookup_key.len() != FINGERPRINT_KEY_LEN {
-            return Err(ApplicationError::Configuration(format!(
-                "the idempotency lookup key must be {FINGERPRINT_KEY_LEN} bytes"
-            )));
-        }
-        if lookup_key_version < 1 || current_request_key_version < 1 {
+        if current_request_key_version < 1 {
             return Err(ApplicationError::Configuration(
                 "fingerprint key versions must be positive".to_owned(),
             ));
@@ -124,36 +121,22 @@ impl FingerprintKeys {
             )));
         }
         Ok(Self {
-            lookup_key,
-            lookup_key_version,
             request_keys,
             current_request_key_version,
         })
     }
 
-    /// 从环境变量读：IDEMPOTENCY_LOOKUP_KEY 与 REQUEST_FINGERPRINT_KEY_V<version> 是 32 字节的
-    /// base64；IDEMPOTENCY_LOOKUP_KEY_VERSION 缺省 1，REQUEST_FINGERPRINT_KEY_VERSION 缺省 1，
-    /// 且 1..=当前版本每一档都必须给出密钥。缺失或非法报配置错误，不让进程起来。
+    /// 从环境变量读：REQUEST_FINGERPRINT_KEY_V<version> 是 32 字节的 base64；
+    /// REQUEST_FINGERPRINT_KEY_VERSION 缺省 1，且 1..=当前版本每一档都必须给出密钥。
+    /// 缺失或非法报配置错误，不让进程起来。
     pub fn from_env() -> Result<Self, ApplicationError> {
-        let lookup_key = read_key("IDEMPOTENCY_LOOKUP_KEY")?;
-        let lookup_key_version = read_version("IDEMPOTENCY_LOOKUP_KEY_VERSION", 1)?;
         let current = read_version("REQUEST_FINGERPRINT_KEY_VERSION", 1)?;
         let mut request_keys = BTreeMap::new();
         for version in 1..=current {
             let name = format!("REQUEST_FINGERPRINT_KEY_V{version}");
             request_keys.insert(version, read_key(&name)?);
         }
-        Self::new(lookup_key, lookup_key_version, request_keys, current)
-    }
-
-    #[must_use]
-    pub fn lookup_key(&self) -> &[u8] {
-        &self.lookup_key
-    }
-
-    #[must_use]
-    pub fn lookup_key_version(&self) -> i16 {
-        self.lookup_key_version
+        Self::new(request_keys, current)
     }
 
     #[must_use]
@@ -184,11 +167,6 @@ impl FingerprintKeys {
             Some(key) => input.fingerprint(key).map(Some),
             None => Ok(None),
         }
-    }
-
-    #[must_use]
-    pub fn idempotency_key_digest(&self, idempotency_key: &str) -> String {
-        idempotency_key_digest(&self.lookup_key, idempotency_key)
     }
 }
 

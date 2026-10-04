@@ -1388,7 +1388,6 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
     for column in [
         "execution_protocol",
         "idempotency_key_digest",
-        "idempotency_lookup_key_version",
         "request_digest",
         "request_digest_key_version",
         "execution_owner",
@@ -1397,6 +1396,10 @@ async fn synchronous_gateway_migration_adds_minimal_facts_on_an_existing_databas
     ] {
         assert!(column_exists("jobs", column).await, "缺失列 jobs.{column}");
     }
+    assert!(
+        !column_exists("jobs", "idempotency_lookup_key_version").await,
+        "0035 之后查找摘要不再有密钥版本列"
+    );
     let capacity_table: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM information_schema.tables WHERE table_schema = 'generation' AND table_name = 'execution_capacity'",
     )

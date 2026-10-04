@@ -38,11 +38,12 @@ use crate::{
     ApplicationError, BalanceSource, BeginSubmission, CostInputs, CreateImageGenerationRequest,
     CredentialProvider, DirectExecutionLimits, ExecutionFinalization, ExecutionLookup,
     ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
-    FingerprintKeys, HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling,
-    RequestFingerprintInput, RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision,
+    HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling, RequestFingerprintInput,
+    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision,
     SettleExecution, contract_parameter_face, failure_provider_cost, freeze_offering_pricing,
-    provider_cost_fact, public_error_code, requested_image_count, select_candidate,
-    select_candidate_with_strategy, single_request_cost_cny, validate_idempotency_key,
+    idempotency_key_digest, provider_cost_fact, public_error_code, requested_image_count,
+    select_candidate, select_candidate_with_strategy, single_request_cost_cny,
+    validate_idempotency_key,
 };
 
 /// 直接执行总期限里预留给证据持久化、结算与提交确认的默认预算（秒）。
@@ -236,7 +237,7 @@ pub struct DirectExecutionService {
     executions: Arc<dyn ExecutionRepository>,
     adapters: Arc<dyn AdapterFactory>,
     credentials: Arc<dyn CredentialProvider>,
-    keys: FingerprintKeys,
+    keys: RequestFingerprintKeys,
     timeouts: RequestTimeoutPolicy,
     limits: DirectExecutionLimits,
     /// 总期限 `D` 里留给结算与提交确认的预算 `R`。
@@ -259,7 +260,7 @@ impl DirectExecutionService {
         executions: Arc<dyn ExecutionRepository>,
         adapters: Arc<dyn AdapterFactory>,
         credentials: Arc<dyn CredentialProvider>,
-        keys: FingerprintKeys,
+        keys: RequestFingerprintKeys,
         timeouts: RequestTimeoutPolicy,
         limits: DirectExecutionLimits,
     ) -> Self {
@@ -339,13 +340,13 @@ impl DirectExecutionService {
         }
         let routing_input = routing_request(&request)?;
         let branch = routing_input.branch()?;
-        let idempotency_key_digest = self.keys.idempotency_key_digest(&request.idempotency_key);
+        let lookup_digest = idempotency_key_digest(&request.idempotency_key);
         // 同键预查在选路、候选截断与冻价之前：原记录一旦存在，型号下架、候选停用或选路失败
         // 都不能夺走它的 §4 重放投影（Spec 0005 §4）。命中后按记录冻结的合同与密钥版本比对，
         // 一致才投影；不一致或无法安全比对按 idempotency_conflict 拒绝，绝不新建。
         if let Some(lookup) = self
             .executions
-            .lookup_execution(request.account_id, &idempotency_key_digest)
+            .lookup_execution(request.account_id, &lookup_digest)
             .await?
         {
             return Err(self.replay_projection(&request.endpoint, &routing_input, lookup)?);
@@ -433,8 +434,7 @@ impl DirectExecutionService {
                 offering: admit_offering(&offering),
                 price_snapshot: offering.price_snapshot.clone(),
                 routing,
-                idempotency_key_digest,
-                idempotency_lookup_key_version: self.keys.lookup_key_version(),
+                idempotency_key_digest: lookup_digest,
                 request_digest,
                 request_digest_key_version: self.keys.current_request_key_version(),
                 max_cost_microusd: hold_microusd,

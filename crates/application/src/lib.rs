@@ -67,7 +67,7 @@ pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
 
 mod request_fingerprint;
 pub use request_fingerprint::{
-    FINGERPRINT_KEY_LEN, FingerprintKeys, RequestFingerprintInput, idempotency_key_digest,
+    FINGERPRINT_KEY_LEN, RequestFingerprintInput, RequestFingerprintKeys, idempotency_key_digest,
 };
 
 mod direct_execution;
@@ -1640,9 +1640,8 @@ pub struct AdmitExecution {
     /// 受理时冻结的定价快照，含本次保底额、保底来源与汇率。
     pub price_snapshot: PriceSnapshot,
     pub routing: RoutingDecision,
-    /// 幂等键的不可逆标识（稳定 lookup 密钥）与它的版本。
+    /// 幂等键的不可逆标识（无密钥 SHA-256），只用于查找，不带版本。
     pub idempotency_key_digest: String,
-    pub idempotency_lookup_key_version: i16,
     /// 请求指纹与指纹密钥版本。
     pub request_digest: String,
     pub request_digest_key_version: i16,
