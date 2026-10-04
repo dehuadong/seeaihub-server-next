@@ -35,7 +35,7 @@ curl -sS -o probe-readback.bin -w '%{http_code}\n' "$PUBLIC_URL"
 ## 4. 平台签名的真实服务端联调（需显式批准）
 
 - 前置：上传存储变量指向真实桶；一个平台客户 API Key；显式批准——这一步会在真实桶写入一个对象，产生对象存储的请求费用与残留。
-- 起 API 后发一次探针上传（`probe.png` 就是 §2 用的那个 1×1 PNG）：
+- 起 API 后发探针上传，**限制调用次数**：只发一次（`probe.png` 就是 §2 用的那个 1×1 PNG）：
 
 ```sh
 curl -sS -X POST "$BASE/v1/uploads/images" \

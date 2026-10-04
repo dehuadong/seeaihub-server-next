@@ -82,7 +82,7 @@
 | 类型不在允许范围、0 字节、魔数无法识别 | `400` | `unsupported_media_type` |
 | 声明的 `Content-Type` 与魔数不一致 | `400` | `media_type_mismatch` |
 | 单文件达到或超过 20 MiB | `413` | `image_too_large` |
-| 请求体超过上传路由的请求体上限 | `413` | `request_too_large` |
+| 请求体超过上传路由的请求体上限（声明的 `Content-Length`，或流式读取到同一上限） | `413` | `request_too_large` |
 | 正文慢读超时（受理前） | `408` | `request_timeout` |
 | 请求级速率超限 | `429` | `rate_limit_exceeded` |
 | 本机上传并发满或上传内存预算耗尽 | `429` | `upload_busy` |
@@ -120,13 +120,15 @@
 
 平台在启动或运行期都不探测桶，也不因桶不可读拒绝启动。桶可写但不可匿名读时，上传仍返回 `200`，而返回的 URL 读不到；写错桶、region 或访问密钥时对象存储返回 `403`／`404`，写入本身失败，按 §5 返回 `503 object_store_unavailable`。部署必须在启用上传前自己证明这条前置条件，自检步骤见[对象存储上传设计](../design/0021-object-storage-upload.md) §6，桶策略的写法见[配置项](../operations/configuration.md) §10。
 
+反向代理的请求体上限必须盖住上传路由的请求体上限（`UPLOAD_MAX_REQUEST_BYTES`＝单文件 20 MiB 上限加 multipart 协议余量），这是 §2.2 与 A3b 在真实部署拓扑成立的前提：代理上限更低时，超过它的上传在代理层被拒，调用方拿到的不是平台错误信封，平台侧的 `413 request_too_large` 判据也不适用。平台不探测代理配置，也不因代理上限不足拒绝启动；配置写法见[生产部署](../operations/production.md) §2.5。
+
 ## 9. 验收条件
 
 | 编号 | 可观察判据 |
 | --- | --- |
 | A1 | 全部上传存储变量都不存在时上传返回 `503 upload_storage_unavailable`，对象存储没有新对象，进程照常启动；形状不合法（region / bucket 形状、显式 endpoint 既不是 `https` 也不是 loopback 的 `http`、带凭证、path、query 或 fragment、访问密钥只给一条，或只给了整组配置的一部分）在启动期被拒并点名，进程不启动；密钥解析返回 `Configuration` 类错误时上传返回 `503 upload_storage_unavailable`，不是 `500 internal_error`。 |
 | A2 | 上传一张合法 PNG 返回 `200`，`media_type` 是服务端判定的 `image/png`；用无凭证的客户端读返回的 `url` 能取到与上传一致的字节。 |
-| A3a | 单文件字节严格小于 20 MiB 通过、等于 20 MiB 返回 `413 image_too_large`；请求体超过上传路由的请求体上限时零正文读取返回平台错误信封 `413 request_too_large`，不是框架的裸 `413`。 |
+| A3a | 单文件字节严格小于 20 MiB 通过、等于 20 MiB 返回 `413 image_too_large`；声明的 `Content-Length` 超过上传路由的请求体上限时在零正文读取的情况下返回平台错误信封 `413 request_too_large`，流式读取到同一上限时同样返回平台错误信封 `413 request_too_large`，都不是框架的裸 `413`。 |
 | A3b | 单文件合法、整个请求体超过全局 16 MiB 正文上限且不超过上传路由上限的 multipart 请求被受理：返回 `200` 并写入对象，受理前不返回 `413`。 |
 | A4 | 白名单外的类型、0 字节文件、魔数与声明的 `Content-Type` 不一致都在写入前被拒（`400`），对象存储没有新对象；文件部件不声明 `Content-Type` 时不做一致性比较，`media_type` 仍取魔数判定值。 |
 | A5 | 对象键形如 `reference-media/{UTC 日期}/{uuid}.{ext}`，不含调用方文件名；同一次上传的两次调用产生不同的键。 |
