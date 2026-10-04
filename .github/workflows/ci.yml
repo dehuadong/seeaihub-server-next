@@ -2,11 +2,30 @@ name: ci
 
 on:
   push:
+    # 纯文档与 Agent 记录改不到 Rust 代码和浏览器行为，不必起整条流水线；
+    # 动到代码、测试夹具、工作流仍然照跑。
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.agents/**'
+      - 'out-reference/**'
   pull_request:
+    paths-ignore:
+      - 'docs/**'
+      - '**/*.md'
+      - '.agents/**'
+      - 'out-reference/**'
+
+# 同一分支只保留最新一次：连续推送时旧运行让位，不排队也不重复烧 runner。
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   rust:
     runs-on: ubuntu-24.04
+    # 兜底上限：卡住的用例最多占这么久，不至于拖到默认的 6 小时。
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
@@ -42,6 +61,7 @@ jobs:
   # 全栈串联）。用例与选择器规则见 `apps/web/e2e/` 与根 `AGENTS.md` 的「浏览器行为」一节。
   web-e2e:
     runs-on: ubuntu-24.04
+    timeout-minutes: 30
     services:
       postgres:
         image: postgres:17-alpine
