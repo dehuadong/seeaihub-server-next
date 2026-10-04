@@ -6,7 +6,7 @@ import { captureActiveHold, releaseActiveHold } from './account-state';
 /// 额度减少，结算后按实际扣费多退少补；页面不出现已结算余额、持有中、可用额三个分项，也不出现单笔
 /// 预授权金额（账户资金 Spec A7 的客户那半、控制台 Spec C7、V-D5）。
 ///
-/// "预授权 30"是**真跑**出来的：e2e 不起 Worker，同步入口在窗口后超时（504），请求停在持有中，
+/// "预授权 30"是**真跑**出来的：夹具把上游指到一个不可达地址，直接执行按结果不明转对账、保留占用，
 /// 页面读数因此从 100 掉到 70。实收扣减与释放预授权是 Worker 的结算/收尾事务，浏览器用例里跑不出来，
 /// 由 `account-state.ts` 把**结果**摆进 e2e 库；事务本身由
 /// `apps/api/tests/http_contract/cases_lifecycle.rs` 用真 Worker + 假上游覆盖。
@@ -131,7 +131,7 @@ async function signIn(page: Page, email: string, password: string): Promise<void
   await expect(page.getByTestId('portal-balance')).toContainText('余额');
 }
 
-/// 受理一次并让它停在持有中：没有 Worker，同步入口在窗口后超时。
+/// 受理一次并让它停在持有中：上游地址不可达，结果不明按对账保留占用。
 async function createHold(
   request: APIRequestContext,
   gatewayModel: string,
@@ -148,7 +148,13 @@ async function createHold(
       timeout: 30_000,
     },
   );
-  expect(generation.status(), `没有 Worker 时同步入口超时：${await generation.text()}`).toBe(504);
+  const body = (await generation.json()) as { error?: { code?: string } };
+  // 期限前后回 502 或 504 都可能，但都必须是 outcome_unknown：结果不明才保留占用交对账。
+  expect(
+    [502, 504],
+    `结果不明要停在持有中，不能判成确定未提交：${JSON.stringify(body)}`,
+  ).toContain(generation.status());
+  expect(body.error?.code, '结果不明按 outcome_unknown 回').toBe('outcome_unknown');
 }
 
 /// 接口确认这次受理真的占用了 30 元：已结算余额仍是 100，可用额掉到 70。
