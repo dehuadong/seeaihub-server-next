@@ -252,7 +252,7 @@ server {
     ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 
-    # 生成入口的请求体上限是 16 MiB（参考图/遮罩以公网 URL 或 data URL 文本随正文提交，multipart
+    # 当前生成入口的请求体上限是 16 MiB（参考图/遮罩以公网 URL 或 data URL 文本随正文提交，multipart
     # 文件部件也走这条正文上限）；nginx 默认 1m 会先在它这里 413。示例 16m 与该上限同值。
     # 生成入口收敛为只收公网 URL 的合同见 docs/specs/0005-synchronous-image-gateway.md §1、§3，
     # 随实现落地；本条正文上限不因收敛变化。
