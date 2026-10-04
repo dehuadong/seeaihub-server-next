@@ -2,7 +2,9 @@ use super::*;
 
 /// AIHubMix：两条同步路径都能跑通，且**渠道给什么就返回什么**。
 ///
-/// 覆盖 data URL 输入、公网 URL 输入与 `url` / `b64_json` 两种上游形态。
+/// 覆盖 data URL 输入、公网 URL 输入与 `url` / `b64_json` 两种上游形态。生成入口收敛为只收公网 URL
+/// 后，这里的 data URL 与文件部件用例要改成公网 URL（Spec 0005 §3、Design 0021 分片实施顺序的第 5 片，生成入口收敛）；
+/// multipart 解析仍产出字节，但只供既有记录的重放比对。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() {
@@ -54,7 +56,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         body_contains_bytes(&edits, PNG_FIXTURE),
         "公网 URL 取回的字节必须原样进文件部件"
     );
-    // 平台不落盘：没有上传接口调用，也没有资产接口可用。
+    // 平台不落盘：这次执行没有调用渠道的上传端点，参考图字节由 Adapter 自己从 URL 取。
     assert_eq!(harness.count("POST", "/v1/uploads/images"), 0);
 
     // 3) 参考图走**data URL**：就地解码成字节，仍然不落盘。
@@ -103,8 +105,8 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         body_contains_bytes(&edits, PNG_FIXTURE),
         "两个文件部件的字节都必须到上游"
     );
-    // 文件部件在受理期被转成 data URL 语义、落在候选声明的参数名上；这一步的可见判据就是
-    // 上面那条"字节原样进文件部件"——载荷本身不落库。
+    // 这一步的可见判据就是上面那条"字节原样进文件部件"——载荷本身不落库。生成入口收敛后文件部件会在
+    // 受理前被拒（Spec 0005 §3），当前用例走的仍是收敛前的形态。
 
     // 5) 同义字段只能给一个；只给遮罩是结构性错误。
     let key = format!("sync-conflict-{}", Uuid::new_v4());

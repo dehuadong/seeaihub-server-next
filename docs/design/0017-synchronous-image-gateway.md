@@ -49,7 +49,7 @@ sequenceDiagram
 
 ## 2. 内存输入、候选与输出
 
-入口保留一个拥有请求内容的 `GatewayInput`，包含普通模型参数、输入参考图及 mask。参考图用枚举表达公网 URL、内联 data URL 或上传字节与声明媒体类型；文件部件优先保留 `Bytes`，不先编码为 data URL 再立刻解码。需要 JSON/data URL 的渠道在 wire 序列化阶段编码一次，需上传或 multipart 的渠道直接借用字节。外部 JSON 兼容行为不因内部表达改变。
+入口保留一个拥有请求内容的 `GatewayInput`，包含普通模型参数、输入参考图及 mask。按当前合同，进入执行路径的参考图只有 `http(s)` 公网 URL（[Spec 0005](../specs/0005-synchronous-image-gateway.md) §3）：解析层仍产出公网 URL、内联 data URL 与文件字节三态，后两态只用于按记录冻结的规则比对既有记录，不进新执行；multipart 文件部件优先保留 `Bytes`，不先编码为 data URL 再立刻解码。需要字节的渠道在 wire 序列化阶段自己从 URL 取图，外部 JSON 兼容行为不因内部表达改变。
 
 小结构借用、图片字节共享 `Bytes`，配置共享 `Arc`。需要重试时保存同一份不可变执行输入，通过 body 构造函数重建 HTTP 请求体；不为每次 retry 复制整个 JSON 或图。普通参数可以保留 `serde_json::Value`，但不得用它承载全部图片并在候选循环里深拷贝。
 

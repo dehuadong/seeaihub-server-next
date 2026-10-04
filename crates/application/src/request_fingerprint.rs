@@ -22,8 +22,9 @@ const LOOKUP_DOMAIN: &[u8] = b"seeai/idempotency-lookup/v1";
 
 /// 一次请求里参与指纹的**已识别**输入。
 ///
-/// 未知字段在进入这里之前就被冻结合同过滤掉；图片是公网 URL 或 data URL 的**原值**，平台不下载、
-/// 不解码，摘要只吃内容本身。n 是候选截断前的输出张数。
+/// 未知字段在进入这里之前就被冻结合同过滤掉；按当前合同，入口只收 `http(s)` 公网 URL，图片是 URL 的
+/// **原值**，平台不下载、不解码，摘要只吃内容本身。multipart 解析仍会产出文件部件字节，那些字节只在
+/// 命中既有记录时按记录冻结的规则参与重放比对，不进入新执行。n 是候选截断前的输出张数。
 #[derive(Debug, Clone)]
 pub struct RequestFingerprintInput<'a> {
     pub endpoint: &'a str,

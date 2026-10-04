@@ -74,7 +74,7 @@
 | --- | --- | --- |
 | `POST /v1/images/generations` | 异步，立即返回 `task_id` | 提交生成任务 |
 | `GET /v1/tasks/{task_id}` | 任务查询（可选 `?language=`，只影响 `error.message`） | 轮询到终态并取计量与成本 |
-| `POST /v1/uploads/images` | 上传本地图换公网 `url`（`multipart/form-data`，字段名 `file`） | 调用方给 data URL 时先上传 |
+| `POST /v1/uploads/images` | 上传本地图换公网 `url`（`multipart/form-data`，字段名 `file`） | 渠道能力；生成入口收敛为只收公网 URL 后平台不再调用它（[设计 0021](../design/0021-object-storage-upload.md) §2） |
 
 - 鉴权：`Authorization: Bearer` + `APIMART_API_KEY`。
 - 三个端点在**我们实际配置的域名**上均存在：无凭证请求返回 401，对照的 `/v1/nonexistent-route` 返回 404（零费用探测，[`paid-provider-calls.md`](../verification/paid-provider-calls.md) §5）。
@@ -101,8 +101,8 @@
 - 接受格式 JPEG / PNG / WebP / GIF，单张 ≤ `20MB`；上游文档示例的报错文案（`unsupported image type…`、`file size … exceeds maximum 20971520 bytes`）与上传页一致（出处：`out-reference/apimart/uploads-images.cn.md`）。
 - 生成请求里的参考图是 `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），只接受**公网可访问 URL**。上传页的 Python 示例把它写成 `[{"url": …}]`（对象数组）——实测用字符串数组提交成功并完成出图，平台取字符串数组。
 - 遮罩是 `mask_url`（字符串），与 `image_urls` 同用可行；实测用 512×512 带 alpha 的 PNG、尺寸与参考图一致，上游未报尺寸/通道错误。
-- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台取更严的一侧：一律先上传换 URL。
-- 流程：参考图/遮罩在提交生成任务**之前**先上传换 URL；上传失败＝生成任务**可证明未受理**（`SafeBeforeAcceptance`，[`docs/adr/0011`](../adr/0011-safe-before-acceptance-does-not-retry-yet.md)）⇒ 在额度内重投，用尽后 Job `failed` + 释放预授权，**不进对账**。调用方给公网 URL 时逐字透传、不上传；平台不托管素材，只有 data URL 才需要解码后上传。
+- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台取更严的一侧：生成请求里的参考图只收公网 URL。
+- 流程：参考图/遮罩以公网 URL 提交，平台逐字透传、不代传；调用方手上的本地文件先经平台自己的上传端点换成公网 URL（[Spec 0007](../specs/0007-image-upload-and-object-storage.md)），生成路径不承担素材搬运（[设计 0021](../design/0021-object-storage-upload.md) §2）。
 - 参数名不改写：生成请求用上游原生名 `image_urls` / `mask_url`，由 Offering Parameter Mapping 从合同字段 `image` / `mask` 落位（依据 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。
 - `mask_url` 不在 2.5 生成文档的字段表里，但**实测被接受**（提交 200 → `completed`），因此按厂商契约声明遮罩；渠道将来若拒绝它，表现会是渠道报错，不是平台静默丢字段。
 - 遮罩**不额外计费**：带/不带 `mask_url` 的两次调用 `usage` 与 `cost` 完全相同。

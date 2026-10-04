@@ -30,7 +30,9 @@
              crates/adapter-apimart  ② APIMart 一族
 ```
 
-依赖方向是单向的：`apps/* → application → domain`，基础设施**反向实现**应用层的端口。因此换数据库、加渠道都不牵动领域层。平台不托管生成结果（图片按渠道原形进原形出）；对象存储只服务一条通路——调用方显式上传的输入素材换成公网 URL，落点与机制见[对象存储上传设计](design/0021-object-storage-upload.md) §1，行为合同见[图片上传与对象存储 Spec](specs/0007-image-upload-and-object-storage.md)。
+依赖方向是单向的：`apps/* → application → domain`，基础设施**反向实现**应用层的端口。因此换数据库、加渠道都不牵动领域层。平台不托管生成结果（图片按渠道原形进原形出），生成请求里的输入素材也不落盘；对象存储只服务**一条**通路——调用方显式上传的输入素材换成公网 URL，生成请求与执行记录都不经过它。落点与机制见[对象存储上传设计](design/0021-object-storage-upload.md) §1，行为合同见[图片上传与对象存储 Spec](specs/0007-image-upload-and-object-storage.md)。
+
+基础设施里另有一类**外部服务适配器**：与 ② Adapter Driver 一样反向实现应用层端口、归基础设施，但它不是生成上游——不进 Runtime Revision、不参与选路，渠道差异与它无关。对象存储是这一类。
 
 ## 2. 五层落在哪
 

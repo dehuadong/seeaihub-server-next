@@ -27,6 +27,12 @@
 
 **① 层的已知差距（2026-09-20 登记，同日部分收口）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**已做掉的**：对客请求体改成**扁平**（不再有 `native_parameters` 外壳）、图片改用 OpenAI 契约的 `image` / `mask`（值为公网 URL 或 data URL，平台不再托管素材），参数路径与 `position` 不再出现在调用方面前；AIHubMix 素材与 Adapter 的 `extra` 包装已去掉（`quality` 顶层）。**仍存在的**：其余字段名与取值仍随候选不同（例如同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 且另有 `resolution`），调用方仍要看命中哪个候选；合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定，剩余收口对应的差距登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
+### 1.1 外部服务适配器
+
+② 的外延是**生成上游**：一个 Provider 一族，供应某个 Vendor Model。平台还要调用自己不当作供给的外部服务——上传素材要写对象存储，它没有 Provider、Offering、渠道与发布物，也不参与选路。这类调用按同一种形状落成**外部服务适配器**：一个独立 crate 实现 application 声明的端口，自己拥有该服务的协议、签名与传输的有界性，不读环境变量、不认数据库。它与 ② Adapter Driver 并列，不是 ② 的一支。
+
+判定看事实是谁的：上游的调用路径与响应形态属 ②；平台自己选定的外部服务的协议与凭证属这一类。把外部服务塞进 ② 的外延会让「Provider 一族」这个边界失效——每接一个外部依赖都像多了一条供应渠道，§4 的「接入一个新 Provider」清单也覆盖不了它。今天这一类只有上传用的对象存储，落点见[对象存储上传设计](./0021-object-storage-upload.md) §1。
+
 ## 2. 四条不会违反的规则
 
 这四条都能在既有设计里找到原文依据；它们是防止「渠道差异污染领域」的边界。
@@ -112,6 +118,8 @@ gpt-image-2.5-flare                      <APIMart 实际接受的模型名>  ←
 | **E3 装配点** | 多个 Adapter 需要按 `adapter_key` 派发的组合工厂 | 纯装配，不涉及领域与表结构 |
 
 **除这三类之外**，接入一个新 Provider（加 Driver、发 Profile/Offering/Price、按优先级路由）**不应触发 ① 层或领域模型的改动**。若实现中发现确实触发，应回到 Planning 说明理由，而不是就地扩模型。
+
+外部服务适配器（§1.1）不走这张清单：它不供应任何 Vendor Model，接入它等于平台自己新增一个外部依赖，端口与适配 crate 的落点各自评估。
 
 ## 5. 与既有工件的关系
 

@@ -2802,11 +2802,11 @@ async fn generate_image(
     .await
 }
 
-/// edits 入口（`multipart/form-data`）：`image` 与 `mask` 是**文件部件**。
+/// edits 入口（`multipart/form-data`）：`image` 与 `mask` 以**文本部件**给出 `http(s)` 公网 URL。
 ///
-/// 文件只留在内存里，转成 `data:` URL 语义交给 Driver——**不落盘、不上传**。
+/// 按当前合同，文件部件与 `data:` URL 在受理前被拒（`400 public_image_url_required`），不落盘、
+/// 不上传、不调渠道；文件部件的字节仍由解析层保留，只用于命中既有记录时的重放比对。
 /// 没有 `image` 的 edits 同样合法（那就是文生图）。
-/// 图片字段也可以走文本部件（与 JSON 入口同一套语义），但同一个字段不能既当文件又当文本。
 async fn edit_image(
     State(state): State<AppState>,
     account: Option<Extension<AuthenticatedAccount>>,
@@ -2969,10 +2969,11 @@ fn replay_recorded(
         .map_err(ApiError::from)
 }
 
-/// 按**当前合同**解释有界解析后的入口输入：摘出契约字段名下的文本图片，与 multipart 文件部件合并。
+/// 按**当前合同**解释有界解析后的入口输入：摘出契约字段名下的文本图片，只接受 `http(s)` 公网 URL。
 ///
-/// 只在幂等键未命中记录之后调用。命中时按记录冻结的合同比对，不用这里的新规则重新解释原请求
-/// （Spec 0005 §4）。同一个字段既给文件又给文本一律拒绝：宁可报错也不替调用方挑一个。
+/// 只在幂等键未命中记录之后调用：命中时按记录冻结的合同比对，不用这里的新规则重新解释原请求
+/// （Spec 0005 §4）。`data:` URL 与 multipart 文件部件在这里映射为 `400 public_image_url_required`；
+/// 文件部件字节的归宿是 [`RecordedRequestInput`]（命中记录时的重放比对），不进执行路径。
 fn interpret_current_inputs(
     mut parameters: RequestParameters,
     file_references: Vec<InputImage>,
@@ -3014,6 +3015,7 @@ fn interpret_current_inputs(
 }
 
 /// multipart 图片部件：**直接保留字节**与声明的媒体类型，不再先编码成 data URL 再解码（RFC 0017 §2）。
+/// 这些字节只作为命中既有记录时的重放比对材料，不进新执行路径。
 async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
     let media_type = field
         .content_type()

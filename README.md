@@ -6,7 +6,7 @@
 
 - 一个 `CreateImageGenerationRequest` 接收入口与一条直接执行路径；内部只持久化最小执行与账务记录（Job/Attempt，对客不可见）；
 - 两个渠道族的 Adapter：AIHubMix（`https://api.inferera.com`，同步）与 APIMart（`https://api.apib.ai`，任务式，只在 Adapter 内部）；
-- 对客只有两条同步路径：`POST /v1/images/generations`（JSON）与 `POST /v1/images/edits`（multipart）；参考图/遮罩用公网 URL 或 data URL 给出；
+- 对客只有两条同步路径：`POST /v1/images/generations`（JSON）与 `POST /v1/images/edits`（multipart）；参考图/遮罩用 `http(s)` 公网 URL 给出，`data:` URL 与 multipart 文件部件在受理前被拒；
 - 无图片走上游的文生图接口；有图片、可选遮罩则按渠道自己的参数走图生图/编辑；
 - 结果按渠道原形返回：渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，平台不落盘静态素材；
 - PostgreSQL 固化 Runtime Revision、Job、Attempt、Price Snapshot 和账本；
@@ -55,7 +55,7 @@ cargo run -p seeai-worker            # 另开一个终端
 
 本机 `*.localhost` 由浏览器解析到回环，**不用改 hosts**；但 **Node 的解析器不认 `.localhost`**，脚本里要直连 `127.0.0.1:8081`。可选的供给清单来自 `SUPPLY_MATERIAL_DIR`（开发时可设 `config/bootstrap`），不设就是空的。
 
-参考图与遮罩是**参数值**：公网 URL 或 `data:image/…;base64,…`（遮罩用 PNG data URL）。平台不落盘、不校验其内容——上游不接受就会报错。
+参考图与遮罩是**参数值**：`http(s)` 公网 URL，平台不落盘、不校验其内容——上游不接受就会报错。`data:` URL 与 multipart 文件部件不是合法输入，本地文件先经上传端点换成公网 URL（合同见 [`docs/specs/0007`](docs/specs/0007-image-upload-and-object-storage.md)）。
 
 **逐项说明与常见坑见 [`docs/operations/development.md`](docs/operations/development.md)；生产部署见 [`docs/operations/production.md`](docs/operations/production.md)。**
 

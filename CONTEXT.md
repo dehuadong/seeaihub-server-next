@@ -40,6 +40,10 @@ _Avoid_: 全局 Provider 参数表、跨厂商统一转换、Adapter 的字段�
 Provider 的一个调用入口及凭证身份，包含地址、凭证引用和启用状态。
 _Avoid_: Provider、Offering
 
+**Upload Storage**（上传存储）:
+平台写入调用方上传素材的阿里云 OSS 位置，配置只有部署侧环境变量：region、bucket、可选 endpoint 与访问密钥。它**不是** [Channel](#channel)：Channel 是 Provider 的调用入口与凭证身份，上传存储是平台自己调用的外部服务，不进 Runtime Revision、不参与选路、不计费，也没有管理端页面、渠道行与激活动作；访问密钥只从部署侧环境变量成对读取，未配置时上传端点按请求返回 `503`，进程启动不因缺配置失败。桶必须匿名可读是部署的运维前置条件，平台不逐对象发 ACL 头，也不在运行期探测桶。命名用「上传存储」正是为了不与 Channel 撞名。行为合同见[图片上传与对象存储 Spec](docs/specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](docs/design/0021-object-storage-upload.md)。
+_Avoid_: 上传渠道（与 Channel 混用）、资产库、把上传存储当成一种 Provider 或 Offering、把上传存储当成渠道行或发布物
+
 **Runtime Revision**:
 一次经过校验并发布的不可变运行时目录，固定模型、供给、渠道限制与价格关系。
 _Avoid_: 配置文件、当前缓存

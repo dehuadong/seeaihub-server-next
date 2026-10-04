@@ -5,7 +5,7 @@
 每个变量按"不设会怎样"分三类：
 
 - **必填**：不设进程起不来，报错点名。`DATABASE_URL`（两个进程）、`ADMIN_TOKEN`（API）与 `CUSTOMER_HISTORY_CURSOR_KEY`（API）。
-- **不设＝关掉该能力**：进程照常启动，但某个功能静默失效，日志里只有一条容易漏掉的提示。这类最容易踩——供给导入、管理员登录、渠道密钥、加速层、告警出口，以及多 worker 的 `WORKER_ID`；下面各表会点出来。
+- **不设＝关掉该能力**：进程照常启动，但某个功能静默失效，日志里只有一条容易漏掉的提示。这类最容易踩——供给导入、管理员登录、渠道密钥、上传存储配置、加速层、告警出口，以及多 worker 的 `WORKER_ID`；下面各表会点出来。
 - **有缺省**：不设就走代码缺省，按需覆盖。
 
 `RUST_LOG` 控制日志级别（缺省 `info`），输出是 **JSON**。各表"缺省"列是代码里的缺省，没设就走它。
@@ -193,20 +193,24 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 
 **轮换**：把 `REQUEST_FINGERPRINT_KEY_VERSION` 抬到新值并加上新一档密钥，旧的保留；已有记录继续按自己的版本复核。移除旧版本密钥会让那批记录无法安全比对，同键调用返回 409 `idempotency_conflict`，而不是当成新请求。
 
-## 10. 上传端点与对象存储
+## 10. 上传端点与上传存储
 
-调用方把本地文件经 `POST /v1/uploads/images` 写入对象存储换公网 URL，再作为参考图或遮罩提交（行为合同见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](../design/0021-object-storage-upload.md)）。上传不计费、不计量、不限配额，也不建执行记录。
+调用方把本地文件经 `POST /v1/uploads/images` 写入上传存储换公网 URL，再作为参考图或遮罩提交生成请求（行为合同见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](../design/0021-object-storage-upload.md)）。上传不计费、不计量、不限配额，也不建执行记录；上传存储只有**阿里云 OSS** 一种。
 
-渠道的 region、bucket 与 endpoint 是入库的公开配置，由管理员在渠道页填写与激活，不进环境变量。单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。
+上传存储的配置**全部从环境变量读**：没有后台管理页，也没有数据库表。取值域与失败分类见[对象存储上传设计](../design/0021-object-storage-upload.md)。
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
-| `UPLOAD_STORAGE_ACCESS_KEY_ID` | 空＝该渠道未配置 | 访问密钥标识。与下一条一起构成完整凭据；只从环境变量读，不进库、不进日志与响应 |
-| `UPLOAD_STORAGE_ACCESS_KEY_SECRET` | 空＝该渠道未配置 | 访问密钥。两条只配一条时该渠道按"未配置"处理，进程照常启动，但不能激活 |
+| `UPLOAD_STORAGE_REGION` | 无；整组都不给＝未配置 | 形如 `cn-hangzhou`，取值是小写字母、数字与连字符，首尾必须是字母或数字，长度不超过 63 |
+| `UPLOAD_STORAGE_BUCKET` | 无；整组都不给＝未配置 | 3–63 位小写字母、数字与连字符，**不含点号**（含点的桶名在 `{bucket}.{host}` 形态下会撞只覆盖一级标签的通配符证书） |
+| `UPLOAD_STORAGE_ENDPOINT` | 按 region 派生 | 可选；省略时用 `https://oss-{region}.aliyuncs.com`，显式给出时必须是 `https`、只含主机名与可选端口，不带凭证、path、query 与 fragment |
+| `UPLOAD_STORAGE_ACCESS_KEY_ID` | 无；须与下一条成对 | 访问密钥标识。只从环境变量读，不进日志与响应 |
+| `UPLOAD_STORAGE_ACCESS_KEY_SECRET` | 无；须与上一条成对 | 访问密钥 |
 | `UPLOAD_MAX_REQUEST_BYTES` | 单文件上限加 multipart 协议余量 | 上传请求体上限，超限回 `413 request_too_large`；余量取值在实施时定 |
 | `UPLOAD_SLOTS` | 实施时取值 | 本机同时读上传正文的许可数，取不到回 `429 upload_busy`，不排队 |
 | `UPLOAD_MAX_BUFFER_BYTES` | 实施时取值 | 本机上传内存预算 |
 | `UPLOAD_REQUEST_TIMEOUT_SECONDS` | 实施时取值 | 单次写对象存储的请求超时 |
-| `UPLOAD_HEALTH_PROBE_TIMEOUT_SECONDS` | 实施时取值 | 健康探针单请求超时 |
 
-健康结论只在激活渠道时产生：平台不按周期探测，也不因健康结论自动停用渠道。渠道行由迁移种下一行 `aliyun_oss`，管理端不提供新建渠道。
+单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。上传存储的**整组变量都不给＝未配置**：进程照常启动，上传端点对该请求返回 `503 upload_storage_unavailable`；**只给一部分**（缺 region、bucket 或任一条密钥）或取值形状不合法＝**启动期拒绝并点名**，进程不启动。启动与运行期都不做活体探测：对象存储可达性、bucket 是否存在与桶是否匿名可读都不在启动判据里。
+
+**桶必须匿名可读**，这是运维前置条件：平台不逐对象发 `x-oss-object-acl` 或任何 ACL 头，对象的匿名可读只由桶策略给。平台在启动与运行期都不探测桶；启用上传前由部署侧按[对象存储上传设计](../design/0021-object-storage-upload.md) 的四步自检证明这个桶可用（PUT 探针 → HEAD 核验字节与类型 → 签名 GET → 匿名 GET 且字节一致），任一步失败就改桶策略、region、bucket 或密钥。桶配错的表现是上传返回 `200` 而公网 URL 读不到。

@@ -97,7 +97,8 @@ const PNG_FIXTURE: &[u8] = &[
     0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
-/// 平台上没有对象存储也没有资产接口，图片只以 data URL 的形态在请求里出现。
+/// 调用方以内联 data URL 给出参考图的形态；生成入口收敛为只收公网 URL 后，这些用例要改用公网 URL
+/// （Spec 0005 §3、Design 0021 分片实施顺序的第 5 片，生成入口收敛）。
 fn png_data_url() -> String {
     format!("data:image/png;base64,{}", STANDARD.encode(PNG_FIXTURE))
 }

@@ -9,7 +9,7 @@
 
 修订关系：v5 基于 2026-09-18 的真实付费验证，取代 v4 的「生产路径优先使用 `/ai/v1` 统一异步接口」结论；v4 的 Provider/Vendor 身份、Native Schema 发布与安全重试规则继续有效并已并入本文（其中的**资产归档**已于 2026-09-20 作废，见下方更正）；v3 的统一 Command/Job 与「文生图、图生图同阶段」结论同样继续有效。v1、v2、v3、v4 的逐版全文仍保留在上游 issue 评论中，作为修订历史，不复制到本仓库。
 
-**2026-09-20 就地更正（非修订级变更）**：本文原写的"输入侧先落成 Asset 并校验 MIME/魔数/尺寸/摘要""结果必须先归档到自有对象存储才算成功""对客有 202 受理与 job_id 轮询"三条**已作废**——图片按渠道原形进原形出，平台不落盘静态资产，对客只有同步形态。依据 [`docs/adr/0019`](../adr/0019-images-pass-through-without-asset-storage.md)，取代 [`docs/adr/0008`](../adr/0008-own-object-storage-is-the-platform-result.md)（已退役）。下文涉及之处已就地改写；Job/Attempt/计量证据/对账/结算不受影响，仍是内部执行与审计单位。
+**2026-09-20 就地更正（非修订级变更）**：本文原写的"输入侧先落成 Asset 并校验 MIME/魔数/尺寸/摘要""结果必须先归档到自有对象存储才算成功""对客有 202 受理与 job_id 轮询"三条**已作废**——图片按渠道原形进原形出，生成请求内不落盘静态资产（调用方显式上传的输入素材另见 [ADR 0022](../adr/0022-reference-image-upload-endpoint.md)），对客只有同步形态。依据 [`docs/adr/0019`](../adr/0019-images-pass-through-without-asset-storage.md)，取代 [`docs/adr/0008`](../adr/0008-own-object-storage-is-the-platform-result.md)（已退役）。下文涉及之处已就地改写；Job/Attempt/计量证据/对账/结算不受影响，仍是内部执行与审计单位。
 
 配套工件：实现映射见 [0001-image-generation.md](./0001-image-generation.md)；从本设计抽取的持久决策见 `docs/adr/`。
 
@@ -40,8 +40,8 @@ Provider 与 Vendor 不合并：以后其他 Provider 也供应 `gpt-image-2` �
 CreateImageGenerationRequest {        // 调用方看到的形状（对客接口）
   model,                             // 对外的模型字段＝平台型号名（运营发布时的型号标识）
   <合同里的模型参数，扁平放顶层>,        // prompt / n / size / quality / …
-  image | image_urls,                // 参考图（同义、二选一）：公网 URL 或 data:image/…;base64,…
-  mask,                              // 可选；PNG data URL
+  image | image_urls,                // 参考图（同义、二选一）：http(s) 公网 URL
+  mask,                              // 可选；http(s) 公网 URL
   // 幂等键走 `Idempotency-Key` 请求头；预授权额由服务端定，调用方不报
 }
 ```
@@ -53,7 +53,7 @@ CreateImageGenerationRequest {        // 调用方看到的形状（对客接口
 | 条件 | 内部判定 | 约束 |
 | --- | --- | --- |
 | 无 `image`、无 `mask` | prompt-only | 使用厂商原生文生图参数合同 |
-| 有 `image`、无 `mask` | image-conditioned | 图**只是参数值**（公网 URL 或 data URL）：平台不校验内容、MIME、字节或数量，交给渠道判 |
+| 有 `image`、无 `mask` | image-conditioned | 图**只是参数值**（`http(s)` 公网 URL）：平台不校验内容、MIME、字节或数量，交给渠道判 |
 | 有 `image`、有 `mask` | masked | 仅在候选声明支持时启用；mask 同样是参数值，尺寸/通道由渠道校验 |
 | 无 `image`、有 `mask` | 非法 | 调用上游前失败 |
 
@@ -67,7 +67,7 @@ admitted → executing → succeeded
 
 没有领取阶段：执行由发起这次请求的 API 进程直接持有并完成。Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、请求指纹与幂等摘要、Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
-HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations`（JSON）与 `/v1/images/edits`（`multipart/form-data`，`image`/`mask` 是文件部件）。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。multipart 上 `image`/`mask` 既可以是文件部件（字节只在内存里转成 data URL 语义），也可以是文本部件（值按 URL/data URL 读）——两者同一套语义，但同一个字段不能既当文件又当文本。
+HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations`（JSON）与 `/v1/images/edits`（`multipart/form-data`，`image`/`mask` 以文本部件给出公网 URL）。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。multipart 上 `image`/`mask` 只认文本部件，值按 `http(s)` 公网 URL 读；`data:` URL 与文件部件在受理前被拒（[Spec 0005](../specs/0005-synchronous-image-gateway.md) §3）。
 
 ## 4. 执行路径与接口职责
 
@@ -146,13 +146,13 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 
 ## 8. 输入与输出图片
 
-- 参考图/遮罩就是普通参数值：公网 URL 原样交给上游，data URL 就地解码后按上游要的形态发出去（AIHubMix 的编辑端点要文件部件，所以要字节）；
+- 参考图/遮罩就是普通参数值：`http(s)` 公网 URL；AIHubMix 的编辑端点要文件部件，所以由 Adapter 自己从 URL 取字节，平台不代取；
 - `image`/`images`/`mask` 仍保留 AIHubMix 原生字段语义，平台只把它们放到这些字段上；
 - AIHubMix 输出 URL 约 30 分钟失效，且下载可能需同一 Bearer。平台**不代取**：渠道给 `b64_json` 就回 base64、给 `url` 就回 URL，长期保存由调用方自己负责（决策见 `docs/adr/0019-images-pass-through-without-asset-storage.md`）；
 - 上游 URL 和 Bearer 不返回给平台调用方，不作为永久结果；
 - 当前正式 `/v1` 路径没有可查询 task id；响应解析失败导致是否已生成、是否已计费不确定时，进入 `reconciliation_required`，不得自动重新提交。只有将来发布带可查询任务标识的新执行策略时，才允许在同一 Attempt 内恢复取结果。
 
-图片就是**候选声明的那个参数的值**（`/image`、`/image_urls/0`、`/mask_url`）；平台不持有字节、不给它独立身份，因此没有资产表，也没有资产引用。决策依据见 `docs/adr/0019-images-pass-through-without-asset-storage.md`。
+图片就是**候选声明的那个参数的值**（`/image`、`/image_urls/0`、`/mask_url`）；平台不持有字节、不给它独立身份，因此生成请求内没有资产表，也没有资产引用。决策依据见 `docs/adr/0019-images-pass-through-without-asset-storage.md`；调用方显式上传的输入素材另见 [Spec 0007](../specs/0007-image-upload-and-object-storage.md) 与 [ADR 0022](../adr/0022-reference-image-upload-endpoint.md)。
 
 ## 9. Adapter 首期能力
 
