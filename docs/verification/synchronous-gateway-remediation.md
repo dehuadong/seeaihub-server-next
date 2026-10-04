@@ -151,3 +151,73 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 - 续约三类失败目前的证据是单元用例：容器的 `ownership_lost` 置位、以及被拒后零新增外部动作；真实数据库断开与超时下的端到端零新增调用仍待取证。
 - 本节的 `direct_execution` 用例用假渠道与一次性库；没有调用任何真实 Provider。
 
+## 10. 先查记录再解释请求（R9）的落地证据与 A1/A5/A10 取证
+
+本节记录[整改设计](../design/0018-synchronous-gateway-remediation.md) §9.1（R9）的落地证据，以及本轮实际取得的 A1/A10 证据与 A5 的缺口。基线 `0ca365b`，改动未提交。
+
+### 已落地
+
+| 面 | 结果 |
+| --- | --- |
+| 查找位置 | 两条入口都先做完有界解析（JSON 走 `RequestParameters::parse_with_limits`，multipart 逐字段计数），再用账户与 `Idempotency-Key` 查记录；图片字段抽取、`model` 判定与分支判定、候选处理都在命中判定之后 |
+| 命中判定 | `DirectExecutionService::lookup_recorded` 只读账户与键；命中后 `replay_recorded` 从**原始参数面**按记录冻结的 `capability_schema` 与 `request_digest_key_version` 重算指纹，一致才投影 |
+| 缺材料 | `ExecutionLookup` 的请求指纹、密钥版本与冻结合同都是 `Option`：`lookup_execution` 改用 `LEFT JOIN catalog.vendor_models`，记录在而材料不在时返回 `Some`，由用例层按 `409 idempotency_conflict` 拒绝——不再返回 500，也不再当作未命中 |
+| 未命中 | 只有 `lookup_recorded` 返回 `None` 才按当前合同解释这次请求；`execute` 内的同键预查仍保留，覆盖入口未命中之后、受理之前的并发 |
+| 容量 | 命中判定读的是有界解析后的参数面，不为比对复制图片；本机执行/发送许可仍在未命中之后才预留 |
+
+### 新增用例与结果
+
+| 用例 | 结果 | 判别力 |
+| --- | --- | --- |
+| `cases_direct_execution::direct_replay_uses_the_recorded_contract_after_a_republish` | passed | 新修订要求新必填参数后，同键同正文仍按记录冻结的合同投影 `409 result_not_retained`；同一正文换新键则按当前合同回 `400 validation_error`，不建记录、不调上游 |
+| `cases_direct_execution::direct_replay_without_comparison_material_is_a_conflict` | passed | 记录还在、`request_digest` 被抹掉时回 `409 idempotency_conflict`，不执行；改前这条路回 500 |
+| `cases_direct_execution::direct_replay_is_checked_before_the_current_contract_interprets_the_body` | passed | 同键正文带一个非公网 URL、非 data URL 的图片值时回 `409 idempotency_conflict`（查找发生在图片字段抽取之前）；改前是 `400 invalid_parameter` |
+| `cases_direct_execution::direct_replay_with_a_reference_image_uses_the_recorded_fingerprint` | passed | 带 data URL 参考图的同键重发也命中同一条记录：比对从原始参数面里摘图片字段，指纹取值与受理时逐字相同 |
+
+### 我实际跑过的命令与结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo check --workspace --all-targets` | 无 error、无警告 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 通过 |
+| `cargo test -p seeai-api` | 42 passed、6 ignored；`http_contract` 无库用例 4 passed、201 ignored |
+| `cargo test -p seeai-application --lib` | 162 passed |
+| `HTTP_CONTRACT_DATABASE_URL` 取自 `.env` 的 `DATABASE_URL`、`--test-threads=1`：`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 cases_direct_execution cases_funds` | 25 passed（20 direct_execution + 5 funds） |
+| 同环境：`cargo test -p seeai-application --test direct_execution -- --ignored --test-threads=1` | 24 passed |
+| 同环境：`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 aihubmix_sync_entries_accept_images_and_return_the_provider_envelope synchronous_gateway_migration_adds_minimal_facts_on_an_existing_database finished_requests_page_within_a_pinned_window` | 3 passed |
+
+以上真库用例全部走进程内假上游，没有调用任何真实 Provider；`HTTP_CONTRACT_DATABASE_URL` 的值没有打印，也没有并行跑。
+
+### A1
+
+| 入口 | 上游形态 | 用例 | 结果 |
+| --- | --- | --- | --- |
+| `/v1/images/generations`（JSON） | `url` | `cases_direct_execution::direct_json_generation_returns_url_without_a_worker` | passed |
+| `/v1/images/generations`（JSON） | `b64_json` | `cases_direct_execution::direct_json_generation_returns_base64_without_a_worker` | passed |
+| `/v1/images/edits`（multipart 文件部件） | 同一条闭环 | `cases_aihubmix::aihubmix_sync_entries_accept_images_and_return_the_provider_envelope` | passed |
+
+三条都不启 Worker：`200` 本身就是"这条路不依赖 Worker 生成队列或结果轮询"的判据。前两条各钉一种上游形态（`url` 原样交回、`b64_json` 与 `STANDARD.encode(PNG_FIXTURE)` 逐字相等）；第三条把两条入口放在同一个进程里跑通，另覆盖公网 URL 参考图、data URL 参考图与 multipart 文件部件三种输入形态。
+
+### A5
+
+强杀与恢复矩阵**本轮没有跑**：仓库里没有"在提交前 / 提交中 / 句柄入库前 / 轮询中 / 取得证据后 / 结算提交前后注入子进程强杀"的用例（`harness.rs` 里的 `child.kill()` 只是夹具收尾），本机因此拿不出这一矩阵的任何一条子项，A5 仍待单独取证。
+
+本轮跑到的是相邻的数据库故障注入，不是子进程强杀，只能算 A5 的部分前置：`cargo test -p seeai-application --test direct_execution`（24 passed）里的 `an_unknown_settle_commit_is_confirmed_instead_of_assumed_failed`、`the_same_key_replays_settled_failed_and_unknown_outcomes`、`an_unknown_acceptance_reconciles_and_keeps_the_hold`、`accepted_unpersisted_offers_late_facts_and_reconciles` 覆盖"结算提交结果未知先只读确认、不先假定失败"与"未知受理保留 Hold 并转对账"。
+
+### A10
+
+| 面 | 用例 | 结果 |
+| --- | --- | --- |
+| 记录字段面没有请求与图片 | `cases_migrations::synchronous_gateway_migration_adds_minimal_facts_on_an_existing_database` | passed：`generation.jobs` 在场的是 `idempotency_key_digest`、`request_digest`、`provider_task_handle`、`image_count` 等最小事实；`native_parameters`、`result_images`、`carrier_schema`、`parameter_mapping`、`idempotency_key`、`request_hash` 等载荷列已不在 |
+| 客户读只依赖最小投影 | `cases_customer_history::finished_requests_page_within_a_pinned_window` | passed：客户用量视图按游标分页读已完成的调用记录（状态、金额、产出张数） |
+| 对客响应没有内部记录 | `cases_direct_execution` 的 `direct_*` 各条 | passed：`assert_sync_success` 先跑 `assert_public_only`，钉住响应里不出现 job / offering / channel 等内部词汇，且每张图恰好只有 `url` 或 `b64_json` 一个字段 |
+
+管理端与客户的用量、成本、金额读（`cases_cost_facts`、`cases_billing`、`cases_customer_history` 其余各条）**本轮没有跑**。
+
+### 未跑通与待验证
+
+- A5 的子进程强杀与恢复矩阵：没有用例、本轮没跑，仍按第 2、5 节单独取证。
+- A1 的 `edits` 入口只跑了返回 `url` 形态那条端到端用例；`edits` 配 `b64_json` 的闭环没有单独用例，本轮的 base64 证据来自 JSON 入口那一条。
+- A10 的管理端用量/成本读与金额口径本轮没跑（`cases_cost_facts`、`cases_billing`）。
+- `direct_replay_uses_the_recorded_contract_after_a_republish` 走通的是 Application 层已有的"按记录冻结合同投影"路径，改前也会通过；本轮真正判别的两条是缺材料 409 与查找先于图片解释。

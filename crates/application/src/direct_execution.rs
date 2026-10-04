@@ -24,7 +24,7 @@ use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
     ImageParameterKind, JobId, MeteringEvidence, OfferingCandidate, ProviderCostFact,
     ProviderTaskHandle, ProviderTraceId, PublishedOffering, ReceiptCredential, RequestParameters,
-    RouteStrategy, image_parameter_kind, platform_image_parameters,
+    RouteStrategy, image_parameter_kind, platform_image_parameters, take_contract_image_inputs,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -95,6 +95,22 @@ pub struct DirectExecutionRequest {
     pub reference_images: Vec<InputImage>,
     pub mask: Option<InputImage>,
     pub idempotency_key: String,
+}
+
+/// 命中同键记录后比对用的**原始输入**：有界解析之后、按任何合同解释之前的那一份请求面。
+///
+/// 它比 [`DirectExecutionRequest`] 早一步：图片还在参数面的契约字段名下（JSON 入口），或还是
+/// multipart 文件部件（edits 入口）。记录比对用它按**记录冻结的合同**重算指纹，因此图片字段
+/// 抽取、型号与分支判定都发生在查找之后（RFC 0018 §9.1）。
+pub struct RecordedRequestInput<'a> {
+    /// 幂等键：进记录比对用的请求面（[`CreateImageGenerationRequest`] 的一份形状）。
+    pub idempotency_key: &'a str,
+    /// 已经计过数的参数面；契约字段名下的图片还在里面。
+    pub parameters: RequestParameters,
+    /// multipart 文件部件：参考图。
+    pub file_references: &'a [InputImage],
+    /// multipart 文件部件：遮罩。
+    pub file_mask: Option<&'a InputImage>,
 }
 
 /// 执行所有权的登记出口：直接执行用例在**首次提交声明落库后**把 `(job_id, fencing_token)` 交给调用方。
@@ -434,6 +450,9 @@ impl DirectExecutionService {
         // 同键预查在选路、候选截断与冻价之前：原记录一旦存在，型号下架、候选停用或选路失败
         // 都不能夺走它的 §4 重放投影（Spec 0005 §4）。命中后按记录冻结的合同与密钥版本比对，
         // 一致才投影；不一致或无法安全比对按 idempotency_conflict 拒绝，绝不新建。
+        //
+        // 入口已经用 [`DirectExecutionService::lookup_recorded`] 查过一次（那次在按当前合同解释
+        // 请求之前）；这一条覆盖并发：入口未命中之后、受理之前，另一个同键请求可能已经落了记录。
         if let Some(lookup) = self
             .executions
             .lookup_execution(request.account_id, &lookup_digest)
@@ -915,18 +934,74 @@ impl DirectExecutionService {
         }
     }
 
+    /// 同键只读预查：按账户与键取原记录的投影，未命中返回 `None`。
+    ///
+    /// 入口在**按当前合同解释请求之前**调用它：那时正文只做过有界解析，图片字段还没摘出来、
+    /// 默认值还没注入、型号与分支还没判、候选还没选。未命中返回 `None` 只表示这个账户与这个键
+    /// 没有任何记录；记录存在但比较材料缺失时仍返回 `Some`（材料字段为 `None`），调用方必须按
+    /// `409 idempotency_conflict` 拒绝，不能当作未命中重新受理（RFC 0018 §9.1）。
+    pub async fn lookup_recorded(
+        &self,
+        account_id: AccountId,
+        idempotency_key: &str,
+    ) -> Result<Option<ExecutionLookup>, ApplicationError> {
+        validate_idempotency_key(idempotency_key)?;
+        let lookup_digest = idempotency_key_digest(idempotency_key);
+        self.executions
+            .lookup_execution(account_id, &lookup_digest)
+            .await
+    }
+
+    /// 命中记录后的比对与投影：用记录**冻结的合同**与它写下的指纹版本重算这次请求的指纹。
+    ///
+    /// `input` 是有界解析后的原始请求面（契约字段名下的图片还在参数里，multipart 文件部件单独带）。
+    /// 材料缺失、这次请求在记录合同下认不出来、或指纹不等，都按 `409 idempotency_conflict` 拒绝
+    /// ——旧记录按它自己的规则解释，不拿新修订重定义，也不因为比对不了就当作新请求执行
+    /// （Spec 0005 §4，RFC 0018 §9.1）。
+    pub fn replay_recorded(
+        &self,
+        account_id: AccountId,
+        endpoint: &str,
+        lookup: ExecutionLookup,
+        input: RecordedRequestInput<'_>,
+    ) -> Result<DirectExecutionError, ApplicationError> {
+        let request = match recorded_request_face(account_id, input) {
+            Some(request) => request,
+            None => {
+                tracing::warn!(
+                    job_id = %lookup.job_id,
+                    "the current request cannot be projected onto the recorded one; treating it as an idempotency conflict"
+                );
+                return Ok(idempotency_conflict());
+            }
+        };
+        self.replay_projection(endpoint, &request, lookup)
+    }
+
     /// 同键命中后的安全比对与 Spec 0005 §4 投影。
     ///
-    /// 用记录**冻结的合同**与它写下的密钥版本重算这次请求的指纹：一致才按原阶段投影；版本不同、
-    /// 旧密钥未配置，或这次请求在冻结合同下根本识别不出来时，都无法安全比对，一律按
-    /// idempotency_conflict 拒绝——旧记录仍按它自己的规则解释，不拿新修订重定义（RFC 0017 §2）。
+    /// 用记录**冻结的合同**与它写下的密钥版本重算这次请求的指纹：一致才按原阶段投影；比较材料
+    /// 缺失、版本不同、旧密钥未配置，或这次请求在冻结合同下根本识别不出来时，都无法安全比对，
+    /// 一律按 idempotency_conflict 拒绝——旧记录仍按它自己的规则解释，不拿新修订重定义
+    /// （Spec 0005 §4，RFC 0017 §2）。
     fn replay_projection(
         &self,
         endpoint: &str,
         request: &CreateImageGenerationRequest,
         lookup: ExecutionLookup,
     ) -> Result<DirectExecutionError, ApplicationError> {
-        let recognized = match contract_parameter_face(request, &lookup.capability_schema) {
+        let (Some(request_digest), Some(key_version), Some(capability_schema)) = (
+            lookup.request_digest.as_deref(),
+            lookup.request_digest_key_version,
+            lookup.capability_schema.as_ref(),
+        ) else {
+            tracing::warn!(
+                job_id = %lookup.job_id,
+                "the recorded request has no comparison material; treating it as an idempotency conflict"
+            );
+            return Ok(idempotency_conflict());
+        };
+        let recognized = match contract_parameter_face(request, capability_schema) {
             Ok(parameters) => Value::Object(parameters),
             Err(error) => {
                 tracing::warn!(
@@ -938,7 +1013,7 @@ impl DirectExecutionService {
             }
         };
         let recomputed = self.keys.request_fingerprint(
-            lookup.request_digest_key_version,
+            key_version,
             &RequestFingerprintInput {
                 endpoint,
                 gateway_model: &request.model,
@@ -948,7 +1023,7 @@ impl DirectExecutionService {
                 n: requested_image_count(&recognized),
             },
         )?;
-        if recomputed.as_deref() != Some(lookup.request_digest.as_str()) {
+        if recomputed.as_deref() != Some(request_digest) {
             return Ok(idempotency_conflict());
         }
         Ok(project_replay(
@@ -1482,6 +1557,53 @@ fn image_text(image: &InputImage) -> Result<String, ApplicationError> {
         .to_data_url()
         .map(|value| value.into_owned())
         .map_err(|error| ApplicationError::Validation(error.to_string()))
+}
+
+/// **原始输入** → 记录比对用的请求面：命中同键记录后按记录冻结的合同解释这次请求的那一半。
+///
+/// 图片按契约字段名从参数面里摘出（与受理侧同一组固定名字），multipart 文件部件编码成 data URL；
+/// `model` 与受理侧一样从普通参数面移走。形状取不出来——图片值类型不对、两个同义字段都给、
+/// 没有 `model`——时返回 `None`：这次请求无法用记录冻结的合同解释，调用方必须按冲突拒绝，
+/// 不能当作未命中去执行新请求。
+///
+/// 它不做任何版本化判定：合同面（有没有声明图片位、必填项、`n` 的取值面）由调用方拿记录冻结的
+/// `capability_schema` 应用。
+fn recorded_request_face(
+    account_id: AccountId,
+    input: RecordedRequestInput<'_>,
+) -> Option<CreateImageGenerationRequest> {
+    let RecordedRequestInput {
+        idempotency_key,
+        mut parameters,
+        file_references,
+        file_mask,
+    } = input;
+    let text = take_contract_image_inputs(&mut parameters).ok()?;
+    // 文件部件在场时以它为准：受理侧两者同时给出会被拒，因此不存在"两边都有"的记录。
+    let reference_images = if file_references.is_empty() {
+        text.reference_images
+    } else {
+        file_references
+            .iter()
+            .map(image_text)
+            .collect::<Result<Vec<_>, _>>()
+            .ok()?
+    };
+    let mask = match file_mask {
+        Some(image) => Some(image_text(image).ok()?),
+        None => text.mask,
+    };
+    let model = parameters
+        .remove("model")
+        .and_then(|value| value.as_str().map(str::to_owned))?;
+    Some(CreateImageGenerationRequest {
+        account_id,
+        model,
+        native_parameters: parameters.as_value().clone(),
+        reference_images,
+        mask,
+        idempotency_key: idempotency_key.to_owned(),
+    })
 }
 
 /// 组装 Adapter 的执行输入：普通参数去掉图片参数位上的取值，图片提升为强类型三态。

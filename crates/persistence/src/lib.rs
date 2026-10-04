@@ -3332,6 +3332,10 @@ impl ExecutionRepository for PgHubRepository {
     ///
     /// 合同经 Job 的 `vendor_model_id` 直查 `catalog.vendor_models`：那一行按身份不可变，
     /// 型号下架、候选停用或之后重新发布都不改它，所以旧记录的指纹总能按原样重算（RFC 0017 §2）。
+    ///
+    /// 供给行取不回来时用 LEFT JOIN 留成 `NULL`，连同缺失的请求指纹与版本一起交给调用方按
+    /// `409 idempotency_conflict` 拒绝：**记录存在就不是未命中**，绝不能因为读不全比较材料去执行
+    /// 新请求（RFC 0018 §9.1）。
     async fn lookup_execution(
         &self,
         account_id: AccountId,
@@ -3342,7 +3346,7 @@ impl ExecutionRepository for PgHubRepository {
             SELECT j.id, j.state, j.error_code, j.request_digest, j.request_digest_key_version,
                    j.created_at, j.updated_at, vm.capability_schema
             FROM generation.jobs j
-            JOIN catalog.vendor_models vm ON vm.id = j.vendor_model_id
+            LEFT JOIN catalog.vendor_models vm ON vm.id = j.vendor_model_id
             WHERE j.account_id = $1 AND j.idempotency_key_digest = $2
             "#,
         )
@@ -3359,25 +3363,14 @@ impl ExecutionRepository for PgHubRepository {
         let stage = ExecutionStage::parse(&state).ok_or_else(|| {
             ApplicationError::Persistence(format!("job state {state} is not an execution stage"))
         })?;
-        // 有幂等摘要就必然有指纹与版本（受理同事务写入）；缺了说明记录被绕过，不猜。
-        let request_digest: Option<String> =
-            row.try_get("request_digest").map_err(database_error)?;
-        let request_digest_key_version: Option<i16> = row
-            .try_get("request_digest_key_version")
-            .map_err(database_error)?;
-        let (Some(request_digest), Some(request_digest_key_version)) =
-            (request_digest, request_digest_key_version)
-        else {
-            return Err(ApplicationError::Persistence(format!(
-                "job {job_id} has an idempotency digest but no request fingerprint"
-            )));
-        };
         Ok(Some(ExecutionLookup {
             job_id,
             stage,
             error_code: row.try_get("error_code").map_err(database_error)?,
-            request_digest,
-            request_digest_key_version,
+            request_digest: row.try_get("request_digest").map_err(database_error)?,
+            request_digest_key_version: row
+                .try_get("request_digest_key_version")
+                .map_err(database_error)?,
             capability_schema: row.try_get("capability_schema").map_err(database_error)?,
             created_at: row.try_get("created_at").map_err(database_error)?,
             updated_at: row.try_get("updated_at").map_err(database_error)?,

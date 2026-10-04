@@ -17,15 +17,16 @@ use seeai_application::{
     CachePolicy, CursorPosition, CustomerBillingQuery, CustomerLedgerQuery, CustomerUsageKind,
     CustomerUsageQuery, CustomerUsageScope, CustomerUsageStatus, CustomerView,
     DirectExecutionError, DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService,
-    ExecutionRepository, GatewayModelView, GeneratedImage, GenerationDailySpendLimit,
-    GenerationRateLimit, HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository,
-    IdentityService, LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT,
-    NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
-    PublishRuntimeCommand, ReconciliationService, RefundReconciliationCommand, RequestCostCeiling,
-    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService,
-    SelectableOfferingView, decode_history_cursor, encode_history_cursor, invalid_history_cursor,
-    settle_reserve_from_env, with_admin_id,
+    ExecutionLookup, ExecutionRepository, GatewayModelView, GeneratedImage,
+    GenerationDailySpendLimit, GenerationRateLimit, HISTORY_CURSOR_KEY_LEN, HistoryFilter,
+    HistoryStream, HubRepository, IdentityService, LedgerAuditor, LedgerEntryView,
+    MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter,
+    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublicErrorCode, PublishRuntimeCommand, ReconciliationService,
+    RecordedRequestInput, RefundReconciliationCommand, RequestCostCeiling, RequestFingerprintKeys,
+    RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
+    decode_history_cursor, encode_history_cursor, invalid_history_cursor, settle_reserve_from_env,
+    with_admin_id,
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
@@ -2821,14 +2822,33 @@ async fn edit_image(
     if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
         return Err(slow_read_timeout());
     }
-    let (parameters, reference_images, mask) = parsed?;
+    let (parameters, file_references, file_mask) = parsed?;
+    let endpoint = "/v1/images/edits";
+    let idempotency_key = idempotency_key(&headers);
+    // 有界读取已完成，查找只用到账户与幂等键：这时还没摘图片字段、没判型号，也没占执行许可。
+    if let Some(lookup) = lookup_recorded(&direct, account.0.account_id, &idempotency_key).await? {
+        return Err(replay_recorded(
+            &direct,
+            account.0.account_id,
+            endpoint,
+            lookup,
+            RecordedRequestInput {
+                idempotency_key: &idempotency_key,
+                parameters,
+                file_references: &file_references,
+                file_mask: file_mask.as_ref(),
+            },
+        )?);
+    }
+    let (parameters, reference_images, mask) =
+        interpret_current_inputs(parameters, file_references, file_mask)?;
     run_direct_generation(
         direct,
         account.0.account_id,
         account.0.received_at,
         scope.map(|scope| scope.0),
-        &headers,
-        "/v1/images/edits",
+        idempotency_key,
+        endpoint,
         parameters,
         reference_images,
         mask,
@@ -2872,34 +2892,43 @@ async fn require_generation_access(
     Ok(next.run(request).await)
 }
 
-/// JSON 入口转直接执行请求：图片值分成公网 URL / data URL 两态，model 与图片字段从普通参数里摘掉。
+/// JSON 入口转直接执行请求：**先查记录**，未命中才按当前合同摘图片字段、判型号。
+///
+/// 有界解析已经完成（`RequestParameters` 只能从有界解析、逐项计数或显式计数来）；查找只用到账户
+/// 与幂等键，正文这时还没按任何合同解释，也还没占本机执行许可（RFC 0018 §9.1）。
 async fn run_direct_json(
     direct: Arc<DirectGeneration>,
     account_id: AccountId,
     received_at: tokio::time::Instant,
     scope: Option<Arc<ConnectionScope>>,
     headers: &HeaderMap,
-    mut parameters: RequestParameters,
+    parameters: RequestParameters,
 ) -> Result<Response, ApiError> {
-    let inputs = take_contract_image_inputs(&mut parameters)?;
-    let reference_images = inputs
-        .reference_images
-        .into_iter()
-        .map(InputImage::from_raw)
-        .collect::<Result<Vec<_>, _>>()
-        .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?;
-    let mask = inputs
-        .mask
-        .map(InputImage::from_raw)
-        .transpose()
-        .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?;
+    let endpoint = "/v1/images/generations";
+    let idempotency_key = idempotency_key(headers);
+    if let Some(lookup) = lookup_recorded(&direct, account_id, &idempotency_key).await? {
+        return Err(replay_recorded(
+            &direct,
+            account_id,
+            endpoint,
+            lookup,
+            RecordedRequestInput {
+                idempotency_key: &idempotency_key,
+                parameters,
+                file_references: &[],
+                file_mask: None,
+            },
+        )?);
+    }
+    let (parameters, reference_images, mask) =
+        interpret_current_inputs(parameters, Vec::new(), None)?;
     run_direct_generation(
         direct,
         account_id,
         received_at,
         scope,
-        headers,
-        "/v1/images/generations",
+        idempotency_key,
+        endpoint,
         parameters,
         reference_images,
         mask,
@@ -2907,55 +2936,48 @@ async fn run_direct_json(
     .await
 }
 
-/// multipart 图片部件：**直接保留字节**与声明的媒体类型，不再先编码成 data URL 再解码（RFC 0017 §2）。
-async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
-    let media_type = field
-        .content_type()
-        .map(str::to_owned)
-        .unwrap_or_else(|| "image/png".to_owned());
-    let bytes = field
-        .bytes()
+/// 同键只读预查：命中返回原记录的比对材料，未命中返回 `None`。
+///
+/// 记录存在但材料缺失时仍是命中（[`ExecutionLookup`] 的材料字段为 `None`）——调用方按
+/// `409 idempotency_conflict` 拒绝，不当作未命中。
+async fn lookup_recorded(
+    direct: &DirectGeneration,
+    account_id: AccountId,
+    idempotency_key: &str,
+) -> Result<Option<ExecutionLookup>, ApiError> {
+    direct
+        .service
+        .lookup_recorded(account_id, idempotency_key)
         .await
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
-    Ok(InputImage::Bytes(DecodedImage { media_type, bytes }))
+        .map_err(ApiError::from)
 }
 
-/// 解析 multipart：文件部件保留字节，文本图片字段按 data URL / 公网 URL 解释；两者不能同给。
+/// 命中记录后的比对与投影：用记录冻结的合同与指纹版本重算这次请求的指纹，返回它对客的拒绝。
 ///
-/// 文本部件走 [`RequestParameters::builder`] **逐项计数**：非 JSON 编码的入口同样受容器层数、
-/// 字段数、累计字符串字节与节点数的约束（RFC 0018 §2.2），不能因为"不是 JSON"就绕开这一层。
-async fn parse_multipart_direct(
-    multipart: &mut Multipart,
+/// 它消费原始请求面：命中之后这条路不会再向下执行，因此不必为比对复制一份图片字符串。
+fn replay_recorded(
+    direct: &DirectGeneration,
+    account_id: AccountId,
+    endpoint: &str,
+    lookup: ExecutionLookup,
+    input: RecordedRequestInput<'_>,
+) -> Result<ApiError, ApiError> {
+    direct
+        .service
+        .replay_recorded(account_id, endpoint, lookup, input)
+        .map(map_direct_error)
+        .map_err(ApiError::from)
+}
+
+/// 按**当前合同**解释有界解析后的入口输入：摘出契约字段名下的文本图片，与 multipart 文件部件合并。
+///
+/// 只在幂等键未命中记录之后调用。命中时按记录冻结的合同比对，不用这里的新规则重新解释原请求
+/// （Spec 0005 §4）。同一个字段既给文件又给文本一律拒绝：宁可报错也不替调用方挑一个。
+fn interpret_current_inputs(
+    mut parameters: RequestParameters,
+    file_references: Vec<InputImage>,
+    file_mask: Option<InputImage>,
 ) -> Result<(RequestParameters, Vec<InputImage>, Option<InputImage>), ApiError> {
-    let mut parameters = RequestParameters::builder();
-    let mut file_references: Vec<InputImage> = Vec::new();
-    let mut file_mask: Option<InputImage> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
-    {
-        let name = field.name().unwrap_or_default().to_owned();
-        match contract_image_parameter_kind(&name) {
-            Some(ImageParameterKind::Reference) if field.file_name().is_some() => {
-                file_references.push(form_image_bytes(field).await?);
-            }
-            Some(ImageParameterKind::Mask) if field.file_name().is_some() => {
-                file_mask = Some(form_image_bytes(field).await?);
-            }
-            _ => {
-                let text = field.text().await.map_err(|error| {
-                    ApiError::bad_request("invalid_multipart", error.to_string())
-                })?;
-                parameters
-                    .insert(name.clone(), form_scalar(&name, &text))
-                    .map_err(|violation| {
-                        ApiError::bad_request("invalid_parameter", violation.to_string())
-                    })?;
-            }
-        }
-    }
-    let mut parameters = parameters.finish();
     let text_inputs = take_contract_image_inputs(&mut parameters)?;
     if !text_inputs.reference_images.is_empty() && !file_references.is_empty() {
         return Err(ApiError::bad_request(
@@ -2991,6 +3013,58 @@ async fn parse_multipart_direct(
     Ok((parameters, reference_images, mask))
 }
 
+/// multipart 图片部件：**直接保留字节**与声明的媒体类型，不再先编码成 data URL 再解码（RFC 0017 §2）。
+async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
+    let media_type = field
+        .content_type()
+        .map(str::to_owned)
+        .unwrap_or_else(|| "image/png".to_owned());
+    let bytes = field
+        .bytes()
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
+    Ok(InputImage::Bytes(DecodedImage { media_type, bytes }))
+}
+
+/// 解析 multipart 的**有界读取**：文件部件保留字节，文本部件逐项计数，契约字段名下的文本图片
+/// 原样留在参数面里（是否摘图、按什么规则解释由调用方在查过幂等键之后决定）。
+///
+/// 文本部件走 [`RequestParameters::builder`] **逐项计数**：非 JSON 编码的入口同样受容器层数、
+/// 字段数、累计字符串字节与节点数的约束（RFC 0018 §2.2），不能因为"不是 JSON"就绕开这一层。
+async fn parse_multipart_direct(
+    multipart: &mut Multipart,
+) -> Result<(RequestParameters, Vec<InputImage>, Option<InputImage>), ApiError> {
+    let mut parameters = RequestParameters::builder();
+    let mut file_references: Vec<InputImage> = Vec::new();
+    let mut file_mask: Option<InputImage> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        match contract_image_parameter_kind(&name) {
+            Some(ImageParameterKind::Reference) if field.file_name().is_some() => {
+                file_references.push(form_image_bytes(field).await?);
+            }
+            Some(ImageParameterKind::Mask) if field.file_name().is_some() => {
+                file_mask = Some(form_image_bytes(field).await?);
+            }
+            _ => {
+                let text = field.text().await.map_err(|error| {
+                    ApiError::bad_request("invalid_multipart", error.to_string())
+                })?;
+                parameters
+                    .insert(name.clone(), form_scalar(&name, &text))
+                    .map_err(|violation| {
+                        ApiError::bad_request("invalid_parameter", violation.to_string())
+                    })?;
+            }
+        }
+    }
+    Ok((parameters.finish(), file_references, file_mask))
+}
+
 /// 直接执行入口：预留本机许可，起受监督的执行，等一次性结果，按内存载荷构造响应。
 ///
 /// 成功时执行许可与发送许可随 [`SendHold`] 进入连接 owner registry，只有 transport 任务与缓冲确实
@@ -3001,7 +3075,7 @@ async fn run_direct_generation(
     account_id: AccountId,
     received_at: tokio::time::Instant,
     scope: Option<Arc<ConnectionScope>>,
-    headers: &HeaderMap,
+    idempotency_key: String,
     endpoint: &str,
     mut parameters: RequestParameters,
     reference_images: Vec<InputImage>,
@@ -3018,7 +3092,7 @@ async fn run_direct_generation(
         native_parameters: parameters,
         reference_images,
         mask,
-        idempotency_key: idempotency_key(headers),
+        idempotency_key,
     };
     // 执行与发送许可都在受理前预留：取不到就不执行这次尚未发生费用的请求。
     let lease = direct

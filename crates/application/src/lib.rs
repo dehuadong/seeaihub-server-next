@@ -74,8 +74,8 @@ mod direct_execution;
 pub use direct_execution::{
     DEFAULT_EXECUTION_LEASE_SECONDS, DEFAULT_SETTLE_RESERVE_SECONDS, DirectExecutionCall,
     DirectExecutionError, DirectExecutionRequest, DirectExecutionService, DirectExecutionSuccess,
-    ExecutionOwnershipRegistrar, SupervisedExecutionContext, failure_disposition_for,
-    settle_reserve_from_env,
+    ExecutionOwnershipRegistrar, RecordedRequestInput, SupervisedExecutionContext,
+    failure_disposition_for, settle_reserve_from_env,
 };
 
 mod execution_reconciliation;
@@ -1572,22 +1572,27 @@ pub struct ExecutionReplay {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 同键只读预查返回的原记录投影：调用方据此在选路/候选截断之前判定重复调用。
+/// 同键只读预查返回的原记录投影：调用方据此在按当前合同解释请求之前判定重复调用。
 ///
 /// 它比 [`ExecutionReplay`] 多带**记录冻结的请求指纹与合同**：指纹密钥轮换后，只有用记录写下的
 /// [`Self::request_digest_key_version`] 与 [`Self::capability_schema`] 才能安全重算并比对，
 /// 否则无法判断“同键同请求”还是“同键换请求”（Spec 0005 §4，RFC 0017 §2）。
+///
+/// 三个比较材料是 `Option`：记录被绕过、没写请求指纹或版本，或它引用的那一行供给取不回冻结合同时
+/// 都是 `None`。这种记录**不能当作未命中**——调用方按 `409 idempotency_conflict` 拒绝，不去执行
+/// 新请求（RFC 0018 §9.1）。
 #[derive(Debug, Clone)]
 pub struct ExecutionLookup {
     pub job_id: JobId,
     pub stage: ExecutionStage,
     /// 原记录写下的对客错误码；处理中或成功时为 None。
     pub error_code: Option<String>,
-    pub request_digest: String,
+    /// 原记录写下的请求指纹。
+    pub request_digest: Option<String>,
     /// 原记录生成请求指纹时用的密钥版本。
-    pub request_digest_key_version: i16,
+    pub request_digest_key_version: Option<i16>,
     /// 原记录冻结的模型级合同：旧记录比对用它重算已识别参数，不受之后的重新发布影响。
-    pub capability_schema: Value,
+    pub capability_schema: Option<Value>,
     pub created_at: DateTime<Utc>,
     pub updated_at: DateTime<Utc>,
 }
@@ -2980,9 +2985,13 @@ pub trait ExecutionRepository: Send + Sync {
 
     /// 同键只读预查：按 `(account_id, idempotency_key_digest)` 取原记录的投影，未命中返回 `None`。
     ///
-    /// 它不占锁、不改任何行、不做资金与容量检查。调用方在选路与候选截断之前用它判定重复调用：
-    /// 命中后按记录写下的 [`ExecutionLookup::request_digest_key_version`] 与冻结合同重算请求指纹
-    /// 再比对，一致才走 Spec 0005 §4 的重放投影；无法安全比对时按冲突拒绝。
+    /// 它不占锁、不改任何行、不做资金与容量检查，只用到账户与幂等键。调用方在按当前合同解释请求
+    /// （抽图片字段、注默认值、判型号与分支、选候选）之前用它判定重复调用：命中后按记录写下的
+    /// [`ExecutionLookup::request_digest_key_version`] 与冻结合同重算请求指纹再比对，一致才走
+    /// Spec 0005 §4 的重放投影；无法安全比对时按冲突拒绝。
+    ///
+    /// **记录存在但比较材料缺失时返回 `Some`**，材料字段为 `None`——那不是未命中，调用方必须按
+    /// `409 idempotency_conflict` 拒绝。`None` 只表示这个账户与这个键没有任何记录。
     /// [`Self::admit`] 仍在事务里做同一份最终校验，并发下以库为准。
     async fn lookup_execution(
         &self,

@@ -224,6 +224,255 @@ async fn direct_same_key_different_prompt_is_an_idempotency_conflict() {
     harness.cleanup().await;
 }
 
+/// 用同一个网关模型发一份**新修订**：现行合同多要一个必填参数 `style`。
+///
+/// 合同行按 (厂商, 型号, 修订) 不可变，换合同必须换修订号；发布即原子替换这个型号的 active
+/// 候选，之后的受理按新合同走，而已经受理的 Job 仍指向它自己那一行旧合同。
+async fn republish_requiring_style(harness: &Harness) {
+    let mut draft = candidate(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only", "image_conditioned", "masked"],
+    );
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    // 只动**合同**：`style` 是调用方那一侧的面，承载面不必声明它（这条用例也不会真的提交它）。
+    let mut contract = draft["capability_schema"].clone();
+    contract["properties"]["style"] = json!({"type": "string"});
+    contract["required"] = json!(["model", "prompt", "style"]);
+    assert_eq!(
+        publish_on_revision(
+            harness,
+            harness.model,
+            "route-test-2",
+            contract,
+            vec![draft],
+            None,
+        )
+        .await,
+        StatusCode::OK,
+        "第二次发布必须成功，否则这条用例证明不了现行合同确实换了"
+    );
+}
+
+/// 该账户落下的执行记录数：被拒的请求不该留下记录，判据取账户维度。
+async fn account_job_count(harness: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
+        .bind(Uuid::parse_str(&harness.account_id).expect("the fixture account id"))
+        .fetch_one(&harness.pool)
+        .await
+        .expect("the direct job count")
+}
+
+/// RFC 0018 §9.1 与 Spec 0005 §4：合同换了修订之后，同键重发仍按**记录冻结的合同**比对并投影
+/// 原事实；同一个正文换一把新键才是"未命中"，按**当前**合同解释。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_replay_uses_the_recorded_contract_after_a_republish() {
+    let harness =
+        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
+            .await;
+    let key = format!("direct-recorded-contract-{}", Uuid::new_v4());
+    let request = route_request(harness.model, "the same body across two revisions");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(harness.create_calls(), 1, "第一次请求调一次上游");
+
+    republish_requiring_style(&harness).await;
+
+    // 同键同正文：命中记录，用记录冻结的合同（没有 `style` 这一条）比对，投影"已完成、结果不保留"。
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("result_not_retained"),
+        "同键重发必须按记录规则投影，不拿新修订重新解释原请求：{body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "重放不再调上游");
+
+    // 同一正文换一把新键：未命中记录，按当前合同解释 → 缺必填 `style`。
+    let fresh_key = format!("direct-current-contract-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &fresh_key,
+        &request,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "未命中的请求要按当前合同校验：{body}"
+    );
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("validation_error"),
+        "{body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "被当前合同拒绝的请求不调上游");
+    assert_eq!(
+        account_job_count(&harness).await,
+        1,
+        "被当前合同拒绝的请求不建执行记录"
+    );
+    harness.cleanup().await;
+}
+
+/// RFC 0018 §9.1 与 Spec 0005 §4：记录缺比较材料（记录还在、请求指纹不在）时按
+/// 409 `idempotency_conflict` 拒绝，**不当作未命中**去执行新请求。
+///
+/// `request_digest` 在库层可空（迁移 0038 只把幂等摘要收成 NOT NULL），所以"记录在、材料不在"
+/// 这种形态用 SQL 就造得出来；修好之前这里会一路走到 500，而不是 409。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_replay_without_comparison_material_is_a_conflict() {
+    let harness =
+        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
+            .await;
+    let key = format!("direct-no-material-{}", Uuid::new_v4());
+    let request = route_request(harness.model, "drop the recorded fingerprint");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+
+    let cleared = sqlx::query(
+        "UPDATE generation.jobs SET request_digest = NULL WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(&key))
+    .execute(&harness.pool)
+    .await
+    .expect("clear the recorded request fingerprint");
+    assert_eq!(
+        cleared.rows_affected(),
+        1,
+        "必须真的抹掉了一行，否则下面的断言没有前提"
+    );
+
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("idempotency_conflict"),
+        "缺比较材料必须按冲突拒绝，不能当作未命中：{body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "不执行第二次生成");
+    assert_eq!(account_job_count(&harness).await, 1, "不新建执行记录");
+    harness.cleanup().await;
+}
+
+/// RFC 0018 §9.1：按幂等键查记录发生在按当前合同的图片字段抽取与型号判定**之前**。
+///
+/// 同键正文里放一个既不是公网 URL 也不是 data URL 的图片值：入口若先按当前规则解释，这里是
+/// 400 `invalid_parameter`；先查记录则命中，用记录规则比对不上，按 409 `idempotency_conflict` 拒绝。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_replay_is_checked_before_the_current_contract_interprets_the_body() {
+    let harness =
+        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
+            .await;
+    let key = format!("direct-lookup-first-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &route_request(harness.model, "a recorded request"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+
+    let mut replay = route_request(harness.model, "a recorded request");
+    replay["image"] = json!("neither a public url nor a data url");
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &replay,
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::CONFLICT,
+        "先查记录就不该落到当前合同的图片校验：{body}"
+    );
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("idempotency_conflict"),
+        "{body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "不执行第二次生成");
+    assert_eq!(account_job_count(&harness).await, 1, "不新建执行记录");
+    harness.cleanup().await;
+}
+
+/// RFC 0018 §9.1：带参考图的同键重发也按记录规则比对——记录比对从**原始参数面**里摘图片字段，
+/// 指纹里的图片取值与受理时逐字相同。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_replay_with_a_reference_image_uses_the_recorded_fingerprint() {
+    let harness =
+        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
+            .await;
+    let key = format!("direct-image-replay-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "edit with an inline image twice");
+    request["image"] = json!(png_data_url());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("result_not_retained"),
+        "带图的同键重发必须命中同一条记录：{body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "重放不再调上游");
+    assert_eq!(account_job_count(&harness).await, 1, "不新建执行记录");
+    harness.cleanup().await;
+}
+
 /// 认证发生在消费正文之前：无效密钥配一个坏 JSON 体，必须回 401，而不是 JSON 解析的 4xx。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
