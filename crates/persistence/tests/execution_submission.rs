@@ -18,6 +18,7 @@ use seeai_domain::{
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
 use sqlx::{AssertSqlSafe, PgPool, Row};
+use std::collections::BTreeSet;
 use uuid::Uuid;
 
 async fn isolated_database_url() -> (String, String) {
@@ -814,6 +815,162 @@ async fn takeover_swaps_ownership_and_increments_the_fencing_token() {
 
     drop(pool);
     drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 多副本并发接管：不重复、不丢（Issue #62/#64，RFC 0017 §5）。
+///
+/// 前置：与文件内其它真库用例相同——HTTP_CONTRACT_DATABASE_URL 指向一个允许 CREATE DATABASE
+/// 的 PostgreSQL，角色能跑迁移；用例自建一次性库并在结束删除。
+///
+/// 两个 repository 各自建池、各用一条连接，指向同一座一次性库，才谈得上并发接管。两次调用都给
+/// limit = 4：任何一方都拿不满 8 台，只有两方各领一半，并集才凑得齐 8 台——断言因此必须覆盖
+/// "两批不相交 + 并集等于 8"，而不是让一方一次领完。两侧用不同 worker_id：owner 落到库里之后
+/// 能指认是哪一方写的，"owner 只被接管它的一方写"就直接从库里核对。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn concurrent_takeovers_partition_expired_executions_without_overlap_or_loss() {
+    const JOBS: usize = 8;
+    const PER_CALLER: u32 = 4;
+    const ORIGINAL_TOKEN: i64 = 0;
+
+    // 两个 repository 指向同一座一次性库，但各自建池、各用一条连接，才谈得上并发接管。
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository_a = PgHubRepository::connect(&database_url, 1)
+        .await
+        .expect("the first independent connection");
+    repository_a.migrate().await.expect("the migrations apply");
+    let repository_b = PgHubRepository::connect(&database_url, 1)
+        .await
+        .expect("the second independent connection");
+    let pool = repository_a.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+
+    // 造 8 台 v1、executing、各带一个 open attempt 的执行，随后让 8 条租约一起过期。
+    let mut expected = BTreeSet::new();
+    for index in 0..JOBS {
+        let job_id = admit_one(&repository_a, &fixture, &format!("takeover-race-{index}")).await;
+        let started = repository_a
+            .begin_submission(begin(
+                job_id,
+                "supervisor-a",
+                ORIGINAL_TOKEN as u64,
+                Utc::now() + ChronoDuration::minutes(5),
+            ))
+            .await
+            .expect("begin_submission");
+        repository_a
+            .record_acceptance(RecordAcceptance {
+                job_id,
+                attempt_id: started.attempt_id,
+                execution_owner: "supervisor-a".to_owned(),
+                fencing_token: FencingToken::new(ORIGINAL_TOKEN as u64),
+                provider_task_handle: Some(format!("task-{index}")),
+                provider_trace_id: Some(format!("trace-{index}")),
+            })
+            .await
+            .expect("record_acceptance");
+        expected.insert(job_id.0);
+    }
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET lease_expires_at = now() - interval '1 second'
+         WHERE execution_protocol = 'v1' AND state = 'executing'",
+    )
+    .execute(&pool)
+    .await
+    .expect("expire every lease at once");
+
+    let (left, right) = tokio::join!(
+        repository_a.takeover_expired_executions(
+            "worker-a",
+            ChronoDuration::minutes(5),
+            PER_CALLER,
+            5
+        ),
+        repository_b.takeover_expired_executions(
+            "worker-b",
+            ChronoDuration::minutes(5),
+            PER_CALLER,
+            5
+        ),
+    );
+    let left = left.expect("the first concurrent takeover");
+    let right = right.expect("the second concurrent takeover");
+
+    let left_ids: BTreeSet<Uuid> = left.iter().map(|taken| taken.job_id.0).collect();
+    let right_ids: BTreeSet<Uuid> = right.iter().map(|taken| taken.job_id.0).collect();
+
+    // 不重复：两批没有交集；每台只在其中一批出现。
+    assert!(
+        left_ids.is_disjoint(&right_ids),
+        "two concurrent takeovers must not both own the same job: {left_ids:?} vs {right_ids:?}"
+    );
+    // 不丢：并集恰好是全部 8 台，且两次调用各拿满 limit。
+    let union: BTreeSet<Uuid> = left_ids.union(&right_ids).copied().collect();
+    assert_eq!(
+        union, expected,
+        "every expired execution is taken over exactly once"
+    );
+    assert_eq!(
+        left_ids.len(),
+        PER_CALLER as usize,
+        "the first caller fills its share"
+    );
+    assert_eq!(
+        right_ids.len(),
+        PER_CALLER as usize,
+        "the second caller fills its share"
+    );
+
+    // 每台 fencing_token 恰好 +1，且只出现在一侧。
+    let mut seen = BTreeSet::new();
+    for taken in left.iter().chain(right.iter()) {
+        assert_eq!(
+            taken.fencing_token,
+            FencingToken::new((ORIGINAL_TOKEN + 1) as u64),
+            "each takeover moves the token by exactly one"
+        );
+        assert!(
+            seen.insert(taken.job_id.0),
+            "a job may appear in only one batch"
+        );
+    }
+
+    // 库里的落定事实：owner 是领走它的一方，token 恰好 +1。
+    let rows = sqlx::query(
+        "SELECT id, execution_owner, fencing_token
+         FROM generation.jobs
+         WHERE execution_protocol = 'v1'",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the jobs after the concurrent takeovers");
+    assert_eq!(rows.len(), JOBS);
+    for row in &rows {
+        let id: Uuid = row.try_get("id").expect("id");
+        let owner: Option<String> = row.try_get("execution_owner").expect("owner");
+        let token: i64 = row.try_get("fencing_token").expect("token");
+        let expected_owner = if left_ids.contains(&id) {
+            "worker-a"
+        } else {
+            "worker-b"
+        };
+        assert_eq!(
+            owner.as_deref(),
+            Some(expected_owner),
+            "the owner is written only by the side that took the job"
+        );
+        assert_eq!(
+            token,
+            ORIGINAL_TOKEN + 1,
+            "each row moved exactly one fencing step"
+        );
+    }
+
+    drop(pool);
+    drop(repository_a);
+    drop(repository_b);
     drop_isolated_database(&database_name).await;
 }
 
