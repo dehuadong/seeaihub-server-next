@@ -280,7 +280,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 - 两个域名共用一份配置：分发由 API 按 `Host` 决定，反代不区分；**别把 `Host` 改写成 `127.0.0.1`**，否则运营后台打不开；
 - `client_max_body_size` 要盖住生成入口的 16 MiB 正文上限（示例 `16m`）；`proxy_read_timeout` 不小于 `GENERATION_SYNC_WAIT_SECONDS`（默认是 `PROVIDER_TIMEOUT_SECONDS + 30`）；
-- 上传端点落地时，这条 `client_max_body_size` 必须盖住 `UPLOAD_MAX_REQUEST_BYTES`（单文件上限 20 MiB 加 multipart 协议余量；示例 `24m` 即 20 MiB 加 4 MiB 余量，实际取值以部署配的 `UPLOAD_MAX_REQUEST_BYTES` 为准）。代理层上限低于它时轮不到平台判：这些大上传在 nginx 就被 413 拒掉，响应体是 nginx 自己的 HTML，不是平台的 `{"error":{"code","message"}}` 信封；
+- 上传端点落地时，这条 `client_max_body_size` 必须盖住 `UPLOAD_MAX_REQUEST_BYTES`（单文件上限 20 MiB 加 multipart 协议余量；示例 `24m` 即 20 MiB 加 4 MiB 余量，实际取值以部署配的 `UPLOAD_MAX_REQUEST_BYTES` 为准）；上限不足的后果见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8；
 - API 绑在回环（`API_BIND=127.0.0.1:8081`），只让 nginx 够得到；证书用 certbot 之类签发即可。
 
 ## 3. 启动与探活
