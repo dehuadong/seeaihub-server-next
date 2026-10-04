@@ -566,6 +566,139 @@ fn auto_is_passed_through_and_a_size_converting_offering_cannot_take_it() {
     );
 }
 
+/// 一份映射把默认值、改名、取值映射、尺寸换算与输出张数上限**组合**在一起：计划与物化必须
+/// 与逐条判定的口径一致——默认值补在合同字段名上、取值映射按线上名字查表、尺寸换算写进目标
+/// 字段、张数按线上名字夹。
+#[test]
+fn one_mapping_composes_defaults_renames_enum_maps_size_conversion_and_the_count_cap() {
+    let mut vendor = offering();
+    vendor.capability_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "size": {"type": "string"},
+        "resolution": {"type": "string"},
+        "quality": {"type": "string"},
+        "watermark": {"type": "boolean"},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10}
+    }));
+    vendor.carrier_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "size": {"type": "string"},
+        "quality_wire": {"type": "string"},
+        "watermark": {"type": "boolean"},
+        "num_images": {"type": "integer", "minimum": 1, "maximum": 3}
+    }));
+    vendor.parameter_mapping = serde_json::json!({
+        "defaults": {"watermark": true},
+        "rename": {"quality": "quality_wire", "n": "num_images"},
+        "enum_map": {"quality": {"high": "xhigh"}},
+        "size": {
+            "source": ["size", "resolution"],
+            "target": "size",
+            "form": "pixels",
+            "profile": {"2K": {"2:3": "1664x2496"}}
+        }
+    });
+
+    let request = image_request(serde_json::json!({
+        "prompt": "hello",
+        "size": "2:3",
+        "resolution": "2K",
+        "quality": "high",
+        "n": 6
+    }));
+    let face = contract_face(&request, &vendor);
+    let prepared = prepare_carrier_parameters(&face, &request, &vendor).expect("carried");
+    assert_eq!(
+        prepared,
+        serde_json::json!({
+            "model": "gpt-image-2",
+            "prompt": "hello",
+            "size": "1664x2496",
+            "quality_wire": "xhigh",
+            "watermark": true,
+            "num_images": 3
+        }),
+        "五样映射要一起落地：{prepared}"
+    );
+}
+
+/// 尺寸换算的源字段**不需要**被承载面声明：它们正是"被换算消耗"的那一类——请求用到了它们、
+/// 合同声明了它们，这条候选就承载得了，换算结果写进承载面声明的目标字段。
+#[test]
+fn a_size_source_outside_the_carrier_still_converts() {
+    let contract = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "resolution": {"type": "string"},
+        "aspect_ratio": {"type": "string"}
+    }));
+    let mut converting = offering();
+    converting.capability_schema = contract.clone();
+    // 承载面只声明目标字段：两个源字段一个都不在它上面。
+    converting.carrier_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "size": {"type": "string"}
+    }));
+    converting.parameter_mapping = serde_json::json!({
+        "size": {
+            "source": ["resolution", "aspect_ratio"],
+            "target": "size",
+            "form": "pixels",
+            "profile": {"2K": {"2:3": "1664x2496"}}
+        }
+    });
+
+    let request = image_request(serde_json::json!({
+        "prompt": "hello",
+        "resolution": "2K",
+        "aspect_ratio": "2:3"
+    }));
+    let face = contract_face(&request, &converting);
+    let prepared = prepare_carrier_parameters(&face, &request, &converting)
+        .expect("a request whose size sources this carrier consumes is still carried");
+    assert_eq!(
+        prepared.get("size"),
+        Some(&serde_json::json!("1664x2496")),
+        "换算结果落在承载面声明的目标字段上：{prepared}"
+    );
+    assert!(
+        prepared.get("resolution").is_none() && prepared.get("aspect_ratio").is_none(),
+        "被消耗的源字段不再原样上行：{prepared}"
+    );
+}
+
+/// 取值映射把承载面**必填**的字段映射成 `null`：物化后那个字段就不在场了，这条候选因此不合格
+/// （与"缺必填"同一条口径）——不把 `null` 发上去当作给出了值。
+#[test]
+fn an_enum_map_that_maps_a_required_field_to_null_makes_the_candidate_ineligible() {
+    let mut vendor = offering();
+    vendor.capability_schema = surface(serde_json::json!({
+        "model": {"const": "gpt-image-2"},
+        "prompt": {"type": "string"},
+        "quality": {"type": "string"}
+    }));
+    vendor.carrier_schema = serde_json::json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt", "quality"],
+        "properties": {
+            "model": {"const": "gpt-image-2"},
+            "prompt": {"type": "string"},
+            "quality": {"type": "string"}
+        }
+    });
+    vendor.parameter_mapping = serde_json::json!({"enum_map": {"quality": {"high": null}}});
+
+    let request = image_request(serde_json::json!({"prompt": "hello", "quality": "high"}));
+    let face = contract_face(&request, &vendor);
+    let reason = prepare_carrier_parameters(&face, &request, &vendor)
+        .expect_err("the mapped null leaves the required field absent");
+    assert!(reason.contains("quality"), "{reason}");
+}
+
 /// 取值映射：组装期把合同取值换成线上取值；表里没有这个取值 → 这条候选**不合格**（不猜、
 /// 不透传原值），原因写进路由判定记录，有别的候选就落过去。
 #[test]

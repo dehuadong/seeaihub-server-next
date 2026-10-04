@@ -290,3 +290,26 @@ pub(super) fn contract_face(
     contract_parameter_face(request, &offering.capability_schema)
         .expect("the fixture request satisfies the contract")
 }
+
+/// 一条候选的准备入口：走生产的**判定 → 物化**两段。
+///
+/// 用例把它当"这条候选承载得了吗、承载成什么"的观察点：选路用的是同一条路——判定阶段只产出
+/// 计划，物化阶段才构造参数面，所以这个入口同时钉住两段的行为。
+pub(super) fn prepare_carrier_parameters(
+    contract_parameters: &Map<String, Value>,
+    request: &CreateImageGenerationRequest,
+    offering: &PublishedOffering,
+) -> Result<Value, String> {
+    let branch = request.branch().map_err(|error| error.to_string())?;
+    let shared = SharedInput {
+        parameters: contract_parameters,
+        reference_images: &request.reference_images,
+        mask: request.mask.as_deref(),
+    };
+    let candidate = candidate_of(offering, 0);
+    let plan = plan_candidate(&candidate, &shared.features(branch), None);
+    if let Some(reason) = plan.skip_reason() {
+        return Err(reason.into_owned());
+    }
+    materialize_selected(&plan, &shared)
+}

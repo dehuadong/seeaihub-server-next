@@ -8,7 +8,7 @@
 //!   生效，所以取的是**所有在效合同里最大的那个 `n`**；一条都没发布时取
 //!   [`crate::NO_CONTRACT_MAX_OUTPUT_IMAGES`]，那只是让"还没发布过"的部署也能跑起来，不是取值来源。
 //! - **受理时发往上游的张数**：来源是**这条候选承载面**为它声明的上界——各候选不同，所以它是逐次
-//!   判的（见 `crate::cap_output_image_count`）。
+//!   判的（见 `crate::plan_candidate`）。
 
 use serde_json::Value;
 
@@ -18,7 +18,7 @@ use serde_json::Value;
 /// 那一侧是字段名 `n`，候选承载面那一侧是改名表把它落到的**线上名**（与承载校验用同一条规则）。
 ///
 /// 这个读法**不带任何取值语义**，`maximum: 0` 会原样读出来：两条消费路径对 0 的解释不同（见
-/// [`declared_output_images`] 与 `crate::cap_output_image_count`），所以过滤留给各自那一侧。
+/// [`declared_output_images`] 与 `crate::declared_n_maximum`），所以过滤留给各自那一侧。
 #[must_use]
 pub fn declared_output_image_maximum(schema: &Value, name: &str) -> Option<u64> {
     schema

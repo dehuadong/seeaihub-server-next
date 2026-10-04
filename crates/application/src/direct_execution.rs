@@ -26,7 +26,7 @@ use seeai_domain::{
     ProviderTaskHandle, ProviderTraceId, PublishedOffering, ReceiptCredential, RouteStrategy,
     image_parameter_kind, platform_image_parameters,
 };
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::sync::Arc;
 use std::time::Duration;
 use thiserror::Error;
@@ -1329,6 +1329,9 @@ fn image_text(image: &InputImage) -> Result<String, ApplicationError> {
 }
 
 /// 组装 Adapter 的执行输入：普通参数去掉图片参数位上的取值，图片提升为强类型三态。
+///
+/// 选中候选的映射参数面在这里**移动**进 [`GatewayInput`]：只摘掉图片参数位的键，普通参数不会
+/// 为了这一步再构造一遍（RFC 0018 §3）。
 fn build_gateway_input(
     offering: &PublishedOffering,
     branch: ImageBranch,
@@ -1345,7 +1348,11 @@ fn build_gateway_input(
         })?
         .to_owned();
     let image_sites = image_sites_for(&offering.carrier_schema, branch);
-    let mut parameters = native_parameters.as_object().cloned().unwrap_or_default();
+    // 映射后的参数面一定是对象（物化的产物）；别的形状按"没有普通参数"处理。
+    let mut parameters = match native_parameters {
+        Value::Object(parameters) => parameters,
+        _ => Map::new(),
+    };
     for name in platform_image_parameters(&offering.carrier_schema, branch) {
         parameters.remove(&name);
     }

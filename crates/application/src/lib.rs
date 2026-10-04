@@ -8,21 +8,23 @@ use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
     FencingToken, FloorTable, FxRate, HoldSource, ImageBranch, ImageParameterKind, JobId,
     LedgerEntry, LedgerEntryKind, MeteringEvidence, OfferingCandidate, OfferingId,
-    ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
-    ProviderCostSource, ProviderTaskHandle, ProviderTraceId, PublishedModel, PublishedOffering,
-    PublishedRevision, ReceiptCredential, RoutePolicy, RouteStrategy, RuntimeRevisionId,
-    TokenUsage, VendorModelId, apply_enum_maps, apply_parameter_defaults, apply_parameter_renames,
-    apply_size_mapping, carries_parameter, contract_image_parameter_kind, contract_model_identity,
-    declared_defaults, declared_enum_maps, declared_field_names, declared_parameter_names,
+    ParameterEnumMaps, ParameterRenames, PriceRates, PriceSnapshot, PricingFormula,
+    ProviderCostFact, ProviderCostSource, ProviderTaskHandle, ProviderTraceId, PublishedModel,
+    PublishedOffering, PublishedRevision, ReceiptCredential, RoutePolicy, RouteStrategy,
+    RuntimeRevisionId, SizeMapping, TokenUsage, VendorModelId, apply_enum_maps, apply_size_mapping,
+    carries_parameter, contract_image_parameter_kind, contract_model_identity, declared_defaults,
+    declared_enum_maps, declared_field_names, declared_parameter_names,
     declared_reference_image_limit, declared_renames, declared_size_mapping,
     declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
-    is_used_parameter_value, literal_parameter_text, place_image_inputs, resolve_size_tier,
-    unit_amount_microusd, wire_parameter_name,
+    image_parameter_kind, is_used_parameter_value, literal_parameter_text, place_image_inputs,
+    platform_image_parameters, resolve_size_tier, unit_amount_microusd, validate_image_inputs,
+    wire_parameter_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
+    borrow::Cow,
     collections::{BTreeMap, BTreeSet, HashSet},
     sync::Arc,
     time::Duration,
@@ -47,6 +49,7 @@ mod ledger_audit;
 pub use ledger_audit::{LedgerAuditReport, LedgerAuditor, LedgerMismatch, OpenLedgerCaseCommand};
 
 mod declared_images;
+use declared_images::declared_output_image_maximum;
 pub use declared_images::{DeclaredOutputImages, declared_output_images};
 
 mod request_timeout;
@@ -977,6 +980,11 @@ fn reviewed_as_disabled(
 /// 策略只决定"在一批合格候选里挑哪一条"：候选合格与否仍由启用复核与承载面判定，策略不改它们，
 /// 也不改选中之后的参数准备与冻结路径。取值空间只有合格候选——不合格的既不进权重之和，也不在
 /// 分摊区间里，**策略指定不了它们**。
+///
+/// 判定为每条候选产出一份 [`CandidatePlan`]：计划只引用共享输入与发布声明，既不含图片取值，
+/// 也不是映射后的参数对象。选中之后才用共享输入物化一次参数面；物化时若发现实际承载不了
+/// （判定阶段看不到的取值），在**受理前**把这条候选排除并按既有机制重选，没有 Hold、也没有
+/// Provider 副作用（RFC 0018 §3）。
 fn select_candidate_with_strategy(
     request: &CreateImageGenerationRequest,
     branch: ImageBranch,
@@ -994,100 +1002,76 @@ fn select_candidate_with_strategy(
     let revision_id = candidates[0].runtime_revision_id;
     // 合同是模型级唯一一份，同一型号的候选共享它：请求按合同校验只做一次，与选路无关。
     let contract_parameters = contract_parameter_face(request, &candidates[0].capability_schema)?;
-    // 把每个候选连它的取舍结果一起算出来。`considered` 要记录**完整**的取舍画面，
-    // 而不是"评估到命中为止"的部分清单——它是判定记录，不是求值轨迹。
-    // 候选判定不复制图片：用同样张数的空占位走完同一条映射管线，图片内容留给选中那条物化。
-    let plan_images = vec![String::new(); request.reference_images.len()];
-    let plan_mask = request.mask.as_deref().map(|_| "");
-    let evaluated: Vec<(PublishedOffering, Value, ConsideredCandidate)> = candidates
+    // 判定与物化共用这一份输入：普通参数借用合同面，图片借用原请求，全程只有一份。
+    let shared = SharedInput {
+        parameters: &contract_parameters,
+        reference_images: &request.reference_images,
+        mask: request.mask.as_deref(),
+    };
+    // `considered` 要记录**完整**的取舍画面，而不是"评估到命中为止"的部分清单——它是判定记录，
+    // 不是求值轨迹。
+    let mut plans: Vec<CandidatePlan<'_>> = candidates
         .iter()
-        .map(|candidate| {
-            let published = candidate.clone().into_published();
-            let mut skip_reason = None;
-            let mut parameters = Value::Null;
-            // 复核（只在缓存给出的候选集上做）说这条供给或它的渠道已经停用 ⇒ 不合格，与"承载面
-            // 表达不了"同一条路：不进权重之和、不被任何策略指定。判在承载面之前：开关关掉是更准确
-            // 的落选原因（进判定记录，运营据此解释"为什么没走这条"），也无须替一条已经停用的候选
-            // 再准备参数。
-            if reviewed_as_disabled(candidate, enabled_offerings) {
-                skip_reason = Some(DISABLED_OFFERING_REASON.to_owned());
-            } else {
-                match prepare_carrier_parameters_with(
-                    &contract_parameters,
-                    &published,
-                    &plan_images,
-                    plan_mask,
-                ) {
-                    Err(reason) => skip_reason = Some(reason),
-                    Ok(prepared) => {
-                        if let Err(error) = validate_restrictions(
-                            branch,
-                            request.reference_images.len(),
-                            &candidate.restrictions,
-                        ) {
-                            skip_reason = Some(error.to_string());
-                        } else {
-                            parameters = prepared;
-                        }
-                    }
-                }
-            }
-            let considered = ConsideredCandidate {
-                offering_id: candidate.offering_id,
-                provider_kind: candidate.provider_kind.clone(),
-                routing_priority: candidate.routing_priority,
-                weight: candidate.weight,
-                // 落点先占位，定下命中档之后统一回填（它是本次判定一个数，不是每条候选各一个）。
-                weight_draw: 0,
-                eligible: skip_reason.is_none(),
-                skip_reason,
-            };
-            (published, parameters, considered)
-        })
+        .map(|candidate| plan_candidate(candidate, &shared.features(branch), enabled_offerings))
         .collect();
-    let Some(chosen) = choose_candidate(&evaluated, request, choice) else {
-        let reasons = evaluated
-            .iter()
-            .map(|(_, _, considered)| {
-                format!(
-                    "{}#{}: {}",
-                    considered.provider_kind,
-                    considered.routing_priority,
-                    considered.skip_reason.as_deref().unwrap_or("unknown")
-                )
-            })
-            .collect::<Vec<_>>()
-            .join("; ");
-        return Err(ApplicationError::NoEligibleOffering(format!(
-            "no offering can carry this request for model {} (revision {revision_id}): {reasons}",
-            request.model
-        )));
-    };
-    let (chosen, weight_draw) = chosen;
-    let considered = evaluated
+    loop {
+        let Some((chosen, weight_draw)) = choose_candidate(&plans, request, choice) else {
+            return Err(no_eligible_offering(&plans, &request.model, revision_id));
+        };
+        match materialize_selected(&plans[chosen], &shared) {
+            Ok(parameters) => {
+                let considered = plans
+                    .iter()
+                    .map(|plan| ConsideredCandidate {
+                        offering_id: plan.candidate.offering_id,
+                        provider_kind: plan.candidate.provider_kind.clone(),
+                        routing_priority: plan.candidate.routing_priority,
+                        weight: plan.candidate.weight,
+                        weight_draw,
+                        eligible: plan.eligible(),
+                        skip_reason: plan.skip_reason().map(Cow::into_owned),
+                    })
+                    .collect();
+                // 只有选中的候选才复制一次发布字段转成固化形态（RFC 0018 §3）。
+                let published = plans[chosen].candidate.clone().into_published();
+                let decision = RoutingDecision {
+                    runtime_revision_id: revision_id,
+                    chosen_offering_id: published.offering_id,
+                    considered,
+                };
+                return Ok((published, parameters, decision));
+            }
+            Err(reason) => {
+                // 物化时才发现实际承载不了：受理前排除这条候选并重选。排除之后合格集合是真小了
+                // 一条，因此循环一定终止；一条都不剩时走"无可用供给"，不建 Job、不占容量。
+                plans[chosen].reject(reason);
+            }
+        }
+    }
+}
+
+/// 一条候选都不合格时的结论：请求本身没违反合同，是平台的供给面承载不了它——对客必须表现为
+/// 平台侧故障，不是参数错。原因按**完整**判定记录逐条列出。
+fn no_eligible_offering(
+    plans: &[CandidatePlan<'_>],
+    model: &str,
+    revision_id: RuntimeRevisionId,
+) -> ApplicationError {
+    let reasons = plans
         .iter()
-        .map(|(_, _, considered)| ConsideredCandidate {
-            weight_draw,
-            ..considered.clone()
+        .map(|plan| {
+            format!(
+                "{}#{}: {}",
+                plan.candidate.provider_kind,
+                plan.candidate.routing_priority,
+                plan.skip_reason().as_deref().unwrap_or("unknown")
+            )
         })
-        .collect::<Vec<_>>();
-    let (published, _, _) = evaluated
-        .into_iter()
-        .nth(chosen)
-        .expect("index just computed");
-    // 只有选中的候选才复制图片：判定阶段用的是空占位（RFC 0018 §3）。
-    let parameters = prepare_carrier_parameters(&contract_parameters, request, &published)
-        .map_err(|reason| {
-            ApplicationError::NoEligibleOffering(format!(
-                "the chosen offering cannot carry this request: {reason}"
-            ))
-        })?;
-    let decision = RoutingDecision {
-        runtime_revision_id: revision_id,
-        chosen_offering_id: published.offering_id,
-        considered,
-    };
-    Ok((published, parameters, decision))
+        .collect::<Vec<_>>()
+        .join("; ");
+    ApplicationError::NoEligibleOffering(format!(
+        "no offering can carry this request for model {model} (revision {revision_id}): {reasons}"
+    ))
 }
 
 /// 选路要用的策略输入：策略本身，以及只有 `user_tag` 才消费的账户标签。
@@ -1112,17 +1096,18 @@ struct RouteChoice<'a> {
 /// 判失败——别的候选明明能承载这次请求，把它们一起判掉没有任何好处；退回的顺序是确定的，
 /// 仍然满足"同一请求重放落同一条"。
 fn choose_candidate(
-    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    plans: &[CandidatePlan<'_>],
     request: &CreateImageGenerationRequest,
     choice: &RouteChoice<'_>,
 ) -> Option<(usize, u64)> {
     match choice.strategy {
-        RouteStrategy::PriorityFailover => choose_by_priority_and_weight(evaluated, request),
-        RouteStrategy::WeightedRandom => choose_by_weight_across_all(evaluated, request),
-        RouteStrategy::LeastCost => choose_least_cost(evaluated, choice)
-            .or_else(|| choose_by_priority_and_weight(evaluated, request)),
-        RouteStrategy::UserTag => choose_by_tag(evaluated, choice)
-            .or_else(|| choose_by_priority_and_weight(evaluated, request)),
+        RouteStrategy::PriorityFailover => choose_by_priority_and_weight(plans, request),
+        RouteStrategy::WeightedRandom => choose_by_weight_across_all(plans, request),
+        RouteStrategy::LeastCost => choose_least_cost(plans, choice)
+            .or_else(|| choose_by_priority_and_weight(plans, request)),
+        RouteStrategy::UserTag => {
+            choose_by_tag(plans, choice).or_else(|| choose_by_priority_and_weight(plans, request))
+        }
     }
 }
 
@@ -1131,32 +1116,32 @@ fn choose_candidate(
 /// 定档位时权重不参与：合格候选里最小的 `routing_priority` 先定下来，因此"档 0 有合格候选"时
 /// 权重再小的候选也不会被后面的档抢走。
 fn choose_by_priority_and_weight(
-    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    plans: &[CandidatePlan<'_>],
     request: &CreateImageGenerationRequest,
 ) -> Option<(usize, u64)> {
-    let tier = evaluated
+    let tier = plans
         .iter()
-        .filter(|(_, _, considered)| considered.eligible)
-        .map(|(_, _, considered)| considered.routing_priority)
+        .filter(|plan| plan.eligible())
+        .map(|plan| plan.candidate.routing_priority)
         .min()?;
-    let pool: Vec<usize> = (0..evaluated.len())
+    let pool: Vec<usize> = (0..plans.len())
         .filter(|index| {
-            let considered = &evaluated[*index].2;
-            considered.eligible && considered.routing_priority == tier
+            let plan = &plans[*index];
+            plan.eligible() && plan.candidate.routing_priority == tier
         })
         .collect();
-    split_by_weight(evaluated, request, pool)
+    split_by_weight(plans, request, pool)
 }
 
 /// 不看档位：**全部**合格候选按权重分摊。
 fn choose_by_weight_across_all(
-    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    plans: &[CandidatePlan<'_>],
     request: &CreateImageGenerationRequest,
 ) -> Option<(usize, u64)> {
-    let pool: Vec<usize> = (0..evaluated.len())
-        .filter(|index| evaluated[*index].2.eligible)
+    let pool: Vec<usize> = (0..plans.len())
+        .filter(|index| plans[*index].eligible())
         .collect();
-    split_by_weight(evaluated, request, pool)
+    split_by_weight(plans, request, pool)
 }
 
 /// 折后成本估算最小的一条。
@@ -1168,20 +1153,20 @@ fn choose_by_weight_across_all(
 ///
 /// 比较用 `u128`：参考成本是 `u64`，乘上万分比会溢出 `u64`。
 fn choose_least_cost(
-    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    plans: &[CandidatePlan<'_>],
     choice: &RouteChoice<'_>,
 ) -> Option<(usize, u64)> {
     let mut best: Option<(usize, u128)> = None;
-    for (index, (published, _, considered)) in evaluated.iter().enumerate() {
-        if !considered.eligible {
+    for (index, plan) in plans.iter().enumerate() {
+        if !plan.eligible() {
             continue;
         }
-        let Some(cost) = published.price_snapshot.reference_cost_microusd else {
+        let Some(cost) = plan.candidate.price_snapshot.reference_cost_microusd else {
             continue;
         };
         let rate = choice
             .discount_rates
-            .get(&considered.offering_id.0.to_string())
+            .get(&plan.candidate.offering_id.0.to_string())
             .copied()
             .unwrap_or(NO_DISCOUNT_RATE);
         let discounted = u128::from(cost) * u128::from(rate);
@@ -1189,8 +1174,8 @@ fn choose_least_cost(
             None => true,
             // 同价时按 `offering_id` 升序定胜负：比较结果不能取决于取数顺序。
             Some((best_index, current)) => {
-                (discounted, considered.offering_id.0)
-                    < (current, evaluated[best_index].2.offering_id.0)
+                (discounted, plan.candidate.offering_id.0)
+                    < (current, plans[best_index].candidate.offering_id.0)
             }
         };
         if better {
@@ -1204,15 +1189,12 @@ fn choose_least_cost(
 ///
 /// 标签没配映射、映射指向的候选这次承载不了这次请求，两者都不算数：返回 `None`，由调用方退回
 /// 默认顺序。映射**不是**绕过承载校验的入口。
-fn choose_by_tag(
-    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
-    choice: &RouteChoice<'_>,
-) -> Option<(usize, u64)> {
+fn choose_by_tag(plans: &[CandidatePlan<'_>], choice: &RouteChoice<'_>) -> Option<(usize, u64)> {
     let mapped = choice.tag_channel_map.get(choice.account_tag?)?;
-    (0..evaluated.len())
+    (0..plans.len())
         .find(|index| {
-            let considered = &evaluated[*index].2;
-            considered.eligible && considered.offering_id.0.to_string() == *mapped
+            let plan = &plans[*index];
+            plan.eligible() && plan.candidate.offering_id.0.to_string() == *mapped
         })
         .map(|index| (index, 0))
 }
@@ -1225,22 +1207,22 @@ fn choose_by_tag(
 ///
 /// 权重之和用 `u64` 累加：权重本身是 `u32`，多条候选相加可能溢出 `u32`。
 fn split_by_weight(
-    evaluated: &[(PublishedOffering, Value, ConsideredCandidate)],
+    plans: &[CandidatePlan<'_>],
     request: &CreateImageGenerationRequest,
     mut pool: Vec<usize>,
 ) -> Option<(usize, u64)> {
     // 定序键用 `offering_id` 里的 UUID 本身：`OfferingId` 是个新类型，没有比较语义，
     // 而这里要的只是"每次取数都排出同一个顺序"，不是任何业务顺序。
-    pool.sort_by_key(|index| evaluated[*index].2.offering_id.0);
+    pool.sort_by_key(|index| plans[*index].candidate.offering_id.0);
     // 集合里至少有一条合格候选 ⇒ 权重至少是 1 ⇒ 总和至少是 1，取模不会除以零。
     let total: u64 = pool
         .iter()
-        .map(|index| u64::from(evaluated[*index].2.weight))
+        .map(|index| u64::from(plans[*index].candidate.weight))
         .sum();
     let draw = weight_split_draw(request.account_id, &request.idempotency_key) % total;
     let mut cursor = 0_u64;
     for index in pool {
-        cursor += u64::from(evaluated[index].2.weight);
+        cursor += u64::from(plans[index].candidate.weight);
         if draw < cursor {
             return Some((index, draw));
         }
@@ -6673,46 +6655,6 @@ fn declared_integer_value(value: &Value) -> Option<i64> {
     (number.fract() == 0.0).then_some(number as i64)
 }
 
-/// 把参数面上的输出张数 `n` 夹到**这条候选承载面**为它声明的 `maximum`。
-///
-/// 请求里的 `n` 是"最多要几张"，不是"必须给我几张"：合同声明 `10`、这条候选只声明 `4` 时，
-/// 调用方给 `6` 表达的是"至少 4 张也成，多多益善"。夹到 `4` 照常受理，比为此判这条候选承载不了
-/// （换候选，全不行即 503）更贴合那个意思——值在合同之内，调用方没有说错话。
-///
-/// 上界按**承载面最终落到的那个名字**找（承载面自己声明了 `n` 就用它，否则看改名表把 `n` 落到
-/// 哪个名字上，与承载校验是同一条规则）：这样"承载面线上叫 `num_images`"的候选照样夹得住，
-/// 不会因为换了个线上名字就把超界的值原样发出去。平台拿这个数算超时与单次成本（见
-/// [`requested_image_count`] 与 [`single_request_cost_cny`]），所以改了它两处跟着改。承载面声明的
-/// 下界不在这里判：把值往上抬等于替调用方多要图，平台不做这件事。
-///
-/// 这里不套用 [`declared_output_image_maximum`]：那个读法把 `maximum: 0` 当"没声明"（超时链的
-/// 口径），而这条路上 0 就是"一张都出不了"——照读照夹，不额外发明一个语义。
-fn cap_output_image_count(
-    carrier: &Value,
-    renames: Option<&ParameterRenames>,
-    parameters: &mut Map<String, Value>,
-) {
-    // 判据是承载面**自己**那份声明：各候选的界不同（同一份合同下 AIHubMix 声明 10、APIMart 声明 4）。
-    let Some(wire_name) = wire_parameter_name(carrier, renames, "n") else {
-        return;
-    };
-    let Some(maximum) = carrier
-        .get("properties")
-        .and_then(|properties| properties.get(&wire_name))
-        .and_then(|n| n.get("maximum"))
-        .and_then(Value::as_u64)
-    else {
-        return;
-    };
-    let over = parameters
-        .get("n")
-        .and_then(declared_integer_value)
-        .is_some_and(|requested| requested > maximum as i64);
-    if over {
-        parameters.insert("n".to_owned(), Value::from(maximum));
-    }
-}
-
 /// 合同字段名下的图片输入是否"在场"。
 ///
 /// 参考图与遮罩在受理侧就按契约字段名从参数面里取了出来（它们有自己的去处：选路后落到候选声明的
@@ -6726,137 +6668,567 @@ fn contract_image_input_present(request: &CreateImageGenerationRequest, name: &s
     }
 }
 
-/// 受理的第二步：这条供给承载得了这次请求吗？承载得了就把参数面组装出来。
+/// 候选判定共用的请求面：**借用**合同面过滤后的普通参数，图片只带张数与分支。
 ///
-/// **承载校验**：请求里**实际用到**的每个字段（非空值）都必须被这条候选承载；缺一个就是
-/// 这条候选不合格，返回原因写进路由判定记录。这正是"声明了承载面"的意义——供给说了自己能把哪些
-/// 字段带到线上，平台不替它加码。承载的判据不只看承载面声明：某个合同字段承载面没声明、但映射
-/// 的**改名表**把它落到了承载面声明的名字上时，这条供给照样承载得了它（只是线上叫另一个名字）。
-///
-/// 两个例外都算"表达得了这次请求，只是表达成另一个样子"：
-/// - **被尺寸换算消耗**的字段：那条供给把它当作换算的输入（比例 + 档位 → 像素），而不是要原样
-///   发出去的字段——像素面渠道的线上根本没有 `resolution` 这个名字，正因为有换算它才承载得了；
-/// - 换算本身失败（档案缺那一格、取值不成形状）同样是"这条候选不合格"，理由照旧写进判定记录。
-///
-/// **输出张数 `n` 超过这条候选声明的上界不算承载不了**：值取该上界发出去（见
-/// [`cap_output_image_count`]）——`n` 是"最多要几张"，请求给得更多是"少给几张也成"。承载校验
-/// 不判取值：这条候选声明的 `n` 下界不是判据，低于它的值原样上行，由上游按自己的 schema 处置。
-///
-/// 合格之后才组装要落进 Job、并发给上游的参数面：
-/// 1. 按承载留下名字：承载面声明了这个名字就用它，否则用改名表映射出来的**线上名字**；两边都
-///    落不到的名字（含调用方给了空值的）在这里去掉——空值不携带信息，而发一个承载不了的字段名
-///    给上游，只会得到上游自己的一套解释；
-/// 2. 把参考图与遮罩落到这条候选**自己声明的**参数名上（声明不了就是不合格，绝不静默丢图）；
-/// 3. 注入映射声明的**显式默认值**：调用方没给的字段由平台定，而不是由渠道自己的默认值定；
-/// 4. 把输出张数 `n` 夹到这条候选**自己声明的**上限（见 [`cap_output_image_count`]）；
-/// 5. 按映射声明做**尺寸换算**：这一步在改名之前做，因为换算的源字段是**合同字段名**；
-/// 6. 改名：把还没落到线上的合同字段名换成这条供给线上要发的名字；
-/// 7. 按**取值映射表**把取值换成线上取值：表里没有的取值让这条候选不合格（不猜、不透传原值）；
-/// 8. 最后看一眼承载面**自己声明的必填字段**是否都在场：供给说了"这次请求必须带上它"，
-///    平台不替它省。放在最后是因为前几步都可能把必填项补上（图落在承载面的名字上、默认值注入、
-///    尺寸换算写进目标字段），先判会把"其实跑得通"的候选误判成不合格。
-///
-/// 返回的是"这条候选不合格"的原因，不是请求级错误：换一条承载面更宽的候选仍然可能跑通，
-/// 所以它写进路由判定记录，而不是直接回给调用方。
-fn prepare_carrier_parameters(
-    contract_parameters: &Map<String, Value>,
-    request: &CreateImageGenerationRequest,
-    offering: &PublishedOffering,
-) -> Result<Value, String> {
-    prepare_carrier_parameters_with(
-        contract_parameters,
-        offering,
-        &request.reference_images,
-        request.mask.as_deref(),
-    )
+/// 判定阶段看不到图片取值——这正是"不为每条候选复制图片"的落点：计划里的图片位只记在场
+/// （见 [`PlannedValue::PlacedImage`]），取值留到选中之后由 [`place_image_inputs`] 装载一次。
+struct RequestFeatures<'a> {
+    /// 合同面过滤后的普通参数（含 `model`），按合同字段名索引。
+    parameters: &'a Map<String, Value>,
+    /// 参考图张数：判定只判"这次带进来几张"，不看取值。
+    reference_image_count: usize,
+    /// 这次请求是否带遮罩。
+    has_mask: bool,
+    /// 本次分支：限制声明与承载判定都按它。
+    branch: ImageBranch,
 }
 
-/// 同一条映射管线的内部形态：图片与遮罩由调用方给。
+/// 判定与物化共用的共享输入：普通参数、参考图与遮罩都**借用**原请求，全程只有一份。
+struct SharedInput<'a> {
+    parameters: &'a Map<String, Value>,
+    reference_images: &'a [String],
+    mask: Option<&'a str>,
+}
+
+impl<'a> SharedInput<'a> {
+    /// 判定用的请求面（RFC 0018 §3）。
+    fn features(&self, branch: ImageBranch) -> RequestFeatures<'a> {
+        RequestFeatures {
+            parameters: self.parameters,
+            reference_image_count: self.reference_images.len(),
+            has_mask: self.mask.is_some(),
+            branch,
+        }
+    }
+}
+
+/// 一条候选的承载结论与映射计划。
 ///
-/// 选路对**每条**候选只问"表达得了吗"，用的是一组同形状的空占位；图片内容只在选中那条上
-/// 复制一次（RFC 0018 §3）。判定与物化必须走同一条管线，否则"候选能不能承载"会在两处各判一遍。
-fn prepare_carrier_parameters_with(
-    contract_parameters: &Map<String, Value>,
-    offering: &PublishedOffering,
-    reference_images: &[String],
-    mask: Option<&str>,
-) -> Result<Value, String> {
-    let mapping = &offering.parameter_mapping;
-    let renames = declared_renames(mapping)?;
-    let enum_maps = declared_enum_maps(mapping)?;
-    let size = declared_size_mapping(mapping)?;
-    for (name, value) in contract_parameters {
+/// 计划只记**名字与声明**：借用的合同参数、显式默认值、改名、尺寸换算与取值映射声明，以及这条
+/// 候选夹到的输出张数。它不持有图片取值，也不是映射后的参数对象；后者由 [`materialize_selected`]
+/// 对**选中**候选做一次（RFC 0018 §3）。
+#[derive(Debug)]
+struct CandidatePlan<'a> {
+    /// 这条计划属于候选集里的哪一条。
+    candidate: &'a OfferingCandidate,
+    /// 承载结论：`Ok` = 承载得了；`Err` = 有界落选原因。
+    verdict: Result<(), SkipReason>,
+    /// 改名表：物化时取值映射仍要按它找线上名字。
+    renames: Option<ParameterRenames>,
+    /// 取值映射声明：判定阶段已判过可行性，物化时按同一张表落地。
+    enum_maps: Option<ParameterEnumMaps>,
+    /// 尺寸换算声明：判定阶段已算过一次可行性，物化时按同一份声明再算一次。
+    size: Option<SizeMapping>,
+    /// 要落到线上的字段计划（图片位只是一个在场标记）；里面没有映射后的取值。
+    fields: Vec<PlannedField>,
+}
+
+/// 计划里一个线上字段的取值来源：只引用共享输入与发布声明，**不持有取值**。
+#[derive(Debug)]
+enum PlannedValue {
+    /// 合同参数：按合同字段名从共享输入借。
+    Contract { name: String },
+    /// 映射声明的显式默认值：调用方没给（或给了空值）时按声明注入。
+    Default { name: String },
+    /// 尺寸换算的结果：物化时按声明的源字段算出来写进这个字段。
+    Size,
+    /// 平台装载的图片位：判定阶段只记它在场，取值留到物化装载。
+    PlacedImage,
+    /// 夹到这条候选上界的输出张数。
+    CappedOutputCount(i64),
+}
+
+/// 计划里一个线上字段。
+#[derive(Debug)]
+struct PlannedField {
+    /// 线上字段名：改名已经落在计划里。
+    wire: String,
+    value: PlannedValue,
+}
+
+/// 落选原因：承载面必填却缺失的字段单独成一支，其余是一句有界文案。
+#[derive(Debug)]
+enum SkipReason {
+    /// 承载面声明必填、计划里却没有的字段。
+    MissingRequired(Vec<String>),
+    /// 其它落选原因（承载不了某个字段、换算不了、取值映射不了…）。
+    Other(String),
+}
+
+impl SkipReason {
+    /// 写进判定记录与"无可用供给"错误的原因文本。
+    fn reason(&self) -> Cow<'_, str> {
+        match self {
+            Self::MissingRequired(names) => Cow::Owned(format!(
+                "this offering requires parameter(s) {}, which the request does not provide",
+                names.join(", ")
+            )),
+            Self::Other(reason) => Cow::Borrowed(reason),
+        }
+    }
+}
+
+impl<'a> CandidatePlan<'a> {
+    /// 判定阶段就落选的计划：没有字段计划，也没有解析过的声明。
+    fn rejected(candidate: &'a OfferingCandidate, reason: String) -> Self {
+        Self::rejected_with(candidate, SkipReason::Other(reason))
+    }
+
+    /// 同上，由落选原因本身构成。
+    fn rejected_with(candidate: &'a OfferingCandidate, verdict: SkipReason) -> Self {
+        Self {
+            candidate,
+            verdict: Err(verdict),
+            renames: None,
+            enum_maps: None,
+            size: None,
+            fields: Vec::new(),
+        }
+    }
+
+    /// 承载结论。
+    fn eligible(&self) -> bool {
+        self.verdict.is_ok()
+    }
+
+    /// 判定记录里的落选原因；合格时为 `None`。
+    fn skip_reason(&self) -> Option<Cow<'_, str>> {
+        self.verdict.as_ref().err().map(SkipReason::reason)
+    }
+
+    /// 物化时才发现实际承载不了：按既有机制在**受理前**排除这条候选，字段计划随之作废。
+    fn reject(&mut self, reason: String) {
+        self.verdict = Err(SkipReason::Other(reason));
+        self.fields.clear();
+    }
+}
+
+/// 判定一条候选并产出它的映射计划。
+///
+/// 判定覆盖原有全部语义：必填、承载参数、默认注入、尺寸换算可行性、取值映射可行性、分支、
+/// 参考图数量、候选较小的 `n` 上限。判据只借用共享输入与发布声明：图片按张数与分支参与，
+/// 计划里既没有图片取值，也没有映射后的参数对象（RFC 0018 §3）。
+fn plan_candidate<'a>(
+    candidate: &'a OfferingCandidate,
+    features: &RequestFeatures<'_>,
+    enabled_offerings: Option<&HashSet<OfferingId>>,
+) -> CandidatePlan<'a> {
+    // 复核（只在缓存给出的候选集上做）说这条供给或它的渠道已经停用 ⇒ 不合格，与"承载面表达
+    // 不了"同一条路。判在承载面之前：开关关掉是更准确的落选原因，也无须替一条已经停用的候选
+    // 再解析映射声明。
+    if reviewed_as_disabled(candidate, enabled_offerings) {
+        return CandidatePlan::rejected(candidate, DISABLED_OFFERING_REASON.to_owned());
+    }
+    let carrier = &candidate.carrier_schema;
+    let mapping = &candidate.parameter_mapping;
+    let renames = match declared_renames(mapping) {
+        Ok(renames) => renames,
+        Err(reason) => return CandidatePlan::rejected(candidate, reason),
+    };
+    let enum_maps = match declared_enum_maps(mapping) {
+        Ok(enum_maps) => enum_maps,
+        Err(reason) => return CandidatePlan::rejected(candidate, reason),
+    };
+    let size = match declared_size_mapping(mapping) {
+        Ok(size) => size,
+        Err(reason) => return CandidatePlan::rejected(candidate, reason),
+    };
+    // 请求**实际用到**的字段都必须被这条候选承载。被尺寸换算消耗的字段是例外：那条供给把它当作
+    // 换算的输入，而不是要原样发出去的字段。
+    for (name, value) in features.parameters {
         if !is_used_parameter_value(value) {
             continue;
         }
         if size.as_ref().is_some_and(|mapping| mapping.consumes(name)) {
             continue;
         }
-        if !carries_parameter(&offering.carrier_schema, renames.as_ref(), name) {
-            return Err(format!(
-                "this offering cannot carry parameter {name}, which the request uses"
-            ));
+        if !carries_parameter(carrier, renames.as_ref(), name) {
+            return CandidatePlan::rejected(
+                candidate,
+                format!("this offering cannot carry parameter {name}, which the request uses"),
+            );
         }
     }
-    // 参数面此时还在**合同名字**上：默认值按合同字段名注入、尺寸换算按合同字段名取输入，改名与
-    // 取值映射放到最后统一落到线上形态。落不进承载面的名字在这里就被丢掉，与"未声明的参数不上行"
-    // 是同一条规则。
-    let mut parameters = contract_parameters
+    // 参考图与遮罩按**张数与分支**判：判定阶段不看图片取值。
+    if let Err(reason) =
+        validate_image_inputs(carrier, features.reference_image_count, features.has_mask)
+    {
+        return CandidatePlan::rejected(candidate, reason);
+    }
+    // 参数面在判定阶段是一份**计划**：键与承载面过滤后的名字相同，取值只记来源。空值也在里面
+    // （判定与物化的键集合必须一致）。
+    let mut planned: BTreeMap<String, PlannedValue> = features
+        .parameters
         .iter()
-        .filter(|(name, _)| carries_parameter(&offering.carrier_schema, renames.as_ref(), name))
-        .map(|(name, value)| (name.clone(), value.clone()))
-        .collect::<Map<_, _>>();
-    place_image_inputs(
-        &offering.carrier_schema,
-        &mut parameters,
-        reference_images,
-        mask,
-    )?;
-    apply_parameter_defaults(
-        &offering.capability_schema,
-        &offering.carrier_schema,
-        renames.as_ref(),
-        declared_defaults(mapping),
-        &mut parameters,
-    );
-    cap_output_image_count(&offering.carrier_schema, renames.as_ref(), &mut parameters);
-    if let Some(size) = &size {
-        // 换算结果写进承载面声明的目标字段。发布期已经拦下"目标字段没被承载面声明"的映射，
-        // 这里再判一次是因为落库的那一行也可能来自更早的发布：宁可判这条候选不合格，
-        // 也不往线上写一个它没声明过的字段。
-        if !declares_parameter(&offering.carrier_schema, &size.target) {
-            return Err(format!(
-                "this offering's size mapping writes {}, which it does not declare",
-                size.target
-            ));
+        .filter(|(name, _)| carries_parameter(carrier, renames.as_ref(), name))
+        .map(|(name, _)| (name.clone(), PlannedValue::Contract { name: name.clone() }))
+        .collect();
+    // 图片位与 [`place_image_inputs`] 用同一条判据（请求给了几张、有没有遮罩、承载面把这些名字
+    // 声明在哪），但判定阶段只记"在场"，不留取值。
+    for name in placed_image_parameters(carrier, features) {
+        planned.insert(name, PlannedValue::PlacedImage);
+    }
+    // 显式默认值：调用方没给（或给了空值）时按声明注入。已经给了的字段一个字都不改。
+    if let Some(defaults) = declared_defaults(mapping) {
+        for name in defaults.keys() {
+            if !declares_parameter(&candidate.capability_schema, name)
+                || !carries_parameter(carrier, renames.as_ref(), name)
+            {
+                continue;
+            }
+            let given = planned
+                .get(name)
+                .is_some_and(|value| planned_value_used(value, features, candidate));
+            if !given {
+                planned.insert(name.clone(), PlannedValue::Default { name: name.clone() });
+            }
         }
-        apply_size_mapping(size, contract_parameters, &mut parameters)?;
     }
-    apply_parameter_renames(&offering.carrier_schema, renames.as_ref(), &mut parameters)?;
+    // 输出张数超过这条候选声明的上界 ⇒ 夹到上界（`n` 是"最多要几张"）。上界按承载面**线上那个
+    // 名字**找，因此换个线上名也照样夹得住；夹的结果落在 `n` 这个名字上，改名随后统一处理。
+    if let Some(maximum) = declared_n_maximum(carrier, renames.as_ref())
+        && let Some(requested) = planned
+            .get("n")
+            .and_then(|value| planned_integer(value, features, candidate))
+        && requested > maximum
+    {
+        planned.insert("n".to_owned(), PlannedValue::CappedOutputCount(maximum));
+    }
+    // 尺寸换算：判目标字段被承载面声明，再对源取值真算一次（只碰几个尺寸串）以判可行性；换算
+    // 结果只用于取值映射可行性，物化时按同一份声明再算一次。
+    let mut converted_size = None;
+    if let Some(size_mapping) = &size {
+        if !declares_parameter(carrier, &size_mapping.target) {
+            return CandidatePlan::rejected(
+                candidate,
+                format!(
+                    "this offering's size mapping writes {}, which it does not declare",
+                    size_mapping.target
+                ),
+            );
+        }
+        if planned_size_source_used(size_mapping, &planned, features, candidate) {
+            // 换算除了合同面还会看组装中的参数面：默认值补进来的源字段要在这一份里。
+            let mut scratch: Map<String, Value> = Map::new();
+            for name in &size_mapping.source {
+                if matches!(planned.get(name), Some(PlannedValue::Default { .. }))
+                    && let Some(value) = default_value(candidate, name)
+                {
+                    scratch.insert(name.clone(), value.clone());
+                }
+            }
+            match apply_size_mapping(size_mapping, features.parameters, &mut scratch) {
+                Ok(()) => {
+                    converted_size = scratch
+                        .get(&size_mapping.target)
+                        .and_then(Value::as_str)
+                        .map(str::to_owned);
+                }
+                Err(reason) => return CandidatePlan::rejected(candidate, reason),
+            }
+            for name in &size_mapping.source {
+                if *name != size_mapping.target {
+                    planned.remove(name);
+                }
+            }
+            planned.insert(size_mapping.target.clone(), PlannedValue::Size);
+        }
+    }
+    // 改名：承载面没声明的名字经映射表落到线上名上。两个合同字段落到同一个线上名 = 这条候选
+    // 承载不了（平台不猜调用方想留哪一个）。
+    let mut wire_of: BTreeMap<String, String> = BTreeMap::new();
+    let mut taken: BTreeSet<String> = planned
+        .keys()
+        .filter(|name| declares_parameter(carrier, name))
+        .cloned()
+        .collect();
+    for name in planned
+        .keys()
+        .filter(|name| !declares_parameter(carrier, name))
+    {
+        let wire = renames
+            .as_ref()
+            .and_then(|renames| renames.get(name))
+            .filter(|wire| *wire != name && declares_parameter(carrier, wire))
+            .cloned()
+            .unwrap_or_else(|| name.clone());
+        if taken.contains(&wire) {
+            return CandidatePlan::rejected(
+                candidate,
+                format!(
+                    "this offering writes both {name} and {wire} on the wire; it cannot carry this request"
+                ),
+            );
+        }
+        taken.insert(wire.clone());
+        wire_of.insert(name.clone(), wire);
+    }
+    let fields: Vec<PlannedField> = planned
+        .into_iter()
+        .map(|(name, value)| {
+            let wire = if declares_parameter(carrier, &name) {
+                name
+            } else {
+                wire_of.get(&name).cloned().unwrap_or_else(|| name.clone())
+            };
+            PlannedField { wire, value }
+        })
+        .collect();
+    // 取值映射：表里没有这个取值 = 这条候选不合格（不猜、不透传原值）。判定阶段能看到的取值
+    // 在这里就判（合同参数、默认值、夹后的张数、换算结果）；图片位上的取值看不到，留给物化。
+    // 映射成 `null` 的字段物化后就不在场了，因此它对承载面的必填判据也算缺失。
+    let mut mapped_to_null: BTreeSet<String> = BTreeSet::new();
     if let Some(enum_maps) = &enum_maps {
-        apply_enum_maps(
-            &offering.carrier_schema,
-            renames.as_ref(),
-            enum_maps,
-            &mut parameters,
-        )?;
+        for (name, table) in enum_maps {
+            let Some(wire) = wire_parameter_name(carrier, renames.as_ref(), name) else {
+                continue;
+            };
+            let Some(field) = fields.iter().find(|field| field.wire == wire) else {
+                continue;
+            };
+            let resolved: Option<Cow<'_, Value>> = match &field.value {
+                PlannedValue::Size => converted_size
+                    .as_deref()
+                    .map(|text| Cow::Owned(Value::String(text.to_owned()))),
+                value => planned_value(value, features, candidate),
+            };
+            let Some(resolved) = resolved else {
+                continue;
+            };
+            let value: &Value = &resolved;
+            if !is_used_parameter_value(value) {
+                continue;
+            }
+            let Some(mapped) = value.as_str().and_then(|text| table.get(text)) else {
+                return CandidatePlan::rejected(
+                    candidate,
+                    format!(
+                        "this offering declares no wire value for {name}={value}, so it cannot carry this request"
+                    ),
+                );
+            };
+            if mapped.is_null() {
+                mapped_to_null.insert(wire);
+            }
+        }
     }
-    let missing: Vec<&str> = offering
-        .carrier_schema
+    // 承载面**自己声明的必填字段**也得在场；缺了哪些单独记下来，判定记录因此看得出缺了什么。
+    let missing: Vec<String> = carrier
         .get("required")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .filter_map(Value::as_str)
-        .filter(|name| parameters.get(*name).is_none_or(Value::is_null))
+        .filter(|name| {
+            mapped_to_null.contains(*name)
+                || !fields
+                    .iter()
+                    .find(|field| field.wire == *name)
+                    .is_some_and(|field| planned_field_present(field, features, candidate))
+        })
+        .map(str::to_owned)
         .collect();
     if !missing.is_empty() {
-        return Err(format!(
-            "this offering requires parameter(s) {}, which the request does not provide",
-            missing.join(", ")
-        ));
+        return CandidatePlan::rejected_with(candidate, SkipReason::MissingRequired(missing));
+    }
+    // 限制声明最后判：它与参数面无关，判在承载之后，与原来同一顺序。
+    if let Err(error) = validate_restrictions(
+        features.branch,
+        features.reference_image_count,
+        &candidate.restrictions,
+    ) {
+        return CandidatePlan::rejected(candidate, error.to_string());
+    }
+    CandidatePlan {
+        candidate,
+        verdict: Ok(()),
+        renames,
+        enum_maps,
+        size,
+        fields,
+    }
+}
+
+/// 这条候选为输出张数声明的上界：按承载面**线上那个名字**找（改名表把它落到哪就用哪个名字）。
+fn declared_n_maximum(carrier: &Value, renames: Option<&ParameterRenames>) -> Option<i64> {
+    let wire = wire_parameter_name(carrier, renames, "n")?;
+    // 这里不套用超时链"`maximum: 0` 当没声明"的口径：这条路上 0 就是"一张都出不了"。
+    declared_output_image_maximum(carrier, &wire)
+        .map(|maximum| i64::try_from(maximum).unwrap_or(i64::MAX))
+}
+
+/// 这次请求要装载的图片位名字：与 [`place_image_inputs`] 用同一条判据（请求给了几张、有没有
+/// 遮罩、承载面把这些名字声明在哪）。
+fn placed_image_parameters(carrier: &Value, features: &RequestFeatures<'_>) -> Vec<String> {
+    let mut names = Vec::new();
+    if features.reference_image_count > 0
+        && let Some(name) = platform_image_parameters(carrier, ImageBranch::ImageConditioned)
+            .into_iter()
+            .next()
+    {
+        names.push(name);
+    }
+    if features.has_mask
+        && let Some(name) = platform_image_parameters(carrier, ImageBranch::Masked)
+            .into_iter()
+            .find(|name| image_parameter_kind(name) == Some(ImageParameterKind::Mask))
+    {
+        names.push(name);
+    }
+    names
+}
+
+/// 判定阶段能看到的字段取值：借用共享输入里的合同参数或映射声明的默认值，或平台自己算的小标量。
+///
+/// `PlacedImage` 与 `Size` 返回 `None`：图片取值判定阶段看不到，换算结果在规划里另算。
+fn planned_value<'v>(
+    value: &'v PlannedValue,
+    features: &'v RequestFeatures<'_>,
+    candidate: &'v OfferingCandidate,
+) -> Option<Cow<'v, Value>> {
+    match value {
+        PlannedValue::Contract { name } => features.parameters.get(name).map(Cow::Borrowed),
+        PlannedValue::Default { name } => default_value(candidate, name).map(Cow::Borrowed),
+        PlannedValue::CappedOutputCount(count) => Some(Cow::Owned(Value::from(*count))),
+        PlannedValue::Size | PlannedValue::PlacedImage => None,
+    }
+}
+
+/// 映射声明的显式默认值：取值来自这条候选自己的发布声明。
+fn default_value<'v>(candidate: &'v OfferingCandidate, name: &str) -> Option<&'v Value> {
+    declared_defaults(&candidate.parameter_mapping)?.get(name)
+}
+
+/// 这个计划字段算不算"调用方真的用了"（默认值注入的判据）。
+fn planned_value_used(
+    value: &PlannedValue,
+    features: &RequestFeatures<'_>,
+    candidate: &OfferingCandidate,
+) -> bool {
+    match value {
+        // 图片已经装载：它在场，默认值不该顶掉它。
+        PlannedValue::PlacedImage => true,
+        value => planned_value(value, features, candidate)
+            .is_some_and(|value| is_used_parameter_value(&value)),
+    }
+}
+
+/// 这次请求有没有用到尺寸换算的源字段：判据与 [`apply_size_mapping`] 一致——先看**合同面**的取值
+/// （承载面没声明的源字段也在那里，它正是"被换算消耗"那一类），再看组装中的参数面（映射补进来的
+/// 默认值也在内）。
+fn planned_size_source_used(
+    mapping: &SizeMapping,
+    planned: &BTreeMap<String, PlannedValue>,
+    features: &RequestFeatures<'_>,
+    candidate: &OfferingCandidate,
+) -> bool {
+    mapping.source.iter().any(|name| {
+        features
+            .parameters
+            .get(name)
+            .is_some_and(is_used_parameter_value)
+            || planned
+                .get(name)
+                .is_some_and(|value| planned_value_used(value, features, candidate))
+    })
+}
+
+/// 计划里 `n` 的整数取值（夹输出张数用）。
+fn planned_integer(
+    value: &PlannedValue,
+    features: &RequestFeatures<'_>,
+    candidate: &OfferingCandidate,
+) -> Option<i64> {
+    planned_value(value, features, candidate).and_then(|value| declared_integer_value(&value))
+}
+
+/// 计划里的这个字段物化后是否在场且非 `null`：承载面必填的判据。
+fn planned_field_present(
+    field: &PlannedField,
+    features: &RequestFeatures<'_>,
+    candidate: &OfferingCandidate,
+) -> bool {
+    match &field.value {
+        // 换算结果、夹后的张数与装载的图片位都会写出一个非空取值。
+        PlannedValue::Size | PlannedValue::CappedOutputCount(_) | PlannedValue::PlacedImage => true,
+        value => planned_value(value, features, candidate).is_some_and(|value| !value.is_null()),
+    }
+}
+
+/// 用共享输入物化选中候选的参数面：**只在这里**构造一次映射后的参数对象。
+///
+/// 普通参数按合同取值复制一次，图片由 [`place_image_inputs`] 从共享输入装载（判定阶段看不到它们
+/// 的取值）；尺寸换算与取值映射按计划里那些声明落地。判定阶段看不到的取值可能让这一步失败：
+/// 调用方据此在**受理前**排除该候选并重选（RFC 0018 §3）。
+fn materialize_selected(
+    plan: &CandidatePlan<'_>,
+    shared: &SharedInput<'_>,
+) -> Result<Value, String> {
+    #[cfg(test)]
+    materializations_probe::record();
+    let carrier = &plan.candidate.carrier_schema;
+    let mut parameters: Map<String, Value> = Map::new();
+    for field in &plan.fields {
+        match &field.value {
+            PlannedValue::Contract { name } => {
+                if let Some(value) = shared.parameters.get(name) {
+                    parameters.insert(field.wire.clone(), value.clone());
+                }
+            }
+            PlannedValue::Default { name } => {
+                if let Some(value) = default_value(plan.candidate, name) {
+                    parameters.insert(field.wire.clone(), value.clone());
+                }
+            }
+            PlannedValue::CappedOutputCount(count) => {
+                parameters.insert(field.wire.clone(), Value::from(*count));
+            }
+            // 图片位与尺寸换算的取值在下面按共享输入装载/换算。
+            PlannedValue::PlacedImage | PlannedValue::Size => {}
+        }
+    }
+    place_image_inputs(
+        carrier,
+        &mut parameters,
+        shared.reference_images,
+        shared.mask,
+    )?;
+    if let Some(size) = &plan.size
+        && plan
+            .fields
+            .iter()
+            .any(|field| matches!(field.value, PlannedValue::Size))
+    {
+        // 源取值按声明从共享输入借；这一步排在装载图片之后，与原来"先装图、再换算"的顺序一致。
+        apply_size_mapping(size, shared.parameters, &mut parameters)?;
+    }
+    if let Some(enum_maps) = &plan.enum_maps {
+        apply_enum_maps(carrier, plan.renames.as_ref(), enum_maps, &mut parameters)?;
     }
     Ok(Value::Object(parameters))
+}
+
+/// 测试探针：本线程上的物化次数。
+///
+/// 用例据它证明"判定不物化任何候选、选中只物化一次"。用线程局部而不是全局计数：libtest 默认
+/// 每个用例一个线程，并行跑不会互相干扰。
+#[cfg(test)]
+mod materializations_probe {
+    use std::cell::Cell;
+
+    thread_local! {
+        static MATERIALIZATIONS: Cell<usize> = const { Cell::new(0) };
+    }
+
+    /// 记一次物化。
+    pub(super) fn record() {
+        MATERIALIZATIONS.with(|count| count.set(count.get() + 1));
+    }
+
+    /// 本线程到目前为止的物化次数。
+    pub(super) fn count() -> usize {
+        MATERIALIZATIONS.with(Cell::get)
+    }
 }
 
 fn canonicalize_json(value: &mut Value) {
