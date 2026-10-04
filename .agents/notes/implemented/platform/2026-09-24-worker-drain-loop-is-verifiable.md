@@ -2,9 +2,9 @@
 title: worker 排空逻辑改为可确定验证的循环
 status: implemented
 created: 2026-09-24
-updated: 2026-09-24
+updated: 2026-10-04
 approval: 工单 #24 的验收条件要求"给 worker 发终止信号后 Job 不滞留提交中"；原实现已排空，但无法确定验证。本次按该验收把停机输入改为参数化并补齐用例。
-verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信号都不打断在飞那一轮、已在排空态不领新任务、没有停机请求时不退出）；既有定价端到端全套 `cargo test -p seeai-api --test http_contract cases_pricing -- --ignored`（9 passed，其中两条正是被本轮回归打红、修复后转绿的用例）；`cargo clippy -p seeai-worker -p seeai-api --all-targets --all-features -- -D warnings` 通过；`cargo fmt --all -- --check` 通过。
+verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信号都不打断在飞那一轮、已在排空态不领新任务、没有停机请求时不退出）；既有定价端到端全套 `cargo test -p seeai-api --test http_contract cases_pricing -- --ignored`（9 passed，其中两条正是被本轮回归打红、修复后转绿的用例）；`cargo clippy -p seeai-worker -p seeai-api --all-targets --all-features -- -D warnings` 通过；`cargo fmt --all -- --check` 通过；停机修复后 `cargo test --workspace --all-features` 全绿（修复前卡在 `an_interrupt_waits_for_the_in_flight_iteration` 超过 60s），该条单条重复 15 次全绿。
 ---
 
 # Agent Note：worker 排空逻辑改为可确定验证的循环
@@ -32,7 +32,9 @@ verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信
 ## 后果
 
 - 停机判定与在飞调用彻底分开：`run_once` 一旦开始就一定跑完，排空与终止都只在它前后生效。
-- 终止信号是**可重复轮询**的：`select!` 会在已就绪的分支上再轮询一次，所以停机源必须能安全地"再问一遍"。用例里的替身因此也用可重复轮询的形状（裸 `oneshot` 会在第二次轮询时 panic）。
+- 停机一旦被看见就不再回到 `select!`：终止信号触发后一直就绪，再进 `select!` 会每次都选中它，循环不让出线程，单线程运行时连在飞那一轮的定时器都推不动（实测挂死）。看见停机之后直接等手上那一轮跑完。
+- 内层 `select!` 用 `biased`：停机优先于"这一轮刚好跑完"。两边同时就绪时让迭代先赢，这次终止会被跳过，循环回到退避里等，终止信号直到下一轮才可能被再看见。
+- 停机源仍是**可重复轮询**的（触发后一直就绪）：`await_stop` 在选定之前会反复询问它。用例的替身用 `watch` 的同源接收端复现这一性质（裸 `oneshot` 完成后再被轮询会 panic）。
 - 两条新用例把合同钉死：停机请求投在"这一轮已经在飞"时，返回前那一轮必须跑完；已经在排空态时一轮都不领；没有停机请求时循环不退出。
 - 停机的**操作系统侧**（SIGTERM/Ctrl+C 真的送到进程）仍由部署验证：本件验的是"送到之后循环怎么做"，不是信号投递本身。
 
@@ -44,6 +46,7 @@ verification: `cargo test -p seeai-worker`（4 passed：排空请求与终止信
 | 终止信号同样等手上那一轮跑完 | `an_interrupt_waits_for_the_in_flight_iteration`（同文件） |
 | 已经在排空态时一轮都不领（重复的停机请求不会各领一轮） | `an_already_draining_worker_does_not_claim_another_iteration`（同文件） |
 | 没有停机请求时循环不退出 | `the_loop_keeps_working_while_no_stop_is_requested`（同文件） |
+| 停机选中后不再空转、终止不会被跑到轮边界才看见 | `cargo test -p seeai-worker worker_loop_tests`（4 passed）；`an_interrupt_waits_for_the_in_flight_iteration` 单条重复 15 次全绿（修复前 `cargo test --workspace --all-features` 卡在该条超过 60s） |
 | **领任务不依赖停机输入**（回归） | 定价端到端全套 `cargo test -p seeai-api --test http_contract cases_pricing -- --ignored`（9 passed）——首版"先等停机再领"在这里被当场抓住 |
 | 门禁（本改动面） | `cargo fmt --all -- --check`、`cargo clippy -p seeai-worker -p seeai-api --all-targets --all-features -- -D warnings`、`cargo test -p seeai-worker` |
 

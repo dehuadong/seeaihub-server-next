@@ -679,39 +679,40 @@ impl CredentialProvider for NoCredentials {
 
 /// 一条用例自己的终止信号：可以自己投递一次；[`Self::signal`] 给出主循环要的那份 future。
 ///
-/// 形状与生产里的终止信号（SIGINT / SIGTERM）一致：**可重复轮询**，触发之后一直就绪。用裸 `oneshot` 不行——
-/// `select!` 会在已就绪的分支上再轮询一次，而"已完成又被轮询"的 future 会 panic。
-#[derive(Default)]
+/// 形状与生产里的终止信号（SIGINT / SIGTERM）一致：**可重复轮询**，触发之后一直就绪。`watch` 的当前值
+/// 让"再问一遍"始终给出触发结论；裸 `oneshot` 完成后再被轮询会 panic。
 struct TestInterrupt {
-    /// **已经触发过**。它必须是一个能被反复读到的状态，不能只用 [`tokio::sync::Notify`]：
-    /// `notify_one` 的额度会被第一个 `notified()` 用掉，第二次 `notified()` 又变成未就绪——
-    /// 于是"触发之后一直就绪"这条性质不成立，而主循环的 `select!` 会把这条腿反复轮询。
-    fired: Arc<std::sync::atomic::AtomicBool>,
-    wake: Arc<tokio::sync::Notify>,
+    /// 触发开关：置位后唤醒 `signal` 的等待者，之后一直读到 `true`。
+    trigger: tokio::sync::watch::Sender<bool>,
+    /// 交给主循环的那份；`signal()` 从这里克隆，与 `trigger` 同源。
+    receiver: tokio::sync::watch::Receiver<bool>,
+}
+
+impl Default for TestInterrupt {
+    fn default() -> Self {
+        let (trigger, receiver) = tokio::sync::watch::channel(false);
+        Self { trigger, receiver }
+    }
 }
 
 impl TestInterrupt {
     fn signal(&self) -> Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>> {
-        let fired = self.fired.clone();
-        let wake = self.wake.clone();
-        Box::pin(std::future::poll_fn(move |context| {
-            // 先看状态：触发过就一直就绪，与被通知了几次无关。这一条不成立时，`select!` 里那条腿
-            // 会在触发之后回到 pending，内层循环于是等一个不会再来事件——实测表现为用例挂住。
-            if fired.load(std::sync::atomic::Ordering::SeqCst) {
-                return std::task::Poll::Ready(Ok(()));
+        let mut receiver = self.receiver.clone();
+        Box::pin(async move {
+            loop {
+                if *receiver.borrow() {
+                    return Ok(());
+                }
+                // 发送端没了：没人再能要求停机，按已触发处理，不永远等下去。
+                if receiver.changed().await.is_err() {
+                    return Ok(());
+                }
             }
-            let notified = wake.notified();
-            tokio::pin!(notified);
-            match notified.poll(context) {
-                std::task::Poll::Ready(()) => std::task::Poll::Ready(Ok(())),
-                std::task::Poll::Pending => std::task::Poll::Pending,
-            }
-        }))
+        })
     }
 
     fn send(&self) {
-        self.fired.store(true, std::sync::atomic::Ordering::SeqCst);
-        self.wake.notify_waiters();
+        self.trigger.send_replace(true);
     }
 }
 

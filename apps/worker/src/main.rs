@@ -172,7 +172,8 @@ type ShutdownFuture = Pin<Box<dyn Future<Output = std::io::Result<()>> + Send>>;
 /// 进程终止信号：SIGINT（Ctrl+C）或 SIGTERM（systemd 与容器的默认信号）。两者走同一条排空路径
 /// （口径见 `docs/design/0009-operational-baseline.md` §2）。
 ///
-/// **触发之后一直就绪**：主循环把手上那一轮等完时会反复轮询它，普通 `async fn` 或 `oneshot` 完成后再被轮询会 panic。
+/// **触发之后一直就绪**：停机源在选定之前会被反复询问，做成可重复轮询让每次询问都给出同一结论；
+/// 普通 `async fn` 或 `oneshot` 完成后再被轮询会 panic。
 fn shutdown_signal() -> ShutdownFuture {
     let mut interrupt = Box::pin(tokio::signal::ctrl_c());
     #[cfg(unix)]
@@ -241,7 +242,13 @@ async fn run_until_shutdown(
         tokio::pin!(iteration);
         let mut draining = false;
         let handled = loop {
+            // 停机只决定"不再领下一轮"：一旦看见，就不再回到 select!，手上这一轮等完。
+            if draining {
+                break iteration.await;
+            }
+            // biased：停机优先于"这一轮刚好跑完"，已就绪的终止不会被同轮完成的迭代盖过。
             tokio::select! {
+                biased;
                 stop = await_stop(&mut signals) => {
                     if let Some(is_interrupted) = stop {
                         interrupted = interrupted || is_interrupted;
