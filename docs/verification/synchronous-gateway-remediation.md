@@ -221,3 +221,69 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 - A1 的 `edits` 入口只跑了返回 `url` 形态那条端到端用例；`edits` 配 `b64_json` 的闭环没有单独用例，本轮的 base64 证据来自 JSON 入口那一条。
 - A10 的管理端用量/成本读与金额口径本轮没跑（`cases_cost_facts`、`cases_billing`）。
 - `direct_replay_uses_the_recorded_contract_after_a_republish` 走通的是 Application 层已有的"按记录冻结合同投影"路径，改前也会通过；本轮真正判别的两条是缺材料 409 与查找先于图片解释。
+
+## 11. A5 子进程强杀矩阵的实施证据
+
+本节记录 [Spec 0005 §8](0005-synchronous-image-gateway.md) A5 的进程级强杀取证。用例在 `apps/api/tests/http_contract/cases_kill_matrix.rs`（7 条，全部 `#[ignore]`），基线 `7923fb4`，改动未提交。
+
+第 10 节缺的是"运行到某一格再真的 SIGKILL"那一半，这里补上；恢复那一半复用第 10 节的数据库级用例。恢复跑的是生产同一份 `ExecutionReconciliationService` 与真渠道 Driver（`AdapterRegistry` 装 AIHubMix / APIMart 工厂），在测试进程里对着被杀进程的那个一次性库。验收只连进程内假上游，没有调用任何真实 Provider。
+
+### 夹具与用例
+
+| 面 | 结果 |
+| --- | --- |
+| 强杀用例 | 7 条：提交前两格（受理后未写提交声明 / 已写提交声明未发生成请求）、提交中、接受后句柄未写入、轮询中、取得证据后与结算提交前、结算提交后 |
+| 假上游闸门 | `UpstreamGate`：命中 `HeldRequest::{Upload,Create,Query}` 时先记到达再停住，用例 `wait_for_arrival` 等到"请求真的发出去了"才杀 |
+| 查询序号 | 假上游的查询序号改在读完请求时定下，闸门停住响应不改变"被杀那次查询"与"恢复那次查询"各拿第几个状态 |
+| 假 Redis 闸门 | `BalanceWriteGate`：武装后下一条 `SET user_balance:` 停住、永不应答；`CacheSettings.operation_timeout_ms` 可把缓存命令上限调长到等得起 |
+| SIGKILL | `ApiProcess::sigkill`：`Child::kill()`（Unix 上是 SIGKILL），并核对退出状态记的确实是信号 9 |
+| 夹具自检 | `harness_check::the_upstream_gate_signals_arrival_before_releasing`：不启平台进程、不用库，随 workspace 单测跑 |
+
+### 注入方式与屏障
+
+| 手段 | 证明的事实 | 为什么不是 sleep 猜时间 |
+| --- | --- | --- |
+| 假上游闸门 | 上游真的收到了目标请求（上传 / 生成提交 / 任务查询），且响应还没写回 | 到达计数由假上游在读完请求时置位，用例等在 `Notify` 上 |
+| 数据库表锁 | 受理已提交、`begin_submission` 还没写出提交声明 | `LOCK TABLE generation.attempts IN ACCESS EXCLUSIVE MODE` 挡住 INSERT；信号是 `pg_stat_activity.wait_event_type = 'Lock'` |
+| 数据库行锁 | `record_acceptance` 或 `settle` 已经走到、但提交不了 | 用例先持 Job 行 `FOR UPDATE`；信号同样是锁等待 |
+| 缓存写回闸门 | 结算已提交、`refresh_balance` 写回未回 | 假 Redis 在收到那条 `SET user_balance:` 时置信号并永不应答 |
+| 死进程后端清理 | "崩溃即事务未提交" | SIGKILL 后 `pg_terminate_backend` 掉仍等在锁上的那条后端，再放掉用例自己的锁；否则后端会在锁放行后替死进程把事务提交掉 |
+
+### 逐格结果
+
+杀进程前的库内事实是用例在屏障信号之后读到的真实行；生成计数是假上游记录的 `POST .../images/*` 次数。
+
+| 格 | 用例 | 屏障信号 | 杀进程前的库内事实 | 恢复动作 | 恢复后断言 | 结果 |
+| --- | --- | --- | --- | --- | --- | --- |
+| 提交前（受理后未写提交声明） | `sigkill_before_the_submission_declaration_reaps_the_orphan_admission` | `attempts` 整表锁 + 锁等待 | Job `admitted`、无 Attempt、生成 0、上传 0 | 终止等锁后端 → 放锁 → Worker 一轮 | `reaped_orphans = 1`；Job `failed`、Attempt 0；Hold 释放为 0；渠道槽位 `released`；对账案例 0；生成 0；同键重发（另一个 API 副本）`502 platform_unavailable` 且生成计数仍 0 | passed |
+| 提交前（已写提交声明、生成请求未发） | `sigkill_with_the_submission_declared_but_before_the_create_request_keeps_the_hold` | 上游停住 `POST /v1/uploads/images`（data URL 参考图先上传换 URL） | Job `executing`、Attempt `submitting`、无句柄、生成 0、上传 1 | 杀 → 放行闸门 → 推租约过期 → Worker 一轮 | `reconciled = 1`；Job `reconciliation_required`、Attempt `unknown`；对账案例 1；Hold 原样保留、渠道槽位 `held`；生成 0、查询 0、capture 0 | passed |
+| 提交中／未知接受 | `sigkill_while_the_create_response_is_missing_keeps_the_hold_and_never_resends` | 上游停住生成请求的响应 | Job `executing`、Attempt `submitting`、无句柄、生成 1 | 同上 | `reconciled = 1`；`reconciliation_required` / `unknown`；案例 1；Hold 保留、槽位 `held`；capture 0；生成计数仍为 1、查询 0 | passed |
+| 接受后句柄未写入 | `sigkill_after_acceptance_before_the_handle_is_stored_keeps_the_hold` | 上游先停住生成请求 → 锁 Job 行 → 放行提交应答 → 锁等待（`record_acceptance`） | 无句柄、查询 0、生成 1 | 终止等锁后端 → 放锁 → 推租约过期 → Worker 一轮 | `reconciled = 1`；`reconciliation_required` / `unknown`；案例 1；Hold 保留、槽位 `held`；capture 0；生成 1、查询 0 | passed |
+| 轮询中（终态未回） | `sigkill_while_polling_settles_once_on_recovery_without_resubmitting` | 上游停住第一次任务查询 | Job `executing`、Attempt `accepted`、句柄已入库、生成 1 | 杀 → 放行闸门并等那次挂起查询走出闸门 → 推租约过期 → Worker 一轮（按句柄只读查同一任务） | `taken_over = 1`、`settled = 1`；Job `succeeded`、Attempt `terminal`；capture 1；Hold 0；槽位 `released`；案例 0；生成 1、查询 2（被杀进程 1 次 + 恢复 1 次） | passed |
+| 取得证据后／结算提交前 | `sigkill_after_the_evidence_arrives_before_the_settlement_commit_settles_once` | 上游停住第一次查询 → 锁 Job 行 → 放行带证据的终态 → 锁等待（结算事务） | 句柄已入库、查询 1、capture 0 | 终止等锁后端 → 放锁 → 推租约过期 → Worker 一轮 | `taken_over = 1`、`settled = 1`；`succeeded`；capture 1；Hold 0；槽位 `released`；案例 0；生成 1、查询 2 | passed |
+| 结算提交后 | `sigkill_after_the_settlement_commit_replays_as_result_not_retained` | 上游收到 AIHubMix 生成请求 → 武装余额写回闸门 → 放行 → 等写回被停住 | capture 1、Job `succeeded`、Hold 0（提交已落、响应未交） | 杀 → 另起一个 API 副本连同一库 → 同键同正文重发 | `409 result_not_retained`；capture 仍为 1；生成计数仍为 1 | passed |
+
+### 我实际跑过的命令与结果
+
+真库串取自 `.env` 的 `DATABASE_URL`（没有打印），一律 `--test-threads=1`、不并行。命令都在仓库根执行。
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo check --workspace --all-targets` | 无 error、无警告 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 通过 |
+| `cargo test -p seeai-api --test http_contract` | 5 passed、208 ignored（含新的闸门自检） |
+| `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 harness::cases_kill_matrix` | 7 passed；多次连跑稳定，每次约 10–11s |
+| 同环境 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 harness::cases_direct_execution` | 20 passed（86.33s），无回归 |
+| 同环境 `... -- --ignored --test-threads=1 harness::cases_apimart harness::cases_retry` | 7 passed（12.71s）；假上游查询序号与调用计数是改动面 |
+| 同环境 `... -- --ignored --test-threads=1 harness::cases_cache` | 12 passed（22.55s）；假 Redis 与 `CACHE_OPERATION_TIMEOUT_MS` 是改动面 |
+
+7 格全部符合 §5，本轮没有抓到"恢复后重发"或占用错误，因此没有需要裁决的产品缺陷与最小复现。
+
+### 未覆盖与待验证
+
+- 结算提交中（COMMIT 应答丢失、提交结果未知）没有进程级强杀：要在提交那一瞬注入得让 `COMMIT` 的应答在网络里丢掉或连接被切断，进程内假上游与行锁都做不到稳定复现。相邻证据仍是数据库级的 `an_unknown_settle_commit_is_confirmed_instead_of_assumed_failed` 与 `an_unknown_acceptance_reconciles_and_keeps_the_hold`（`crates/application/tests/direct_execution.rs`），那是注入数据库错误、不是子进程强杀。
+- "上游已接受、提交响应在网络里丢失"没有单独格：从平台看它与格 2（响应没回来）同属接受状态未知、走同一分支，要分开需要网络层丢包注入。
+- 句柄相关的三格只覆盖任务式渠道 APIMart：同步渠道 AIHubMix 没有任务句柄（§3 的"先存句柄再轮询"对它不适用），这三格无法造；格 6 用的正是 AIHubMix。
+- A5 的"只有可证明未受理的失败允许重试"只取证了一半：矩阵证明的是"强杀恢复不重发生成请求"；原请求内的安全重投（证明未受理后重投同一候选、保留 Hold 与容量）由 `cases_retry` 与 `crates/application/tests/direct_execution.rs` 的相邻用例覆盖，本轮没有为它新增强杀用例——进程都死了，原请求不存在。
+- 观察记录：格 1a 里孤儿受理被回收后 Job 收成 `failed`、库里没有原平台错误码，同键重发按既有回退口径投影 `502 platform_unavailable`，上游计数仍为 0。若要把"可证未受理的键允许重试"扩展到崩溃后的同键重发（重新受理而不是投影失败），那是新的合同决定，本轮不改产品代码。

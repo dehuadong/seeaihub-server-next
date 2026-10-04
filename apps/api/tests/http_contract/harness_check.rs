@@ -48,6 +48,34 @@ async fn fake_platform_api(admin_ok: bool) -> String {
     format!("http://127.0.0.1:{port}")
 }
 
+/// 假上游的闸门必须**先记到达、再停住**，放行后才继续。
+///
+/// 强杀矩阵的判据全靠这条顺序：用例先看到到达信号，才敢说"API 到了这一格、杀进程时状态是确定的"。
+/// 这里不启平台进程、不用数据库，所以不进 `#[ignore]`。
+#[tokio::test]
+async fn the_upstream_gate_signals_arrival_before_releasing() {
+    let gate = Arc::new(UpstreamGate::default());
+    assert_eq!(gate.arrivals(), 0);
+    let held = {
+        let gate = gate.clone();
+        tokio::spawn(async move {
+            // 假上游收到命中请求时做的两件事：记到达、停住。
+            let ordinal = gate.arrivals.fetch_add(1, Ordering::SeqCst) + 1;
+            gate.arrival_notify.notify_waiters();
+            gate.arrive_and_hold(ordinal).await;
+        })
+    };
+    gate.wait_for_arrival(1).await;
+    assert_eq!(gate.arrivals(), 1, "the arrival is visible before release");
+    assert!(
+        !held.is_finished(),
+        "the gate must still be holding the request"
+    );
+    gate.release_all();
+    gate.wait_for_resume(1).await;
+    held.await.expect("the held request finishes after release");
+}
+
 /// 对任何 GET 都回 200 的应答者不是平台 API：假上游就是这样（它给参考图取字节的那条兜底）。
 #[tokio::test]
 async fn probe_rejects_a_blanket_200_responder() {

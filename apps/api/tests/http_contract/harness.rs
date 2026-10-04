@@ -19,7 +19,10 @@ use std::{
     net::TcpListener,
     path::PathBuf,
     process::{Child, Command, Stdio},
-    sync::{Arc, Mutex},
+    sync::{
+        Arc, Mutex,
+        atomic::{AtomicBool, AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 use uuid::Uuid;
@@ -48,6 +51,8 @@ mod cases_direct_execution;
 mod cases_funds;
 #[path = "cases_identity.rs"]
 mod cases_identity;
+#[path = "cases_kill_matrix.rs"]
+mod cases_kill_matrix;
 #[path = "cases_lifecycle.rs"]
 mod cases_lifecycle;
 #[path = "cases_migrations.rs"]
@@ -106,6 +111,105 @@ struct UpstreamCall {
 }
 
 type UpstreamCalls = Arc<Mutex<Vec<UpstreamCall>>>;
+
+/// 假上游要在哪一类请求上停住，等用例放行。
+///
+/// 三类正是强杀矩阵要用屏障钉住的几个注入点：上传（提交前，生成请求还没发）、生成提交
+/// （提交中／接受后句柄未写入）、任务查询（轮询中，终态还没回）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum HeldRequest {
+    Upload,
+    Create,
+    Query,
+}
+
+impl HeldRequest {
+    fn matches(self, method: &str, path: &str) -> bool {
+        match self {
+            Self::Upload => method == "POST" && path == "/v1/uploads/images",
+            Self::Create => {
+                method == "POST"
+                    && (path.ends_with("/images/generations") || path.ends_with("/images/edits"))
+            }
+            Self::Query => method == "GET" && path.starts_with("/v1/tasks/"),
+        }
+    }
+}
+
+/// 假上游上的**闸门**：命中目标请求时记一次到达再停住，直到用例放行。
+///
+/// 强杀矩阵用它把 API 稳定地钉在"请求已发出、响应还没回"那一格：用例等的是假上游**真的收到了**
+/// 这条请求（到达计数），不是 sleep 猜时间；放行之前 API 一直停着，所以杀进程时状态是确定的。
+#[derive(Default)]
+struct UpstreamGate {
+    arrivals: AtomicUsize,
+    /// 允许继续的到达序号上限：`release_all` 把它置为 `usize::MAX`。
+    released_upto: AtomicUsize,
+    /// 已经走出闸门（`arrive_and_hold` 返回）的到达数。
+    resumed: AtomicUsize,
+    arrival_notify: tokio::sync::Notify,
+    resume_notify: tokio::sync::Notify,
+}
+
+impl UpstreamGate {
+    /// 用例侧：等第 `n` 条目标请求到达假上游。
+    async fn wait_for_arrival(&self, n: usize) {
+        loop {
+            if self.arrivals.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            let notified = self.arrival_notify.notified();
+            if self.arrivals.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 到达过的目标请求条数。
+    fn arrivals(&self) -> usize {
+        self.arrivals.load(Ordering::SeqCst)
+    }
+
+    /// 放行全部已到达与之后才到达的目标请求。
+    fn release_all(&self) {
+        self.released_upto.store(usize::MAX, Ordering::SeqCst);
+        self.resume_notify.notify_waiters();
+    }
+
+    /// 用例侧：等第 `n` 条被停住的请求真的走出闸门（紧接着就会写响应）。
+    ///
+    /// 恢复对账复用同一个假上游时，它要靠这个信号确认"被杀进程手里那次挂起的请求已经放完"，
+    /// 否则上游的查询计数可能被两条请求交错推进。
+    async fn wait_for_resume(&self, n: usize) {
+        loop {
+            if self.resumed.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            let notified = self.resume_notify.notified();
+            if self.resumed.load(Ordering::SeqCst) >= n {
+                return;
+            }
+            notified.await;
+        }
+    }
+
+    /// 请求侧：记下这次到达的序号，到放行为止一直等。
+    async fn arrive_and_hold(&self, ordinal: usize) {
+        loop {
+            if self.released_upto.load(Ordering::SeqCst) >= ordinal {
+                break;
+            }
+            let notified = self.resume_notify.notified();
+            if self.released_upto.load(Ordering::SeqCst) >= ordinal {
+                break;
+            }
+            notified.await;
+        }
+        self.resumed.fetch_add(1, Ordering::SeqCst);
+        self.resume_notify.notify_waiters();
+    }
+}
 
 /// 假上游扮演哪个渠道：两家的线上形状不同（一个任务式、一个同步返回图片）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -169,6 +273,8 @@ struct UpstreamBehaviour {
     terminal_without_images: bool,
     /// 生成请求应答前的延迟（毫秒）：把一次执行留在在飞状态，观察同键重放与期限。
     delay_ms: u64,
+    /// 命中这个目标请求时停住、等用例放行（强杀矩阵的屏障，见 [`UpstreamGate`]）；`None` 是不停。
+    hold: Option<(HeldRequest, Arc<UpstreamGate>)>,
 }
 
 impl UpstreamBehaviour {
@@ -188,6 +294,7 @@ impl UpstreamBehaviour {
             declared_cost: Some(json!(0.011354)),
             terminal_without_images: false,
             delay_ms: 0,
+            hold: None,
         }
     }
 
@@ -197,6 +304,12 @@ impl UpstreamBehaviour {
             sync_image,
             ..Self::apimart()
         }
+    }
+
+    /// 让假上游在命中 `target` 的请求上停住，等用例放行；闸门句柄由 [`Harness::gate`] 取回。
+    fn holding(mut self, target: HeldRequest) -> Self {
+        self.hold = Some((target, Arc::new(UpstreamGate::default())));
+        self
     }
 }
 
@@ -264,6 +377,23 @@ async fn serve_fake_upstream(
         });
     }
     let port = port_of(socket);
+
+    // 查询编号在**读完请求**时就定下来：闸门把响应停住也不会改变这一次查询的序号，用例因此能
+    // 确定"被杀进程那一次查询"与"恢复对账那一次查询"各拿到上游的第几个状态。
+    let query_ordinal = if method == "GET" && path.starts_with("/v1/tasks/") {
+        Some(query_count.fetch_add(1, Ordering::SeqCst) + 1)
+    } else {
+        None
+    };
+    // 闸门：命中目标请求时先记一次到达，再停住等用例放行。用例等的正是"API 真的把这条请求发
+    // 出来了"这一格，而不是靠 sleep 猜时间。
+    if let Some((target, gate)) = &behaviour.hold
+        && target.matches(&method, &path)
+    {
+        let ordinal = gate.arrivals.fetch_add(1, Ordering::SeqCst) + 1;
+        gate.arrival_notify.notify_waiters();
+        gate.arrive_and_hold(ordinal).await;
+    }
 
     // 上传：内联图片换公网 URL。这个分支必须在生成分支之前判断，
     // 而且它的失败**不**代表"生成可能已发生"——生成任务此时还没提交。
@@ -367,7 +497,8 @@ async fn serve_fake_upstream(
         return write_response(socket, 200, "OK", "application/json", &payload).await;
     }
     if method == "GET" && path.starts_with("/v1/tasks/") {
-        let attempt = query_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
+        let attempt =
+            query_ordinal.expect("a task query carries its ordinal from the request read");
         if attempt <= behaviour.query_failures {
             let payload = serde_json::to_vec(&json!({
                 "error": {"code": 500, "message": "temporary upstream failure"}
@@ -666,6 +797,24 @@ impl ApiProcess {
     /// 子进程号：峰值 RSS 用例要读它的 `/proc/<pid>/status`。
     fn pid(&self) -> u32 {
         self.child.id()
+    }
+
+    /// 给这个 API 进程发 SIGKILL 并收尸。
+    ///
+    /// `Child::kill` 在 Unix 上就是 SIGKILL（不给进程任何收尾机会），这正是强杀矩阵要的注入方式；
+    /// 这里再核对一次退出状态里记的确实是信号 9——"强杀"是这些用例的判据本身，不能只靠"进程没了"。
+    fn sigkill(&mut self) {
+        self.child.kill().expect("the API process must be killable");
+        let status = self
+            .child
+            .wait()
+            .expect("the killed API process must be reaped");
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(
+            status.signal(),
+            Some(9),
+            "the API process must die from SIGKILL, got {status}"
+        );
     }
 }
 
@@ -1221,6 +1370,8 @@ struct Harness {
     _upstream: FakeUpstream,
     /// 这次用例给 API 与对账配的加速层（假 Redis）；没配就是"没有缓存"的那条路径。
     cache: Option<CacheFixture>,
+    /// 这次用例假上游上的闸门（没配 [`UpstreamBehaviour::holding`] 时为 `None`）。
+    hold: Option<Arc<UpstreamGate>>,
 }
 
 impl Harness {
@@ -1570,6 +1721,8 @@ impl Harness {
     ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
+        // 闸门句柄要在 behaviour 交给假上游之前取出来：用例侧拿它等到达、放行。
+        let hold = behaviour.hold.as_ref().map(|(_, gate)| gate.clone());
         let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
         let (base_url, admin_token, process) = start_api_with(
             &database_url,
@@ -1628,6 +1781,7 @@ impl Harness {
             _api: process,
             _upstream: upstream,
             cache: settings.api.cache,
+            hold,
         }
     }
 
@@ -1657,6 +1811,13 @@ impl Harness {
         self.cache
             .as_ref()
             .expect("this test must run with the cache fixture")
+    }
+
+    /// 假上游上的闸门：配了 [`UpstreamBehaviour::holding`] 的用例用它等到达、等放行。
+    fn gate(&self) -> &Arc<UpstreamGate> {
+        self.hold
+            .as_ref()
+            .expect("this case must pin the fake upstream with UpstreamBehaviour::holding")
     }
 
     /// 走同步入口发一次 JSON 请求：这一次执行在本进程内跑完才返回。
@@ -3083,6 +3244,11 @@ async fn account_balance(harness: &Harness, job_id: Uuid) -> i64 {
 struct CacheSettings {
     balance_ttl_seconds: u64,
     reconcile_interval_ms: u64,
+    /// 单条缓存命令的等待上限（毫秒），写进 `CACHE_OPERATION_TIMEOUT_MS`。
+    ///
+    /// 缺省 200ms 就是生产里的快速失败取值；强杀矩阵要"把进程卡在缓存写回上"，得把它调到
+    /// 等得起的量级，否则写入会先超时、进程照样把响应交出去。
+    operation_timeout_ms: u64,
 }
 
 impl Default for CacheSettings {
@@ -3090,6 +3256,7 @@ impl Default for CacheSettings {
         Self {
             balance_ttl_seconds: 360,
             reconcile_interval_ms: 180_000,
+            operation_timeout_ms: 200,
         }
     }
 }
@@ -3102,6 +3269,57 @@ impl CacheSettings {
             ..self
         }
     }
+}
+
+/// 余额写回闸门：把 API 钉在"结算已经提交、写回缓存还没回来"那一格（A5 的结算提交后）。
+///
+/// 只拦 `SET user_balance:…`——限流与路由缓存用别的键前缀，不该被这条闸门拦下。`arm` 之后
+/// **下一条**余额写回会被停住并置信号，用例据此确认"提交已经落库、响应还没交出去"。
+#[derive(Default)]
+struct BalanceWriteGate {
+    armed: AtomicBool,
+    held: AtomicUsize,
+    notify: tokio::sync::Notify,
+}
+
+impl BalanceWriteGate {
+    /// 武装：下一条余额写回停住。
+    fn arm(&self) {
+        self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// 请求侧：已经武装就原子地卸下并置信号，调用方随后永不应答。
+    fn take_hold(&self) -> bool {
+        if !self.armed.swap(false, Ordering::SeqCst) {
+            return false;
+        }
+        self.held.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
+        true
+    }
+
+    /// 用例侧：等一条余额写回真的被停住。
+    async fn wait_until_held(&self) {
+        loop {
+            if self.held.load(Ordering::SeqCst) >= 1 {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.held.load(Ordering::SeqCst) >= 1 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// 是不是余额写回（`SET user_balance:…`）。
+fn is_balance_write(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|name| name.eq_ignore_ascii_case("SET"))
+        && args
+            .get(1)
+            .is_some_and(|key| key.starts_with("user_balance:"))
 }
 
 /// 假 Redis 里的一条：值 + 过期时刻（`None` 表示不过期）。
@@ -3120,6 +3338,8 @@ struct CacheFixture {
     state: Arc<Mutex<BTreeMap<String, CacheEntry>>>,
     connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>>,
     listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// 余额写回闸门：强杀矩阵要卡在"结算已提交、缓存写回未回"时用它。
+    balance_write_gate: Arc<BalanceWriteGate>,
 }
 
 impl CacheFixture {
@@ -3131,17 +3351,20 @@ impl CacheFixture {
         let state: Arc<Mutex<BTreeMap<String, CacheEntry>>> = Arc::new(Mutex::new(BTreeMap::new()));
         let connections: Arc<Mutex<Vec<tokio::task::JoinHandle<()>>>> =
             Arc::new(Mutex::new(Vec::new()));
+        let balance_write_gate = Arc::new(BalanceWriteGate::default());
         let handle = {
             let state = state.clone();
             let connections = connections.clone();
+            let balance_write_gate = balance_write_gate.clone();
             tokio::spawn(async move {
                 loop {
                     let Ok((socket, _)) = listener.accept().await else {
                         break;
                     };
                     let state = state.clone();
+                    let gate = balance_write_gate.clone();
                     let served = tokio::spawn(async move {
-                        let _ = serve_fake_redis(socket, state).await;
+                        let _ = serve_fake_redis(socket, state, gate).await;
                     });
                     if let Ok(mut connections) = connections.lock() {
                         connections.push(served);
@@ -3155,6 +3378,7 @@ impl CacheFixture {
             state,
             connections,
             listener: Mutex::new(Some(handle)),
+            balance_write_gate,
         }
     }
 
@@ -3257,6 +3481,19 @@ impl CacheFixture {
         }
         None
     }
+
+    /// 武装余额写回闸门：下一条 `SET user_balance:…` 被停住、永不应答。
+    ///
+    /// 用例要在**受理时的写回已经过去之后**再武装（例如等假上游先收到生成请求），这样被停住的
+    /// 就一定是结算之后的那一次写回。
+    fn hold_next_balance_write(&self) {
+        self.balance_write_gate.arm();
+    }
+
+    /// 等那条被停住的余额写回真的到点。到点时结算事务已经提交、响应还没交出去。
+    async fn wait_for_balance_write_hold(&self) {
+        self.balance_write_gate.wait_until_held().await;
+    }
 }
 
 /// 给子进程装上加速层的那几个环境变量。
@@ -3280,13 +3517,17 @@ fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
             "CACHE_RECONCILE_INTERVAL_MS",
             settings.reconcile_interval_ms.to_string(),
         )
-        .env("CACHE_OPERATION_TIMEOUT_MS", "200");
+        .env(
+            "CACHE_OPERATION_TIMEOUT_MS",
+            settings.operation_timeout_ms.to_string(),
+        );
 }
 
 /// 假 Redis 的服务循环：读一条 RESP 命令、回一条应答。
 async fn serve_fake_redis(
     socket: tokio::net::TcpStream,
     state: Arc<Mutex<BTreeMap<String, CacheEntry>>>,
+    balance_write_gate: Arc<BalanceWriteGate>,
 ) -> std::io::Result<()> {
     use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt, BufReader};
 
@@ -3317,6 +3558,11 @@ async fn serve_fake_redis(
             let mut buffer = vec![0_u8; length + 2];
             reader.read_exact(&mut buffer).await?;
             args.push(String::from_utf8_lossy(&buffer[..length]).into_owned());
+        }
+        if is_balance_write(&args) && balance_write_gate.take_hold() {
+            // 模拟余额写回阻塞：连接保持打开但一条应答都不写。用例把缓存命令上限调长到等得起，
+            // 于是 API 停在这里——此刻结算事务已经提交、响应还没交出去（A5 的结算提交后）。
+            std::future::pending::<()>().await;
         }
         let reply = fake_redis_command(&args, &state);
         writer.write_all(reply.as_bytes()).await?;
