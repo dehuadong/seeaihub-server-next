@@ -572,6 +572,13 @@ impl ExecutionRepository for BlockedReconciliationRepository {
         unimplemented!()
     }
 
+    async fn cancel_unsubmitted(
+        &self,
+        _command: CancelUnsubmitted,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        unimplemented!()
+    }
+
     async fn settle(
         &self,
         _command: SettleExecution,

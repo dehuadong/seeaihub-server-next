@@ -90,9 +90,8 @@ async fn the_ledger_view_and_the_consumer_account_read_the_database_not_the_cach
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
         30,
-        // 余额缓存与 route 缓存都调得很长：真走缓存的话，下面读到的就会是那个错数。
+        // 余额缓存调得很长：真走缓存的话，下面读到的就会是那个错数。
         CacheFixture::start(CacheSettings {
-            route_ttl_seconds: 600,
             balance_ttl_seconds: 600,
             ..CacheSettings::default()
         })
@@ -398,12 +397,12 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
     assert_eq!(with_cache.1, 1_000_000 - 43_680);
 }
 
-/// **陈旧缓存不得拒绝**：缓存里的余额偏低，且超出新鲜窗口（或来源是对账写回）→ 不提示、不拒绝，
-/// 判定交给数据库，请求照常成功。
+/// **陈旧缓存不得拒绝**：缓存里的余额偏低（来源是对账写回，或写穿但已经很旧）→ 判定交给数据库，
+/// 请求照常成功。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_stale_balance_entry_never_rejects() {
-    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let settings = CacheSettings::default().with_reconcile_interval(300_000);
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
@@ -441,7 +440,7 @@ async fn a_stale_balance_entry_never_rejects() {
     .await;
     assert_eq!(status, StatusCode::OK, "对账写回的值不得用于拒绝：{body}");
 
-    // ② 来源是写穿路径，但写入时间在窗口之外（一小时前）。
+    // ② 来源是写穿路径，但写入时间是一小时前（已经陈旧）。
     let long_ago = (chrono::Utc::now() - chrono::Duration::hours(1)).to_rfc3339();
     harness
         .cache()
@@ -472,13 +471,13 @@ async fn a_stale_balance_entry_never_rejects() {
     harness.cleanup().await;
 }
 
-/// **新鲜缓存说"不够"也不得单独拒**：缓存里是一条新鲜（写穿来源、写入时间在窗口内）但可用额
-/// 低于保底额的快照——例如充值的写回丢了，缓存落后于数据库。受理必须交给数据库条件更新确认：
-/// 数据库说够就照常受理、照常扣费，缓存只留下一条"很可能不够"的日志。
+/// **缓存说"不够"也不得单独拒**：缓存里是一条刚写穿但可用额低于保底额的快照——例如充值的写回
+/// 丢了，缓存落后于数据库。受理必须交给数据库条件更新确认：
+/// 数据库说够就照常受理、照常扣费，缓存说什么都不决定结果。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
-    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let settings = CacheSettings::default().with_reconcile_interval(300_000);
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
@@ -540,7 +539,7 @@ async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_cache_that_says_there_is_enough_still_lets_the_database_refuse() {
-    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+    let settings = CacheSettings::default().with_reconcile_interval(300_000);
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
@@ -668,12 +667,12 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
     harness.cleanup().await;
 }
 
-/// **重放不受余额预检影响**：预检只提示、不产生 402，同一个幂等键重发仍去重成原来那个 Job，
+/// **重放不受缓存余额影响**：缓存里说不够也不产生 402，同一个幂等键重发仍去重成原来那个 Job，
 /// 不新建、不扣款；"重发同一个键"不因缓存说什么而改变行为。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
-    let settings = CacheSettings::default().with_windows(30_000, 300_000);
+async fn a_replayed_request_is_never_refused_by_the_cached_balance() {
+    let settings = CacheSettings::default().with_reconcile_interval(300_000);
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
@@ -781,14 +780,14 @@ async fn a_replayed_request_is_never_refused_by_the_balance_precheck() {
     harness.cleanup().await;
 }
 
-/// **定时对账兜底**：把缓存里的余额与候选集改错 → 对账以数据库为准覆盖，并留下审计。
+/// **定时对账兜底**：把缓存里的余额改错 → 对账以数据库为准覆盖，并留下审计。
 ///
-/// 覆盖之后的来源标记是 `reconciler`——它**不再**能用于提前拒绝（见上一条用例的口径）。
+/// 覆盖之后的来源标记是 `reconciler`，与写穿路径写下的值分得开。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
-    // 对账周期 1 秒、新鲜窗口 200 毫秒：用例等得起，而且满足"窗口显著小于周期"。
-    let settings = CacheSettings::default().with_windows(200, 1_000);
+    // 对账周期 1 秒：用例等得起。
+    let settings = CacheSettings::default().with_reconcile_interval(1_000);
     let harness = Harness::start_with_cache(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
@@ -833,7 +832,7 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     assert_eq!(
         corrected["source"],
         json!("reconciler"),
-        "对账写回的值来源是 reconciler（因此不再能用于提前拒绝）"
+        "对账写回的值来源是 reconciler"
     );
     assert_eq!(corrected["balance_microusd"], json!(settled));
 

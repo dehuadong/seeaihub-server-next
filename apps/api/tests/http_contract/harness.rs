@@ -3081,29 +3081,23 @@ async fn account_balance(harness: &Harness, job_id: Uuid) -> i64 {
 /// 缓存参数：写进 API / Worker 进程的环境变量。默认值就是设计里给的那一套。
 #[derive(Debug, Clone, Copy)]
 struct CacheSettings {
-    route_ttl_seconds: u64,
     balance_ttl_seconds: u64,
-    freshness_window_ms: u64,
     reconcile_interval_ms: u64,
 }
 
 impl Default for CacheSettings {
     fn default() -> Self {
         Self {
-            route_ttl_seconds: 60,
             balance_ttl_seconds: 360,
-            freshness_window_ms: 5_000,
             reconcile_interval_ms: 180_000,
         }
     }
 }
 
 impl CacheSettings {
-    /// 换掉新鲜窗口与对账周期。两者必须满足生产实现的那条校验（窗口至少小 4 倍），否则 API 进程
-    /// 会因为配置不合法直接退出。
-    fn with_windows(self, freshness_window_ms: u64, reconcile_interval_ms: u64) -> Self {
+    /// 换掉对账周期：用例要等得起对账，就得把它调短。
+    fn with_reconcile_interval(self, reconcile_interval_ms: u64) -> Self {
         Self {
-            freshness_window_ms,
             reconcile_interval_ms,
             ..self
         }
@@ -3279,16 +3273,8 @@ fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
     command
         .env("REDIS_URL", cache.url())
         .env(
-            "CACHE_ROUTE_TTL_SECONDS",
-            settings.route_ttl_seconds.to_string(),
-        )
-        .env(
             "CACHE_BALANCE_TTL_SECONDS",
             settings.balance_ttl_seconds.to_string(),
-        )
-        .env(
-            "CACHE_FRESHNESS_WINDOW_MS",
-            settings.freshness_window_ms.to_string(),
         )
         .env(
             "CACHE_RECONCILE_INTERVAL_MS",

@@ -21,16 +21,16 @@ use seeai_adapter_sdk::{
     ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput,
     GeneratedImage, ImageAdapter, ProviderCallError, ProviderCost, ProviderCredential,
     ProviderTaskHandle, QueryAccountingCapability, ResponsePayload, RetrySafety,
-    begin_generation_send,
+    begin_generation_send, ensure_external_call_allowed,
 };
 use seeai_application::{
     AdapterFactory, AdmitExecution, AdmitOutcome, ApplicationError, BeginSubmission,
-    ClaimedLateFact, CredentialProvider, DirectExecutionCall, DirectExecutionError,
-    DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService, ExecutionFinalization,
-    ExecutionLookup, ExecutionRepository, FailOrReconcileExecution, HubRepository, LateFacts,
-    LateFactsOutcome, OfferingDraft, PricePlanDraft, ProviderFailureKind, PublishRuntimeCommand,
-    RecordAcceptance, RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RuntimeService,
-    SettleExecution, SubmissionStarted, TakenOverExecution,
+    CancelUnsubmitted, ClaimedLateFact, CredentialProvider, DirectExecutionCall,
+    DirectExecutionError, DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService,
+    ExecutionFinalization, ExecutionLookup, ExecutionRepository, FailOrReconcileExecution,
+    HubRepository, LateFacts, LateFactsOutcome, OfferingDraft, PricePlanDraft, ProviderFailureKind,
+    PublishRuntimeCommand, RecordAcceptance, RequestFingerprintKeys, RequestTimeoutPolicy,
+    RetryPolicy, RuntimeService, SettleExecution, SubmissionStarted, TakenOverExecution,
 };
 use seeai_domain::{
     AccountId, AttemptId, ConsumerRatesCny, FencingToken, JobId, ProviderCostFact, ProviderTraceId,
@@ -87,6 +87,12 @@ enum FakeBehavior {
     CancelledBeforeSend,
     /// 取消发生在等待上游结果的阶段：不能证明是否已受理。
     CancelledAfterAcceptance,
+    /// 客户端断开落在提交声明之后、第一次外部调用之前：库里已经有 submitting Attempt。
+    ClientGoneAtSend,
+    /// 所有权失效落在同一位置。
+    OwnershipLostAtSend,
+    /// 发送资格先赢、取消随后到达：闸口放行过一次，此后只能按"可能已提交"处理。
+    CancelRacingAfterTheSendWon,
     /// 第一次调用报可证明未受理，之后成功：验证请求内重投会换新 Attempt 并成功。
     SafeBeforeAcceptanceOnce,
     /// 睡这么多毫秒再成功：把总期限推到结算之后，验证交付超时。
@@ -153,12 +159,36 @@ impl GatewayAdapter for FakeGateway {
             FakeBehavior::CancelledBeforeSend => {
                 // 取消恰好落在发送前：先关闸，再问发送资格——真实竞态的等价模型。
                 if let Some(gate) = self.send_gate.lock().expect("the send gate lock").clone() {
-                    gate.cancel();
+                    gate.client_gone();
                 }
                 begin_generation_send(context)?;
                 Err(AdapterError::Configuration(
                     "the generation gate unexpectedly allowed a send in this test".to_owned(),
                 ))
+            }
+            FakeBehavior::ClientGoneAtSend | FakeBehavior::OwnershipLostAtSend => {
+                // 提交声明已经落库，第一次外部调用之前收到取消。两种原因走同一段收尾，
+                // 差异只有闸口上的事实本身。
+                if let Some(gate) = self.send_gate.lock().expect("the send gate lock").clone() {
+                    if matches!(behavior, FakeBehavior::ClientGoneAtSend) {
+                        gate.client_gone();
+                    } else {
+                        gate.ownership_lost();
+                    }
+                }
+                ensure_external_call_allowed(context)?;
+                Err(AdapterError::Configuration(
+                    "the external call gate unexpectedly allowed a call in this test".to_owned(),
+                ))
+            }
+            FakeBehavior::CancelRacingAfterTheSendWon => {
+                // 发送资格先赢：闸口记下"已经开始发送"，此后收到取消也只能按可能已提交处理。
+                ensure_external_call_allowed(context)?;
+                begin_generation_send(context)?;
+                if let Some(gate) = self.send_gate.lock().expect("the send gate lock").clone() {
+                    gate.ownership_lost();
+                }
+                Err(AdapterError::CancelledBeforeSend)
             }
             FakeBehavior::CancelledAfterAcceptance => Err(AdapterError::Cancelled),
         }
@@ -423,10 +453,24 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
 /// `always_conflict` 则让 `settle` 与 `fail_or_reconcile` 一直报冲突、只读确认也读不到，
 /// 模拟所有权已被接管或提交结果长期不明：验证已经取得的事实会在有限收尾预算内交回收件端口，
 /// 而不是随返回值丢掉（RFC 0018 §5.1）。
+///
+/// `cancel_fault` 只作用在 `cancel_unsubmitted` 那一条端口上，用来验证"提交结果未知时不声称
+/// 释放成功"（RFC 0018 §4.1）。
 struct FlakySettleRepository {
     inner: Arc<PgHubRepository>,
     fail_next_settle: Arc<AtomicBool>,
     always_conflict: Arc<AtomicBool>,
+    cancel_fault: CancelFault,
+}
+
+/// `cancel_unsubmitted` 上注入的故障形态；`None` 表示端口照常工作。
+#[derive(Clone)]
+enum CancelFault {
+    None,
+    /// 事务已经提交，但调用方没收到确认：这正是"COMMIT 响应丢失"。
+    LostAcknowledgement(Arc<AtomicBool>),
+    /// 事务从未提交、也确认不回来：不能声称释放成功。
+    NeverCommitted,
 }
 
 #[async_trait]
@@ -454,6 +498,33 @@ impl ExecutionRepository for FlakySettleRepository {
 
     async fn record_acceptance(&self, command: RecordAcceptance) -> Result<(), ApplicationError> {
         self.inner.record_acceptance(command).await
+    }
+
+    async fn cancel_unsubmitted(
+        &self,
+        command: CancelUnsubmitted,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        if self.always_conflict.load(Ordering::SeqCst) {
+            return Err(ApplicationError::Conflict(
+                "simulated ownership conflict on the unsubmitted cancellation".to_owned(),
+            ));
+        }
+        match &self.cancel_fault {
+            CancelFault::None => self.inner.cancel_unsubmitted(command).await,
+            CancelFault::LostAcknowledgement(pending) => {
+                let result = self.inner.cancel_unsubmitted(command).await;
+                if pending.swap(false, Ordering::SeqCst) && result.is_ok() {
+                    // 已经提交，只是确认丢了：应用层必须靠只读确认把它读回来。
+                    return Err(ApplicationError::Persistence(
+                        "simulated lost commit acknowledgement".to_owned(),
+                    ));
+                }
+                result
+            }
+            CancelFault::NeverCommitted => Err(ApplicationError::Persistence(
+                "simulated database that never applied the cancellation".to_owned(),
+            )),
+        }
     }
 
     async fn settle(
@@ -591,18 +662,30 @@ async fn setup() -> Fixture {
 }
 
 async fn setup_with(flaky_settle: Option<Arc<AtomicBool>>) -> Fixture {
-    setup_with_keys(flaky_settle, None, test_keys()).await
+    setup_with_keys(flaky_settle, None, test_keys(), CancelFault::None).await
 }
 
 /// 收尾端口一直报冲突、只读确认也读不到：验证已经取得的事实会被交回收件端口。
 async fn setup_with_conflicting_finalization() -> Fixture {
-    setup_with_keys(None, Some(Arc::new(AtomicBool::new(true))), test_keys()).await
+    setup_with_keys(
+        None,
+        Some(Arc::new(AtomicBool::new(true))),
+        test_keys(),
+        CancelFault::None,
+    )
+    .await
+}
+
+/// `cancel_unsubmitted` 上注入故障：验证"提交结果未知时不声称释放成功"。
+async fn setup_with_cancel_fault(fault: CancelFault) -> Fixture {
+    setup_with_keys(None, None, test_keys(), fault).await
 }
 
 async fn setup_with_keys(
     flaky_settle: Option<Arc<AtomicBool>>,
     always_conflict: Option<Arc<AtomicBool>>,
     keys: RequestFingerprintKeys,
+    cancel_fault: CancelFault,
 ) -> Fixture {
     let (database_url, database_name) = isolated_database_url().await;
     let repository = Arc::new(
@@ -637,13 +720,23 @@ async fn setup_with_keys(
             inner: repository.clone(),
             fail_next_settle: flag.clone(),
             always_conflict: Arc::new(AtomicBool::new(false)),
+            cancel_fault: cancel_fault.clone(),
         }),
         (None, Some(conflict)) => Arc::new(FlakySettleRepository {
             inner: repository.clone(),
             fail_next_settle: Arc::new(AtomicBool::new(false)),
             always_conflict: conflict.clone(),
+            cancel_fault: cancel_fault.clone(),
         }),
-        (None, None) => repository.clone(),
+        (None, None) => match cancel_fault {
+            CancelFault::None => repository.clone(),
+            fault => Arc::new(FlakySettleRepository {
+                inner: repository.clone(),
+                fail_next_settle: Arc::new(AtomicBool::new(false)),
+                always_conflict: Arc::new(AtomicBool::new(false)),
+                cancel_fault: fault,
+            }),
+        },
     };
     let service = build_service(repository.clone(), executions, factory.clone(), keys);
     Fixture {
@@ -784,6 +877,24 @@ impl Fixture {
         .fetch_all(self.pool())
         .await
         .expect("the attempt states")
+    }
+
+    /// 这台 Job 的渠道容量槽位状态。
+    async fn channel_slot_state(&self, job_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT state FROM generation.execution_capacity WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(self.pool())
+            .await
+            .expect("the channel capacity slot")
+    }
+
+    /// 这台 Job 的预授权行状态。
+    async fn hold_status(&self, job_id: Uuid) -> String {
+        sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(self.pool())
+            .await
+            .expect("the hold status")
     }
 }
 
@@ -1191,6 +1302,317 @@ async fn a_cancellation_after_acceptance_keeps_the_hold() {
     fixture.cleanup().await;
 }
 
+/// 客户端断开落在提交声明之后、第一次外部调用之前：按确定未提交释放，账务与容量都归还。
+///
+/// "尚无 Attempt" 那一档（提交声明之前的断开）没有可注入的挂起点，它的证明在仓储层：
+/// `execution_submission::cancelling_an_unsubmitted_execution_releases_without_creating_an_attempt`
+/// 直接验端口不建 Attempt。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_client_disconnect_releases_an_unsubmitted_execution() {
+    let fixture = setup().await;
+    fixture.factory.set(FakeBehavior::ClientGoneAtSend);
+    fixture.factory.set_send_gate(fixture.gate.clone());
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-client-gone"), &fixture.call())
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::RequestTimeout)),
+        "a proven non-submission is reported as a timeout"
+    );
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "the adapter was entered and refused before any external call"
+    );
+    assert!(!fixture.gate.generation_started(), "the send never started");
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.job_state().await, "failed");
+    assert_eq!(
+        fixture.attempt_states().await,
+        vec!["terminal"],
+        "the release closes the submission declaration it was written for"
+    );
+    assert_eq!(fixture.held_microusd().await, 0, "the hold is released");
+    assert_eq!(fixture.hold_status(job_id).await, "released");
+    assert_eq!(
+        fixture.channel_slot_state(job_id).await,
+        "released",
+        "the channel slot is given back in the same transaction"
+    );
+    assert_eq!(
+        fixture.reconciliation_cases(job_id).await,
+        0,
+        "a proven non-submission is not a reconciliation case"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// 所有权失效落在同一位置：同一个带 fencing 的端口照样释放，且闸口上只有 `ownership_lost`。
+///
+/// 释放的资格来自库里的 token，不来自本地置位本身：这里旧 token 仍然有效，所以释放成立；真实
+/// 接管之后同一次调用会按 token 冲突，那时才交还当前所有者。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn an_ownership_loss_releases_an_unsubmitted_execution_through_the_same_fenced_port() {
+    let fixture = setup().await;
+    fixture.factory.set(FakeBehavior::OwnershipLostAtSend);
+    fixture.factory.set_send_gate(fixture.gate.clone());
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-ownership-lost"), &fixture.call())
+        .await;
+    assert!(matches!(result, Err(DirectExecutionError::RequestTimeout)));
+    assert!(
+        fixture.gate.is_ownership_lost(),
+        "the gate records ownership loss, not a client disconnect"
+    );
+    assert!(
+        !fixture.gate.is_client_gone(),
+        "the two cancel facts stay separate on the gate"
+    );
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.job_state().await, "failed");
+    assert_eq!(fixture.held_microusd().await, 0);
+    assert_eq!(fixture.channel_slot_state(job_id).await, "released");
+
+    fixture.cleanup().await;
+}
+
+/// 接管之后旧的所有者与 token 一律冲突：所有权已经不属于本进程，释放与结算都不能按旧事实落下。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_taken_over_execution_cannot_be_released_under_the_old_token() {
+    let fixture = setup().await;
+    // 造一台"受理已提交、生成确实没发出"的执行：取消一次，让 Hold 释放，再把受理事实恢复回来
+    // 并让另一个执行者接管。
+    fixture.factory.set(FakeBehavior::ClientGoneAtSend);
+    fixture.factory.set_send_gate(fixture.gate.clone());
+    let _ = fixture
+        .service
+        .execute(fixture.request("request-taken-over"), &fixture.call())
+        .await;
+    let job_id = fixture.job_id().await;
+
+    // 把这次执行恢复成"受理已提交、生成确实没发出"的库内形态（那次取消已经释放过占用，
+    // 这里按同一事实把预授权与容量重新拿在手里），再让另一个执行者接管。
+    sqlx::query(
+        "UPDATE generation.jobs
+         SET state = 'executing', execution_owner = 'worker-b', fencing_token = 1,
+             terminal_at = NULL, updated_at = now()
+         WHERE id = $1",
+    )
+    .bind(job_id)
+    .execute(fixture.pool())
+    .await
+    .expect("take the execution over");
+    sqlx::query("UPDATE ledger.holds SET status = 'active' WHERE job_id = $1")
+        .bind(job_id)
+        .execute(fixture.pool())
+        .await
+        .expect("restore the hold");
+    sqlx::query("UPDATE ledger.accounts SET held_microusd = 1000 WHERE id = $1")
+        .bind(fixture.account_id.0)
+        .execute(fixture.pool())
+        .await
+        .expect("restore the reservation");
+    sqlx::query(
+        "UPDATE generation.execution_capacity SET state = 'held', released_at = NULL WHERE job_id = $1",
+    )
+    .bind(job_id)
+    .execute(fixture.pool())
+    .await
+    .expect("restore the channel slot");
+
+    // 旧 owner + 旧 token 的释放请求：一律冲突，绝不按旧事实动账。
+    let stale = fixture
+        .repository
+        .cancel_unsubmitted(CancelUnsubmitted {
+            job_id: JobId(job_id),
+            execution_owner: fixture.owner.clone(),
+            fencing_token: FencingToken::new(0),
+        })
+        .await;
+    assert!(
+        matches!(stale, Err(ApplicationError::Conflict(_))),
+        "a stale token must never release an execution owned by someone else"
+    );
+    // 只对上了 owner 而 token 过期：同样冲突。
+    let wrong_token = fixture
+        .repository
+        .cancel_unsubmitted(CancelUnsubmitted {
+            job_id: JobId(job_id),
+            execution_owner: "worker-b".to_owned(),
+            fencing_token: FencingToken::new(0),
+        })
+        .await;
+    assert!(
+        matches!(wrong_token, Err(ApplicationError::Conflict(_))),
+        "a stale fencing token must never release"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
+            .fetch_one(fixture.pool())
+            .await
+            .expect("the job state"),
+        "executing",
+        "a refused release changes nothing"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// 取消与开始发送竞争同一个原子状态：只有一方获资格，且结论与状态一致。
+///
+/// 闸口拒绝（取消先赢）时按确定未提交释放且不重投；闸口放行（发送先赢）时只能按"可能已提交"
+/// 收尾，保留占用（RFC 0018 §4.1）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_cancellation_racing_the_send_has_exactly_one_winner() {
+    // 取消先赢：假渠道在发送资格之前关闸，闸口拒绝，这次 Attempt 确实没有发出生成请求。
+    let cancelled_first = setup().await;
+    cancelled_first
+        .factory
+        .set(FakeBehavior::CancelledBeforeSend);
+    cancelled_first
+        .factory
+        .set_send_gate(cancelled_first.gate.clone());
+    let result = cancelled_first
+        .service
+        .execute(
+            cancelled_first.request("request-race-cancel"),
+            &cancelled_first.call(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::RequestTimeout)),
+        "the cancel won the race: a proven non-submission is reported as a timeout"
+    );
+    assert!(
+        !cancelled_first.gate.generation_started(),
+        "the gate refused, so the send never started"
+    );
+    assert!(
+        cancelled_first.gate.is_client_gone(),
+        "the refusal names the cancel fact that won"
+    );
+    let cancelled_job = cancelled_first.job_id().await;
+    assert_eq!(cancelled_first.job_state().await, "failed");
+    assert_eq!(cancelled_first.held_microusd().await, 0);
+    assert_eq!(
+        cancelled_first.reconciliation_cases(cancelled_job).await,
+        0,
+        "a proven non-submission is not a reconciliation case"
+    );
+    cancelled_first.cleanup().await;
+
+    // 发送先赢：闸口已经记下"开始发送"，此后再收到取消只能按可能已提交收尾。
+    let send_first = setup().await;
+    send_first
+        .factory
+        .set(FakeBehavior::CancelRacingAfterTheSendWon);
+    send_first.factory.set_send_gate(send_first.gate.clone());
+    let result = send_first
+        .service
+        .execute(send_first.request("request-race-send"), &send_first.call())
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::OutcomeUnknown)),
+        "the send won the race: the outcome can no longer be proven unsubmitted"
+    );
+    assert!(
+        send_first.gate.generation_started(),
+        "the gate records that the send began"
+    );
+    let send_job = send_first.job_id().await;
+    assert_eq!(send_first.job_state().await, "reconciliation_required");
+    assert_eq!(
+        send_first.held_microusd().await,
+        1_000,
+        "a possible submission keeps its hold"
+    );
+    assert_eq!(send_first.reconciliation_cases(send_job).await, 1);
+    send_first.cleanup().await;
+}
+
+/// COMMIT 响应丢失：取消其实已经提交，应用层必须先只读确认再返回，不重复释放、不谎称未知。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_lost_cancellation_acknowledgement_is_confirmed_instead_of_assumed_unknown() {
+    let pending = Arc::new(AtomicBool::new(true));
+    let fixture = setup_with_cancel_fault(CancelFault::LostAcknowledgement(pending.clone())).await;
+    fixture.factory.set(FakeBehavior::ClientGoneAtSend);
+    fixture.factory.set_send_gate(fixture.gate.clone());
+
+    let result = fixture
+        .service
+        .execute(
+            fixture.request("request-cancel-unknown-commit"),
+            &fixture.call(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::RequestTimeout)),
+        "the committed cancellation is confirmed, not reported as an unknown outcome"
+    );
+    assert!(
+        !pending.load(Ordering::SeqCst),
+        "the simulated lost acknowledgement was exercised"
+    );
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.job_state().await, "failed");
+    assert_eq!(
+        fixture.held_microusd().await,
+        0,
+        "confirming the commit must not release twice"
+    );
+    assert_eq!(fixture.hold_status(job_id).await, "released");
+
+    fixture.cleanup().await;
+}
+
+/// 取消从未提交、也确认不回来：不能声称释放成功，占用保留，如实返回结果未知。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_cancellation_that_cannot_be_confirmed_does_not_claim_a_release() {
+    let fixture = setup_with_cancel_fault(CancelFault::NeverCommitted).await;
+    fixture.factory.set(FakeBehavior::ClientGoneAtSend);
+    fixture.factory.set_send_gate(fixture.gate.clone());
+
+    let result = fixture
+        .service
+        .execute(
+            fixture.request("request-cancel-unconfirmed"),
+            &fixture.call(),
+        )
+        .await;
+    assert!(
+        matches!(result, Err(DirectExecutionError::OutcomeUnknown)),
+        "an unconfirmed cancellation must not be reported as a release"
+    );
+    let job_id = fixture.job_id().await;
+    assert_eq!(
+        fixture.held_microusd().await,
+        1_000,
+        "the hold stays until the release is actually confirmed"
+    );
+    assert_eq!(fixture.hold_status(job_id).await, "active");
+    assert_eq!(fixture.channel_slot_state(job_id).await, "held");
+    assert_eq!(fixture.job_state().await, "executing");
+    assert_eq!(
+        fixture.calls.load(Ordering::SeqCst),
+        1,
+        "no provider call was made"
+    );
+
+    fixture.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn accepted_unpersisted_offers_late_facts_and_reconciles() {
@@ -1415,7 +1837,7 @@ async fn a_replay_survives_a_disabled_candidate() {
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn a_cancellation_before_admission_creates_nothing() {
     let fixture = setup().await;
-    fixture.gate.cancel();
+    fixture.gate.client_gone();
 
     let result = fixture
         .service

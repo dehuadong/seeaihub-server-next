@@ -130,13 +130,13 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 
 | 变量 | 缺省 |
 | --- | --- |
-| `CACHE_ROUTE_TTL_SECONDS` | `60` |
 | `CACHE_BALANCE_TTL_SECONDS` | `360` |
-| `CACHE_FRESHNESS_WINDOW_MS` | `5000` |
 | `CACHE_RECONCILE_INTERVAL_MS` | `180000` |
 | `CACHE_OPERATION_TIMEOUT_MS` | `200` |
 
-缓存**不是事实来源**：它对不上就回源数据库，不可达时报 miss 而不是挂住。所以 Redis 故障是**降级**，不是故障。
+缓存**不是事实来源**：余额以数据库为准，不可达时读写都当未命中，不挂住请求。所以 Redis 故障是**降级**，不是故障。
+
+受理**不从缓存取候选**：直接执行每次受理直读数据库的 `supply` 候选查询。缓存里只放提交后的余额快照（写穿）、每把 API Key 的速率计数，以及历史 route 条目——后者由对账器按修订标识与网关模型开关清理，并写 `cache.route_invalidated` 审计。
 
 ## 5. 渠道凭证
 

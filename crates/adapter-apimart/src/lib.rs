@@ -1573,7 +1573,8 @@ impl ApimartImageAdapter {
         context: &dyn ExecutionContext,
     ) -> Result<TaskData, AdapterError> {
         loop {
-            if context.is_cancelled() {
+            // 已经受理之后的轮询：任一取消事实成立都停下，且绝不能报成"发送前取消"。
+            if context.client_gone() || context.ownership_lost() {
                 return Err(AdapterError::Cancelled);
             }
             if context.deadline().is_expired() {

@@ -1,7 +1,8 @@
 use super::*;
 use async_trait::async_trait;
 use seeai_adapter_sdk::{
-    AcceptanceError, AcceptedHandle, Deadline, ImageSite, ImageSites, ImageValueShape,
+    AcceptanceError, AcceptedHandle, Deadline, ExternalActionRefused, ImageSite, ImageSites,
+    ImageValueShape,
 };
 use seeai_domain::{
     ImageParameterKind, MAX_PROVIDER_IDENTIFIER_BYTES, platform_image_parameter,
@@ -30,11 +31,11 @@ fn a_different_transport_policy_gets_its_own_client() {
     assert!(!Arc::ptr_eq(&first.client, &other.client));
 }
 
-/// 假执行上下文：期限与取消状态固定；同步渠道绝不该调用 accepted。
+/// 假执行上下文：期限与两种取消事实固定；同步渠道绝不该调用 accepted。
 struct FakeContext {
     deadline: Deadline,
-    cancelled: bool,
-    /// 取消恰好落在生成发送闸口：`is_cancelled()` 仍为 false，但最后资格检查失败。
+    client_gone: bool,
+    /// 取消恰好落在生成发送闸口：前面的取消检查都通过，但最后资格检查必须被拦下。
     gate_closed: bool,
 }
 
@@ -42,7 +43,7 @@ impl FakeContext {
     fn fresh() -> Self {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
-            cancelled: false,
+            client_gone: false,
             gate_closed: false,
         }
     }
@@ -50,7 +51,7 @@ impl FakeContext {
     fn cancelled() -> Self {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
-            cancelled: true,
+            client_gone: true,
             gate_closed: false,
         }
     }
@@ -59,7 +60,7 @@ impl FakeContext {
     fn gate_closed() -> Self {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
-            cancelled: false,
+            client_gone: false,
             gate_closed: true,
         }
     }
@@ -67,7 +68,7 @@ impl FakeContext {
     fn expired() -> Self {
         Self {
             deadline: Deadline::after(Duration::ZERO),
-            cancelled: false,
+            client_gone: false,
             gate_closed: false,
         }
     }
@@ -79,12 +80,19 @@ impl ExecutionContext for FakeContext {
         self.deadline
     }
 
-    fn is_cancelled(&self) -> bool {
-        self.cancelled
+    fn client_gone(&self) -> bool {
+        self.client_gone
     }
 
-    fn try_begin_generation(&self) -> bool {
-        !self.cancelled && !self.gate_closed
+    fn ownership_lost(&self) -> bool {
+        false
+    }
+
+    fn try_begin_external_action(&self) -> Result<(), ExternalActionRefused> {
+        if self.gate_closed || self.client_gone {
+            return Err(ExternalActionRefused::ClientGone);
+        }
+        Ok(())
     }
 
     async fn accepted(&self, _handle: AcceptedHandle) -> Result<(), AcceptanceError> {

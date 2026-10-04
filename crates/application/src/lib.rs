@@ -923,7 +923,8 @@ fn normalize_candidate_pricing(
 
 /// 选出这次请求走的那条候选：**先定档位，再在档内按权重分摊**。
 ///
-/// 合格 = 启用复核放行（见 `enabled_offerings`），**且**该候选自己的 `restrictions` 允许本次分支
+/// 合格 = 可选的启用复核放行（`enabled_offerings` 为 `Some` 时，见
+/// [`HubRepository::enabled_offerings`]），**且**该候选自己的 `restrictions` 允许本次分支
 /// 与图片张数，**且**这条供给的承载面能承载这次请求**实际用到**的每个字段（图片要能落到它声明的
 /// 参数名上）。后两个条件都必须用该候选自己的声明判断——这正是「每条供给各自声明承载面、限制只
 /// 收窄」的落地方式。
@@ -964,10 +965,10 @@ fn select_candidate(
 /// 复核发现供给或它的渠道已停用时的落选原因：它进判定记录，是运营解释"为什么没走这条"的依据。
 const DISABLED_OFFERING_REASON: &str = "this offering or its channel is disabled";
 
-/// 复核是否把这条候选判掉了：只有复核结果存在、且这条供给不在"仍然启用"里时才算停用。
+/// 复核是否把这条候选判掉了：只有调用方给了复核结果、且这条供给不在"仍然启用"里时才算停用。
 ///
-/// 复核结果不存在表示这批候选刚回源读来（取数时已经判过开关），此时一条都不判停用：没有缓存的
-/// 那条路径因此与复核引入之前逐位相同。
+/// 复核结果是可选的：`None` 表示这批候选刚由按启用状态过滤的取数读来（直接执行的受理走的就是
+/// 这条），此时一条都不判停用。
 fn reviewed_as_disabled(
     candidate: &OfferingCandidate,
     enabled_offerings: Option<&HashSet<OfferingId>>,
@@ -1667,6 +1668,21 @@ pub struct SubmissionStarted {
     pub attempt_no: u32,
     /// 与本 Attempt 绑定的收件凭据原值；不写日志、不入库。
     pub receipt_credential: ReceiptCredential,
+}
+
+/// `cancel_unsubmitted` 的命令：受理已提交、生成请求确实没有发出的执行身份。
+///
+/// 这类执行能按"确定未提交"收尾：原子释放 Hold、账户执行名额与渠道容量，落一个确定未提交的
+/// 结论。它**不新建 Attempt**——为释放先写一条 submitting 记录，会把确定未提交的执行伪装成
+/// 可能已提交（RFC 0018 §4.1）。调用方声称这次生成确实没发出，端口据此把已有的提交声明（若
+/// 有）收成 `terminal`；已经 `accepted`/`unknown` 的 Attempt 说明提交可能已在飞，一律冲突。
+#[derive(Debug, Clone)]
+pub struct CancelUnsubmitted {
+    pub job_id: JobId,
+    /// 执行所有权标识；与 fencing token 一起核验，所有权已属他人时冲突。
+    pub execution_owner: String,
+    /// 受理时发给调用方的 fencing token；被接管后旧 token 一律冲突。
+    pub fencing_token: FencingToken,
 }
 
 /// `record_acceptance` 的命令：可信 task/trace 标识与执行身份，**不含请求或响应正文**。
@@ -2389,16 +2405,14 @@ pub trait HubRepository: Send + Sync {
         gateway_model: &str,
     ) -> Result<Vec<OfferingCandidate>, ApplicationError>;
 
-    /// 受理路径的**开关复核**：这些供给里，此刻仍然启用的有哪些（它的渠道也启用）。
+    /// **按主键点读的供给可用性复核**：这些供给里，此刻仍然启用的有哪些（它的渠道也启用）。
     ///
     /// 判据与 [`Self::active_offering`] 那条 `o.enabled AND c.enabled` **同一条**，取值方式不同：
-    /// 这里按供给的主键点读（一次一批，不逐条查），不重新解析发布、不看修订标识。启停是可变表里
-    /// 的事、**不改变修订标识**——route 缓存里那份候选集在停用之后仍然"看起来是新的"，所以停用
-    /// 要立刻生效只能靠这次复核，而它与那次失效有没有成功无关。
+    /// 这里按供给的主键点读（一次一批，不逐条查），不重新解析发布、不看修订标识。引用式发布用它
+    /// 拒绝"选了一条停用供给"（见 [`RuntimeService::resolve_referenced_offerings`]）。
     ///
-    /// 只回"还作数的供给 id"，不回候选本身：候选由缓存给出，这里判的是它还作不作数。空集合直接
-    /// 回空集合，不查库。读失败按平台侧故障往外抛（出错就整次受理失败），不退化成"不复核"——
-    /// 静默放行会让停用在读失败的那几次请求上重新失效。
+    /// 只回"还作数的供给 id"，不回候选本身。空集合直接回空集合，不查库。读失败按平台侧故障往外抛
+    /// （出错就整次调用失败），不退化成"不复核"——静默放行会让一条停用供给被发布出去。
     async fn enabled_offerings(
         &self,
         offering_ids: &[OfferingId],
@@ -2430,8 +2444,8 @@ pub trait HubRepository: Send + Sync {
 
     /// 管理员写：只改一条**供给**的启用开关，写一条审计事件。
     ///
-    /// 返回这条供给现在出现在哪些网关模型的**生效**候选集里——调用方拿这些名字失效 route 缓存。
-    /// 启停不改变修订标识，失效因此只影响命中率；停用本身的生效见 [`Self::enabled_offerings`]。
+    /// 返回这条供给现在出现在哪些网关模型的**生效**候选集里——调用方拿这些名字清理 route 缓存。
+    /// 停用本身的生效见 [`Self::active_offering`]：直接执行每次受理都直读数据库，不经过缓存。
     ///
     /// 没发布过的供给 id 返回 [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**
     /// 任何东西。停用只影响之后的受理——已受理 Job 的候选与定价早已随快照冻结在 Job 上。
@@ -2502,7 +2516,7 @@ pub trait HubRepository: Send + Sync {
     ) -> Result<(), ApplicationError>;
 
     /// 建账户。返回的是**数据库里那个账户**变更后的余额与写入时刻：调用方要把它写进缓存
-    /// （写穿），而缓存里的写入时间要参与新鲜度判定与审计，只能用数据库盖章的那个时间。
+    /// （写穿），而缓存里的写入时间要参与对账审计，只能用数据库盖章的那个时间。
     async fn create_account(
         &self,
         account_id: AccountId,
@@ -3002,6 +3016,24 @@ pub trait ExecutionRepository: Send + Sync {
     /// ApplicationError::Conflict，不覆盖原事实；Attempt 不属于该 Job、不在 submitting/accepted、
     /// Job 已不是 executing、所有权或 fencing token 不匹配时同样冲突。
     async fn record_acceptance(&self, command: RecordAcceptance) -> Result<(), ApplicationError>;
+
+    /// 带 fencing 的"确定未提交"取消：受理已提交但生成请求确实没发出的执行按确定未提交收尾。
+    ///
+    /// 同一事务里原子释放该 Job 的 active Hold（并按预授权额去掉账户占用）、账户执行名额与渠道
+    /// 容量槽位，把 Job 写成 failed 并盖 `terminal_at`；不写对客错误码（没有对客结论，也不需要
+    /// 重开路径）。它**不建 Attempt**：没有提交声明的执行本来就没有 Attempt，已有已收尾 Attempt
+    /// 的重投也无法再证明"没发过"。若库里存在未收尾的 Attempt（prepared/submitting/accepted/
+    /// unknown），说明提交可能已经在飞，一律冲突，不释放。
+    ///
+    /// 事务结果未知时不能声称释放成功：COMMIT 的响应丢失时这次取消可能已经提交，调用方按
+    /// [`Self::read_finalization`] 的确认结果判断，不先假定失败也不重复释放。
+    ///
+    /// 失败：Job 不存在返回 ApplicationError::NotFound；已成功、已是对账态、所有权或 fencing token
+    /// 不匹配、存在未收尾的 Attempt 返回 ApplicationError::Conflict。
+    async fn cancel_unsubmitted(
+        &self,
+        command: CancelUnsubmitted,
+    ) -> Result<ExecutionFinalization, ApplicationError>;
 
     /// 原子结算：锁定 Job → Hold → 账户，核验执行所有权、fencing token、Attempt 归属与证据 Attempt，
     /// 把 Attempt 写成 terminal 并落计量证据与成本事实，Job 写成 succeeded 并盖 `terminal_at`，
@@ -4186,7 +4218,7 @@ impl RoutePolicyService {
 ///
 /// **语义只到这里为止**：键名、值长什么样、什么时候能拿缓存下结论，全在
 /// [`AccelerationService`] 里；实现只负责把这三条命令发给缓存服务。接口这么窄是故意的——
-/// 一旦让实现方也懂"余额"与"候选集"，两边的语义就会各自漂移，而漂移的表现是"缓存说的和
+/// 一旦让实现方也懂"余额"与"限流窗口"，两边的语义就会各自漂移，而漂移的表现是"缓存说的和
 /// 数据库说的不一样"。
 ///
 /// 所有方法都可能失败。调用方一律把失败当"这次没命中"，回源数据库：缓存出问题不该让任何
@@ -4201,62 +4233,39 @@ pub trait CacheStore: Send + Sync {
     async fn delete(&self, key: &str) -> Result<(), ApplicationError>;
 }
 
-/// 加速层的运行参数。
+/// 加速层的运行参数：余额快照能留多久、多久对账一轮。
 ///
-/// 新鲜窗口必须**显著小于**对账周期：对账写回的条目来源标记是 `reconciler`、本来就**不作为**
-/// 新鲜提示，这条比例关系是第二道保险——它保证"能用作提示的值"实际都来自写穿路径。
+/// route 缓存不再有"写进去、读出来选路"的读路径，因此没有 TTL；对账器仍按
+/// [`AccelerationService::reconcile_once`] 清理陈旧条目并记审计。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct CachePolicy {
-    pub route_ttl: Duration,
     pub balance_ttl: Duration,
-    pub freshness_window: Duration,
     pub reconcile_interval: Duration,
 }
 
 impl CachePolicy {
-    /// 新鲜窗口至少要比对账周期小这么多倍。
-    pub const FRESHNESS_TO_RECONCILE_RATIO: u32 = 4;
-
     pub fn new(
-        route_ttl: Duration,
         balance_ttl: Duration,
-        freshness_window: Duration,
         reconcile_interval: Duration,
     ) -> Result<Self, ApplicationError> {
-        if route_ttl.is_zero()
-            || balance_ttl.is_zero()
-            || freshness_window.is_zero()
-            || reconcile_interval.is_zero()
-        {
+        if balance_ttl.is_zero() || reconcile_interval.is_zero() {
             return Err(ApplicationError::Configuration(
                 "cache durations must be positive".to_owned(),
             ));
         }
-        if freshness_window.saturating_mul(Self::FRESHNESS_TO_RECONCILE_RATIO) > reconcile_interval
-        {
-            return Err(ApplicationError::Configuration(format!(
-                "the cache freshness window ({freshness_window:?}) must be at least {} times \
-                 smaller than the reconcile interval ({reconcile_interval:?})",
-                Self::FRESHNESS_TO_RECONCILE_RATIO
-            )));
-        }
         Ok(Self {
-            route_ttl,
             balance_ttl,
-            freshness_window,
             reconcile_interval,
         })
     }
 
-    /// 默认参数：设计里给的那一套（route 60 秒、余额 360 秒、新鲜窗口 5 秒、对账周期 3 分钟）。
+    /// 默认参数：设计里给的那一套（余额 360 秒、对账周期 3 分钟）。
     ///
     /// 未配置缓存时用不到它——那时这一层是空操作，参数只在"缓存启用后怎么写"上起作用。
     #[must_use]
     pub fn default_policy() -> Self {
         Self {
-            route_ttl: Duration::from_secs(60),
             balance_ttl: Duration::from_secs(360),
-            freshness_window: Duration::from_secs(5),
             reconcile_interval: Duration::from_secs(180),
         }
     }
@@ -4266,9 +4275,7 @@ impl CachePolicy {
     /// **默认值不等于启用**：这一层启不启用只看有没有缓存服务（`REDIS_URL`），不看这些参数。
     pub fn from_env() -> Result<Self, ApplicationError> {
         Self::new(
-            cache_duration_env("CACHE_ROUTE_TTL_SECONDS", 60)?,
             cache_duration_env("CACHE_BALANCE_TTL_SECONDS", 360)?,
-            cache_duration_env("CACHE_FRESHNESS_WINDOW_MS", 5_000)?,
             cache_duration_env("CACHE_RECONCILE_INTERVAL_MS", 180_000)?,
         )
     }
@@ -4293,7 +4300,7 @@ fn cache_duration_env(name: &str, default: u64) -> Result<Duration, ApplicationE
 /// 一次余额变更的结果：**哪个账户**、变更**之后**的余额、以及数据库记下的时刻。
 ///
 /// 三个数都由**数据库**给出（`UPDATE … RETURNING balance_microusd, updated_at`，账户就是被改的
-/// 那一行）。缓存里的写入时间要参与"新鲜不新鲜"的判定与审计，换成 API 进程的时钟就会因为两个
+/// 那一行）。缓存里的写入时间要参与对账审计，换成 API 进程的时钟就会因为两个
 /// 时钟的漂移把刚写的值判成旧的（或反过来，把旧值当成刚写的）；账户也一律取库里那一行，
 /// 不取调用方手上的 id——写穿缓存必须写回**真正被改动**的那个账户。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -4310,26 +4317,7 @@ pub struct BalanceChange {
     pub updated_at: DateTime<Utc>,
 }
 
-/// 受理前的一次轻量读：网关模型开关、当前生效的修订标识、**数据库时钟**，以及这次请求是不是
-/// 一次**重放**（该账户下已有同一个幂等键的 Job）。
-///
-/// 修订标识用来判断 route 缓存是不是陈旧的：缓存里带着写它那次发布的标识，与这里读到的比对，
-/// 不一致就当未命中。开关必须**单独**读一次——`PATCH enabled` 改的是可变表、**不改变修订
-/// 标识**，交给缓存判定的话，关掉的模型会在缓存有效期内继续被受理。
-///
-/// 时钟也在这里取：缓存里的写入时间由数据库盖章，拿它跟进程时钟比就会因为漂移判错新鲜度。
-///
-/// 重放这一项服务余额预检：重放会去重成原来那个 Job（不新建、不扣款），因此**不受预检管辖**
-/// ——预检要避免的正是"新建一个 Job 却扣不动钱"，而重放本来就不新建。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AcceptanceProbe {
-    pub enabled: bool,
-    pub effective_revision_id: Option<RuntimeRevisionId>,
-    pub database_now: DateTime<Utc>,
-    pub replay: bool,
-}
-
-/// 余额缓存条目的来源：写穿路径写下的值**可以**用作新鲜提示，对账写回的不行。
+/// 余额缓存条目的来源：写穿路径写下的值，还是定时对账覆盖写回的副本。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum BalanceSource {
@@ -4339,29 +4327,15 @@ pub enum BalanceSource {
     Reconciler,
 }
 
-/// 一次候选取数的结果：候选集，外加"这次复核到的可用供给集"。
+/// route 缓存的值里**对账器唯一还读的东西**：写它那次发布的修订标识。
 ///
-/// 复核只发生在缓存给出的候选集上：回源数据库那一支的取数 SQL 已经判过开关，复核结果因此是
-/// `None`。为什么缓存那一支必须复核，见 [`HubRepository::enabled_offerings`]。
-///
-/// 复核结果**不写回缓存**：缓存里的值始终是那一版发布的候选集，写回被裁过的集合会让"重新启用"
-/// 在一个 TTL 内看不见。
-#[derive(Debug, Clone)]
-pub struct CandidateSet {
-    /// 候选，`routing_priority` 升序。
-    pub candidates: Vec<OfferingCandidate>,
-    /// `Some`：只有出现在集合里的供给才合格。`None`：这份候选集刚回源读来，不需要复核。
-    pub enabled_offerings: Option<HashSet<OfferingId>>,
-}
-
-/// route 缓存的值：候选集 + **写它那次发布**的修订标识。
-///
-/// 修订标识是这一层的可检性来源：受理时与当前生效的修订比对，不一致就当未命中——因此
-/// "发布后的失效没成功"只会让缓存里留着旧值，不会让旧候选被用上。
-#[derive(Debug, Serialize, Deserialize)]
+/// 受理期的候选读取路径已删（直接执行每次受理都直读数据库的 `active_offering`），候选集因此
+/// 不再进这个值、也不再被解析。对账器只比对修订标识与网关模型开关，据此清理陈旧条目
+/// （[`AccelerationService::reconcile_once`]）——值里的其它字段（历史写入留下的候选集）反序列化时
+/// 直接忽略。
+#[derive(Debug, Deserialize)]
 struct CachedRoute {
     runtime_revision_id: RuntimeRevisionId,
-    candidates: Vec<OfferingCandidate>,
 }
 
 /// 余额缓存的值：一次账户读取的完整快照 + 写入时间（数据库盖章）+ 来源标记。
@@ -4377,27 +4351,6 @@ struct CachedBalance {
     version: i64,
     written_at: DateTime<Utc>,
     source: BalanceSource,
-}
-
-impl CachedBalance {
-    /// 这条值能不能作为**新鲜提示**。两条判据都要满足：
-    ///
-    /// 1. 来源是**写穿路径**——对账写回的只是"与数据库一致"的副本，不构成"刚有一笔钱变动过"；
-    /// 2. 写入时间落在新鲜窗口内，且**不晚于数据库当前时刻**。晚于它只可能是两个时钟不同步，
-    ///    那种值一律当不新鲜：不拿一个来路不明的时间去提示。
-    ///
-    /// 它只影响预检日志，**不决定受理**：402 一律由数据库条件更新确认
-    /// （[`AccelerationService::precheck_balance`]）。
-    fn is_fresh(&self, database_now: DateTime<Utc>, window: Duration) -> bool {
-        if self.source != BalanceSource::DbCommit {
-            return false;
-        }
-        if self.written_at > database_now {
-            return false;
-        }
-        let window = ChronoDuration::from_std(window).unwrap_or_else(|_| ChronoDuration::zero());
-        database_now - self.written_at < window
-    }
 }
 
 /// 一轮对账的结果（供定时任务记日志；对客不可见）。
@@ -4426,7 +4379,7 @@ struct CachedRateLimit {
 /// 1. **任何一次缓存操作失败都只是"这次没命中"**——回源数据库，绝不让请求因为缓存出问题而失败；
 /// 2. **扣减与余额事实只在数据库事务里发生**：这里的写入一律发生在提交**之后**、写的是提交后的
 ///    值，从不用 `DECRBY` 之类的增量命令（增量表达不了"以数据库为准"，重放还会漂移）；
-/// 3. **缓存从不决定资金结果**：预检只读新鲜值作提示，受理与 402 一律由数据库条件更新判定。
+/// 3. **缓存从不决定资金结果**：受理与 402 一律由数据库条件更新判定，缓存只写穿提交后的快照。
 #[derive(Clone)]
 pub struct AccelerationService {
     repository: Arc<dyn HubRepository>,
@@ -4435,7 +4388,7 @@ pub struct AccelerationService {
 }
 
 impl AccelerationService {
-    /// 没有缓存服务时的加速层：所有方法都是空操作，受理路径**不额外查库**。
+    /// 没有缓存服务时的加速层：所有方法都是空操作，不额外查库。
     ///
     /// 于是"未配置缓存"的行为与没有这一层时逐位相同——降级不是"多打几次数据库"，而是根本
     /// 不走这条路。
@@ -4461,7 +4414,7 @@ impl AccelerationService {
         }
     }
 
-    /// 有没有缓存服务。受理路径用它决定走不走加速：没有缓存时连那次轻量读都不做。
+    /// 有没有缓存服务。进程用它决定要不要挂起对账循环（[`Self::run_reconciler`]）。
     #[must_use]
     pub fn is_enabled(&self) -> bool {
         self.cache.is_some()
@@ -4577,98 +4530,10 @@ impl AccelerationService {
         }
     }
 
-    /// 取该网关模型的候选集：缓存命中且**修订标识一致**才用缓存，否则回源数据库并重建缓存。
-    ///
-    /// 修订标识由受理前那次 [`AcceptanceProbe`] 读来，这里不再查库。不一致（或值里根本没有这个
-    /// 标识、值读不出来）⇒ 当未命中。因此 route 缓存的陈旧是**可检的**，不依赖"发布后的失效
-    /// 一定成功"。
-    ///
-    /// 关掉（或从未发布）的模型**不看缓存**：开关与启停都是可变表里的事、不改变修订标识，缓存里
-    /// 那份候选集在关掉或停用之后仍然"看起来是新的"（口径见 [`HubRepository::enabled_offerings`]）。
-    ///
-    /// 命中缓存时按主键复核一遍供给与渠道的启用状态（判据见 [`HubRepository::enabled_offerings`]），
-    /// 复核结果随候选集一起交出；回源那一支取数已经判过开关，不需要复核，因此复核结果只在缓存给出
-    /// 的候选集上出现（见 [`CandidateSet`]）。
-    pub async fn candidates(
-        &self,
-        gateway_model: &str,
-        probe: &AcceptanceProbe,
-    ) -> Result<CandidateSet, ApplicationError> {
-        let Some(effective) = probe.effective_revision_id.filter(|_| probe.enabled) else {
-            return Ok(CandidateSet {
-                candidates: Vec::new(),
-                enabled_offerings: None,
-            });
-        };
-        if let Some(cached) = self.read_route(gateway_model).await
-            && cached.runtime_revision_id == effective
-        {
-            let offering_ids = cached
-                .candidates
-                .iter()
-                .map(|candidate| candidate.offering_id)
-                .collect::<Vec<_>>();
-            let enabled_offerings = self.repository.enabled_offerings(&offering_ids).await?;
-            return Ok(CandidateSet {
-                candidates: cached.candidates,
-                enabled_offerings: Some(enabled_offerings),
-            });
-        }
-        let candidates = self.repository.active_offering(gateway_model).await?;
-        // **空候选集不入缓存**：它是"这个型号现在调不动"的瞬时状态，而回源它只发生在错误路径上。
-        // 缓存下来反而会让"供给被重新启用"（今天没有写入方，但将来会有）在一个 TTL 内看不见。
-        if !candidates.is_empty() {
-            self.write_route(gateway_model, effective, &candidates)
-                .await;
-        }
-        Ok(CandidateSet {
-            candidates,
-            enabled_offerings: None,
-        })
-    }
-
-    /// 受理前的余额预检：读缓存里的**可用额**作提示，**不决定受理**。
-    ///
-    /// 缓存不可用、值过期、不是写穿来源或这次是重放时都不提示。命中一条新鲜且可用额低于本次
-    /// 保底额的值时只记一条日志——它说明"这次很可能受理不了"，但**不产生 402**：受理闸门是
-    /// 数据库那条条件更新（`balance − held ≥ 保底额` 且 `kind = consumer`），缓存不足也要由它
-    /// 确认才回 402（`0013` §3）。重放会去重成原来那个 Job，不新建也不扣款，提示对它是噪音。
-    pub async fn precheck_balance(
-        &self,
-        account_id: AccountId,
-        hold_microusd: u64,
-        gateway_model: &str,
-        probe: &AcceptanceProbe,
-    ) {
-        if probe.replay {
-            return;
-        }
-        let Some(cached) = self.read_balance(account_id).await else {
-            return;
-        };
-        if !cached.is_fresh(probe.database_now, self.policy.freshness_window) {
-            return;
-        }
-        let Ok(hold) = i64::try_from(hold_microusd) else {
-            return;
-        };
-        if cached.available_microusd >= hold {
-            return;
-        }
-        tracing::warn!(
-            account_id = %account_id,
-            gateway_model,
-            cached_available_microusd = cached.available_microusd,
-            cached_version = cached.version,
-            hold_microusd,
-            "the fresh cached available amount is below the hold; the database conditional update decides"
-        );
-    }
-
     /// 把**数据库提交后**的余额快照写进缓存（写穿），并拒绝倒序写回。
     ///
     /// 写的是提交后的值而不是增量：`DECRBY` 表达不了"以数据库为准"，重放还会漂移。写入时间用
-    /// 数据库给出的 `updated_at`，于是"新鲜"提示与日志里的时间都是数据库的时间。
+    /// 数据库给出的 `updated_at`，于是日志与对账审计里的时间都是数据库的时间。
     ///
     /// **版本闸门**：只有版本**不低于**缓存当前值的快照才写。数据库对同一账户的金额更新是串行的，
     /// 版本随每次变更递增；两个事务提交后的异步写回若乱序到达，旧快照会试图覆盖新快照——这里按
@@ -4711,9 +4576,8 @@ impl AccelerationService {
 
     /// 发布成功（事务提交后）与启停开关改动后失效 route 缓存。
     ///
-    /// 失效失败不影响正确性：旧值带着旧修订标识，受理时的比对必然不一致 ⇒ 回源数据库；启停那一项
-    /// 由受理路径的复核兜住（见 [`HubRepository::enabled_offerings`]），失效只影响命中率。失败只记
-    /// 一条日志（运营要能发现命中率在下降）。
+    /// 直接执行每次受理都直读数据库的 `active_offering`，route 缓存已经不参与选路，因此这里的失效
+    /// 只用于清理历史条目，不改变任何受理结果。失败只记一条日志（运营要能发现清理没有生效）。
     pub async fn invalidate_route(&self, gateway_model: &str) {
         let Some(cache) = self.cache.as_ref() else {
             return;
@@ -4723,15 +4587,15 @@ impl AccelerationService {
             tracing::warn!(
                 key,
                 error = %error,
-                "cache invalidation failed; a stale entry is still caught at acceptance time"
+                "cache invalidation failed; a stale route entry survives until the reconciler or its TTL clears it"
             );
         }
     }
 
     /// 定时对账兜底：以数据库为准把缓存覆盖回去，并把**真的不一致**记下来。
     ///
-    /// 只覆盖不一致的条目：已经等于数据库值的条目不动——重写会把它的来源降级成 `reconciler`
-    /// （等于这条值不再能作为新鲜提示），没必要为一次没发生的不一致付这个代价。缓存比这次读到的
+    /// 只覆盖不一致的条目：已经等于数据库值的条目不动——重写会把它的来源从写穿降级成
+    /// `reconciler`，没必要为一次没发生的不一致付这个代价。缓存比这次读到的
     /// 数据库行**新**时也不动它：那次读发生在新提交之前，覆盖回去才是倒序写回。
     pub async fn reconcile_once(&self) -> Result<ReconcileReport, ApplicationError> {
         if !self.is_enabled() {
@@ -4793,14 +4657,15 @@ impl AccelerationService {
             let Some(cached) = self.read_route(&view.gateway_model).await else {
                 continue;
             };
-            // 当前生效修订取自同一次只读投影：它与受理前那次轻量读取的是同一批复发行。
+            // 当前生效修订取自同一次只读投影；条目缺修订标识、或与它不一致、或模型已关，
+            // 都说明这条缓存不该再留着。
             if view.enabled && view.runtime_revision_id == cached.runtime_revision_id {
                 continue;
             }
             report.routes_invalidated += 1;
             tracing::warn!(
                 gateway_model = %view.gateway_model,
-                "the cached candidate set is not the effective revision; invalidating it"
+                "the cached route entry is not the effective revision; invalidating it"
             );
             self.record_reconcile_correction(
                 "cache.route_invalidated",
@@ -4869,37 +4734,16 @@ impl AccelerationService {
         }
     }
 
-    async fn write_route(
-        &self,
-        gateway_model: &str,
-        runtime_revision_id: RuntimeRevisionId,
-        candidates: &[OfferingCandidate],
-    ) {
-        let value = CachedRoute {
-            runtime_revision_id,
-            candidates: candidates.to_vec(),
-        };
-        let Ok(serialized) = serde_json::to_string(&value) else {
-            return;
-        };
-        self.write(
-            &Self::route_key(gateway_model),
-            &serialized,
-            self.policy.route_ttl,
-        )
-        .await;
-    }
-
     async fn read_route(&self, gateway_model: &str) -> Option<CachedRoute> {
         let raw = self.read(&Self::route_key(gateway_model)).await?;
         match serde_json::from_str(&raw) {
             Ok(cached) => Some(cached),
             Err(error) => {
-                // 值读不出来（格式变了、被改坏了）：当未命中，回源重建。
+                // 值读不出来（格式变了、被改坏了）：这一轮跳过它，当作"没有可清理的条目"。
                 tracing::warn!(
                     gateway_model,
                     error = %error,
-                    "the cached candidate set is unreadable; falling back to the database"
+                    "the cached route entry is unreadable; skipping the invalidation check"
                 );
                 None
             }
@@ -4933,8 +4777,8 @@ impl AccelerationService {
         }
     }
 
-    /// 写一条缓存值。失败只记一条日志：缓存里留着旧值时，受理时的比对必然不一致 ⇒ 回源数据库，
-    /// 所以**正确性不依赖这次写入成功**。
+    /// 写一条缓存值。失败只记一条日志：写的是提交后的余额快照与限流计数，两者的正确性都不依赖
+    /// 缓存（余额以数据库为准，限流是保护机制），所以写失败不改变任何结果。
     async fn write(&self, key: &str, value: &str, ttl: Duration) {
         let Some(cache) = self.cache.as_ref() else {
             return;
@@ -5138,8 +4982,8 @@ impl RuntimeService {
         validate_gateway_model_identity(&request)?;
         let gateway_model = request.gateway_model.clone();
         let revision = self.repository.publish_runtime(request).await?;
-        // 发布已经提交：这时才失效缓存。失效失败不影响正确性——旧值带着旧修订标识，
-        // 受理时的比对必然不一致（见 `AccelerationService::candidates`）。
+        // 发布已经提交：这时才失效缓存。直接执行每次受理都直读数据库，失效只清理历史条目，
+        // 不影响任何受理结果。
         self.acceleration.invalidate_route(&gateway_model).await;
         Ok(revision)
     }
@@ -5401,9 +5245,8 @@ impl RuntimeService {
 
     /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。
     ///
-    /// 改完失效该型号的 route 缓存：开关**不改变修订标识**，缓存里那份候选集在关掉之后仍然
-    /// "看起来是新的"，只能靠失效把它拿掉。失效失败也不影响正确性——受理前那次轻量读
-    /// （`acceptance_probe`）取的就是这一个开关，关掉的模型在它那里被当成"模型不存在"。
+    /// 改完失效该型号的 route 缓存（清理历史条目）：直接执行每次受理都直读数据库的候选与开关，
+    /// 关掉的模型在受理期就是"模型不存在"，不依赖任何缓存是否过期。
     pub async fn set_gateway_model_enabled(
         &self,
         gateway_model: &str,
@@ -5417,10 +5260,10 @@ impl RuntimeService {
         Ok(())
     }
 
-    /// 管理员写：只改一条**供给**的启用开关，并失效受影响型号的 route 缓存。
+    /// 管理员写：只改一条**供给**的启用开关，并失效受影响型号的 route 缓存（清理历史条目）。
     ///
-    /// 停用即刻影响之后的受理，**不需要重发修订**——启停是运行状态、不是定义，候选查询与受理路径
-    /// 的复核都直接读这两列（见 [`HubRepository::enabled_offerings`]），失效只影响命中率。已受理的
+    /// 停用即刻影响之后的受理，**不需要重发修订**——启停是运行状态、不是定义，直接执行的候选查询
+    /// 读的就是这两列（见 [`HubRepository::active_offering`]）。已受理的
     /// Job 不受影响（候选已冻结在它们的快照里）。
     pub async fn set_offering_enabled(
         &self,
@@ -6813,7 +6656,7 @@ fn plan_candidate<'a>(
     features: &RequestFeatures<'_>,
     enabled_offerings: Option<&HashSet<OfferingId>>,
 ) -> CandidatePlan<'a> {
-    // 复核（只在缓存给出的候选集上做）说这条供给或它的渠道已经停用 ⇒ 不合格，与"承载面表达
+    // 复核（调用方给了复核结果时）说这条供给或它的渠道已经停用 ⇒ 不合格，与"承载面表达
     // 不了"同一条路。判在承载面之前：开关关掉是更准确的落选原因，也无须替一条已经停用的候选
     // 再解析映射声明。
     if reviewed_as_disabled(candidate, enabled_offerings) {

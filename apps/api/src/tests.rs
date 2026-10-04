@@ -285,8 +285,8 @@ mod memory_measurement {
     use crate::{SyncImageResponse, take_contract_image_inputs};
     use seeai_adapter_aihubmix::{ADAPTER_KEY as AIHUBMIX_ADAPTER_KEY, AihubmixAdapterFactory};
     use seeai_adapter_sdk::{
-        AcceptanceError, AcceptedHandle, Deadline, ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES,
-        GatewayInput, ImageSites, InputImage, ProviderCredential,
+        AcceptanceError, AcceptedHandle, Deadline, ExecutionContext, ExternalActionRefused,
+        GATEWAY_REQUEST_WIRE_BYTES, GatewayInput, ImageSites, InputImage, ProviderCredential,
     };
     use seeai_application::{AdapterFactory, GeneratedImage};
     use seeai_domain::{
@@ -643,12 +643,16 @@ mod memory_measurement {
             Deadline::after(Duration::from_secs(60))
         }
 
-        fn is_cancelled(&self) -> bool {
+        fn client_gone(&self) -> bool {
             false
         }
 
-        fn try_begin_generation(&self) -> bool {
-            true
+        fn ownership_lost(&self) -> bool {
+            false
+        }
+
+        fn try_begin_external_action(&self) -> Result<(), ExternalActionRefused> {
+            Ok(())
         }
 
         async fn accepted(&self, _handle: AcceptedHandle) -> Result<(), AcceptanceError> {

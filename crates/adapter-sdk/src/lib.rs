@@ -10,9 +10,9 @@ use thiserror::Error;
 mod gateway;
 pub use gateway::{
     AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, Deadline, DispatchGate,
-    ExecutionContext, GatewayAdapter, GatewayInput, ImageSite, ImageSites, ImageValueShape,
-    InputImage, ProviderOutput, ProviderTaskHandle, ProviderTaskState, ProviderTraceId,
-    QueryAccountingCapability, ResponsePayload, begin_generation_send,
+    ExecutionContext, ExternalActionRefused, GatewayAdapter, GatewayInput, ImageSite, ImageSites,
+    ImageValueShape, InputImage, ProviderOutput, ProviderTaskHandle, ProviderTaskState,
+    ProviderTraceId, QueryAccountingCapability, ResponsePayload, begin_generation_send,
     ensure_external_call_allowed, ensure_read_call_allowed, external_call_timeout,
     gateway_passthrough_parameters,
 };

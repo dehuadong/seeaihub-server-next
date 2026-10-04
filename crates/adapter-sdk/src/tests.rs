@@ -54,22 +54,66 @@ fn generated_images_keep_only_the_shape_the_provider_gave() {
 #[test]
 fn a_cancel_before_the_generation_gate_blocks_the_send() {
     let gate = DispatchGate::new();
-    gate.cancel();
-    assert!(!gate.try_begin_generation());
+    gate.client_gone();
+    assert_eq!(
+        gate.try_begin_external_action(),
+        Err(ExternalActionRefused::ClientGone)
+    );
     assert!(!gate.generation_started());
-    assert!(gate.is_cancelled());
+    assert!(gate.is_client_gone());
+    assert!(!gate.is_ownership_lost(), "断开不等于所有权失效");
+    assert!(gate.is_stopped());
+}
+
+/// 两种取消原因各自可查、可唤醒，且都不放行生成发送——行为差异在收尾权限，不在闸口本身。
+#[test]
+fn the_two_cancel_reasons_are_distinct_and_each_refuses_the_send() {
+    let lost = DispatchGate::new();
+    lost.ownership_lost();
+    assert_eq!(
+        lost.try_begin_external_action(),
+        Err(ExternalActionRefused::OwnershipLost)
+    );
+    assert!(lost.is_ownership_lost());
+    assert!(!lost.is_client_gone(), "续约失败不等于客户端断开");
+    assert_eq!(
+        lost.stop_reason(),
+        Some(ExternalActionRefused::OwnershipLost)
+    );
+
+    // 两个都成立时报更严的那一条：所有权不在了，连"本进程按旧 token 收尾"都不成立。
+    let both = DispatchGate::new();
+    both.client_gone();
+    both.ownership_lost();
+    assert_eq!(
+        both.try_begin_external_action(),
+        Err(ExternalActionRefused::OwnershipLost)
+    );
+}
+
+/// 停机这类不区分原因的场景两位一起置：既停外部动作，也不声称本地未发送。
+#[test]
+fn stop_all_records_both_reasons_and_refuses_the_send() {
+    let gate = DispatchGate::new();
+    gate.stop_all();
+    assert!(gate.is_client_gone());
+    assert!(gate.is_ownership_lost());
+    assert_eq!(
+        gate.try_begin_external_action(),
+        Err(ExternalActionRefused::OwnershipLost)
+    );
 }
 
 #[test]
 fn a_generation_that_started_first_is_recorded_even_if_cancelled_after() {
     let gate = DispatchGate::new();
-    assert!(gate.try_begin_generation());
-    gate.cancel();
+    assert_eq!(gate.try_begin_external_action(), Ok(()));
+    gate.client_gone();
     assert!(
         gate.generation_started(),
         "已经开始发送的事实不能被后来的取消抹掉"
     );
-    assert!(gate.is_cancelled(), "之后的取消仍然生效，用于停止后续动作");
+    assert!(gate.is_stopped(), "之后的取消仍然生效，用于停止后续动作");
 }
 
 /// 取消与发送竞争同一个原子字：并发下结论必须与状态一致，且不会两者都"赢"。
@@ -78,17 +122,22 @@ fn concurrent_cancel_and_generation_have_one_consistent_winner() {
     use std::sync::{Arc, Barrier};
     use std::thread;
 
-    for _ in 0..500 {
+    for round in 0..500 {
         let gate = Arc::new(DispatchGate::new());
         let cancelling = gate.clone();
         let barrier = Arc::new(Barrier::new(2));
         let other = barrier.clone();
         let handle = thread::spawn(move || {
             other.wait();
-            cancelling.cancel();
+            // 两种原因轮流置位：线性化对两条取消路径都成立。
+            if round % 2 == 0 {
+                cancelling.client_gone();
+            } else {
+                cancelling.ownership_lost();
+            }
         });
         barrier.wait();
-        let started = gate.try_begin_generation();
+        let started = gate.try_begin_external_action().is_ok();
         handle.join().expect("the cancelling thread");
 
         assert_eq!(
@@ -98,7 +147,7 @@ fn concurrent_cancel_and_generation_have_one_consistent_winner() {
         );
         if !started {
             assert!(
-                gate.is_cancelled(),
+                gate.is_stopped(),
                 "闸口拒绝意味着取消先赢，取消必须是可观察的"
             );
         }

@@ -475,8 +475,7 @@ fn an_ineligible_candidate_never_wins_the_split() {
 
 /// 复核说某条供给已经停用 ⇒ 它与"承载面表达不了"同一条路：不合格，权重再大也换不来一次选中。
 ///
-/// 复核结果只由**缓存给出的**候选集带来（`None` 表示这批候选刚回源读来），所以 `None` 那一支
-/// 必须与复核引入之前逐位相同。
+/// 复核结果只由调用方随候选集给出（`None` 表示没有复核，直接执行的受理走的这一支）。
 #[test]
 fn a_reviewed_disabled_offering_is_ineligible_and_never_wins_the_split() {
     let disabled = offering();
@@ -510,7 +509,7 @@ fn a_reviewed_disabled_offering_is_ineligible_and_never_wins_the_split() {
         "{error}"
     );
 
-    // 不复核（候选刚回源读来）：仍按档位选优先级 0 那条，逐位不变。
+    // 不复核（没有复核结果）：仍按档位选优先级 0 那条，逐位不变。
     let (chosen, _, _) = select_candidate(&request, branch, &candidates, None)
         .expect("an unreviewed candidate set routes as before");
     assert_eq!(chosen.offering_id, disabled.offering_id);

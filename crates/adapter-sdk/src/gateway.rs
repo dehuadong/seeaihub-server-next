@@ -14,6 +14,19 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
 
+/// 生成发送前的最后资格被拒的原因：两种取消事实各自指名，不合并成一个"取消了"。
+///
+/// 两种拒因都证明本地没有发出生成请求，差别在收尾权限：客户端离开时本进程仍是这笔执行的所有者，
+/// 所有权失效时不是。两个事实同时成立时返回 [`Self::OwnershipLost`]——那一条更严
+/// （见 [`DispatchGate::try_begin_external_action`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ExternalActionRefused {
+    /// 客户端已断开：停止新的上传、生成、重试与轮询。
+    ClientGone,
+    /// 执行所有权已失效（租约/续约失败、被接管）：已收到的事实只做有限收尾或交还当前所有者。
+    OwnershipLost,
+}
+
 /// Provider 有界标识与 trace：权威定义在 [`seeai_domain`]，SDK 只重导出，不另立一套校验。
 pub use seeai_domain::{ProviderTaskHandle, ProviderTraceId};
 
@@ -210,23 +223,25 @@ pub enum AcceptanceError {
     Cancelled,
 }
 
-/// Adapter 能看到的执行上下文：绝对期限、取消状态与异步接受确认。
+/// Adapter 能看到的执行上下文：绝对期限、两种取消事实与异步接受确认。
 ///
-/// 它不暴露 Repository、凭证或财务规则：Adapter 只看这三处（RFC 0017 §4）。
+/// 它不暴露 Repository、凭证或财务规则：Adapter 只看这几处（RFC 0017 §4）。
 #[async_trait]
 pub trait ExecutionContext: Send + Sync {
     /// 绝对总期限；上传、下载、submit、poll 都用它做单次超时上界。
     fn deadline(&self) -> Deadline;
 
-    /// 执行所有权失效或停机：Adapter 应停止新的提交、重试与轮询。
-    fn is_cancelled(&self) -> bool;
+    /// 客户端已断开：transport 观察到调用方离开（RFC 0018 §4.1）。
+    fn client_gone(&self) -> bool;
 
-    /// 生成发送的最后资格检查：与取消共用同一状态，二者只有一个先成功。
+    /// 执行所有权已失效：租约/续约失败或被接管。
+    fn ownership_lost(&self) -> bool;
+
+    /// 生成发送的最后资格检查：与两种取消事实共用同一原子状态，二者只有一个先成功。
     ///
-    /// 返回 `true` 表示这次生成发送可以开始（此后即使取消也只能按"可能已提交"处理）；
-    /// 返回 `false` 表示取消先发生，调用方绝不能发出生成请求。轮询、上传等非生成调用不需要
-    /// 也不能调用它。
-    fn try_begin_generation(&self) -> bool;
+    /// 返回 `Ok(())` 表示这次生成发送可以开始（此后即使收到取消也只能按"可能已提交"处理）；
+    /// 返回 `Err(_)` 表示取消先发生，调用方绝不能发出生成请求。轮询、上传等非生成调用不调用它。
+    fn try_begin_external_action(&self) -> Result<(), ExternalActionRefused>;
 
     /// 上游已受理：只有平台确认句柄入库后返回 Ok，之后才允许按句柄查询。
     async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError>;
@@ -234,17 +249,25 @@ pub trait ExecutionContext: Send + Sync {
 
 /// 取消与"生成发送已经开始"的**线性化**状态。
 ///
-/// 两个事实放在同一个原子字里：[`Self::cancel`] 与 [`Self::try_begin_generation`] 竞争同一个
+/// 三个事实放在同一个原子字里，逐位可查：`client_gone`（transport 观察到客户端断开）、
+/// `ownership_lost`（租约/续约失败、接管）与 `generation_started`。取消与发送资格竞争同一个
 /// compare-exchange，因此只有两种可观察结局——取消先赢（这次 Attempt 没有发出生成请求），
 /// 或发送先赢（此后只能按"可能已提交"处理）。拆成两个独立标志会让两边各自"成功"，
 /// 从而把可能已提交的执行误判成确定未提交（RFC 0018 §4.1）。
+///
+/// 两个取消事实同时成立时报价按 `ownership_lost`：那条更严——所有权都不在了，没有任何
+/// 按旧 token 正式收尾的余地，只能有限收尾或交还当前所有者。位只增不减，所以"读到的原因"
+/// 只会更严，不会把已经判成"不能正式收尾"的执行又放回旧 token 通道。
 #[derive(Debug, Default)]
 pub struct DispatchGate {
     state: AtomicU8,
 }
 
-const CANCELLED: u8 = 0b01;
-const GENERATION_STARTED: u8 = 0b10;
+const CLIENT_GONE: u8 = 0b001;
+const OWNERSHIP_LOST: u8 = 0b010;
+const GENERATION_STARTED: u8 = 0b100;
+/// 任何原因都停止：两位一起置，用于停机这类"不区分原因、一律不许证明未提交"的场景。
+const STOPPED: u8 = CLIENT_GONE | OWNERSHIP_LOST;
 
 impl DispatchGate {
     #[must_use]
@@ -254,15 +277,40 @@ impl DispatchGate {
         }
     }
 
-    /// 取消：无论生成是否已经开始都记录取消；已经开始的事实不回退。
-    pub fn cancel(&self) {
-        self.state.fetch_or(CANCELLED, Ordering::SeqCst);
+    /// 记录"客户端已断开"；生成是否已经开始的事实不回退。
+    pub fn client_gone(&self) {
+        self.state.fetch_or(CLIENT_GONE, Ordering::SeqCst);
     }
 
-    /// 取消是否已经发生：用于停止后续上传、重试与轮询。生成已经开始本身不算取消。
+    /// 记录"执行所有权已失效"。
+    pub fn ownership_lost(&self) {
+        self.state.fetch_or(OWNERSHIP_LOST, Ordering::SeqCst);
+    }
+
+    /// 无论什么原因，停止新的上传、生成、重试与轮询；同时放弃"本地未发送"的证明。
+    ///
+    /// 用于停机与接管这类既不是本进程还能证明的客户端断开、也不是一次可指名的续约失败的场景：
+    /// 调用方不再声称自己没发过请求，让结论交给当前所有者。
+    pub fn stop_all(&self) {
+        self.state.fetch_or(STOPPED, Ordering::SeqCst);
+    }
+
+    /// 客户端是否已断开：用于停止后续上传、重试与轮询。
     #[must_use]
-    pub fn is_cancelled(&self) -> bool {
-        self.state.load(Ordering::SeqCst) & CANCELLED != 0
+    pub fn is_client_gone(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & CLIENT_GONE != 0
+    }
+
+    /// 执行所有权是否已失效。
+    #[must_use]
+    pub fn is_ownership_lost(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & OWNERSHIP_LOST != 0
+    }
+
+    /// 任一取消事实成立：停止新的上传、生成、重试与轮询。
+    #[must_use]
+    pub fn is_stopped(&self) -> bool {
+        self.state.load(Ordering::SeqCst) & STOPPED != 0
     }
 
     /// 生成发送是否已经开始：开始之后即使取消，也只能按"可能已提交"收尾。
@@ -271,13 +319,20 @@ impl DispatchGate {
         self.state.load(Ordering::SeqCst) & GENERATION_STARTED != 0
     }
 
-    /// 生成发送前的最后资格：与取消线性化，二者只有一个先成功。
+    /// 已生效的取消原因；两个都成立时报 `ownership_lost`（更严的那一条）。
     #[must_use]
-    pub fn try_begin_generation(&self) -> bool {
+    pub fn stop_reason(&self) -> Option<ExternalActionRefused> {
+        stop_reason_of(self.state.load(Ordering::SeqCst))
+    }
+
+    /// 生成发送前的最后资格：与两次取消线性化，二者只有一个先成功。
+    ///
+    /// 检查与标记不可分离：同一原子字上退回重试，取消在中间落下时这一轮必然看到并使用它。
+    pub fn try_begin_external_action(&self) -> Result<(), ExternalActionRefused> {
         let mut current = self.state.load(Ordering::SeqCst);
         loop {
-            if current & CANCELLED != 0 {
-                return false;
+            if let Some(refused) = stop_reason_of(current) {
+                return Err(refused);
             }
             match self.state.compare_exchange_weak(
                 current,
@@ -285,19 +340,30 @@ impl DispatchGate {
                 Ordering::SeqCst,
                 Ordering::SeqCst,
             ) {
-                Ok(_) => return true,
+                Ok(_) => return Ok(()),
                 Err(observed) => current = observed,
             }
         }
     }
 }
 
-/// 调用之前的公共闸：已取消按给定错误返回；总期限已到返回 `execution_deadline_exceeded`。
+/// 取一个已加载状态字里的取消原因；两个都成立时报 `ownership_lost`。
+fn stop_reason_of(state: u8) -> Option<ExternalActionRefused> {
+    if state & OWNERSHIP_LOST != 0 {
+        Some(ExternalActionRefused::OwnershipLost)
+    } else if state & CLIENT_GONE != 0 {
+        Some(ExternalActionRefused::ClientGone)
+    } else {
+        None
+    }
+}
+
+/// 调用之前的公共闸：任一取消事实成立按给定错误返回；总期限已到返回 `execution_deadline_exceeded`。
 fn ensure_call_allowed(
     context: &dyn ExecutionContext,
     cancelled: AdapterError,
 ) -> Result<(), AdapterError> {
-    if context.is_cancelled() {
+    if context.client_gone() || context.ownership_lost() {
         return Err(cancelled);
     }
     if context.deadline().is_expired() {
@@ -336,12 +402,13 @@ pub fn ensure_read_call_allowed(context: &dyn ExecutionContext) -> Result<(), Ad
 /// - 返回 `Ok(())`：这次生成发送可以开始；此后即使收到取消，也只能按"可能已提交"处理。
 /// - 返回 [`AdapterError::CancelledBeforeSend`]：取消先发生，**绝不能**发出生成请求，
 ///   调用方可以按"确定未提交"释放占用与渠道名额。
+///
+/// 被拒时具体是哪一条取消事实由 [`DispatchGate::stop_reason`] 给出：调用方据此区分
+/// "客户端离开、本进程仍持有所有权"与"所有权已失效、只能有限收尾"（RFC 0018 §4.1）。
 pub fn begin_generation_send(context: &dyn ExecutionContext) -> Result<(), AdapterError> {
-    if context.try_begin_generation() {
-        Ok(())
-    } else {
-        Err(AdapterError::CancelledBeforeSend)
-    }
+    context
+        .try_begin_external_action()
+        .map_err(|_| AdapterError::CancelledBeforeSend)
 }
 
 /// 单次外部调用的超时上界：`min(自身配置超时, 总期限剩余)`（RFC 0017 §6）。

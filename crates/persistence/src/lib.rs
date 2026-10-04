@@ -2,17 +2,17 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     AccountSummary, ActiveOfferingChannel, AdmitExecution, AdmitOutcome, AdmittedJob, ApiKeyView,
-    ApplicationError, BalanceChange, BeginSubmission, ClaimedLateFact, CustomerAccountTarget,
-    CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind,
-    CustomerUsageQuery, CustomerUsageScope, CustomerUsageView, CustomerView, ExecutionFinalization,
-    ExecutionLookup, ExecutionReplay, ExecutionRepository, FailOrReconcileExecution,
-    FailureDisposition, GatewayModelCandidateView, GatewayModelView, HubRepository, LateFactKind,
-    LateFacts, LateFactsOutcome, LedgerMismatch, LedgerPage, NewFxRate, NormalizedOffering,
-    OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeRequest,
-    ReconciliationCaseView, RecordAcceptance, ReferencedOffering, RefundReconciliationCommand,
-    SelectableOfferingView, SettleExecution, SubmissionStarted, TakenOverExecution,
-    customer_usage_status, declared_output_images,
+    ApplicationError, BalanceChange, BeginSubmission, CancelUnsubmitted, ClaimedLateFact,
+    CustomerAccountTarget, CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery,
+    CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope, CustomerUsageView, CustomerView,
+    ExecutionFinalization, ExecutionLookup, ExecutionReplay, ExecutionRepository,
+    FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView, GatewayModelView,
+    HubRepository, LateFactKind, LateFacts, LateFactsOutcome, LedgerMismatch, LedgerPage,
+    NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance, ReferencedOffering,
+    RefundReconciliationCommand, SelectableOfferingView, SettleExecution, SubmissionStarted,
+    TakenOverExecution, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
@@ -44,6 +44,11 @@ const LEDGER_RANGE_PREDICATE: &str =
 /// **对客资金流水只认这三类**：`hold` / `release` 是预授权机制，`cost` 是平台成本——都不是客户的事实
 /// （Spec C8、V-C15）。抽成一处是为了无论调用方给不给 `kind`，这条读都不会漏出预授权行。
 const CUSTOMER_ENTRY_KINDS_PREDICATE: &str = "kind IN ('credit', 'capture', 'adjustment')";
+
+/// "这台 Job 没有 Attempt"的哨兵身份：只用来问只读收尾投影，绝不写进任何表。
+///
+/// 受理之后、提交声明之前取消的执行没有 Attempt 可指；收尾结论属于 Job，读取按 Job 阶段判断。
+const NO_ATTEMPT: AttemptId = AttemptId(Uuid::nil());
 
 /// **唯一的候选可用性判据**：这条候选现在真的能走吗——它自己启用，且它所在的渠道也启用。
 ///
@@ -146,6 +151,23 @@ impl PgHubRepository {
     #[must_use]
     pub fn pool(&self) -> &PgPool {
         &self.pool
+    }
+
+    /// 这台 Job 最新一条 Attempt 的身份；从来没有过 Attempt 时返回 `None`。
+    ///
+    /// 未提交取消用它把"确定未提交"的结论指到一条真实 Attempt 上，或在没有 Attempt 时退回哨兵值。
+    async fn latest_attempt_id(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<AttemptId>, ApplicationError> {
+        let id: Option<Uuid> = sqlx::query_scalar(
+            "SELECT id FROM generation.attempts WHERE job_id = $1 ORDER BY attempt_no DESC LIMIT 1",
+        )
+        .bind(job_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(id.map(AttemptId))
     }
 
     /// 读一个账户**当前**的余额与写入时刻。
@@ -3731,6 +3753,152 @@ impl ExecutionRepository for PgHubRepository {
         })
     }
 
+    async fn cancel_unsubmitted(
+        &self,
+        command: CancelUnsubmitted,
+    ) -> Result<ExecutionFinalization, ApplicationError> {
+        let CancelUnsubmitted {
+            job_id,
+            execution_owner,
+            fencing_token,
+        } = command;
+        let token = to_i64(fencing_token.get())?;
+        // 这台 Job 最新一条 Attempt 的身份：没有 Attempt 的执行（受理之后还没写提交声明）用哨兵
+        // 值回答只读确认。收尾结论属于 Job，读取按 Job 阶段判断，哨兵不写进任何表。
+        let attempt_id = self.latest_attempt_id(job_id).await?.unwrap_or(NO_ATTEMPT);
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 锁序与结算、确定失败一致：先 Job 行，再 Hold，最后账户。期限不在这里判：取消是"不再
+        // 发送"，不是"开始发送"，期限到了不该阻止一次已经确定未提交的释放。
+        let job = sqlx::query(
+            r#"
+            SELECT account_id, state, execution_owner, fencing_token
+            FROM generation.jobs
+            WHERE id = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("job {job_id}")))?;
+        let account_id = AccountId(job.try_get("account_id").map_err(database_error)?);
+        let state: String = job.try_get("state").map_err(database_error)?;
+        let stage = ExecutionStage::parse(&state).ok_or_else(|| {
+            ApplicationError::Persistence(format!("job state {state} is not an execution stage"))
+        })?;
+        let stored_owner: Option<String> =
+            job.try_get("execution_owner").map_err(database_error)?;
+        // 库为空说明这次是首次认领（受理之后还没有提交声明）；已经写在别的调用方名下（例如
+        // 接管之后）一律冲突，与 `begin_submission` 同一判据。
+        if stored_owner
+            .as_deref()
+            .is_some_and(|owner| owner != execution_owner)
+        {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} is owned by another execution"
+            )));
+        }
+        let stored_token: i64 = job.try_get("fencing_token").map_err(database_error)?;
+        if stored_token != token {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} fencing token does not match"
+            )));
+        }
+        match stage {
+            // 已经按确定失败或对账收尾：重复取消幂等，回已提交结果，不重复释放。
+            ExecutionStage::Failed | ExecutionStage::ReconciliationRequired => {
+                transaction.rollback().await.map_err(database_error)?;
+                return committed_finalization(&self.pool, job_id, attempt_id).await;
+            }
+            ExecutionStage::Succeeded => {
+                return Err(ApplicationError::Conflict(format!(
+                    "job {job_id} already succeeded; a settled execution is never rewritten"
+                )));
+            }
+            ExecutionStage::Admitted | ExecutionStage::Executing => {}
+        }
+        // 已经交给渠道的 Attempt 是这条端口的硬边界：accepted（句柄已入库）与 unknown（结果不明）
+        // 都说明提交可能已经在飞，那时释放就是把可能已提交的执行当成确定未提交（RFC 0018 §4.1）。
+        let accepted_or_unknown: i64 = sqlx::query_scalar(
+            r#"
+            SELECT count(*) FROM generation.attempts
+            WHERE job_id = $1 AND state IN ('accepted', 'unknown')
+            "#,
+        )
+        .bind(job_id.0)
+        .fetch_one(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if accepted_or_unknown > 0 {
+            return Err(ApplicationError::Conflict(format!(
+                "job {job_id} has an attempt that may have reached the provider"
+            )));
+        }
+        // prepared/submitting 只是"提交声明已写下、还没有可证明的发送结果"。调用方凭带 fencing 的
+        // token 声称这次生成确实没发出，因此把它收成 terminal，让确定未提交的结论有身份可指；
+        // 调用的崩溃窗口仍由提交声明本身兜住（Worker 保守转对账，RFC 0018 §4.1）。
+        sqlx::query(
+            r#"
+            UPDATE generation.attempts
+            SET state = 'terminal', completed_at = now()
+            WHERE job_id = $1 AND state IN ('prepared', 'submitting')
+            "#,
+        )
+        .bind(job_id.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 确定未提交：Job 落 failed 并盖终态时刻。不写对客错误码与失败类别——没有对客结论，
+        // 也没有可归因的平台侧事件（与孤儿回收同一口径）。
+        sqlx::query(
+            r#"
+            UPDATE generation.jobs
+            SET state = 'failed', terminal_at = now(), updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(job_id.0)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 释放占用：锁 Hold 再动账户，与结算同一锁序；账户执行名额与渠道容量同事务归还。
+        let (hold_id, hold_amount) = lock_active_hold(&mut transaction, job_id).await?;
+        sqlx::query(
+            "UPDATE ledger.holds SET status = 'released', updated_at = now() WHERE id = $1 AND status = 'active'",
+        )
+        .bind(hold_id)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 确定无需收费：只把占用从占用合计里去掉，不动已结算余额、不写对客流水。
+        let updated = sqlx::query(
+            r#"
+            UPDATE ledger.accounts
+            SET held_microusd = held_microusd - $2,
+                version = version + 1,
+                updated_at = now()
+            WHERE id = $1
+            "#,
+        )
+        .bind(account_id.0)
+        .bind(hold_amount)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        if updated.rows_affected() != 1 {
+            return Err(ApplicationError::NotFound(format!("account {account_id}")));
+        }
+        release_channel_slot(&mut transaction, job_id).await?;
+        transaction.commit().await.map_err(database_error)?;
+        Ok(ExecutionFinalization {
+            job_id,
+            attempt_id,
+            stage: ExecutionStage::Failed,
+            charge_microusd: 0,
+        })
+    }
+
     async fn record_acceptance(&self, command: RecordAcceptance) -> Result<(), ApplicationError> {
         let RecordAcceptance {
             job_id,
@@ -4366,7 +4534,11 @@ impl ExecutionRepository for PgHubRepository {
         .await
         .map_err(database_error)?;
         let Some(row) = row else {
-            return Ok(None);
+            // 没有这个 Attempt：可能是"受理已提交但尚无 Attempt"的执行按确定未提交收尾了
+            // （`cancel_unsubmitted` 不写 Attempt）。那种执行只有在这台 Job 已经落成终态时才有
+            // 可读的收尾结论；仍在 admitted/executing 的回答"未提交"，调用方据此继续确认。
+            let finalization = committed_finalization(&self.pool, job_id, attempt_id).await?;
+            return Ok(finalization.stage.is_terminal().then_some(finalization));
         };
         let attempt_state: String = row.try_get("attempt_state").map_err(database_error)?;
         if attempt_state != AttemptStage::Terminal.as_str()

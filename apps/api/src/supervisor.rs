@@ -273,8 +273,8 @@ impl SendHold {
 
 /// 一次执行的结果接收端与它的外部动作闸。
 ///
-/// 闸交给连接层跟踪：客户端断开被可靠观察到时置取消，停止这次执行尚未开始的外部动作；已经开始的
-/// 生成发送按"可能已提交"继续有限收尾，不因断开改写账务（Spec 0005 §5）。
+/// 闸交给连接层跟踪：客户端断开被可靠观察到时置 `client_gone`，停止这次执行尚未开始的外部动作；
+/// 已经开始的生成发送按"可能已提交"继续有限收尾，不因断开改写账务（Spec 0005 §5）。
 pub struct ExecutionHandle {
     pub outcome: oneshot::Receiver<ExecutionOutcome>,
     pub gate: Arc<DispatchGate>,
@@ -325,7 +325,7 @@ impl DisconnectSignal {
 
 /// 一次请求所属连接的作用域：放进 request extension，handler 用它登记这次执行的动作闸。
 ///
-/// 断开是**连接级**事实：观测到客户端关闭时，这条连接上所有在飞执行的闸一起置取消。
+/// 断开是**连接级**事实：观测到客户端关闭时，这条连接上所有在飞执行的闸一起置 `client_gone`。
 pub struct ConnectionScope {
     signal: Arc<DisconnectSignal>,
     gates: Mutex<GateTracker>,
@@ -355,7 +355,7 @@ impl ConnectionScope {
 
     /// 登记一次执行的动作闸；返回的 guard 在 handler 结束时撤销登记。
     ///
-    /// 连接已经被观察到断开时当场置取消：登记与取消之间不能留下"断开早于登记"的窗口。
+    /// 连接已经被观察到断开时当场置 `client_gone`：登记与置位之间不能留下"断开早于登记"的窗口。
     #[must_use]
     pub fn track(self: &Arc<Self>, gate: &Arc<DispatchGate>) -> ConnectionGateGuard {
         let id = {
@@ -367,7 +367,7 @@ impl ConnectionScope {
             id
         };
         if self.is_cancelled() {
-            gate.cancel();
+            gate.client_gone();
         }
         ConnectionGateGuard {
             scope: Arc::clone(self),
@@ -375,8 +375,13 @@ impl ConnectionScope {
         }
     }
 
-    /// 连接被观察到断开：取消这条连接上所有在飞执行尚未开始的外部动作。
-    pub fn cancel_gates(&self) {
+    /// 连接被观察到断开：这条连接上所有在飞执行只置 `client_gone`。
+    ///
+    /// 断开是 transport 观察到的事实，不是所有权失效：本进程仍是这些执行的所有者，因此它不碰
+    /// `ownership_lost`，也不放弃"本地未发送"的证明（RFC 0018 §4.1）。先置连接信号再逐个
+    /// 置闸：此后才登记的闸由 [`Self::track`] 当场补上，不留"断开早于登记"的窗口。
+    pub fn mark_client_gone(&self) {
+        self.signal.cancel();
         let gates: Vec<Arc<DispatchGate>> = self
             .gates
             .lock()
@@ -386,7 +391,7 @@ impl ConnectionScope {
             .filter_map(Weak::upgrade)
             .collect();
         for gate in gates {
-            gate.cancel();
+            gate.client_gone();
         }
     }
 }
@@ -697,10 +702,12 @@ impl Supervisor {
         deadline: tokio::time::Instant,
     ) -> ExecutionHandle {
         let (sender, receiver) = oneshot::channel();
-        // 每次执行一份取消标志：初值取当前停机状态，续约冲突只置这一份，不波及其它在飞执行。
+        // 每次执行一份自己的取消事实：续约冲突只置这一份的 ownership_lost，不波及其它在飞执行。
         let gate = Arc::new(DispatchGate::new());
-        if self.gate.is_cancelled() {
-            gate.cancel();
+        if self.gate.is_stopped() {
+            // 停机不是"客户端断开"也不是一次可指名的续约失败：两位一起置，执行不声称本地未发送，
+            // 结论交给当前所有者（RFC 0018 §4.1）。
+            gate.stop_all();
         }
         let execution_id = self.next_execution_id.fetch_add(1, Ordering::Relaxed);
         let live = self.live_executions.clone();
@@ -746,12 +753,15 @@ impl Supervisor {
     }
 
     /// 停机开始：停止新的外部副作用，交给在飞任务有限收尾。
+    ///
+    /// 停机不是一个可指名的取消原因：它在每次执行的闸上两位一起置（见 [`Supervisor::spawn`]），
+    /// 因此停机期间在飞的执行不会声称"本地可证明未发送"。
     pub fn begin_drain(&self) {
-        self.gate.cancel();
+        self.gate.stop_all();
         if let Ok(live) = self.live_executions.lock() {
             for flag in live.values() {
                 if let Some(flag) = flag.upgrade() {
-                    flag.cancel();
+                    flag.stop_all();
                 }
             }
         }
@@ -863,9 +873,11 @@ impl OwnershipRenewal for RepositoryRenewal {
 
 /// 一次执行的所有权续约：按租约的三分之一周期在独立任务里续约。
 ///
-/// **任何**续约失败或一次续约超过一个续约周期都立即取消这次执行并停止新的外部动作：所有权冲突、
-/// 数据库不可用、超时都同样意味着"不能再证明还持有所有权"，继续生成就可能与接管方重复收费
-/// （RFC 0017 §5）。已到达的句柄或账务事实仍由执行路径有限收尾，不因取消而丢弃。
+/// **任何**续约失败或一次续约超过一个续约周期都立即置这次执行的 `ownership_lost` 并停止新的外部
+/// 动作：所有权冲突、数据库不可用、超时都同样意味着"不能再证明还持有所有权"，继续生成就可能与
+/// 接管方重复收费（RFC 0017 §5）。置的是 `ownership_lost` 而不是客户端断开：这类执行的收尾要按
+/// "只能有限收尾或交还当前所有者"走，不能按旧 token 正式结算（RFC 0018 §4.1）。已到达的句柄或
+/// 账务事实仍由执行路径有限收尾，不因取消而丢弃。
 struct RenewingOwnership {
     renewal: Arc<dyn OwnershipRenewal>,
     owner_id: String,
@@ -887,14 +899,14 @@ impl ExecutionOwnershipRegistrar for RenewingOwnership {
             ticker.tick().await;
             loop {
                 ticker.tick().await;
-                if stopped.load(Ordering::SeqCst) || gate.is_cancelled() {
+                if stopped.load(Ordering::SeqCst) || gate.is_stopped() {
                     return;
                 }
                 let attempt = renewal.renew(job_id, owner.clone(), fencing_token, lease);
                 match tokio::time::timeout(renewal_interval(lease), attempt).await {
                     Ok(Ok(())) => {}
                     Ok(Err(error)) => {
-                        gate.cancel();
+                        gate.ownership_lost();
                         tracing::warn!(
                             job_id = %job_id,
                             error = %error,
@@ -903,7 +915,7 @@ impl ExecutionOwnershipRegistrar for RenewingOwnership {
                         return;
                     }
                     Err(_elapsed) => {
-                        gate.cancel();
+                        gate.ownership_lost();
                         tracing::warn!(
                             job_id = %job_id,
                             "execution ownership renewal did not finish within one renewal period; stopping new external actions"

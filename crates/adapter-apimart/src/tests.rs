@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use seeai_adapter_sdk::ImageSites;
+use seeai_adapter_sdk::{ExternalActionRefused, ImageSites};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 
@@ -973,7 +973,7 @@ async fn serve(
 struct FakeContext {
     deadline: Deadline,
     cancelled: bool,
-    /// 取消恰好落在生成发送闸口：`is_cancelled()` 仍为 false，但最后资格检查失败。
+    /// 取消恰好落在生成发送闸口：前面的取消检查都通过，但最后资格检查必须被拦下。
     gate_closed: bool,
     request_log: Arc<Mutex<Vec<String>>>,
     accepted: Mutex<Vec<(AcceptedHandle, Vec<String>)>>,
@@ -1027,12 +1027,19 @@ impl ExecutionContext for FakeContext {
         self.deadline
     }
 
-    fn is_cancelled(&self) -> bool {
+    fn client_gone(&self) -> bool {
         self.cancelled
     }
 
-    fn try_begin_generation(&self) -> bool {
-        !self.cancelled && !self.gate_closed
+    fn ownership_lost(&self) -> bool {
+        false
+    }
+
+    fn try_begin_external_action(&self) -> Result<(), ExternalActionRefused> {
+        if self.cancelled || self.gate_closed {
+            return Err(ExternalActionRefused::ClientGone);
+        }
+        Ok(())
     }
 
     async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError> {

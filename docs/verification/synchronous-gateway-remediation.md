@@ -109,10 +109,45 @@ A10 核对管理端/客户调用记录只依赖最小投影，字段无请求/�
 
 ### 已知未完成（不计入本次收敛）
 
-R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限与预算观测、R4 `client_gone` 与 `ownership_lost` 分离与 `cancel_unsubmitted`、T1 预留常数与上限组合校验、T7 其余验收取证，以及受理前 route 缓存的死路径清理。R5（晚到事实交接与可信失败的确定处置）、R6（Provider 身份类型收口）与 R7/T6（连接层发送期限与断开监视）已完成，见对应提交。
+R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限与预算观测、T1 预留常数与上限组合校验、T7 其余验收取证，以及受理前 route 缓存的死路径清理。R4（`client_gone` 与 `ownership_lost` 分离、`cancel_unsubmitted`）见第 9 节；R5（晚到事实交接与可信失败的确定处置）、R6（Provider 身份类型收口）与 R7/T6（连接层发送期限与断开监视）见对应提交。
 
 ### 环境发现
 
 迁移守卫用例会连续让迁移以守卫报错收场，而 sqlx 的迁移排他锁是会话级的：多连接池下下一次 `run` 可能落到另一条连接上被前一次留下的锁挡住，表现为测试空转。该用例改用单连接池后稳定通过（0.54s）。同类现象可能是此前"测试二进制空转 15 分钟"的原因。
 
 修改已应用过的迁移会改其 SHA-384 校验和，sqlx 会以"migration 38 was previously applied but has been modified"拒绝启动。本次 0038 的 DDL 未变（只补了守卫），因此开发库按新文件哈希更新了 `_sqlx_migrations` 的校验和记录，未动业务数据；重建库的环境不受影响。
+
+## 9. 取消事实分离与未提交取消的落地证据
+
+本节记录[整改设计](../design/0018-synchronous-gateway-remediation.md) §4.1（R4）的落地证据：`DispatchGate` 上的 `client_gone`、`ownership_lost` 与 `generation_started` 三位分开，未提交的执行由带 fencing 的 `cancel_unsubmitted` 按"确定未提交"释放。
+
+### 已落地
+
+| 面 | 结果 |
+| --- | --- |
+| 状态机 | `seeai_adapter_sdk::DispatchGate` 三个事实各占一位，任一取消都停止新的上传/生成/重试/轮询；`try_begin_external_action` 与两次取消在同一个 compare-exchange 上线性化，两个原因同时成立时报 `ownership_lost` |
+| 接线 | transport 的 `ConnectionScope::mark_client_gone` 只置 `client_gone`；续约 Conflict/数据库不可用/超时与停机置 `ownership_lost`（停机 `stop_all` 两位一起置，不声称本地未发送）；已发出的 Provider 调用仍由 Supervisor 的独立收尾路径按既有预算处置 |
+| 端口 | `ExecutionRepository::cancel_unsubmitted`：同一事务释放 active Hold、账户占用与渠道容量槽位，把 `prepared`/`submitting` 的 Attempt 收成 `terminal`，Job 落 `failed` 并盖 `terminal_at`；`accepted`/`unknown` 的 Attempt 一律冲突，不为了释放新建 Attempt |
+| 提交结果未知 | 取消接口的失败先按 `read_finalization` 只读确认（无 Attempt 的执行按 Job 阶段回答），确认不到再有界重试；确认不了就返回 outcome_unknown，不声称释放成功 |
+| 收尾差异 | `client_gone` 与 token 仍有效时的 `ownership_lost` 走同一段带 fencing 的释放并回 504；发送先赢时按"可能已提交"转对账并保留占用；接管之后旧 token 的释放/结算一律冲突 |
+
+### 我实际跑过的命令与结果
+
+| 命令 | 结果 |
+| --- | --- |
+| `cargo fmt --check` | 通过 |
+| `cargo check --workspace --all-targets` | 无 error、无警告 |
+| `cargo clippy --workspace --all-targets --all-features -- -D warnings` | 通过 |
+| `cargo test -p seeai-api` | 42 passed、6 ignored；http_contract 无库用例 4 passed |
+| `cargo test -p seeai-application --lib` | 162 passed |
+| `cargo test -p seeai-application --test direct_execution -- --ignored --test-threads=1` | 24 passed |
+| `cargo test -p seeai-application --test execution_reconciliation -- --ignored --test-threads=1` | 20 passed |
+| `cargo test -p seeai-persistence --test execution_submission -- --ignored --test-threads=1` | 9 passed |
+| `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 cases_direct_execution` | 16 passed |
+
+### 未跑通与待验证
+
+- 提交前断开的端到端取证（真实 socket 在正文前/中/解析后/受理后断开）与 A5 的子进程强杀矩阵不在本次范围内，仍按第 2、5 节单独取证。
+- 续约三类失败目前的证据是单元用例：容器的 `ownership_lost` 置位、以及被拒后零新增外部动作；真实数据库断开与超时下的端到端零新增调用仍待取证。
+- 本节的 `direct_execution` 用例用假渠道与一次性库；没有调用任何真实 Provider。
+

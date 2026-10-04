@@ -212,8 +212,8 @@ async fn main() -> Result<()> {
             Arc::new(AihubmixAdapterFactory),
             Arc::new(ApimartAdapterFactory),
         ]));
-    // 加速层：`REDIS_URL` 没配就是没有缓存——那时这一层是空操作，受理路径连那次轻量读都不做，
-    // 行为与没有它时逐位相同。配了但连不上也只是"每次都未命中"，回源数据库。
+    // 加速层：`REDIS_URL` 没配就是没有缓存——那时这一层是空操作（余额写穿、速率计数都不落缓存），
+    // 行为与没有它时逐位相同。配了但连不上只是写不进、读不到，业务事实一律以数据库为准。
     let acceleration = match RedisCache::from_env()? {
         Some(cache) => {
             info!("cache acceleration layer enabled");

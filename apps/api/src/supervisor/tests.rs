@@ -242,7 +242,7 @@ impl OwnershipRenewal for RenewalHanging {
     }
 }
 
-/// 起一个续约任务并等到取消标志置位；超时未置位即失败。
+/// 起一个续约任务并等到 `ownership_lost` 置位；超时未置位即失败。
 async fn renewal_task_cancels(renewal: Arc<dyn OwnershipRenewal>) -> bool {
     let gate = Arc::new(DispatchGate::new());
     let ownership = RenewingOwnership {
@@ -254,10 +254,10 @@ async fn renewal_task_cancels(renewal: Arc<dyn OwnershipRenewal>) -> bool {
     };
     ownership.registered(JobId::new(), FencingToken::new(1));
     let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-    while !gate.is_cancelled() && tokio::time::Instant::now() < deadline {
+    while !gate.is_ownership_lost() && tokio::time::Instant::now() < deadline {
         tokio::time::sleep(Duration::from_millis(2)).await;
     }
-    gate.is_cancelled()
+    gate.is_ownership_lost()
 }
 
 #[tokio::test]
@@ -282,4 +282,57 @@ async fn a_stalled_renewal_stops_new_external_actions() {
         cancelled,
         "a renewal that never returns must not keep the execution eligible to act"
     );
+}
+
+/// 续约失败置的是 **ownership_lost**，不是 client_gone：收尾路径按"不能按旧 token 正式结算"走，
+/// 而客户端断开那条路仍能证明本进程是所有者（RFC 0018 §4.1）。
+#[tokio::test]
+async fn a_renewal_failure_is_recorded_as_ownership_loss_not_a_client_disconnect() {
+    let gate = Arc::new(DispatchGate::new());
+    let ownership = RenewingOwnership {
+        renewal: Arc::new(RenewalFailure::Conflict),
+        owner_id: "owner-under-test".to_owned(),
+        lease: ChronoDuration::zero(),
+        gate: gate.clone(),
+        stopped: Arc::new(AtomicBool::new(false)),
+    };
+    ownership.registered(JobId::new(), FencingToken::new(1));
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while !gate.is_ownership_lost() && tokio::time::Instant::now() < deadline {
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert!(gate.is_ownership_lost());
+    assert!(
+        !gate.is_client_gone(),
+        "续约失败不是 transport 观察到的客户端断开"
+    );
+    assert_eq!(
+        gate.stop_reason(),
+        Some(seeai_adapter_sdk::ExternalActionRefused::OwnershipLost)
+    );
+}
+
+/// 连接层登记的断开只置 `client_gone`：同一个闸上的所有权事实不受影响。
+#[test]
+fn tracking_a_disconnected_connection_marks_only_the_client_as_gone() {
+    let scope = ConnectionScope::new(DisconnectSignal::new());
+    let gate = Arc::new(DispatchGate::new());
+    let guard = scope.track(&gate);
+    assert!(!gate.is_stopped());
+
+    scope.mark_client_gone();
+    assert!(gate.is_client_gone());
+    assert!(
+        !gate.is_ownership_lost(),
+        "transport 断开不改变执行所有权事实"
+    );
+
+    // 连接在登记之前就已经断开：登记当场补上 client_gone，不留"断开早于登记"的窗口。
+    drop(guard);
+    let late_scope = ConnectionScope::new(DisconnectSignal::new());
+    late_scope.mark_client_gone();
+    let late = Arc::new(DispatchGate::new());
+    let _late_guard = late_scope.track(&late);
+    assert!(late.is_client_gone());
+    assert!(!late.is_ownership_lost());
 }

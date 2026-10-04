@@ -17,8 +17,8 @@ use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, AdapterError, Deadline, DispatchGate, ExecutionContext,
-    GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage, ProviderFailureKind,
-    ProviderOutput, ProviderTaskState, ResponsePayload, RetrySafety,
+    ExternalActionRefused, GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage,
+    ProviderFailureKind, ProviderOutput, ProviderTaskState, ResponsePayload, RetrySafety,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
@@ -33,12 +33,12 @@ use thiserror::Error;
 
 use crate::{
     AccelerationService, AdapterFactory, AdmitExecution, AdmitOffering, AdmitOutcome,
-    ApplicationError, BalanceSource, BeginSubmission, CostInputs, CreateImageGenerationRequest,
-    CredentialProvider, DirectExecutionLimits, ExecutionFinalization, ExecutionLookup,
-    ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
-    GenerationDailySpendLimit, HubRepository, LateFacts, PublicErrorCode, RequestCostCeiling,
-    RequestFingerprintInput, RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy,
-    RouteChoice, RoutingDecision, SettleExecution, contract_parameter_face,
+    ApplicationError, BalanceSource, BeginSubmission, CancelUnsubmitted, CostInputs,
+    CreateImageGenerationRequest, CredentialProvider, DirectExecutionLimits, ExecutionFinalization,
+    ExecutionLookup, ExecutionReplay, ExecutionRepository, FailOrReconcileExecution,
+    FailureDisposition, GenerationDailySpendLimit, HubRepository, LateFacts, PublicErrorCode,
+    RequestCostCeiling, RequestFingerprintInput, RequestFingerprintKeys, RequestTimeoutPolicy,
+    RetryPolicy, RouteChoice, RoutingDecision, SettleExecution, contract_parameter_face,
     daily_spend_limit_error, failure_provider_cost, freeze_offering_pricing,
     idempotency_key_digest, provider_cost_fact, public_error_code, requested_image_count,
     select_candidate, select_candidate_with_strategy, single_request_cost_cny,
@@ -52,6 +52,11 @@ pub const DEFAULT_SETTLE_RESERVE_SECONDS: u64 = 10;
 /// 独立续约任务按它的三分之一周期续约。部署用 `GENERATION_EXECUTION_LEASE_SECONDS` 覆盖。
 pub const DEFAULT_EXECUTION_LEASE_SECONDS: i64 = 60;
 
+/// 只读确认"确定未提交"取消时用的占位 Attempt 身份。
+///
+/// 受理已提交但尚无 Attempt 的执行没有可指的 Attempt；收尾投影只按 Job 给结论，因此这里用一个
+/// 绝不会被写进库的固定值问同一份投影。它不进入任何写路径，也不表示一次真实执行。
+const NO_ATTEMPT_SENTINEL: AttemptId = AttemptId(uuid::Uuid::nil());
 /// 从 `GENERATION_SETTLE_RESERVE_SECONDS` 读结算预留预算（秒，默认
 /// [`DEFAULT_SETTLE_RESERVE_SECONDS`]）。它必须是整数：读不懂的配置宁可让进程起不来，
 /// 也不要拿一个猜出来的值去卡总期限。
@@ -252,6 +257,15 @@ impl SupervisedExecutionContext {
     pub fn generation_started(&self) -> bool {
         self.gate.generation_started()
     }
+
+    /// 这次 Attempt 的取消原因：`None` 表示还没有任何取消事实。
+    ///
+    /// 拒因只会越来越严（位只增不减），因此在闸口拒绝之后读它做收尾分支是安全的：读数要么就是
+    /// 那次拒绝的原因，要么是一条更严的事实。
+    #[must_use]
+    pub fn stop_reason(&self) -> Option<ExternalActionRefused> {
+        self.gate.stop_reason()
+    }
 }
 
 #[async_trait]
@@ -260,12 +274,16 @@ impl ExecutionContext for SupervisedExecutionContext {
         self.deadline
     }
 
-    fn is_cancelled(&self) -> bool {
-        self.gate.is_cancelled()
+    fn client_gone(&self) -> bool {
+        self.gate.is_client_gone()
     }
 
-    fn try_begin_generation(&self) -> bool {
-        self.gate.try_begin_generation()
+    fn ownership_lost(&self) -> bool {
+        self.gate.is_ownership_lost()
+    }
+
+    fn try_begin_external_action(&self) -> Result<(), ExternalActionRefused> {
+        self.gate.try_begin_external_action()
     }
 
     async fn accepted(&self, handle: AcceptedHandle) -> Result<(), AcceptanceError> {
@@ -500,7 +518,11 @@ impl DirectExecutionService {
         // 受理之前就已经取消（停机、所有权失效，或调用方已经离开）：这次执行还没有任何记录、
         // 也没有发出过请求，直接按"确定未提交"回应，不建 Job、不占 Hold、不占渠道名额。
         // 这也让同键重试能作为一次正常的新请求处理，而不是命中一条被取消写死的失败记录。
-        if call.gate.is_cancelled() {
+        if let Some(refused) = call.gate.stop_reason() {
+            tracing::debug!(
+                reason = ?refused,
+                "this request was cancelled before admission; no record is created"
+            );
             return Err(DirectExecutionError::RequestTimeout);
         }
         // 每日扣费上限：与两个容量名额是**三道不同的门**——账户名额守"同时在跑几个"、渠道名额守
@@ -576,6 +598,15 @@ impl DirectExecutionService {
         // 渠道名额原样保留；只有终局确定失败、期限截止或次数耗尽才释放（Spec 0005 §5）。
         let mut ownership_registered = false;
         loop {
+            // 提交声明落下之前收到取消：库里此刻只有受理事实，没有 Attempt。按带 fencing 的
+            // `cancel_unsubmitted` 原子释放，不为了释放先造一条 submitting Attempt
+            // （RFC 0018 §4.1）。重投循环的第二轮起库里已有已收尾的 Attempt，端口按同一判据放行；
+            // 已经 accepted/unknown 的 Attempt 会让它冲突，那时不声称释放成功。
+            if let Some(refused) = call.gate.stop_reason() {
+                return self
+                    .release_unsubmitted(request.account_id, job_id, call, fencing_token, refused)
+                    .await;
+            }
             let started = self
                 .executions
                 .begin_submission(BeginSubmission {
@@ -593,6 +624,16 @@ impl DirectExecutionService {
                     registrar.registered(job_id, fencing_token);
                 }
                 ownership_registered = true;
+            }
+            // 提交声明落库期间收到取消、而生成发送确实没开始时，这次 Attempt 还没有发出任何外部
+            // 请求：仍然按"确定未提交"释放，不把它伪装成可能已提交。发送已经开始的情形由
+            // Adapter 的 `Cancelled` 分支按"可能已提交"收尾（RFC 0018 §4.1）。
+            if !call.gate.generation_started()
+                && let Some(refused) = call.gate.stop_reason()
+            {
+                return self
+                    .release_unsubmitted(request.account_id, job_id, call, fencing_token, refused)
+                    .await;
             }
             // 提交声明已落、但外部预算已到：这一次不发任何外部调用，直接释放，按 504 request_timeout。
             if deadline.is_expired() {
@@ -650,7 +691,7 @@ impl DirectExecutionService {
                         let backoff = self.retry_policy.backoff_for(started.attempt_no);
                         let can_retry =
                             self.retry_policy.allows_another_attempt(started.attempt_no)
-                                && !call.gate.is_cancelled()
+                                && !call.gate.is_stopped()
                                 && !deadline.is_expired()
                                 && deadline.remaining() > backoff;
                         if can_retry {
@@ -676,7 +717,7 @@ impl DirectExecutionService {
                                 "the provider provably did not accept this request; retrying in-request"
                             );
                             tokio::time::sleep(backoff).await;
-                            if call.gate.is_cancelled() || deadline.is_expired() {
+                            if call.gate.is_stopped() || deadline.is_expired() {
                                 self.record_failure(
                                     request.account_id,
                                     job_id,
@@ -697,7 +738,7 @@ impl DirectExecutionService {
                         }
                         // 终局：释放占用与渠道名额。期限截止（或退避放不下）按 504 request_timeout，
                         // 次数耗尽按确定失败返回原平台错误码（Spec 0005 §4）。
-                        let timed_out = call.gate.is_cancelled()
+                        let timed_out = call.gate.is_stopped()
                             || deadline.is_expired()
                             || deadline.remaining() <= backoff;
                         self.record_failure(
@@ -799,18 +840,21 @@ impl DirectExecutionService {
                 Err(AdapterError::CancelledBeforeSend) => {
                     // 闸口拒绝只有在生成发送确实没开始过时才等价于"确定未提交"。取消与发送竞争
                     // 同一个原子状态，发送先赢时闸口的拒绝可能来自更早的调用点，此时必须按
-                    // 可能已提交收尾（Spec 0005 §5、RFC 0018 §4）。
-                    let (disposition, outcome) = if context.generation_started() {
-                        (
-                            FailureDisposition::Unknown,
-                            DirectExecutionError::OutcomeUnknown,
-                        )
-                    } else {
-                        (
-                            FailureDisposition::DeterminedFailure,
-                            DirectExecutionError::RequestTimeout,
-                        )
-                    };
+                    // 可能已提交收尾（Spec 0005 §5、RFC 0018 §4）。没有可指名的取消事实时同样按
+                    // 可能已提交处理：拿不准的事不按"确定未提交"释放。
+                    if !context.generation_started()
+                        && let Some(refused) = context.stop_reason()
+                    {
+                        return self
+                            .release_unsubmitted(
+                                request.account_id,
+                                job_id,
+                                call,
+                                fencing_token,
+                                refused,
+                            )
+                            .await;
+                    }
                     self.record_failure(
                         request.account_id,
                         job_id,
@@ -819,17 +863,18 @@ impl DirectExecutionService {
                         fencing_token,
                         &started.receipt_credential,
                         ProviderFailureKind::PlatformInternal,
-                        disposition,
+                        FailureDisposition::Unknown,
                         None,
                         None,
-                        LateFactsInput::for_disposition(disposition),
+                        LateFactsInput::for_disposition(FailureDisposition::Unknown),
                     )
                     .await?;
-                    return Err(outcome);
+                    return Err(DirectExecutionError::OutcomeUnknown);
                 }
                 Err(AdapterError::Cancelled) => {
                     // 已经在等待上游结果的阶段收到取消，不能证明上游未受理：保留占用与渠道
-                    // 名额，交异常对账处置（RFC 0017 §5）。
+                    // 名额，交异常对账处置（RFC 0017 §5）。两种取消事实到这里完全同解——
+                    // 已经发出的调用既不能撤回，也不该按旧事实改写。
                     self.record_failure(
                         request.account_id,
                         job_id,
@@ -1186,6 +1231,113 @@ impl DirectExecutionService {
             "the failure finalization stayed unknown after bounded confirmation; leaving it to reconciliation"
         );
         Err(DirectExecutionError::OutcomeUnknown)
+    }
+
+    /// 生成请求确实没有发出时的收尾：按带 fencing 的"确定未提交"释放这次执行的占用。
+    ///
+    /// 两条取消事实走同一条收尾路径（RFC 0018 §4.1）：先置位的原因只决定日志措辞，能不能释放由
+    /// 同一个带 fencing 的端口按库里的所有权与 token 判定。所有权已被接管时那次释放按 token 冲突，
+    /// 此时不声称成功，结论交还当前所有者。收尾不写晚到事实、不建对账案例——请求根本没发，
+    /// 没有事实可交接，把"确定未提交"记成"结果不明"是错的。
+    ///
+    /// 确认释放之后返回 504 request_timeout：这次请求确定没有提交给渠道。
+    async fn release_unsubmitted(
+        &self,
+        account_id: AccountId,
+        job_id: JobId,
+        call: &DirectExecutionCall,
+        fencing_token: FencingToken,
+        refused: ExternalActionRefused,
+    ) -> Result<DirectExecutionSuccess, DirectExecutionError> {
+        match self
+            .finalize_unsubmitted_cancel(CancelUnsubmitted {
+                job_id,
+                execution_owner: call.execution_owner.clone(),
+                fencing_token,
+            })
+            .await
+        {
+            Ok(_) => {
+                self.refresh_balance(account_id).await;
+                tracing::info!(
+                    job_id = %job_id,
+                    reason = ?refused,
+                    "the provider was never asked to generate; the execution is confirmed unsubmitted"
+                );
+                Err(DirectExecutionError::RequestTimeout)
+            }
+            Err(error) => {
+                tracing::warn!(
+                    job_id = %job_id,
+                    reason = ?refused,
+                    "the unsubmitted cancellation could not be confirmed; reporting an unknown outcome"
+                );
+                Err(error)
+            }
+        }
+    }
+
+    /// 未提交取消的"先确认、再重试同一幂等取消"。
+    ///
+    /// COMMIT 的响应可能丢失：那时取消已经提交，只是调用方没收到确认。因此任何一次失败都先按
+    /// Job 只读确认是否已落成确定未提交，绝不在结果未知时就声称释放成功，也绝不重复释放
+    /// （RFC 0018 §4.1）。确认不到时按同一幂等取消有界重试。
+    async fn finalize_unsubmitted_cancel(
+        &self,
+        command: CancelUnsubmitted,
+    ) -> Result<ExecutionFinalization, DirectExecutionError> {
+        let job_id = command.job_id;
+        let max_attempts = self.retry_policy.max_attempts.max(1);
+        for attempt in 1..=max_attempts {
+            match self.executions.cancel_unsubmitted(command.clone()).await {
+                Ok(finalization) => return Ok(finalization),
+                Err(error) => {
+                    tracing::warn!(
+                        job_id = %job_id,
+                        error = %error,
+                        "the unsubmitted cancellation result is unknown; confirming the committed record"
+                    );
+                }
+            }
+            match self.confirm_unsubmitted_cancellation(job_id).await {
+                Ok(Some(finalization)) => return Ok(finalization),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    job_id = %job_id,
+                    error = %error,
+                    "could not confirm the unsubmitted cancellation"
+                ),
+            }
+            if attempt < max_attempts {
+                tokio::time::sleep(self.retry_policy.backoff_for(attempt)).await;
+            }
+        }
+        tracing::warn!(
+            job_id = %job_id,
+            "the unsubmitted cancellation stayed unknown after bounded confirmation; its hold stays until reconciliation"
+        );
+        Err(DirectExecutionError::OutcomeUnknown)
+    }
+
+    /// 只读确认某台 Job 是否已落成"确定未提交"：已落成返回它的收尾，尚未落成或已是别的结论
+    /// 返回 `None`。
+    ///
+    /// 没有 Attempt 的执行没有可读的 Attempt 身份，这里用 `NO_ATTEMPT_SENTINEL` 问同一份收尾
+    /// 投影；仓储只在这台 Job 已进终态时给出记录。读不回来的"取消"不算取消，不据此声称释放成功。
+    async fn confirm_unsubmitted_cancellation(
+        &self,
+        job_id: JobId,
+    ) -> Result<Option<ExecutionFinalization>, ApplicationError> {
+        match self
+            .executions
+            .read_finalization(job_id, NO_ATTEMPT_SENTINEL)
+            .await?
+        {
+            Some(finalization) if finalization.stage == ExecutionStage::Failed => {
+                Ok(Some(finalization))
+            }
+            _ => Ok(None),
+        }
     }
 
     /// 把一次失败按处置落库并写穿余额。同一处置重复调用幂等；换了处置由仓储报冲突。

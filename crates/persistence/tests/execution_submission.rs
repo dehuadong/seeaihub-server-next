@@ -9,7 +9,7 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_application::{
     AdmitExecution, AdmitOffering, AdmitOutcome, ApplicationError, BeginSubmission,
-    ExecutionRepository, RecordAcceptance, RoutingDecision,
+    CancelUnsubmitted, ExecutionRepository, RecordAcceptance, RoutingDecision,
 };
 use seeai_domain::{
     AccountId, AttemptStage, ChannelId, ExecutionStage, FencingToken, ImageBranch, JobId,
@@ -195,6 +195,14 @@ fn begin(
         fencing_token: FencingToken::new(token),
         deadline,
         lease: ChronoDuration::minutes(5),
+    }
+}
+
+fn cancel(job_id: JobId, owner: &str, token: u64) -> CancelUnsubmitted {
+    CancelUnsubmitted {
+        job_id,
+        execution_owner: owner.to_owned(),
+        fencing_token: FencingToken::new(token),
     }
 }
 
@@ -1050,6 +1058,118 @@ async fn reaping_an_unsubmitted_admission_releases_hold_and_channel_slot() {
         .await
         .expect("state");
     assert_eq!(state, "executing");
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 带 fencing 的"确定未提交"取消：原子释放 Hold、账户占用与渠道容量，且**不建 Attempt**。
+///
+/// 未收尾的 Attempt 是这条端口的硬边界：有它就不能释放（提交可能已经在飞），已收尾的历史 Attempt
+/// 不影响同一次执行的重投取消。这些判据都在行锁内，只有真库验得到（RFC 0018 §4.1）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn cancelling_an_unsubmitted_execution_releases_without_creating_an_attempt() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "cancel").await;
+
+    // 错误 token 一律冲突：释放的资格来自库里的所有权与 fencing token，不来自调用方自称。
+    let wrong_token = repository
+        .cancel_unsubmitted(cancel(job_id, "supervisor-a", 1))
+        .await
+        .expect_err("a stale fencing token must not release");
+    assert!(matches!(wrong_token, ApplicationError::Conflict(_)));
+
+    let finalization = repository
+        .cancel_unsubmitted(cancel(job_id, "supervisor-a", 0))
+        .await
+        .expect("the unsubmitted cancellation");
+    assert_eq!(finalization.stage, ExecutionStage::Failed);
+    assert_eq!(finalization.charge_microusd, 0);
+    assert_eq!(
+        count(
+            &pool,
+            "SELECT count(*) FROM generation.attempts WHERE job_id = $1",
+            job_id.0
+        )
+        .await,
+        0,
+        "releasing as unsubmitted must not fabricate a submitting Attempt"
+    );
+    let job = sqlx::query("SELECT state, terminal_at FROM generation.jobs WHERE id = $1")
+        .bind(job_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("the cancelled job");
+    assert_eq!(job.try_get::<String, _>("state").expect("state"), "failed");
+    assert!(
+        job.try_get::<Option<chrono::DateTime<Utc>>, _>("terminal_at")
+            .expect("terminal_at")
+            .is_some(),
+        "the cancellation stamps the terminal moment"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT status FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the hold"),
+        "released"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, String>(
+            "SELECT state FROM generation.execution_capacity WHERE job_id = $1"
+        )
+        .bind(job_id.0)
+        .fetch_one(&pool)
+        .await
+        .expect("the channel slot"),
+        "released"
+    );
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT held_microusd FROM ledger.accounts WHERE id = $1")
+            .bind(fixture.account_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the reservation"),
+        0,
+        "the reservation is given back exactly once"
+    );
+    // 重复调用幂等：已经 failed 的执行回已提交结论，不重复释放。
+    let again = repository
+        .cancel_unsubmitted(cancel(job_id, "supervisor-a", 0))
+        .await
+        .expect("a repeated cancellation is idempotent");
+    assert_eq!(again.stage, ExecutionStage::Failed);
+
+    // 已有未收尾的 Attempt：提交可能已经在飞，不许按确定未提交释放。
+    let submitted = admit_one(&repository, &fixture, "cancel-with-attempt").await;
+    repository
+        .begin_submission(begin(
+            submitted,
+            "supervisor-a",
+            0,
+            Utc::now() + ChronoDuration::minutes(5),
+        ))
+        .await
+        .expect("begin_submission");
+    let refused = repository
+        .cancel_unsubmitted(cancel(submitted, "supervisor-a", 0))
+        .await
+        .expect_err("an unfinished attempt must not be released as unsubmitted");
+    assert!(matches!(refused, ApplicationError::Conflict(_)));
+    assert_eq!(
+        sqlx::query_scalar::<_, String>("SELECT state FROM generation.jobs WHERE id = $1")
+            .bind(submitted.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the still executing job"),
+        "executing",
+        "a refused cancellation changes nothing"
+    );
 
     drop(pool);
     drop(repository);

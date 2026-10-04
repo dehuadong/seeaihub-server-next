@@ -573,8 +573,8 @@ async fn run_connection(
             );
         }
         Outcome::ClientGone => {
-            // 客户端走了：停止这条连接上在飞执行尚未开始的外部动作。
-            scope.cancel_gates();
+            // 客户端走了：这条连接上在飞执行的闸只置 client_gone——本进程仍是它们的所有者。
+            scope.mark_client_gone();
         }
         Outcome::Finished(Ok(())) => {}
         Outcome::Finished(Err(error)) => {
