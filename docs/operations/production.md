@@ -254,6 +254,8 @@ server {
 
     # 生成入口的请求体上限是 16 MiB（参考图/遮罩以公网 URL 或 data URL 文本随正文提交，multipart
     # 文件部件也走这条正文上限）；nginx 默认 1m 会先在它这里 413。示例 16m 与该上限同值。
+    # 生成入口收敛为只收公网 URL 的合同见 docs/specs/0005-synchronous-image-gateway.md §1、§3，
+    # 随实现落地；本条正文上限不因收敛变化。
     client_max_body_size 16m;
 
     # 一次生成对客是同步的，最长等到 GENERATION_SYNC_WAIT_SECONDS 才回；nginx 默认 60s 会提前切断。
