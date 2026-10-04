@@ -14,6 +14,8 @@ chrono.workspace = true
 dotenvy.workspace = true
 futures-util.workspace = true
 http.workspace = true
+hyper.workspace = true
+hyper-util.workspace = true
 seeai-adapter-aihubmix = { path = "../../crates/adapter-aihubmix" }
 seeai-adapter-apimart = { path = "../../crates/adapter-apimart" }
 seeai-adapter-sdk = { path = "../../crates/adapter-sdk" }
@@ -22,6 +24,7 @@ seeai-application = { path = "../../crates/application" }
 seeai-cache-redis = { path = "../../crates/cache-redis" }
 seeai-domain = { path = "../../crates/domain" }
 seeai-persistence = { path = "../../crates/persistence" }
+rustix.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
@@ -35,6 +38,7 @@ workspace = true
 
 [dev-dependencies]
 base64.workspace = true
+h2.workspace = true
 reqwest.workspace = true
 sha2.workspace = true
 sqlx.workspace = true

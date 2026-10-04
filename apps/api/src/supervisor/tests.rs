@@ -88,28 +88,37 @@ fn send_and_read_slots_are_refused_when_exhausted() {
     );
 }
 
-/// 发送期限只能在这一层"产出下一段之前"生效：到点必须让 body 出错而不是照常交付。
+/// 发送许可与执行预算随 [`SendHold`] 一起被持有：只要还有句柄在，许可就不归零。
 ///
-/// 底层 socket 写阻塞无法从这里取消，这条用例只固定能闭合的那一段（见 [`GuardedResponseStream`]）。
-#[tokio::test]
-async fn a_response_past_its_send_window_fails_before_delivering() {
-    use futures_util::StreamExt;
-
+/// 期限本身由连接层执行；这一层只负责"谁持有、什么时候释放"（RFC 0018 §8.3）。
+#[test]
+fn a_send_hold_keeps_its_permits_until_the_last_handle_is_dropped() {
     let supervisor =
         Supervisor::new(config(4, EXECUTION_MEMORY_BYTES * 4)).expect("the supervisor");
     let lease = supervisor
         .try_reserve_execution()
         .expect("an execution lease");
     let send = supervisor.try_reserve_send().expect("a send lease");
-    let mut stream =
-        GuardedResponseStream::new(Bytes::from_static(b"{}"), lease, send, Duration::ZERO);
-    let item = stream
-        .next()
-        .await
-        .expect("the stream yields one terminal item");
-    assert!(
-        item.is_err(),
-        "a send window already gone must fail, not deliver the payload"
+    assert_eq!(supervisor.send_slots_available(), 3);
+    assert_eq!(supervisor.execution_slots_available(), 3);
+    let hold = SendHold::new(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        lease,
+        send,
+    );
+    let handle = hold.clone();
+    drop(hold);
+    assert_eq!(
+        supervisor.send_slots_available(),
+        3,
+        "a live handle still holds the send permit"
+    );
+    drop(handle);
+    assert_eq!(supervisor.send_slots_available(), 4);
+    assert_eq!(supervisor.execution_slots_available(), 4);
+    assert_eq!(
+        supervisor.memory_bytes_available(),
+        EXECUTION_MEMORY_BYTES * 4
     );
 }
 

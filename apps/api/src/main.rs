@@ -10,7 +10,6 @@ use axum::{
     routing::{delete, get, patch, post, put},
 };
 use base64::{Engine, engine::general_purpose::STANDARD};
-use bytes::Bytes;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
@@ -50,9 +49,11 @@ use uuid::Uuid;
 
 mod supervisor;
 use supervisor::{
-    AuthenticatedAccount, ExecutionLease, GuardedResponseStream, OwnershipRenewalConfig, SendLease,
-    SlowRead, Supervisor, SupervisorConfig,
+    AuthenticatedAccount, ConnectionScope, ExecutionHandle, ExecutionLease, OwnershipRenewalConfig,
+    SendHold, SendLease, SlowRead, Supervisor, SupervisorConfig,
 };
+#[cfg(target_os = "linux")]
+use supervisor::{TransportConfig, serve as serve_transport};
 
 /// 平台直接执行时随进程装配的一份用例与它的 Supervisor。
 ///
@@ -510,17 +511,71 @@ async fn main() -> Result<()> {
     };
     let listener = tokio::net::TcpListener::bind(bind).await?;
     info!(%bind, "api listening");
+    // 直接执行依赖 Linux 的独立 socket 关闭事件检测（Spec 0005 §6）：没有等效检测的平台显式拒绝
+    // 启动，不退回保存业务载荷的生成链路。
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = (listener, app);
+        bail!(
+            "direct execution requires the Linux disconnect monitor (RFC 0018 §8.2); this platform \
+             has no equivalent client-close detection, so the process refuses to start"
+        );
+    }
     // 停机：先停止新执行并给在飞任务有限收尾，进程退出前再等在飞任务收尾到宽限期上限；到点仍
     // 有残余时它们的账务事实由应用层的对账路径接管（RFC 0017 §5、§6）。
-    let supervisor_for_shutdown = direct_execution.supervisor.clone();
-    axum::serve(listener, app)
-        .with_graceful_shutdown(async move {
+    #[cfg(target_os = "linux")]
+    {
+        let supervisor_for_shutdown = direct_execution.supervisor.clone();
+        serve_transport(listener, app, transport_config()?, async move {
             shutdown_signal().await;
             supervisor_for_shutdown.begin_drain();
         })
         .await?;
-    direct_execution.supervisor.drain().await;
+        direct_execution.supervisor.drain().await;
+    }
     Ok(())
+}
+
+/// 连接驱动的容量与期限：每一项都是明确上限，默认值按单机 64 路执行容量给出。
+#[cfg(target_os = "linux")]
+fn transport_config() -> Result<TransportConfig> {
+    let max_connections = generation_env_usize("API_MAX_CONNECTIONS", 1024)?;
+    let max_connection_tasks = generation_env_usize("API_MAX_CONNECTION_TASKS", 64)?;
+    let control_queue_capacity = generation_env_usize("API_MONITOR_CONTROL_QUEUE", 1024)?;
+    Ok(TransportConfig {
+        max_connections,
+        max_connection_tasks,
+        monitor: supervisor::MonitorConfig {
+            max_connections,
+            control_queue_capacity,
+            event_batch: 256,
+        },
+        registration_timeout: Duration::from_millis(generation_env_u64(
+            "API_MONITOR_CONFIRM_MILLIS",
+            2_000,
+        )?),
+        release_timeout: Duration::from_millis(generation_env_u64(
+            "API_MONITOR_CONFIRM_MILLIS",
+            2_000,
+        )?),
+        shutdown_grace: Duration::from_secs(generation_env_u64(
+            "GENERATION_SHUTDOWN_GRACE_SECONDS",
+            25,
+        )?),
+        http1_max_headers: generation_env_usize("API_MAX_HEADERS", 128)?,
+        http1_max_buf_size: generation_env_usize("API_MAX_BUFFER_BYTES", 64 * 1024)?,
+        http2_max_concurrent_streams: u32::try_from(generation_env_usize(
+            "API_H2_MAX_CONCURRENT_STREAMS",
+            128,
+        )?)
+        .context("API_H2_MAX_CONCURRENT_STREAMS must fit in 32 bits")?,
+        http2_max_send_buf_size: generation_env_usize("API_H2_MAX_SEND_BUFFER_BYTES", 1024 * 1024)?,
+        http2_max_header_list_size: u32::try_from(generation_env_usize(
+            "API_H2_MAX_HEADER_LIST_BYTES",
+            64 * 1024,
+        )?)
+        .context("API_H2_MAX_HEADER_LIST_BYTES must fit in 32 bits")?,
+    })
 }
 
 /// 托管的两个前端入口：管理主机回运营后台那一份、其余主机回客户那一份。
@@ -2548,6 +2603,7 @@ async fn generate_image(
     State(state): State<AppState>,
     account: Option<Extension<AuthenticatedAccount>>,
     slow: Option<Extension<SlowRead>>,
+    scope: Option<Extension<Arc<ConnectionScope>>>,
     headers: HeaderMap,
     body: Result<Json<CreateGenerationBody>, JsonRejection>,
 ) -> Result<Response, ApiError> {
@@ -2567,6 +2623,7 @@ async fn generate_image(
         direct,
         account.0.account_id,
         account.0.received_at,
+        scope.map(|scope| scope.0),
         &headers,
         body.parameters,
     )
@@ -2582,6 +2639,7 @@ async fn edit_image(
     State(state): State<AppState>,
     account: Option<Extension<AuthenticatedAccount>>,
     slow: Option<Extension<SlowRead>>,
+    scope: Option<Extension<Arc<ConnectionScope>>>,
     headers: HeaderMap,
     mut multipart: Multipart,
 ) -> Result<Response, ApiError> {
@@ -2597,6 +2655,7 @@ async fn edit_image(
         direct,
         account.0.account_id,
         account.0.received_at,
+        scope.map(|scope| scope.0),
         &headers,
         "/v1/images/edits",
         parameters,
@@ -2647,6 +2706,7 @@ async fn run_direct_json(
     direct: Arc<DirectGeneration>,
     account_id: AccountId,
     received_at: tokio::time::Instant,
+    scope: Option<Arc<ConnectionScope>>,
     headers: &HeaderMap,
     mut parameters: Map<String, Value>,
 ) -> Result<Response, ApiError> {
@@ -2666,6 +2726,7 @@ async fn run_direct_json(
         direct,
         account_id,
         received_at,
+        scope,
         headers,
         "/v1/images/generations",
         parameters,
@@ -2753,12 +2814,14 @@ async fn parse_multipart_direct(
 
 /// 直接执行入口：预留本机许可，起受监督的执行，等一次性结果，按内存载荷构造响应。
 ///
-/// 成功时执行许可与发送许可随响应 body 存活到发送完成；失败或断开时它们随本次调用立即释放。
+/// 成功时执行许可与发送许可随 [`SendHold`] 进入连接 owner registry，只有 transport 任务与缓冲确实
+/// 销毁之后才释放；失败或断开时它们随本次调用立即释放。
 #[allow(clippy::too_many_arguments)]
 async fn run_direct_generation(
     direct: Arc<DirectGeneration>,
     account_id: AccountId,
     received_at: tokio::time::Instant,
+    scope: Option<Arc<ConnectionScope>>,
     headers: &HeaderMap,
     endpoint: &str,
     mut parameters: Map<String, Value>,
@@ -2789,14 +2852,17 @@ async fn run_direct_generation(
         .ok_or_else(direct_capacity_unavailable)?;
     // 总期限 D 从收到请求头起算；执行侧与 handler 等的是同一个绝对时刻。
     let deadline = received_at + direct.supervisor.total_deadline();
-    let receiver = direct
-        .supervisor
-        .spawn(direct.service.clone(), request, lease, deadline);
+    let ExecutionHandle { outcome, gate } =
+        direct
+            .supervisor
+            .spawn(direct.service.clone(), request, lease, deadline);
+    // 连接层观察到客户端断开时置取消这次执行尚未开始的外部动作；handler 结束即撤销登记。
+    let _tracked = scope.map(|scope| scope.track(&gate));
     // Handler 等到 D 再加工应用层的收尾宽限：先让应用层把"确定未提交 / 已确认结算 / 事实未知"
     // 交回来，只有连这个兜底也到点才回 outcome_unknown。
     let wait = deadline.saturating_duration_since(tokio::time::Instant::now())
         + direct.supervisor.finalization_grace();
-    let outcome = match tokio::time::timeout(wait, receiver).await {
+    let outcome = match tokio::time::timeout(wait, outcome).await {
         Ok(Ok(outcome)) => outcome,
         // 执行任务在投递结果前消失（异常）：没有可返回的载荷。
         Ok(Err(_recv)) => return Err(direct_internal()),
@@ -2819,6 +2885,8 @@ async fn run_direct_generation(
 }
 
 /// 成功响应：created 与内存里的 data 直接构造，不读 Job、不重放结果。
+///
+/// 发送期限在**交接时**定为绝对时刻，交给连接层执行：body 是否继续被读取不影响它（RFC 0018 §8.1）。
 fn direct_success_response(
     success: seeai_application::DirectExecutionSuccess,
     lease: ExecutionLease,
@@ -2838,17 +2906,19 @@ fn direct_success_response(
         message: error.to_string(),
         retry_after: None,
     })?;
-    let stream = GuardedResponseStream::new(Bytes::from(payload), lease, send, window);
-    Response::builder()
+    let hold = SendHold::new(tokio::time::Instant::now() + window, lease, send);
+    let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")
-        .body(axum::body::Body::from_stream(stream))
+        .body(axum::body::Body::from(payload))
         .map_err(|error| ApiError {
             status: StatusCode::INTERNAL_SERVER_ERROR,
             code: "internal_error",
             message: error.to_string(),
             retry_after: None,
-        })
+        })?;
+    response.extensions_mut().insert(hold);
+    Ok(response)
 }
 
 /// 直接执行的拒绝 → Spec 0005 §4 的对客码：同键四投影、结果未知、确定失败与既有应用错误。

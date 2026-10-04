@@ -34,7 +34,18 @@ use seeai_application::{
 };
 use seeai_domain::{AccountId, FencingToken, JobId};
 use tokio::sync::{Notify, OwnedSemaphorePermit, Semaphore, oneshot};
+use tokio::time::Instant;
 use uuid::Uuid;
+
+#[cfg(target_os = "linux")]
+mod connection;
+#[cfg(target_os = "linux")]
+mod monitor;
+
+#[cfg(target_os = "linux")]
+pub use connection::{TransportConfig, serve};
+#[cfg(target_os = "linux")]
+pub use monitor::MonitorConfig;
 
 /// 执行所有权续约的装配：续约端口与租约时长。没有它就不起续约任务。
 #[derive(Clone)]
@@ -137,6 +148,174 @@ pub struct SendLease {
 /// 一个本机正文读取名额。
 pub struct ReadLease {
     _permit: OwnedSemaphorePermit,
+}
+
+/// 一个图片响应的发送许可与它实际占用的执行许可，外加绝对发送期限。
+///
+/// 它由 handler 在结果就绪时构造，随响应扩展交给连接层；连接 owner registry 是它唯一的长期持有者，
+/// 只有 transport 任务与缓冲确实销毁之后才释放（RFC 0018 §8.1、§8.3）。放进响应扩展要求可克隆，
+/// 因此内部用 `Arc`。
+#[derive(Clone)]
+pub struct SendHold(Arc<SendHoldInner>);
+
+struct SendHoldInner {
+    deadline: Instant,
+    _lease: ExecutionLease,
+    _send: SendLease,
+}
+
+impl SendHold {
+    /// `deadline` 是绝对时刻：不因部分写成功、body 被 poll 或流量波动重置。
+    #[must_use]
+    pub fn new(deadline: Instant, lease: ExecutionLease, send: SendLease) -> Self {
+        Self(Arc::new(SendHoldInner {
+            deadline,
+            _lease: lease,
+            _send: send,
+        }))
+    }
+
+    #[must_use]
+    pub fn deadline(&self) -> Instant {
+        self.0.deadline
+    }
+}
+
+/// 一次执行的结果接收端与它的外部动作闸。
+///
+/// 闸交给连接层跟踪：客户端断开被可靠观察到时置取消，停止这次执行尚未开始的外部动作；已经开始的
+/// 生成发送按"可能已提交"继续有限收尾，不因断开改写账务（Spec 0005 §5）。
+pub struct ExecutionHandle {
+    pub outcome: oneshot::Receiver<ExecutionOutcome>,
+    pub gate: Arc<DispatchGate>,
+}
+
+/// 一条连接的取消信号：置位并通知，连接任务据此销毁整条连接。
+///
+/// 监视线程是同步线程，`cancel` 只做原子写与同步唤醒。
+pub struct DisconnectSignal {
+    cancelled: AtomicBool,
+    notify: Notify,
+}
+
+impl DisconnectSignal {
+    #[must_use]
+    pub fn new() -> Arc<Self> {
+        Arc::new(Self {
+            cancelled: AtomicBool::new(false),
+            notify: Notify::new(),
+        })
+    }
+
+    pub fn cancel(&self) {
+        self.cancelled.store(true, Ordering::SeqCst);
+        self.notify.notify_waiters();
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.cancelled.load(Ordering::SeqCst)
+    }
+
+    /// 等到取消发生；已经取消时立即返回。
+    pub async fn cancelled(&self) {
+        if self.is_cancelled() {
+            return;
+        }
+        // 先注册等待再复查，避免复查与等待之间漏掉一次通知。
+        let notified = self.notify.notified();
+        tokio::pin!(notified);
+        notified.as_mut().enable();
+        if self.is_cancelled() {
+            return;
+        }
+        notified.await;
+    }
+}
+
+/// 一次请求所属连接的作用域：放进 request extension，handler 用它登记这次执行的动作闸。
+///
+/// 断开是**连接级**事实：观测到客户端关闭时，这条连接上所有在飞执行的闸一起置取消。
+pub struct ConnectionScope {
+    signal: Arc<DisconnectSignal>,
+    gates: Mutex<GateTracker>,
+}
+
+struct GateTracker {
+    next: u64,
+    live: HashMap<u64, Weak<DispatchGate>>,
+}
+
+impl ConnectionScope {
+    #[must_use]
+    pub fn new(signal: Arc<DisconnectSignal>) -> Arc<Self> {
+        Arc::new(Self {
+            signal,
+            gates: Mutex::new(GateTracker {
+                next: 0,
+                live: HashMap::new(),
+            }),
+        })
+    }
+
+    #[must_use]
+    pub fn is_cancelled(&self) -> bool {
+        self.signal.is_cancelled()
+    }
+
+    /// 登记一次执行的动作闸；返回的 guard 在 handler 结束时撤销登记。
+    ///
+    /// 连接已经被观察到断开时当场置取消：登记与取消之间不能留下"断开早于登记"的窗口。
+    #[must_use]
+    pub fn track(self: &Arc<Self>, gate: &Arc<DispatchGate>) -> ConnectionGateGuard {
+        let id = {
+            let mut gates = self.gates.lock().unwrap_or_else(|error| error.into_inner());
+            gates.next += 1;
+            let id = gates.next;
+            gates.live.retain(|_, gate| gate.strong_count() > 0);
+            gates.live.insert(id, Arc::downgrade(gate));
+            id
+        };
+        if self.is_cancelled() {
+            gate.cancel();
+        }
+        ConnectionGateGuard {
+            scope: Arc::clone(self),
+            id,
+        }
+    }
+
+    /// 连接被观察到断开：取消这条连接上所有在飞执行尚未开始的外部动作。
+    pub fn cancel_gates(&self) {
+        let gates: Vec<Arc<DispatchGate>> = self
+            .gates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .live
+            .values()
+            .filter_map(Weak::upgrade)
+            .collect();
+        for gate in gates {
+            gate.cancel();
+        }
+    }
+}
+
+/// 一次执行的闸登记；Drop 即撤销。
+pub struct ConnectionGateGuard {
+    scope: Arc<ConnectionScope>,
+    id: u64,
+}
+
+impl Drop for ConnectionGateGuard {
+    fn drop(&mut self) {
+        self.scope
+            .gates
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+            .live
+            .remove(&self.id);
+    }
 }
 
 /// 执行任务交回 Handler 的结果：载荷或错误，外加必须继续持有的执行许可。
@@ -262,6 +441,24 @@ impl Supervisor {
         self.finalization_grace
     }
 
+    /// 单测观察口：还剩多少个发送名额。
+    #[cfg(test)]
+    pub(crate) fn send_slots_available(&self) -> usize {
+        self.send_slots.available_permits()
+    }
+
+    /// 单测观察口：还剩多少个执行 slot。
+    #[cfg(test)]
+    pub(crate) fn execution_slots_available(&self) -> usize {
+        self.execution_slots.available_permits()
+    }
+
+    /// 单测观察口：还剩多少可预占字节。
+    #[cfg(test)]
+    pub(crate) fn memory_bytes_available(&self) -> usize {
+        self.memory.total - self.memory.used.load(Ordering::Relaxed)
+    }
+
     /// 取一个本机正文读取名额；满员时拒绝而不是排队。
     #[must_use]
     pub fn try_reserve_read(&self) -> Option<ReadLease> {
@@ -303,7 +500,7 @@ impl Supervisor {
         request: DirectExecutionRequest,
         lease: ExecutionLease,
         deadline: tokio::time::Instant,
-    ) -> oneshot::Receiver<ExecutionOutcome> {
+    ) -> ExecutionHandle {
         let (sender, receiver) = oneshot::channel();
         // 每次执行一份取消标志：初值取当前停机状态，续约冲突只置这一份，不波及其它在飞执行。
         let gate = Arc::new(DispatchGate::new());
@@ -347,7 +544,10 @@ impl Supervisor {
             active.fetch_sub(1, Ordering::SeqCst);
             idle.notify_one();
         });
-        receiver
+        ExecutionHandle {
+            outcome: receiver,
+            gate,
+        }
     }
 
     /// 停机开始：停止新的外部副作用，交给在飞任务有限收尾。
@@ -432,50 +632,6 @@ impl Stream for DeadlineBody {
             Poll::Ready(None) => Poll::Ready(None),
             Poll::Pending => Poll::Pending,
         }
-    }
-}
-
-/// 成功响应 body：持有执行许可与发送名额，直到发送完成或 body 被销毁。
-///
-/// 发送本身有独立期限；到点仍没发完就让 body 出错，连接终结，许可随 body 释放。
-///
-/// **限制**：这个方法只在**产出下一段 body 之前**检查期限。载荷是一次性完整缓冲、一次吐出的，
-/// 所以期限覆盖的是"开始发送前"的等待；一旦这一整块交给传输层，底层 socket 写阻塞无法从这里
-/// 取消——那一段由客户端/传输层超时收口。真正的交付超时（已结算但图片来不及准备）由应用层在
-/// 响应构造前判定并回 504 result_delivery_timeout，见 `DirectExecutionError::ResultDeliveryTimeout`。
-pub struct GuardedResponseStream {
-    payload: Option<Bytes>,
-    lease: Option<ExecutionLease>,
-    send: Option<SendLease>,
-    deadline: tokio::time::Instant,
-}
-
-impl GuardedResponseStream {
-    #[must_use]
-    pub fn new(payload: Bytes, lease: ExecutionLease, send: SendLease, window: Duration) -> Self {
-        Self {
-            payload: Some(payload),
-            lease: Some(lease),
-            send: Some(send),
-            deadline: tokio::time::Instant::now() + window,
-        }
-    }
-}
-
-impl Stream for GuardedResponseStream {
-    type Item = Result<Bytes, std::io::Error>;
-
-    fn poll_next(mut self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        if tokio::time::Instant::now() >= self.deadline {
-            let _ = self.lease.take();
-            let _ = self.send.take();
-            self.payload = None;
-            return Poll::Ready(Some(Err(std::io::Error::new(
-                std::io::ErrorKind::TimedOut,
-                "the result was not delivered within the configured send limit",
-            ))));
-        }
-        Poll::Ready(self.payload.take().map(Ok))
     }
 }
 
