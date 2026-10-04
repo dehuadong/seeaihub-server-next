@@ -924,6 +924,9 @@ struct ApiProcessSettings {
     /// 下限是每次执行的固定预留 32MiB——比它小 Supervisor::new 直接拒绝启动，所以单个请求
     /// 永远在预算内；能压出来的边界只有预算已被另一个在飞执行占满这一种。
     max_memory_bytes: Option<usize>,
+    /// 渠道全局未决任务上限（GENERATION_MAX_CHANNEL_IN_FLIGHT）：用例要观察"账户名额还空着、
+    /// 但渠道名额已被另一个副本占住"那条 503 时把它压到最小。缺省不配，进程用生产默认值（32）。
+    channel_max_in_flight: Option<u64>,
 }
 
 /// 一次用例的全部进程配置：API 进程那一套、发布时的修订级加价系数、以及 Worker 的重投策略。
@@ -1028,6 +1031,9 @@ async fn start_api_with(
             .stdout(Stdio::null())
             .stderr(Stdio::null());
         apply_cache_env(&mut command, settings.cache.as_ref());
+        if let Some(limit) = settings.channel_max_in_flight {
+            command.env("GENERATION_MAX_CHANNEL_IN_FLIGHT", limit.to_string());
+        }
         if let Some(rate_limit) = settings.rate_limit {
             command
                 .env(
@@ -1690,6 +1696,27 @@ impl Harness {
             Some(alerts),
             self.retry,
         )
+    }
+
+    /// 起**第二个**连同一数据库的 API 副本：多副本容量竞争与"缓存通知丢失"的验收靠它。
+    ///
+    /// 副本复用本装置已经发布好的库，摘要/指纹密钥与假渠道凭证也由 `start_api_with` 的直连分支
+    /// 给同一套（见那里），所以同一把客户密钥在两个进程上都认得出。返回它的 `base_url` 与进程
+    /// 句柄，丢弃句柄即结束它。
+    async fn start_replica(
+        &self,
+        max_concurrent_jobs: u64,
+        sync_wait_seconds: u64,
+        settings: &ApiProcessSettings,
+    ) -> (String, ApiProcess) {
+        let (base_url, _admin_token, process) = start_api_with(
+            &self.database_url,
+            sync_wait_seconds,
+            max_concurrent_jobs,
+            settings,
+        )
+        .await;
+        (base_url, process)
     }
 
     /// 这次用例的假 Redis；没配缓存的用例调用它会直接失败（那是用例写错了）。
@@ -3416,6 +3443,19 @@ impl CacheFixture {
 
     fn settings(&self) -> CacheSettings {
         self.settings
+    }
+
+    /// 给**第二个 API 副本**用的缓存句柄：共享同一台假 Redis 的 URL、状态与写入闸门，但不持有
+    /// 监听任务——停止与否仍由原夹具决定，第二个副本只借它读写同一台缓存。
+    fn share(&self) -> Self {
+        Self {
+            url: self.url.clone(),
+            settings: self.settings,
+            state: self.state.clone(),
+            fail_writes: self.fail_writes.clone(),
+            connections: Arc::new(Mutex::new(Vec::new())),
+            listener: Mutex::new(None),
+        }
     }
 
     /// 缓存里的原文（不看 TTL）。

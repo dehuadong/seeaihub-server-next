@@ -737,3 +737,234 @@ async fn direct_peak_rss_stays_within_the_memory_budget() {
     );
     harness.cleanup().await;
 }
+
+/// 数据库里当前 `held` 的渠道名额行数：跨副本共同遵守的唯一事实就是它。
+async fn held_channel_slots(harness: &Harness) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM generation.execution_capacity WHERE state = 'held'")
+        .fetch_one(&harness.pool)
+        .await
+        .expect("channel slot count")
+}
+
+/// A8：两个 API 副本连同一数据库时，账户与渠道上限由数据库事实共同遵守。
+///
+/// 主进程与副本各配 1 个账户名额、1 个渠道名额。第一个请求在主进程上停在上游等待里，此时：
+/// - 同一账户在副本上再发一次 ⇒ 429 `too_many_in_flight`（账户名额已被占）；
+/// - 另一个账户在副本上发一次 ⇒ 503 `platform_unavailable`（它自己的账户名额是空的，但唯一的
+///   渠道名额被占）。
+///
+/// 两次拒绝都不建执行记录，`execution_capacity` 始终只有第一个请求那一行 held；第一个请求结束
+/// 后，另一个账户在副本上的请求照常成功，证明释放也被对方看见。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn two_api_replicas_share_the_account_and_channel_capacity() {
+    let harness = Harness::start_direct_with(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        UpstreamBehaviour {
+            delay_ms: 3_000,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
+        1,  // 账户在飞上限
+        30, // 总期限：要盖过 3s 的上游等待
+        ApiProcessSettings {
+            direct_execution: true,
+            channel_max_in_flight: Some(1),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await;
+    // 第二个副本与本装置同一个库、同一组上限，但有自己的进程与连接池。
+    let (peer_base, peer) = harness
+        .start_replica(
+            1,
+            30,
+            &ApiProcessSettings {
+                direct_execution: true,
+                channel_max_in_flight: Some(1),
+                ..ApiProcessSettings::default()
+            },
+        )
+        .await;
+
+    // 另一个账户：它自己的账户名额是空的，所以它只能被渠道名额挡住。
+    let client = Client::new();
+    let (_, other_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+
+    // 第一个请求在主进程上停在上游等待里：此时账户与渠道名额都已占住。
+    let first_key = format!("replica-cap-first-{}", Uuid::new_v4());
+    let first = tokio::spawn({
+        let base_url = harness.base_url.clone();
+        let api_key = harness.api_key.clone();
+        let key = first_key.clone();
+        let body = route_request(harness.model, "hold both capacities open");
+        async move { post_json(&base_url, &api_key, "/v1/images/generations", &key, &body).await }
+    });
+    wait_for_create_calls(&harness, 1).await;
+    assert_eq!(
+        held_channel_slots(&harness).await,
+        1,
+        "第一个请求必须已经占住唯一的渠道名额"
+    );
+
+    // ① 同一账户在**副本**上再发：账户名额已满。
+    let same_account_key = format!("replica-cap-same-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &peer_base,
+        &harness.api_key,
+        "/v1/images/generations",
+        &same_account_key,
+        &route_request(harness.model, "same account on the peer"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "got {body}");
+    assert_eq!(body["error"]["code"], json!("too_many_in_flight"));
+    assert_public_only("跨副本账户名额", &body);
+
+    // ② 另一个账户在副本上发：账户名额是空的，但唯一的渠道名额被占。
+    let other_account_key = format!("replica-cap-other-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &peer_base,
+        &other_key,
+        "/v1/images/generations",
+        &other_account_key,
+        &route_request(harness.model, "another account on the peer"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "got {body}");
+    assert_eq!(body["error"]["code"], json!("platform_unavailable"));
+    assert_public_only("跨副本渠道名额", &body);
+
+    // 两次拒绝都不留下执行记录，held 槽位仍然只有第一个请求那一行。
+    assert_eq!(
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM generation.jobs")
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job count"),
+        1,
+        "被容量拒绝的受理不该建 Job"
+    );
+    assert_eq!(held_channel_slots(&harness).await, 1);
+
+    // 第一个请求跑完：名额释放，副本立刻看得见。
+    let (status, body) = first.await.expect("the first request joins");
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        held_channel_slots(&harness).await,
+        0,
+        "终态必须释放渠道名额"
+    );
+
+    let after_key = format!("replica-cap-after-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &peer_base,
+        &other_key,
+        "/v1/images/generations",
+        &after_key,
+        &route_request(harness.model, "the capacity is free again"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_sync_success("释放后另一账户在副本上的请求", &body);
+
+    drop(peer);
+    harness.cleanup().await;
+}
+
+/// A8：一个副本先按旧修订写下 route 缓存，随后库里发布新修订、失效通知丢失；另一个副本受理时
+/// 必须回源数据库用新修订，不选陈旧缓存里的旧候选。
+///
+/// route 缓存住在 Redis、由各副本共享，所以"通知丢失"就是缓存里留着旧修订那份。这里让主进程
+/// 写入旧值，副本在**不刷新缓存**的情况下受理，用冻结快照里的对客费率判它用的是哪一版。
+///
+/// 这条走**旧 Job 流水线**：直接执行那条路每次受理都直读 `active_offering`，根本不读 route
+/// 缓存，验不到"陈旧缓存"这个形态；缓存命中与回源只发生在 `GenerationService` 的受理前选路里。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_peer_replica_falls_back_to_the_database_when_the_route_cache_is_stale() {
+    let cache = CacheFixture::start(CacheSettings::default()).await;
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        cache,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(
+        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        StatusCode::OK
+    );
+    let (_, api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+
+    // 副本与主进程共用同一台假 Redis，因此也会读到后面那份没有被失效掉的旧修订。它在旧值写进
+    // 缓存**之前**起来，免得它启动时那轮对账把还没写的缓存当成陈旧项去清。
+    let (peer_base, peer) = harness
+        .start_replica(
+            64,
+            30,
+            &ApiProcessSettings {
+                cache: Some(harness.cache().share()),
+                ..ApiProcessSettings::default()
+            },
+        )
+        .await;
+    // 一个 Worker 覆盖两次受理：Job 记在库里，哪个 API 进程受理的都能被执行。
+    let _worker = harness.spawn_worker();
+
+    // 先在主进程上受理一次，把 route 缓存按修订 A 写起来。
+    let first_key = format!("replica-route-first-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &first_key,
+        &route_request(harness.model, "warm the route cache"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    let stale = harness.cache().route(harness.model).expect("route 缓存");
+
+    // 发布新修订并让失效失败：缓存里留着的是修订 A 那份候选集。
+    harness.cache().set_fail_writes(true);
+    let mut higher = priced_consumer_rates();
+    higher["image_output_micros_per_million"] = json!(440_000_000);
+    assert_eq!(
+        publish_cache_priced(&harness, higher.clone()).await,
+        StatusCode::OK
+    );
+    harness.cache().set_fail_writes(false);
+    assert_eq!(
+        harness.cache().route(harness.model).expect("旧值还在"),
+        stale,
+        "失效失败后缓存里仍是旧修订那份"
+    );
+
+    // 在**副本**上受理：它必须按数据库当前修订回源，用新定价。
+    let second_key = format!("replica-route-second-{}", Uuid::new_v4());
+    let (status, body) = post_json(
+        &peer_base,
+        &api_key,
+        "/v1/images/generations",
+        &second_key,
+        &route_request(harness.model, "the peer must not use the stale route"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+    assert_eq!(
+        frozen_snapshot(&harness.pool, &second_key).await["consumer_rates_cny"],
+        higher,
+        "副本必须采用数据库当前修订的定价，而不是陈旧缓存里的旧修订"
+    );
+    assert_ne!(
+        harness.cache().route(harness.model).expect("重建后的缓存"),
+        stale,
+        "副本回源后缓存被重建成新修订那一份"
+    );
+
+    drop(peer);
+    harness.cleanup().await;
+}
