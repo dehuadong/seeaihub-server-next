@@ -2,7 +2,7 @@
 当前修订: v3
 生效修订: v3
 状态: 已接受
-依赖: [账户资金 Spec v4](0002-account-funds-and-reservations.md)、[图片上传与对象存储 Spec](0007-image-upload-and-object-storage.md) v2（待接受）、[结算证据门槛](../adr/0006-no-settlement-without-metering-evidence.md)
+依赖: [账户资金 Spec v4](0002-account-funds-and-reservations.md)、[图片上传与对象存储 Spec](0007-image-upload-and-object-storage.md) v2、[结算证据门槛](../adr/0006-no-settlement-without-metering-evidence.md)
 
 # 同步图片网关与最小执行记录
 

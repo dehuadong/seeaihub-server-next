@@ -1,6 +1,6 @@
 主题: 对象存储上传：模块划分、签名与上传存储配置
 当前修订: v2
-状态: 待评审
+状态: 已接受
 承接: [图片上传与对象存储 Spec v2](../specs/0007-image-upload-and-object-storage.md) §2–§8；并与[同步图片网关 Spec v3](../specs/0005-synchronous-image-gateway.md) §1、§3 的输入图片形态收敛同一变更实施；生成入口的指纹输入域与验收见 Spec 0005 §4、§8（A12）。
 依赖: [分层架构](0004-layered-architecture.md)、[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)、[同步网关设计](0017-synchronous-image-gateway.md) §2、[图片透传决定](../adr/0019-images-pass-through-without-asset-storage.md)（结果侧不落盘与只有同步形态的结论继续适用）、[参考图上传决定](../adr/0022-reference-image-upload-endpoint.md)
 
