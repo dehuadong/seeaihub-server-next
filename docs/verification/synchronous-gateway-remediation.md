@@ -172,7 +172,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 | `cases_direct_execution::direct_replay_uses_the_recorded_contract_after_a_republish` | passed | 新修订要求新必填参数后，同键同正文仍按记录冻结的合同投影 `409 result_not_retained`；同一正文换新键则按当前合同回 `400 validation_error`，不建记录、不调上游 |
 | `cases_direct_execution::direct_replay_without_comparison_material_is_a_conflict` | passed | 记录还在、`request_digest` 被抹掉时回 `409 idempotency_conflict`，不执行；改前这条路回 500 |
 | `cases_direct_execution::direct_replay_is_checked_before_the_current_contract_interprets_the_body` | passed | 同键正文带一个非公网 URL、非 data URL 的图片值时回 `409 idempotency_conflict`（查找发生在图片字段抽取之前）；改前是 `400 invalid_parameter` |
-| `cases_direct_execution::direct_replay_with_a_reference_image_uses_the_recorded_fingerprint` | passed | 带 data URL 参考图的同键重发也命中同一条记录：比对从原始参数面里摘图片字段，指纹取值与受理时逐字相同 |
+| `cases_direct_execution::direct_replay_with_a_reference_image_uses_the_recorded_fingerprint` | passed | 同键重发带着记录里已受理的那份参考图值时仍命中同一条记录（图片形态判定发生在幂等预查之后，只对未命中的请求适用）：比对从原始参数面里摘图片字段，指纹取值与受理时逐字相同 |
 
 ### 我实际跑过的命令与结果
 
@@ -195,9 +195,9 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 | --- | --- | --- | --- |
 | `/v1/images/generations`（JSON） | `url` | `cases_direct_execution::direct_json_generation_returns_url_without_a_worker` | passed |
 | `/v1/images/generations`（JSON） | `b64_json` | `cases_direct_execution::direct_json_generation_returns_base64_without_a_worker` | passed |
-| `/v1/images/edits`（multipart 文件部件） | 同一条闭环 | `cases_aihubmix::aihubmix_sync_entries_accept_images_and_return_the_provider_envelope` | passed |
+| `/v1/images/edits`（multipart 文本部件，值为公网 URL） | 同一条闭环 | `cases_aihubmix::aihubmix_sync_entries_accept_images_and_return_the_provider_envelope` | passed |
 
-三条都不启 Worker：`200` 本身就是"这条路不依赖 Worker 生成队列或结果轮询"的判据。前两条各钉一种上游形态（`url` 原样交回、`b64_json` 与 `STANDARD.encode(PNG_FIXTURE)` 逐字相等）；第三条把两条入口放在同一个进程里跑通，另覆盖公网 URL 参考图、data URL 参考图与 multipart 文件部件三种输入形态。
+三条都不启 Worker：`200` 本身就是"这条路不依赖 Worker 生成队列或结果轮询"的判据。前两条各钉一种上游形态（`url` 原样交回、`b64_json` 与 `STANDARD.encode(PNG_FIXTURE)` 逐字相等）；第三条把两条入口放在同一个进程里跑通，参考图以公网 URL 给出。
 
 ### A5
 
@@ -224,7 +224,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 
 ## 11. A5 子进程强杀矩阵的实施证据
 
-本节记录 [Spec 0005 §8](0005-synchronous-image-gateway.md) A5 的进程级强杀取证。用例在 `apps/api/tests/http_contract/cases_kill_matrix.rs`（7 条，全部 `#[ignore]`），基线 `7923fb4`，改动未提交。
+本节记录 [Spec 0005 §8](../specs/0005-synchronous-image-gateway.md) A5 的进程级强杀取证。用例在 `apps/api/tests/http_contract/cases_kill_matrix.rs`（7 条，全部 `#[ignore]`），基线 `7923fb4`，改动未提交。
 
 第 10 节缺的是"运行到某一格再真的 SIGKILL"那一半，这里补上；恢复那一半复用第 10 节的数据库级用例。恢复跑的是生产同一份 `ExecutionReconciliationService` 与真渠道 Driver（`AdapterRegistry` 装 AIHubMix / APIMart 工厂），在测试进程里对着被杀进程的那个一次性库。验收只连进程内假上游，没有调用任何真实 Provider。
 
@@ -256,7 +256,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 | 格 | 用例 | 屏障信号 | 杀进程前的库内事实 | 恢复动作 | 恢复后断言 | 结果 |
 | --- | --- | --- | --- | --- | --- | --- |
 | 提交前（受理后未写提交声明） | `sigkill_before_the_submission_declaration_reaps_the_orphan_admission` | `attempts` 整表锁 + 锁等待 | Job `admitted`、无 Attempt、生成 0、上传 0 | 终止等锁后端 → 放锁 → Worker 一轮 | `reaped_orphans = 1`；Job `failed`、Attempt 0；Hold 释放为 0；渠道槽位 `released`；对账案例 0；生成 0；同键重发（另一个 API 副本）`502 platform_unavailable` 且生成计数仍 0 | passed |
-| 提交前（已写提交声明、生成请求未发） | `sigkill_with_the_submission_declared_but_before_the_create_request_keeps_the_hold` | 上游停住 `POST /v1/uploads/images`（data URL 参考图先上传换 URL） | Job `executing`、Attempt `submitting`、无句柄、生成 0、上传 1 | 杀 → 放行闸门 → 推租约过期 → Worker 一轮 | `reconciled = 1`；Job `reconciliation_required`、Attempt `unknown`；对账案例 1；Hold 原样保留、渠道槽位 `held`；生成 0、查询 0、capture 0 | passed |
+| 提交前（已写提交声明、生成请求未发） | `sigkill_with_the_submission_declared_but_before_the_create_request_keeps_the_hold` | 上游停住 APIMart 的 `POST /v1/uploads/images`（夹具先上传参考图换 URL） | Job `executing`、Attempt `submitting`、无句柄、生成 0、上传 1 | 杀 → 放行闸门 → 推租约过期 → Worker 一轮 | `reconciled = 1`；Job `reconciliation_required`、Attempt `unknown`；对账案例 1；Hold 原样保留、渠道槽位 `held`；生成 0、查询 0、capture 0 | passed |
 | 提交中／未知接受 | `sigkill_while_the_create_response_is_missing_keeps_the_hold_and_never_resends` | 上游停住生成请求的响应 | Job `executing`、Attempt `submitting`、无句柄、生成 1 | 同上 | `reconciled = 1`；`reconciliation_required` / `unknown`；案例 1；Hold 保留、槽位 `held`；capture 0；生成计数仍为 1、查询 0 | passed |
 | 接受后句柄未写入 | `sigkill_after_acceptance_before_the_handle_is_stored_keeps_the_hold` | 上游先停住生成请求 → 锁 Job 行 → 放行提交应答 → 锁等待（`record_acceptance`） | 无句柄、查询 0、生成 1 | 终止等锁后端 → 放锁 → 推租约过期 → Worker 一轮 | `reconciled = 1`；`reconciliation_required` / `unknown`；案例 1；Hold 保留、槽位 `held`；capture 0；生成 1、查询 0 | passed |
 | 轮询中（终态未回） | `sigkill_while_polling_settles_once_on_recovery_without_resubmitting` | 上游停住第一次任务查询 | Job `executing`、Attempt `accepted`、句柄已入库、生成 1 | 杀 → 放行闸门并等那次挂起查询走出闸门 → 推租约过期 → Worker 一轮（按句柄只读查同一任务） | `taken_over = 1`、`settled = 1`；Job `succeeded`、Attempt `terminal`；capture 1；Hold 0；槽位 `released`；案例 0；生成 1、查询 2（被杀进程 1 次 + 恢复 1 次） | passed |

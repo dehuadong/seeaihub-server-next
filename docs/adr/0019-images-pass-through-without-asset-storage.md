@@ -17,3 +17,5 @@ status: accepted
 **可行性备选有两条，都落选**：① **先把结果归档到自有对象存储、再标 Job 成功**（[0008](./0008-own-object-storage-is-the-platform-result.md)，已退役）——落选，托管的每一步都要平台先持有字节，于是平台不得不替调用方承担素材权限、尺寸、摘要与存储寿命的责任，还要在渠道链接失效后继续"拥有"这张图（依据提交 `4f58b74` 与 [`.agents/notes/implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md`](../../.agents/notes/implemented/platform/2026-09-20-images-pass-through-without-asset-storage.md) 的"问题"节）；② **对客提供异步形态**（受理拿 `job_id`、再轮询取结果）——落选，上游是不是任务式是 ② Adapter 内部的事，把内部 Generation Record 投射成对客协议等于让调用方承担一次平台的执行细节（同一条记录的"问题"节把 202 受理与查询路由列在上一版设施里）。
 
 **代价**：上游 URL 短期有效，同步响应就是客户端拿到图的唯一时机——等不到结果只能靠超时窗口（上限 `GENERATION_SYNC_WAIT_SECONDS`）与失败重试；拿不到字节就没有魔数、尺寸、摘要校验，内容问题只能靠渠道报错；平台不再能承诺"这张图是你的资产"，要长期保存由调用方自己存；已建成的资产表、对象存储、异步受理与查询路由都要撤掉（迁移）。
+
+**生成请求之外的收窄**：上文的"不做上传换 id"只覆盖生成请求内——调用方手上的本地文件可以经**显式上传端点**转存到平台对象存储、换一个公网可读 URL 再提交，该通路不绑定 Job、不归档结果、不承诺保留期，见 [ADR-0022](./0022-reference-image-upload-endpoint.md)。

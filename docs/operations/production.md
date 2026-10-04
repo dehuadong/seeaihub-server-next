@@ -252,8 +252,9 @@ server {
     ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 
-    # API 的请求体上限是 16MB（参考图/遮罩走 multipart 或 data URL）；nginx 默认 1m 会先在它这里 413。
-    client_max_body_size 16m;
+    # 生成入口的请求体上限是 16MB（参考图/遮罩以公网 URL 文本随正文提交）；nginx 默认 1m 会先在它这里 413。
+    # 上传端点的单文件上限是 20 MiB，同一处正文上限还要盖住它的请求体上限（单文件加 multipart 余量，取值见 UPLOAD_MAX_REQUEST_BYTES）；示例取 24m。
+    client_max_body_size 24m;
 
     # 一次生成对客是同步的，最长等到 GENERATION_SYNC_WAIT_SECONDS 才回；nginx 默认 60s 会提前切断。
     proxy_read_timeout 720s;

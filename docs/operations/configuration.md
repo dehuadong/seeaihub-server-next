@@ -192,3 +192,21 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 请求指纹密钥只从环境变量读，**32 字节 base64**（`openssl rand -base64 32`），不进仓库、日志、响应或测试夹具，也不与渠道凭证混用。缺失、长度不对、或当前版本没有对应密钥时**启动即失败**，不让进程带着不完整的去重能力跑。
 
 **轮换**：把 `REQUEST_FINGERPRINT_KEY_VERSION` 抬到新值并加上新一档密钥，旧的保留；已有记录继续按自己的版本复核。移除旧版本密钥会让那批记录无法安全比对，同键调用返回 409 `idempotency_conflict`，而不是当成新请求。
+
+## 10. 上传端点与对象存储
+
+调用方把本地文件经 `POST /v1/uploads/images` 写入对象存储换公网 URL，再作为参考图或遮罩提交（行为合同见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](../design/0021-object-storage-upload.md)）。上传不计费、不计量、不限配额，也不建执行记录。
+
+渠道的 region、bucket 与 endpoint 是入库的公开配置，由管理员在渠道页填写与激活，不进环境变量。单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。
+
+| 变量 | 缺省 | 说明 |
+| --- | --- | --- |
+| `UPLOAD_STORAGE_ACCESS_KEY_ID` | 空＝该渠道未配置 | 访问密钥标识。与下一条一起构成完整凭据；只从环境变量读，不进库、不进日志与响应 |
+| `UPLOAD_STORAGE_ACCESS_KEY_SECRET` | 空＝该渠道未配置 | 访问密钥。两条只配一条时该渠道按"未配置"处理，进程照常启动，但不能激活 |
+| `UPLOAD_MAX_REQUEST_BYTES` | 单文件上限加 multipart 协议余量 | 上传请求体上限，超限回 `413 request_too_large`；余量取值在实施时定 |
+| `UPLOAD_SLOTS` | 实施时取值 | 本机同时读上传正文的许可数，取不到回 `429 upload_busy`，不排队 |
+| `UPLOAD_MAX_BUFFER_BYTES` | 实施时取值 | 本机上传内存预算 |
+| `UPLOAD_REQUEST_TIMEOUT_SECONDS` | 实施时取值 | 单次写对象存储的请求超时 |
+| `UPLOAD_HEALTH_PROBE_TIMEOUT_SECONDS` | 实施时取值 | 健康探针单请求超时 |
+
+健康结论只在激活渠道时产生：平台不按周期探测，也不因健康结论自动停用渠道。渠道行由迁移种下一行 `aliyun_oss`，管理端不提供新建渠道。
