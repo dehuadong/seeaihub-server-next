@@ -30,7 +30,7 @@
              crates/adapter-apimart  ② APIMart 一族
 ```
 
-依赖方向是单向的：`apps/* → application → domain`，基础设施**反向实现**应用层的端口。因此换数据库、加渠道都不牵动领域层。平台**不托管静态素材**（图片按渠道原形进原形出），所以没有对象存储这一层。
+依赖方向是单向的：`apps/* → application → domain`，基础设施**反向实现**应用层的端口。因此换数据库、加渠道都不牵动领域层。基础设施里没有对象存储的 crate 或表：生成结果按渠道原形进原形出，请求里的图只是参数值。
 
 ## 2. 五层落在哪
 
@@ -208,6 +208,6 @@ DirectExecutionService::execute                        crates/application  direc
 
 - **新增一个渠道族**：在 `crates/adapter-*` 加 Driver（②），发布新的 Profile/Offering（③④），不动 ① 与领域层——判据与合法例外见 0004 §4。
 - **新增一个型号或调整参数面**：只发布新的运行时素材（`config/bootstrap/*.json` 的形状），不重新编译。
-- **参考图的形态差异**（公网 URL / data URL、上游要 URL 还是要字节）：只在 ② Adapter 内部吸收，平台不搬运、不托管；判据见 [`docs/adr/0019`](adr/0019-images-pass-through-without-asset-storage.md)。
+- **参考图的形态差异**（公网 URL / data URL、上游要 URL 还是要字节）：只在 ② Adapter 内部吸收——上游要 URL 就透传，或经渠道自己的上传端点把内联图换成 URL；上游要字节就取回 URL 或就地解码。平台不落盘，也不托管生成结果；判据见 [`docs/adr/0019`](adr/0019-images-pass-through-without-asset-storage.md) 与 [`docs/adr/0022`](adr/0022-reference-image-upload-endpoint.md)。
 - **参数合同的归属**：调用方按 **Vendor Model Contract** 提交参数；同一 Vendor Model 在不同 Provider 的字段/位置/枚举差异由 **Offering Parameter Mapping** 在平台内部吸收。决策见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)。
 - **面向消费侧的跨厂商统一简化接口**：**不在本仓库内部**，属后期独立规划（见 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。**注意：这与上面那条不是同一件事**——"按各模型自己的合同提交"不等于"所有厂商共用一套字段"。

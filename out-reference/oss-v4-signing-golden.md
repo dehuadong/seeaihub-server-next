@@ -2,7 +2,7 @@
 
 > **性质**：参考实现的验收基准向量，外部参考资源，**不是平台接口合同**，运行中的服务不读取。
 > **来源**：参考实现 `/mnt/d/workspace/seeaihub` 的 `src/service/tests/uploads_signing_golden.rs`（自述其 golden 是正式实现的验收基准）、`src/service/src/uploads/signing/oss_v4.rs`（生产签名器）与 `src/service/src/uploads/signing/oss_v4_test.rs`（附加签名头向量）；生产请求构造在 `src/service/src/uploads/runtime.rs`。
-> **用途**：给[对象存储上传设计](../docs/design/0021-object-storage-upload.md) §5 的签名器对拍提供固定输入与期望值；参考实现本身在仓库外，本档让审阅与链接检查在仓库内够得到这些向量。
+> **用途**：给[对象存储上传设计](../docs/design/0021-object-storage-upload.md) §5 的签名器对拍提供固定输入与期望值（§2 末行是按该设计规则复算的生产 PUT 值，不是参考实现的输出）；参考实现本身在仓库外，本档让审阅与链接检查在仓库内够得到这些向量。
 
 ## 1. 固定输入
 
@@ -22,8 +22,11 @@
 | PUT | canonical query `x-oss-forbid-overwrite=true`、头 `content-type: image/jpeg` | `b3a10a1219b3e7a8dc32be76c288025027602d8227a591db3317f9be10cc8b14` |
 | HEAD | 无 query、无显式头 | `90cf7b7b9c6fc4062c5bcb51b2526cf11c24a7e6ded03d07d3532863438fc06a` |
 | GET | 头 `content-type: application/octet-stream` | `205d5ebe2322cc91d4657f9947681f95c13af8980e6315fe957bcbf017c486cc` |
+| PUT（按本设计规则复算，非参考实现输出） | canonical query 为空、头 `content-type: image/jpeg` 与 `x-oss-forbid-overwrite: true` | `c00baf659ad74992fd003d49e754bb137dfd35f235251529a398517dbce5e093` |
 
-上列输入都没有非默认头，AdditionalHeaders 为空，HashedPayload 是 `UNSIGNED-PAYLOAD`。
+上列前三条输入都没有非默认头，AdditionalHeaders 为空，HashedPayload 是 `UNSIGNED-PAYLOAD`。
+
+最后一行不是参考实现的输出：参考实现的生产 PUT 用请求头形态禁覆盖（§6），它的 golden 只钉 query 形态，这一行按[对象存储上传设计](../docs/design/0021-object-storage-upload.md) §5 的请求构造规则复算（同一构造对上面三条复算后与本档逐字节一致），供实现时对拍；实施时须用移植用例逐字节复验后再钉住。
 
 ## 3. 预签名 GET（query 模式）
 

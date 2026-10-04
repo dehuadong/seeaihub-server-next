@@ -40,8 +40,8 @@ Provider 与 Vendor 不合并：以后其他 Provider 也供应 `gpt-image-2` �
 CreateImageGenerationRequest {        // 调用方看到的形状（对客接口）
   model,                             // 对外的模型字段＝平台型号名（运营发布时的型号标识）
   <合同里的模型参数，扁平放顶层>,        // prompt / n / size / quality / …
-  image | image_urls,                // 参考图（同义、二选一）：http(s) 公网 URL
-  mask,                              // 可选；http(s) 公网 URL
+  image | image_urls,                // 参考图（同义、二选一）：http(s) 公网 URL 或 data URL
+  mask,                              // 可选；http(s) 公网 URL 或 data URL
   // 幂等键走 `Idempotency-Key` 请求头；预授权额由服务端定，调用方不报
 }
 ```
@@ -53,7 +53,7 @@ CreateImageGenerationRequest {        // 调用方看到的形状（对客接口
 | 条件 | 内部判定 | 约束 |
 | --- | --- | --- |
 | 无 `image`、无 `mask` | prompt-only | 使用厂商原生文生图参数合同 |
-| 有 `image`、无 `mask` | image-conditioned | 图**只是参数值**（`http(s)` 公网 URL）：平台不校验内容、MIME、字节或数量，交给渠道判 |
+| 有 `image`、无 `mask` | image-conditioned | 图**只是参数值**（`http(s)` 公网 URL 或 `data:` URL，edits 的 multipart 文件部件也一样）：平台不校验内容、MIME、字节或数量，交给渠道判 |
 | 有 `image`、有 `mask` | masked | 仅在候选声明支持时启用；mask 同样是参数值，尺寸/通道由渠道校验 |
 | 无 `image`、有 `mask` | 非法 | 调用上游前失败 |
 
@@ -67,7 +67,7 @@ admitted → executing → succeeded
 
 没有领取阶段：执行由发起这次请求的 API 进程直接持有并完成。Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、请求指纹与幂等摘要、Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
-HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations`（JSON）与 `/v1/images/edits`（`multipart/form-data`，`image`/`mask` 以文本部件给出公网 URL）。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。multipart 上 `image`/`mask` 只认文本部件，值按 `http(s)` 公网 URL 读；`data:` URL 与文件部件在受理前被拒（[Spec 0005](../specs/0005-synchronous-image-gateway.md) §3）。
+HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations`（JSON）与 `/v1/images/edits`（`multipart/form-data`，`image`/`mask` 可以是文本部件或文件部件）。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。图片取值是 `http(s)` 公网 URL 或 `data:` URL，multipart 的文本部件按这两种值读、文件部件也受理；生成入口收敛为只收公网 URL 的合同见 [Spec 0005](../specs/0005-synchronous-image-gateway.md) §1、§3，随实现落地。
 
 ## 4. 执行路径与接口职责
 
@@ -146,7 +146,7 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 
 ## 8. 输入与输出图片
 
-- 参考图/遮罩就是普通参数值：`http(s)` 公网 URL；AIHubMix 的编辑端点要文件部件，所以由 Adapter 自己从 URL 取字节，平台不代取；
+- 参考图/遮罩就是普通参数值：`http(s)` 公网 URL 或 `data:` URL，edits 的 multipart 文件部件也一样；AIHubMix 的编辑端点要文件部件，所以由 Adapter 自己取字节（公网 URL 去取、`data:` URL 就地解码）；
 - `image`/`images`/`mask` 仍保留 AIHubMix 原生字段语义，平台只把它们放到这些字段上；
 - AIHubMix 输出 URL 约 30 分钟失效，且下载可能需同一 Bearer。平台**不代取**：渠道给 `b64_json` 就回 base64、给 `url` 就回 URL，长期保存由调用方自己负责（决策见 `docs/adr/0019-images-pass-through-without-asset-storage.md`）；
 - 上游 URL 和 Bearer 不返回给平台调用方，不作为永久结果；

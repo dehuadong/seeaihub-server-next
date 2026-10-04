@@ -252,10 +252,9 @@ server {
     ssl_certificate     /etc/letsencrypt/live/example.com/fullchain.pem;
     ssl_certificate_key /etc/letsencrypt/live/example.com/privkey.pem;
 
-    # 生成入口的请求体上限是 16MB（参考图/遮罩以公网 URL 文本随正文提交）；nginx 默认 1m 会先在它这里 413。
-    # 上传端点的单文件上限是 20 MiB（领域常量，不可配），同一处还要盖住它的请求体上限：单文件上限加
-    # multipart 协议余量，API 侧取值由 UPLOAD_MAX_REQUEST_BYTES 定。示例 24m = 20 MiB + 协议余量。
-    client_max_body_size 24m;
+    # 生成入口的请求体上限是 16 MiB（参考图/遮罩以公网 URL 或 data URL 文本随正文提交，multipart
+    # 文件部件也走这条正文上限）；nginx 默认 1m 会先在它这里 413。示例 16m 与该上限同值。
+    client_max_body_size 16m;
 
     # 一次生成对客是同步的，最长等到 GENERATION_SYNC_WAIT_SECONDS 才回；nginx 默认 60s 会提前切断。
     proxy_read_timeout 720s;
@@ -280,7 +279,7 @@ sudo nginx -t && sudo systemctl reload nginx
 要点：
 
 - 两个域名共用一份配置：分发由 API 按 `Host` 决定，反代不区分；**别把 `Host` 改写成 `127.0.0.1`**，否则运营后台打不开；
-- `client_max_body_size` 要同时盖住生成入口的 16MB 正文上限与上传端点的请求体上限（20 MiB 单文件加 multipart 协议余量，示例 24m）；`proxy_read_timeout` 不小于 `GENERATION_SYNC_WAIT_SECONDS`（默认是 `PROVIDER_TIMEOUT_SECONDS + 30`）；
+- `client_max_body_size` 要盖住生成入口的 16 MiB 正文上限（示例 `16m`）；`proxy_read_timeout` 不小于 `GENERATION_SYNC_WAIT_SECONDS`（默认是 `PROVIDER_TIMEOUT_SECONDS + 30`）；
 - API 绑在回环（`API_BIND=127.0.0.1:8081`），只让 nginx 够得到；证书用 certbot 之类签发即可。
 
 ## 3. 启动与探活

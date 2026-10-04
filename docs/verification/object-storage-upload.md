@@ -1,47 +1,65 @@
 # 上传存储（阿里云 OSS）部署自检执行清单
 
-- **用途**：在启用上传前证明部署侧的桶满足[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8 的匿名可读前置条件，并核对签名与桶配置在真实服务端可用。
-- **性质**：部署侧在真实桶上执行的清单；产生的探针对象是外部副作用，不是本平台的业务事实。
-- **前置**：上传存储变量已配齐（见本文 §1）；有对象存储控制台或命令行工具可核对桶策略与对象。
-- **边界**：本文只列执行步骤与停止条件；合同归上述 Spec，机制与四步自检归[对象存储上传设计](../design/0021-object-storage-upload.md) §6。自检不是运行期健康检查，平台在启动或运行期都不探测桶。
+- **用途**：在启用上传前证明部署侧的桶满足[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8 的匿名可读前置条件，并核对桶配置与平台签名在真实服务端可用。
+- **性质**：部署侧在真实桶上执行的清单；产生的探针对象与上传对象是外部副作用，不是本平台的业务事实。
+- **前置**：上传存储变量已配齐（见本文 §1）；有对象存储控制台或命令行工具；§4 另需服务的对外地址（下面写作 `$BASE`）、一个平台客户 API Key（下面写作 `$API_KEY`）与显式批准。
+- **边界**：本文只列执行步骤与停止条件；合同归上述 Spec，机制与四步自检归[对象存储上传设计](../design/0021-object-storage-upload.md) §6。平台的上传路径只有 PUT 与 HEAD 两个操作，不发 GET，也不签发预签名 URL：下面的核验读回与匿名读用对象存储控制台或命令行工具完成。自检不是运行期健康检查，平台在启动或运行期都不探测桶。
 
 ## 1. 配置形状检查
 
 - 取值域归[对象存储上传设计](../design/0021-object-storage-upload.md) §3、§4，这里逐条核对：region 形如 `cn-hangzhou`（小写字母、数字与连字符，首尾是字母或数字，长度不超过 63）；bucket 是 3–63 位同类字符、不含点号；`UPLOAD_STORAGE_ACCESS_KEY_ID` 与 `UPLOAD_STORAGE_ACCESS_KEY_SECRET` 成对（要么都给、要么都不给）。
-- 显式 endpoint 是 `https`，或只给 loopback（`127.0.0.1`、`::1`、`localhost`）的 `http`；不带凭证（userinfo）、path、query 与 fragment。省略 endpoint 时按 region 派生 `https://oss-{region}.aliyuncs.com`。
+- 显式 endpoint 是含 scheme 的 origin：scheme 为 `https`，或只给 loopback（`127.0.0.1`、`::1`、`localhost`）的 `http`；不带凭证（userinfo）、path、query 与 fragment。省略 endpoint 时按 region 派生 `https://oss-{region}.aliyuncs.com`。
 - 整组都不给＝未配置：进程照常启动，上传端点对该请求返回 `503 upload_storage_unavailable`；只给一部分或形状不合法：启动期被拒并点名变量，进程不启动。被点名的变量改回合法取值再启动，不靠自检绕过。
 - 启动后确认上传端点不是 `503 upload_storage_unavailable`（即上传存储已配置）。
 
-## 2. PUT 探针对象
+## 2. 写入探针对象（对象存储控制台或命令行工具）
 
-- 用服务端生成的 1×1 合法 PNG 探针字节，对象键取 `reference-media/{UTC 日期}/probe-{uuid}.png`，与调用方素材的键不复用。
-- 带禁覆盖头 `x-oss-forbid-overwrite: true` 与 V4 签名发出 PUT，期望 `200`。
-- 在对象存储控制台核对该键存在，字节长度与内容类型与写入一致。
+- 用一个 1×1 合法 PNG 探针字节，对象键取 `reference-media/{UTC 日期}/probe-{uuid}.png`，与调用方素材的键不复用。
+- 用控制台或命令行工具写入该对象（工具自己完成 V4 签名），期望成功。
+- 在控制台核对该键存在，字节长度与内容类型与写入一致。
 
-## 3. HEAD 核验
+## 3. 核验、读回与公网 URL
 
-- 对同一对象键发 HEAD（header 模式签名），期望 `200`。
-- 比对返回的字节长度与内容类型与写入值一致；不一致即这次自检不通过，按下文处置。
+- 对同一对象键核对字节长度与内容类型与写入值一致；不一致即这次自检不通过，按下文处置。
+- 用控制台或命令行工具（自带签名）读回该对象，返回字节与写入字节逐字节相同。
+- 再用不带凭证的客户端读同一对象的公网 URL（下面写作 `$PUBLIC_URL`）：
 
-## 4. 读回比对与公网 URL
+```sh
+curl -sS -o probe-readback.bin -w '%{http_code}\n' "$PUBLIC_URL"
+# 期望 200，且 probe-readback.bin 与写入的探针字节逐字节相同
+```
 
-- 先用带 `Authorization` 头的 header 模式 GET 读回对象，确认返回字节与写入逐字节相同（证明签名与读权限）。
-- 再用不带凭证的客户端 GET 公网 URL，确认返回字节与写入逐字节相同（证明桶匿名可读）。
-- 公网 URL 取哪种寻址形态、它与签名输入的关系见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §6；这里只确认不带凭证的客户端读的是归属该 endpoint 的形态（真实 OSS 虚拟主机式，显式 loopback 端点 path-style）。
-- 签名必查项：header 模式 GET 的 canonical URI 必须恒为 `/{bucket}/{key}`（含 bucket），与寻址形态无关（[对象存储上传设计](../design/0021-object-storage-upload.md) §5）。漏拼 bucket 只会在这里被真实服务端拒。
+- 公网 URL 取哪种寻址形态、`{endpoint-host}` 与寻址形态的关系见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §6；这里只确认不带凭证的客户端读的是归属该 endpoint 的形态（真实 OSS 虚拟主机式，显式 loopback 端点 path-style）。
 - 对象清理：记录本次创建的探针对象键，在对象存储控制台按自己的保留策略清理；平台不代删、不续期。
+
+## 4. 平台签名的真实服务端联调（需显式批准）
+
+- 前置：上传存储变量指向真实桶；一个平台客户 API Key；显式批准——这一步会在真实桶写入一个对象，产生对象存储的请求费用与残留。
+- 起 API 后发一次探针上传（`probe.png` 就是 §2 用的那个 1×1 PNG）：
+
+```sh
+curl -sS -X POST "$BASE/v1/uploads/images" \
+  -H "Authorization: Bearer $API_KEY" \
+  -F file=@probe.png
+# 期望 200 与 {"url":"…","media_type":"image/png","byte_length":N}
+```
+
+- 这次上传的 PUT（带禁覆盖头）与 HEAD 元数据核验都由平台的签名实现发出：PUT 被真实服务端接受，即证明签名与 canonical URI 的拼装都对。
+- 签名必查项：canonical URI 必须恒为 `/{bucket}/{key}`（含 bucket），与寻址形态无关（[对象存储上传设计](../design/0021-object-storage-upload.md) §5、§10）。请求走虚拟主机形态，漏拼 bucket 只会在这里被真实服务端拒。
+- 对返回的 `url` 重跑 §3 的不带凭证读取，确认字节与上传一致；记录对象键以便清理。
 
 ## 失败时看什么
 
-- `401`、`403`、`404`：密钥写错、权限不足（缺 PUT / HEAD / GET 之一）或 bucket / region 写错；对照[对象存储上传设计](../design/0021-object-storage-upload.md) §7 的失败分类表。
-- 上传返回 `200` 但匿名 GET 读不到：桶策略没有匿名可读，按[Spec 0007](../specs/0007-image-upload-and-object-storage.md) §8 改桶策略。
-- 签名被服务端拒：核对 canonical URI 是否含 bucket、签名头集合是否为全部 `x-oss-*` 加 `content-type` / `content-md5`、`x-oss-date` 是否为当前 UTC。
+- `401`、`403`、`404`：密钥写错、权限不足（平台的上传路径需要 PUT 与 HEAD 两个权限）或 bucket / region 写错；对照[对象存储上传设计](../design/0021-object-storage-upload.md) §7 的失败分类表。
+- 平台上传返回 `200` 但匿名读不到：按[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8 处置。
+- 平台上传被服务端拒签名：核对 canonical URI 是否含 bucket、签名头集合是否为全部 `x-oss-*` 加 `content-type` / `content-md5`、`x-oss-date` 是否为当前 UTC。
 - 自检失败不产生任何状态变更：不写健康状态、不改配置、不建执行记录、不动账务；处置是部署侧改配置后重跑。
 
 ## 停止条件
 
-- 四步任一步失败即停止，不在运行期降级，也不因结论不健康停用上传路径。
+- §2 与 §3 的四步任一步失败即停止，不在运行期降级，也不因结论不健康停用上传路径。
+- §4 失败同样停止：先按「失败时看什么」改配置或修签名，再重跑。
 
 ## 执行记录
 
-（实现落地后在此填日期、步骤、状态码、探针对象键与结论；不写密钥、签名参数与完整 URL。）
+（实现落地后在此填日期、步骤、状态码、探针与上传对象键与结论；不写密钥、签名参数与完整 URL。）

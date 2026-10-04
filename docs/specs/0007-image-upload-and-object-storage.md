@@ -32,7 +32,7 @@
 
 请求体是 `multipart/form-data`，恰好一个文件部件，字段名 `file`。缺少 `file`、出现除 `file` 以外的部件、出现两个 `file` 部件、或 `file` 没有文件名时，返回 `400 invalid_multipart`。一次请求一个文件，本端点不做批量。
 
-声明的 `Content-Length` 超过上传路由的请求体上限即在零正文读取的情况下返回平台错误信封 `413 request_too_large`；流式读取的同一上限同样返回 `413 request_too_large`；正文慢读超时是受理前的 `408 request_timeout`。
+声明的 `Content-Length` 超过上传路由的请求体上限即在零正文读取的情况下返回平台错误信封 `413 request_too_large`；流式读取的同一上限同样返回 `413 request_too_large`；正文慢读超时是受理前的 `408 request_timeout`。上传路由自带请求体上限，进程合并后的全局 16 MiB 正文上限不约束它：单文件合法、整个请求体超过 16 MiB 而不超过上传路由上限的请求正常受理。
 
 ### 2.3 成功响应
 
@@ -65,7 +65,7 @@
 
 ## 4. 对象键与写入
 
-对象键的构造、签名机制、签名头集合与对象存储的地址构成由[对象存储上传设计](../design/0021-object-storage-upload.md) §5 拥有。调用方可见的判据是：键形如 `reference-media/{UTC 日期}/{uuid}.{ext}`，`uuid` 是随机 v4，扩展名由规范 MIME 反推；调用方给的文件名不进对象键、不进对象元数据。
+对象键的构造、签名机制与签名头集合由[对象存储上传设计](../design/0021-object-storage-upload.md) §5 拥有。调用方可见的判据是：键形如 `reference-media/{UTC 日期}/{uuid}.{ext}`，`uuid` 是随机 v4，扩展名由规范 MIME 反推；调用方给的文件名不进对象键、不进对象元数据。
 
 写入禁止覆盖同名对象，键按随机唯一构造，正常不会相撞。相撞是平台侧异常，按 §5 的平台侧错误回应：不换键重写、不覆盖既有对象。
 
@@ -86,8 +86,8 @@
 | 正文慢读超时（受理前） | `408` | `request_timeout` |
 | 请求级速率超限 | `429` | `rate_limit_exceeded` |
 | 本机上传并发满或上传内存预算耗尽 | `429` | `upload_busy` |
-| 上传存储未配置（全部上传存储变量都不存在） | `503` | `upload_storage_unavailable` |
-| 对象存储不可达、超时、`5xx`、限流重试耗尽、对象键相撞、写入后元数据核验不一致 | `503` | `object_store_unavailable` |
+| 上传存储未配置（全部上传存储变量都不存在），或密钥解析返回 `Configuration` 类错误 | `503` | `upload_storage_unavailable` |
+| 对象存储不可达、超时、`5xx`、限流重试耗尽、对象键相撞、写入后元数据核验不一致、返回终态 `4xx`（`401`、`403`、`404`、`409` 与其他 `4xx`） | `503` | `object_store_unavailable` |
 | 其他服务端故障 | `500` | `internal_error` |
 
 只有可重试失败才重试写入：网络错误、对象存储返回的 `408`、`429` 与对象存储 `5xx`（失败分类见[对象存储上传设计](../design/0021-object-storage-upload.md) §7）。对客的 `408 request_timeout` 是受理前正文慢读的终态码，不参与重试。总尝试次数有上限；对象存储给出有界整数秒 `Retry-After` 时按它等待，否则按固定退避。上限与退避基准由服务端配置的 `UPLOAD_RETRY_MAX_ATTEMPTS` 与 `UPLOAD_RETRY_BACKOFF_BASE_SECONDS` 给出，具体取值在实施时定，取值不改变本节的语义。已确认写入成功的对象不再重复写入。
@@ -100,7 +100,7 @@
 
 ## 6. 公网 URL 的语义与有效性
 
-返回的 URL 不带签名参数、不带过期时间。寻址形态随 endpoint 决定：真实 OSS 用虚拟主机式 `https://{bucket}.{endpoint-host}/{object-key}`；显式给 loopback 端点时用 path-style `http://{endpoint-host}/{bucket}/{object-key}`，端到端夹具按这个形态取图。签名的 canonical URI 与寻址形态无关，恒为 `/{bucket}/{key}`。任何持有该 URL 的一方都能匿名读到对象；URL 本身不含凭证，分享 URL 等于分享图片内容。
+返回的 URL 不带签名参数、不带过期时间。寻址形态随 endpoint 决定：`UPLOAD_STORAGE_ENDPOINT` 是**含 scheme 的 origin**（如 `https://oss-cn-hangzhou.aliyuncs.com`、`http://127.0.0.1:9000`）；真实 OSS 用虚拟主机式 `https://{bucket}.{endpoint-host}/{object-key}`，显式给 loopback 端点时用 path-style `http://{endpoint-host}/{bucket}/{object-key}`，端到端夹具按这个形态取图。`{endpoint-host}` 是这个 origin 去掉 scheme 后的 host 与可选端口（取值域与形状校验见[对象存储上传设计](../design/0021-object-storage-upload.md) §3）。签名的 canonical URI 与寻址形态无关，恒为 `/{bucket}/{key}`。任何持有该 URL 的一方都能匿名读到对象；URL 本身不含凭证，分享 URL 等于分享图片内容。
 
 平台承诺的有效性边界是：对象未被删除、桶保持公网可读、配置（region、bucket、endpoint）未改动时，该 URL 继续可读。桶的匿名可读是部署侧要满足的运维前置条件，不是平台在运行期检查或激活的动作，见 §8。
 
@@ -124,16 +124,18 @@
 
 | 编号 | 可观察判据 |
 | --- | --- |
-| A1 | 全部上传存储变量都不存在时上传返回 `503 upload_storage_unavailable`，对象存储没有新对象，进程照常启动；形状不合法（region / bucket 形状、显式 endpoint 既不是 `https` 也不是 loopback 的 `http`、带凭证、path、query 或 fragment、访问密钥只给一条，或只给了整组配置的一部分）在启动期被拒并点名，进程不启动。 |
+| A1 | 全部上传存储变量都不存在时上传返回 `503 upload_storage_unavailable`，对象存储没有新对象，进程照常启动；形状不合法（region / bucket 形状、显式 endpoint 既不是 `https` 也不是 loopback 的 `http`、带凭证、path、query 或 fragment、访问密钥只给一条，或只给了整组配置的一部分）在启动期被拒并点名，进程不启动；密钥解析返回 `Configuration` 类错误时上传返回 `503 upload_storage_unavailable`，不是 `500 internal_error`。 |
 | A2 | 上传一张合法 PNG 返回 `200`，`media_type` 是服务端判定的 `image/png`；用无凭证的客户端读返回的 `url` 能取到与上传一致的字节。 |
-| A3 | 单文件字节严格小于 20 MiB 通过、等于 20 MiB 返回 `413 image_too_large`；超过上传路由请求体上限时（含单文件合法、整个请求体超过全局 16 MiB 正文上限的场景）零正文读取返回平台错误信封 `413 request_too_large`，不是框架的裸 `413`。 |
+| A3a | 单文件字节严格小于 20 MiB 通过、等于 20 MiB 返回 `413 image_too_large`；请求体超过上传路由的请求体上限时零正文读取返回平台错误信封 `413 request_too_large`，不是框架的裸 `413`。 |
+| A3b | 单文件合法、整个请求体超过全局 16 MiB 正文上限且不超过上传路由上限的 multipart 请求被受理：返回 `200` 并写入对象，受理前不返回 `413`。 |
 | A4 | 白名单外的类型、0 字节文件、魔数与声明的 `Content-Type` 不一致都在写入前被拒（`400`），对象存储没有新对象；文件部件不声明 `Content-Type` 时不做一致性比较，`media_type` 仍取魔数判定值。 |
 | A5 | 对象键形如 `reference-media/{UTC 日期}/{uuid}.{ext}`，不含调用方文件名；同一次上传的两次调用产生不同的键。 |
 | A6 | 无效 API Key 返回 `401 invalid_api_key` 且不读正文、不写对象；上传速率超限返回 `429 rate_limit_exceeded`；本机上传并发满或上传内存预算耗尽返回 `429 upload_busy`；上传速率不占用生成接口的每 API Key 配额。 |
 | A7 | 上传前后账户余额、资金占用、执行记录条数与账本条目不变：上传不计费、不计量、不限配额，也不产生执行记录与账目。 |
-| A8 | 对象存储返回可重试错误时按同一对象键重试；重试耗尽返回 `503 object_store_unavailable`；写入后元数据核验不一致同样返回 `503 object_store_unavailable` 且不返回 URL；日志、trace 与响应不含密钥、签名与对象字节。 |
+| A8 | 对象存储返回可重试错误时按同一对象键重试；重试耗尽返回 `503 object_store_unavailable`；对象存储返回终态 `4xx`（`401`、`403`、`404`、`409` 与其他 `4xx`）时不重试、返回 `503 object_store_unavailable` 且不返回 URL；写入后元数据核验不一致同样返回 `503 object_store_unavailable` 且不返回 URL；日志、trace 与响应不含密钥、签名与对象字节。 |
 | A9 | 正文慢读超时（受理前）返回 `408 request_timeout`，此时没有对象被写入；写入开始后客户端断开是服务端观测事实，不构成对客错误码：服务端不为已断开的请求返回 URL，已写入的对象成为孤儿、平台不为它产生 URL，账户与账本不变。 |
 | A10 | 内容为 PNG 字节而文件名为 `a.gif` 时仍按 `image/png` 受理，对象键扩展名是 `png`：准入只看内容魔数，调用方文件名的扩展名不影响受理。 |
+| A11 | 非 multipart 正文、缺 boundary、缺少 `file` 部件、出现除 `file` 以外的部件、出现两个 `file` 部件、`file` 没有文件名时都返回 `400 invalid_multipart`，对象存储没有新对象。 |
 
 ## 10. 技术设计与修订
 
@@ -142,4 +144,4 @@
 | 修订 | 章节 | 合同变化摘要 | 状态／生效版本 |
 | --- | --- | --- | --- |
 | v1 | 全文 | 建立上传端点的鉴权、请求与响应形态、大小与类型上限、错误码与重试合同，公网 URL 的语义与有效性边界（桶的匿名可读是激活判据），平台不承担保留期与删除，以及对象存储（今称上传存储）的公开配置、健康判据、激活语义与管理端端点。 | 已接受／v1 |
-| v2 | §1–§9 | 上传素材只走阿里云 OSS，region / bucket / 可选 endpoint / 访问密钥全部来自部署侧环境变量：没有管理端页面、存储表与激活动作，配置整组缺失时上传返回 `503 upload_storage_unavailable` 且进程照常启动，形状不合法在启动期拒绝并点名，启动期不做活体探测；术语改为「上传存储」（英文 Upload Storage）；上传速率用独立命名空间，不挤占生成的每 API Key 配额；bucket 名按阿里云规则禁用点号，region 给出合法形状，endpoint 保留为部署侧可改的 `https` 地址；密钥成对读取、不完整按形状不合法处理；错误码区分"未配置"与"对象存储故障"；补 HEAD 核验不一致、缺 `Content-Type` 声明与两个 `file` 部件的判据；签名机制、对象键构造与桶匿名可读的自检步骤移入设计，Spec 只留可观察判据；新增 A9（`408` 慢读的对象副作用）与 A10（准入只看魔数）。 | 待接受／无 |
+| v2 | §1–§9 | 上传素材只走阿里云 OSS，region / bucket / 可选 endpoint / 访问密钥全部来自部署侧环境变量：没有管理端页面、存储表与激活动作，配置整组缺失时上传返回 `503 upload_storage_unavailable` 且进程照常启动，形状不合法在启动期拒绝并点名，启动期不做活体探测；术语改为「上传存储」（英文 Upload Storage）；上传速率用独立命名空间，不挤占生成的每 API Key 配额；bucket 名按阿里云规则禁用点号，region 给出合法形状，endpoint 是部署侧可改的含 scheme 的 origin（真实 OSS 必须 `https`，loopback 允许 `http`）；密钥成对读取、不完整按形状不合法处理；错误码区分"未配置"与"对象存储故障"；补 HEAD 核验不一致、缺 `Content-Type` 声明与两个 `file` 部件的判据；签名机制、对象键构造与桶匿名可读的自检步骤移入设计，Spec 只留可观察判据；新增 A9（`408` 慢读的对象副作用）、A10（准入只看魔数）与 A3b（单文件合法、整体超过全局 16 MiB 正文上限且不超过上传路由上限的请求必须受理），原 A3 的请求体超限判据保留为 A3a；A1 补密钥解析 `Configuration` 类错误的兜底判据，A8 补对象存储终态 `4xx` 的不重试与不返回 URL 判据，新增 A11（`invalid_multipart` 的请求形态判据）。 | 待接受／无 |

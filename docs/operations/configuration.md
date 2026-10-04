@@ -195,6 +195,8 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 
 ## 10. 上传端点与上传存储
 
+这些配置随上传端点实现落地：在此之前 `POST /v1/uploads/images` 与下面的 `UPLOAD_*` 变量在代码里都不存在，进程不读取也不接受它们。
+
 调用方把本地文件经 `POST /v1/uploads/images` 写入上传存储换公网 URL，再作为参考图或遮罩提交生成请求（行为合同见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](../design/0021-object-storage-upload.md)）。上传不计费、不计量、不限配额，也不建执行记录；上传存储只有**阿里云 OSS** 一种。
 
 上传存储的配置**全部从环境变量读**：没有后台管理页，也没有数据库表。取值域与失败分类见[对象存储上传设计](../design/0021-object-storage-upload.md)。
@@ -203,14 +205,21 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 | --- | --- | --- |
 | `UPLOAD_STORAGE_REGION` | 无；整组都不给＝未配置 | 形如 `cn-hangzhou`，取值是小写字母、数字与连字符，首尾必须是字母或数字，长度不超过 63 |
 | `UPLOAD_STORAGE_BUCKET` | 无；整组都不给＝未配置 | 3–63 位小写字母、数字与连字符，**不含点号**（含点的桶名在 `{bucket}.{host}` 形态下会撞只覆盖一级标签的通配符证书） |
-| `UPLOAD_STORAGE_ENDPOINT` | 按 region 派生 | 可选；省略时用 `https://oss-{region}.aliyuncs.com`，显式给出时必须是 `https`、只含主机名与可选端口，不带凭证、path、query 与 fragment |
+| `UPLOAD_STORAGE_ENDPOINT` | 按 region 派生 | 可选；省略时用 `https://oss-{region}.aliyuncs.com`，显式给出时是含 scheme 的 origin（`https://主机[:端口]`；端到端自检可给 loopback 的 `http://127.0.0.1[:端口]`，见[对象存储上传设计](../design/0021-object-storage-upload.md) §4），不带凭证、path、query 与 fragment |
 | `UPLOAD_STORAGE_ACCESS_KEY_ID` | 无；须与下一条成对 | 访问密钥标识。只从环境变量读，不进日志与响应 |
 | `UPLOAD_STORAGE_ACCESS_KEY_SECRET` | 无；须与上一条成对 | 访问密钥 |
 | `UPLOAD_MAX_REQUEST_BYTES` | 单文件上限加 multipart 协议余量 | 上传请求体上限，超限回 `413 request_too_large`；余量取值在实施时定 |
 | `UPLOAD_SLOTS` | 实施时取值 | 本机同时读上传正文的许可数，取不到回 `429 upload_busy`，不排队 |
 | `UPLOAD_MAX_BUFFER_BYTES` | 实施时取值 | 本机上传内存预算 |
 | `UPLOAD_REQUEST_TIMEOUT_SECONDS` | 实施时取值 | 单次写对象存储的请求超时 |
+| `UPLOAD_SLOW_READ_TIMEOUT_SECONDS` | 实施时取值 | 上传正文从开始接收到读完的上限；超时在受理前回 `408 request_timeout`，此时没有对象被写入 |
+| `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` | 实施时取值 | 每 API Key 每窗口允许的上传请求数。上传的计数键与生成分开，不挤占生成的每 API Key 配额；超限回 `429 rate_limit_exceeded` |
+| `UPLOAD_RATE_LIMIT_WINDOW_MS` | 实施时取值 | 上传限流窗口的毫秒数 |
+| `UPLOAD_RETRY_MAX_ATTEMPTS` | 实施时取值 | 单次上传写入的总尝试次数上限 |
+| `UPLOAD_RETRY_BACKOFF_BASE_SECONDS` | 实施时取值 | 固定退避基准秒数；对象存储未给出有界整数秒 `Retry-After` 时按它等待 |
 
-单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。上传存储的**整组变量都不给＝未配置**：进程照常启动，上传端点对该请求返回 `503 upload_storage_unavailable`；**只给一部分**（缺 region、bucket 或任一条密钥）或取值形状不合法＝**启动期拒绝并点名**，进程不启动。启动与运行期都不做活体探测：对象存储可达性、bucket 是否存在与桶是否匿名可读都不在启动判据里。
+标「实施时取值」的缺省值在实施落地时按本机容量与对象存储表现取定。单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。上传存储的**整组变量都不给＝未配置**：进程照常启动，上传端点对该请求返回 `503 upload_storage_unavailable`；**只给一部分**（缺 region、bucket 或任一条密钥）或取值形状不合法＝**启动期拒绝并点名**，进程不启动。启动与运行期都不做活体探测：对象存储可达性、bucket 是否存在与桶是否匿名可读都不在启动判据里。
 
-**桶必须匿名可读**，这是运维前置条件：平台不逐对象发 `x-oss-object-acl` 或任何 ACL 头，对象的匿名可读只由桶策略给。平台在启动与运行期都不探测桶；启用上传前由部署侧按[对象存储上传设计](../design/0021-object-storage-upload.md) 的四步自检证明这个桶可用（PUT 探针 → HEAD 核验字节与类型 → 签名 GET → 匿名 GET 且字节一致），任一步失败就改桶策略、region、bucket 或密钥。桶配错的表现是上传返回 `200` 而公网 URL 读不到。
+桶的匿名可读是启用上传的运维前置条件：它的合同、失败后果与自检入口见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8。
+
+桶策略由运维在对象存储控制台写：把该桶的读写权限设为**公共读**。平台不发放对象 ACL 头，也不在启动或运行期探测桶；桶策略没生效时上传仍会成功，但返回的公网 URL 读不到。
