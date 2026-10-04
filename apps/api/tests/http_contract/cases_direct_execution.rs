@@ -552,6 +552,9 @@ async fn direct_same_key_while_running_is_request_in_progress() {
     harness.cleanup().await;
 }
 
+/// 等计数器稳定的上限：到点用最后一次读数，不让等待无限拉长。
+const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
+
 /// 本库**已提交事务**计数：直接执行期间的 SQL 增量按它观测。
 async fn committed_transactions(pool: &sqlx::PgPool) -> i64 {
     let count: i64 = sqlx::query_scalar(
@@ -563,19 +566,24 @@ async fn committed_transactions(pool: &sqlx::PgPool) -> i64 {
     count
 }
 
-/// 等计数器**稳定**后再读它。
+/// 等计数器**稳定**后再读它，最多等到 `SETTLE_DEADLINE`。
 ///
 /// `pg_stat_database` 的计数按约 1s 的粒度成批可见：只前后各读一次，批次边界上与本请求无关的
-/// 整批提交（夹具建库、发布与账户夹具）会被算进请求增量。这里读到连续两次读数相同为止
-/// （间隔大于一档统计粒度），读到的是真正落定的提交数。
+/// 整批提交（夹具建库、发布与账户夹具）会被算进请求增量。这里读到连续两次读数相同为止。
+///
+/// 但**读计数器本身也是一次提交**，而负载高时统计刷新更勤，前后两次读数可能始终差 1——纯等
+/// "两次相同"会无限循环（实测整套并行跑时挂死在这里）。所以给一个上限：到点用最后一次读数，
+/// 让抖动落进用例自己留的余量里，而不是把等待无限拉长。
 async fn settled_committed_transactions(pool: &sqlx::PgPool) -> i64 {
+    let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
+    let mut last = committed_transactions(pool).await;
     loop {
-        let before = committed_transactions(pool).await;
         tokio::time::sleep(Duration::from_millis(1_200)).await;
         let after = committed_transactions(pool).await;
-        if before == after {
+        if last == after || tokio::time::Instant::now() >= deadline {
             return after;
         }
+        last = after;
     }
 }
 
