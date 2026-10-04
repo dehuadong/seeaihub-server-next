@@ -50,7 +50,7 @@
 
 - **存的那份合同不动**（合同行不可变，`ADR-0003`/`ADR-0015`），**对客投射时把 `model.const` 替换成该网关模型名**。理由：受理期平台本来就用调用方给的 `model` 覆盖这个字段（`crates/application` 的 `contract_parameter_face` 里 `parameters.insert("model", request.model)`），`model` 一直是**平台字段**，不是厂商字段；投射时替换既不改数据、也不改校验行为。
 - **发布期新增一条校验**：合同的 `properties.model.const` 必须等于本次发布的 `native_model_id`。它保证素材不把网关名或别的名字写进合同正文，也让 P1 工单的"响应全文不含原生名"这条验收可判定（合同正文里没有第二个模型名来源）。
-- `GET /v1/models` 的 `revision` 字段仍取 `native_revision`：它是**合同修订号**，不是模型名（`docs/design/0005` §8.1 已定下该响应形状，本设计只增 `vendor_id`、不删字段）。
+- `GET /v1/models` 的 `revision` 字段仍取 `native_revision`：它是**合同修订号**，不是模型名（`docs/design/0005` §8.1 已定下该响应形状，本设计增 `vendor_id` 与 `type`、不删字段；`type` 的取值与展示归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)，落地见[模型类型设计](0020-model-type.md) §3）。
 
 ### 1.5 历史修订与已发布数据：不回填
 
@@ -88,6 +88,7 @@
       "name": "gpt-image-2.5-plus",
       "vendor_id": "OpenAI",
       "revision": "2026-09-20-contract-1.0",
+      "type": "image",
       "contract": { "...": "发布的那份合同，其中 properties.model.const 已替换为 gpt-image-2.5-plus" }
     }
   ]
@@ -97,6 +98,7 @@
 - `name`：**网关模型名**，客户端提交 `model` 时用的唯一身份；
 - `vendor_id`：厂商标识（目录属性；现有响应把同一个值叫 `vendor`，按用户口径改名 `vendor_id`——这**修订**了 `docs/design/0005` §8.1 已定的响应形状 `{name, vendor, revision, contract}`，评审时按该节的处理方式确认）；
 - `revision`：合同修订号；
+- `type`：模型类型，取值 `image` / `video` / `chat`，来自本次发布引用的 Vendor Model；客户端据此判断用量单位；
 - `contract`：发布的那份合同（`model.const` 已替换，见 §1.4）。
 - **不出现**：`native_model_id`、`provider_model_id`、渠道、供给、驱动、优先级、权重、价格、任何执行记录。
 - **仍公开、不校验 Key**：沿用 `docs/design/0005` §8.1 的裁定（建表单之前先要凭证等于逼调用方为了看一眼目录去开户；目录只有型号身份与合同）。
@@ -192,7 +194,7 @@
 
 ### 设计级修订（改 `docs/design/`，不动 ADR）
 
-- `GET /v1/models` 的字段名 `vendor` → `vendor_id`（[`docs/design/0005`](./0005-vendor-model-contract-and-offering-mapping.md) §8.1 已定该形状，该节第 1 条已同步改毕）；
+- `GET /v1/models` 的字段名 `vendor` → `vendor_id`、新增 `type`（[`docs/design/0005`](./0005-vendor-model-contract-and-offering-mapping.md) §8.1 已定该形状，该节第 1 条已同步改毕；`type` 的取值与展示归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)）；
 - 合同 `model.const` 的对客投射替换规则（§1.4）。
 
 > 评审过程与逐条处置见提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 的评论。

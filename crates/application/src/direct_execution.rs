@@ -23,8 +23,8 @@ use seeai_adapter_sdk::{
 use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
     ImageParameterKind, JobId, MeteringEvidence, OfferingCandidate, ProviderCostFact,
-    PublishedOffering, ReceiptCredential, RouteStrategy, image_parameter_kind,
-    platform_image_parameters,
+    ProviderTaskHandle, ProviderTraceId, PublishedOffering, ReceiptCredential, RouteStrategy,
+    image_parameter_kind, platform_image_parameters,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -130,7 +130,7 @@ struct LateFactsInput {
     /// 上游终态快照；平台内部失败（根本没交到渠道）留 `None`。
     provider_state: Option<ProviderTaskState>,
     /// 上游任务句柄；同步渠道通常没有。
-    provider_task_handle: Option<String>,
+    provider_task_handle: Option<ProviderTaskHandle>,
     /// 上游实际产出的图片张数。
     image_count: Option<u32>,
     /// 计量证据（自带 Attempt 关联）。
@@ -274,7 +274,7 @@ impl ExecutionContext for SupervisedExecutionContext {
                 attempt_id: self.attempt_id,
                 execution_owner: self.execution_owner.clone(),
                 fencing_token: self.fencing_token,
-                provider_task_handle: Some(handle.task_id.into_string()),
+                provider_task_handle: Some(handle.task_id),
                 provider_trace_id: handle.trace_id,
             })
             .await
@@ -741,7 +741,7 @@ impl DirectExecutionService {
                     // 绝不重发（重发等于为同一个请求再付一次上游成本，RFC 0017 §4）。
                     // 只交付句柄：这一刻还不知道上游终态，收件行如实记「没有终态」。
                     let late = LateFactsInput {
-                        provider_task_handle: Some(handle.task_id.into_string()),
+                        provider_task_handle: Some(handle.task_id),
                         ..LateFactsInput::default()
                     };
                     self.hand_off_late_facts(
@@ -1201,7 +1201,7 @@ impl DirectExecutionService {
         kind: ProviderFailureKind,
         disposition: FailureDisposition,
         provider_cost: Option<ProviderCostFact>,
-        provider_trace_id: Option<String>,
+        provider_trace_id: Option<ProviderTraceId>,
         late: LateFactsInput,
     ) -> Result<(), DirectExecutionError> {
         let command = FailOrReconcileExecution::for_failure(
@@ -1241,7 +1241,7 @@ impl DirectExecutionService {
         job_id: JobId,
         attempt_id: AttemptId,
         receipt_credential: &ReceiptCredential,
-        provider_trace_id: Option<String>,
+        provider_trace_id: Option<ProviderTraceId>,
         provider_cost: Option<ProviderCostFact>,
         late: LateFactsInput,
     ) {

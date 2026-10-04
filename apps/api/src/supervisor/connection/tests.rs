@@ -59,15 +59,26 @@ type Server = (
 
 /// 起一个真实监听端口的连接驱动。
 async fn start_server(router: Router) -> Server {
+    let (server, _observability) = start_server_with(router, test_config()).await;
+    server
+}
+
+/// 按给定容量起服务：观测计数随连接一起交回用例。
+async fn start_server_with(
+    router: Router,
+    config: TransportConfig,
+) -> (Server, Arc<TransportObservability>) {
     let listener = TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind a loopback port");
     let address = listener.local_addr().expect("the bound address");
+    let observability = Arc::new(TransportObservability::default());
     let (stop_tx, stop_rx) = oneshot::channel::<()>();
-    let server = tokio::spawn(serve(listener, router, test_config(), async move {
+    let served = Arc::clone(&observability);
+    let server = tokio::spawn(serve(listener, router, config, served, async move {
         let _ = stop_rx.await;
     }));
-    (address, stop_tx, server)
+    ((address, stop_tx, server), observability)
 }
 
 async fn stop_server(
@@ -106,6 +117,10 @@ async fn wait_until(condition: impl Fn() -> bool, limit: Duration) -> bool {
         tokio::time::sleep(Duration::from_millis(5)).await;
     }
     condition()
+}
+
+fn test_observability() -> Arc<TransportObservability> {
+    Arc::new(TransportObservability::default())
 }
 
 /// 一个在 handler 被丢弃时置位的探针：证明连接销毁确实丢掉了在飞 service future。
@@ -181,7 +196,12 @@ async fn http2_zero_window_still_expires_and_releases_permits() {
                 let send = supervisor
                     .try_reserve_send()
                     .expect("a send lease for the test response");
-                let hold = SendHold::new(Instant::now() + Duration::from_millis(400), lease, send);
+                let hold = SendHold::new(
+                    Instant::now() + Duration::from_millis(400),
+                    lease,
+                    send,
+                    256 * 1024,
+                );
                 let mut response = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -253,7 +273,7 @@ async fn http1_image_response_closes_the_connection_and_releases_after_it() {
                 let send = supervisor
                     .try_reserve_send()
                     .expect("a send lease for the test response");
-                let hold = SendHold::new(Instant::now() + Duration::from_secs(30), lease, send);
+                let hold = SendHold::new(Instant::now() + Duration::from_secs(30), lease, send, 24);
                 let mut response = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")
@@ -281,11 +301,12 @@ async fn http1_image_response_closes_the_connection_and_releases_after_it() {
     assert!(
         wait_until(
             || supervisor.send_slots_available() == 1
-                && supervisor.execution_slots_available() == 1,
+                && supervisor.execution_slots_available() == 1
+                && supervisor.observability() == super::super::ExecutionBudgetSnapshot::default(),
             Duration::from_secs(3)
         )
         .await,
-        "the permits are released after the connection is destroyed"
+        "the permits and their observation counts are released after the connection is destroyed"
     );
     stop_server(stop, server).await;
 }
@@ -298,7 +319,11 @@ async fn teardown_waits_for_the_task_group_before_releasing_permits() {
     let supervisor = test_supervisor(1, 1);
     let config = test_config();
     let monitor = DisconnectMonitor::start(config.monitor).expect("the monitor");
-    let registry = Arc::new(Registry::new(Arc::clone(&monitor), config));
+    let registry = Arc::new(Registry::new(
+        Arc::clone(&monitor),
+        config,
+        test_observability(),
+    ));
     let socket = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     let fd = Arc::new(OwnedFd::from(socket.0));
     let owner = Arc::new(ConnectionOwner::new(
@@ -306,6 +331,7 @@ async fn teardown_waits_for_the_task_group_before_releasing_permits() {
         fd,
         DisconnectSignal::new(),
         config.max_connection_tasks,
+        test_observability(),
     ));
     let lease = supervisor
         .try_reserve_execution()
@@ -315,6 +341,7 @@ async fn teardown_waits_for_the_task_group_before_releasing_permits() {
         Instant::now() + Duration::from_secs(30),
         lease,
         send,
+        0,
     ));
     assert_eq!(supervisor.send_slots_available(), 0);
     assert!(owner.spawn_task(async {
@@ -387,14 +414,14 @@ async fn the_connection_takes_the_earliest_send_deadline_and_never_extends_it() 
     let monitor = DisconnectMonitor::start(config.monitor).expect("the monitor");
     let socket = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     let fd = Arc::new(OwnedFd::from(socket.0));
-    let owner = ConnectionOwner::new(1, fd, DisconnectSignal::new(), 4);
+    let owner = ConnectionOwner::new(1, fd, DisconnectSignal::new(), 4, test_observability());
 
     let reserve = |supervisor: &Arc<super::super::Supervisor>, deadline| {
         let lease = supervisor
             .try_reserve_execution()
             .expect("an execution lease");
         let send = supervisor.try_reserve_send().expect("a send lease");
-        SendHold::new(deadline, lease, send)
+        SendHold::new(deadline, lease, send, 0)
     };
     let now = Instant::now();
     let late = now + Duration::from_secs(10);
@@ -421,7 +448,7 @@ async fn the_connection_takes_the_earliest_send_deadline_and_never_extends_it() 
     monitor.shutdown();
 }
 
-/// 任务组满时拒绝新 task 并关闭整条连接，不排队。
+/// 任务组满时拒绝新 task 并关闭整条连接，不排队；拒绝计入观测。
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_full_task_group_refuses_and_closes_instead_of_queueing() {
     use hyper::rt::Executor as _;
@@ -431,11 +458,13 @@ async fn a_full_task_group_refuses_and_closes_instead_of_queueing() {
     let socket = std::os::unix::net::UnixStream::pair().expect("a socket pair");
     let fd = Arc::new(OwnedFd::from(socket.0));
     let signal = DisconnectSignal::new();
+    let observability = test_observability();
     let owner = Arc::new(ConnectionOwner::new(
         1,
         fd,
         Arc::clone(&signal),
         /* capacity */ 1,
+        Arc::clone(&observability),
     ));
     assert!(owner.spawn_task(async {
         std::thread::sleep(Duration::from_millis(150));
@@ -448,7 +477,60 @@ async fn a_full_task_group_refuses_and_closes_instead_of_queueing() {
         signal.is_cancelled(),
         "a refused task must close the connection instead of queueing"
     );
+    assert_eq!(observability.snapshot().task_rejections, 1);
     monitor.shutdown();
+}
+
+/// 连接数上限的拒绝也计入观测：在册连接数与拒绝次数都与真实连接一致。
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn the_connection_limit_refusal_is_counted() {
+    let router = Router::new().route("/ping", get(|| async { "pong" }));
+    let mut config = test_config();
+    config.max_connections = 1;
+    config.monitor.max_connections = 1;
+    let ((address, stop, server), observability) = start_server_with(router, config).await;
+
+    let mut first = TcpStream::connect(address).await.expect("connect");
+    first
+        .write_all(b"GET /ping HTTP/1.1\r\nHost: test\r\n\r\n")
+        .await
+        .expect("write the request");
+    let (bytes, _closed) = read_to_end_within(&mut first, Duration::from_secs(2)).await;
+    assert!(String::from_utf8_lossy(&bytes).contains("pong"));
+    assert_eq!(
+        observability.snapshot().connections,
+        1,
+        "the first connection is on the books"
+    );
+
+    // 第二条连接达到上限：直接关闭，不进队列。
+    let mut second = TcpStream::connect(address).await.expect("connect");
+    let (bytes, closed) = read_to_end_within(&mut second, Duration::from_secs(2)).await;
+    assert!(
+        closed && bytes.is_empty(),
+        "a refused connection is closed without a response"
+    );
+    assert!(
+        wait_until(
+            || observability.snapshot().connection_rejections == 1,
+            Duration::from_secs(2)
+        )
+        .await,
+        "the refusal is counted"
+    );
+    assert_eq!(observability.snapshot().connections, 1);
+
+    drop(first);
+    drop(second);
+    stop_server(stop, server).await;
+    assert!(
+        wait_until(
+            || observability.snapshot().connections == 0,
+            Duration::from_secs(2)
+        )
+        .await,
+        "every connection owner had to subtract its own count"
+    );
 }
 
 /// 停机：空闲的 keep-alive 连接必须被关闭，`serve` 在宽限期内返回。
@@ -496,7 +578,12 @@ async fn http1_slow_reader_still_expires_at_the_send_deadline() {
                 let send = supervisor
                     .try_reserve_send()
                     .expect("a send lease for the test response");
-                let hold = SendHold::new(Instant::now() + Duration::from_millis(500), lease, send);
+                let hold = SendHold::new(
+                    Instant::now() + Duration::from_millis(500),
+                    lease,
+                    send,
+                    8 * 1024 * 1024,
+                );
                 let mut response = Response::builder()
                     .status(StatusCode::OK)
                     .header(header::CONTENT_TYPE, "application/json")

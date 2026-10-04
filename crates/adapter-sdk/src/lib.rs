@@ -11,9 +11,10 @@ mod gateway;
 pub use gateway::{
     AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, Deadline, DispatchGate,
     ExecutionContext, GatewayAdapter, GatewayInput, ImageSite, ImageSites, ImageValueShape,
-    InputImage, ProviderOutput, ProviderTaskHandle, ProviderTaskState, QueryAccountingCapability,
-    ResponsePayload, begin_generation_send, ensure_external_call_allowed, ensure_read_call_allowed,
-    external_call_timeout, gateway_passthrough_parameters,
+    InputImage, ProviderOutput, ProviderTaskHandle, ProviderTaskState, ProviderTraceId,
+    QueryAccountingCapability, ResponsePayload, begin_generation_send,
+    ensure_external_call_allowed, ensure_read_call_allowed, external_call_timeout,
+    gateway_passthrough_parameters,
 };
 
 #[derive(Clone)]
@@ -154,7 +155,7 @@ pub struct ProviderSuccess {
     ///
     /// 平台把它落到已存在的 `attempts.provider_trace_id` 列。注意：本仓库**只用它做人工
     /// 对账**，不用它自动把结果取回来（那需要另一套模型与列）——创建响应失联一律进对账。
-    pub provider_trace_id: Option<String>,
+    pub provider_trace_id: Option<ProviderTraceId>,
     /// 这次执行看到的**成本事实**（成本平面，币种按渠道声明）。
     ///
     /// 它是**成本口径**，不是计量证据：计量事实仍然是 [`ProviderSuccess::usage`] 的四分项
@@ -316,7 +317,51 @@ pub const ENCODED_RESPONSE_EXPANSION: usize = 6;
 /// 入口请求 wire 的上限：与 API 的正文上限同一口径，解析结果与它同时存活。
 pub const GATEWAY_REQUEST_WIRE_BYTES: usize = 16 * 1024 * 1024;
 
+/// 只读对账查询响应上限的缺省值（1 MiB）。
+///
+/// 对账读取与生成读取是两条不同的路径：生成响应要装下结果图，对账只需要状态、计量与成本
+/// 字段。它因此用一条独立、更小但明确的上限；超过这条上限的响应只留下证据缺口，不无界读图
+/// （RFC 0018 §2.1）。
+pub const GATEWAY_RECONCILIATION_READ_BYTES: usize = 1024 * 1024;
+
+/// 覆盖对账读取上限（字节）的配置变量名。
+pub const RECONCILIATION_READ_BYTES_ENV: &str = "GENERATION_RECONCILIATION_READ_BYTES";
+
+/// `GENERATION_RECONCILIATION_READ_BYTES` 的配置值；缺省 [`GATEWAY_RECONCILIATION_READ_BYTES`]。
+///
+/// 读不出来或不是正数时给明确错误：配置错误由启动校验点名，不由运行时静默换一个数。
+pub fn reconciliation_read_bytes_from_env() -> Result<usize, String> {
+    match std::env::var(RECONCILIATION_READ_BYTES_ENV) {
+        Ok(value) => {
+            let parsed = value.trim().parse::<usize>().map_err(|error| {
+                format!("{RECONCILIATION_READ_BYTES_ENV} is not a byte count: {error}")
+            })?;
+            if parsed == 0 {
+                return Err(format!("{RECONCILIATION_READ_BYTES_ENV} must be positive"));
+            }
+            Ok(parsed)
+        }
+        Err(std::env::VarError::NotPresent) => Ok(GATEWAY_RECONCILIATION_READ_BYTES),
+        Err(std::env::VarError::NotUnicode(_)) => Err(format!(
+            "{RECONCILIATION_READ_BYTES_ENV} is not valid unicode"
+        )),
+    }
+}
+
 impl GatewayByteLimits {
+    /// 这条通路上只读对账查询的响应上限。
+    ///
+    /// 缺省 [`GATEWAY_RECONCILIATION_READ_BYTES`]，`GENERATION_RECONCILIATION_READ_BYTES` 可覆盖；
+    /// 无论怎么配都不会超过本 Adapter 声明的 [`GatewayByteLimits::provider_response_bytes`]——
+    /// 对账读取不会比生成读取更大。配置读不出来时按缺省值走：运行时的读取仍然有界。
+    #[must_use]
+    pub fn reconciliation_read_bytes(self) -> usize {
+        reconciliation_read_bytes_from_env()
+            .unwrap_or(GATEWAY_RECONCILIATION_READ_BYTES)
+            .min(self.provider_response_bytes)
+            .max(1)
+    }
+
     /// 一次执行的最坏占用上界（字节）。用饱和加法，配置极大时退化为 `usize::MAX` 而不是回绕。
     #[must_use]
     pub const fn max_bytes_per_execution(self) -> usize {
@@ -362,7 +407,8 @@ pub struct AdapterDescriptor {
 pub struct ProviderCallError {
     pub code: String,
     pub message: String,
-    pub trace_id: Option<String>,
+    /// 上游逐请求标识；入口按有界标识构造，非法原值在 Adapter 内部就被丢弃。
+    pub trace_id: Option<ProviderTraceId>,
     pub retry_safety: RetrySafety,
     /// 平台侧失败类别（见 [`ProviderFailureKind`]），与 `retry_safety` 正交。
     pub kind: ProviderFailureKind,

@@ -1,7 +1,7 @@
 主题: 身份与控制台的技术设计
-当前修订: v1
-状态: 待评审
-承接: [`0001` 控制台 Spec v15](../specs/0001-admin-and-customer-consoles.md) 的身份与双入口产物；账户金额及账单行为由 [`0002` 账户资金 Spec v3](../specs/0002-account-funds-and-reservations.md) 承接，客户独立页面由 [`0014`](0014-customer-console-navigation-and-history.md) 承接
+当前修订: v2
+状态: 待接受
+承接: [`0001` 控制台 Spec v19](../specs/0001-admin-and-customer-consoles.md) 的身份与双入口产物；账户金额及账单行为由 [`0002` 账户资金 Spec v4](../specs/0002-account-funds-and-reservations.md) 承接，客户独立页面由 [`0014`](0014-customer-console-navigation-and-history.md) 承接，模型类型与用量口径由 [`0006` 模型类型 Spec](../specs/0006-model-type-and-usage-records.md) 承接
 依赖: [`docs/design/0006`](./0006-gateway-models-and-consumer-surface.md)、[`0007`](./0007-pricing-floor-and-settlement.md)、[`0008`](./0008-routing-strategy-and-caching.md)、[`0009`](./0009-operational-baseline.md)；`ADR-0003`、`ADR-0015`、`ADR-0016`、`ADR-0017`
 
 # 身份与控制台的技术设计
@@ -153,11 +153,11 @@
 
 **为什么把账务拆成四条而不是一个聚合响应**：汇总与明细的"口径"不同——汇总必须按区间全量算，明细按上限截断；塞进一个响应里，改一次页大小就会让"明细求和等于汇总"这条验收条件失效（Spec V-C8）。拆开之后，每条端点的语义各自稳定，页面按需组合。
 
-**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`status`、`created_at`、`terminal_at`、`image_count`、`charged_microusd`——**不含 Generation Job 的标识与内部状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为"对客不可见、不投射成对客协议"，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。
+**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`status`、`created_at`、`terminal_at`、`type`（模型类型）与按类型的用量 `usage`、`charged_microusd`——**不含 Generation Job 的标识与内部状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为"对客不可见、不投射成对客协议"，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。模型类型与用量取值归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)，落地见[模型类型设计](0020-model-type.md) §4。
 
 `status` 是收敛后的四值（`succeeded` / `failed` / `pending` / `canceled`），由内部 Job 状态与结算结果映射而来；未结案的 `reconciliation_required` 对客仍是 `pending`，不提前宣告失败。映射写在拥有它的读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。`failed` 只说这次未产出，不改写渠道侧的错误细节。
 
-**汇总怎么算**：`requests` 与 `images` 按区间内到达终态的执行记录计，`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
+**汇总怎么算**：`requests` 按区间内到达终态的执行记录计；用量按 `model_type` 分组、各类型各自的量合计放在同一个按类型的用量值里，不跨类型相加；`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
 
 **为什么重置令牌也走摘要入库**：它等同于一次登录凭据（能改口令），因此与会话令牌同一条纪律——明文只在响应里，库里只有 SHA-256，且有独立更短的过期（`PASSWORD_RESET_TTL_SECONDS`，默认 30 分钟），用完即删。
 
@@ -295,7 +295,7 @@ apps/web/
 
 ## 10. 兼容与迁移
 
-- **向上兼容**：新增表与端点；既有端点形状不变；`ADMIN_TOKEN` 仍可用（V-A6 是一条硬回归）。
+- **向上兼容**：新增表与端点；既有端点形状不变，例外是账户用量读的行内用量按模型类型给出（`image_count` 换成按类型的 `usage`，见[模型类型 Spec](../specs/0006-model-type-and-usage-records.md) 与[模型类型设计](0020-model-type.md) §4）；`ADMIN_TOKEN` 仍可用（V-A6 是一条硬回归）。
 - **历史账户配身份**：`ledger.accounts` 里已有的账户可以**由运营配上登录身份**（§2.3、`POST /api/v1/customers` 带 `account_id`），配好之后客户就能登录看自己的余额与历史；配身份不动账本、不动密钥，也不做账户间转账。
 - **回滚**：`0020` 只新增表与一列，回滚即删除新增的五张表与 `audit_events.admin_id`（会话、身份与重置令牌都是新数据，删掉不影响账本与 Job）。
 

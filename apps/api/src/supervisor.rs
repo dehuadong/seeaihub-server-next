@@ -43,7 +43,7 @@ mod connection;
 mod monitor;
 
 #[cfg(target_os = "linux")]
-pub use connection::{TransportConfig, serve};
+pub use connection::{TransportConfig, TransportObservability, serve};
 #[cfg(target_os = "linux")]
 pub use monitor::MonitorConfig;
 
@@ -134,20 +134,86 @@ impl Drop for ByteBudgetPermit {
     }
 }
 
+/// 本机直接执行的预算观测计数（RFC 0018 §2.3）。
+///
+/// 每个"持有量"都由真实许可的生命周期维护：许可构造时加、许可 `Drop` 时减，因此快照与真实
+/// 持有量一致，没有单独的记账路径可以漂移。拒绝次数是单调计数。只记数量，不记图片或参数。
+#[derive(Debug, Default)]
+pub struct ExecutionObservability {
+    buffered_bytes: AtomicUsize,
+    active_reads: AtomicUsize,
+    active_executions: AtomicUsize,
+    active_sends: AtomicUsize,
+    read_rejections: AtomicUsize,
+    send_rejections: AtomicUsize,
+    execution_rejections: AtomicUsize,
+    memory_rejections: AtomicUsize,
+}
+
+/// 某一时刻的执行预算快照，字段与 [`ExecutionObservability`] 的观测项一一对应。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct ExecutionBudgetSnapshot {
+    /// 已预留字节：与字节预算的当前占用同源。
+    pub reserved_bytes: usize,
+    /// 实际缓冲字节：连接层仍持有的响应正文之和。
+    pub buffered_bytes: usize,
+    /// 活跃的正文读取名额。
+    pub active_reads: usize,
+    /// 活跃的执行 slot（含已交回结果、仍由发送许可持有的那些）。
+    pub active_executions: usize,
+    /// 活跃的响应发送名额。
+    pub active_sends: usize,
+    /// 因读取名额耗尽被拒绝的次数。
+    pub read_rejections: usize,
+    /// 因发送名额耗尽被拒绝的次数。
+    pub send_rejections: usize,
+    /// 因执行 slot 耗尽被拒绝的次数。
+    pub execution_rejections: usize,
+    /// 因内存预算不足被拒绝的次数。
+    pub memory_rejections: usize,
+}
+
 /// 一次执行占用的 slot 与内存预算。它随结果从执行任务交回 Handler，再随响应 body 存活到发送完成。
 pub struct ExecutionLease {
     _slot: OwnedSemaphorePermit,
     _memory: ByteBudgetPermit,
+    observability: Arc<ExecutionObservability>,
+}
+
+impl Drop for ExecutionLease {
+    fn drop(&mut self) {
+        self.observability
+            .active_executions
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 一个响应发送名额。
 pub struct SendLease {
     _permit: OwnedSemaphorePermit,
+    observability: Arc<ExecutionObservability>,
+}
+
+impl Drop for SendLease {
+    fn drop(&mut self) {
+        self.observability
+            .active_sends
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 一个本机正文读取名额。
 pub struct ReadLease {
     _permit: OwnedSemaphorePermit,
+    observability: Arc<ExecutionObservability>,
+}
+
+impl Drop for ReadLease {
+    fn drop(&mut self) {
+        self.observability
+            .active_reads
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 /// 一个图片响应的发送许可与它实际占用的执行许可，外加绝对发送期限。
@@ -160,16 +226,40 @@ pub struct SendHold(Arc<SendHoldInner>);
 
 struct SendHoldInner {
     deadline: Instant,
+    /// 这份许可代表的实际缓冲字节（编码后的响应正文长度）：随许可一起被观测与释放。
+    buffered_bytes: usize,
+    observability: Arc<ExecutionObservability>,
     _lease: ExecutionLease,
     _send: SendLease,
 }
 
+impl Drop for SendHoldInner {
+    fn drop(&mut self) {
+        self.observability
+            .buffered_bytes
+            .fetch_sub(self.buffered_bytes, Ordering::AcqRel);
+    }
+}
+
 impl SendHold {
     /// `deadline` 是绝对时刻：不因部分写成功、body 被 poll 或流量波动重置。
+    ///
+    /// `buffered_bytes` 是这份许可背后实际驻留的响应正文字节数，记进观测而不参与预算许可本身。
     #[must_use]
-    pub fn new(deadline: Instant, lease: ExecutionLease, send: SendLease) -> Self {
+    pub fn new(
+        deadline: Instant,
+        lease: ExecutionLease,
+        send: SendLease,
+        buffered_bytes: usize,
+    ) -> Self {
+        let observability = Arc::clone(&lease.observability);
+        observability
+            .buffered_bytes
+            .fetch_add(buffered_bytes, Ordering::AcqRel);
         Self(Arc::new(SendHoldInner {
             deadline,
+            buffered_bytes,
+            observability,
             _lease: lease,
             _send: send,
         }))
@@ -382,6 +472,8 @@ pub struct Supervisor {
     total_deadline: Duration,
     finalization_grace: Duration,
     send_window: Duration,
+    /// 预算观测计数：每次取/放许可都在这里留数（RFC 0018 §2.3）。
+    observability: Arc<ExecutionObservability>,
 }
 
 impl Supervisor {
@@ -422,6 +514,7 @@ impl Supervisor {
             total_deadline: config.total_deadline,
             finalization_grace: config.finalization_grace,
             send_window: config.send_window,
+            observability: Arc::new(ExecutionObservability::default()),
         }))
     }
 
@@ -459,34 +552,136 @@ impl Supervisor {
         self.memory.total - self.memory.used.load(Ordering::Relaxed)
     }
 
+    /// 当前预算观测快照：每个持有量都取自真实许可（RFC 0018 §2.3）。
+    #[must_use]
+    pub fn observability(&self) -> ExecutionBudgetSnapshot {
+        ExecutionBudgetSnapshot {
+            reserved_bytes: self.memory.used.load(Ordering::Relaxed),
+            buffered_bytes: self.observability.buffered_bytes.load(Ordering::Relaxed),
+            active_reads: self.observability.active_reads.load(Ordering::Relaxed),
+            active_executions: self.observability.active_executions.load(Ordering::Relaxed),
+            active_sends: self.observability.active_sends.load(Ordering::Relaxed),
+            read_rejections: self.observability.read_rejections.load(Ordering::Relaxed),
+            send_rejections: self.observability.send_rejections.load(Ordering::Relaxed),
+            execution_rejections: self
+                .observability
+                .execution_rejections
+                .load(Ordering::Relaxed),
+            memory_rejections: self.observability.memory_rejections.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 把当前预算快照写进 tracing：有界记录，只记数量，不记图片或参数（RFC 0018 §2.3）。
+    pub fn record_observability(&self) {
+        let snapshot = self.observability();
+        tracing::info!(
+            reserved_bytes = snapshot.reserved_bytes,
+            buffered_bytes = snapshot.buffered_bytes,
+            active_reads = snapshot.active_reads,
+            active_executions = snapshot.active_executions,
+            active_sends = snapshot.active_sends,
+            read_rejections = snapshot.read_rejections,
+            send_rejections = snapshot.send_rejections,
+            execution_rejections = snapshot.execution_rejections,
+            memory_rejections = snapshot.memory_rejections,
+            "direct execution budget"
+        );
+    }
+
     /// 取一个本机正文读取名额；满员时拒绝而不是排队。
     #[must_use]
     pub fn try_reserve_read(&self) -> Option<ReadLease> {
-        self.read_slots
-            .clone()
-            .try_acquire_owned()
-            .ok()
-            .map(|_permit| ReadLease { _permit })
+        match self.read_slots.clone().try_acquire_owned() {
+            Ok(permit) => {
+                self.observability
+                    .active_reads
+                    .fetch_add(1, Ordering::AcqRel);
+                Some(ReadLease {
+                    _permit: permit,
+                    observability: Arc::clone(&self.observability),
+                })
+            }
+            Err(_) => {
+                let rejections = self
+                    .observability
+                    .read_rejections
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
+                tracing::warn!(
+                    read_rejections = rejections,
+                    "refusing a request body read: the read slots are exhausted"
+                );
+                None
+            }
+        }
     }
 
     /// 取一个响应发送名额；在受理前取，取不到就不执行这次尚未发生费用的请求。
     #[must_use]
     pub fn try_reserve_send(&self) -> Option<SendLease> {
-        self.send_slots
-            .clone()
-            .try_acquire_owned()
-            .ok()
-            .map(|_permit| SendLease { _permit })
+        match self.send_slots.clone().try_acquire_owned() {
+            Ok(permit) => {
+                self.observability
+                    .active_sends
+                    .fetch_add(1, Ordering::AcqRel);
+                Some(SendLease {
+                    _permit: permit,
+                    observability: Arc::clone(&self.observability),
+                })
+            }
+            Err(_) => {
+                let rejections = self
+                    .observability
+                    .send_rejections
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
+                tracing::warn!(
+                    send_rejections = rejections,
+                    "refusing a generation request: the response send slots are exhausted"
+                );
+                None
+            }
+        }
     }
 
     /// 取一次执行的 slot 与内存预算；两者任一不足都拒绝。
     #[must_use]
     pub fn try_reserve_execution(&self) -> Option<ExecutionLease> {
-        let slot = self.execution_slots.clone().try_acquire_owned().ok()?;
-        let memory = self.memory.try_acquire(self.execution_memory_bytes)?;
+        let slot = match self.execution_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                let rejections = self
+                    .observability
+                    .execution_rejections
+                    .fetch_add(1, Ordering::AcqRel)
+                    + 1;
+                tracing::warn!(
+                    execution_rejections = rejections,
+                    "refusing an execution: the execution slots are exhausted"
+                );
+                return None;
+            }
+        };
+        let Some(memory) = self.memory.try_acquire(self.execution_memory_bytes) else {
+            let rejections = self
+                .observability
+                .memory_rejections
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
+            tracing::warn!(
+                memory_rejections = rejections,
+                execution_memory_bytes = self.execution_memory_bytes,
+                "refusing an execution: the memory budget cannot cover one execution reservation"
+            );
+            return None;
+        };
+        self.observability
+            .active_executions
+            .fetch_add(1, Ordering::AcqRel);
         Some(ExecutionLease {
             _slot: slot,
             _memory: memory,
+            observability: Arc::clone(&self.observability),
         })
     }
 

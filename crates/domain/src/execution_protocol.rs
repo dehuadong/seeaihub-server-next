@@ -147,6 +147,9 @@ impl Display for AttemptStage {
 }
 
 /// Provider 任务句柄与 trace 标识的字节上限。
+///
+/// 数据库侧 `migrations/0036_provider_identifier_bounds.sql` 对同一批列抄了同一组长度与字符集：
+/// SQL 无法引用 Rust 常量，应用层与数据库是两道独立防线，改这里必须同步改那里。
 pub const MAX_PROVIDER_IDENTIFIER_BYTES: usize = 128;
 
 /// Provider 任务句柄或 trace 标识是不是有界标识。
@@ -160,6 +163,74 @@ pub fn is_bounded_provider_identifier(value: &str) -> bool {
         && value
             .bytes()
             .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'-' | b'_' | b'.' | b':'))
+}
+
+/// Provider 任务句柄：**有界标识**，只能经 [`ProviderTaskHandle::parse`] 构造。
+///
+/// 它是对账唯一允许拼进上游查询 URL 的值，也是任务式渠道复查的入口。字段私有，URL、data URL、
+/// 控制字符与超长正文在这里就被挡下，不能靠"记得先校验"绕过去（Spec 0005 §2、RFC 0018 §6）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ProviderTaskHandle(String);
+
+impl ProviderTaskHandle {
+    /// 按标识白名单构造：不是有界标识就拒绝，且不保留原值。
+    pub fn parse(value: String) -> Result<Self, String> {
+        if is_bounded_provider_identifier(&value) {
+            Ok(Self(value))
+        } else {
+            Err("the provider task handle is not a bounded identifier".to_owned())
+        }
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+/// Provider trace 标识：**有界标识**，只能经 [`ProviderTraceId::parse`] 构造。
+///
+/// 上游的逐请求响应头或错误 `tid` 都可能带回 URL、data URL、控制字符或任意正文；它落
+/// `attempts.provider_trace_id`、晚到事实与管理端视图，供人工去上游核对。因此入口就按标识构造，
+/// 无效值按"没有可信 trace"丢弃，只留平台自己的分类（Spec 0005 §2、RFC 0018 §6）。
+///
+/// [Debug] 只输出字节数：trace 标识不进日志，避免把上游原值提前打出去。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ProviderTraceId(String);
+
+impl ProviderTraceId {
+    /// 按标识白名单构造；无效值返回 `None`，由调用方按"没有可信 trace"处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        is_bounded_provider_identifier(value).then(|| Self(value.to_owned()))
+    }
+
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+
+    #[must_use]
+    pub fn into_string(self) -> String {
+        self.0
+    }
+}
+
+impl Display for ProviderTraceId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str(self.as_str())
+    }
+}
+
+impl Debug for ProviderTraceId {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        write!(formatter, "ProviderTraceId({} bytes)", self.0.len())
+    }
 }
 
 /// 执行所有权的 fencing token：每次提交与持久收尾都核验它。

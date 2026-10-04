@@ -9,14 +9,15 @@ use seeai_domain::{
     FencingToken, FloorTable, FxRate, HoldSource, ImageBranch, ImageParameterKind, JobId,
     LedgerEntry, LedgerEntryKind, MeteringEvidence, OfferingCandidate, OfferingId,
     ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
-    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, ReceiptCredential,
-    RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, VendorModelId, apply_enum_maps,
-    apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
-    contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
-    declared_field_names, declared_parameter_names, declared_reference_image_limit,
-    declared_renames, declared_size_mapping, declares_mask_parameter, declares_parameter,
-    declares_reference_image_parameter, is_used_parameter_value, literal_parameter_text,
-    place_image_inputs, resolve_size_tier, unit_amount_microusd, wire_parameter_name,
+    ProviderCostSource, ProviderTaskHandle, ProviderTraceId, PublishedModel, PublishedOffering,
+    PublishedRevision, ReceiptCredential, RoutePolicy, RouteStrategy, RuntimeRevisionId,
+    TokenUsage, VendorModelId, apply_enum_maps, apply_parameter_defaults, apply_parameter_renames,
+    apply_size_mapping, carries_parameter, contract_image_parameter_kind, contract_model_identity,
+    declared_defaults, declared_enum_maps, declared_field_names, declared_parameter_names,
+    declared_reference_image_limit, declared_renames, declared_size_mapping,
+    declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
+    is_used_parameter_value, literal_parameter_text, place_image_inputs, resolve_size_tier,
+    unit_amount_microusd, wire_parameter_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -1627,9 +1628,10 @@ pub struct TakenOverExecution {
     /// 所有权租约本身给出。达到自动查询上限的案例不会出现在接管结果里。
     pub query_attempts: u32,
     pub next_query_at: Option<DateTime<Utc>>,
-    /// 上游任务句柄；任务式渠道才有。
-    pub provider_task_handle: Option<String>,
-    pub provider_trace_id: Option<String>,
+    /// 上游任务句柄；任务式渠道才有。只能由有界标识构造（历史非法值读回时为 `None`）。
+    pub provider_task_handle: Option<ProviderTaskHandle>,
+    /// 上游逐请求标识；入口已按有界标识构造，历史非法值读回时为 `None`。
+    pub provider_trace_id: Option<ProviderTraceId>,
     pub adapter_key: String,
     pub base_url: String,
     pub credential_env: String,
@@ -1695,8 +1697,8 @@ pub struct RecordAcceptance {
     pub attempt_id: AttemptId,
     pub execution_owner: String,
     pub fencing_token: FencingToken,
-    pub provider_task_handle: Option<String>,
-    pub provider_trace_id: Option<String>,
+    pub provider_task_handle: Option<ProviderTaskHandle>,
+    pub provider_trace_id: Option<ProviderTraceId>,
 }
 
 /// `settle` 的命令：执行身份、fencing token 与**强类型账务事实**，不含任何业务载荷。
@@ -1720,8 +1722,8 @@ pub struct SettleExecution {
     /// 它是用量明细与账单汇总里"几张"的唯一来源（RFC 0019 §5.3）；缺失就是缺失，
     /// 不拿请求的 `n`、token 数或 0 顶替。
     pub image_count: Option<u32>,
-    /// 上游逐请求标识；写入 Attempt 供人工对账。
-    pub provider_trace_id: Option<String>,
+    /// 上游逐请求标识；写入 Attempt 供人工对账。非法值在入口已被丢弃。
+    pub provider_trace_id: Option<ProviderTraceId>,
 }
 
 /// 一次新协议收尾的**已提交结果**：`settle` 的返回与 `read_finalization` 的确认共用。
@@ -1766,8 +1768,8 @@ pub struct FailOrReconcileExecution {
     /// `None` 是"请求根本没交到渠道，没采过"——两者在成本缺口清单里的处置不同。
     pub provider_cost: Option<ProviderCostFact>,
     pub disposition: FailureDisposition,
-    /// 上游逐请求标识；没有可信标识时为空。
-    pub provider_trace_id: Option<String>,
+    /// 上游逐请求标识；入口已按有界标识构造，没有可信标识时为空。
+    pub provider_trace_id: Option<ProviderTraceId>,
 }
 
 impl FailOrReconcileExecution {
@@ -1782,7 +1784,7 @@ impl FailOrReconcileExecution {
         failure_kind: ProviderFailureKind,
         disposition: FailureDisposition,
         provider_cost: Option<ProviderCostFact>,
-        provider_trace_id: Option<String>,
+        provider_trace_id: Option<ProviderTraceId>,
     ) -> Self {
         Self {
             job_id,
@@ -1828,9 +1830,9 @@ pub struct LateFacts {
     /// 或 Attempt 早于凭据机制（库里摘要为空）时投递被忽略（RFC 0018 §5.2）。
     pub receipt_credential: ReceiptCredential,
     /// 上游任务句柄；任务式渠道才有。
-    pub provider_task_handle: Option<String>,
-    /// 上游逐请求标识。
-    pub provider_trace_id: Option<String>,
+    pub provider_task_handle: Option<ProviderTaskHandle>,
+    /// 上游逐请求标识；入口已按有界标识构造。
+    pub provider_trace_id: Option<ProviderTraceId>,
     /// 上游实际产出的图片张数；调用方拿不到时为空。
     ///
     /// 按张计价的成本或对客价靠它才算得出：缺它时按缺口处理，不拿 token 数或请求的 `n` 顶替。
@@ -1895,8 +1897,8 @@ pub struct ClaimedLateFact {
     pub attempt_id: AttemptId,
     /// 收件形态。
     pub kind: LateFactKind,
-    pub provider_task_handle: Option<String>,
-    pub provider_trace_id: Option<String>,
+    pub provider_task_handle: Option<ProviderTaskHandle>,
+    pub provider_trace_id: Option<ProviderTraceId>,
     /// 收件行记下的产出图片张数；收件形态不包含它时为 None。
     pub image_count: Option<u32>,
     /// 计量证据（自带 Attempt 关联）；收件形态不包含它时为 None。

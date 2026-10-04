@@ -18,9 +18,9 @@ use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
     FencingToken, FxRate, HitCandidate, ImageBranch, JobId, LedgerEntry, LedgerEntryKind,
     MeteringEvidence, OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot,
-    PricingFormula, ProviderCostFact, ProviderCostSource, PublishedModel, PublishedRevision,
-    RECEIPT_CREDENTIAL_HEX_LEN, ReceiptCredential, RoutePolicy, RouteStrategy, RuntimeRevisionId,
-    VendorModelId, is_bounded_provider_identifier,
+    PricingFormula, ProviderCostFact, ProviderCostSource, ProviderTaskHandle, ProviderTraceId,
+    PublishedModel, PublishedRevision, RECEIPT_CREDENTIAL_HEX_LEN, ReceiptCredential, RoutePolicy,
+    RouteStrategy, RuntimeRevisionId, VendorModelId,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -3740,17 +3740,7 @@ impl ExecutionRepository for PgHubRepository {
             provider_task_handle,
             provider_trace_id,
         } = command;
-        // 任务句柄是对账的唯一入口：它不是有界标识时宁可让这次确认失败（调用方转未知对账），
-        // 也不把 URL、data URL 或正文写进库里；trace 只是标识，非法时直接丢弃（Spec 0005 §2）。
-        let provider_task_handle = match provider_task_handle {
-            Some(handle) if !is_bounded_provider_identifier(&handle) => {
-                return Err(ApplicationError::Validation(
-                    "the provider task handle is not a bounded identifier".to_owned(),
-                ));
-            }
-            other => other,
-        };
-        let provider_trace_id = bounded_identifier(provider_trace_id);
+        // 句柄与 trace 都是有界类型：构造即校验，这里不再按字符串重判一次（Spec 0005 §2）。
         let token = to_i64(fencing_token.get())?;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         // 锁序与结算一致：先锁 Job 行，再锁 Attempt 行。
@@ -3814,10 +3804,10 @@ impl ExecutionRepository for PgHubRepository {
             let stored_handle: Option<String> = job
                 .try_get("provider_task_handle")
                 .map_err(database_error)?;
-            // 存量里可能有没经过有界校验的旧值（URL、超长值）：它们不算标识，比较前同样过滤，
-            // 否则同一组事实重放会因为"新值被丢、旧值还在"被误判成冲突。
-            let stored_trace = bounded_identifier(stored_trace);
-            let stored_handle = bounded_identifier(stored_handle);
+            // 存量里可能有没经过有界校验的旧值（URL、超长值）：它们不算标识，比较前同样按类型
+            // 构造丢弃，否则同一组事实重放会因为"新值被丢、旧值还在"被误判成冲突。
+            let stored_trace = stored_trace_id(stored_trace);
+            let stored_handle = stored_task_handle(stored_handle);
             if stored_trace == provider_trace_id && stored_handle == provider_task_handle {
                 transaction.rollback().await.map_err(database_error)?;
                 return Ok(());
@@ -3839,7 +3829,7 @@ impl ExecutionRepository for PgHubRepository {
             "#,
         )
         .bind(attempt_id.0)
-        .bind(&provider_trace_id)
+        .bind(provider_trace_id.as_ref().map(ProviderTraceId::as_str))
         .bind(job_id.0)
         .execute(&mut *transaction)
         .await
@@ -3853,7 +3843,11 @@ impl ExecutionRepository for PgHubRepository {
             "#,
         )
         .bind(job_id.0)
-        .bind(&provider_task_handle)
+        .bind(
+            provider_task_handle
+                .as_ref()
+                .map(ProviderTaskHandle::as_str),
+        )
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -3876,9 +3870,7 @@ impl ExecutionRepository for PgHubRepository {
             image_count,
             provider_trace_id,
         } = command;
-        // trace 只是标识：不是有界标识就不落库，结算本身不受影响（Spec 0005 §2）。
-        let provider_trace_id =
-            provider_trace_id.filter(|trace| is_bounded_provider_identifier(trace));
+        // trace 是有界类型：构造即校验，结算本身不受影响（Spec 0005 §2）。
         // 产出张数是用量与账单的分母：上游没给就留 NULL，不把缺失写成 0（RFC 0019 §5.3）。
         let image_count = image_count
             .map(|count| {
@@ -4010,7 +4002,7 @@ impl ExecutionRepository for PgHubRepository {
         .bind(job_id.0)
         .bind(&evidence.provider_response_digest)
         .bind(&evidence_json)
-        .bind(&provider_trace_id)
+        .bind(provider_trace_id.as_ref().map(ProviderTraceId::as_str))
         .bind(cost_amount)
         .bind(&cost_currency)
         .bind(cost_source)
@@ -4112,9 +4104,7 @@ impl ExecutionRepository for PgHubRepository {
             disposition,
             provider_trace_id,
         } = command;
-        // trace 只是标识：不是有界标识就不落库，失败处置本身不受影响（Spec 0005 §2）。
-        let provider_trace_id =
-            provider_trace_id.filter(|trace| is_bounded_provider_identifier(trace));
+        // trace 是有界类型：构造即校验，失败处置本身不受影响（Spec 0005 §2）。
         let token = to_i64(fencing_token.get())?;
         // 处置决定终态与 Attempt 形态：确定失败释放，结果未知转对账，可重试的中间失败保留 executing。
         let (target_state, target_attempt_state, release) = match disposition {
@@ -4248,7 +4238,7 @@ impl ExecutionRepository for PgHubRepository {
         .bind(attempt_id.0)
         .bind(job_id.0)
         .bind(target_attempt_state)
-        .bind(&provider_trace_id)
+        .bind(provider_trace_id.as_ref().map(ProviderTraceId::as_str))
         .bind(cost_amount)
         .bind(&cost_currency)
         .bind(cost_source)
@@ -4413,9 +4403,7 @@ impl ExecutionRepository for PgHubRepository {
             provider_cost,
             provider_state,
         } = facts;
-        // 无效句柄不是标识：不写入，也不拿它去对账；其余事实仍然收下（Spec 0005 §2、RFC 0018 §6）。
-        let provider_task_handle = bounded_identifier(provider_task_handle);
-        let provider_trace_id = bounded_identifier(provider_trace_id);
+        // 句柄与 trace 都是有界类型：构造即校验，这里不再按字符串重判一次（Spec 0005 §2、RFC 0018 §6）。
         let image_count = image_count
             .map(|count| {
                 i32::try_from(count).map_err(|_| {
@@ -4464,10 +4452,14 @@ impl ExecutionRepository for PgHubRepository {
             return Ok(LateFactsOutcome::Ignored);
         }
         let mut outcome = LateFactsOutcome::Received;
-        if let Some(handle) = provider_task_handle.as_deref() {
+        if let Some(handle) = provider_task_handle.as_ref() {
             let digest = late_fact_digest(&[
-                handle.as_bytes(),
-                provider_trace_id.as_deref().unwrap_or("").as_bytes(),
+                handle.as_str().as_bytes(),
+                provider_trace_id
+                    .as_ref()
+                    .map(ProviderTraceId::as_str)
+                    .unwrap_or("")
+                    .as_bytes(),
             ]);
             match insert_late_fact(
                 &mut transaction,
@@ -4475,8 +4467,8 @@ impl ExecutionRepository for PgHubRepository {
                 attempt_id,
                 LateFactKind::TaskHandle,
                 &digest,
-                Some(handle),
-                provider_trace_id.as_deref(),
+                Some(handle.as_str()),
+                provider_trace_id.as_ref().map(ProviderTraceId::as_str),
                 None,
                 None,
                 None,
@@ -4518,7 +4510,13 @@ impl ExecutionRepository for PgHubRepository {
             if let Some(bytes) = evidence_bytes.as_deref() {
                 parts.push(bytes);
             }
-            parts.push(provider_trace_id.as_deref().unwrap_or("").as_bytes());
+            parts.push(
+                provider_trace_id
+                    .as_ref()
+                    .map(ProviderTraceId::as_str)
+                    .unwrap_or("")
+                    .as_bytes(),
+            );
             parts.push(image_count_text.as_bytes());
             parts.push(amount.as_bytes());
             parts.push(cost_currency.as_deref().unwrap_or("").as_bytes());
@@ -4538,7 +4536,7 @@ impl ExecutionRepository for PgHubRepository {
                 LateFactKind::Accounting,
                 &digest,
                 None,
-                provider_trace_id.as_deref(),
+                provider_trace_id.as_ref().map(ProviderTraceId::as_str),
                 image_count,
                 evidence_json,
                 cost_columns,
@@ -4900,10 +4898,13 @@ fn taken_over_execution(
         stage,
         attempt_id: attempt_id.map(AttemptId),
         attempt_state,
-        provider_task_handle: row
-            .try_get("provider_task_handle")
-            .map_err(database_error)?,
-        provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
+        provider_task_handle: stored_task_handle(
+            row.try_get("provider_task_handle")
+                .map_err(database_error)?,
+        ),
+        provider_trace_id: stored_trace_id(
+            row.try_get("provider_trace_id").map_err(database_error)?,
+        ),
         query_attempts: u32::try_from(
             row.try_get::<i32, _>("query_attempts")
                 .map_err(database_error)?,
@@ -4978,10 +4979,13 @@ fn claimed_late_fact(row: &sqlx::postgres::PgRow) -> Result<ClaimedLateFact, App
                 })
             })
             .transpose()?,
-        provider_task_handle: row
-            .try_get("provider_task_handle")
-            .map_err(database_error)?,
-        provider_trace_id: row.try_get("provider_trace_id").map_err(database_error)?,
+        provider_task_handle: stored_task_handle(
+            row.try_get("provider_task_handle")
+                .map_err(database_error)?,
+        ),
+        provider_trace_id: stored_trace_id(
+            row.try_get("provider_trace_id").map_err(database_error)?,
+        ),
         image_count: row
             .try_get::<Option<i32>, _>("image_count")
             .map_err(database_error)?
@@ -6021,9 +6025,17 @@ async fn account_name_taken(
     Ok(taken.is_some())
 }
 
-/// Provider 标识的落库过滤：不是有界标识就当没有（Spec 0005 §2、RFC 0018 §6）。
-fn bounded_identifier(value: Option<String>) -> Option<String> {
-    value.filter(|identifier| is_bounded_provider_identifier(identifier))
+/// 数据库边界的兜底：历史行可能带着未经过类型构造的值（URL、data URL、控制字符、超长正文）。
+///
+/// 写路径只接受 [`ProviderTraceId`] / [`ProviderTaskHandle`]，入口那一次构造就是唯一的校验；
+/// 这里在**读回存量**时按同一条权威规则再构造一次，构造不出来就当没有该标识——绝不把原值
+/// 交给对账查询或管理端视图。这是本层唯一一处事后过滤（Spec 0005 §2、RFC 0018 §6）。
+fn stored_trace_id(value: Option<String>) -> Option<ProviderTraceId> {
+    value.as_deref().and_then(ProviderTraceId::parse)
+}
+
+fn stored_task_handle(value: Option<String>) -> Option<ProviderTaskHandle> {
+    value.and_then(|value| ProviderTaskHandle::parse(value).ok())
 }
 
 fn database_error(error: impl std::fmt::Display) -> ApplicationError {

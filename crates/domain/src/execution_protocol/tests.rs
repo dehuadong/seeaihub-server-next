@@ -119,3 +119,66 @@ fn a_receipt_credential_is_bounded_and_never_printed() {
         );
     }
 }
+
+#[test]
+fn a_trace_id_is_bounded_and_never_printed() {
+    let trace = ProviderTraceId::parse("req_1a-2B.3:4").expect("a bounded trace id");
+    assert_eq!(trace.as_str(), "req_1a-2B.3:4");
+    assert_eq!(trace.to_string(), "req_1a-2B.3:4");
+    assert_eq!(trace.clone().into_string(), "req_1a-2B.3:4");
+    assert_eq!(
+        format!("{trace:?}"),
+        "ProviderTraceId(13 bytes)",
+        "the original value must not reach logs"
+    );
+}
+
+#[test]
+fn a_trace_id_rejects_urls_payloads_controls_and_over_long_values() {
+    for rejected in [
+        "",
+        "https://example.invalid/task/1",
+        "data:image/png;base64,AAAA",
+        "req id with spaces",
+        "line\nbreak",
+        "trace\u{7f}",
+        "任务标识",
+    ] {
+        assert!(
+            ProviderTraceId::parse(rejected).is_none(),
+            "{rejected:?} must not pass as a trace id"
+        );
+    }
+    assert!(
+        ProviderTraceId::parse(&"a".repeat(MAX_PROVIDER_IDENTIFIER_BYTES + 1)).is_none(),
+        "an over-long value is not a trace id"
+    );
+    assert!(
+        ProviderTraceId::parse(&"a".repeat(MAX_PROVIDER_IDENTIFIER_BYTES)).is_some(),
+        "the length limit is inclusive"
+    );
+}
+
+#[test]
+fn a_task_handle_is_the_same_bounded_identifier() {
+    let handle =
+        ProviderTaskHandle::parse("task_abc-123.4:x".to_owned()).expect("a bounded handle");
+    assert_eq!(handle.as_str(), "task_abc-123.4:x");
+    assert_eq!(handle.into_string(), "task_abc-123.4:x");
+
+    for rejected in [
+        "",
+        "https://example.invalid/task/1",
+        "data:image/png;base64,AAAA",
+        "task\u{0}id",
+    ] {
+        assert!(
+            ProviderTaskHandle::parse(rejected.to_owned()).is_err(),
+            "{rejected:?} must not pass as a task handle"
+        );
+    }
+    assert!(
+        ProviderTaskHandle::parse("a".repeat(MAX_PROVIDER_IDENTIFIER_BYTES + 1)).is_err(),
+        "an over-long value is not a task handle"
+    );
+}

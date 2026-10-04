@@ -12,6 +12,10 @@ _Avoid_: Provider、渠道
 由 Vendor 发布、以原生模型 ID 和修订标识确定的模型产品。
 _Avoid_: 平台模型、渠道模型
 
+**模型类型**（Model Type）:
+Vendor Model 的产品种类，取值为 `image`、`video`、`chat`。它是模型自身的事实，随发布素材声明，不随渠道、候选或定价变化；用量记录与账单汇总按类型决定用量的单位——图片是产出张数，视频是产出秒数，对话是输入与输出 token。它不是计费口径，也不决定一个模型能不能调。
+_Avoid_: 计费类型、计价形态、按类型的路由或配额
+
 **Vendor Model Contract**:
 调用方针对某个 Vendor Model 提交参数时所遵循的合同：字段名、类型、枚举、默认值、组合约束与能力边界。它表达**模型语义**，不表达任何 Provider 的 HTTP 包装。它随不可变 Runtime Revision 发布，调用方按选中的模型使用它，不按渠道使用它。归属见 `docs/adr/0015`。
 _Avoid_: Provider Schema、渠道请求格式、跨厂商统一图片参数

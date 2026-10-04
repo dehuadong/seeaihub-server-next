@@ -129,6 +129,28 @@ fn an_extreme_envelope_saturates_instead_of_wrapping() {
     assert_eq!(huge.max_bytes_per_execution(), usize::MAX);
 }
 
+/// 对账读取上限是独立的一条，并且**不大于**该 Adapter 声明的生成响应上限。
+#[test]
+fn the_reconciliation_read_limit_stays_within_the_declared_response_limit() {
+    let configured =
+        reconciliation_read_bytes_from_env().unwrap_or(GATEWAY_RECONCILIATION_READ_BYTES);
+    let wide = GatewayByteLimits {
+        request_wire_bytes: 16 * 1024 * 1024,
+        provider_response_bytes: 128 * 1024 * 1024,
+    };
+    assert_eq!(
+        wide.reconciliation_read_bytes(),
+        configured.min(128 * 1024 * 1024),
+        "对账读取取配置值，并以声明的生成响应上限收口"
+    );
+    // 声明面比缺省值还小时，对账读取跟着它收窄，绝不反过来放大。
+    let narrow = GatewayByteLimits {
+        request_wire_bytes: 16 * 1024 * 1024,
+        provider_response_bytes: 1,
+    };
+    assert_eq!(narrow.reconciliation_read_bytes(), 1);
+}
+
 /// 任务句柄只能是有界标识：URL、data URL、超长值与正文在构造处就被拒绝，且不保留原值。
 #[test]
 fn a_task_handle_can_only_be_parsed_from_a_bounded_identifier() {

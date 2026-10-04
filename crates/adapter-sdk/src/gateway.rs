@@ -6,13 +6,16 @@ use crate::{
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
-use seeai_domain::{ImageBranch, TokenUsage, is_bounded_provider_identifier};
+use seeai_domain::{ImageBranch, TokenUsage};
 use serde_json::Value;
 use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
 use std::time::Duration;
+
+/// Provider 有界标识与 trace：权威定义在 [`seeai_domain`]，SDK 只重导出，不另立一套校验。
+pub use seeai_domain::{ProviderTaskHandle, ProviderTraceId};
 
 /// 一处输入图片的形态：公网 URL、未解码的 data URL，或已解码的字节。
 ///
@@ -191,41 +194,13 @@ impl Deadline {
     }
 }
 
-/// Provider 任务句柄：**有界标识**，只能经 [`ProviderTaskHandle::parse`] 构造。
-///
-/// 它是对账的唯一入口，也是唯一会被拼进上游查询 URL 的值。字段私有，URL、data URL、控制字符与
-/// 超长正文在这里就被挡下，不能靠"记得先校验"绕过去（Spec 0005 §2、RFC 0018 §6）。
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ProviderTaskHandle(String);
-
-impl ProviderTaskHandle {
-    /// 按标识白名单构造：不是有界标识就拒绝，且不保留原值。
-    pub fn parse(value: String) -> Result<Self, String> {
-        if is_bounded_provider_identifier(&value) {
-            Ok(Self(value))
-        } else {
-            Err("the provider task handle is not a bounded identifier".to_owned())
-        }
-    }
-
-    #[must_use]
-    pub fn as_str(&self) -> &str {
-        &self.0
-    }
-
-    #[must_use]
-    pub fn into_string(self) -> String {
-        self.0
-    }
-}
-
 /// 上游已受理的可信标识。不含上传地址：上传 URL 只用于当次内存执行（RFC 0017 §4）。
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct AcceptedHandle {
     /// 任务式渠道的任务标识；只有任务式渠道会调用 `accepted`。类型保证它是有界标识。
     pub task_id: ProviderTaskHandle,
-    /// 逐请求标识。
-    pub trace_id: Option<String>,
+    /// 逐请求标识；非法值在 Adapter 入口就被丢弃，因此这里要么是可信标识，要么为空。
+    pub trace_id: Option<ProviderTraceId>,
 }
 
 /// accepted 确认失败的原因：平台侧入库失败，或执行已被取消。
@@ -412,7 +387,8 @@ pub struct AccountingFacts {
     pub provider_cost: ProviderCost,
     pub image_count: u32,
     pub response_digest: String,
-    pub provider_trace_id: Option<String>,
+    /// 上游逐请求标识；Adapter 入口已按有界标识构造，非法原值不会到这里。
+    pub provider_trace_id: Option<ProviderTraceId>,
 }
 
 /// 一次执行的输出：内存载荷与账务事实分开（RFC 0017 §2）。

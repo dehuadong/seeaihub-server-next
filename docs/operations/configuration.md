@@ -53,14 +53,18 @@
 | `GENERATION_EXECUTION_LEASE_SECONDS` | `60` | v1 执行所有权的租约时长（秒）。`begin_submission` 按它落 `lease_expires_at`，API Supervisor 按它的三分之一周期独立续约；续约冲突或所有权失效立即取消该次执行 |
 | `GENERATION_MAX_CHANNEL_IN_FLIGHT` | `32` | **渠道全局**未决任务上限，多副本经数据库槽位共同遵守（不是单机限制） |
 | `GENERATION_EXECUTION_SLOTS` | `64` | 本机同时在执行的生成任务数 |
-| `GENERATION_MAX_MEMORY_BYTES` | `2147483648`（2GiB） | 本机在飞执行可预占的内存总量；每次执行预留 32MiB，配得比它小进程起不来 |
+| `GENERATION_MAX_MEMORY_BYTES` | `2147483648`（2GiB） | 本机在飞执行可预占的内存总量；每次执行的预留按各 Driver 声明的字节上限算出（入口 wire、上游响应与编码膨胀同时计），配得比它小进程起不来 |
 | `GENERATION_READ_SLOTS` | `64` | 本机同时在读请求正文的准入名额；取不到直接拒绝，不排队 |
 | `GENERATION_SEND_SLOTS` | `64` | 本机同时可持有的响应发送名额；在受理前预留 |
 | `GENERATION_SLOW_READ_TIMEOUT_SECONDS` | `30` | 请求正文从开始接收到读完的上限；超时在受理前返回 408 `request_timeout`，不建记录 |
 | `GENERATION_SEND_TIMEOUT_SECONDS` | `30` | 客户端发送的独立有界期限，不占用 D |
 | `GENERATION_SHUTDOWN_GRACE_SECONDS` | `25` | 停机时给在飞任务有限收尾的宽限期；到点残余交异常对账 |
+| `GENERATION_RECONCILIATION_READ_BYTES` | `1048576`（1MiB） | 只读对账查询的响应上限（字节）。它独立于生成响应上限，超限的响应只留下证据缺口、不无界读图；配得比任何 Adapter 声明的生成响应上限还大时进程启动失败 |
+| `GENERATION_OBSERVABILITY_INTERVAL_SECONDS` | `30` | 预算观测记录周期（秒）；`0` 表示不做周期记录，逐次容量拒绝仍在拒绝点记录 |
 
 名额取正数、内存预算至少够一次执行：配不成可用的执行容量时进程启动失败并点名。
+
+预算观测每周期记一次已预留字节、实际缓冲字节、活跃读取/执行/发送、连接数与各段拒绝次数（只记数量，不记图片或参数）；容量拒绝当场各记一条。两者都走 `tracing`，不引入独立的指标库。
 
 ### 连接与断开监视
 
@@ -91,6 +95,8 @@ HTTP/1 的图片响应带 `Connection: close`：写完这条连接就结束，�
 ### 异常对账查询调度
 
 Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄只读查询、按证据幂等结算或建案。查询排期落在 `operations.reconciliation_cases` 的 `next_query_at`/`attempts` 上：同一案例未到下次查询时刻的记录本轮跳过；自动查询到次数上限后转人工并告警，不再自动查询。配置这些值不会改变收费或占用释放语义。
+
+只读查询读多少字节由渠道侧的 `GENERATION_RECONCILIATION_READ_BYTES` 定（见 §2「直接同步执行」）：它比生成响应的上限小，响应超过它就只留证据缺口，API 与 Worker 读同一份配置。
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |

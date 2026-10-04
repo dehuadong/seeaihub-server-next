@@ -1,7 +1,7 @@
 主题: 账户资金与预授权的当前值模型
-当前修订: v4
-状态: 已评审通过
-承接: [`账户余额、预授权与实际收支` v3](../specs/0002-account-funds-and-reservations.md) §1–§7
+当前修订: v5
+状态: 待接受
+承接: [`账户余额、预授权与实际收支` v4](../specs/0002-account-funds-and-reservations.md) §1–§7
 依赖: [`0007` 定价、保底与结算](0007-pricing-floor-and-settlement.md)、[`0008` 路由与缓存](0008-routing-strategy-and-caching.md)、[`0009` 运行基线](0009-operational-baseline.md)；[`ADR-0003`](../adr/0003-postgresql-is-source-of-truth.md)、[`ADR-0006`](../adr/0006-no-settlement-without-metering-evidence.md)
 
 # 账户资金与预授权的当前值模型
@@ -75,7 +75,7 @@ Redis 的 `user_balance` 值改为 `{balance_microusd, held_microusd, available_
 
 ## 5. 用量、账单和账实核对
 
-Job 上增加终态时刻；成功结算的终态时刻与 `capture.created_at` 由同一数据库事务确定。已完成请求的区间过滤按终态时刻，处理中请求按受理时刻显示。用量行返回请求时刻和终态时刻，逐笔扣费只关联该 Job 的 `capture`，不再同时用 Job 创建时间和流水入账时间筛选同一笔扣费。账单中扣费与调整按各自流水入账时刻归属；已完成请求与图片数按 Job 终态时刻归属。处理中请求不计账单请求数。跨天结算以结算日入账，不把次日的扣费投进昨日区间。
+Job 上增加终态时刻；成功结算的终态时刻与 `capture.created_at` 由同一数据库事务确定。已完成请求的区间过滤按终态时刻，处理中请求按受理时刻显示。用量行返回请求时刻和终态时刻，逐笔扣费只关联该 Job 的 `capture`，不再同时用 Job 创建时间和流水入账时间筛选同一笔扣费。账单中扣费与调整按各自流水入账时刻归属；已完成请求与各类型的用量按 Job 终态时刻归属，用量按模型类型分别给出、不相加（见[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)）。处理中请求不计账单请求数。跨天结算以结算日入账，不把次日的扣费投进昨日区间。
 
 取消默认每 15 分钟对全库全部历史流水求和的账实任务，保留可按账户触发的后台核查：核对 `balance = SUM(actual entries)` 与 `held = SUM(active holds)`，发现差异只建案并告警，不自动改账。账户级差异另建可指向 `account_id` 的核查案例；现有必须关联 Job 和 Attempt 的对账案例只处理单笔请求，不承载账户级差异。生产规模增长后按账户分批调度，查询走账户与日期索引；该任务不参与任一资金写入或余额读取。Redis 副本的增量校正仍独立运行。
 
@@ -83,7 +83,7 @@ Job 上增加终态时刻；成功结算的终态时刻与 `capture.created_at` 
 
 ## 6. 与现行文档和代码的交接
 
-[`0001` 控制台 Spec](../specs/0001-admin-and-customer-consoles.md) v15 与本 RFC 使用同一客户金额语义；[`0007`](0007-pricing-floor-and-settlement.md) 继续负责保底额与价格计算，[`0008`](0008-routing-strategy-and-caching.md) 继续负责路由及非账务缓存，[`0009`](0009-operational-baseline.md) 负责运维入口，[`0010`](0010-identity-and-consoles.md) 负责身份与控制台读，[`0011`](0011-console-information-architecture.md) 负责管理端页面组织，[`0014`](0014-customer-console-navigation-and-history.md) 负责客户页面组织与历史浏览。账户资金写法、Redis 余额快照与账实核查由本 RFC 统一承接。
+[`0001` 控制台 Spec](../specs/0001-admin-and-customer-consoles.md) v19 与本 RFC 使用同一客户金额语义；[`0007`](0007-pricing-floor-and-settlement.md) 继续负责保底额与价格计算，[`0008`](0008-routing-strategy-and-caching.md) 继续负责路由及非账务缓存，[`0009`](0009-operational-baseline.md) 负责运维入口，[`0010`](0010-identity-and-consoles.md) 负责身份与控制台读，[`0011`](0011-console-information-architecture.md) 负责管理端页面组织，[`0014`](0014-customer-console-navigation-and-history.md) 负责客户页面组织与历史浏览。账户资金写法、Redis 余额快照与账实核查由本 RFC 统一承接。
 
 没有已上线账务数据需要转换。实现采用新建或调整数据库迁移并以干净开发库验证完整迁移链，不对已应用的迁移文件做历史改写，也不承担旧流水回填。账户页面布局工作与本方案的金额语义改动分别验收。
 

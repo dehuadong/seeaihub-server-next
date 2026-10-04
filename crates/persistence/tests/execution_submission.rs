@@ -13,7 +13,8 @@ use seeai_application::{
 };
 use seeai_domain::{
     AccountId, AttemptStage, ChannelId, ExecutionStage, FencingToken, ImageBranch, JobId,
-    OfferingId, PriceSnapshot, RuntimeRevisionId, VendorModelId,
+    OfferingId, PriceSnapshot, ProviderTaskHandle, ProviderTraceId, RuntimeRevisionId,
+    VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
@@ -285,8 +286,10 @@ async fn submission_declaration_then_acceptance_persist_the_minimal_facts() {
             attempt_id: started.attempt_id,
             execution_owner: "supervisor-a".to_owned(),
             fencing_token: FencingToken::new(0),
-            provider_task_handle: Some("task-42".to_owned()),
-            provider_trace_id: Some("trace-42".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse("task-42".to_owned()).expect("test handle"),
+            ),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-42").expect("test trace")),
         })
         .await
         .expect("record_acceptance");
@@ -505,8 +508,10 @@ async fn acceptance_is_idempotent_for_same_facts_and_conflicts_on_different_ones
         attempt_id: started.attempt_id,
         execution_owner: "supervisor-a".to_owned(),
         fencing_token: FencingToken::new(0),
-        provider_task_handle: Some("task-1".to_owned()),
-        provider_trace_id: Some(trace.to_owned()),
+        provider_task_handle: Some(
+            ProviderTaskHandle::parse("task-1".to_owned()).expect("test handle"),
+        ),
+        provider_trace_id: Some(ProviderTraceId::parse(trace).expect("test trace")),
     };
 
     repository
@@ -690,8 +695,10 @@ async fn takeover_swaps_ownership_and_increments_the_fencing_token() {
             attempt_id: started.attempt_id,
             execution_owner: "supervisor-a".to_owned(),
             fencing_token: FencingToken::new(0),
-            provider_task_handle: Some("task-7".to_owned()),
-            provider_trace_id: Some("trace-7".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse("task-7".to_owned()).expect("test handle"),
+            ),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-7").expect("test trace")),
         })
         .await
         .expect("record_acceptance");
@@ -729,8 +736,20 @@ async fn takeover_swaps_ownership_and_increments_the_fencing_token() {
     );
     assert_eq!(taken.attempt_id, Some(started.attempt_id));
     assert_eq!(taken.attempt_state, Some(AttemptStage::Accepted));
-    assert_eq!(taken.provider_task_handle.as_deref(), Some("task-7"));
-    assert_eq!(taken.provider_trace_id.as_deref(), Some("trace-7"));
+    assert_eq!(
+        taken
+            .provider_task_handle
+            .as_ref()
+            .map(ProviderTaskHandle::as_str),
+        Some("task-7")
+    );
+    assert_eq!(
+        taken
+            .provider_trace_id
+            .as_ref()
+            .map(ProviderTraceId::as_str),
+        Some("trace-7")
+    );
     assert_eq!(taken.adapter_key, "fake");
     assert_eq!(taken.base_url, "http://127.0.0.1:9");
     assert_eq!(taken.credential_env, "FAKE_PROVIDER_KEY");
@@ -826,8 +845,13 @@ async fn concurrent_takeovers_partition_expired_executions_without_overlap_or_lo
                 attempt_id: started.attempt_id,
                 execution_owner: "supervisor-a".to_owned(),
                 fencing_token: FencingToken::new(ORIGINAL_TOKEN as u64),
-                provider_task_handle: Some(format!("task-{index}")),
-                provider_trace_id: Some(format!("trace-{index}")),
+                provider_task_handle: Some(
+                    ProviderTaskHandle::parse(format!("task-{index}"))
+                        .expect("a bounded task handle"),
+                ),
+                provider_trace_id: Some(
+                    ProviderTraceId::parse(&format!("trace-{index}")).expect("a bounded trace id"),
+                ),
             })
             .await
             .expect("record_acceptance");
@@ -1032,11 +1056,11 @@ async fn reaping_an_unsubmitted_admission_releases_hold_and_channel_slot() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 不是标识的句柄不能入库：接受确认失败、Attempt 不落 accepted、原值不写库；
-/// 换成合法句柄重试仍然成功——拒绝不能把这次提交卡死。
+/// 不是标识的句柄/ trace 在类型构造处就被拒绝，端口拿不到这样的值，原文因此永不落库；
+/// 合法值照常受理——拒绝只发生在值进入端口之前。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
-async fn a_handle_that_is_not_an_identifier_is_refused_at_acceptance() {
+async fn a_handle_that_is_not_an_identifier_cannot_reach_acceptance() {
     let (repository, database_name) = connect().await;
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
@@ -1051,46 +1075,57 @@ async fn a_handle_that_is_not_an_identifier_is_refused_at_acceptance() {
         .await
         .expect("begin_submission");
 
+    // 非标识的"句柄"与 trace 都构造不出来：URL、data URL、控制字符与超长正文到这里为止。
+    assert!(
+        ProviderTaskHandle::parse("data:image/png;base64,AAAA".to_owned()).is_err(),
+        "a payload must not construct a task handle"
+    );
+    assert!(
+        ProviderTraceId::parse("https://example.invalid/trace/1").is_none(),
+        "a url must not construct a trace id"
+    );
+
     let acceptance = |handle: &str, trace: &str| RecordAcceptance {
         job_id,
         attempt_id: started.attempt_id,
         execution_owner: "supervisor-a".to_owned(),
         fencing_token: FencingToken::new(0),
-        provider_task_handle: Some(handle.to_owned()),
-        provider_trace_id: Some(trace.to_owned()),
+        provider_task_handle: ProviderTaskHandle::parse(handle.to_owned()).ok(),
+        provider_trace_id: ProviderTraceId::parse(trace),
     };
 
-    let refused = repository
-        .record_acceptance(acceptance("data:image/png;base64,AAAA", "trace-bad"))
-        .await;
-    assert!(
-        matches!(refused, Err(ApplicationError::Validation(_))),
-        "a non-identifier handle must be refused, got {refused:?}"
-    );
+    // 非法 trace 在这里被丢弃，句柄合法时其余事实照常受理。
+    repository
+        .record_acceptance(acceptance("task-good", "https://example.invalid/trace/1"))
+        .await
+        .expect("a valid handle is accepted even when the trace is dropped");
     let stored: Option<String> =
         sqlx::query_scalar("SELECT provider_task_handle FROM generation.jobs WHERE id = $1")
             .bind(job_id.0)
             .fetch_one(&pool)
             .await
             .expect("the stored handle");
+    assert_eq!(
+        stored.as_deref(),
+        Some("task-good"),
+        "the bounded handle is stored verbatim"
+    );
+    let stored_trace: Option<String> =
+        sqlx::query_scalar("SELECT provider_trace_id FROM generation.attempts WHERE id = $1")
+            .bind(started.attempt_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the stored trace");
     assert!(
-        stored.is_none(),
-        "the raw value must never reach the database"
+        stored_trace.is_none(),
+        "an invalid trace is dropped instead of stored"
     );
     let state: String = sqlx::query_scalar("SELECT state FROM generation.attempts WHERE id = $1")
         .bind(started.attempt_id.0)
         .fetch_one(&pool)
         .await
         .expect("the attempt state");
-    assert_ne!(
-        state, "accepted",
-        "a refused acceptance must not mark the attempt accepted"
-    );
-
-    repository
-        .record_acceptance(acceptance("task-good", "trace-good"))
-        .await
-        .expect("a valid handle is still accepted after a refusal");
+    assert_eq!(state, "accepted");
 
     drop(pool);
     drop(repository);

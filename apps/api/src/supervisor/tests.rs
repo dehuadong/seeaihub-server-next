@@ -88,6 +88,81 @@ fn send_and_read_slots_are_refused_when_exhausted() {
     );
 }
 
+/// 观测计数与真实许可同源：许可释放之后每一项都回到零（RFC 0018 §2.3）。
+#[test]
+fn releasing_every_permit_returns_the_observation_to_zero() {
+    let supervisor =
+        Supervisor::new(config(4, EXECUTION_MEMORY_BYTES * 4)).expect("the supervisor");
+    let read = supervisor.try_reserve_read().expect("a read lease");
+    let lease = supervisor
+        .try_reserve_execution()
+        .expect("an execution lease");
+    let send = supervisor.try_reserve_send().expect("a send lease");
+    let hold = SendHold::new(
+        tokio::time::Instant::now() + Duration::from_secs(5),
+        lease,
+        send,
+        4096,
+    );
+    let observed = supervisor.observability();
+    assert_eq!(observed.reserved_bytes, EXECUTION_MEMORY_BYTES);
+    assert_eq!(observed.buffered_bytes, 4096);
+    assert_eq!(observed.active_reads, 1);
+    assert_eq!(observed.active_executions, 1);
+    assert_eq!(observed.active_sends, 1);
+
+    drop(read);
+    drop(hold);
+    assert_eq!(
+        supervisor.observability(),
+        ExecutionBudgetSnapshot::default(),
+        "each permit's release path must subtract its own count"
+    );
+}
+
+/// 容量拒绝每次都记数，并且按拒绝的那一段分开记。
+#[test]
+fn capacity_refusals_are_counted_per_stage() {
+    let supervisor = Supervisor::new(config(1, EXECUTION_MEMORY_BYTES)).expect("the supervisor");
+    let _lease = supervisor
+        .try_reserve_execution()
+        .expect("the single execution lease");
+    assert!(supervisor.try_reserve_execution().is_none());
+    let observed = supervisor.observability();
+    assert_eq!(observed.execution_rejections, 1);
+    assert_eq!(observed.memory_rejections, 0);
+
+    let mut reads = Vec::new();
+    for _ in 0..4 {
+        reads.push(supervisor.try_reserve_read().expect("a read lease"));
+    }
+    assert!(supervisor.try_reserve_read().is_none());
+    let mut sends = Vec::new();
+    for _ in 0..4 {
+        sends.push(supervisor.try_reserve_send().expect("a send lease"));
+    }
+    assert!(supervisor.try_reserve_send().is_none());
+    let observed = supervisor.observability();
+    assert_eq!(observed.read_rejections, 1);
+    assert_eq!(observed.send_rejections, 1);
+    assert_eq!(observed.active_reads, 4);
+    assert_eq!(observed.active_sends, 4);
+    assert_eq!(observed.active_executions, 1);
+}
+
+/// 内存不够时记的是内存拒绝，不是 slot 拒绝。
+#[test]
+fn a_memory_shortfall_is_counted_as_a_memory_refusal() {
+    let supervisor = Supervisor::new(config(4, EXECUTION_MEMORY_BYTES)).expect("the supervisor");
+    let _lease = supervisor
+        .try_reserve_execution()
+        .expect("the single reservable execution");
+    assert!(supervisor.try_reserve_execution().is_none());
+    let observed = supervisor.observability();
+    assert_eq!(observed.execution_rejections, 0);
+    assert_eq!(observed.memory_rejections, 1);
+}
+
 /// 发送许可与执行预算随 [`SendHold`] 一起被持有：只要还有句柄在，许可就不归零。
 ///
 /// 期限本身由连接层执行；这一层只负责"谁持有、什么时候释放"（RFC 0018 §8.3）。
@@ -105,6 +180,7 @@ fn a_send_hold_keeps_its_permits_until_the_last_handle_is_dropped() {
         tokio::time::Instant::now() + Duration::from_secs(5),
         lease,
         send,
+        4096,
     );
     let handle = hold.clone();
     drop(hold);

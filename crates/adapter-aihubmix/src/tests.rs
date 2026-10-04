@@ -3,7 +3,10 @@ use async_trait::async_trait;
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, Deadline, ImageSite, ImageSites, ImageValueShape,
 };
-use seeai_domain::{ImageParameterKind, platform_image_parameter, platform_image_parameters};
+use seeai_domain::{
+    ImageParameterKind, MAX_PROVIDER_IDENTIFIER_BYTES, platform_image_parameter,
+    platform_image_parameters,
+};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
 
@@ -590,7 +593,10 @@ fn provider_error_marks_upstream_unreachable_as_unknown() {
         br#"{"error":{"message":"maybe accepted","code":"upstream_unreachable","tid":"req_1"}}"#;
     let error = parse_provider_error(StatusCode::BAD_GATEWAY, body);
     assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
-    assert_eq!(error.trace_id.as_deref(), Some("req_1"));
+    assert_eq!(
+        error.trace_id.as_ref().map(ProviderTraceId::as_str),
+        Some("req_1")
+    );
 }
 
 #[test]
@@ -599,6 +605,38 @@ fn provider_error_marks_service_unavailable_as_unknown() {
     let error = parse_provider_error(StatusCode::SERVICE_UNAVAILABLE, body);
     assert_eq!(error.retry_safety, RetrySafety::AcceptanceUnknown);
     assert_eq!(error.kind, ProviderFailureKind::UpstreamUnavailable);
+}
+
+/// 错误体里的 tid 与成功响应头同源：URL、data URL、控制字符与超长值都不是标识，
+/// 入口就丢弃，只留平台自己的分类（Spec 0005 §2、RFC 0018 §6）。
+#[test]
+fn provider_error_drops_a_tid_that_is_not_a_bounded_identifier() {
+    for tid in [
+        "https://example.invalid/trace/1",
+        "data:image/png;base64,AAAA",
+        "trace\u{7f}",
+        "line\\nbreak",
+    ] {
+        let body = format!(
+            r#"{{"error":{{"message":"boom","code":"upstream_unreachable","tid":"{tid}"}}}}"#
+        );
+        let error = parse_provider_error(StatusCode::BAD_GATEWAY, body.as_bytes());
+        assert!(
+            error.trace_id.is_none(),
+            "{tid:?} must not become a trace id"
+        );
+    }
+
+    let too_long = "a".repeat(MAX_PROVIDER_IDENTIFIER_BYTES + 1);
+    let body = format!(
+        r#"{{"error":{{"message":"boom","code":"upstream_unreachable","tid":"{too_long}"}}}}"#
+    );
+    assert!(
+        parse_provider_error(StatusCode::BAD_GATEWAY, body.as_bytes())
+            .trace_id
+            .is_none(),
+        "an over-long tid must not become a trace id"
+    );
 }
 
 #[test]

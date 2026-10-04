@@ -53,7 +53,7 @@ use supervisor::{
     SendHold, SendLease, SlowRead, Supervisor, SupervisorConfig,
 };
 #[cfg(target_os = "linux")]
-use supervisor::{TransportConfig, serve as serve_transport};
+use supervisor::{TransportConfig, TransportObservability, serve as serve_transport};
 
 /// 平台直接执行时随进程装配的一份用例与它的 Supervisor。
 ///
@@ -272,20 +272,38 @@ async fn main() -> Result<()> {
         // 单次执行的预留按各 Driver 声明的字节上限算：入口 wire、上游响应与编码膨胀可能同时存活，
         // 不能再用一个与真实响应无关的固定值（RFC 0018 §2）。读不到任何 Driver 的字节上限时
         // **拒绝启动**：静默退回一个更小的固定值，正是"把预算改小还装作没发生"。
-        let execution_memory_bytes = [
+        let descriptors: Vec<_> = [
             seeai_adapter_aihubmix::ADAPTER_KEY,
             seeai_adapter_apimart::ADAPTER_KEY,
         ]
         .iter()
         .filter_map(|key| adapters.descriptor(key))
-        .map(|descriptor| descriptor.byte_limits.max_bytes_per_execution())
-        .max()
-        .ok_or_else(|| {
-            anyhow::anyhow!(
-                "no registered adapter declared its byte limits; the per-execution memory \
-                 reservation cannot be derived, so direct execution must not start"
-            )
-        })?;
+        .collect();
+        // 只读对账用独立、更小的响应上限（RFC 0018 §2.1）。配置值必须读得出来，且不超过任何一条
+        // 声明了字节上限的 Adapter 的生成响应上限——对账读取绝不比生成读取更大，配错就拒绝启动。
+        let reconciliation_read_bytes =
+            seeai_adapter_sdk::reconciliation_read_bytes_from_env().map_err(anyhow::Error::msg)?;
+        for descriptor in &descriptors {
+            if reconciliation_read_bytes > descriptor.byte_limits.provider_response_bytes {
+                anyhow::bail!(
+                    "GENERATION_RECONCILIATION_READ_BYTES is {reconciliation_read_bytes} bytes, \
+                     above the {} provider response limit declared by adapter {}; the \
+                     reconciliation read must not be larger than the generation read",
+                    descriptor.byte_limits.provider_response_bytes,
+                    descriptor.key
+                );
+            }
+        }
+        let execution_memory_bytes = descriptors
+            .iter()
+            .map(|descriptor| descriptor.byte_limits.max_bytes_per_execution())
+            .max()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "no registered adapter declared its byte limits; the per-execution memory \
+                     reservation cannot be derived, so direct execution must not start"
+                )
+            })?;
         let send_slots = generation_env_usize("GENERATION_SEND_SLOTS", 64)?;
         let read_slots = generation_env_usize("GENERATION_READ_SLOTS", 64)?;
         let supervisor = Supervisor::new(SupervisorConfig {
@@ -316,7 +334,12 @@ async fn main() -> Result<()> {
         .map_err(anyhow::Error::from)?;
         info!(
             execution_slots,
-            send_slots, read_slots, max_memory_bytes, "direct synchronous execution is enabled"
+            send_slots,
+            read_slots,
+            max_memory_bytes,
+            execution_memory_bytes,
+            reconciliation_read_bytes,
+            "direct synchronous execution is enabled"
         );
         Arc::new(DirectGeneration {
             service: Arc::new(service),
@@ -525,15 +548,54 @@ async fn main() -> Result<()> {
     // 有残余时它们的账务事实由应用层的对账路径接管（RFC 0017 §5、§6）。
     #[cfg(target_os = "linux")]
     {
+        // 预算观测：执行侧与连接侧各自维护真实许可的计数，这里按固定周期合成一条记录
+        // （RFC 0018 §2.3）。周期配 0 表示不周期记录，逐次拒绝仍在各自的拒绝点记录。
+        let transport_observability = Arc::new(TransportObservability::default());
+        match generation_env_u64("GENERATION_OBSERVABILITY_INTERVAL_SECONDS", 30)? {
+            0 => info!("periodic budget observation is disabled"),
+            seconds => spawn_budget_observability(
+                direct_execution.supervisor.clone(),
+                Arc::clone(&transport_observability),
+                Duration::from_secs(seconds),
+            ),
+        }
         let supervisor_for_shutdown = direct_execution.supervisor.clone();
-        serve_transport(listener, app, transport_config()?, async move {
-            shutdown_signal().await;
-            supervisor_for_shutdown.begin_drain();
-        })
+        serve_transport(
+            listener,
+            app,
+            transport_config()?,
+            transport_observability,
+            async move {
+                shutdown_signal().await;
+                supervisor_for_shutdown.begin_drain();
+            },
+        )
         .await?;
         direct_execution.supervisor.drain().await;
     }
     Ok(())
+}
+
+/// 按固定周期把执行侧与连接侧的预算计数写进 tracing。
+///
+/// 只记数量，不记图片或参数；周期本身是有界的（`GENERATION_OBSERVABILITY_INTERVAL_SECONDS`），
+/// 逐次容量拒绝在各自的拒绝点记录（RFC 0018 §2.3）。
+#[cfg(target_os = "linux")]
+fn spawn_budget_observability(
+    supervisor: Arc<Supervisor>,
+    transport: Arc<TransportObservability>,
+    interval: Duration,
+) {
+    tokio::spawn(async move {
+        let mut ticker = tokio::time::interval(interval);
+        // 落后时按周期顺延，不在追赶时连发一串记录。
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        loop {
+            ticker.tick().await;
+            supervisor.record_observability();
+            transport.record();
+        }
+    });
 }
 
 /// 连接驱动的容量与期限：每一项都是明确上限，默认值按单机 64 路执行容量给出。
@@ -2906,7 +2968,12 @@ fn direct_success_response(
         message: error.to_string(),
         retry_after: None,
     })?;
-    let hold = SendHold::new(tokio::time::Instant::now() + window, lease, send);
+    let hold = SendHold::new(
+        tokio::time::Instant::now() + window,
+        lease,
+        send,
+        payload.len(),
+    );
     let mut response = Response::builder()
         .status(StatusCode::OK)
         .header(header::CONTENT_TYPE, "application/json")

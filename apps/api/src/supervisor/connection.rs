@@ -27,7 +27,10 @@ use std::{
     future::Future,
     os::fd::OwnedFd,
     pin::Pin,
-    sync::{Arc, Mutex, MutexGuard, PoisonError, Weak},
+    sync::{
+        Arc, Mutex, MutexGuard, PoisonError, Weak,
+        atomic::{AtomicUsize, Ordering},
+    },
     time::Duration,
 };
 
@@ -51,6 +54,56 @@ use super::{
     ConnectionScope, DisconnectSignal, SendHold,
     monitor::{DisconnectMonitor, MonitorConfig},
 };
+
+/// 连接层的观测计数（RFC 0018 §2.3）。
+///
+/// 连接数由 owner 的真实生命周期维护：owner 构造时加、`Drop` 时减，因此快照与 registry 的
+/// 在册连接一致。拒绝次数是单调计数。只记数量，不记请求内容。
+#[derive(Debug, Default)]
+pub struct TransportObservability {
+    connections: AtomicUsize,
+    connection_rejections: AtomicUsize,
+    task_rejections: AtomicUsize,
+    monitor_rejections: AtomicUsize,
+}
+
+impl TransportObservability {
+    /// 当前连接层快照。
+    #[must_use]
+    pub fn snapshot(&self) -> TransportSnapshot {
+        TransportSnapshot {
+            connections: self.connections.load(Ordering::Relaxed),
+            connection_rejections: self.connection_rejections.load(Ordering::Relaxed),
+            task_rejections: self.task_rejections.load(Ordering::Relaxed),
+            monitor_rejections: self.monitor_rejections.load(Ordering::Relaxed),
+        }
+    }
+
+    /// 把当前快照写进 tracing：有界记录，只记数量。
+    pub fn record(&self) {
+        let snapshot = self.snapshot();
+        tracing::info!(
+            connections = snapshot.connections,
+            connection_rejections = snapshot.connection_rejections,
+            task_rejections = snapshot.task_rejections,
+            monitor_rejections = snapshot.monitor_rejections,
+            "direct gateway transport"
+        );
+    }
+}
+
+/// 某一时刻的连接层快照，字段与 [`TransportObservability`] 的观测项一一对应。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct TransportSnapshot {
+    /// 在册连接数。
+    pub connections: usize,
+    /// 因连接数达到上限被拒绝的次数。
+    pub connection_rejections: usize,
+    /// 因每连接任务组满员被拒绝并关闭连接的次数。
+    pub task_rejections: usize,
+    /// 因断开监视未确认（登记失败或 fd 复制失败）被拒绝的次数。
+    pub monitor_rejections: usize,
+}
 
 /// 传输层容量与期限：每一项都是明确上限，没有"按需增长"的默认值。
 #[derive(Debug, Clone, Copy)]
@@ -86,14 +139,17 @@ type ConnectionResult = Result<(), Box<dyn StdError + Send + Sync>>;
 ///
 /// 停机分两段：先停止受理并让在飞连接优雅收尾（Hyper 的 `graceful_shutdown`），到 `shutdown_grace`
 /// 仍有连接没结束时强制 `shutdown(Both)` 收尾，最后停掉断开监视线程。
+///
+/// `observability` 由调用方持有：连接数与拒绝次数写到同一份计数里，供周期性观测读取（RFC 0018 §2.3）。
 pub async fn serve(
     listener: TcpListener,
     router: Router,
     config: TransportConfig,
+    observability: Arc<TransportObservability>,
     shutdown: impl Future<Output = ()>,
 ) -> anyhow::Result<()> {
     let monitor = DisconnectMonitor::start(config.monitor).map_err(anyhow::Error::msg)?;
-    let registry = Arc::new(Registry::new(monitor, config));
+    let registry = Arc::new(Registry::new(monitor, config, observability));
     let (shutdown_tx, shutdown_rx) = watch::channel(false);
     let mut connections: JoinSet<()> = JoinSet::new();
     let mut shutdown = std::pin::pin!(shutdown);
@@ -104,7 +160,13 @@ pub async fn serve(
                 match accepted {
                     Ok((stream, peer)) => {
                         if registry.live_count() >= config.max_connections {
-                            tracing::warn!(%peer, "refusing a connection: the transport is at its connection limit");
+                            let rejections = registry.observability.connection_rejections
+                                .fetch_add(1, Ordering::AcqRel) + 1;
+                            tracing::warn!(
+                                %peer,
+                                connection_rejections = rejections,
+                                "refusing a connection: the transport is at its connection limit"
+                            );
                             drop(stream);
                             continue;
                         }
@@ -159,14 +221,20 @@ pub async fn serve(
 struct Registry {
     monitor: Arc<DisconnectMonitor>,
     config: TransportConfig,
+    observability: Arc<TransportObservability>,
     live: Mutex<HashMap<u64, Weak<ConnectionOwner>>>,
 }
 
 impl Registry {
-    fn new(monitor: Arc<DisconnectMonitor>, config: TransportConfig) -> Self {
+    fn new(
+        monitor: Arc<DisconnectMonitor>,
+        config: TransportConfig,
+        observability: Arc<TransportObservability>,
+    ) -> Self {
         Self {
             monitor,
             config,
+            observability,
             live: Mutex::new(HashMap::new()),
         }
     }
@@ -210,6 +278,16 @@ struct ConnectionOwner {
     tasks: Mutex<TaskGroup>,
     holds: Mutex<Holds>,
     deadline_moved: tokio::sync::Notify,
+    /// 连接数观测：owner 构造时加、`Drop` 时减，与 registry 的在册连接一一对应。
+    observability: Arc<TransportObservability>,
+}
+
+impl Drop for ConnectionOwner {
+    fn drop(&mut self) {
+        self.observability
+            .connections
+            .fetch_sub(1, Ordering::AcqRel);
+    }
 }
 
 struct TaskGroup {
@@ -227,7 +305,14 @@ struct Holds {
 }
 
 impl ConnectionOwner {
-    fn new(id: u64, fd: Arc<OwnedFd>, signal: Arc<DisconnectSignal>, capacity: usize) -> Self {
+    fn new(
+        id: u64,
+        fd: Arc<OwnedFd>,
+        signal: Arc<DisconnectSignal>,
+        capacity: usize,
+        observability: Arc<TransportObservability>,
+    ) -> Self {
+        observability.connections.fetch_add(1, Ordering::AcqRel);
         Self {
             id,
             fd,
@@ -243,6 +328,7 @@ impl ConnectionOwner {
                 deadline: None,
             }),
             deadline_moved: tokio::sync::Notify::new(),
+            observability,
         }
     }
 
@@ -333,8 +419,15 @@ where
     fn execute(&self, future: F) {
         if !self.owner.spawn_task(future) {
             // 任务组满或已关闸：不排队，直接关闭整条连接。
+            let rejections = self
+                .owner
+                .observability
+                .task_rejections
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
             tracing::warn!(
                 connection_id = self.owner.id,
+                task_rejections = rejections,
                 "the connection task group refused a task; closing the connection"
             );
             self.owner.force_close();
@@ -354,9 +447,15 @@ async fn run_connection(
     let fd = match rustix::io::fcntl_dupfd_cloexec(&stream, 0) {
         Ok(fd) => Arc::new(fd),
         Err(error) => {
+            let rejections = registry
+                .observability
+                .monitor_rejections
+                .fetch_add(1, Ordering::AcqRel)
+                + 1;
             tracing::warn!(
                 connection_id = id,
                 error = %error,
+                monitor_rejections = rejections,
                 "duplicating the socket for the disconnect monitor failed"
             );
             return;
@@ -368,6 +467,7 @@ async fn run_connection(
         Arc::clone(&fd),
         Arc::clone(&signal),
         config.max_connection_tasks,
+        Arc::clone(&registry.observability),
     ));
     registry.insert(&owner);
     if let Err(error) = registry
@@ -381,9 +481,15 @@ async fn run_connection(
         .await
     {
         // 得不到监视保证就不启动连接：这正是 §8.2 要求"收到注册确认后才启动"的原因。
+        let rejections = registry
+            .observability
+            .monitor_rejections
+            .fetch_add(1, Ordering::AcqRel)
+            + 1;
         tracing::warn!(
             connection_id = id,
             error = %error,
+            monitor_rejections = rejections,
             "refusing a connection: the disconnect monitor did not confirm the registration"
         );
         registry.remove(id);

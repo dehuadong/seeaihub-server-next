@@ -220,7 +220,10 @@ fn a_terminal_without_images_still_carries_the_cost_it_declared() {
     match error {
         AdapterError::Provider(provider) => {
             assert_eq!(provider.code, "provider_result_missing");
-            assert_eq!(provider.trace_id.as_deref(), Some("task-x"));
+            assert_eq!(
+                provider.trace_id.as_ref().map(ProviderTraceId::as_str),
+                Some("task-x")
+            );
             assert_eq!(
                 provider.provider_cost,
                 Some(provider_cost),
@@ -614,7 +617,10 @@ fn post_acceptance_failures_carry_the_task_id_for_reconciliation() {
     let adjusted = after_acceptance(AdapterError::Provider(raw));
     match with_task_id(adjusted, "task_abc") {
         AdapterError::Provider(provider) => {
-            assert_eq!(provider.trace_id.as_deref(), Some("task_abc"));
+            assert_eq!(
+                provider.trace_id.as_ref().map(ProviderTraceId::as_str),
+                Some("task_abc")
+            );
             // 分类与 code 不被这条补丁改变。
             assert_eq!(provider.retry_safety, RetrySafety::AcceptanceUnknown);
             assert_eq!(provider.code, "500");
@@ -629,11 +635,14 @@ fn post_acceptance_failures_carry_the_task_id_for_reconciliation() {
         ProviderFailureKind::Unknown,
     );
     if let AdapterError::Provider(provider) = &mut existing {
-        provider.trace_id = Some("from-upstream".to_owned());
+        provider.trace_id = ProviderTraceId::parse("from-upstream");
     }
     match with_task_id(existing, "task_abc") {
         AdapterError::Provider(provider) => {
-            assert_eq!(provider.trace_id.as_deref(), Some("from-upstream"));
+            assert_eq!(
+                provider.trace_id.as_ref().map(ProviderTraceId::as_str),
+                Some("from-upstream")
+            );
         }
         other => panic!("expected a provider error, got {other:?}"),
     }
@@ -1078,7 +1087,11 @@ async fn the_handle_is_persisted_before_any_task_poll() {
     );
     assert_eq!(output.accounting_facts.image_count, 1);
     assert_eq!(
-        output.accounting_facts.provider_trace_id.as_deref(),
+        output
+            .accounting_facts
+            .provider_trace_id
+            .as_ref()
+            .map(ProviderTraceId::as_str),
         Some("task_abc")
     );
     let calls = context.accepted_calls();
@@ -1150,7 +1163,7 @@ async fn query_accounting_reads_the_known_task_without_submitting() {
     let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
     let handle = AcceptedHandle {
         task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
-        trace_id: Some("task_abc".to_owned()),
+        trace_id: ProviderTraceId::parse("task_abc"),
     };
     let query = adapter(&provider)
         .query_accounting(
@@ -1175,7 +1188,13 @@ async fn query_accounting_reads_the_known_task_without_submitting() {
         }),
         "币种取受理时冻结的成本币种，不硬编码"
     );
-    assert_eq!(facts.provider_trace_id.as_deref(), Some("task_abc"));
+    assert_eq!(
+        facts
+            .provider_trace_id
+            .as_ref()
+            .map(ProviderTraceId::as_str),
+        Some("task_abc")
+    );
     let requests = provider.requests();
     assert!(
         requests.iter().all(|request| request.starts_with("GET ")),
@@ -1421,6 +1440,7 @@ async fn a_cancellation_while_reading_a_task_is_not_a_before_send_cancellation()
             "task_abc",
             &credential,
             Some(&FakeContext::cancelled(provider.requests.clone())),
+            ReadBudget::GENERATION,
         )
         .await
         .expect_err("取消必须停下");
@@ -1521,5 +1541,68 @@ async fn provider_error_bodies_are_not_echoed() {
     assert!(
         !rendered.contains("SECRET_PROVIDER_BODY") && !rendered.contains("SECRET_TOKEN"),
         "Provider 正文与敏感 URL 不得出现在错误里：{rendered}"
+    );
+}
+
+/// 对账读取上限来自这份字节声明，并且不超过生成响应上限。
+#[test]
+fn the_reconciliation_read_limit_comes_from_the_declared_byte_limits() {
+    let adapter = ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(1))
+        .expect("adapter config");
+    assert_eq!(
+        adapter.reconciliation_read_bytes,
+        byte_limits().reconciliation_read_bytes()
+    );
+    assert!(
+        adapter.reconciliation_read_bytes <= MAX_PROVIDER_RESPONSE_BYTES,
+        "对账读取不会比生成读取更大"
+    );
+}
+
+/// 只读对账有自己的、更小的响应上限：超过它的响应读不下去，也不从中推断状态，只留证据缺口。
+///
+/// 用例把上限自己收成 4 KiB，而响应明显大于它、又远小于生成响应上限（8 MiB）：对账若沿用生成
+/// 上限，这份响应会被完整读入并解析成 `Succeeded`；返回 `Unknown` 才证明读取以对账上限为界。
+#[tokio::test]
+async fn a_reconciliation_response_above_its_own_limit_is_an_evidence_gap() {
+    let body = serde_json::json!({
+        "code": 200,
+        "data": {
+            "id": "task_abc",
+            "status": "completed",
+            "usage": full_usage(),
+            "result": {"images": [{"url": ["https://example.invalid/a.png"]}]},
+            "cost": 0.011354,
+            "note": "x".repeat(8 * 1024),
+        }
+    })
+    .to_string();
+    assert!(body.len() > 4096 && body.len() < MAX_PROVIDER_RESPONSE_BYTES);
+    let provider = FakeProvider::start(vec![("GET", "/v1/tasks/task_abc", 200, body)]).await;
+    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
+    let handle = AcceptedHandle {
+        task_id: ProviderTaskHandle::parse("task_abc".to_owned()).expect("test handle"),
+        trace_id: None,
+    };
+    let mut subject = adapter(&provider);
+    subject.reconciliation_read_bytes = 4096;
+    let query = subject
+        .query_accounting(
+            &handle,
+            "CNY",
+            Deadline::after(Duration::from_secs(30)),
+            &credential,
+        )
+        .await
+        .expect("超限按证据缺口交回，不是通道错误");
+    assert_eq!(query.state, ProviderTaskState::Unknown);
+    assert!(
+        query.accounting_facts.is_none(),
+        "读不下去的响应不能被当成账务事实"
+    );
+    assert_eq!(
+        provider.requests(),
+        vec!["GET /v1/tasks/task_abc".to_owned()],
+        "超限不重读：只发一次只读查询，绝不 submit"
     );
 }

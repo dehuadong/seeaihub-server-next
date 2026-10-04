@@ -21,9 +21,9 @@ use seeai_adapter_sdk::{
     GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage, ImageAdapter, ImageValueShape,
     InputImage, PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential,
     ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTaskHandle, ProviderTaskState,
-    QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
-    decode_data_url, ensure_external_call_allowed, ensure_read_call_allowed, external_call_timeout,
-    gateway_passthrough_parameters, is_http_url,
+    ProviderTraceId, QueryAccountingCapability, ResponsePayload, RetrySafety,
+    begin_generation_send, decode_data_url, ensure_external_call_allowed, ensure_read_call_allowed,
+    external_call_timeout, gateway_passthrough_parameters, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
@@ -42,6 +42,11 @@ pub const ADAPTER_KEY: &str = "apimart-image-v1";
 
 /// 上游响应正文上限：调用方据此计算一次执行的内存预留。
 pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 8 * 1024 * 1024;
+
+/// 生成路径读上游响应时的超限错误码。
+const RESPONSE_TOO_LARGE_CODE: &str = "provider_response_too_large";
+/// 只读对账查询响应超过它自己的上限时的错误码：按证据缺口处置，不重试重读。
+const RECONCILIATION_READ_EXCEEDED_CODE: &str = "reconciliation_read_limit_exceeded";
 /// 轮询间隔。文档建议 2~5 秒，取偏小值以缩短 Job 驻留时间。
 const POLL_INTERVAL: Duration = Duration::from_secs(3);
 /// 单次任务查询的瞬时失败重试次数上限（幂等读才允许重试）。
@@ -50,6 +55,18 @@ const QUERY_RETRY_LIMIT: u32 = 3;
 const QUERY_RETRY_BACKOFF: Duration = Duration::from_millis(500);
 /// 单次 HTTP 调用的超时（提交与轮询各自适用）。整轮耗时由 `deadline` 约束。
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// 本 Driver 声明的字节上限。
+///
+/// 生成响应上限与只读对账读取上限都从这里派生：对账读取用一条独立、更小但明确的上限，由
+/// [`GatewayByteLimits::reconciliation_read_bytes`] 收口（RFC 0018 §2.1）。
+#[must_use]
+fn byte_limits() -> GatewayByteLimits {
+    GatewayByteLimits {
+        request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
+        provider_response_bytes: MAX_PROVIDER_RESPONSE_BYTES,
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct ApimartAdapterFactory;
@@ -89,10 +106,7 @@ impl AdapterFactory for ApimartAdapterFactory {
             // APIMart 的终态另带 `cost`（实扣金额，含渠道侧折扣）：声明"上游给金额"的候选
             // 在这条通路上成立。
             declares_cost: true,
-            byte_limits: GatewayByteLimits {
-                request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
-                provider_response_bytes: MAX_PROVIDER_RESPONSE_BYTES,
-            },
+            byte_limits: byte_limits(),
         })
     }
 
@@ -226,6 +240,8 @@ pub struct ApimartImageAdapter {
     base_url: Url,
     /// 整轮（提交 + 轮询到终态）的墙钟上限。
     deadline: Duration,
+    /// 只读对账查询的响应上限：独立于生成响应上限，超限只留证据缺口（RFC 0018 §2.1）。
+    reconciliation_read_bytes: usize,
 }
 
 impl ApimartImageAdapter {
@@ -238,6 +254,7 @@ impl ApimartImageAdapter {
             client,
             base_url,
             deadline: timeout,
+            reconciliation_read_bytes: byte_limits().reconciliation_read_bytes(),
         })
     }
 
@@ -464,16 +481,21 @@ impl ApimartImageAdapter {
         task_id: &str,
         credential: &ProviderCredential,
     ) -> Result<Bytes, AdapterError> {
-        self.query_task_with(task_id, credential, None).await
+        self.query_task_with(task_id, credential, None, ReadBudget::GENERATION)
+            .await
     }
 
     /// 单次任务查询（含幂等读的有界退避重试）。`context` 给出取消与总期限时，每次尝试前
     /// 都过闸，单次超时用 min(自身配置, 剩余)（RFC 0017 §6）。
+    ///
+    /// `budget` 决定这次读取用哪条上限：生成路径用生成响应上限，只读对账用它自己更小的上限。
+    /// 超限是否重试也随预算定：对账路径不重读同一份超限响应，直接交回给调用方按证据缺口处置。
     async fn query_task_with(
         &self,
         task_id: &str,
         credential: &ProviderCredential,
         context: Option<&dyn ExecutionContext>,
+        budget: ReadBudget,
     ) -> Result<Bytes, AdapterError> {
         let mut attempt = 0_u32;
         loop {
@@ -494,12 +516,15 @@ impl ApimartImageAdapter {
                 .send()
                 .await
             {
-                Ok(response) => read_body(response).await,
+                Ok(response) => read_body_within(response, budget).await,
                 Err(error) => Err(ambiguous_transport_error(error)),
             };
             match outcome {
                 Ok(body) => return Ok(body),
                 Err(error) => {
+                    if !budget.retry_on_overflow && budget.is_overflow(&error) {
+                        return Err(error);
+                    }
                     attempt += 1;
                     if attempt > QUERY_RETRY_LIMIT {
                         return Err(error);
@@ -656,7 +681,7 @@ impl ApimartImageAdapter {
             usage,
             // 对账标识：任务式上游的 task id。只写入 attempts.provider_trace_id 供人工对账，
             // **不用于跨调用自动恢复**——拿它自动补齐结果需要另一套模型。
-            provider_trace_id: Some(task_id.to_owned()),
+            provider_trace_id: ProviderTraceId::parse(task_id),
             response_digest: digest,
             provider_cost,
         })
@@ -690,7 +715,7 @@ fn with_task_id(error: AdapterError, task_id: &str) -> AdapterError {
     match error {
         AdapterError::Provider(mut provider) => {
             if provider.trace_id.is_none() {
-                provider.trace_id = Some(task_id.to_owned());
+                provider.trace_id = ProviderTraceId::parse(task_id);
             }
             AdapterError::Provider(provider)
         }
@@ -995,24 +1020,70 @@ fn parse_decimal_microusd(text: &str) -> Option<u64> {
     u64::try_from(scaled).ok()
 }
 
+/// 一次读上游响应时用的读取预算：上限、超限错误码，以及超限是否仍按瞬时失败重试。
+///
+/// 生成路径与只读对账路径是两条不同的读取：前者要装下结果图，后者只要有界的状态与计量字段。
+/// 超限用各自的错误码交回，调用方据此区分"读不下这份生成响应"和"这次对账拿不到证据"。
+#[derive(Debug, Clone, Copy)]
+struct ReadBudget {
+    limit: usize,
+    overflow_code: &'static str,
+    /// 超限是否仍按瞬时失败重试。生成路径保留原有的有界重试；对账路径不重读同一份超限响应。
+    retry_on_overflow: bool,
+}
+
+impl ReadBudget {
+    /// 生成路径：上游响应上限。
+    const GENERATION: Self = Self {
+        limit: MAX_PROVIDER_RESPONSE_BYTES,
+        overflow_code: RESPONSE_TOO_LARGE_CODE,
+        retry_on_overflow: true,
+    };
+
+    /// 只读对账路径：独立且更小的上限（RFC 0018 §2.1）。
+    fn reconciliation(limit: usize) -> Self {
+        Self {
+            limit,
+            overflow_code: RECONCILIATION_READ_EXCEEDED_CODE,
+            retry_on_overflow: false,
+        }
+    }
+
+    /// 这次错误是不是"超过本预算的上限"。
+    fn is_overflow(self, error: &AdapterError) -> bool {
+        matches!(error, AdapterError::Provider(call) if call.code == self.overflow_code)
+    }
+}
+
 async fn read_body(response: reqwest::Response) -> Result<Bytes, AdapterError> {
+    read_body_within(response, ReadBudget::GENERATION).await
+}
+
+async fn read_body_within(
+    response: reqwest::Response,
+    budget: ReadBudget,
+) -> Result<Bytes, AdapterError> {
     let status = response.status();
-    let body = read_bytes(response, MAX_PROVIDER_RESPONSE_BYTES).await?;
+    let body = read_bytes(response, budget.limit, budget.overflow_code).await?;
     if !status.is_success() {
         return Err(parse_provider_error(status, &body).into());
     }
     Ok(body)
 }
 
-async fn read_bytes(response: reqwest::Response, limit: usize) -> Result<Bytes, AdapterError> {
+async fn read_bytes(
+    response: reqwest::Response,
+    limit: usize,
+    overflow_code: &'static str,
+) -> Result<Bytes, AdapterError> {
     let mut body = BytesMut::new();
     let mut stream = response.bytes_stream();
     while let Some(chunk) = stream.next().await {
         let chunk = chunk.map_err(ambiguous_transport_error)?;
         if body.len().saturating_add(chunk.len()) > limit {
             return Err(provider_error(
-                "provider_response_too_large",
-                "provider response exceeded the configured safety limit".to_owned(),
+                overflow_code,
+                format!("provider response exceeded the {limit}-byte limit"),
                 RetrySafety::AcceptanceUnknown,
                 ProviderFailureKind::Unknown,
             ));
@@ -1514,7 +1585,7 @@ impl ApimartImageAdapter {
                 ));
             }
             let body = match self
-                .query_task_with(task_id, credential, Some(context))
+                .query_task_with(task_id, credential, Some(context), ReadBudget::GENERATION)
                 .await
             {
                 Ok(body) => body,
@@ -1608,7 +1679,7 @@ impl ApimartImageAdapter {
                 provider_cost,
                 image_count,
                 response_digest: digest,
-                provider_trace_id: Some(task_id.to_owned()),
+                provider_trace_id: ProviderTraceId::parse(task_id),
             },
         })
     }
@@ -1656,7 +1727,7 @@ impl GatewayAdapter for ApimartImageAdapter {
         };
         let handle = AcceptedHandle {
             task_id: typed_task_id,
-            trace_id: Some(task_id.clone()),
+            trace_id: ProviderTraceId::parse(&task_id),
         };
         if let Err(error) = context.accepted(handle.clone()).await {
             let reason = match error {
@@ -1697,10 +1768,23 @@ impl GatewayAdapter for ApimartImageAdapter {
                 ProviderFailureKind::Unknown,
             ));
         }
-        let body = self
-            .query_task(task_id, credential)
+        let budget = ReadBudget::reconciliation(self.reconciliation_read_bytes);
+        let body = match self
+            .query_task_with(task_id, credential, None, budget)
             .await
-            .map_err(after_acceptance)?;
+        {
+            Ok(body) => body,
+            // 响应超过对账读取自己的上限：整份响应不可信，也不无界重读；按证据缺口（Unknown）
+            // 交回，由收尾方保留占用并建对账案例，绝不从读了一半的内容里推断成功或失败
+            // （RFC 0018 §2.1）。
+            Err(error) if budget.is_overflow(&error) => {
+                return Ok(AccountingQuery {
+                    state: ProviderTaskState::Unknown,
+                    accounting_facts: None,
+                });
+            }
+            Err(error) => return Err(after_acceptance(error)),
+        };
         let parsed: TaskEnvelope = serde_json::from_slice(&body).map_err(|error| {
             provider_error(
                 "provider_response_invalid",
@@ -1750,7 +1834,7 @@ impl GatewayAdapter for ApimartImageAdapter {
                 provider_cost: task.provider_cost(cost_currency),
                 image_count,
                 response_digest: task.response_digest(task_id),
-                provider_trace_id: Some(task_id.to_owned()),
+                provider_trace_id: ProviderTraceId::parse(task_id),
             }),
         })
     }

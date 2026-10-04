@@ -33,7 +33,8 @@ use seeai_application::{
     SettleExecution, SubmissionStarted, TakenOverExecution,
 };
 use seeai_domain::{
-    AccountId, AttemptId, ConsumerRatesCny, FencingToken, JobId, ProviderCostFact, TokenUsage,
+    AccountId, AttemptId, ConsumerRatesCny, FencingToken, JobId, ProviderCostFact, ProviderTraceId,
+    TokenUsage,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::{Value, json};
@@ -125,7 +126,7 @@ impl GatewayAdapter for FakeGateway {
                 Err(AdapterError::Provider(ProviderCallError {
                     code: "fake-provider".to_owned(),
                     message: "the fake provider failed before acceptance".to_owned(),
-                    trace_id: Some("trace-1".to_owned()),
+                    trace_id: Some(ProviderTraceId::parse("trace-1").expect("test trace")),
                     retry_safety: RetrySafety::SafeBeforeAcceptance,
                     kind: ProviderFailureKind::UpstreamUnavailable,
                     provider_cost: Some(ProviderCost::Unavailable),
@@ -136,7 +137,7 @@ impl GatewayAdapter for FakeGateway {
                 Err(AdapterError::Provider(ProviderCallError {
                     code: "fake-provider".to_owned(),
                     message: "the fake provider failed".to_owned(),
-                    trace_id: Some("trace-1".to_owned()),
+                    trace_id: Some(ProviderTraceId::parse("trace-1").expect("test trace")),
                     retry_safety,
                     kind,
                     provider_cost: Some(ProviderCost::Unavailable),
@@ -145,7 +146,7 @@ impl GatewayAdapter for FakeGateway {
             FakeBehavior::AcceptedUnpersisted => Err(AdapterError::AcceptedUnpersisted {
                 handle: AcceptedHandle {
                     task_id: ProviderTaskHandle::parse("task-1".to_owned()).expect("test handle"),
-                    trace_id: Some("trace-1".to_owned()),
+                    trace_id: Some(ProviderTraceId::parse("trace-1").expect("test trace")),
                 },
                 reason: "the fake could not persist the handle".to_owned(),
             }),
@@ -296,7 +297,7 @@ fn success_output() -> seeai_adapter_sdk::ProviderOutput {
             }),
             image_count: 1,
             response_digest: "digest-1".to_owned(),
-            provider_trace_id: Some("trace-1".to_owned()),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-1").expect("test trace")),
         },
     }
 }

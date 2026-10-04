@@ -16,7 +16,7 @@
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
     AcceptedHandle, AccountingFacts, AdapterError, Deadline, ProviderCost, ProviderTaskHandle,
-    QueryAccountingCapability,
+    ProviderTraceId, QueryAccountingCapability,
 };
 use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChargeFacts, ExecutionStage, JobId, MeteringEvidence,
@@ -645,22 +645,16 @@ impl ExecutionReconciliationService {
     }
 
     /// 一次性只读查询：能力、凭证、成本币种或适配器任缺一律不查，查询失败按可重试处理。
+    ///
+    /// 句柄与 trace 都是已经构造过的有界标识：存量里不是标识的旧值在仓储读回时就按"没有可信
+    /// 句柄/标识"丢掉了（RFC 0018 §6），这里不必再判一次。
     async fn read_only_accounting(
         &self,
         execution: &TakenOverExecution,
-        handle: &str,
-        trace_id: Option<String>,
+        handle: &ProviderTaskHandle,
+        trace_id: Option<ProviderTraceId>,
         report: &mut ReconciliationReport,
     ) -> QueryOutcome {
-        // 存量里可能有不是标识的旧句柄（URL、data URL、超长值）：拿它去拼上游查询 URL 等于把
-        // 一段正文当任务名发出去。这类执行不具备只读查询条件，保留占用并建案（Spec 0005 §5）。
-        if !seeai_domain::is_bounded_provider_identifier(handle) {
-            tracing::warn!(
-                job_id = %execution.job_id,
-                "the stored provider task handle is not a bounded identifier; the read-only query is refused"
-            );
-            return QueryOutcome::Unavailable;
-        }
         let adapter = match self.adapters.create_gateway(
             &execution.adapter_key,
             &execution.base_url,
@@ -700,11 +694,11 @@ impl ExecutionReconciliationService {
                 return QueryOutcome::Unavailable;
             }
         };
-        // 上面的有界校验已经把不是标识的值拦下；这里把同一条不变量变成类型。
-        let Ok(task_id) = ProviderTaskHandle::parse(handle.to_owned()) else {
-            return QueryOutcome::Unavailable;
+        // 句柄已经是有界类型：类型构造就是唯一的那次校验。
+        let handle = AcceptedHandle {
+            task_id: handle.clone(),
+            trace_id,
         };
-        let handle = AcceptedHandle { task_id, trace_id };
         let deadline = Deadline::after(self.policy.query_timeout);
         report.queried += 1;
         // 记一次查询尝试并排下次退避（RFC 0017 §5）。没有未结案例（仍在 executing）时不落任何

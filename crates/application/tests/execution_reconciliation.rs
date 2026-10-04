@@ -30,7 +30,8 @@ use seeai_application::{
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ChargeFacts, FencingToken, ImageBranch, JobId,
     MeteringEvidence, OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource,
-    ReceiptCredential, RuntimeRevisionId, TokenUsage, VendorModelId,
+    ProviderTaskHandle, ProviderTraceId, ReceiptCredential, RuntimeRevisionId, TokenUsage,
+    VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
@@ -265,7 +266,7 @@ fn terminal_facts() -> AccountingFacts {
         }),
         image_count: 1,
         response_digest: "resp-recon".to_owned(),
-        provider_trace_id: Some("trace-recon".to_owned()),
+        provider_trace_id: Some(ProviderTraceId::parse("trace-recon").expect("test trace")),
     }
 }
 
@@ -420,8 +421,10 @@ async fn accept(repository: &PgHubRepository, job_id: JobId, attempt_id: Attempt
             attempt_id,
             execution_owner: "supervisor-a".to_owned(),
             fencing_token: FencingToken::new(0),
-            provider_task_handle: Some(handle.to_owned()),
-            provider_trace_id: Some("trace-accepted".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse(handle.to_owned()).expect("a bounded task handle"),
+            ),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-accepted").expect("test trace")),
         })
         .await
         .expect("record_acceptance");
@@ -860,7 +863,7 @@ async fn a_late_accounting_fact_settles_and_is_consumed() {
             attempt_id,
             receipt_credential: credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-late".to_owned()),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-late").expect("test trace")),
             image_count: None,
             evidence: Some(MeteringEvidence {
                 attempt_id,
@@ -915,8 +918,12 @@ async fn an_unfinished_late_handle_is_not_consumed_and_is_reclaimable_after_the_
             job_id,
             attempt_id,
             receipt_credential: credential.clone(),
-            provider_task_handle: Some("task-unfinished".to_owned()),
-            provider_trace_id: Some("trace-unfinished".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse("task-unfinished".to_owned()).expect("test handle"),
+            ),
+            provider_trace_id: Some(
+                ProviderTraceId::parse("trace-unfinished").expect("test trace"),
+            ),
             image_count: None,
             evidence: None,
             provider_cost: None,
@@ -979,8 +986,10 @@ async fn a_late_handle_whose_task_failed_releases_the_hold_without_charging() {
             job_id,
             attempt_id,
             receipt_credential: credential.clone(),
-            provider_task_handle: Some("task-failed".to_owned()),
-            provider_trace_id: Some("trace-failed".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse("task-failed".to_owned()).expect("test handle"),
+            ),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-failed").expect("test trace")),
             image_count: None,
             evidence: None,
             provider_cost: None,
@@ -1034,7 +1043,9 @@ async fn a_late_accounting_fact_that_reports_a_failure_releases_the_hold_without
             attempt_id,
             receipt_credential: credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-late-failed".to_owned()),
+            provider_trace_id: Some(
+                ProviderTraceId::parse("trace-late-failed").expect("test trace"),
+            ),
             image_count: Some(1),
             evidence: Some(MeteringEvidence {
                 attempt_id,
@@ -1098,7 +1109,9 @@ async fn a_late_accounting_fact_that_reports_a_cancellation_releases_the_hold_wi
             attempt_id,
             receipt_credential: credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-late-cancelled".to_owned()),
+            provider_trace_id: Some(
+                ProviderTraceId::parse("trace-late-cancelled").expect("test trace"),
+            ),
             image_count: Some(1),
             evidence: Some(MeteringEvidence {
                 attempt_id,
@@ -1145,7 +1158,9 @@ async fn a_late_accounting_fact_with_an_unknown_state_keeps_the_hold() {
             attempt_id,
             receipt_credential: credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-late-unknown".to_owned()),
+            provider_trace_id: Some(
+                ProviderTraceId::parse("trace-late-unknown").expect("test trace"),
+            ),
             image_count: Some(1),
             evidence: Some(MeteringEvidence {
                 attempt_id,
@@ -1270,8 +1285,10 @@ async fn late_handle_queries_back_off_and_stop_at_the_retry_cap() {
             job_id,
             attempt_id,
             receipt_credential: credential.clone(),
-            provider_task_handle: Some("task-schedule".to_owned()),
-            provider_trace_id: Some("trace-schedule".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse("task-schedule".to_owned()).expect("test handle"),
+            ),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-schedule").expect("test trace")),
             image_count: None,
             evidence: None,
             provider_cost: None,
@@ -1355,7 +1372,7 @@ async fn a_terminal_late_cost_lands_in_the_cost_gap_without_reopening_the_job() 
             attempt_id,
             receipt_credential: credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-terminal".to_owned()),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-terminal").expect("test trace")),
             image_count: None,
             evidence: None,
             provider_state: None,
@@ -1427,7 +1444,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
             attempt_id: gap_attempt,
             receipt_credential: gap_credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-gap".to_owned()),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-gap").expect("test trace")),
             image_count: None,
             evidence: Some(MeteringEvidence {
                 attempt_id: gap_attempt,
@@ -1479,7 +1496,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
             attempt_id: count_attempt,
             receipt_credential: count_credential.clone(),
             provider_task_handle: None,
-            provider_trace_id: Some("trace-count".to_owned()),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-count").expect("test trace")),
             image_count: Some(2),
             evidence: Some(MeteringEvidence {
                 attempt_id: count_attempt,
@@ -1553,7 +1570,7 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
             })
             .expect("the API charge"),
         image_count: Some(1),
-        provider_trace_id: Some("trace-api".to_owned()),
+        provider_trace_id: Some(ProviderTraceId::parse("trace-api").expect("test trace")),
     };
 
     let factory = Arc::new(FakeFactory::new());

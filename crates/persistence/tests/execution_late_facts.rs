@@ -11,8 +11,8 @@ use seeai_application::{
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, FencingToken, ImageBranch, JobId, MeteringEvidence,
-    OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource, ReceiptCredential,
-    RuntimeRevisionId, TokenUsage, VendorModelId,
+    OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource, ProviderTaskHandle,
+    ProviderTraceId, ReceiptCredential, RuntimeRevisionId, TokenUsage, VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
@@ -193,7 +193,7 @@ fn facts(job_id: JobId, attempt_id: AttemptId, credential: &ReceiptCredential) -
         attempt_id,
         receipt_credential: credential.clone(),
         provider_task_handle: None,
-        provider_trace_id: Some("trace-late".to_owned()),
+        provider_trace_id: Some(ProviderTraceId::parse("trace-late").expect("test trace")),
         image_count: None,
         evidence: None,
         provider_cost: None,
@@ -232,8 +232,9 @@ async fn a_late_task_handle_is_received_once_and_keeps_ownership_untouched() {
     let (attempt_id, credential) = begin(&repository, job_id).await;
 
     let mut late = facts(job_id, attempt_id, &credential);
-    late.provider_task_handle = Some("task-9".to_owned());
-    late.provider_trace_id = Some("trace-9".to_owned());
+    late.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-9".to_owned()).expect("test handle"));
+    late.provider_trace_id = Some(ProviderTraceId::parse("trace-9").expect("test trace"));
     assert_eq!(
         repository
             .offer_late_facts(late.clone())
@@ -276,7 +277,8 @@ async fn a_late_task_handle_is_received_once_and_keeps_ownership_untouched() {
 
     // 异内容：建案，不覆盖原收件。
     let mut different = facts(job_id, attempt_id, &credential);
-    different.provider_task_handle = Some("task-other".to_owned());
+    different.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-other".to_owned()).expect("test handle"));
     assert_eq!(
         repository
             .offer_late_facts(different)
@@ -351,7 +353,8 @@ async fn late_accounting_facts_are_received_but_unrelated_ones_are_ignored() {
         LateFactsOutcome::Ignored
     );
     let mut unrelated = facts(JobId::new(), attempt_id, &credential);
-    unrelated.provider_task_handle = Some("task-x".to_owned());
+    unrelated.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-x".to_owned()).expect("test handle"));
     assert_eq!(
         repository
             .offer_late_facts(unrelated)
@@ -375,8 +378,9 @@ async fn a_late_task_handle_is_claimed_reclaimable_after_the_ttl_and_marked_cons
     let (attempt_id, credential) = begin(&repository, job_id).await;
 
     let mut late = facts(job_id, attempt_id, &credential);
-    late.provider_task_handle = Some("task-claim".to_owned());
-    late.provider_trace_id = Some("trace-claim".to_owned());
+    late.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-claim".to_owned()).expect("test handle"));
+    late.provider_trace_id = Some(ProviderTraceId::parse("trace-claim").expect("test trace"));
     assert_eq!(
         repository.offer_late_facts(late).await.expect("offer"),
         LateFactsOutcome::Received
@@ -391,8 +395,16 @@ async fn a_late_task_handle_is_claimed_reclaimable_after_the_ttl_and_marked_cons
     assert_eq!(fact.job_id, job_id);
     assert_eq!(fact.attempt_id, attempt_id);
     assert_eq!(fact.kind, LateFactKind::TaskHandle);
-    assert_eq!(fact.provider_task_handle.as_deref(), Some("task-claim"));
-    assert_eq!(fact.provider_trace_id.as_deref(), Some("trace-claim"));
+    assert_eq!(
+        fact.provider_task_handle
+            .as_ref()
+            .map(ProviderTaskHandle::as_str),
+        Some("task-claim")
+    );
+    assert_eq!(
+        fact.provider_trace_id.as_ref().map(ProviderTraceId::as_str),
+        Some("trace-claim")
+    );
     assert!(fact.evidence.is_none());
     assert!(fact.provider_cost.is_none());
 
@@ -519,7 +531,7 @@ async fn claimed_accounting_late_facts_carry_the_evidence_and_cost() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 不是有界标识的"句柄"不能从收件口子回到库里：它既不是任务标识，也可能带着正文。
+/// 不是有界标识的"句柄"在类型构造处就被拒绝，进不了收件端口；没有其它可收事实时不写空行。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn a_late_handle_that_is_not_an_identifier_is_not_stored() {
@@ -529,9 +541,17 @@ async fn a_late_handle_that_is_not_an_identifier_is_not_stored() {
     let job_id = admit_one(&repository, &fixture, "late-bad-handle").await;
     let (attempt_id, credential) = begin(&repository, job_id).await;
 
-    let mut late = facts(job_id, attempt_id, &credential);
-    // 只有无效句柄、没有其它事实：按无可收内容处理，不写空行。
-    late.provider_task_handle = Some("data:image/png;base64,AAAA".to_owned());
+    assert!(
+        ProviderTaskHandle::parse("data:image/png;base64,AAAA".to_owned()).is_err(),
+        "a payload must not construct a task handle"
+    );
+    assert!(
+        ProviderTraceId::parse("data:image/png;base64,AAAA").is_none(),
+        "a payload must not construct a trace id"
+    );
+
+    // 只有句柄形态、没有其它事实：按无可收内容处理，不写空行。
+    let late = facts(job_id, attempt_id, &credential);
     assert_eq!(
         repository.offer_late_facts(late).await.expect("offer"),
         LateFactsOutcome::Ignored
@@ -556,7 +576,8 @@ async fn a_late_fact_with_a_mismatched_credential_is_ignored() {
     // 形状合法但不是这一份：只在库里存摘要，拿不到原值就伪造不出。
     let forged = ReceiptCredential::parse(&"a".repeat(64)).expect("a well-formed credential");
     let mut late = facts(job_id, attempt_id, &forged);
-    late.provider_task_handle = Some("task-forged".to_owned());
+    late.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-forged".to_owned()).expect("test handle"));
     assert_eq!(
         repository.offer_late_facts(late).await.expect("offer"),
         LateFactsOutcome::Ignored
@@ -565,7 +586,8 @@ async fn a_late_fact_with_a_mismatched_credential_is_ignored() {
 
     // 原凭据仍然有效：拒绝的是伪造那一份，不是把这条通路关掉。
     let mut valid = facts(job_id, attempt_id, &credential);
-    valid.provider_task_handle = Some("task-valid".to_owned());
+    valid.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-valid".to_owned()).expect("test handle"));
     assert_eq!(
         repository.offer_late_facts(valid).await.expect("offer"),
         LateFactsOutcome::Received
@@ -593,7 +615,8 @@ async fn a_late_fact_for_an_attempt_without_a_credential_is_ignored() {
         .expect("clear the credential digest");
 
     let mut late = facts(job_id, attempt_id, &credential);
-    late.provider_task_handle = Some("task-legacy".to_owned());
+    late.provider_task_handle =
+        Some(ProviderTaskHandle::parse("task-legacy".to_owned()).expect("test handle"));
     assert_eq!(
         repository.offer_late_facts(late).await.expect("offer"),
         LateFactsOutcome::Ignored

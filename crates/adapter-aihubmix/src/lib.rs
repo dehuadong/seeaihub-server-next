@@ -6,7 +6,7 @@ use seeai_adapter_sdk::{
     AccountingFacts, AdapterDescriptor, AdapterError, DecodedImage, ExecutionContext,
     GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage,
     ImageAdapter, InputImage, PreparedImageRequest, ProviderCallError, ProviderCost,
-    ProviderCredential, ProviderFailureKind, ProviderOutput, ProviderSuccess,
+    ProviderCredential, ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTraceId,
     QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
     decode_data_url, ensure_external_call_allowed, external_call_timeout,
     gateway_passthrough_parameters, is_http_url,
@@ -30,6 +30,19 @@ pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
 /// 单张输入图（参考图或遮罩）在内存里的上限：data URL 就地解码、公网 URL 自己下载，
 /// 两种形态都不落盘，因此必须有上限兜住内存。
 const MAX_INPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
+
+/// 本 Driver 声明的字节上限。
+///
+/// 生成响应上限与只读对账读取上限都从这里派生（RFC 0018 §2.1）。这条通路不声明按句柄查询
+/// 计量的能力（[`QueryAccountingCapability::Unsupported`]），对账读取上限仍随这份声明一起
+/// 存在：它与生成响应上限的关系不需要第二个地方维护。
+#[must_use]
+fn byte_limits() -> GatewayByteLimits {
+    GatewayByteLimits {
+        request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
+        provider_response_bytes: MAX_PROVIDER_RESPONSE_BYTES,
+    }
+}
 
 #[derive(Debug, Default)]
 pub struct AihubmixAdapterFactory;
@@ -62,10 +75,7 @@ impl AdapterFactory for AihubmixAdapterFactory {
             // AIHubMix 只回四分项 `usage`，金额由平台按费率自算：声明"上游给金额"的候选
             // （成本或对客）在这条通路上发布期就拒。
             declares_cost: false,
-            byte_limits: GatewayByteLimits {
-                request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
-                provider_response_bytes: MAX_PROVIDER_RESPONSE_BYTES,
-            },
+            byte_limits: byte_limits(),
         })
     }
 
@@ -955,11 +965,12 @@ fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {
 async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, AdapterError> {
     let status = response.status();
     // 对账标识：上游的逐请求标识，只用于对账，不参与计价（见 CONTEXT.md 的 Generation Attempt）。
+    // 响应头可能带回 URL 或任意正文，入口就按有界标识构造，非法值按"没有可信 trace"丢弃。
     let provider_trace_id = response
         .headers()
         .get("x-request-id")
         .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
+        .and_then(ProviderTraceId::parse);
     if response
         .content_length()
         .is_some_and(|length| length > MAX_PROVIDER_RESPONSE_BYTES as u64)
@@ -987,7 +998,7 @@ async fn parse_response(response: reqwest::Response) -> Result<ProviderSuccess, 
 /// 只在这一处发生，也能直接在用例里喂一份响应体验证——它们都要带上这次执行的成本事实。
 fn success_from_body(
     body: &[u8],
-    provider_trace_id: Option<String>,
+    provider_trace_id: Option<ProviderTraceId>,
 ) -> Result<ProviderSuccess, AdapterError> {
     let digest = sha256_hex(body);
     let parsed: ImageResponse = serde_json::from_slice(body).map_err(|error| {
@@ -1077,7 +1088,9 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
         .as_ref()
         .map(|value| value.error.message.clone())
         .unwrap_or_else(|| "provider returned an error without a JSON body".to_owned());
-    let trace_id = parsed.and_then(|value| value.error.tid);
+    // 错误体里的 tid 与成功响应头同源：同样按有界标识构造，非法值丢弃（Spec 0005 §2）。
+    let trace_id =
+        parsed.and_then(|value| value.error.tid.as_deref().and_then(ProviderTraceId::parse));
     let retry_safety = if status == StatusCode::TOO_MANY_REQUESTS
         || matches!(
             code.as_str(),

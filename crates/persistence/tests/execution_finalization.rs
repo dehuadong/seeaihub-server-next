@@ -15,7 +15,7 @@ use seeai_application::{
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ExecutionStage, FencingToken, ImageBranch, JobId,
     MeteringEvidence, OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource,
-    RuntimeRevisionId, TokenUsage, VendorModelId,
+    ProviderTaskHandle, ProviderTraceId, RuntimeRevisionId, TokenUsage, VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
@@ -202,8 +202,10 @@ async fn start_and_accept(
             attempt_id: started.attempt_id,
             execution_owner: "supervisor-a".to_owned(),
             fencing_token: FencingToken::new(0),
-            provider_task_handle: Some("task-1".to_owned()),
-            provider_trace_id: Some("trace-1".to_owned()),
+            provider_task_handle: Some(
+                ProviderTaskHandle::parse("task-1".to_owned()).expect("test handle"),
+            ),
+            provider_trace_id: Some(ProviderTraceId::parse("trace-1").expect("test trace")),
         })
         .await
         .expect("record_acceptance");
@@ -250,7 +252,7 @@ fn settle_command(
         },
         charge_microusd: charge,
         image_count: Some(1),
-        provider_trace_id: Some("trace-1".to_owned()),
+        provider_trace_id: Some(ProviderTraceId::parse("trace-1").expect("test trace")),
     }
 }
 
@@ -268,7 +270,7 @@ fn failure_command(
         ProviderFailureKind::PlatformInternal,
         disposition,
         provider_cost,
-        Some("trace-1".to_owned()),
+        Some(ProviderTraceId::parse("trace-1").expect("test trace")),
     )
 }
 
