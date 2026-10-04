@@ -8,7 +8,7 @@
 //! docs/design/0017-synchronous-image-gateway.md 的 §3、§5。
 
 use serde::{Deserialize, Serialize};
-use std::fmt::{Display, Formatter};
+use std::fmt::{Debug, Display, Formatter};
 
 use crate::DomainError;
 
@@ -196,7 +196,7 @@ impl FencingToken {
 
 impl Display for FencingToken {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        self.0.fmt(formatter)
+        Display::fmt(&self.0, formatter)
     }
 }
 
@@ -245,5 +245,40 @@ impl ProviderTaskState {
             "unknown" => Some(Self::Unknown),
             _ => None,
         }
+    }
+}
+
+/// 收件凭据的十六进制长度：32 字节随机数。
+pub const RECEIPT_CREDENTIAL_HEX_LEN: usize = 64;
+
+/// Attempt 的**收件凭据**：`begin_submission` 原子生成，数据库只存摘要，执行上下文持有原值。
+///
+/// 它只证明"这次投递来自创建该 Attempt 的原提交者"：凭据有效即可交付晚到事实，即使原 fencing
+/// token 已经过期（RFC 0018 §5.2）。它不授权正式结算、不改所有权、不重开终态；它不是环境变量，
+/// 也不进日志——[`Debug`] 只输出占位符。
+#[derive(Clone, PartialEq, Eq)]
+pub struct ReceiptCredential(String);
+
+impl ReceiptCredential {
+    /// 从原值还原：只接受全长的十六进制串，其余按"不可信"处理。
+    #[must_use]
+    pub fn parse(value: &str) -> Option<Self> {
+        let bounded = value.len() == RECEIPT_CREDENTIAL_HEX_LEN
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || (b'a'..=b'f').contains(&byte));
+        bounded.then(|| Self(value.to_owned()))
+    }
+
+    /// 取出原值，交给收件校验；不要写进日志、错误正文或任何持久化载荷。
+    #[must_use]
+    pub fn expose(&self) -> &str {
+        &self.0
+    }
+}
+
+impl Debug for ReceiptCredential {
+    fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
+        formatter.write_str("ReceiptCredential([REDACTED])")
     }
 }

@@ -37,7 +37,7 @@ use seeai_domain::{
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::{Value, json};
-use sqlx::{AssertSqlSafe, PgPool};
+use sqlx::{AssertSqlSafe, PgPool, Row};
 use uuid::Uuid;
 
 const ADAPTER_KEY: &str = "fake-gateway";
@@ -416,11 +416,16 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
         .expect("the runtime publication");
 }
 
-/// 只在 `settle` 上做手脚的端口包装：第一次调用**先让真实仓库提交**，再谎报提交结果未知，
+/// 只在收尾端口上做手脚的包装：第一次 `settle` **先让真实仓库提交**，再谎报提交结果未知，
 /// 用来验证应用层"先 read_finalization 确认、不先假定失败"（RFC 0017 §3）。
+///
+/// `always_conflict` 则让 `settle` 与 `fail_or_reconcile` 一直报冲突、只读确认也读不到，
+/// 模拟所有权已被接管或提交结果长期不明：验证已经取得的事实会在有限收尾预算内交回收件端口，
+/// 而不是随返回值丢掉（RFC 0018 §5.1）。
 struct FlakySettleRepository {
     inner: Arc<PgHubRepository>,
     fail_next_settle: Arc<AtomicBool>,
+    always_conflict: Arc<AtomicBool>,
 }
 
 #[async_trait]
@@ -454,6 +459,11 @@ impl ExecutionRepository for FlakySettleRepository {
         &self,
         command: SettleExecution,
     ) -> Result<ExecutionFinalization, ApplicationError> {
+        if self.always_conflict.load(Ordering::SeqCst) {
+            return Err(ApplicationError::Conflict(
+                "simulated ownership conflict on settle".to_owned(),
+            ));
+        }
         let result = self.inner.settle(command).await;
         if self.fail_next_settle.swap(false, Ordering::SeqCst) && result.is_ok() {
             return Err(ApplicationError::Persistence(
@@ -467,6 +477,11 @@ impl ExecutionRepository for FlakySettleRepository {
         &self,
         command: FailOrReconcileExecution,
     ) -> Result<ExecutionFinalization, ApplicationError> {
+        if self.always_conflict.load(Ordering::SeqCst) {
+            return Err(ApplicationError::Conflict(
+                "simulated ownership conflict on failure finalization".to_owned(),
+            ));
+        }
         self.inner.fail_or_reconcile(command).await
     }
 
@@ -475,6 +490,10 @@ impl ExecutionRepository for FlakySettleRepository {
         job_id: JobId,
         attempt_id: AttemptId,
     ) -> Result<Option<ExecutionFinalization>, ApplicationError> {
+        if self.always_conflict.load(Ordering::SeqCst) {
+            // 提交结果长期不明：确认不到任何已提交的收尾。
+            return Ok(None);
+        }
         self.inner.read_finalization(job_id, attempt_id).await
     }
 
@@ -571,11 +590,17 @@ async fn setup() -> Fixture {
 }
 
 async fn setup_with(flaky_settle: Option<Arc<AtomicBool>>) -> Fixture {
-    setup_with_keys(flaky_settle, test_keys()).await
+    setup_with_keys(flaky_settle, None, test_keys()).await
+}
+
+/// 收尾端口一直报冲突、只读确认也读不到：验证已经取得的事实会被交回收件端口。
+async fn setup_with_conflicting_finalization() -> Fixture {
+    setup_with_keys(None, Some(Arc::new(AtomicBool::new(true))), test_keys()).await
 }
 
 async fn setup_with_keys(
     flaky_settle: Option<Arc<AtomicBool>>,
+    always_conflict: Option<Arc<AtomicBool>>,
     keys: RequestFingerprintKeys,
 ) -> Fixture {
     let (database_url, database_name) = isolated_database_url().await;
@@ -606,12 +631,18 @@ async fn setup_with_keys(
     let factory = Arc::new(FakeFactory::new());
     publish(&repository, factory.clone()).await;
     let calls = factory.calls.clone();
-    let executions: Arc<dyn ExecutionRepository> = match &flaky_settle {
-        Some(flag) => Arc::new(FlakySettleRepository {
+    let executions: Arc<dyn ExecutionRepository> = match (&flaky_settle, &always_conflict) {
+        (Some(flag), _) => Arc::new(FlakySettleRepository {
             inner: repository.clone(),
             fail_next_settle: flag.clone(),
+            always_conflict: Arc::new(AtomicBool::new(false)),
         }),
-        None => repository.clone(),
+        (None, Some(conflict)) => Arc::new(FlakySettleRepository {
+            inner: repository.clone(),
+            fail_next_settle: Arc::new(AtomicBool::new(false)),
+            always_conflict: conflict.clone(),
+        }),
+        (None, None) => repository.clone(),
     };
     let service = build_service(repository.clone(), executions, factory.clone(), keys);
     Fixture {
@@ -776,6 +807,16 @@ async fn success_settles_before_returning_and_charges_once() {
     );
     assert_eq!(fixture.held_microusd().await, 0, "the hold is settled");
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+    let handed_off: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.late_facts WHERE job_id = $1")
+            .bind(job_id.0)
+            .fetch_one(fixture.pool())
+            .await
+            .expect("the late fact count");
+    assert_eq!(
+        handed_off, 0,
+        "a formally settled success does not fill the inbox"
+    );
 
     // 同键再来：已结算且结果不保留，不重新执行、不再扣费。
     let replay = fixture
@@ -906,6 +947,137 @@ async fn a_settle_after_the_total_deadline_returns_result_delivery_timeout() {
     assert_eq!(fixture.job_state().await, "succeeded");
     assert_eq!(fixture.held_microusd().await, 0, "the charge is committed");
     assert_eq!(fixture.calls.load(Ordering::SeqCst), 1);
+
+    fixture.cleanup().await;
+}
+
+/// 同步成功但当前所有权下结算不了：已经取得的成功事实在有限预算内交回收件端口，不丢。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_success_that_cannot_be_settled_hands_off_its_facts() {
+    let fixture = setup_with_conflicting_finalization().await;
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-handoff-success"), &fixture.call())
+        .await;
+    assert!(matches!(result, Err(DirectExecutionError::OutcomeUnknown)));
+    let job_id = fixture.job_id().await;
+    assert_eq!(
+        fixture.captures(job_id).await,
+        0,
+        "no formal settlement: nothing is captured"
+    );
+    assert_eq!(
+        fixture.held_microusd().await,
+        1_000,
+        "without a committed finalization the hold is retained"
+    );
+    let row = sqlx::query(
+        "SELECT provider_state, image_count, metering_evidence IS NOT NULL AS has_evidence
+         FROM generation.late_facts WHERE job_id = $1 AND kind = 'accounting'",
+    )
+    .bind(job_id)
+    .fetch_one(fixture.pool())
+    .await
+    .expect("the handed-off success fact");
+    assert_eq!(
+        row.try_get::<Option<String>, _>("provider_state")
+            .expect("provider_state")
+            .as_deref(),
+        Some("succeeded"),
+        "the provider terminal state travels with the fact"
+    );
+    assert_eq!(
+        row.try_get::<Option<i32>, _>("image_count")
+            .expect("image_count"),
+        Some(1)
+    );
+    assert!(
+        row.try_get::<bool, _>("has_evidence").expect("evidence"),
+        "the metering evidence travels with the fact"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// 明确失败但当前所有权下收尾不了：失败与成本事实同样交回收件端口。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_determined_failure_that_cannot_be_finalized_hands_off_its_facts() {
+    let fixture = setup_with_conflicting_finalization().await;
+    fixture.factory.set(FakeBehavior::Provider {
+        retry_safety: RetrySafety::NotRetryable,
+        kind: ProviderFailureKind::UpstreamRejected,
+    });
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-handoff-failure"), &fixture.call())
+        .await;
+    assert!(matches!(result, Err(DirectExecutionError::OutcomeUnknown)));
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.captures(job_id).await, 0);
+    let row = sqlx::query(
+        "SELECT provider_state, provider_cost_source
+         FROM generation.late_facts WHERE job_id = $1 AND kind = 'accounting'",
+    )
+    .bind(job_id)
+    .fetch_one(fixture.pool())
+    .await
+    .expect("the handed-off failure fact");
+    assert_eq!(
+        row.try_get::<Option<String>, _>("provider_state")
+            .expect("provider_state")
+            .as_deref(),
+        Some("failed"),
+        "an explicitly failed task is not recorded as success"
+    );
+    assert_eq!(
+        row.try_get::<Option<String>, _>("provider_cost_source")
+            .expect("cost source")
+            .as_deref(),
+        Some("unavailable"),
+        "a failure without a reliable amount keeps the cost gap instead of faking zero"
+    );
+
+    fixture.cleanup().await;
+}
+
+/// 受理状态不明但收尾不了：未知终态如实交接，保留占用交对账。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn an_unknown_outcome_that_cannot_be_reconciled_hands_off_its_facts() {
+    let fixture = setup_with_conflicting_finalization().await;
+    fixture.factory.set(FakeBehavior::Provider {
+        retry_safety: RetrySafety::AcceptanceUnknown,
+        kind: ProviderFailureKind::UpstreamUnavailable,
+    });
+
+    let result = fixture
+        .service
+        .execute(fixture.request("request-handoff-unknown"), &fixture.call())
+        .await;
+    assert!(matches!(result, Err(DirectExecutionError::OutcomeUnknown)));
+    let job_id = fixture.job_id().await;
+    assert_eq!(fixture.captures(job_id).await, 0);
+    assert_eq!(
+        fixture.held_microusd().await,
+        1_000,
+        "an unknown acceptance keeps the hold"
+    );
+    let state: Option<String> = sqlx::query_scalar(
+        "SELECT provider_state FROM generation.late_facts WHERE job_id = $1 AND kind = 'accounting'",
+    )
+    .bind(job_id)
+    .fetch_one(fixture.pool())
+    .await
+    .expect("the handed-off unknown fact");
+    assert_eq!(
+        state.as_deref(),
+        Some("unknown"),
+        "an unproven acceptance is handed off as unknown, never as success"
+    );
 
     fixture.cleanup().await;
 }

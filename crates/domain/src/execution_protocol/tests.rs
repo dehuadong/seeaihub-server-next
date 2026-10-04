@@ -94,3 +94,28 @@ fn fencing_token_increments_and_never_wraps() {
     assert_eq!(last.get(), u64::MAX);
     assert_eq!(last.next(), Err(DomainError::ArithmeticOverflow));
 }
+
+#[test]
+fn a_receipt_credential_is_bounded_and_never_printed() {
+    let value = "a".repeat(RECEIPT_CREDENTIAL_HEX_LEN);
+    let credential = ReceiptCredential::parse(&value).expect("a full hex credential");
+    assert_eq!(credential.expose(), value);
+    assert_eq!(
+        format!("{credential:?}"),
+        "ReceiptCredential([REDACTED])",
+        "the original value must not reach logs"
+    );
+
+    for rejected in [
+        String::new(),
+        "A".repeat(RECEIPT_CREDENTIAL_HEX_LEN),
+        "a".repeat(RECEIPT_CREDENTIAL_HEX_LEN - 1),
+        "a".repeat(RECEIPT_CREDENTIAL_HEX_LEN + 1),
+        "g".repeat(RECEIPT_CREDENTIAL_HEX_LEN),
+    ] {
+        assert!(
+            ReceiptCredential::parse(&rejected).is_none(),
+            "{rejected:?} is not a bounded credential"
+        );
+    }
+}

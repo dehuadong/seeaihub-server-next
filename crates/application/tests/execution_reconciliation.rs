@@ -30,7 +30,7 @@ use seeai_application::{
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, ChargeFacts, FencingToken, ImageBranch, JobId,
     MeteringEvidence, OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource,
-    RuntimeRevisionId, TokenUsage, VendorModelId,
+    ReceiptCredential, RuntimeRevisionId, TokenUsage, VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
@@ -399,8 +399,8 @@ async fn admit_with_snapshot(
     job.job_id
 }
 
-async fn begin(repository: &PgHubRepository, job_id: JobId) -> AttemptId {
-    repository
+async fn begin(repository: &PgHubRepository, job_id: JobId) -> (AttemptId, ReceiptCredential) {
+    let started = repository
         .begin_submission(BeginSubmission {
             job_id,
             execution_owner: "supervisor-a".to_owned(),
@@ -409,8 +409,8 @@ async fn begin(repository: &PgHubRepository, job_id: JobId) -> AttemptId {
             lease: ChronoDuration::minutes(5),
         })
         .await
-        .expect("begin_submission")
-        .attempt_id
+        .expect("begin_submission");
+    (started.attempt_id, started.receipt_credential)
 }
 
 async fn accept(repository: &PgHubRepository, job_id: JobId, attempt_id: AttemptId, handle: &str) {
@@ -546,7 +546,7 @@ async fn a_taken_over_handle_is_queried_read_only_and_settled_once() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-settle").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-recon").await;
     expire_lease(&pool, job_id).await;
 
@@ -597,7 +597,7 @@ async fn a_taken_over_failed_task_releases_the_hold_without_charging() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-failed").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-failed").await;
     expire_lease(&pool, job_id).await;
 
@@ -652,7 +652,7 @@ async fn a_taken_over_cancelled_task_releases_the_hold_without_charging() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-cancelled").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-cancelled").await;
     expire_lease(&pool, job_id).await;
 
@@ -689,7 +689,7 @@ async fn an_untrusted_task_state_opens_a_case_and_keeps_the_hold() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-untrusted").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-untrusted").await;
     expire_lease(&pool, job_id).await;
 
@@ -731,7 +731,7 @@ async fn a_taken_over_execution_without_a_handle_opens_a_case_and_keeps_the_hold
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-no-handle").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     expire_lease(&pool, job_id).await;
 
     let factory = Arc::new(FakeFactory::new());
@@ -770,7 +770,7 @@ async fn a_terminal_query_without_evidence_records_a_cost_gap() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-gap").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-gap").await;
     expire_lease(&pool, job_id).await;
 
@@ -815,7 +815,7 @@ async fn a_channel_without_read_only_query_only_opens_a_case() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-unsupported").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-unsupported").await;
     expire_lease(&pool, job_id).await;
 
@@ -853,11 +853,12 @@ async fn a_late_accounting_fact_settles_and_is_consumed() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-late-accounting").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
     repository
         .offer_late_facts(LateFacts {
             job_id,
             attempt_id,
+            receipt_credential: credential.clone(),
             provider_task_handle: None,
             provider_trace_id: Some("trace-late".to_owned()),
             image_count: None,
@@ -908,11 +909,12 @@ async fn an_unfinished_late_handle_is_not_consumed_and_is_reclaimable_after_the_
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-late-handle").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
     repository
         .offer_late_facts(LateFacts {
             job_id,
             attempt_id,
+            receipt_credential: credential.clone(),
             provider_task_handle: Some("task-unfinished".to_owned()),
             provider_trace_id: Some("trace-unfinished".to_owned()),
             image_count: None,
@@ -971,11 +973,12 @@ async fn a_late_handle_whose_task_failed_releases_the_hold_without_charging() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-late-failed").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
     repository
         .offer_late_facts(LateFacts {
             job_id,
             attempt_id,
+            receipt_credential: credential.clone(),
             provider_task_handle: Some("task-failed".to_owned()),
             provider_trace_id: Some("trace-failed".to_owned()),
             image_count: None,
@@ -1009,6 +1012,171 @@ async fn a_late_handle_whose_task_failed_releases_the_hold_without_charging() {
         0,
         "the hold is released"
     );
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 晚到**账务**事实写明渠道失败：即便捎带返回了计量与成本，也按确定失败释放占用、实收为零。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_late_accounting_fact_that_reports_a_failure_releases_the_hold_without_charging() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-late-accounting-failed").await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
+    repository
+        .offer_late_facts(LateFacts {
+            job_id,
+            attempt_id,
+            receipt_credential: credential.clone(),
+            provider_task_handle: None,
+            provider_trace_id: Some("trace-late-failed".to_owned()),
+            image_count: Some(1),
+            evidence: Some(MeteringEvidence {
+                attempt_id,
+                provider_response_digest: "resp-late-failed".to_owned(),
+                usage: usage(),
+            }),
+            provider_cost: Some(ProviderCostFact {
+                source: ProviderCostSource::Declared,
+                amount_microusd: Some(2_000),
+                currency: Some("USD".to_owned()),
+                cny_microusd: None,
+            }),
+            provider_state: Some(ProviderTaskState::Failed),
+        })
+        .await
+        .expect("offer the failed accounting fact");
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    let service = reconciliation(&repository, factory);
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.settled, 0, "a failed task is never charged");
+    assert_eq!(report.late_facts_consumed, 1);
+    assert_eq!(state(&pool, job_id).await, "failed");
+    assert_eq!(captures(&pool, job_id).await, 0, "no capture is written");
+    assert_eq!(
+        held(&pool, fixture.account_id).await,
+        0,
+        "the hold is released"
+    );
+    assert_eq!(capacity_state(&pool, job_id).await, "released");
+    // 上游声明的成本照记，不伪造零成本。
+    let source: Option<String> =
+        sqlx::query_scalar("SELECT provider_cost_source FROM generation.attempts WHERE id = $1")
+            .bind(attempt_id.0)
+            .fetch_one(&pool)
+            .await
+            .expect("the cost source");
+    assert_eq!(source.as_deref(), Some("declared"));
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 晚到账务事实写明渠道取消：处置同失败。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_late_accounting_fact_that_reports_a_cancellation_releases_the_hold_without_charging() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-late-accounting-cancelled").await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
+    repository
+        .offer_late_facts(LateFacts {
+            job_id,
+            attempt_id,
+            receipt_credential: credential.clone(),
+            provider_task_handle: None,
+            provider_trace_id: Some("trace-late-cancelled".to_owned()),
+            image_count: Some(1),
+            evidence: Some(MeteringEvidence {
+                attempt_id,
+                provider_response_digest: "resp-late-cancelled".to_owned(),
+                usage: usage(),
+            }),
+            provider_cost: None,
+            provider_state: Some(ProviderTaskState::Cancelled),
+        })
+        .await
+        .expect("offer the cancelled accounting fact");
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    let service = reconciliation(&repository, factory);
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(report.failed, 1);
+    assert_eq!(report.settled, 0, "a cancelled task is never charged");
+    assert_eq!(report.late_facts_consumed, 1);
+    assert_eq!(state(&pool, job_id).await, "failed");
+    assert_eq!(captures(&pool, job_id).await, 0);
+    assert_eq!(held(&pool, fixture.account_id).await, 0);
+    assert_eq!(capacity_state(&pool, job_id).await, "released");
+
+    drop(pool);
+    drop(service);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 终态不明（Unknown）的晚到账务事实：保留占用并进对账，绝不按成功结算。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_late_accounting_fact_with_an_unknown_state_keeps_the_hold() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "recon-late-accounting-unknown").await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
+    repository
+        .offer_late_facts(LateFacts {
+            job_id,
+            attempt_id,
+            receipt_credential: credential.clone(),
+            provider_task_handle: None,
+            provider_trace_id: Some("trace-late-unknown".to_owned()),
+            image_count: Some(1),
+            evidence: Some(MeteringEvidence {
+                attempt_id,
+                provider_response_digest: "resp-late-unknown".to_owned(),
+                usage: usage(),
+            }),
+            provider_cost: None,
+            provider_state: Some(ProviderTaskState::Unknown),
+        })
+        .await
+        .expect("offer the unknown accounting fact");
+    expire_lease(&pool, job_id).await;
+
+    let factory = Arc::new(FakeFactory::new());
+    let service = reconciliation(&repository, factory);
+    let report = service.run_once().await.expect("the reconciliation round");
+
+    assert_eq!(report.settled, 0, "an unknown state is never charged");
+    assert_eq!(
+        report.failed, 0,
+        "an unknown state is not a determined failure"
+    );
+    assert_eq!(report.late_facts_consumed, 1);
+    assert_eq!(state(&pool, job_id).await, "reconciliation_required");
+    assert_eq!(captures(&pool, job_id).await, 0);
+    assert_eq!(
+        held(&pool, fixture.account_id).await,
+        1_000,
+        "an unknown outcome keeps the hold and the channel slot"
+    );
+    assert_eq!(capacity_state(&pool, job_id).await, "held");
 
     drop(pool);
     drop(service);
@@ -1096,11 +1264,12 @@ async fn late_handle_queries_back_off_and_stop_at_the_retry_cap() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-schedule").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
     repository
         .offer_late_facts(LateFacts {
             job_id,
             attempt_id,
+            receipt_credential: credential.clone(),
             provider_task_handle: Some("task-schedule".to_owned()),
             provider_trace_id: Some("trace-schedule".to_owned()),
             image_count: None,
@@ -1163,7 +1332,7 @@ async fn a_terminal_late_cost_lands_in_the_cost_gap_without_reopening_the_job() 
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-terminal-cost").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
     // 确定失败：请求根本没交到渠道，成本四列留空，Job 已收成 failed 终态。
     repository
         .fail_or_reconcile(FailOrReconcileExecution::for_failure(
@@ -1184,6 +1353,7 @@ async fn a_terminal_late_cost_lands_in_the_cost_gap_without_reopening_the_job() 
         .offer_late_facts(LateFacts {
             job_id,
             attempt_id,
+            receipt_credential: credential.clone(),
             provider_task_handle: None,
             provider_trace_id: Some("trace-terminal".to_owned()),
             image_count: None,
@@ -1249,12 +1419,13 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
         per_image_snapshot(),
     )
     .await;
-    let gap_attempt = begin(&repository, gap_job).await;
+    let (gap_attempt, gap_credential) = begin(&repository, gap_job).await;
     accept(&repository, gap_job, gap_attempt, "task-per-image-gap").await;
     repository
         .offer_late_facts(LateFacts {
             job_id: gap_job,
             attempt_id: gap_attempt,
+            receipt_credential: gap_credential.clone(),
             provider_task_handle: None,
             provider_trace_id: Some("trace-gap".to_owned()),
             image_count: None,
@@ -1294,7 +1465,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
         per_image_snapshot(),
     )
     .await;
-    let count_attempt = begin(&repository, count_job).await;
+    let (count_attempt, count_credential) = begin(&repository, count_job).await;
     accept(
         &repository,
         count_job,
@@ -1306,6 +1477,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
         .offer_late_facts(LateFacts {
             job_id: count_job,
             attempt_id: count_attempt,
+            receipt_credential: count_credential.clone(),
             provider_task_handle: None,
             provider_trace_id: Some("trace-count".to_owned()),
             image_count: Some(2),
@@ -1354,7 +1526,7 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
 
     // 竞争件：S3 直接执行的收尾入口与 Worker 的接管查询同一条 Attempt 竞争。
     let job_id = admit_one(&repository, &fixture, "recon-competition").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-competition").await;
     expire_lease(&pool, job_id).await;
     let api_command = SettleExecution {
@@ -1401,7 +1573,7 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
 
     // 重复收尾：同一条已提交的 API 收尾再调一次，回原结果、不再扣费。
     let duplicate_job = admit_one(&repository, &fixture, "recon-duplicate").await;
-    let duplicate_attempt = begin(&repository, duplicate_job).await;
+    let (duplicate_attempt, _duplicate_credential) = begin(&repository, duplicate_job).await;
     let mut duplicate = api_command.clone();
     duplicate.job_id = duplicate_job;
     duplicate.attempt_id = duplicate_attempt;
@@ -1463,7 +1635,7 @@ async fn a_taken_over_execution_reports_settlement_latency() {
     let mut wall_latencies = Vec::with_capacity(ROUNDS);
     for index in 0..ROUNDS {
         let job_id = admit_one(&repository, &fixture, &format!("recon-latency-{index}")).await;
-        let attempt_id = begin(&repository, job_id).await;
+        let (attempt_id, _credential) = begin(&repository, job_id).await;
         accept(&repository, job_id, attempt_id, "task-latency").await;
         expire_lease(&pool, job_id).await;
 
@@ -1521,7 +1693,7 @@ async fn a_stored_handle_that_is_not_an_identifier_cannot_be_written() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "recon-bad-handle").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, _credential) = begin(&repository, job_id).await;
     accept(&repository, job_id, attempt_id, "task-legacy").await;
 
     for bad in [

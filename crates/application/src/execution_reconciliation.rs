@@ -502,6 +502,39 @@ impl ExecutionReconciliationService {
         Ok(())
     }
 
+    /// 晚到账务事实写明渠道**失败或取消**：按确定失败释放消费者 Hold 与渠道名额，实收为零。
+    ///
+    /// 事实里可能捎带计量与成本，但失败不是成功：计量只用于记录平台成本，绝不构成向消费者收费的
+    /// 依据，也不把终态翻过来（Spec 0005 §5、RFC 0018 §7）。
+    async fn fail_late_accounting_fact(
+        &self,
+        execution: &TakenOverExecution,
+        fact: &ClaimedLateFact,
+        provider_cost: ProviderCostFact,
+        report: &mut ReconciliationReport,
+    ) -> Result<(), ApplicationError> {
+        let command = FailOrReconcileExecution::for_failure(
+            fact.job_id,
+            fact.attempt_id,
+            self.worker_id.clone(),
+            execution.fencing_token,
+            // 与同步执行看到同一终态时的分类保持一致，不因为观察时机不同而另判一套。
+            ProviderFailureKind::Unknown,
+            FailureDisposition::DeterminedFailure,
+            Some(provider_cost),
+            fact.provider_trace_id.clone(),
+        );
+        let finalization = self.fail_with_confirmation(command).await?;
+        report.failed += 1;
+        self.refresh_balance(execution.account_id).await;
+        tracing::info!(
+            job_id = %fact.job_id,
+            stage = %finalization.stage,
+            "a late accounting fact reported an upstream failure or cancellation; the consumer is not charged"
+        );
+        Ok(())
+    }
+
     /// 按只读查询结果收尾：有效计量证据结算一次，证据缺失或算不出对客价就保留占用并建案。
     async fn settle_query_facts(
         &self,
@@ -774,22 +807,47 @@ impl ExecutionReconciliationService {
             return Ok(LateFactAction::Consumed);
         };
         // 收件只说明上游给过什么，不能凭"有 usage"推断成功：没有成功终态就没有向消费者收费的
-        // 依据。缺失或未知一律保留占用并进对账；但已核实的上游成本照记——带证据与张数时按冻结
-        // 单价能算出来，就不能把它降级成"拿不到"（Spec 0005 §5、RFC 0018 §7）。
-        if fact.provider_state != Some(seeai_domain::ProviderTaskState::Succeeded) {
-            let provider_cost = match (&fact.provider_cost, fact.evidence.as_ref()) {
-                (Some(cost), _) => cost.clone(),
-                (None, Some(evidence)) => {
-                    let images = fact
-                        .image_count
-                        .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
-                    self_computed_late_cost(&execution.price_snapshot, &evidence.usage, images)
-                }
-                (None, None) => failure_provider_cost(&execution.price_snapshot, None),
-            };
-            self.reconcile_unknown(execution, fact.attempt_id, Some(provider_cost), report)
-                .await?;
-            return Ok(LateFactAction::Consumed);
+        // 依据（Spec 0005 §5、RFC 0018 §7）。可信失败/取消是**确定的终态**：按既有失败规则释放
+        // 消费者 Hold 与渠道名额、实收为零，即便捎带返回了计量也不收费——上游声明的成本照记，
+        // 没有可靠金额时用 unavailable，不伪造零成本。Pending/未知/缺失一律保留占用进对账。
+        match fact.provider_state {
+            Some(seeai_domain::ProviderTaskState::Succeeded) => {}
+            Some(
+                seeai_domain::ProviderTaskState::Failed
+                | seeai_domain::ProviderTaskState::Cancelled,
+            ) => {
+                let provider_cost = match (&fact.provider_cost, fact.evidence.as_ref()) {
+                    (Some(cost), _) => cost.clone(),
+                    (None, Some(evidence)) => {
+                        let images = fact
+                            .image_count
+                            .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
+                        self_computed_late_cost(&execution.price_snapshot, &evidence.usage, images)
+                    }
+                    (None, None) => failure_provider_cost(&execution.price_snapshot, None),
+                };
+                self.fail_late_accounting_fact(execution, fact, provider_cost, report)
+                    .await?;
+                return Ok(LateFactAction::Consumed);
+            }
+            Some(
+                seeai_domain::ProviderTaskState::Pending | seeai_domain::ProviderTaskState::Unknown,
+            )
+            | None => {
+                let provider_cost = match (&fact.provider_cost, fact.evidence.as_ref()) {
+                    (Some(cost), _) => cost.clone(),
+                    (None, Some(evidence)) => {
+                        let images = fact
+                            .image_count
+                            .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
+                        self_computed_late_cost(&execution.price_snapshot, &evidence.usage, images)
+                    }
+                    (None, None) => failure_provider_cost(&execution.price_snapshot, None),
+                };
+                self.reconcile_unknown(execution, fact.attempt_id, Some(provider_cost), report)
+                    .await?;
+                return Ok(LateFactAction::Consumed);
+            }
         }
         let Some(evidence) = fact.evidence.as_ref() else {
             // 没有计量证据不结算；成本事实照落缺口并转对账。

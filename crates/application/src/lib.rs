@@ -9,8 +9,8 @@ use seeai_domain::{
     FencingToken, FloorTable, FxRate, HoldSource, ImageBranch, ImageParameterKind, JobId,
     LedgerEntry, LedgerEntryKind, MeteringEvidence, OfferingCandidate, OfferingId,
     ParameterRenames, PriceRates, PriceSnapshot, PricingFormula, ProviderCostFact,
-    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, RoutePolicy,
-    RouteStrategy, RuntimeRevisionId, TokenUsage, VendorModelId, apply_enum_maps,
+    ProviderCostSource, PublishedModel, PublishedOffering, PublishedRevision, ReceiptCredential,
+    RoutePolicy, RouteStrategy, RuntimeRevisionId, TokenUsage, VendorModelId, apply_enum_maps,
     apply_parameter_defaults, apply_parameter_renames, apply_size_mapping, carries_parameter,
     contract_image_parameter_kind, contract_model_identity, declared_defaults, declared_enum_maps,
     declared_field_names, declared_parameter_names, declared_reference_image_limit,
@@ -1672,12 +1672,17 @@ pub struct BeginSubmission {
 }
 
 /// `begin_submission` 落库后的本次 Attempt 标识：提交、接受与收尾都用它。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `receipt_credential` 是**只在内存里流动**的收件凭据原值：它由这次提交在数据库事务里原子生成，
+/// 库里只有摘要。执行上下文持有它，收尾来不及正式结算时用它把晚到事实交回（RFC 0018 §5.2）。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SubmissionStarted {
     pub job_id: JobId,
     pub attempt_id: AttemptId,
     /// 同一台 Job 内的第几次执行，从 1 起。
     pub attempt_no: u32,
+    /// 与本 Attempt 绑定的收件凭据原值；不写日志、不入库。
+    pub receipt_credential: ReceiptCredential,
 }
 
 /// `record_acceptance` 的命令：可信 task/trace 标识与执行身份，**不含请求或响应正文**。
@@ -1817,6 +1822,11 @@ pub fn public_error_code_for_disposition(
 pub struct LateFacts {
     pub job_id: JobId,
     pub attempt_id: AttemptId,
+    /// 本次 Attempt 的收件凭据原值；`begin_submission` 生成、上下文持有。
+    ///
+    /// 它在库里只以摘要存在，因此原提交者的 fencing token 过期后仍能交付事实；凭据不匹配、
+    /// 或 Attempt 早于凭据机制（库里摘要为空）时投递被忽略（RFC 0018 §5.2）。
+    pub receipt_credential: ReceiptCredential,
     /// 上游任务句柄；任务式渠道才有。
     pub provider_task_handle: Option<String>,
     /// 上游逐请求标识。
@@ -2988,6 +2998,10 @@ pub trait ExecutionRepository: Send + Sync {
     /// 返回的 Attempt 标识是提交、接受与收尾共用的身份；attempt_no 与旧协议同义（同一台 Job
     /// 内从 1 起），由本次写入在 Job 行锁内定号，并发提交不会拿到同一个号。
     ///
+    /// 同一事务里原子生成与该 Attempt 绑定的随机收件凭据：库里只落摘要，原值随
+    /// [`SubmissionStarted::receipt_credential`] 交给执行上下文，用于 token 失效后交付晚到事实
+    /// （RFC 0018 §5.2）。凭据不是环境变量，也不进日志。
+    ///
     /// 失败：Job 不存在返回 ApplicationError::NotFound；已终态、已在 reconciliation_required、
     /// 执行所有权已属别的调用方、fencing token 不匹配、已有未收尾的 Attempt
     /// （submitting/accepted/unknown）返回 ApplicationError::Conflict；数据库时钟已到 deadline
@@ -3050,7 +3064,11 @@ pub trait ExecutionRepository: Send + Sync {
     /// 收下**晚到事实**：原提交者在执行 token 可能已失效后仍可交付有界 task handle 或计量/成本事实。
     ///
     /// 只写最小收件行，不改所有权、不重开终态、不直接结算；当前收尾者另行领取并按现有端口处理。
-    /// 重复事实幂等（同 Attempt 同形态同内容只收一次），冲突事实建对账案例且不覆盖；关联不上时忽略。
+    /// 投递必须携带与该 Attempt 绑定的收件凭据（`begin_submission` 生成、库里只存摘要）：凭据缺失、
+    /// 不匹配、与 Job/渠道关联不上，或该 Attempt 早于凭据机制时一律忽略，不写任何行。凭据只决定
+    /// 收不收件，**不授权正式结算**——结算仍要当前有效的所有权与 fencing token。
+    /// 收件按 `(attempt_id, kind)` 串行；重复事实幂等（同 Attempt 同形态同内容只收一次），
+    /// 冲突事实建对账案例且不覆盖，每 Attempt 每形态只留一条规范记录。
     async fn offer_late_facts(
         &self,
         facts: LateFacts,

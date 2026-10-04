@@ -11,8 +11,8 @@ use seeai_application::{
 };
 use seeai_domain::{
     AccountId, AttemptId, ChannelId, FencingToken, ImageBranch, JobId, MeteringEvidence,
-    OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource, RuntimeRevisionId, TokenUsage,
-    VendorModelId,
+    OfferingId, PriceSnapshot, ProviderCostFact, ProviderCostSource, ReceiptCredential,
+    RuntimeRevisionId, TokenUsage, VendorModelId,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::json;
@@ -173,8 +173,8 @@ async fn admit_one(repository: &PgHubRepository, fixture: &Fixture, key: &str) -
     job.job_id
 }
 
-async fn begin(repository: &PgHubRepository, job_id: JobId) -> AttemptId {
-    repository
+async fn begin(repository: &PgHubRepository, job_id: JobId) -> (AttemptId, ReceiptCredential) {
+    let started = repository
         .begin_submission(BeginSubmission {
             job_id,
             execution_owner: "supervisor-a".to_owned(),
@@ -183,14 +183,15 @@ async fn begin(repository: &PgHubRepository, job_id: JobId) -> AttemptId {
             lease: ChronoDuration::minutes(5),
         })
         .await
-        .expect("begin_submission")
-        .attempt_id
+        .expect("begin_submission");
+    (started.attempt_id, started.receipt_credential)
 }
 
-fn facts(job_id: JobId, attempt_id: AttemptId) -> LateFacts {
+fn facts(job_id: JobId, attempt_id: AttemptId, credential: &ReceiptCredential) -> LateFacts {
     LateFacts {
         job_id,
         attempt_id,
+        receipt_credential: credential.clone(),
         provider_task_handle: None,
         provider_trace_id: Some("trace-late".to_owned()),
         image_count: None,
@@ -228,9 +229,9 @@ async fn a_late_task_handle_is_received_once_and_keeps_ownership_untouched() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "late-handle").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
 
-    let mut late = facts(job_id, attempt_id);
+    let mut late = facts(job_id, attempt_id, &credential);
     late.provider_task_handle = Some("task-9".to_owned());
     late.provider_trace_id = Some("trace-9".to_owned());
     assert_eq!(
@@ -274,7 +275,7 @@ async fn a_late_task_handle_is_received_once_and_keeps_ownership_untouched() {
     assert_eq!(count_facts(&pool, job_id.0, "task_handle").await, 1);
 
     // 异内容：建案，不覆盖原收件。
-    let mut different = facts(job_id, attempt_id);
+    let mut different = facts(job_id, attempt_id, &credential);
     different.provider_task_handle = Some("task-other".to_owned());
     assert_eq!(
         repository
@@ -305,9 +306,9 @@ async fn late_accounting_facts_are_received_but_unrelated_ones_are_ignored() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "late-accounting").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
 
-    let mut late = facts(job_id, attempt_id);
+    let mut late = facts(job_id, attempt_id, &credential);
     late.evidence = Some(MeteringEvidence {
         attempt_id,
         provider_response_digest: "resp-late".to_owned(),
@@ -326,7 +327,7 @@ async fn late_accounting_facts_are_received_but_unrelated_ones_are_ignored() {
     assert_eq!(count_facts(&pool, job_id.0, "accounting").await, 1);
 
     // 证据 Attempt 对不上：忽略，不写。
-    let mut mismatched = facts(job_id, attempt_id);
+    let mut mismatched = facts(job_id, attempt_id, &credential);
     mismatched.evidence = Some(MeteringEvidence {
         attempt_id: AttemptId::new(),
         provider_response_digest: "resp-other".to_owned(),
@@ -344,12 +345,12 @@ async fn late_accounting_facts_are_received_but_unrelated_ones_are_ignored() {
     // 没有可收内容或 Job 关联不上：忽略。
     assert_eq!(
         repository
-            .offer_late_facts(facts(job_id, attempt_id))
+            .offer_late_facts(facts(job_id, attempt_id, &credential))
             .await
             .expect("empty"),
         LateFactsOutcome::Ignored
     );
-    let mut unrelated = facts(JobId::new(), attempt_id);
+    let mut unrelated = facts(JobId::new(), attempt_id, &credential);
     unrelated.provider_task_handle = Some("task-x".to_owned());
     assert_eq!(
         repository
@@ -371,9 +372,9 @@ async fn a_late_task_handle_is_claimed_reclaimable_after_the_ttl_and_marked_cons
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "late-claim").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
 
-    let mut late = facts(job_id, attempt_id);
+    let mut late = facts(job_id, attempt_id, &credential);
     late.provider_task_handle = Some("task-claim".to_owned());
     late.provider_trace_id = Some("trace-claim".to_owned());
     assert_eq!(
@@ -471,9 +472,9 @@ async fn claimed_accounting_late_facts_carry_the_evidence_and_cost() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "late-accounting-claim").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
 
-    let mut late = facts(job_id, attempt_id);
+    let mut late = facts(job_id, attempt_id, &credential);
     late.evidence = Some(MeteringEvidence {
         attempt_id,
         provider_response_digest: "resp-claim".to_owned(),
@@ -526,11 +527,73 @@ async fn a_late_handle_that_is_not_an_identifier_is_not_stored() {
     let pool = repository.pool().clone();
     let fixture = seed_fixture(&pool).await;
     let job_id = admit_one(&repository, &fixture, "late-bad-handle").await;
-    let attempt_id = begin(&repository, job_id).await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
 
-    let mut late = facts(job_id, attempt_id);
+    let mut late = facts(job_id, attempt_id, &credential);
     // 只有无效句柄、没有其它事实：按无可收内容处理，不写空行。
     late.provider_task_handle = Some("data:image/png;base64,AAAA".to_owned());
+    assert_eq!(
+        repository.offer_late_facts(late).await.expect("offer"),
+        LateFactsOutcome::Ignored
+    );
+    assert_eq!(count_facts(&pool, job_id.0, "task_handle").await, 0);
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 收件凭据不匹配：不写任何收件行，也不改所有权与状态（RFC 0018 §5.2）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_late_fact_with_a_mismatched_credential_is_ignored() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "late-bad-credential").await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
+
+    // 形状合法但不是这一份：只在库里存摘要，拿不到原值就伪造不出。
+    let forged = ReceiptCredential::parse(&"a".repeat(64)).expect("a well-formed credential");
+    let mut late = facts(job_id, attempt_id, &forged);
+    late.provider_task_handle = Some("task-forged".to_owned());
+    assert_eq!(
+        repository.offer_late_facts(late).await.expect("offer"),
+        LateFactsOutcome::Ignored
+    );
+    assert_eq!(count_facts(&pool, job_id.0, "task_handle").await, 0);
+
+    // 原凭据仍然有效：拒绝的是伪造那一份，不是把这条通路关掉。
+    let mut valid = facts(job_id, attempt_id, &credential);
+    valid.provider_task_handle = Some("task-valid".to_owned());
+    assert_eq!(
+        repository.offer_late_facts(valid).await.expect("offer"),
+        LateFactsOutcome::Received
+    );
+    assert_eq!(count_facts(&pool, job_id.0, "task_handle").await, 1);
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 升级前已在飞的 Attempt 没有凭据摘要：不伪造身份，一律不收（RFC 0018 §5.2）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
+async fn a_late_fact_for_an_attempt_without_a_credential_is_ignored() {
+    let (repository, database_name) = connect().await;
+    let pool = repository.pool().clone();
+    let fixture = seed_fixture(&pool).await;
+    let job_id = admit_one(&repository, &fixture, "late-no-credential").await;
+    let (attempt_id, credential) = begin(&repository, job_id).await;
+    sqlx::query("UPDATE generation.attempts SET receipt_credential_digest = NULL WHERE id = $1")
+        .bind(attempt_id.0)
+        .execute(&pool)
+        .await
+        .expect("clear the credential digest");
+
+    let mut late = facts(job_id, attempt_id, &credential);
+    late.provider_task_handle = Some("task-legacy".to_owned());
     assert_eq!(
         repository.offer_late_facts(late).await.expect("offer"),
         LateFactsOutcome::Ignored

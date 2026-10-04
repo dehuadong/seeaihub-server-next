@@ -12,7 +12,7 @@ mod parameter_mapping;
 mod size_spec;
 pub use execution_protocol::{
     AttemptStage, ExecutionStage, FencingToken, MAX_PROVIDER_IDENTIFIER_BYTES, ProviderTaskState,
-    is_bounded_provider_identifier,
+    RECEIPT_CREDENTIAL_HEX_LEN, ReceiptCredential, is_bounded_provider_identifier,
 };
 pub use image_parameters::{
     ImageInputs, ImageParameterKind, contract_image_parameter_kind, declared_parameter_names,

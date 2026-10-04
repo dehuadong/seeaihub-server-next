@@ -19,7 +19,8 @@ use seeai_domain::{
     FencingToken, FxRate, HitCandidate, ImageBranch, JobId, LedgerEntry, LedgerEntryKind,
     MeteringEvidence, OfferingCandidate, OfferingId, PricePlanId, PriceRates, PriceSnapshot,
     PricingFormula, ProviderCostFact, ProviderCostSource, PublishedModel, PublishedRevision,
-    RoutePolicy, RouteStrategy, RuntimeRevisionId, VendorModelId, is_bounded_provider_identifier,
+    RECEIPT_CREDENTIAL_HEX_LEN, ReceiptCredential, RoutePolicy, RouteStrategy, RuntimeRevisionId,
+    VendorModelId, is_bounded_provider_identifier,
 };
 use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
@@ -3601,7 +3602,7 @@ impl ExecutionRepository for PgHubRepository {
         // 锁 Job 行并一次取齐检查用的事实；期限用数据库时钟判，不认调用方进程时钟。
         let job = sqlx::query(
             r#"
-            SELECT state, execution_owner, fencing_token,
+            SELECT state, execution_owner, fencing_token, channel_id,
                    request_digest, clock_timestamp() < $2 AS before_deadline
             FROM generation.jobs
             WHERE id = $1
@@ -3682,10 +3683,17 @@ impl ExecutionRepository for PgHubRepository {
             ApplicationError::Persistence(format!("job {job_id} has no request digest"))
         })?;
         let attempt_id = AttemptId::new();
+        // 收件凭据与提交声明同事务、同一条 INSERT 落库：库里只有摘要，原值只随返回值进入内存。
+        // 它绑定 Attempt、Job 与 Job 的渠道（Provider），因此换一个 Job 或渠道的凭据校验不上
+        // （RFC 0018 §5.2）。
+        let channel_id: Uuid = job.try_get("channel_id").map_err(database_error)?;
+        let receipt_credential = new_receipt_credential();
+        let receipt_digest = receipt_credential_digest(attempt_id, channel_id, &receipt_credential);
         sqlx::query(
             r#"
-            INSERT INTO generation.attempts (id, job_id, state, request_digest, attempt_no)
-            VALUES ($1,$2,'submitting',$3,$4)
+            INSERT INTO generation.attempts
+                (id, job_id, state, request_digest, attempt_no, receipt_credential_digest)
+            VALUES ($1,$2,'submitting',$3,$4,$5)
             "#,
         )
         .bind(attempt_id.0)
@@ -3694,6 +3702,7 @@ impl ExecutionRepository for PgHubRepository {
         .bind(i32::try_from(attempt_no).map_err(|_| {
             ApplicationError::Persistence("attempt number is out of range".to_owned())
         })?)
+        .bind(&receipt_digest)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -3718,6 +3727,7 @@ impl ExecutionRepository for PgHubRepository {
             job_id,
             attempt_id,
             attempt_no,
+            receipt_credential,
         })
     }
 
@@ -4395,6 +4405,7 @@ impl ExecutionRepository for PgHubRepository {
         let LateFacts {
             job_id,
             attempt_id,
+            receipt_credential,
             provider_task_handle,
             provider_trace_id,
             image_count,
@@ -4423,13 +4434,17 @@ impl ExecutionRepository for PgHubRepository {
             return Ok(LateFactsOutcome::Ignored);
         }
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        // 关联核对：Attempt 必须属于该 Job。它只决定收不收，不改所有权、状态或终态。
-        let related: Option<Uuid> = sqlx::query_scalar(
+        // 凭据与关联核对：Attempt 必须属于该 Job，且收件凭据摘要必须与 `begin_submission` 落下的
+        // 那一份一致（摘要绑定 Attempt 与 Job 的渠道）。`FOR UPDATE OF a` 把同一 Attempt 的收件串行，
+        // 并发投递不会各自读到"还没收过"再各写一行——每 Attempt 每形态因此至多一条规范记录。
+        // 凭据缺失、为空（早于凭据机制的 Attempt）或不匹配一律忽略，不写任何行（RFC 0018 §5.2）。
+        let related = sqlx::query(
             r#"
-            SELECT j.id
-            FROM generation.jobs j
-            JOIN generation.attempts a ON a.id = $2 AND a.job_id = j.id
-            WHERE j.id = $1
+            SELECT a.receipt_credential_digest, j.channel_id
+            FROM generation.attempts a
+            JOIN generation.jobs j ON j.id = a.job_id
+            WHERE a.id = $2 AND a.job_id = $1
+            FOR UPDATE OF a
             "#,
         )
         .bind(job_id.0)
@@ -4437,7 +4452,15 @@ impl ExecutionRepository for PgHubRepository {
         .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if related.is_none() {
+        let Some(related) = related else {
+            return Ok(LateFactsOutcome::Ignored);
+        };
+        let stored_digest: Option<String> = related
+            .try_get("receipt_credential_digest")
+            .map_err(database_error)?;
+        let channel_id: Uuid = related.try_get("channel_id").map_err(database_error)?;
+        let expected = receipt_credential_digest(attempt_id, channel_id, &receipt_credential);
+        if stored_digest.as_deref() != Some(expected.as_str()) {
             return Ok(LateFactsOutcome::Ignored);
         }
         let mut outcome = LateFactsOutcome::Received;
@@ -5214,6 +5237,33 @@ fn late_fact_digest(parts: &[&[u8]]) -> String {
         hasher.update(part);
     }
     hex::encode(hasher.finalize())
+}
+
+/// 生成一份收件凭据原值：两个 v4 UUID 的字节拼成 32 字节十六进制（各 122 位随机）。
+///
+/// 它只在内存里流动，库里写的是 [`receipt_credential_digest`] 的摘要；不读环境变量、不进日志。
+fn new_receipt_credential() -> ReceiptCredential {
+    let mut bytes = [0u8; RECEIPT_CREDENTIAL_HEX_LEN / 2];
+    bytes[..16].copy_from_slice(Uuid::new_v4().as_bytes());
+    bytes[16..].copy_from_slice(Uuid::new_v4().as_bytes());
+    let value = hex::encode(bytes);
+    ReceiptCredential::parse(&value).expect("a generated receipt credential is 32 hex bytes")
+}
+
+/// 收件凭据摘要：固定领域前缀 + Attempt + Job 的渠道（Provider）+ 凭据原值，长度前缀串接后 SHA-256。
+///
+/// 渠道进摘要把"Provider 关联"变成凭据校验的一部分：另一个 Job 或另一个渠道的同名凭据校验不上。
+fn receipt_credential_digest(
+    attempt_id: AttemptId,
+    channel_id: Uuid,
+    credential: &ReceiptCredential,
+) -> String {
+    late_fact_digest(&[
+        b"seeai/receipt-credential/v1",
+        attempt_id.0.as_bytes(),
+        channel_id.as_bytes(),
+        credential.expose().as_bytes(),
+    ])
 }
 
 /// 一次发布**冻结进条目**的那份技术定义：`runtime_entries` 的八列，加上它们指向的供给、渠道与

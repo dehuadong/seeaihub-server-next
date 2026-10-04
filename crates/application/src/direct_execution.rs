@@ -18,12 +18,13 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, AdapterError, Deadline, DispatchGate, ExecutionContext,
     GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage, ProviderFailureKind,
-    ProviderOutput, ResponsePayload, RetrySafety,
+    ProviderOutput, ProviderTaskState, ResponsePayload, RetrySafety,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
     ImageParameterKind, JobId, MeteringEvidence, OfferingCandidate, ProviderCostFact,
-    PublishedOffering, RouteStrategy, image_parameter_kind, platform_image_parameters,
+    PublishedOffering, ReceiptCredential, RouteStrategy, image_parameter_kind,
+    platform_image_parameters,
 };
 use serde_json::Value;
 use std::sync::Arc;
@@ -120,6 +121,37 @@ pub struct DirectExecutionSuccess {
     pub payload: ResponsePayload,
 }
 
+/// 一次收尾里**已经取得、可能来不及在当前所有权下正式结算**的账务事实。
+///
+/// 收尾确认失败（token Conflict 或提交结果不明）时用它构造 [`LateFacts`] 交给收件端口；它只含
+/// Spec 0005 §2 允许的最小事实，不含图片、响应正文或请求参数（RFC 0018 §5.1）。
+#[derive(Debug, Clone, Default)]
+struct LateFactsInput {
+    /// 上游终态快照；平台内部失败（根本没交到渠道）留 `None`。
+    provider_state: Option<ProviderTaskState>,
+    /// 上游任务句柄；同步渠道通常没有。
+    provider_task_handle: Option<String>,
+    /// 上游实际产出的图片张数。
+    image_count: Option<u32>,
+    /// 计量证据（自带 Attempt 关联）。
+    evidence: Option<MeteringEvidence>,
+}
+
+impl LateFactsInput {
+    /// 按处置给出如实的上游终态：确定失败记 `Failed`，结果不明记 `Unknown`，未交到渠道留空。
+    fn for_disposition(disposition: FailureDisposition) -> Self {
+        let provider_state = match disposition {
+            FailureDisposition::DeterminedFailure => Some(ProviderTaskState::Failed),
+            FailureDisposition::Unknown => Some(ProviderTaskState::Unknown),
+            FailureDisposition::SafeRetry => None,
+        };
+        Self {
+            provider_state,
+            ..Self::default()
+        }
+    }
+}
+
 /// 直接执行用例的处置结果。
 ///
 /// 受理前的参数/资金/容量/期限错误按既有 [`ApplicationError`] 原样带出；同键重放的四种投影
@@ -173,6 +205,8 @@ pub struct SupervisedExecutionContext {
     attempt_id: AttemptId,
     execution_owner: String,
     fencing_token: FencingToken,
+    /// 本 Attempt 的收件凭据原值：执行期间只在内存里，收尾交接时用它投递晚到事实。
+    receipt_credential: ReceiptCredential,
     deadline: Deadline,
     gate: Arc<DispatchGate>,
 }
@@ -180,12 +214,14 @@ pub struct SupervisedExecutionContext {
 impl SupervisedExecutionContext {
     /// 组装一次执行的上下文；`deadline` 是已经算好的绝对期限（`D − R`）。
     #[must_use]
+    #[allow(clippy::too_many_arguments)]
     pub fn new(
         executions: Arc<dyn ExecutionRepository>,
         job_id: JobId,
         attempt_id: AttemptId,
         execution_owner: String,
         fencing_token: FencingToken,
+        receipt_credential: ReceiptCredential,
         deadline: Deadline,
         gate: Arc<DispatchGate>,
     ) -> Self {
@@ -195,9 +231,16 @@ impl SupervisedExecutionContext {
             attempt_id,
             execution_owner,
             fencing_token,
+            receipt_credential,
             deadline,
             gate,
         }
+    }
+
+    /// 这次 Attempt 的收件凭据原值；只交给收件端口，不写日志、不入库。
+    #[must_use]
+    pub fn receipt_credential(&self) -> &ReceiptCredential {
+        &self.receipt_credential
     }
 
     /// 这次 Attempt 的生成发送是否已经开始：用于区分"闸口拒绝"与"发送已开始后才收到取消"。
@@ -555,10 +598,12 @@ impl DirectExecutionService {
                     attempt_id,
                     &call.execution_owner,
                     fencing_token,
+                    &started.receipt_credential,
                     ProviderFailureKind::PlatformInternal,
                     FailureDisposition::DeterminedFailure,
                     None,
                     None,
+                    LateFactsInput::default(),
                 )
                 .await?;
                 return Err(DirectExecutionError::RequestTimeout);
@@ -569,6 +614,7 @@ impl DirectExecutionService {
                 attempt_id,
                 call.execution_owner.clone(),
                 fencing_token,
+                started.receipt_credential.clone(),
                 deadline,
                 call.gate.clone(),
             );
@@ -582,6 +628,7 @@ impl DirectExecutionService {
                             attempt_id,
                             &call.execution_owner,
                             fencing_token,
+                            &started.receipt_credential,
                             &offering,
                             output,
                             call.total_deadline,
@@ -609,10 +656,12 @@ impl DirectExecutionService {
                                 attempt_id,
                                 &call.execution_owner,
                                 fencing_token,
+                                &started.receipt_credential,
                                 provider.kind,
                                 FailureDisposition::SafeRetry,
                                 Some(provider_cost.clone()),
                                 provider.trace_id.clone(),
+                                LateFactsInput::default(),
                             )
                             .await?;
                             tracing::info!(
@@ -630,10 +679,12 @@ impl DirectExecutionService {
                                     attempt_id,
                                     &call.execution_owner,
                                     fencing_token,
+                                    &started.receipt_credential,
                                     provider.kind,
                                     FailureDisposition::DeterminedFailure,
                                     Some(provider_cost),
                                     provider.trace_id.clone(),
+                                    LateFactsInput::default(),
                                 )
                                 .await?;
                                 return Err(DirectExecutionError::RequestTimeout);
@@ -651,10 +702,12 @@ impl DirectExecutionService {
                             attempt_id,
                             &call.execution_owner,
                             fencing_token,
+                            &started.receipt_credential,
                             provider.kind,
                             FailureDisposition::DeterminedFailure,
                             Some(provider_cost),
                             provider.trace_id.clone(),
+                            LateFactsInput::for_disposition(FailureDisposition::DeterminedFailure),
                         )
                         .await?;
                         if timed_out {
@@ -668,10 +721,12 @@ impl DirectExecutionService {
                         attempt_id,
                         &call.execution_owner,
                         fencing_token,
+                        &started.receipt_credential,
                         provider.kind,
                         disposition,
                         Some(provider_cost),
                         provider.trace_id.clone(),
+                        LateFactsInput::for_disposition(disposition),
                     )
                     .await?;
                     return Err(match disposition {
@@ -684,34 +739,32 @@ impl DirectExecutionService {
                 Err(AdapterError::AcceptedUnpersisted { handle, .. }) => {
                     // 上游已受理、句柄没能入库：先按不可伪造的同一 Attempt 交付晚到事实，再转对账。
                     // 绝不重发（重发等于为同一个请求再付一次上游成本，RFC 0017 §4）。
-                    let late = LateFacts {
+                    // 只交付句柄：这一刻还不知道上游终态，收件行如实记「没有终态」。
+                    let late = LateFactsInput {
+                        provider_task_handle: Some(handle.task_id.into_string()),
+                        ..LateFactsInput::default()
+                    };
+                    self.hand_off_late_facts(
                         job_id,
                         attempt_id,
-                        provider_task_handle: Some(handle.task_id.into_string()),
-                        provider_trace_id: handle.trace_id,
-                        image_count: None,
-                        evidence: None,
-                        provider_cost: None,
-                        // 只交付句柄：这一刻还不知道上游终态，收件行如实记「没有终态」。
-                        provider_state: None,
-                    };
-                    if let Err(error) = self.executions.offer_late_facts(late).await {
-                        tracing::warn!(
-                            job_id = %job_id,
-                            error = %error,
-                            "could not record a late acceptance handle; the execution stays unknown"
-                        );
-                    }
+                        &started.receipt_credential,
+                        handle.trace_id.clone(),
+                        None,
+                        late.clone(),
+                    )
+                    .await;
                     self.record_failure(
                         request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
                         fencing_token,
+                        &started.receipt_credential,
                         ProviderFailureKind::PlatformInternal,
                         FailureDisposition::Unknown,
                         None,
-                        None,
+                        handle.trace_id,
+                        late,
                     )
                     .await?;
                     return Err(DirectExecutionError::OutcomeUnknown);
@@ -727,10 +780,12 @@ impl DirectExecutionService {
                         attempt_id,
                         &call.execution_owner,
                         fencing_token,
+                        &started.receipt_credential,
                         ProviderFailureKind::PlatformInternal,
                         FailureDisposition::DeterminedFailure,
                         None,
                         None,
+                        LateFactsInput::default(),
                     )
                     .await?;
                     return Err(DirectExecutionError::OriginalFailure {
@@ -758,10 +813,12 @@ impl DirectExecutionService {
                         attempt_id,
                         &call.execution_owner,
                         fencing_token,
+                        &started.receipt_credential,
                         ProviderFailureKind::PlatformInternal,
                         disposition,
                         None,
                         None,
+                        LateFactsInput::for_disposition(disposition),
                     )
                     .await?;
                     return Err(outcome);
@@ -775,10 +832,12 @@ impl DirectExecutionService {
                         attempt_id,
                         &call.execution_owner,
                         fencing_token,
+                        &started.receipt_credential,
                         ProviderFailureKind::PlatformInternal,
                         FailureDisposition::Unknown,
                         None,
                         None,
+                        LateFactsInput::for_disposition(FailureDisposition::Unknown),
                     )
                     .await?;
                     return Err(DirectExecutionError::OutcomeUnknown);
@@ -791,10 +850,12 @@ impl DirectExecutionService {
                         attempt_id,
                         &call.execution_owner,
                         fencing_token,
+                        &started.receipt_credential,
                         ProviderFailureKind::PlatformInternal,
                         FailureDisposition::DeterminedFailure,
                         None,
                         None,
+                        LateFactsInput::default(),
                     )
                     .await?;
                     return Err(DirectExecutionError::OriginalFailure {
@@ -882,9 +943,10 @@ impl DirectExecutionService {
 
     /// 成功收尾：先结算再返回载荷；证据缺失或没有产出图时转对账。
     ///
-    /// 结算提交结果未知时先按 Job/Attempt 只读确认，确认不到再重试同一幂等结算；仍不明时转异常
-    /// 处置。已确认结算但总期限已过时返回交付超时——原请求已完成并收费，不能改写成"结果未知"
-    /// （Spec 0005 §3–§5，RFC 0017 §3）。
+    /// 结算提交结果未知时先按 Job/Attempt 只读确认，确认不到再重试同一幂等结算；仍不明时在有限
+    /// finalization 预算内把已经取得的事实交回收件端口，再按异常处置——**不丢内存里的成功事实**
+    /// （RFC 0018 §5.1）。已确认结算但总期限已过时返回交付超时——原请求已完成并收费，不能改写成
+    /// "结果未知"（Spec 0005 §3–§5，RFC 0017 §3）。
     #[allow(clippy::too_many_arguments)]
     async fn finish_success(
         &self,
@@ -893,6 +955,7 @@ impl DirectExecutionService {
         attempt_id: AttemptId,
         execution_owner: &str,
         fencing_token: FencingToken,
+        receipt_credential: &ReceiptCredential,
         offering: &PublishedOffering,
         output: ProviderOutput,
         total_deadline: tokio::time::Instant,
@@ -909,10 +972,15 @@ impl DirectExecutionService {
                 attempt_id,
                 execution_owner,
                 fencing_token,
+                receipt_credential,
                 ProviderFailureKind::PlatformInternal,
                 FailureDisposition::Unknown,
                 Some(provider_cost),
                 output.accounting_facts.provider_trace_id.clone(),
+                LateFactsInput {
+                    provider_state: Some(ProviderTaskState::Succeeded),
+                    ..LateFactsInput::default()
+                },
             )
             .await?;
             return Err(DirectExecutionError::OutcomeUnknown);
@@ -926,10 +994,15 @@ impl DirectExecutionService {
                 attempt_id,
                 execution_owner,
                 fencing_token,
+                receipt_credential,
                 ProviderFailureKind::PlatformInternal,
                 FailureDisposition::Unknown,
                 Some(provider_cost),
                 output.accounting_facts.provider_trace_id.clone(),
+                LateFactsInput {
+                    provider_state: Some(ProviderTaskState::Succeeded),
+                    ..LateFactsInput::default()
+                },
             )
             .await?;
             return Err(DirectExecutionError::OutcomeUnknown);
@@ -954,8 +1027,20 @@ impl DirectExecutionService {
                 declared_cost_microusd: provider_cost.amount_microusd,
             })
             .map_err(|error| ApplicationError::Reconciliation(error.to_string()))?;
+        // 结算确认失败时要交接的同一份最小事实；先构造好，提交路径不借它。
+        let late = LateFactsInput {
+            provider_state: Some(ProviderTaskState::Succeeded),
+            provider_task_handle: None,
+            image_count: Some(image_count),
+            evidence: Some(MeteringEvidence {
+                attempt_id,
+                provider_response_digest: output.accounting_facts.response_digest.clone(),
+                usage: usage.clone(),
+            }),
+        };
+        let provider_trace_id = output.accounting_facts.provider_trace_id.clone();
         // 先结算后返回：结算提交成功之前，载荷不交给调用方（RFC 0017 §2）。
-        let finalization = self
+        let finalization = match self
             .finalize_settle(SettleExecution {
                 job_id,
                 attempt_id,
@@ -966,15 +1051,41 @@ impl DirectExecutionService {
                     provider_response_digest: output.accounting_facts.response_digest.clone(),
                     usage,
                 },
-                provider_cost,
+                provider_cost: provider_cost.clone(),
                 charge_microusd: charge,
                 image_count: Some(image_count),
-                provider_trace_id: output.accounting_facts.provider_trace_id.clone(),
+                provider_trace_id: provider_trace_id.clone(),
             })
-            .await?;
+            .await
+        {
+            Ok(finalization) => finalization,
+            Err(error) => {
+                // token Conflict 或提交结果不明：当前所有权下无法正式结算，但成功事实已经取得，
+                // 在有限 finalization 预算内交回收件端口，绝不随返回值丢掉（RFC 0018 §5.1）。
+                self.hand_off_late_facts(
+                    job_id,
+                    attempt_id,
+                    receipt_credential,
+                    provider_trace_id,
+                    Some(provider_cost),
+                    late,
+                )
+                .await;
+                return Err(error);
+            }
+        };
         self.refresh_balance(account_id).await;
         if finalization.stage != ExecutionStage::Succeeded {
-            // 结算没有落成成功：不许把图片当成功交回。
+            // 结算没有落成成功：不许把图片当成功交回；事实仍交回收件端口。
+            self.hand_off_late_facts(
+                job_id,
+                attempt_id,
+                receipt_credential,
+                provider_trace_id,
+                None,
+                late,
+            )
+            .await;
             return Err(DirectExecutionError::OutcomeUnknown);
         }
         // 已确认结算、但总期限已过：图片来不及准备返回，按交付超时回应（结果不保留）。
@@ -1074,6 +1185,10 @@ impl DirectExecutionService {
     }
 
     /// 把一次失败按处置落库并写穿余额。同一处置重复调用幂等；换了处置由仓储报冲突。
+    ///
+    /// 收尾提交结果不明或所有权已切换（token Conflict）时，当前所有权下已经无法正式结算：在有限
+    /// finalization 预算内把 `late` 里的有界事实交回收件端口，再如实返回未知——不把内存里的事实
+    /// 随返回值丢掉（RFC 0018 §5.1）。
     #[allow(clippy::too_many_arguments)]
     async fn record_failure(
         &self,
@@ -1082,24 +1197,89 @@ impl DirectExecutionService {
         attempt_id: AttemptId,
         execution_owner: &str,
         fencing_token: FencingToken,
+        receipt_credential: &ReceiptCredential,
         kind: ProviderFailureKind,
         disposition: FailureDisposition,
         provider_cost: Option<ProviderCostFact>,
         provider_trace_id: Option<String>,
+        late: LateFactsInput,
     ) -> Result<(), DirectExecutionError> {
-        self.finalize_failure(FailOrReconcileExecution::for_failure(
+        let command = FailOrReconcileExecution::for_failure(
             job_id,
             attempt_id,
             execution_owner.to_owned(),
             fencing_token,
             kind,
             disposition,
-            provider_cost,
-            provider_trace_id,
-        ))
-        .await?;
+            provider_cost.clone(),
+            provider_trace_id.clone(),
+        );
+        if let Err(error) = self.finalize_failure(command).await {
+            self.hand_off_late_facts(
+                job_id,
+                attempt_id,
+                receipt_credential,
+                provider_trace_id,
+                provider_cost,
+                late,
+            )
+            .await;
+            return Err(error);
+        }
         self.refresh_balance(account_id).await;
         Ok(())
+    }
+
+    /// 把**已经取得、但当前所有权下无法正式结算**的有界事实交回收件端口。
+    ///
+    /// 它只是收件：不改所有权、不重开终态、不直接结算，所以原 token 已失效也能投递；凭据在库里
+    /// 只以摘要存在，投递不携带 token（RFC 0018 §5.2）。投递幂等，因此按同一份收尾确认骨架的次数
+    /// 与退避**有界重试**：多投一次不会重复扣费，漏投一次这些事实就没了。没有可交付的有界事实
+    /// （请求根本没交到渠道）时直接返回，不写空收件。
+    async fn hand_off_late_facts(
+        &self,
+        job_id: JobId,
+        attempt_id: AttemptId,
+        receipt_credential: &ReceiptCredential,
+        provider_trace_id: Option<String>,
+        provider_cost: Option<ProviderCostFact>,
+        late: LateFactsInput,
+    ) {
+        if late.provider_task_handle.is_none() && late.evidence.is_none() && provider_cost.is_none()
+        {
+            return;
+        }
+        let facts = LateFacts {
+            job_id,
+            attempt_id,
+            receipt_credential: receipt_credential.clone(),
+            provider_task_handle: late.provider_task_handle,
+            provider_trace_id,
+            image_count: late.image_count,
+            evidence: late.evidence,
+            provider_cost,
+            provider_state: late.provider_state,
+        };
+        let max_attempts = self.retry_policy.max_attempts.max(1);
+        for attempt in 1..=max_attempts {
+            match self.executions.offer_late_facts(facts.clone()).await {
+                Ok(_) => return,
+                Err(error) => tracing::warn!(
+                    job_id = %job_id,
+                    attempt_id = %attempt_id,
+                    error = %error,
+                    "could not hand off late facts; retrying within the bounded budget"
+                ),
+            }
+            if attempt < max_attempts {
+                tokio::time::sleep(self.retry_policy.backoff_for(attempt)).await;
+            }
+        }
+        tracing::warn!(
+            job_id = %job_id,
+            attempt_id = %attempt_id,
+            "late facts could not be handed off within the bounded finalization budget"
+        );
     }
 
     /// 提交后把数据库的当前余额写穿缓存（RFC 0017 §3）。读不到只记日志：缓存不是事实来源。
