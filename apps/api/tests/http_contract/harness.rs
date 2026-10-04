@@ -1354,6 +1354,9 @@ struct Harness {
     account_id: String,
     api_key: String,
     pool: PgPool,
+    /// 连到**基库**（`HTTP_CONTRACT_DATABASE_URL`）的池：读 `pg_stat_database` 时用它，
+    /// 这样读本身提交的事务记在基库上，不会算进被观测的一次性库。
+    admin_pool: PgPool,
     calls: UpstreamCalls,
     upstream_base_url: String,
     /// 这次用例**实际发布**的那份**线上声明面**（承载面 `properties` 的顶层名字；老形状的素材
@@ -1741,6 +1744,12 @@ impl Harness {
         let pool = PgPool::connect(&database_url)
             .await
             .expect("contract database");
+        let admin_pool = PgPool::connect(
+            &std::env::var("HTTP_CONTRACT_DATABASE_URL")
+                .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract tests"),
+        )
+        .await
+        .expect("contract base database");
 
         draft["base_url"] = Value::String(upstream.base_url.clone());
         // 判据在发布之前从同一份候选里取出来：它就是这次用例真正交给平台的**线上声明面**——
@@ -1775,6 +1784,7 @@ impl Harness {
             account_id: account,
             api_key,
             pool,
+            admin_pool,
             calls,
             upstream_base_url: upstream.base_url.clone(),
             declared_surface,

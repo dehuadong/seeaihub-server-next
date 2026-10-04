@@ -555,14 +555,17 @@ async fn direct_same_key_while_running_is_request_in_progress() {
 /// 等计数器稳定的上限：到点用最后一次读数，不让等待无限拉长。
 const SETTLE_DEADLINE: Duration = Duration::from_secs(10);
 
-/// 本库**已提交事务**计数：直接执行期间的 SQL 增量按它观测。
-async fn committed_transactions(pool: &sqlx::PgPool) -> i64 {
-    let count: i64 = sqlx::query_scalar(
-        "SELECT xact_commit FROM pg_stat_database WHERE datname = current_database()",
-    )
-    .fetch_one(pool)
-    .await
-    .expect("read the database transaction counter");
+/// **目标库**的已提交事务计数：直接执行期间的 SQL 增量按它观测。
+///
+/// 从基库的池上读、按库名过滤：读计数本身也是一次提交。若从被观测的那个库上读，观测者自己
+/// 的读会被算进去，负载高、统计刷新勤时前后两次读数永远差 1，等待稳定就成了死循环。
+async fn committed_transactions(admin: &sqlx::PgPool, database: &str) -> i64 {
+    let count: i64 =
+        sqlx::query_scalar("SELECT xact_commit FROM pg_stat_database WHERE datname = $1")
+            .bind(database)
+            .fetch_one(admin)
+            .await
+            .expect("read the database transaction counter");
     count
 }
 
@@ -570,16 +573,13 @@ async fn committed_transactions(pool: &sqlx::PgPool) -> i64 {
 ///
 /// `pg_stat_database` 的计数按约 1s 的粒度成批可见：只前后各读一次，批次边界上与本请求无关的
 /// 整批提交（夹具建库、发布与账户夹具）会被算进请求增量。这里读到连续两次读数相同为止。
-///
-/// 但**读计数器本身也是一次提交**，而负载高时统计刷新更勤，前后两次读数可能始终差 1——纯等
-/// "两次相同"会无限循环（实测整套并行跑时挂死在这里）。所以给一个上限：到点用最后一次读数，
-/// 让抖动落进用例自己留的余量里，而不是把等待无限拉长。
-async fn settled_committed_transactions(pool: &sqlx::PgPool) -> i64 {
+/// 上限只作兜底：正常情况下读数在基库上不再自增，很快稳定。
+async fn settled_committed_transactions(admin: &sqlx::PgPool, database: &str) -> i64 {
     let deadline = tokio::time::Instant::now() + SETTLE_DEADLINE;
-    let mut last = committed_transactions(pool).await;
+    let mut last = committed_transactions(admin, database).await;
     loop {
         tokio::time::sleep(Duration::from_millis(1_200)).await;
-        let after = committed_transactions(pool).await;
+        let after = committed_transactions(admin, database).await;
         if last == after || tokio::time::Instant::now() >= deadline {
             return after;
         }
@@ -606,7 +606,7 @@ async fn warm_up_direct(harness: &Harness) {
 /// 调用前必须先 [`warm_up_direct`]：`create_calls == 2` 就是预热那一次加上测量这一次。
 async fn one_direct_request_commits(harness: &Harness) -> i64 {
     let key = format!("direct-sql-{}", Uuid::new_v4());
-    let before = settled_committed_transactions(&harness.pool).await;
+    let before = settled_committed_transactions(&harness.admin_pool, &harness.database_name).await;
     let (status, body) = post_json(
         &harness.base_url,
         &harness.api_key,
@@ -618,7 +618,7 @@ async fn one_direct_request_commits(harness: &Harness) -> i64 {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("direct sql counting", &body);
     assert_eq!(harness.create_calls(), 2, "预热与测量各调一次上游");
-    let after = settled_committed_transactions(&harness.pool).await;
+    let after = settled_committed_transactions(&harness.admin_pool, &harness.database_name).await;
     after - before
 }
 
