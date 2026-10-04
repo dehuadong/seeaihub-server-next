@@ -8,6 +8,15 @@
 
 use super::*;
 
+/// 一组样本的均值与 p95：p95 取向上取整那一档（两态基线与耗时拆分同一口径）。
+fn mean_and_p95(mut samples: Vec<Duration>) -> (Duration, Duration) {
+    samples.sort();
+    let count = u32::try_from(samples.len()).expect("the sample count fits a u32");
+    let mean = samples.iter().sum::<Duration>() / count;
+    let p95_index = (samples.len() as f64 * 0.95).ceil() as usize - 1;
+    (mean, samples[p95_index.min(samples.len() - 1)])
+}
+
 /// 两态各自一次有界负载的观测结果。
 ///
 /// `total` 是从第一个请求发出到最后一个成功请求返回的墙钟时间；延迟分布只统计成功请求——
@@ -151,16 +160,129 @@ async fn measure_baseline(
     drop(worker);
     harness.cleanup().await;
 
-    latencies.sort();
-    let mean = latencies.iter().sum::<Duration>()
-        / u32::try_from(requests).expect("the request count fits a u32");
-    // p95 取向上取整那一档（48 个样本里的第 46 小），与实际延迟分布一致。
-    let p95_index = (requests as f64 * 0.95).ceil() as usize - 1;
+    let (mean, p95) = mean_and_p95(latencies);
     BaselineObservation {
         label,
         total,
         mean,
-        p95: latencies[p95_index.min(latencies.len() - 1)],
+        p95,
         requests_per_second: requests as f64 / total.as_secs_f64(),
     }
+}
+
+/// 顺序直接执行下的一次观测：每次总耗时，以及扣掉固定上游延迟后的网关净耗时。
+///
+/// 「净耗时」= 总耗时 − D，含受理事务与写回、选路、参数映射与序列化、连接获取、响应序列化，
+/// 以及顺序循环里的调度与排队；D 是假上游对每次生成请求固定压的那段。
+struct GatewayOverheadObservation {
+    requests: usize,
+    upstream_delay: Duration,
+    total_mean: Duration,
+    total_p95: Duration,
+    net_mean: Duration,
+    net_p95: Duration,
+}
+
+impl GatewayOverheadObservation {
+    fn summary(&self) -> String {
+        format!(
+            "sequential-direct: n={} upstream_delay={}ms total_mean={:.1}ms total_p95={:.1}ms net_mean={:.1}ms net_p95={:.1}ms",
+            self.requests,
+            self.upstream_delay.as_millis(),
+            self.total_mean.as_secs_f64() * 1_000.0,
+            self.total_p95.as_secs_f64() * 1_000.0,
+            self.net_mean.as_secs_f64() * 1_000.0,
+            self.net_p95.as_secs_f64() * 1_000.0,
+        )
+    }
+}
+
+/// A8：关闭并发（一次只发一个），顺序发 [`REQUESTS`] 个成功的直接执行请求，假上游固定延迟 D。
+///
+/// 逐个记录墙钟总耗时，再报告总耗时与「网关净耗时 = 总耗时 − D」的均值与 p95。净耗时里混着
+/// 受理与结算的数据库往返、参数映射与序列化、连接获取、响应序列化，以及顺序循环自身的调度与
+/// 排队——上游那一段 D 被减掉，剩下的就是这个网关与执行路径给一次请求加的时间。只记录，不断言。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn direct_execution_gateway_overhead_split() {
+    const REQUESTS: usize = 10;
+    const UPSTREAM_DELAY_MS: u64 = 200;
+    // 与两态基线同一组窗口、上游超时与账户在飞上限，只有"顺序发"这一点不同。
+    const SYNC_WAIT_SECONDS: u64 = 30;
+    const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
+    const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;
+
+    let draft = candidate(
+        "AIHubMix",
+        "aihubmix-image-v1",
+        &["prompt_only", "image_conditioned", "masked"],
+    );
+    let behaviour = UpstreamBehaviour {
+        delay_ms: UPSTREAM_DELAY_MS,
+        ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+    };
+    let harness =
+        Harness::start_direct(draft, behaviour, MAX_ACCOUNT_IN_FLIGHT, SYNC_WAIT_SECONDS).await;
+    let (_, api_key) = funded_account(
+        &Client::new(),
+        &harness.base_url,
+        &harness.admin_token,
+        MEASURE_ACCOUNT_CREDIT_MICROUSD,
+    )
+    .await;
+
+    // 预热一次：首请求冷的选路与余额缓存不进统计。
+    let (status, body) = post_json(
+        &harness.base_url,
+        &api_key,
+        "/v1/images/generations",
+        &format!("overhead-warmup-{}", Uuid::new_v4()),
+        &route_request(harness.model, "warm the route and balance caches"),
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "预热失败: {body}");
+
+    let mut totals = Vec::with_capacity(REQUESTS);
+    for index in 0..REQUESTS {
+        let key = format!("overhead-{index}-{}", Uuid::new_v4());
+        let prompt = format!("overhead request {index}");
+        let began = std::time::Instant::now();
+        let (status, body) = post_json(
+            &harness.base_url,
+            &api_key,
+            "/v1/images/generations",
+            &key,
+            &route_request(harness.model, &prompt),
+        )
+        .await;
+        let total = began.elapsed();
+        assert_eq!(status, StatusCode::OK, "顺序请求 {index} 失败: {body}");
+        println!(
+            "request {index}: total={:.1}ms net={:.1}ms",
+            total.as_secs_f64() * 1_000.0,
+            total
+                .saturating_sub(Duration::from_millis(UPSTREAM_DELAY_MS))
+                .as_secs_f64()
+                * 1_000.0,
+        );
+        totals.push(total);
+    }
+    harness.cleanup().await;
+
+    let upstream_delay = Duration::from_millis(UPSTREAM_DELAY_MS);
+    let (total_mean, total_p95) = mean_and_p95(totals.clone());
+    let net: Vec<Duration> = totals
+        .iter()
+        .map(|total| total.saturating_sub(upstream_delay))
+        .collect();
+    let (net_mean, net_p95) = mean_and_p95(net);
+    let observation = GatewayOverheadObservation {
+        requests: REQUESTS,
+        upstream_delay,
+        total_mean,
+        total_p95,
+        net_mean,
+        net_p95,
+    };
+    println!("{}", observation.summary());
 }
