@@ -7,6 +7,7 @@
 // 前置：`npm run build` 已经产出 `apps/web/dist`（Playwright 的 webServer 在起 API 之前先跑它）。
 // 用法：`node e2e/start-api.mjs`，由 `playwright.config.ts` 的 webServer 启动并在结束时收掉。
 import { spawn } from 'node:child_process';
+import { randomBytes } from 'node:crypto';
 import { existsSync } from 'node:fs';
 import { dirname, resolve } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -55,6 +56,10 @@ Object.assign(env, {
   // 客户历史游标密钥：生产**必须配**（缺了进程起不来），e2e 走同一条路，不给测试旁路。
   CUSTOMER_HISTORY_CURSOR_KEY:
     process.env.SEEAI_E2E_CURSOR_KEY ?? 'AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8=',
+  // 请求指纹密钥：API 启动时无条件校验，生产必配。按运维文档它不进仓库，这里每次运行现生成一份
+  // 32 字节 base64——e2e 每次都是空库，不需要跨运行复现指纹。
+  REQUEST_FINGERPRINT_KEY_V1:
+    process.env.SEEAI_E2E_FINGERPRINT_KEY ?? randomBytes(32).toString('base64'),
   // **显式不导入供给素材**：e2e 库每次重置成空库、用例自己造夹具；不设的话默认值
   // （`config/bootstrap`）会让每个用例都先看到仓库那两份素材。
   SUPPLY_MATERIAL_DIR: '',
