@@ -311,11 +311,15 @@ pub struct GatewayByteLimits {
 }
 
 /// 入口请求 wire 的上限：与 API 的正文上限同一口径，解析结果与它同时存活。
-pub const GATEWAY_REQUEST_WIRE_BYTES: usize = 16 * 1024 * 1024;
+///
+/// 唯一的取值来源是 [`seeai_domain::SUPPORTED_REQUEST_WIRE_BYTES`]：请求结构的四条计数上限
+/// （节点数、容器层数、对象字段数、累计字符串字节）就是从它推导的（RFC 0018 §2.2），两处不能各写
+/// 一个数。
+pub const GATEWAY_REQUEST_WIRE_BYTES: usize = seeai_domain::SUPPORTED_REQUEST_WIRE_BYTES;
 
 /// 实测：贴住 [`GATEWAY_REQUEST_WIRE_BYTES`] 的**已支持输入形态**（一个 data URL 参考图加普通
-/// 参数）经 API 真实解析路径（`CreateGenerationBody`）之后，解析结构在峰值时额外持有的字节数，
-/// 不含 wire 本身。
+/// 参数）经 API 真实解析路径（[`seeai_domain::RequestParameters::parse`]）之后，解析结构在峰值时
+/// 额外持有的字节数，不含 wire 本身。
 ///
 /// 测量命令（Linux、dev profile、一条用例一个进程，`VmHWM` 前后差值）：
 ///
@@ -324,14 +328,25 @@ pub const GATEWAY_REQUEST_WIRE_BYTES: usize = 16 * 1024 * 1024;
 ///   memory_request_parse_peak_image
 /// ```
 ///
-/// 实测：wire 16777216 字节，额外峰值 17544–17992 KiB（四次）；取 18 MiB 收口。
+/// 实测（有界解析落地后）：wire 16777216 字节，额外峰值 17160 / 17224 KiB（两次）；上限仍是 18 MiB。
 ///
-/// **已知缺口（T1 剩余项，必须知道）**：节点密集的 JSON 在 §2.2 的节点/字段计数落地前不受这个
-/// 常数约束。同一命令下的 `memory_request_parse_peak_small_object_nodes`（16 MiB 的
-/// `[{"a":0},…]`）实测解析结构峰值 2065756 KiB（约 2.0 GiB），
-/// `memory_request_parse_peak_scalar_nodes`（`[0,0,…]`）实测 526036 KiB。也就是说：在节点计数
-/// 落地前，一份 16 MiB 的请求能把堆抬到远超本常数——那时这份预留不再是内存保证。这里是按
-/// **已支持输入形态**实测的最大值钉的，节点/字段计数是收口这一缺口的既定机制。
+/// **节点密集输入的缺口已封堵**（T1）：解析入口现在边解析边计数（RFC 0018 §2.2），节点数、容器
+/// 层数、对象字段数、累计字符串字节任一超限都在**构造过程中**失败，不会出现"wire 只有 16 MiB、
+/// 解析结构却有 2 GiB"的形态。同一命令下重测两种节点密集形态（它们现在都在节点数上限处被拒）：
+///
+/// | 形态 | 封堵前峰值 | 封堵后峰值（本次实测） |
+/// | --- | --- | --- |
+/// | `[0,0,…]`（标量节点） | 526036 KiB | 1228 / 1356 / 1356 KiB（三次） |
+/// | `[{"a":0},…]`（单字段对象节点） | 2065756 KiB | 1864–1992 KiB（四次） |
+///
+/// 这里钉的 18 MiB 仍然成立，因为它就是按这四条上限推导的：累计字符串 ≤ 16 MiB，节点数
+/// 2048 × 1 KiB/节点（实测最贵一档 ≈ 1008 B/节点）= 2 MiB，合计 18 MiB。推导写在
+/// `crates/domain/src/request_structure.rs` 的模块注释里，探针在 `apps/api/src/tests.rs`。
+///
+/// 剩余边界：累计字符串字节那条上限等于 wire 上限（解码后的字符串字节恒 ≤ wire 字节，再紧就会
+/// 拒绝已支持的 16 MiB data URL），所以它在缺省配置下永远不会是先被撞到的一条——真正的收口
+/// 是正文上限。转义密集的字符串在 `serde_json` 的内部暂存里可能短暂多占一份，其大小仍被同一
+/// wire 上限约束（转义序列的解码产出 ≤ 其 wire 占用的一半），未单独实测。
 pub const GATEWAY_REQUEST_PARSE_BYTES: usize = 18 * 1024 * 1024;
 
 /// 实测：解析结构提升为 Adapter 输入（取参考图/遮罩并构造强类型 [`InputImage`]）时的额外峰值。
@@ -343,7 +358,8 @@ pub const GATEWAY_REQUEST_PARSE_BYTES: usize = 18 * 1024 * 1024;
 ///   memory_mapped_parameter_peak
 /// ```
 ///
-/// 实测：额外峰值 16472–16540 KiB（四次）；取 17 MiB 收口。其中约 16 MiB 是
+/// 实测：额外峰值 16472–16540 KiB（四次；有界解析落地后复测一次 16604 KiB）；取 17 MiB 收口。
+/// 其中约 16 MiB 是
 /// `seeai_domain::take_contract_image_inputs` 对图片值的那一次拷贝——它与 map 里的原值在峰值时
 /// 同时存活（RFC 0018 §2.2 要求图片输入共享，落地后应重测收窄）。
 pub const GATEWAY_MAPPED_PARAMETER_BYTES: usize = 17 * 1024 * 1024;

@@ -34,7 +34,7 @@ use seeai_application::{
 };
 use seeai_domain::{
     AccountId, AttemptId, ConsumerRatesCny, FencingToken, JobId, ProviderCostFact, ProviderTraceId,
-    TokenUsage,
+    RequestParameters, TokenUsage,
 };
 use seeai_persistence::PgHubRepository;
 use serde_json::{Value, json};
@@ -703,7 +703,8 @@ impl Fixture {
             account_id: self.account_id,
             model: "gw".to_owned(),
             endpoint: "/v1/images/generations".to_owned(),
-            native_parameters: json!({"prompt": "a red fox"}),
+            native_parameters: RequestParameters::try_from(json!({"prompt": "a red fox"}))
+                .expect("the fixture parameters are within the request structure limits"),
             reference_images: Vec::new(),
             mask: None,
             idempotency_key: key.to_owned(),

@@ -498,3 +498,159 @@ async fn an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum() {
 
     harness.cleanup().await;
 }
+
+// ── RFC 0018 §2.2：请求结构的有界解析 ─────────────────────────────────────────
+
+/// 一份结构超限的请求在**受理前**被拒：400 `invalid_parameter`，不建 Job、不占 Hold、上游一次
+/// 都不调。四条计数（容器层数、节点数、对象字段数、累计字符串字节）的对外表现是同一条。
+async fn assert_structured_request_is_rejected(harness: &Harness, key: &str, request: Value) {
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", key, request)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "结构超限是参数问题：{body}"
+    );
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("invalid_parameter"),
+        "{body}"
+    );
+    assert_public_only("结构超限", &body);
+    let account_id = Uuid::parse_str(&harness.account_id).expect("the fixture account id");
+    let jobs: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
+            .bind(account_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("job count");
+    assert_eq!(jobs, 0, "结构超限的请求不许建执行记录");
+    assert_eq!(harness.create_calls(), 0, "结构超限的请求不许碰上游");
+}
+
+/// 节点密集的两种形态（标量数组、单字段对象数组）在受理前被拒。
+///
+/// 这两种正是把解析结构抬到远超预留的形态：16 MiB 的 `[{"a":0},…]` 曾能把堆抬到约 2.0 GiB。现在
+/// 节点数在解析过程中就被核对，超限即失败，不建记录。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn node_dense_requests_are_rejected_before_acceptance() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+
+    let mut scalars = route_request(harness.model, "a scalar node flood");
+    scalars["x"] = json!(vec![0_u64; 4096]);
+    assert_structured_request_is_rejected(
+        &harness,
+        &format!("structure-scalars-{}", Uuid::new_v4()),
+        scalars,
+    )
+    .await;
+
+    let mut objects = route_request(harness.model, "a small-object node flood");
+    objects["x"] = Value::Array((0..4096).map(|_| json!({"a": 0})).collect());
+    assert_structured_request_is_rejected(
+        &harness,
+        &format!("structure-objects-{}", Uuid::new_v4()),
+        objects,
+    )
+    .await;
+
+    harness.cleanup().await;
+}
+
+/// 深嵌套在受理前被拒。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn deeply_nested_requests_are_rejected_before_acceptance() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let mut nested = json!(0);
+    for _ in 0..256 {
+        nested = json!([nested]);
+    }
+    let mut request = route_request(harness.model, "nesting far past the supported shape");
+    request["x"] = nested;
+    assert_structured_request_is_rejected(
+        &harness,
+        &format!("structure-depth-{}", Uuid::new_v4()),
+        request,
+    )
+    .await;
+    harness.cleanup().await;
+}
+
+/// 一个对象的字段数超限在受理前被拒。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn wide_requests_are_rejected_before_acceptance() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let mut request = route_request(harness.model, "too many top-level fields");
+    for index in 0..300 {
+        request[format!("field_{index}")] = json!(index);
+    }
+    assert_structured_request_is_rejected(
+        &harness,
+        &format!("structure-fields-{}", Uuid::new_v4()),
+        request,
+    )
+    .await;
+    harness.cleanup().await;
+}
+
+/// 累计字符串字节超限在受理前被拒。
+///
+/// 缺省上限等于 16 MiB 的 wire 上限，而解码后的字符串字节恒 ≤ wire 字节，所以它永远不会是缺省
+/// 配置下先被撞到的一条——这条用例把上限收紧到 64 字节来验计数本身（生产配置只允许收紧）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn oversized_string_data_is_rejected_before_acceptance() {
+    let harness = Harness::start_direct_with(
+        candidate(
+            "AIHubMix",
+            "aihubmix-image-v1",
+            &["prompt_only", "image_conditioned", "masked"],
+        ),
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        ApiProcessSettings {
+            request_json_max_string_bytes: Some(64),
+            ..ApiProcessSettings::default()
+        },
+    )
+    .await;
+    let mut request = route_request(harness.model, &"s".repeat(256));
+    request["prompt"] = json!("s".repeat(256));
+    assert_structured_request_is_rejected(
+        &harness,
+        &format!("structure-strings-{}", Uuid::new_v4()),
+        request,
+    )
+    .await;
+    harness.cleanup().await;
+}
+
+/// 边界之内的合法大请求仍然通过：一份约 1 MiB 的 data URL 参考图照旧走完受理与生成。
+///
+/// 16 MiB 的边界由 `crates/domain` 的 `a_full_size_image_request_still_parses` 与 API 的内存探针
+/// （`apps/api/src/tests.rs`）在解析层钉住；这条用例验的是它端到端不被结构上限误伤。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_large_but_bounded_reference_image_still_passes() {
+    let harness =
+        Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
+    let key = format!("structure-large-ok-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "a large but legitimate reference image");
+    request["image"] = json!(format!("data:image/png;base64,{}", "A".repeat(1024 * 1024)));
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request)
+        .await;
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "结构上限之内的合法大请求必须照旧通过：{body}"
+    );
+    assert_sync_success("边界之内的合法大请求", &body);
+    assert_job_succeeded(&harness, &key).await;
+    harness.cleanup().await;
+}

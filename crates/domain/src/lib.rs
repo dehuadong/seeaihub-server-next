@@ -9,6 +9,7 @@ use uuid::Uuid;
 mod execution_protocol;
 mod image_parameters;
 mod parameter_mapping;
+mod request_structure;
 mod size_spec;
 pub use execution_protocol::{
     AttemptStage, ExecutionStage, FencingToken, MAX_PROVIDER_IDENTIFIER_BYTES, ProviderTaskHandle,
@@ -27,6 +28,12 @@ pub use parameter_mapping::{
     apply_parameter_renames, apply_size_mapping, carries_parameter, declared_defaults,
     declared_enum_maps, declared_field_names, declared_renames, declared_size_mapping,
     declares_parameter, is_used_parameter_value, literal_parameter_text, wire_parameter_name,
+};
+pub use request_structure::{
+    REQUEST_JSON_LIMITS, REQUEST_JSON_MAX_DEPTH, REQUEST_JSON_MAX_NODES,
+    REQUEST_JSON_MAX_OBJECT_FIELDS, REQUEST_JSON_MAX_STRING_BYTES, RequestJsonError,
+    RequestJsonLimits, RequestParameters, RequestParametersBuilder, RequestStructureCounter,
+    RequestStructureViolation, SUPPORTED_REQUEST_WIRE_BYTES,
 };
 pub use size_spec::{SizeForm, SizeProfile, SizeSpec, convert_size};
 

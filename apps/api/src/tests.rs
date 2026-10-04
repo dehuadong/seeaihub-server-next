@@ -282,14 +282,16 @@ fn an_unclosed_fragment_drops_the_rest_of_the_message() {
 // 只有 Linux 有 `VmHWM`：这些用例因此是 Linux 专属（直接执行本身也只在 Linux 上启动）。
 #[cfg(target_os = "linux")]
 mod memory_measurement {
-    use crate::{CreateGenerationBody, SyncImageResponse, take_contract_image_inputs};
+    use crate::{SyncImageResponse, take_contract_image_inputs};
     use seeai_adapter_aihubmix::{ADAPTER_KEY as AIHUBMIX_ADAPTER_KEY, AihubmixAdapterFactory};
     use seeai_adapter_sdk::{
         AcceptanceError, AcceptedHandle, Deadline, ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES,
         GatewayInput, ImageSites, InputImage, ProviderCredential,
     };
     use seeai_application::{AdapterFactory, GeneratedImage};
-    use seeai_domain::ImageBranch;
+    use seeai_domain::{
+        ImageBranch, RequestJsonError, RequestParameters, RequestStructureViolation,
+    };
     use serde_json::json;
     use std::sync::Arc;
     use std::time::Duration;
@@ -364,7 +366,7 @@ mod memory_measurement {
 
     /// 入口 wire → 解析结构（RFC 0018 §2.1 的 `A`），大图输入。
     ///
-    /// 解析用 API 自己那一个反序列化类型（`CreateGenerationBody`），不是另写一个等价的 `Value`
+    /// 解析走线上那条入口（[`RequestParameters::parse`]，有界 visitor），不是另写一个等价的 `Value`
     /// 解析：测的必须是线上那条路径。解析结果活着离开测量窗口——峰值里同时有 wire 与解析结构，
     /// 正是公式里 `I + A` 的形态。
     #[test]
@@ -373,51 +375,59 @@ mod memory_measurement {
         let body = max_wire_request_body();
         let wire = body.len();
         let before = process_peak_rss_kib();
-        let parsed: CreateGenerationBody =
-            serde_json::from_slice(&body).expect("the max-wire request parses");
+        let parsed = RequestParameters::parse(&body).expect("the max-wire request parses");
         let after = process_peak_rss_kib();
         println!(
             "请求解析（大图）：wire {wire} 字节（{} KiB），解析结构额外峰值 {} KiB",
             kib(wire),
             after - before
         );
-        assert!(!parsed.parameters.is_empty());
+        assert!(!parsed.as_object().is_empty());
     }
 
     /// 入口 wire → 解析结构，标量节点密集。
+    ///
+    /// 有界解析在节点数上限处失败：测出来的增量是"走到上限为止已经构造出来的那些节点"，不是整份
+    /// 16 MiB 正文能撑出的结构。它必须留在 `GATEWAY_REQUEST_PARSE_BYTES` 之内。
     #[test]
     #[ignore = "内存实测：Linux + 单线程跑，见本模块注释"]
     fn memory_request_parse_peak_scalar_nodes() {
         let body = max_wire_scalar_nodes_body();
         let wire = body.len();
         let before = process_peak_rss_kib();
-        let parsed: CreateGenerationBody =
-            serde_json::from_slice(&body).expect("the node-heavy request parses");
+        let error =
+            RequestParameters::parse(&body).expect_err("the node-heavy request is rejected");
         let after = process_peak_rss_kib();
         println!(
-            "请求解析（标量节点密集）：wire {wire} 字节（{} KiB），解析结构额外峰值 {} KiB",
+            "请求解析（标量节点密集，超限拒绝：{error}）：wire {wire} 字节（{} KiB），解析结构额外峰值 {} KiB",
             kib(wire),
             after - before
         );
-        assert!(!parsed.parameters.is_empty());
+        assert!(matches!(
+            error,
+            RequestJsonError::Limit(RequestStructureViolation::Nodes { .. })
+        ));
     }
 
-    /// 入口 wire → 解析结构，单字段对象密集。
+    /// 入口 wire → 解析结构，单字段对象密集（每节点一次 `Map` 分配，是最贵的一档）。
     #[test]
     #[ignore = "内存实测：Linux + 单线程跑，见本模块注释"]
     fn memory_request_parse_peak_small_object_nodes() {
         let body = max_wire_small_object_nodes_body();
         let wire = body.len();
         let before = process_peak_rss_kib();
-        let parsed: CreateGenerationBody =
-            serde_json::from_slice(&body).expect("the object-heavy request parses");
+        let error =
+            RequestParameters::parse(&body).expect_err("the object-heavy request is rejected");
         let after = process_peak_rss_kib();
         println!(
-            "请求解析（小对象密集）：wire {wire} 字节（{} KiB），解析结构额外峰值 {} KiB",
+            "请求解析（小对象密集，超限拒绝：{error}）：wire {wire} 字节（{} KiB），解析结构额外峰值 {} KiB",
             kib(wire),
             after - before
         );
-        assert!(!parsed.parameters.is_empty());
+        assert!(matches!(
+            error,
+            RequestJsonError::Limit(RequestStructureViolation::Nodes { .. })
+        ));
     }
 
     /// 解析结构 → API 侧映射（图片提升为强类型输入；RFC 0018 §2.1 的 `X` 可测到的部分）。
@@ -425,10 +435,9 @@ mod memory_measurement {
     #[ignore = "内存实测：Linux + 单线程跑，见本模块注释"]
     fn memory_mapped_parameter_peak() {
         let body = max_wire_request_body();
-        let mut parsed: CreateGenerationBody =
-            serde_json::from_slice(&body).expect("the max-wire request parses");
+        let mut parsed = RequestParameters::parse(&body).expect("the max-wire request parses");
         let before = process_peak_rss_kib();
-        let inputs = take_contract_image_inputs(&mut parsed.parameters).expect("image fields");
+        let inputs = take_contract_image_inputs(&mut parsed).expect("image fields");
         let reference_images = inputs
             .reference_images
             .into_iter()

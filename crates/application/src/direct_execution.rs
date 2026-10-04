@@ -23,8 +23,8 @@ use seeai_adapter_sdk::{
 use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
     ImageParameterKind, JobId, MeteringEvidence, OfferingCandidate, ProviderCostFact,
-    ProviderTaskHandle, ProviderTraceId, PublishedOffering, ReceiptCredential, RouteStrategy,
-    image_parameter_kind, platform_image_parameters,
+    ProviderTaskHandle, ProviderTraceId, PublishedOffering, ReceiptCredential, RequestParameters,
+    RouteStrategy, image_parameter_kind, platform_image_parameters,
 };
 use serde_json::{Map, Value};
 use std::sync::Arc;
@@ -82,7 +82,11 @@ pub struct DirectExecutionRequest {
     pub model: String,
     /// 请求指纹里的端点标识（例如 `/v1/images/generations`）。
     pub endpoint: String,
-    pub native_parameters: Value,
+    /// 调用方的普通参数（已经摘掉 `model` 与图片字段）。
+    ///
+    /// 类型是 [`RequestParameters`]：只有**计过数**的请求参数面才进得来（RFC 0018 §2.2）。受理路径
+    /// 因此不可能拿到一份"先建好再统计"的无界 `Value`；wire 入口的有界解析归接口层。
+    pub native_parameters: RequestParameters,
     pub reference_images: Vec<InputImage>,
     pub mask: Option<InputImage>,
     pub idempotency_key: String,
@@ -459,7 +463,7 @@ impl DirectExecutionService {
         let hold_microusd = freeze_offering_pricing(
             self.repository.as_ref(),
             self.limits.default_hold_microusd,
-            &request.native_parameters,
+            request.native_parameters.as_value(),
             &mut offering,
         )
         .await?;
@@ -560,7 +564,7 @@ impl DirectExecutionService {
         let submission_deadline = db_deadline(remaining.min(self.timeouts.sync_wait));
         let provider_timeout = self
             .timeouts
-            .upstream_timeout_for(requested_image_count(&request.native_parameters));
+            .upstream_timeout_for(requested_image_count(request.native_parameters.as_value()));
         let adapter = self.adapters.create_gateway(
             &offering.adapter_key,
             &offering.base_url,
@@ -1313,7 +1317,7 @@ fn routing_request(
     Ok(CreateImageGenerationRequest {
         account_id: request.account_id,
         model: request.model.clone(),
-        native_parameters: request.native_parameters.clone(),
+        native_parameters: request.native_parameters.as_value().clone(),
         reference_images,
         mask,
         idempotency_key: request.idempotency_key.clone(),

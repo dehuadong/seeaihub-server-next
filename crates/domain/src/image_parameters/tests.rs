@@ -1,4 +1,11 @@
 use super::*;
+use crate::{REQUEST_JSON_LIMITS, RequestParameters};
+
+/// 已计数的请求参数面：这些用例只验摘图的语义，结构计数走缺省上限。
+fn counted(entries: impl IntoIterator<Item = (String, Value)>) -> RequestParameters {
+    RequestParameters::try_from_object(Map::from_iter(entries), REQUEST_JSON_LIMITS)
+        .expect("the fixture is within the request structure limits")
+}
 
 fn schema(properties: Value) -> Value {
     serde_json::json!({
@@ -391,7 +398,7 @@ fn ownership_comes_from_the_name_list_not_from_the_shape_of_the_value() {
 /// 受理侧只认契约字段名：取值解释不成一张图的直接报错，其余名字一个字都不碰。
 #[test]
 fn the_contract_side_reads_exactly_three_names() {
-    let mut parameters = serde_json::Map::from_iter([
+    let mut parameters = counted([
         ("model".to_owned(), serde_json::json!("m")),
         ("prompt".to_owned(), serde_json::json!("x")),
         ("image_urls".to_owned(), serde_json::json!(["a", "", "b"])),
@@ -421,7 +428,7 @@ fn the_contract_side_reads_exactly_three_names() {
     assert_eq!(inputs.mask.as_deref(), Some("data:image/png;base64,BBBB"));
     // 只摘契约里的三个名字：其余字段留在参数面里，等选路后按候选声明面处置。
     assert_eq!(
-        parameters.keys().collect::<Vec<_>>(),
+        parameters.as_object().keys().collect::<Vec<_>>(),
         vec!["image_with_roles", "images", "mask_url", "model", "prompt"]
     );
     // 契约字段的取值解释不成一张图：拒绝，不猜。
@@ -432,7 +439,7 @@ fn the_contract_side_reads_exactly_three_names() {
         serde_json::json!([7]),
         serde_json::json!(["a", false]),
     ] {
-        let mut wrong = serde_json::Map::from_iter([
+        let mut wrong = counted([
             ("model".to_owned(), serde_json::json!("m")),
             ("image".to_owned(), value.clone()),
         ]);
@@ -443,14 +450,14 @@ fn the_contract_side_reads_exactly_three_names() {
     }
     // 遮罩没有数组形态：给一个数组（哪怕只有一项）也是形状不对。
     for value in [serde_json::json!(["m1"]), serde_json::json!(["m1", "m2"])] {
-        let mut wrong = serde_json::Map::from_iter([
+        let mut wrong = counted([
             ("image".to_owned(), serde_json::json!("a")),
             ("mask".to_owned(), value),
         ]);
         assert!(take_contract_image_inputs(&mut wrong).is_err());
     }
     // 空值是"没给"，不是错误；空值也不参与同义判定。
-    let mut blank = serde_json::Map::from_iter([
+    let mut blank = counted([
         ("image".to_owned(), serde_json::json!("")),
         ("mask".to_owned(), serde_json::json!(null)),
     ]);
@@ -458,14 +465,17 @@ fn the_contract_side_reads_exactly_three_names() {
         take_contract_image_inputs(&mut blank).expect("blank is not an error"),
         ImageInputs::default()
     );
-    assert!(blank.is_empty(), "摘干净的契约字段不再留在参数面里");
+    assert!(
+        blank.as_object().is_empty(),
+        "摘干净的契约字段不再留在参数面里"
+    );
 }
 
 /// `image` 与 `image_urls` 同义：只有两边都给出非空值才算含糊。
 #[test]
 fn synonymous_fields_conflict_only_when_both_carry_a_value() {
     let conflict = |image: Value, image_urls: Value| {
-        let mut parameters = serde_json::Map::from_iter([
+        let mut parameters = counted([
             ("model".to_owned(), serde_json::json!("m")),
             ("image".to_owned(), image),
             ("image_urls".to_owned(), image_urls),

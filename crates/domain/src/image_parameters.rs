@@ -39,6 +39,7 @@
 //! 调用方说的话，平台不替它猜；第 3 面里的取值是平台自己装载进去的，只可能是字符串或字符串数组。
 
 use crate::ImageBranch;
+use crate::request_structure::RequestParameters;
 use serde_json::{Map, Value};
 
 /// 调用方传进来的图片输入，已经从原生参数里取出来。
@@ -81,6 +82,11 @@ pub fn contract_image_parameter_kind(name: &str) -> Option<ImageParameterKind> {
 
 /// 受理侧入口：按契约字段名取出参考图与遮罩，并把这三个名字从参数里**摘掉**。
 ///
+/// 输入是 [`RequestParameters`]——**已经按请求结构上限计过数**的参数面（RFC 0018 §2.2）。图片值
+/// 是请求里最大的字符串，摘图这一处不能成为绕过节点/字符串计数的口子：只要对象不是从有界解析
+/// （[`RequestParameters::parse`]）、逐项计数（[`RequestParameters::builder`]）或显式计数
+/// （[`RequestParameters::try_from_value`]）来的，类型上就进不了这里。
+///
 /// 摘掉之后它们不再当普通参数：图片有自己的去处（选路后落到候选声明的字段上）。
 /// `image` 与 `image_urls` 是同义字段，**两边都给出非空值**才算含糊，宁可报错也不替调用方挑
 /// 一个；`null`、空串、空数组都是"这一处没有图"，不参与这个判定——否则
@@ -89,7 +95,7 @@ pub fn contract_image_parameter_kind(name: &str) -> Option<ImageParameterKind> {
 /// 只摘这三个名字：其余字段（含渠道文档里的 `image_with_roles`、`mask_url`、`images`）
 /// 留在这里不动，由选路后的 [`declared_parameter_names`] 按候选声明面处置。
 pub fn take_contract_image_inputs(
-    parameters: &mut Map<String, Value>,
+    parameters: &mut RequestParameters,
 ) -> Result<ImageInputs, String> {
     let mut reference_images = Vec::new();
     let mut given: Vec<&str> = Vec::new();

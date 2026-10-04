@@ -1,10 +1,7 @@
 use anyhow::{Context, Result, bail};
 use axum::{
     Json, Router,
-    extract::{
-        DefaultBodyLimit, Extension, Multipart, Path, Query, State, multipart::Field,
-        rejection::JsonRejection,
-    },
+    extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State, multipart::Field},
     http::{HeaderMap, HeaderValue, StatusCode, header},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
@@ -33,14 +30,14 @@ use seeai_application::{
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
     AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, LedgerEntryKind, OfferingId,
-    PublishedModel, RoutePolicy, RouteStrategy, contract_image_parameter_kind,
-    replace_contract_model_identity,
+    PublishedModel, RequestJsonError, RequestJsonLimits, RequestParameters, RoutePolicy,
+    RouteStrategy, contract_image_parameter_kind, replace_contract_model_identity,
 };
 use seeai_persistence::{
     PgHubRepository, material_import::import_supply_materials_from_env, max_declared_output_images,
 };
 use serde::{Deserialize, Serialize};
-use serde_json::{Map, Value, json};
+use serde_json::{Value, json};
 use std::{collections::BTreeMap, env, net::SocketAddr, path::PathBuf, sync::Arc, time::Duration};
 use tower_http::{request_id::MakeRequestUuid, trace::TraceLayer};
 use tracing::info;
@@ -63,6 +60,8 @@ use supervisor::{TransportConfig, TransportObservability, serve as serve_transpo
 struct DirectGeneration {
     service: Arc<DirectExecutionService>,
     supervisor: Arc<Supervisor>,
+    /// 请求 JSON 结构的四条计数上限：缺省从支持的 wire 范围推导，配置只能收紧（RFC 0018 §2.2）。
+    request_json_limits: RequestJsonLimits,
 }
 
 /// 直接执行的渠道凭证：只从环境变量读，交给 Adapter，不落库、不日志。
@@ -243,6 +242,8 @@ async fn main() -> Result<()> {
     let direct_execution = {
         let keys = RequestFingerprintKeys::from_env().map_err(anyhow::Error::from)?;
         let settle_reserve = settle_reserve_from_env().map_err(anyhow::Error::from)?;
+        // 请求 JSON 结构的四条计数上限：缺省从 16 MiB 的 wire 范围推导，配置只允许收紧。
+        let request_json_limits = request_json_limits_from_env()?;
         // 执行所有权租约：begin_submission 按它落 lease_expires_at，Supervisor 按它的三分之一续约。
         let ownership_lease = duration_from_env("GENERATION_EXECUTION_LEASE_SECONDS", 60)?;
         let service = DirectExecutionService::new(
@@ -380,6 +381,7 @@ async fn main() -> Result<()> {
         Arc::new(DirectGeneration {
             service: Arc::new(service),
             supervisor,
+            request_json_limits,
         })
     };
     // 账实核对：比对**账户当前值**与它自己的**明细**。它**不是**上面那个缓存对账——那个问的是
@@ -2657,12 +2659,79 @@ async fn set_channel_enabled(
     Ok(StatusCode::NO_CONTENT)
 }
 
-/// 受理请求：**平铺**的模型参数 + 图片字段（`image` 与 `image_urls` 同义二选一，`mask` 是遮罩）。
-/// 图片直接是公网 URL 或 `data:image/…;base64,…`——平台不换 id、不上传、不落盘。
-#[derive(Debug, Deserialize)]
-struct CreateGenerationBody {
-    #[serde(flatten)]
-    parameters: Map<String, Value>,
+/// 有界 JSON 请求体：与 `axum::Json` 同一套入口语义（正文上限、`application/json` 检查），但
+/// 反序列化走 [`RequestParameters::parse_with_limits`]——**边解析边计数**，容器层数、节点总数、
+/// 对象字段数、累计字符串字节任一超限都在构造过程中失败（RFC 0018 §2.2）。
+///
+/// 不用 `Json<T>` 的原因有两个：`T` 上的 `#[serde(flatten)] Map<String, Value>` 会先把整份正文
+/// 收进 serde 的中间 buffer（无界），计数就只能在建好之后做；而结构超限要走既有的参数校验失败
+/// 语义（400 `invalid_parameter`），不是 `JsonRejection` 的文案。
+struct BoundedRequestParameters(RequestParameters);
+
+/// 有界请求体的拒绝：正文读失败、Content-Type 不对、结构超限三类各自的对客表现。
+enum GenerationBodyRejection {
+    /// 正文读取失败（含 16 MiB 正文上限、慢读超时、连接中断）。
+    Read(axum::extract::rejection::BytesRejection),
+    /// `Content-Type` 不是 `application/json`（与 `axum::Json` 同一判据）。
+    ContentType,
+    /// JSON 语法/形状错误，或结构上限被突破。
+    Structure(RequestJsonError),
+}
+
+impl IntoResponse for GenerationBodyRejection {
+    fn into_response(self) -> Response {
+        match self {
+            Self::Read(rejection) => rejection.into_response(),
+            Self::ContentType => (
+                StatusCode::UNSUPPORTED_MEDIA_TYPE,
+                "Expected request with `Content-Type: application/json`",
+            )
+                .into_response(),
+            // 超限与语法错误同属"这次请求的参数不成立"：受理前的 400，不建记录、不取 Hold。
+            Self::Structure(error) => {
+                ApiError::bad_request("invalid_parameter", error.to_string()).into_response()
+            }
+        }
+    }
+}
+
+impl axum::extract::FromRequest<AppState> for BoundedRequestParameters {
+    type Rejection = GenerationBodyRejection;
+
+    async fn from_request(
+        request: axum::extract::Request,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
+        // `Content-Type` 先判，与 `axum::Json` 一致：不读一个注定要拒的正文。
+        if !json_content_type(request.headers()) {
+            return Err(GenerationBodyRejection::ContentType);
+        }
+        let limits = state.direct.request_json_limits;
+        let bytes = axum::body::Bytes::from_request(request, state)
+            .await
+            .map_err(GenerationBodyRejection::Read)?;
+        RequestParameters::parse_with_limits(&bytes, limits)
+            .map(Self)
+            .map_err(GenerationBodyRejection::Structure)
+    }
+}
+
+/// `Content-Type` 是不是 JSON：`application/json` 与 `application/*+json`，参数忽略。
+fn json_content_type(headers: &HeaderMap) -> bool {
+    let Some(value) = headers
+        .get(header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+    else {
+        return false;
+    };
+    let essence = value
+        .split(';')
+        .next()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase();
+    essence == "application/json"
+        || (essence.starts_with("application/") && essence.ends_with("+json"))
 }
 
 /// `Idempotency-Key` 请求头（可选，OpenAI 的写法）：给了就用它去重，没给就生成一个。
@@ -2682,9 +2751,7 @@ fn idempotency_key(headers: &HeaderMap) -> String {
 /// 受理侧只认契约字段名（`image`、`image_urls`、`mask`），**不按名字像不像图片去判**：渠道
 /// 文档里的一手参数（例如带角色的图片列表）因此不会被平台误截；它们留在请求参数里，
 /// 由选路后的声明面过滤决定留不留。
-fn take_contract_image_inputs(
-    parameters: &mut Map<String, Value>,
-) -> Result<ImageInputs, ApiError> {
+fn take_contract_image_inputs(parameters: &mut RequestParameters) -> Result<ImageInputs, ApiError> {
     seeai_domain::take_contract_image_inputs(parameters)
         .map_err(|message| ApiError::bad_request("invalid_parameter", message))
 }
@@ -2709,10 +2776,10 @@ async fn generate_image(
     slow: Option<Extension<SlowRead>>,
     scope: Option<Extension<Arc<ConnectionScope>>>,
     headers: HeaderMap,
-    body: Result<Json<CreateGenerationBody>, JsonRejection>,
+    body: Result<BoundedRequestParameters, GenerationBodyRejection>,
 ) -> Result<Response, ApiError> {
     let direct = state.direct.clone();
-    let Json(body) = match body {
+    let BoundedRequestParameters(parameters) = match body {
         Ok(body) => body,
         Err(rejection) => {
             // 入口的读错误可能是有界慢读超时：那是受理前的 408，不建记录。
@@ -2729,7 +2796,7 @@ async fn generate_image(
         account.0.received_at,
         scope.map(|scope| scope.0),
         &headers,
-        body.parameters,
+        parameters,
     )
     .await
 }
@@ -2812,7 +2879,7 @@ async fn run_direct_json(
     received_at: tokio::time::Instant,
     scope: Option<Arc<ConnectionScope>>,
     headers: &HeaderMap,
-    mut parameters: Map<String, Value>,
+    mut parameters: RequestParameters,
 ) -> Result<Response, ApiError> {
     let inputs = take_contract_image_inputs(&mut parameters)?;
     let reference_images = inputs
@@ -2854,10 +2921,13 @@ async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
 }
 
 /// 解析 multipart：文件部件保留字节，文本图片字段按 data URL / 公网 URL 解释；两者不能同给。
+///
+/// 文本部件走 [`RequestParameters::builder`] **逐项计数**：非 JSON 编码的入口同样受容器层数、
+/// 字段数、累计字符串字节与节点数的约束（RFC 0018 §2.2），不能因为"不是 JSON"就绕开这一层。
 async fn parse_multipart_direct(
     multipart: &mut Multipart,
-) -> Result<(Map<String, Value>, Vec<InputImage>, Option<InputImage>), ApiError> {
-    let mut parameters = Map::new();
+) -> Result<(RequestParameters, Vec<InputImage>, Option<InputImage>), ApiError> {
+    let mut parameters = RequestParameters::builder();
     let mut file_references: Vec<InputImage> = Vec::new();
     let mut file_mask: Option<InputImage> = None;
     while let Some(field) = multipart
@@ -2877,10 +2947,15 @@ async fn parse_multipart_direct(
                 let text = field.text().await.map_err(|error| {
                     ApiError::bad_request("invalid_multipart", error.to_string())
                 })?;
-                parameters.insert(name.clone(), form_scalar(&name, &text));
+                parameters
+                    .insert(name.clone(), form_scalar(&name, &text))
+                    .map_err(|violation| {
+                        ApiError::bad_request("invalid_parameter", violation.to_string())
+                    })?;
             }
         }
     }
+    let mut parameters = parameters.finish();
     let text_inputs = take_contract_image_inputs(&mut parameters)?;
     if !text_inputs.reference_images.is_empty() && !file_references.is_empty() {
         return Err(ApiError::bad_request(
@@ -2928,7 +3003,7 @@ async fn run_direct_generation(
     scope: Option<Arc<ConnectionScope>>,
     headers: &HeaderMap,
     endpoint: &str,
-    mut parameters: Map<String, Value>,
+    mut parameters: RequestParameters,
     reference_images: Vec<InputImage>,
     mask: Option<InputImage>,
 ) -> Result<Response, ApiError> {
@@ -2940,7 +3015,7 @@ async fn run_direct_generation(
         account_id,
         model,
         endpoint: endpoint.to_owned(),
-        native_parameters: Value::Object(parameters),
+        native_parameters: parameters,
         reference_images,
         mask,
         idempotency_key: idempotency_key(headers),
@@ -3499,6 +3574,52 @@ fn generation_env_usize_optional(name: &str) -> Result<Option<usize>> {
 
 /// 本机在飞执行可预占的内存总量缺省值（2 GiB）。
 const DEFAULT_MAX_MEMORY_BYTES: usize = 2 * 1024 * 1024 * 1024;
+
+/// 请求 JSON 结构的四条计数上限（RFC 0018 §2.2）。
+///
+/// 缺省值只在 `seeai_domain` 里有一份推导（从 [`seeai_domain::SUPPORTED_REQUEST_WIRE_BYTES`]
+/// 推出，说明在 `crates/domain/src/request_structure.rs`）。这里额外接受四个部署变量，但**只允许
+/// 收紧**：配置值大于推导值就拒绝启动——放宽会让"解析结构 ≤ 18 MiB"这个预留推导不再成立，必须先
+/// 重新实测 `GATEWAY_REQUEST_PARSE_BYTES` 并改常数，不能靠一个环境变量悄悄绕过。
+fn request_json_limits_from_env() -> Result<RequestJsonLimits> {
+    let read = |name: &str, derived: usize| -> Result<usize> {
+        let value = generation_env_usize(name, derived)?;
+        if value == 0 {
+            bail!("{name} must be positive: a zero request structure limit rejects every request");
+        }
+        if value > derived {
+            bail!(
+                "{name}={value} is wider than the derived limit {derived}; request structure limits \
+                 may only be tightened, because the per-execution parse reservation is derived from \
+                 the derived values"
+            );
+        }
+        Ok(value)
+    };
+    Ok(RequestJsonLimits {
+        max_depth: read(
+            REQUEST_JSON_MAX_DEPTH_ENV,
+            seeai_domain::REQUEST_JSON_MAX_DEPTH,
+        )?,
+        max_nodes: read(
+            REQUEST_JSON_MAX_NODES_ENV,
+            seeai_domain::REQUEST_JSON_MAX_NODES,
+        )?,
+        max_object_fields: read(
+            REQUEST_JSON_MAX_OBJECT_FIELDS_ENV,
+            seeai_domain::REQUEST_JSON_MAX_OBJECT_FIELDS,
+        )?,
+        max_string_bytes: read(
+            REQUEST_JSON_MAX_STRING_BYTES_ENV,
+            seeai_domain::REQUEST_JSON_MAX_STRING_BYTES,
+        )?,
+    })
+}
+
+const REQUEST_JSON_MAX_DEPTH_ENV: &str = "GENERATION_REQUEST_JSON_MAX_DEPTH";
+const REQUEST_JSON_MAX_NODES_ENV: &str = "GENERATION_REQUEST_JSON_MAX_NODES";
+const REQUEST_JSON_MAX_OBJECT_FIELDS_ENV: &str = "GENERATION_REQUEST_JSON_MAX_OBJECT_FIELDS";
+const REQUEST_JSON_MAX_STRING_BYTES_ENV: &str = "GENERATION_REQUEST_JSON_MAX_STRING_BYTES";
 
 /// 连接驱动的缺省容量。启动组合校验与 [`transport_config`] 共用这一份，不各写一个数。
 const DEFAULT_MAX_CONNECTIONS: usize = 1024;

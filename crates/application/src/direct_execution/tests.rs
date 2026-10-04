@@ -44,7 +44,8 @@ fn request(reference_images: Vec<InputImage>, mask: Option<InputImage>) -> Direc
         account_id: AccountId::new(),
         model: "gw".to_owned(),
         endpoint: "/v1/images/edits".to_owned(),
-        native_parameters: json!({"prompt": "draw"}),
+        native_parameters: RequestParameters::try_from(json!({"prompt": "draw"}))
+            .expect("the fixture parameters are within the request structure limits"),
         reference_images,
         mask,
         idempotency_key: "request-0001".to_owned(),

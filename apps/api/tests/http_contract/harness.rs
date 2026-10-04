@@ -929,6 +929,13 @@ struct ApiProcessSettings {
     /// 渠道全局未决任务上限（GENERATION_MAX_CHANNEL_IN_FLIGHT）：用例要观察"账户名额还空着、
     /// 但渠道名额已被另一个副本占住"那条 503 时把它压到最小。缺省不配，进程用生产默认值（32）。
     channel_max_in_flight: Option<u64>,
+    /// 请求 JSON 结构的四条计数上限（`GENERATION_REQUEST_JSON_*`，RFC 0018 §2.2）：用例要观察
+    /// 某一条超限在受理前被拒时把它压到等得起的量级。缺省不配，进程用从 16 MiB 推导的默认值；
+    /// 与生产校验一致，只允许收紧。
+    request_json_max_depth: Option<usize>,
+    request_json_max_nodes: Option<usize>,
+    request_json_max_object_fields: Option<usize>,
+    request_json_max_string_bytes: Option<usize>,
     /// 请求内安全重投的运维取值（次数与退避基）：直接执行在受理路径上读 `GENERATION_RETRY_*`。
     retry: RetrySettings,
 }
@@ -1094,6 +1101,29 @@ async fn start_api_with(
         }
         if let Some(bytes) = settings.max_memory_bytes {
             command.env("GENERATION_MAX_MEMORY_BYTES", bytes.to_string());
+        }
+        // 请求结构上限：只配用例明确要压的那几条，其余留给进程的推导默认值。
+        for (name, value) in [
+            (
+                "GENERATION_REQUEST_JSON_MAX_DEPTH",
+                settings.request_json_max_depth,
+            ),
+            (
+                "GENERATION_REQUEST_JSON_MAX_NODES",
+                settings.request_json_max_nodes,
+            ),
+            (
+                "GENERATION_REQUEST_JSON_MAX_OBJECT_FIELDS",
+                settings.request_json_max_object_fields,
+            ),
+            (
+                "GENERATION_REQUEST_JSON_MAX_STRING_BYTES",
+                settings.request_json_max_string_bytes,
+            ),
+        ] {
+            if let Some(value) = value {
+                command.env(name, value.to_string());
+            }
         }
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
