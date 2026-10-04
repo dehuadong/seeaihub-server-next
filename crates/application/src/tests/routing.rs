@@ -404,13 +404,18 @@ fn a_count_above_the_carriers_maximum_does_not_disqualify_it() {
             "两条候选都合格：超承载面上界不是落选理由：{:?}",
             decision.considered
         );
-        assert_eq!(
-            chosen.offering_id, narrow.offering_id,
-            "权重 1000 的那条照常按权重赢下分流"
-        );
+        // 权重分摊的落点是 (账户, 幂等键) 的哈希，而账户由夹具随机生成：这里**不能**断言
+        // 权重 1000 的那条必定胜出，那是一次抽样而不是不变量。本用例守的是"超承载面上界
+        // 不等于落选"——无论选中哪条，发出去的都是它自己声明的上限；"重权重更容易被选中"
+        // 由 split_by_weight 的专门用例覆盖。
+        let expected = if chosen.offering_id == narrow.offering_id {
+            4
+        } else {
+            6
+        };
         assert_eq!(
             parameters.get("n"),
-            Some(&serde_json::json!(4)),
+            Some(&serde_json::json!(expected)),
             "选中那条发出去的是它自己声明的上限：{parameters}"
         );
     }
