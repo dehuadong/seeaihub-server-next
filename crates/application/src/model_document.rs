@@ -88,7 +88,7 @@ pub fn render_model_document(
             "| `{}` | {} | {} | {} |\n",
             row.name,
             if row.required { "是" } else { "否" },
-            limits(&row),
+            limits(row),
             definition
         ));
     }
