@@ -53,6 +53,8 @@ mod cases_direct_execution;
 mod cases_funds;
 #[path = "cases_identity.rs"]
 mod cases_identity;
+#[path = "cases_identity_email.rs"]
+mod cases_identity_email;
 #[path = "cases_kill_matrix.rs"]
 mod cases_kill_matrix;
 #[path = "cases_lifecycle.rs"]
@@ -888,6 +890,52 @@ async fn start_api_with_auth_attempts(
     .await
 }
 
+/// 装配一个只差引导变量与 stdio 的 API 探针命令：跑迁移所需的公共环境都在这里。
+///
+/// 在无 `.env` 的目录起进程，本地检出的 `.env` 才不会替探针补配置（"没配"与"配成空串"在引导里
+/// 是两回事，探针要能造出真的没配）。
+fn api_probe_command(database_url: &str, port: u16, admin_token: &str) -> Command {
+    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    command
+        .env("DATABASE_URL", database_url)
+        .env("API_BIND", format!("127.0.0.1:{port}"))
+        .env("ADMIN_TOKEN", admin_token)
+        .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
+        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
+        .env("PROVIDER_TIMEOUT_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
+        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
+        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
+        .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
+        .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
+        .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
+        .current_dir(std::env::temp_dir());
+    command
+}
+
+/// 取一个一次性端口，避免探针与其它进程撞端口。
+fn probe_port() -> u16 {
+    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
+    let port = listener.local_addr().expect("test address").port();
+    drop(listener);
+    port
+}
+
+/// 同 [`probe_api_startup_with_seed`]，但把 stderr 带回来：验“启动失败要点名哪个邮箱”。
+async fn probe_api_startup_with_seed_stderr(
+    database_url: &str,
+    email: &str,
+    password: &str,
+) -> (bool, String) {
+    let mut command = api_probe_command(database_url, probe_port(), "seed-conflict-probe-token");
+    command
+        .env("ADMIN_EMAIL", email)
+        .env("ADMIN_PASSWORD", password)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    probe_running_and_stderr(command).await
+}
+
 /// 只配**引导变量**起一个 API 进程，回报它"起来了"还是"退出了"（V-A8 的三分支）。
 ///
 /// 与 [`start_api`] 的区别是它**不**等 `/health` 等到超时：引导只给一个变量时进程本来就该启动失败。
@@ -898,28 +946,8 @@ async fn probe_api_startup_with_seed(
     email: Option<&str>,
     password: Option<&str>,
 ) -> Result<(), std::process::ExitStatus> {
-    let listener = TcpListener::bind("127.0.0.1:0").expect("test port should bind");
-    let port = listener.local_addr().expect("test address").port();
-    drop(listener);
-    let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
-    command
-        .env("DATABASE_URL", database_url)
-        .env("API_BIND", format!("127.0.0.1:{port}"))
-        .env("ADMIN_TOKEN", "seed-probe-token")
-        .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
-        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
-        .env("PROVIDER_TIMEOUT_SECONDS", "30")
-        .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
-        .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
-        .env("PROVIDER_TIMEOUT_PER_IMAGE_SECONDS", "0")
-        .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
-        .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
-        .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
-        // 引导只认**显式给的**环境变量：在无 `.env` 的目录起进程，本地检出的 `.env` 才不会
-        // 替"只给邮箱"补上一个口令，把这条判据变成看天吃饭。
-        .current_dir(std::env::temp_dir())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null());
+    let mut command = api_probe_command(database_url, probe_port(), "seed-probe-token");
+    command.stdout(Stdio::null()).stderr(Stdio::null());
     // 两个都没给时要**明确不设**这两个变量，而不是设成空串（空串与"没配"在引导里是两回事）。
     if let Some(email) = email {
         command.env("ADMIN_EMAIL", email);

@@ -1762,3 +1762,97 @@ async fn the_gateway_close_out_migration_refuses_legacy_rows_and_leaves_them_alo
     let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
 }
+
+/// 身份邮箱互斥的存量校验（控制台 Spec v21 §6）：同一个邮箱同时是管理员与客户时，0040 整条拒绝
+/// 并点名冲突邮箱，两行 fixture 都原样留着——登录身份不静默改动。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_identity_email_migration_refuses_a_cross_domain_duplicate() {
+    let (database_url, database_name) = isolated_database_url().await;
+    // 单连接池：第二次 run（含 0040）失败时 sqlx 不会 unlock，会话级迁移锁留在它那条连接上；
+    // 单连接让这条遗留锁只落在本用例自己的连接上，不散进池里的其它连接。
+    let pool = sqlx::postgres::PgPoolOptions::new()
+        .max_connections(1)
+        .connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用 0040 之前的迁移，再造一条跨域重复（绕过仓储的创建路径）。
+    let staged = stage_migrations(&migrations, "0040", "email-exclusivity");
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("earlier migrator")
+        .run(&pool)
+        .await
+        .expect("earlier migrations apply");
+
+    let account = Uuid::new_v4();
+    let admin = Uuid::new_v4();
+    let customer = Uuid::new_v4();
+    sqlx::query("INSERT INTO ledger.accounts (id, name, balance_microusd) VALUES ($1, $2, 0)")
+        .bind(account)
+        .bind("dup_account")
+        .execute(&pool)
+        .await
+        .expect("account fixture");
+    sqlx::query("INSERT INTO identity.admin_users (id, email, password_hash) VALUES ($1, $2, $3)")
+        .bind(admin)
+        .bind("dup@example.com")
+        .bind("x")
+        .execute(&pool)
+        .await
+        .expect("admin fixture");
+    sqlx::query(
+        "INSERT INTO identity.customers (id, email, password_hash, account_id) VALUES ($1, $2, $3, $4)",
+    )
+    .bind(customer)
+    .bind("dup@example.com")
+    .bind("x")
+    .bind(account)
+    .execute(&pool)
+    .await
+    .expect("customer fixture");
+
+    // 2) 完整迁移集里的 0040 必须拒绝应用，并点名迁移号与冲突邮箱。
+    let message = format!(
+        "{}",
+        sqlx::migrate::Migrator::new(migrations)
+            .await
+            .expect("migrator")
+            .run(&pool)
+            .await
+            .expect_err("跨域重复必须让迁移失败")
+    );
+    assert!(
+        message.contains("migration 0040 refuses to run") && message.contains("dup@example.com"),
+        "守卫要点名迁移号与冲突邮箱：{message}"
+    );
+
+    // 3) 两行 fixture 与它们的账户都原样留着。
+    let admins: i64 = sqlx::query_scalar("SELECT count(*) FROM identity.admin_users WHERE id = $1")
+        .bind(admin)
+        .fetch_one(&pool)
+        .await
+        .expect("admin survives");
+    let customers: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM identity.customers WHERE id = $1")
+            .bind(customer)
+            .fetch_one(&pool)
+            .await
+            .expect("customer survives");
+    let accounts: i64 = sqlx::query_scalar("SELECT count(*) FROM ledger.accounts WHERE id = $1")
+        .bind(account)
+        .fetch_one(&pool)
+        .await
+        .expect("account survives");
+    assert_eq!(
+        (admins, customers, accounts),
+        (1, 1, 1),
+        "迁移不静默改动登录身份"
+    );
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}

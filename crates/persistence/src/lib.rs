@@ -2647,6 +2647,9 @@ impl HubRepository for PgHubRepository {
         email: &str,
         password_hash: &str,
     ) -> Result<(Uuid, bool), ApplicationError> {
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        // 引导也可能撞上客户身份占用的邮箱：撞了就点名失败，不静默跳过。
+        guard_admin_email(&mut transaction, email).await?;
         // `DO NOTHING` 是这条的关键：账号已存在时**连口令都不动**。运维改过口令之后，
         // 每次重启再把环境变量里的值写回去等于把口令打回初始值。
         //
@@ -2662,20 +2665,24 @@ impl HubRepository for PgHubRepository {
         .bind(Uuid::new_v4())
         .bind(email)
         .bind(password_hash)
-        .fetch_optional(&self.pool)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if let Some(id) = inserted {
-            return Ok((id, true));
-        }
-        let existing: Uuid = sqlx::query_scalar(
-            "SELECT id FROM identity.admin_users WHERE lower(email) = lower($1)",
-        )
-        .bind(email)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(database_error)?;
-        Ok((existing, false))
+        let (id, created) = match inserted {
+            Some(id) => (id, true),
+            None => {
+                let existing: Uuid = sqlx::query_scalar(
+                    "SELECT id FROM identity.admin_users WHERE lower(email) = lower($1)",
+                )
+                .bind(email)
+                .fetch_one(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+                (existing, false)
+            }
+        };
+        transaction.commit().await.map_err(database_error)?;
+        Ok((id, created))
     }
 
     async fn upsert_admin_password(
@@ -2684,6 +2691,9 @@ impl HubRepository for PgHubRepository {
         password_hash: &str,
     ) -> Result<Uuid, ApplicationError> {
         // 按邮箱 upsert：**覆盖**口令，用于运维按邮箱改口令（引导不走这条，见 `ensure_admin_account`）。
+        // 它也可能新建管理员，所以同样要按邮箱串行化并检查客户身份。
+        let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        guard_admin_email(&mut transaction, email).await?;
         let id: Uuid = sqlx::query_scalar(
             r#"
             INSERT INTO identity.admin_users (id, email, password_hash)
@@ -2696,9 +2706,10 @@ impl HubRepository for PgHubRepository {
         .bind(Uuid::new_v4())
         .bind(email)
         .bind(password_hash)
-        .fetch_one(&self.pool)
+        .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
+        transaction.commit().await.map_err(database_error)?;
         Ok(id)
     }
 
@@ -2782,14 +2793,23 @@ impl HubRepository for PgHubRepository {
     ) -> Result<Uuid, ApplicationError> {
         let customer_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        lock_identity_email(&mut transaction, email).await?;
         // 撞邮箱是调用方能自己改的事：回 Conflict，让对客那一层说"这个邮箱已经注册过了"。
-        let existing: Option<Uuid> =
+        // 管理员身份占用的邮箱同样算被占用，两处回**同一句话**，不透露它属于哪个身份域（Spec 0001 C2）。
+        let customer_exists: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM identity.customers WHERE lower(email) = lower($1)")
                 .bind(email)
                 .fetch_optional(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-        if existing.is_some() {
+        if customer_exists.is_some()
+            || email_taken_in(
+                &mut transaction,
+                email,
+                "SELECT id FROM identity.admin_users WHERE lower(email) = lower($1)",
+            )
+            .await?
+        {
             return Err(ApplicationError::Conflict(format!(
                 "email {email} is already registered"
             )));
@@ -3152,15 +3172,23 @@ impl HubRepository for PgHubRepository {
     ) -> Result<(Uuid, Uuid), ApplicationError> {
         let customer_id = Uuid::new_v4();
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
+        lock_identity_email(&mut transaction, email).await?;
         // 邮箱与账户各自唯一（迁移 0020 的两条唯一索引）：先查一次好给出说得清的冲突错误，
-        // 真正的兜底仍由那两条索引承担。
+        // 真正的兜底仍由那两条索引承担。管理员身份占用的邮箱同样算被占用，回**同一句话**。
         let taken: Option<Uuid> =
             sqlx::query_scalar("SELECT id FROM identity.customers WHERE lower(email) = lower($1)")
                 .bind(email)
                 .fetch_optional(&mut *transaction)
                 .await
                 .map_err(database_error)?;
-        if taken.is_some() {
+        if taken.is_some()
+            || email_taken_in(
+                &mut transaction,
+                email,
+                "SELECT id FROM identity.admin_users WHERE lower(email) = lower($1)",
+            )
+            .await?
+        {
             return Err(ApplicationError::Conflict(format!(
                 "email {email} already has a login identity"
             )));
@@ -6170,6 +6198,60 @@ fn account_name_conflict(error: sqlx::Error, name: &str) -> ApplicationError {
         return ApplicationError::NameTaken(format!("account name {name} is already taken"));
     }
     database_error(error)
+}
+
+/// 同一邮箱的身份创建先取一把事务级咨询锁：跨两张身份表的唯一性没有单个索引可用，锁让
+/// “检查另一张表 + 插入”不交错；锁随事务结束释放，不同邮箱各有一把。键带前缀，避免与发布、
+/// 幂等的锁撞键（那是同一个 hashtextextended 空间）。
+///
+/// 键里的邮箱用 SQL 的 lower 归一化，与唯一性判定（同样是 lower(email)）落在同一个域上。
+async fn lock_identity_email(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+) -> Result<(), ApplicationError> {
+    sqlx::query(
+        "SELECT pg_advisory_xact_lock(hashtextextended('identity-email:' || lower($1), 0))",
+    )
+    .bind(email)
+    .execute(&mut **transaction)
+    .await
+    .map_err(database_error)?;
+    Ok(())
+}
+
+/// 这个邮箱在某个身份表里是否已存在。调用方只传本文件里的字面量查询（带一个邮箱占位符），
+/// 不是外部输入。
+async fn email_taken_in(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+    query: &'static str,
+) -> Result<bool, ApplicationError> {
+    let taken: Option<Uuid> = sqlx::query_scalar(query)
+        .bind(email)
+        .fetch_optional(&mut **transaction)
+        .await
+        .map_err(database_error)?;
+    Ok(taken.is_some())
+}
+
+/// 管理员创建路径共用的守卫：按邮箱串行化，客户身份已占用就点名失败。
+async fn guard_admin_email(
+    transaction: &mut sqlx::Transaction<'_, sqlx::Postgres>,
+    email: &str,
+) -> Result<(), ApplicationError> {
+    lock_identity_email(transaction, email).await?;
+    if email_taken_in(
+        transaction,
+        email,
+        "SELECT id FROM identity.customers WHERE lower(email) = lower($1)",
+    )
+    .await?
+    {
+        return Err(ApplicationError::Configuration(format!(
+            "admin email {email} is already a customer login identity"
+        )));
+    }
+    Ok(())
 }
 
 /// 账户名称是否已被**别的账户**占用（**逐字符完全相同**，区分大小写）。`except` 把"自己"排除在外：
