@@ -83,6 +83,18 @@ pub use execution_reconciliation::{
     ExecutionReconciliationService, ReconciliationPolicy, ReconciliationReport,
 };
 
+mod image_upload;
+pub use image_upload::{
+    DEFAULT_UPLOAD_MAX_BUFFER_BYTES, DEFAULT_UPLOAD_MAX_REQUEST_BYTES,
+    DEFAULT_UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW, DEFAULT_UPLOAD_RATE_LIMIT_WINDOW_MS,
+    DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECONDS, DEFAULT_UPLOAD_RETRY_BACKOFF_BASE_SECONDS,
+    DEFAULT_UPLOAD_RETRY_MAX_ATTEMPTS, DEFAULT_UPLOAD_SLOTS,
+    DEFAULT_UPLOAD_SLOW_READ_TIMEOUT_SECONDS, HeadObjectRequest, ImageUploadConfig,
+    ImageUploadError, ImageUploadService, NeverCancelled, ObjectMetadata, ObjectStorage,
+    ObjectStorageCredentials, PutObjectRequest, UPLOAD_STORAGE_ACCESS_KEY_ID_ENV,
+    UPLOAD_STORAGE_ACCESS_KEY_SECRET_ENV, UploadCancellation, UploadStorageConfig, UploadedImage,
+};
+
 /// 直接执行的两个容量名额与平台兜底保底额：运营取值，随调用传入，本用例只在同一个事务里
 /// 按它判定，不在库层另存一份会与调用方漂移的限额（RFC 0017 §6）。
 #[derive(Debug, Clone, Copy)]
@@ -4265,17 +4277,28 @@ impl IdentityService {
     /// 速率判定放在这里、而不是生成流程里面：它只依赖"哪把密钥"，是入口就能判的事；放进生成流程
     /// 等于让每个入口各自记得调用一次。被吊销的密钥读不到账户，因此也**不占**速率名额。
     pub async fn authenticate(&self, plaintext: &str) -> Result<ApiKeyIdentity, ApplicationError> {
+        let identity = self.authenticate_identity(plaintext).await?;
+        // 窗口按进程时钟取：窗口只是"多久算一轮"，时钟漂移只会让某一轮稍长或稍短，不会让计数
+        // 跑到别的键或别的窗口上去；为它多打一次数据库不值。
+        self.acceleration
+            .consume_request_slot(identity.key_id, self.rate_limit, Utc::now())
+            .await?;
+        Ok(identity)
+    }
+
+    /// 只认身份、不占**生成**的速率名额：上传端点用同一套凭证校验，速率走自己的独立命名空间。
+    ///
+    /// 吊销仍然即刻生效——这条读同样每次都查库；它只是不把这次请求计进生成的每 API Key 配额。
+    pub async fn authenticate_identity(
+        &self,
+        plaintext: &str,
+    ) -> Result<ApiKeyIdentity, ApplicationError> {
         if !plaintext.starts_with("sk_seeai_") {
             return Err(ApplicationError::NotFound("api key".to_owned()));
         }
         let (key_id, account_id) = self
             .repository
             .api_key_identity(&sha256_hex(plaintext.as_bytes()))
-            .await?;
-        // 窗口按进程时钟取：窗口只是"多久算一轮"，时钟漂移只会让某一轮稍长或稍短，不会让计数
-        // 跑到别的键或别的窗口上去；为它多打一次数据库不值。
-        self.acceleration
-            .consume_request_slot(key_id, self.rate_limit, Utc::now())
             .await?;
         Ok(ApiKeyIdentity { account_id, key_id })
     }
@@ -4796,6 +4819,11 @@ impl AccelerationService {
         format!("rate_limit:{key_id}:{window}")
     }
 
+    /// 上传端点的速率计数键：与生成同形状，但前缀是 `upload_rate_limit:`，两个命名空间各自计数。
+    fn upload_rate_limit_key(key_id: Uuid, window: i64) -> String {
+        format!("upload_rate_limit:{key_id}:{window}")
+    }
+
     /// 为这把密钥占用当前窗口的一个名额。返回 `Err` 表示这个窗口已经用满，并带上"多久之后
     /// 可以再来"。
     ///
@@ -4821,12 +4849,41 @@ impl AccelerationService {
         now: DateTime<Utc>,
     ) -> Result<(), ApplicationError> {
         let window = self.rate_limit_window(limit.window, now);
-        let count = self
-            .read_counter(&Self::rate_limit_key(key_id, window), window)
+        self.consume_rate_limit_slot(Self::rate_limit_key(key_id, window), window, limit, now)
             .await
-            .saturating_add(1);
+    }
+
+    /// 上传端点的每 API Key 限流：与生成**同一个计数机制**，但键前缀是 `upload_rate_limit:`。
+    ///
+    /// 两个命名空间各自计数，上传不挤占生成的每 API Key 配额；降级与判定语义与
+    /// [`Self::consume_request_slot`] 一致。
+    pub async fn consume_upload_request_slot(
+        &self,
+        key_id: Uuid,
+        limit: GenerationRateLimit,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApplicationError> {
+        let window = self.rate_limit_window(limit.window, now);
+        self.consume_rate_limit_slot(
+            Self::upload_rate_limit_key(key_id, window),
+            window,
+            limit,
+            now,
+        )
+        .await
+    }
+
+    /// 在一个已经算好的窗口键上占一个名额：生成与上传共用这套读写与判定。
+    async fn consume_rate_limit_slot(
+        &self,
+        key: String,
+        window: i64,
+        limit: GenerationRateLimit,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApplicationError> {
+        let count = self.read_counter(&key, window).await.saturating_add(1);
         self.write(
-            &Self::rate_limit_key(key_id, window),
+            &key,
             &json!({ "window": window, "count": count }).to_string(),
             self.rate_limit_ttl(limit.window, now),
         )
