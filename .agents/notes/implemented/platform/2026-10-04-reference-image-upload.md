@@ -1,0 +1,46 @@
+---
+title: 参考图收敛为公网 URL 并新增上传端点
+status: implemented
+created: 2026-10-04
+updated: 2026-10-05
+approval: 用户 2026-10-04 逐条裁决：生成接口只收公网 URL（`data:` URL 与文件部件一律拒绝）、新增单文件上传端点、上传不计费不计量不限配额；同日追加裁决：上传存储不做后台管理与数据库表、配置只走环境变量、对客上传端点只使用阿里云 OSS；两批裁决均要求记录；用户 2026-10-04 接受图片上传与对象存储 Spec 的 v2 修订
+verification: `cargo test -p seeai-domain`（上传规则）、`cargo test -p seeai-application --lib image_upload`（上传用例与配置装载）、`cargo test -p seeai-adapter-object-storage`（金标准签名向量逐字节）、`cargo test -p seeai-api --bin seeai-api`；真库端到端 `cargo test -p seeai-api --test http_contract cases_upload`（上传端点 A1–A11）与 `cases_direct_execution`（生成入口 A12，含历史记录重放）；真实桶按 `docs/verification/object-storage-upload.md` 受控执行
+---
+
+# Agent Note：参考图收敛为公网 URL 并新增上传端点
+
+## 问题
+
+[图片透传记录](2026-09-20-images-pass-through-without-asset-storage.md)把参考图只当参数值：`image` / `image_urls` / `mask` 收公网 URL，也收 `data:image/…;base64,…`，edits 端点另有文件部件。素材搬运因此留在生成路径上：`data:` URL 的字节随请求体进内存再解一份 base64，需要字节的渠道由 Adapter 自行取图或上传；请求体要装下整张图，素材的形态判定混在受理与幂等之间。[同步图片网关 Spec v3](../../../../docs/specs/0005-synchronous-image-gateway.md) 已把不落盘、不代传定在生成请求内，但没回答"调用方手上只有本地文件"这条常见路径。
+
+## 决定
+
+生成接口的参考图与遮罩只收公网 `http(s)` URL；不是公网 URL 的取值（含 `data:` URL、multipart 文件部件与任何其他文本）在幂等预查未命中之后拒绝，返回 `400 public_image_url_required`，不建记录、不取占用、不调上游；命中同一幂等记录的旧请求按记录冻结的规则回应。长期合同由[图片上传与对象存储 Spec](../../../../docs/specs/0007-image-upload-and-object-storage.md)与[同步图片网关 Spec](../../../../docs/specs/0005-synchronous-image-gateway.md) §1、§3 拥有，机制由[对象存储上传设计](../../../../docs/design/0021-object-storage-upload.md)拥有，决策与边界由 [ADR-0022](../../../../docs/adr/0022-reference-image-upload-endpoint.md) 拥有；本记录只保存这次变更独有的理由与后果。
+
+**为什么把图片输入收敛为公网 URL**：`data:` URL 与文件部件让每次生成都替调用方搬一次字节，请求体上限、base64 解码、临时缓冲与素材形态判定因此长在受理路径上；只收 URL 之后，生成请求的大小与素材体积解耦，受理只需判"是不是公网 URL"，形态判定也能放在幂等预查之后（[设计 0021](../../../../docs/design/0021-object-storage-upload.md) §2）。
+
+**为什么上传端点必须存在**：只收 URL 而不给换 URL 的路，等于把调用方推给外部图床；平台自己给一条显式端点 `POST /v1/uploads/images`，才能保证提交进来的 URL 是平台写进自己桶里的地址。它是独立调用，不绑定 Job、不计费、不计量、不限配额，也不进 Runtime Revision。
+
+**为什么不做后台管理与数据库表**：上传存储只有阿里云 OSS 一种，region / bucket / endpoint 是一次部署定一次的静态取值，密钥本来就只从环境变量读；把它们收进数据库并配一套管理端点，等于为一个不变的选择造出持久结构、激活状态机与第二份事实。配置因此全部走环境变量，进程启动只校验形状、不做活体探测；整组不给时上传端点对该请求回 `503 upload_storage_unavailable`，只给一部分或形状不合法则在启动期拒绝并点名。
+
+**为什么不落盘生成请求**：生成请求里的图仍是参数值，上传端点的素材字节与执行记录无关；这条边界由两个 Spec 各守一半——生成请求内的载荷边界归 Spec 0005 §2，上传素材的落点与保留边界归 Spec 0007。结果侧仍按图片透传决定原形交回，不归档。
+
+## 备选方案
+
+- 调用方自备图床：平台不碰素材，但把"能不能被渠道取到"变成调用方的问题，平台也失去对提交 URL 可读性的任何判据，不采用。
+- 生成接口内联收字节（`data:` URL / 文件部件）：请求体要装下整张图、每次生成多一次搬运与解码，素材责任混进受理与幂等，不采用。
+- 私有桶 + 预签名读取：URL 带签名与有效期，调用方拿到的是会失效的地址，上游渠道取图也要赶在有效期内，与"公网 URL 就是参数值"的语义冲突，不采用。
+- 生成接口收字节、由平台在受理内自动上传换 URL：等于隐式上传，调用方看不见一次独立的副作用与失败面，不采用。
+- 上传端点收批量文件、引入 manifest 与逐项状态：失败面从请求级裂成条目级，上传却仍不绑定 Job，批次状态没有归宿，不采用。
+- 公开配置入库、管理端激活：多一套管理端点、一张配置表与激活状态机，只为在一种存储类型上改几个静态参数，不采用。
+
+## 后果
+
+- 调用方多一次调用；URL 可匿名读，分享 URL 等于分享图片；平台不承诺保留期、不代删；桶的匿名可读是运维前置条件，它的后果与处置归 [Spec 0007](../../../../docs/specs/0007-image-upload-and-object-storage.md) §8。
+- 上游渠道对公网 URL 的可达性不受平台控制（跨区域、鉴权头、防盗链），取不到图要到生成时才暴露；平台只保证自己写进去的对象匿名可读。
+- 对象键前缀与对象存储配置是新增的运维面；上线后改用私有桶或预签名读，要为已发出的公网 URL 留解释规则。
+- 上传端点是新的对外失败面（对象存储不可达、限流、桶配错），错误只给稳定码与脱敏诊断，诊断能力靠阶段字段与对象存储请求标识。
+
+## 验证
+
+端到端用例只打进程内假对象存储与假上游：`crates/domain` 覆盖媒体类型、单文件上限与对象键规则；`crates/application` 覆盖上传成功、各失败分类与重试、密钥按请求解析；`crates/adapter-object-storage` 对 [`out-reference/oss-v4-signing-golden.md`](../../../../out-reference/oss-v4-signing-golden.md) 的金标准向量逐字节复验签名。`apps/api/tests/http_contract/cases_upload.rs` 覆盖上传端点 Spec 0007 A1–A11，含真发整体超过全局 16 MiB 的合法 multipart 与声明、分块两条 `413 request_too_large`；`cases_direct_execution.rs` 覆盖生成入口 Spec 0005 A12，含以 `data:` URL 受理的历史记录在改版后仍按原记录回应。真实桶只用于人工受控验证（签名联调、跨区域访问、桶的匿名可读配置），按[上传存储部署自检执行清单](../../../../docs/verification/object-storage-upload.md)留档；签名正确性不靠真实桶证明：官方 V4 文档页公布的派生值与签名来自被替换过的真密钥，同样的输入复算不出，不能当锚。

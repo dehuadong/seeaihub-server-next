@@ -198,8 +198,6 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 
 ## 10. 上传端点与上传存储
 
-这些配置随上传端点实现落地：在此之前 `POST /v1/uploads/images` 与下面的 `UPLOAD_*` 变量在代码里都不存在，进程不读取也不接受它们。
-
 调用方把本地文件经 `POST /v1/uploads/images` 写入上传存储换公网 URL，再作为参考图或遮罩提交生成请求（行为合同见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](../design/0021-object-storage-upload.md)）。上传不计费、不计量、不限配额，也不建执行记录；上传存储只有**阿里云 OSS** 一种。
 
 上传存储的配置**全部从环境变量读**：没有后台管理页，也没有数据库表。取值域与失败分类见[对象存储上传设计](../design/0021-object-storage-upload.md)。
@@ -211,17 +209,17 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 | `UPLOAD_STORAGE_ENDPOINT` | 按 region 派生 | 可选；省略时用 `https://oss-{region}.aliyuncs.com`，显式给出时是含 scheme 的 origin（`https://主机[:端口]`；端到端用例把请求指向进程内假对象存储时可用 loopback 的 `http://127.0.0.1[:端口]`、`http://[::1][:端口]` 或 `http://localhost[:端口]`，见[对象存储上传设计](../design/0021-object-storage-upload.md) §4），不带凭证、path、query 与 fragment |
 | `UPLOAD_STORAGE_ACCESS_KEY_ID` | 无；须与下一条成对 | 访问密钥标识。只从环境变量读，不进日志与响应 |
 | `UPLOAD_STORAGE_ACCESS_KEY_SECRET` | 无；须与上一条成对 | 访问密钥 |
-| `UPLOAD_MAX_REQUEST_BYTES` | 单文件上限加 multipart 协议余量 | 上传请求体上限，超限回 `413 request_too_large`；余量取值在实施时定 |
-| `UPLOAD_SLOTS` | 实施时取值 | 本机同时读上传正文的许可数，取不到回 `429 upload_busy`，不排队 |
-| `UPLOAD_MAX_BUFFER_BYTES` | 实施时取值 | 本机上传内存预算 |
-| `UPLOAD_REQUEST_TIMEOUT_SECONDS` | 实施时取值 | 单次写对象存储的请求超时 |
-| `UPLOAD_SLOW_READ_TIMEOUT_SECONDS` | 实施时取值 | 上传正文从开始接收到读完的上限；超时在受理前回 `408 request_timeout`，此时没有对象被写入 |
-| `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` | 实施时取值 | 每 API Key 每窗口允许的上传请求数。上传的计数键与生成分开，不挤占生成的每 API Key 配额；超限回 `429 rate_limit_exceeded` |
-| `UPLOAD_RATE_LIMIT_WINDOW_MS` | 实施时取值 | 上传限流窗口的毫秒数 |
-| `UPLOAD_RETRY_MAX_ATTEMPTS` | 实施时取值 | 单次上传写入的总尝试次数上限 |
-| `UPLOAD_RETRY_BACKOFF_BASE_SECONDS` | 实施时取值 | 固定退避基准秒数；对象存储未给出有界整数秒 `Retry-After` 时按它等待 |
+| `UPLOAD_MAX_REQUEST_BYTES` | `22020096`（21 MiB） | 上传请求体上限（单文件 20 MiB 加 1 MiB multipart 协议余量），超限回 `413 request_too_large` |
+| `UPLOAD_SLOTS` | `4` | 本机同时读上传正文的许可数，取不到回 `429 upload_busy`，不排队 |
+| `UPLOAD_MAX_BUFFER_BYTES` | `100663296`（96 MiB） | 本机上传内存预算 |
+| `UPLOAD_REQUEST_TIMEOUT_SECONDS` | `30` | 单次写对象存储的请求超时 |
+| `UPLOAD_SLOW_READ_TIMEOUT_SECONDS` | `30` | 上传正文从开始接收到读完的上限；超时在受理前回 `408 request_timeout`，此时没有对象被写入 |
+| `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | 每 API Key 每窗口允许的上传请求数。上传的计数键与生成分开，不挤占生成的每 API Key 配额；超限回 `429 rate_limit_exceeded` |
+| `UPLOAD_RATE_LIMIT_WINDOW_MS` | `60000` | 上传限流窗口的毫秒数 |
+| `UPLOAD_RETRY_MAX_ATTEMPTS` | `3` | 单次上传写入的总尝试次数上限 |
+| `UPLOAD_RETRY_BACKOFF_BASE_SECONDS` | `1` | 固定退避基准秒数；对象存储未给出有界整数秒 `Retry-After` 时按它等待 |
 
-标「实施时取值」的缺省值在实施落地时按本机容量与对象存储表现取定。单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。上传存储的**整组变量都不给＝未配置**：进程照常启动，上传端点对该请求返回 `503 upload_storage_unavailable`；**只给一部分**（缺 region、bucket 或任一条密钥）或取值形状不合法＝**启动期拒绝并点名**，进程不启动。启动与运行期都不做活体探测：对象存储可达性、bucket 是否存在与桶是否匿名可读都不在启动判据里。上传侧的容量组合同样在启动期校验：`UPLOAD_SLOTS × UPLOAD_MAX_REQUEST_BYTES ≤ UPLOAD_MAX_BUFFER_BYTES`（单次上传的预留就是 `UPLOAD_MAX_REQUEST_BYTES`，不另立常数），配不出可用容量就拒绝启动，不替运维调小任何上限。
+单文件上限是**领域常量 20 MiB**（严格小于 20971520 字节），不可配。上传存储的**整组变量都不给＝未配置**：进程照常启动，上传端点对该请求返回 `503 upload_storage_unavailable`；**只给一部分**（缺 region、bucket 或任一条密钥）或取值形状不合法＝**启动期拒绝并点名**，进程不启动。启动与运行期都不做活体探测：对象存储可达性、bucket 是否存在与桶是否匿名可读都不在启动判据里。上传侧的容量组合同样在启动期校验：`UPLOAD_SLOTS × UPLOAD_MAX_REQUEST_BYTES ≤ UPLOAD_MAX_BUFFER_BYTES`（单次上传的预留就是 `UPLOAD_MAX_REQUEST_BYTES`，不另立常数），配不出可用容量就拒绝启动，不替运维调小任何上限。
 
 桶的匿名可读是启用上传的运维前置条件：它的合同、失败后果与自检入口见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8。
 

@@ -25,7 +25,7 @@
 | **④ Offering** | Provider、上游模型名、用哪个 Driver、渠道限制、优先级 | 供给面 | 运行时发布 | `supply.offerings` + `publication.runtime_entries` |
 | **⑤ Price** | 渠道**计价形态**（按 token 计量量 / 按产出张数 / 按调用次数 / 上游直接给实扣金额）、费率与单价、**成本侧的渠道币种**、生效区间（"上游金额口径"不另立形态：上游直接给金额的情形由成本侧的 `declared` 承接）。**汇率不在这一层固定**：它是按币种维护的折算率表（渠道币种 → CNY），受理时取生效那一行并快照，只用于把成本折算成 CNY 做毛利核算；**对客一律 CNY** | 价格 | PG 动态配置 | `supply.offerings.formula` / `cost_unit_price_microusd` + `pricing.price_plans`（按 token 计量量计价时的费率表） |
 
-**① 层的已知差距（2026-09-20 登记，同日部分收口）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**已做掉的**：对客请求体改成**扁平**（不再有 `native_parameters` 外壳）、图片改用 OpenAI 契约的 `image` / `mask`（值为公网 URL 或 data URL，平台不再托管素材），参数路径与 `position` 不再出现在调用方面前；AIHubMix 素材与 Adapter 的 `extra` 包装已去掉（`quality` 顶层）。**仍存在的**：其余字段名与取值仍随候选不同（例如同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 且另有 `resolution`），调用方仍要看命中哪个候选；合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定，剩余收口对应的差距登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
+**① 层的已知差距（2026-09-20 登记，同日部分收口）**：本表要求 ① 是"对外一致（消费侧契约）"，接入新 Provider 时无需改动。**已做掉的**：对客请求体改成**扁平**（不再有 `native_parameters` 外壳）、图片改用 OpenAI 契约的 `image` / `mask`（值为公网 URL，平台不再托管素材），参数路径与 `position` 不再出现在调用方面前；AIHubMix 素材与 Adapter 的 `extra` 包装已去掉（`quality` 顶层）。**仍存在的**：其余字段名与取值仍随候选不同（例如同一个 `size`，AIHubMix 收 `1024x1024`、APIMart 收 `1:1` 且另有 `resolution`），调用方仍要看命中哪个候选；合同归属与目标形态由 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 确定，剩余收口对应的差距登记在工作项 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6)。
 
 ### 1.1 外部服务适配器
 

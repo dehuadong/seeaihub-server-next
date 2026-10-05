@@ -101,8 +101,8 @@
 - 接受格式 JPEG / PNG / WebP / GIF，单张 ≤ `20MB`；上游文档示例的报错文案（`unsupported image type…`、`file size … exceeds maximum 20971520 bytes`）与上传页一致（出处：`out-reference/apimart/uploads-images.cn.md`）。
 - 生成请求里的参考图是 `image_urls`：**字符串数组**（≤16，单张 ≤20MB、总计 ≤256MB），只接受**公网可访问 URL**。上传页的 Python 示例把它写成 `[{"url": …}]`（对象数组）——实测用字符串数组提交成功并完成出图，平台取字符串数组。
 - 遮罩是 `mask_url`（字符串），与 `image_urls` 同用可行；实测用 512×512 带 alpha 的 PNG、尺寸与参考图一致，上游未报尺寸/通道错误。
-- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台给上游的生成请求只放公网 URL：内联图先经该渠道的上传端点换回 URL。
-- 流程：调用方给公网 URL 时逐字透传；给内联图（`data:` URL 或 multipart 文件部件）时由 Driver 经该渠道的上传端点换成公网 URL 再提交。生成入口收敛为只收公网 URL、平台自建上传端点的合同见 [Spec 0005](../specs/0005-synchronous-image-gateway.md) §1、§3 与 [Spec 0007](../specs/0007-image-upload-and-object-storage.md)，随实现落地。
+- 上传页声明生成接口**不再接受 base64**，生成页仍写支持 `base64 data URI` 可与 URL 混填 ⇒ 平台给上游的生成请求只放公网 URL：本地文件先经平台的上传端点换成公网 URL。
+- 流程：平台把公网 URL 逐字透传给上游，不下载、不上传。生成入口只收公网 URL、平台自建上传端点的合同见 [Spec 0005](../specs/0005-synchronous-image-gateway.md) §1、§3 与 [Spec 0007](../specs/0007-image-upload-and-object-storage.md)。
 - 参数名不改写：生成请求用上游原生名 `image_urls` / `mask_url`，由 Offering Parameter Mapping 从合同字段 `image` / `mask` 落位（依据 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)）。
 - `mask_url` 不在 2.5 生成文档的字段表里，但**实测被接受**（提交 200 → `completed`），因此按厂商契约声明遮罩；渠道将来若拒绝它，表现会是渠道报错，不是平台静默丢字段。
 - 遮罩**不额外计费**：带/不带 `mask_url` 的两次调用 `usage` 与 `cost` 完全相同。

@@ -19,7 +19,7 @@
 ## 事实与安全
 
 - PostgreSQL 是业务事实权威；缓存不是事实来源。
-- 图片不落盘：请求里的图就是参数值（公网 URL 或 data URL；`/v1/images/edits` 的 multipart 文件部件也受理），结果按渠道原形回（`url` 或 `b64_json`）。生成入口收敛为只收公网 URL 的合同见[同步图片网关 Spec](docs/specs/0005-synchronous-image-gateway.md) §1、§3，随实现落地。
+- 图片不落盘：请求里的图就是参数值（只收公网 URL；本地文件先经 `POST /v1/uploads/images` 换成公网 URL），结果按渠道原形回（`url` 或 `b64_json`）。合同见[同步图片网关 Spec](docs/specs/0005-synchronous-image-gateway.md) §1、§3。
 - Provider 凭证只从环境变量读取，不写入配置、日志、响应或测试 fixture。
 - Provider 创建请求状态不确定时进入 `reconciliation_required`，不得自动重提。
 - 模型 Schema、Offering、Channel、Price Plan 经不可变 Runtime Revision 发布；请求与 Job 固定受理时版本。

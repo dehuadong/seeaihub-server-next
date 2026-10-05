@@ -44,6 +44,10 @@ _Avoid_: Provider、Offering
 平台写入调用方上传素材的阿里云 OSS 位置，配置只有部署侧环境变量：region、bucket、可选 endpoint 与访问密钥。它**不是** [Channel](#channel)：Channel 是 Provider 的调用入口与凭证身份，上传存储是平台自己调用的外部服务，不进 Runtime Revision、不参与选路、不计费，也没有管理端页面、渠道行与激活动作。命名用「上传存储」正是为了不与 Channel 撞名。行为合同见[图片上传与对象存储 Spec](docs/specs/0007-image-upload-and-object-storage.md)，机制见[对象存储上传设计](docs/design/0021-object-storage-upload.md)。
 _Avoid_: 上传渠道（与 Channel 混用）、资产库、把上传存储当成一种 Provider 或 Offering、把上传存储当成渠道行或发布物
 
+**Object Key**（对象键）:
+上传素材在对象存储里的键，形如 `reference-media/{UTC 日期}/{uuid}.{ext}`：日期取写入时的 UTC 日期，`uuid` 是随机 v4，扩展名由服务端按内容魔数判定的规范 MIME 反推。调用方文件名不进对象键、也不进对象元数据。构造规则见[对象存储上传设计](docs/design/0021-object-storage-upload.md) §5。
+_Avoid_: 文件名、路径、URL（键不是地址；公网 URL 由 endpoint 与寻址形态拼出）
+
 **Runtime Revision**:
 一次经过校验并发布的不可变运行时目录，固定模型、供给、渠道限制与价格关系。
 _Avoid_: 配置文件、当前缓存
@@ -61,7 +65,7 @@ _Avoid_: 重试、Job
 _Avoid_: 把输入参考资源与输出张数混为一谈、用 `max_images` 这种看不出是输入还是输出的名字、把"今天只有图片"说成"这类限制只可能有图片这一种"
 
 **Reference Image / Mask**（参考图与遮罩）:
-调用方给出的图片参数值：公网 URL 或 data URL，今天**唯一**一种 [Input Reference](#input-reference输入参考资源)。它**只是参数值**——平台不落盘、不校验其内容、不给它独立身份，由渠道决定接受什么形态、拒绝什么形态。平台认的调用方图片契约字段只有 `image` / `image_urls` / `mask` 三个名字（`image` 与 `image_urls` 同义）；候选**声明**的参数名另有一套判定：名字以 `image` 开头的是参考图、含 `mask` 的是遮罩（**两者都像时以遮罩为准**），它只用于"把调用方的图落到该候选的哪个参数上"，不用于拦截调用方字段。合同过滤与承载校验见 [Vendor Model Contract 与 Offering Parameter Mapping 落地设计](docs/design/0005-vendor-model-contract-and-offering-mapping.md) §4。
+调用方给出的图片参数值：公网 URL，今天**唯一**一种 [Input Reference](#input-reference输入参考资源)。它**只是参数值**——平台不落盘、不校验其内容、不给它独立身份，由渠道决定接受什么形态、拒绝什么形态。平台认的调用方图片契约字段只有 `image` / `image_urls` / `mask` 三个名字（`image` 与 `image_urls` 同义）；候选**声明**的参数名另有一套判定：名字以 `image` 开头的是参考图、含 `mask` 的是遮罩（**两者都像时以遮罩为准**），它只用于"把调用方的图落到该候选的哪个参数上"，不用于拦截调用方字段。合同过滤与承载校验见 [Vendor Model Contract 与 Offering Parameter Mapping 落地设计](docs/design/0005-vendor-model-contract-and-offering-mapping.md) §4。
 _Avoid_: Asset、资产、素材库、把渠道参数名当作模型参数名、在每个渠道重复一套判定
 
 **Result Envelope**（结果信封）:

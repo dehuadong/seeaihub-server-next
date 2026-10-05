@@ -140,7 +140,7 @@ AIHubMix 的取图路径形态不变：它的 edits 端点要文件部件，所�
 
 **与参考实现相反的一条**：参考实现按私有桶 + 86400 秒预签名 GET 取图，健康判据里含「匿名 GET 必须被拒」；本设计的桶与返回 URL 形态以 [Spec 0007](../specs/0007-image-upload-and-object-storage.md) §1、§8 为准，参考实现的 GET 预签名金标准向量在这里只用来校核签名器（§5），不是对外返回 URL 的形态。
 
-与早期方案比较的取舍理由与后果见[本次变更记录](../../.agents/notes/proposed/platform/2026-10-04-reference-image-upload.md) 的「备选方案」与「后果与验证」。
+与早期方案比较的取舍理由与后果见[本次变更记录](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md) 的「备选方案」与「后果」。
 
 ## 9. 分片实施顺序与验证
 

@@ -37,7 +37,7 @@
 | 持久决定 | [`docs/adr/0022`](../../docs/adr/0022-reference-image-upload-endpoint.md)（限定 [`0019`](../../docs/adr/0019-images-pass-through-without-asset-storage.md) 的适用范围） |
 | 签名金标准向量 | [`out-reference/oss-v4-signing-golden.md`](../../out-reference/oss-v4-signing-golden.md) |
 | 部署侧自检清单 | [`docs/verification/object-storage-upload.md`](../../docs/verification/object-storage-upload.md) |
-| 本次变更独有的理由与备选 | [`.agents/notes/proposed/platform/2026-10-04-reference-image-upload.md`](../notes/proposed/platform/2026-10-04-reference-image-upload.md) |
+| 本次变更独有的理由与备选 | [`.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md`](../notes/implemented/platform/2026-10-04-reference-image-upload.md) |
 
 参考实现（仓库外，权威样本）：`/mnt/d/workspace/seeaihub/src/service/src/uploads/`（含 `signing/`、`runtime.rs`、`transaction.rs`、`health.rs`）与 `/mnt/d/workspace/seeaihub/src/service/tests/uploads_signing_golden.rs`。
 
