@@ -157,7 +157,7 @@
 
 `status` 是收敛后的四值（`succeeded` / `failed` / `pending` / `canceled`），由内部 Job 状态与结算结果映射而来；未结案的 `reconciliation_required` 对客仍是 `pending`，不提前宣告失败。映射写在拥有它的读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。`failed` 只说这次未产出，不改写渠道侧的错误细节。
 
-**汇总怎么算**：`requests` 按区间内到达终态的执行记录计；用量按 `model_type` 分组、各类型各自的量合计放在同一个按类型的用量值里，不跨类型相加；`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
+**汇总怎么算**：`requests` 按区间内到达终态的执行记录计；用量按 `model_type` 分组、各类型各自的量合计放在同一个 `usage` 对象里，不跨类型相加；`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
 
 **为什么重置令牌也走摘要入库**：它等同于一次登录凭据（能改口令），因此与会话令牌同一条纪律——明文只在响应里，库里只有 SHA-256，且有独立更短的过期（`PASSWORD_RESET_TTL_SECONDS`，默认 30 分钟），用完即删。
 

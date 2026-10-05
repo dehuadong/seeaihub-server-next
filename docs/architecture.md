@@ -58,7 +58,7 @@
 | POST | `/api/v1/accounts/{account_id}/ledger-audit` | `trigger_ledger_audit` | 管理员（按账户触发一次账实核对：核对**在后台任务里跑**，触发即返回 202；发现不一致只建账户级案例并告警，不改账。它**没有默认周期**） |
 | GET | `/api/v1/accounts/{account_id}/entries` | `list_account_entries` | 管理员（账目流水：**时间倒序**，`since` 是 RFC3339 的增量起点（不含）、`until` 是上界（不含）、`offset` 翻页、`limit` 截断（缺省 100）；响应带 `count`（本页条数）与 `total`（同一区间条件下的总条数），`truncated` 表示"这个位置之后还有没有更多"。每条带 `kind`（`credit` / `capture` / `adjustment` / `cost`，与账本存储取值同名；预授权不进流水）与金额（人民币微单位，**正负号有语义**）。读 `ledger.entries`、**不读缓存**；**只读**——不改状态、不写审计。账户不存在 404，与"还没有流水"（空数组）分开） |
 | POST | `/api/v1/accounts/{account_id}/api-keys` | `issue_api_key` | 管理员 |
-| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；每个候选带**计价形态**（`formula`：`token_rates` / `per_image` / `per_call` / `upstream_declared`）与它的参数——按 token 计量量要那份四档费率（`price_plan`），按张 / 按次要单价（`cost_unit_price_microusd`），上游直接给金额两种参数都不要；另可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：形态必填且与参数配套、每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
+| POST | `/api/v1/runtime-revisions` | `publish_runtime` | 管理员（发布 Profile + Offering + Price；顶层 `gateway_model` 是**平台对客名**，缺省回退取 `native_model_id`；内联形状另要求顶层给模型类型 `type`，引用式由被引 Offering 所属 Vendor Model 决定；每个候选带**计价形态**（`formula`：`token_rates` / `per_image` / `per_call` / `upstream_declared`）与它的参数——按 token 计量量要那份四档费率（`price_plan`），按张 / 按次要单价（`cost_unit_price_microusd`），上游直接给金额两种参数都不要；另可带**定价**——对客四档 CNY 费率向量、参考成本、成本来源、价目表与保底表，修订级另带 `markup_bps`。**发布期校验：形态必填且与参数配套、每个候选声明的成本币种必须在 `pricing.fx_rates` 里有一行已生效的折算率**，否则整份发布被拒） |
 | GET | `/api/v1/gateway-models` | `list_gateway_models` | 管理员（网关模型清单：对客名、运维开关、候选与承载面、**每个候选的定价**与修订级加价系数；**不回显渠道凭证**。对客名由管理员发布时自己填，平台不预设任何名字） |
 | PATCH | `/api/v1/gateway-models/{gateway_model}` | `set_gateway_model_enabled` | 管理员（**只改启用开关**；没发布过的名字是 404，定义只能由发布产生） |
 | GET | `/api/v1/route-policies` | `list_route_policies` | 管理员（路由策略清单：全局那条与各网关模型的覆盖；策略是**运行期配置**，不进不可变修订） |
@@ -70,7 +70,7 @@
 | POST | `/api/v1/reconciliation-cases/{job_id}/refund` | `refund_reconciliation` | 管理员（幂等退款） |
 | GET | `/api/v1/provider-failures` | `list_provider_failures` | 管理员（平台侧失败清单，含渠道原始码与原文） |
 | GET | `/api/v1/provider-cost-gaps` | `list_provider_cost_gaps` | 管理员（**成本缺口清单**：执行发生了、成本本该有金额却拿不到的那些执行，带上游对账标识。这些 Job **不进对账态**——对客结算照常完成，缺口是平台侧的账务缺口） |
-| GET | `/v1/models` | `list_models` | 任何人（公开目录，无需鉴权；只列当前可调的**网关模型**：`name` 是平台对客名、`vendor_id` 是厂商标识，另给合同修订 `revision` 与调用方合同 `contract`；厂商原生名不进对客面，`contract` 里的型号身份已换成对客名） |
+| GET | `/v1/models` | `list_models` | 任何人（公开目录，无需鉴权；只列当前可调的**网关模型**：`name` 是平台对客名、`vendor_id` 是厂商标识、`type` 是模型类型，另给合同修订 `revision` 与调用方合同 `contract`；厂商原生名不进对客面，`contract` 里的型号身份已换成对客名） |
 | GET | `/v1/account` | `read_own_account` | 持 Key 的账户（**只有自己的**三个金额字段：已结算余额、持有中与可用额，**分开给、不合成一个数**——合成"总资产"会让"这笔钱到底扣没扣"说不清。三个数都以**数据库**为准、不读缓存：缓存可能滞后、也可能刚被对账覆盖写回，而这条读的用途正是查看与核对） |
 | POST | `/v1/images/generations` | `generate_image` | 持 Key 的账户（JSON；`model` + 平铺的模型参数 + 参考图/遮罩；幂等键走 `Idempotency-Key` 头） |
 | POST | `/v1/images/edits` | `edit_image` | 同上（`multipart/form-data`；`image`/`mask` 只收公网 URL 文本部件，文件部件在受理前被拒；与上一条**同一个能力**） |
@@ -87,7 +87,7 @@
 | GET / DELETE | `/v1/customer/api-keys`、`/v1/customer/api-keys/{key_id}` | 客户自助密钥 | 客户会话（列：**不含明文**；建：明文只此一次；吊销：不属于自己的回 404） |
 | PUT | `/v1/customer/password` | `change_customer_password` | 客户会话（需当前口令；成功后该客户全部会话失效） |
 | POST | `/v1/customer/password-resets/redeem` | `redeem_customer_password_reset` | 无需凭据（**凭令牌**；对客面没有"提交邮箱就拿到令牌"的入口——不发邮件时那等于知道邮箱就能接管账户） |
-| GET | `/v1/customer/account`、`/ledger`、`/usage`、`/billing` | 对客账务读 | 客户会话（账户读返回已结算余额、持有中与可用额三个字段，页面只显示一个标题为「余额」的**可用额**数字；用量是执行记录的**对客投影**，不含 Job 标识与内部状态，已完成按终态时刻、处理中按受理时刻；账单按 `[since, until)` 全量算、已完成请求与张数按终态时刻，扣费总额只计 `capture` 与 `adjustment`） |
+| GET | `/v1/customer/account`、`/ledger`、`/usage`、`/billing` | 对客账务读 | 客户会话（账户读返回已结算余额、持有中与可用额三个字段，页面只显示一个标题为「余额」的**可用额**数字；用量是执行记录的**对客投影**，不含 Job 标识与内部状态，行带 `type` 与按类型的 `usage`，已完成按终态时刻、处理中按受理时刻；账单按 `[since, until)` 全量算、已完成请求与按类型的量按终态时刻，扣费总额只计 `capture` 与 `adjustment`） |
 
 对客的**生成面只有这两条路径**，都是**同步**：一个请求把图交回，没有 202 受理、没有 job_id 轮询。**分支由请求内容决定**（有没有参考图/遮罩），不按端点断言——带图的 generations、不带图的 edits 都合法。参考图与遮罩只收**公网 URL**（`image` 与 `image_urls` 同义、二选一），本地文件先经上传端点换成公网 URL；平台**不落盘**：不下载归档、不解码存储，渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，原样放进 `data[]`，由客户端判断。成功响应 `{created, data:[{url|b64_json}]}`；内部受理后等 Job 到终态（上限 `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），等不到就按失败回超时错误。
 
