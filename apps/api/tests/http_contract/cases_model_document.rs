@@ -24,6 +24,11 @@ async fn publish_and_read_url(
     )
     .await;
     assert_eq!(status, StatusCode::OK, "{model} {revision} 必须发布成功");
+    document_url(client, base_url, model).await
+}
+
+/// 目录里某个模型当前的文档地址。
+async fn document_url(client: &Client, base_url: &str, model: &str) -> String {
     let (status, catalog) = get_catalog(client, base_url, None).await;
     assert_eq!(status, StatusCode::OK, "{catalog}");
     let entry = catalog["data"]
@@ -209,6 +214,157 @@ async fn a_model_name_with_reserved_characters_is_addressable() {
     let body = response.text().await.expect("document body");
     assert!(body.contains(&format!("# {model}")), "{body}");
 
+    drop_isolated_database(&database_name).await;
+}
+/// A6 的文案条款：合同修订不变、只改说明文案，也要产生新的文档版本；旧地址读到旧正文。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_copy_only_republish_creates_a_new_document_version() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let contract = surface_schema(json!({
+        "model": {"const": "copy-fix-model"},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let status = publish_with_surfaces(
+        &client,
+        &base_url,
+        &admin_token,
+        "copy-fix-model",
+        "doc-1",
+        contract.clone(),
+        vec![("aihubmix-image-v1", contract.clone())],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+    let first_url = document_url(&client, &base_url, "copy-fix-model").await;
+    let first_body = read_document(&client, &base_url, &first_url).await;
+
+    // 同一合同修订、同一合同内容：只把内联文档素材的正文换掉再发布一次。
+    let mut documentation = documentation_for(&contract);
+    documentation["narrative"] =
+        json!("# {{platform_name}}\n\n（修正过的说明）\n\n{{parameter_table}}\n");
+    let body = json!({
+        "vendor_id": "OpenAI",
+        "native_model_id": "copy-fix-model",
+        "native_revision": "doc-1",
+        "type": "image",
+        "actor": "contract-test",
+        "capability_schema": contract.clone(),
+        "documentation": documentation,
+        "offerings": [{
+            "provider_kind": "AIHubMix",
+            "adapter_key": "aihubmix-image-v1",
+            "provider_model_id": "copy-fix-model",
+            "base_url": "http://127.0.0.1:1",
+            "credential_env": "AIHUBMIX_API_KEY",
+            "restrictions": {"allowed_branches": ["prompt_only"], "max_reference_images": 0},
+            "carrier_schema": contract,
+            "parameter_mapping": {},
+            "formula": "token_rates",
+            "price_plan": {
+                "currency": "USD",
+                "text_input_microusd_per_million": 5_000_000,
+                "image_input_microusd_per_million": 8_000_000,
+                "text_output_microusd_per_million": 10_000_000,
+                "image_output_microusd_per_million": 30_000_000,
+                "source_url": "https://example.invalid/price"
+            }
+        }]
+    });
+    let status = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("copy-only publication")
+        .status();
+    assert_eq!(status, StatusCode::OK);
+
+    let second_url = document_url(&client, &base_url, "copy-fix-model").await;
+    assert_ne!(first_url, second_url, "只改文案也要换文档版本");
+    let second_body = read_document(&client, &base_url, &second_url).await;
+    assert!(second_body.contains("修正过的说明"), "{second_body}");
+    assert_eq!(
+        read_document(&client, &base_url, &first_url).await,
+        first_body,
+        "旧版本读到的是旧正文"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
+async fn read_document(client: &Client, base_url: &str, url: &str) -> String {
+    let response = client
+        .get(format!("{base_url}{url}"))
+        .send()
+        .await
+        .expect("document request");
+    assert_eq!(response.status(), StatusCode::OK, "{url}");
+    response.text().await.expect("document body")
+}
+
+/// A10：当前模型没有文档素材时**阻止切换**——进程起不来并点名模型，不靠隐藏模型通过 A1。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_current_model_without_documentation_material_blocks_startup() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("migrations");
+
+    // 一个「已发布、可调用」却没有文档素材的模型：不隐藏它才是这条用例要验的处置。
+    let vendor_model = Uuid::new_v4();
+    let channel = Uuid::new_v4();
+    let offering = Uuid::new_v4();
+    let price_plan = Uuid::new_v4();
+    let revision = Uuid::new_v4();
+    let contract = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": {"const": "undocumented-model"},
+            "prompt": {"type": "string"}
+        }
+    });
+    sqlx::query("INSERT INTO catalog.vendor_models (id, vendor_id, native_model_id, native_revision, model_type, capability_schema) VALUES ($1,'OpenAI','undocumented-model','r1','image',$2)")
+        .bind(vendor_model).bind(&contract).execute(&pool).await.expect("vendor model");
+    sqlx::query("INSERT INTO supply.channels (id, provider_kind, base_url, credential_env) VALUES ($1,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')")
+        .bind(channel).execute(&pool).await.expect("channel");
+    sqlx::query("INSERT INTO supply.offerings (id, vendor_model_id, channel_id, adapter_key, provider_model_id, restrictions, carrier_schema, parameter_mapping) VALUES ($1,$2,$3,'aihubmix-image-v1','undocumented-model','{}'::jsonb,$4,'{}'::jsonb)")
+        .bind(offering).bind(vendor_model).bind(channel).bind(&contract).execute(&pool).await.expect("offering");
+    sqlx::query("INSERT INTO pricing.price_plans (id, offering_id, currency, text_input_microusd_per_million, image_input_microusd_per_million, text_output_microusd_per_million, image_output_microusd_per_million, source_url, approved_by) VALUES ($1,$2,'USD',0,0,0,0,'https://example.invalid/price','doc-test')")
+        .bind(price_plan).bind(offering).execute(&pool).await.expect("price plan");
+    sqlx::query("INSERT INTO publication.runtime_revisions (id, snapshot, published_by, gateway_model, vendor_model_id) VALUES ($1,'{}'::jsonb,'doc-test','undocumented-model',$2)")
+        .bind(revision).bind(vendor_model).execute(&pool).await.expect("revision");
+    sqlx::query("INSERT INTO publication.runtime_entries (runtime_revision_id, vendor_model_id, offering_id, price_plan_id, gateway_model, active, routing_priority, weight, adapter_key, provider_model_id, carrier_schema, parameter_mapping, restrictions, provider_kind, base_url, credential_env) VALUES ($1,$2,$3,$4,'undocumented-model',true,0,1,'aihubmix-image-v1','undocumented-model',$5,'{}'::jsonb,'{}'::jsonb,'AIHubMix','https://api.inferera.com','AIHUBMIX_API_KEY')")
+        .bind(revision).bind(vendor_model).bind(offering).bind(price_plan).bind(&contract).execute(&pool).await.expect("entry");
+
+    let (running, stderr) = probe_api_startup_with_seed_stderr(
+        &database_url,
+        "probe@example.com",
+        "a-long-enough-password",
+    )
+    .await;
+    assert!(!running, "缺素材时进程不该起来：{stderr}");
+    assert!(
+        stderr.contains("undocumented-model") && stderr.contains("document material"),
+        "失败要点名模型与缺的东西：{stderr}"
+    );
+
+    drop(pool);
     drop_isolated_database(&database_name).await;
 }
 /// A7 的后半：停用模型只影响无版本读取，已知文档版本仍按（平台名, 版本）读得到。
