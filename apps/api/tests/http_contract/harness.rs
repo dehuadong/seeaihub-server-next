@@ -35,6 +35,8 @@ mod cases_admin_surface;
 mod cases_aihubmix;
 #[path = "cases_apimart.rs"]
 mod cases_apimart;
+#[path = "cases_auth_attempts.rs"]
+mod cases_auth_attempts;
 #[path = "cases_billing.rs"]
 mod cases_billing;
 #[path = "cases_cache.rs"]
@@ -868,6 +870,24 @@ async fn start_api_with_admin(
     .await
 }
 
+/// 起一个 API 进程，配上加速层与压小的**公开鉴权失败上限**（来源维采信 `x-real-ip`）。
+///
+/// 共享令牌可用，所以签发重置码那条管理端点不必再引导一个管理员账号。
+async fn start_api_with_auth_attempts(
+    database_url: &str,
+    cache: CacheFixture,
+    failures: u64,
+    window_ms: u64,
+) -> (String, String, ApiProcess) {
+    start_api_with(
+        database_url,
+        2,
+        64,
+        &ApiProcessSettings::with_cache_and_auth_attempt_limit(cache, failures, window_ms),
+    )
+    .await
+}
+
 /// 只配**引导变量**起一个 API 进程，回报它"起来了"还是"退出了"（V-A8 的三分支）。
 ///
 /// 与 [`start_api`] 的区别是它**不**等 `/health` 等到超时：引导只给一个变量时进程本来就该启动失败。
@@ -1087,6 +1107,10 @@ struct ApiProcessSettings {
     request_json_max_string_bytes: Option<usize>,
     /// 请求内安全重投的运维取值（次数与退避基）：直接执行在受理路径上读 `GENERATION_RETRY_*`。
     retry: RetrySettings,
+    /// 公开鉴权端点的失败尝试上限（次数、窗口毫秒）。缺省不配，进程用默认值（10 次 / 60 秒）。
+    auth_attempt_limit: Option<(u64, u64)>,
+    /// 公开鉴权端点来源维采信的受信头。缺省不配，进程退回连接对端地址。
+    auth_source_header: Option<String>,
 }
 
 /// 一次用例的全部进程配置：API 进程那一套与发布时的修订级加价系数。
@@ -1114,6 +1138,21 @@ impl ApiProcessSettings {
         Self {
             cache: Some(cache),
             rate_limit: Some(rate_limit),
+            ..Self::default()
+        }
+    }
+
+    /// 同 [`Self::with_cache`]，但把公开鉴权端点的**失败尝试上限**压到用例等得起的量级，
+    /// 并让来源维采信 `x-real-ip`——用例因此可以用不同的头区分"同一来源"与"同一身份"。
+    fn with_cache_and_auth_attempt_limit(
+        cache: CacheFixture,
+        failures: u64,
+        window_ms: u64,
+    ) -> Self {
+        Self {
+            cache: Some(cache),
+            auth_attempt_limit: Some((failures, window_ms)),
+            auth_source_header: Some("x-real-ip".to_owned()),
             ..Self::default()
         }
     }
@@ -1199,6 +1238,24 @@ async fn start_api_with(
                     "GENERATION_RATE_LIMIT_WINDOW_MS",
                     rate_limit.window_ms.to_string(),
                 );
+        }
+        if let Some((failures, window_ms)) = settings.auth_attempt_limit {
+            // 三个端点各自一份上限与窗口：用例把三份都压到同一个量级，端点之间仍互不占用。
+            for prefix in [
+                "AUTH_ATTEMPT_LIMIT_REGISTER",
+                "AUTH_ATTEMPT_LIMIT_LOGIN",
+                "AUTH_ATTEMPT_LIMIT_REDEEM",
+            ] {
+                command
+                    .env(
+                        format!("{prefix}_FAILURES_PER_WINDOW"),
+                        failures.to_string(),
+                    )
+                    .env(format!("{prefix}_WINDOW_MS"), window_ms.to_string());
+            }
+        }
+        if let Some(name) = &settings.auth_source_header {
+            command.env("AUTH_SOURCE_HEADER", name);
         }
         if let Some(limit_microusd) = settings.daily_spend_limit_microusd {
             command.env(

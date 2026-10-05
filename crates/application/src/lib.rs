@@ -1340,6 +1340,168 @@ fn rate_limit_env(name: &str, default: u64) -> Result<u64, ApplicationError> {
     }
 }
 
+/// 公开鉴权端点的失败尝试上限（次数与窗口）。
+///
+/// 与 [`GenerationRateLimit`] 同样是**运维取值**：上限与窗口随部署形态变，有可直接使用的缺省值。
+/// 计的是**失败次数**而不是请求数——成功的尝试不累计；判定在受理之前，写入在服务端判定失败之后。
+/// 计数落在缓存里、缓存不可用时放行，理由见 [`AccelerationService::auth_attempt_allowed`]。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthAttemptLimit {
+    pub max_failures: u64,
+    pub window: Duration,
+}
+
+impl AuthAttemptLimit {
+    /// 运维默认值：同一来源或同一身份每 60 秒最多 10 次失败。
+    #[must_use]
+    pub fn default_limit() -> Self {
+        Self {
+            max_failures: 10,
+            window: Duration::from_secs(60),
+        }
+    }
+
+    pub fn new(max_failures: u64, window: Duration) -> Result<Self, ApplicationError> {
+        if max_failures == 0 {
+            return Err(ApplicationError::Configuration(
+                "the auth attempt limit must allow at least one failure per window".to_owned(),
+            ));
+        }
+        // 窗口为 0 时"每窗口的失败次数"没有意义，而且 `set` 的存活时间会变成 0。
+        if window.is_zero() {
+            return Err(ApplicationError::Configuration(
+                "the auth attempt limit window must be positive".to_owned(),
+            ));
+        }
+        Ok(Self {
+            max_failures,
+            window,
+        })
+    }
+
+    /// 从环境变量读**某一个端点**的运维取值：
+    /// `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` 与
+    /// `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS`，两项都没给就用 [`Self::default_limit`]。
+    pub fn from_env(endpoint: AuthAttemptEndpoint) -> Result<Self, ApplicationError> {
+        let defaults = Self::default_limit();
+        let prefix = endpoint.env_prefix();
+        Self::new(
+            rate_limit_env(
+                &format!("{prefix}_FAILURES_PER_WINDOW"),
+                defaults.max_failures,
+            )?,
+            Duration::from_millis(rate_limit_env(
+                &format!("{prefix}_WINDOW_MS"),
+                u64::try_from(defaults.window.as_millis()).unwrap_or(u64::MAX),
+            )?),
+        )
+    }
+}
+
+/// 三个公开鉴权端点：计数键各占一段，上限与窗口各自可配（Spec 0004 §1 S5、设计 0016 §3）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthAttemptEndpoint {
+    Register,
+    Login,
+    Redeem,
+}
+
+impl AuthAttemptEndpoint {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Register => "register",
+            Self::Login => "login",
+            Self::Redeem => "redeem",
+        }
+    }
+
+    fn env_prefix(self) -> &'static str {
+        match self {
+            Self::Register => "AUTH_ATTEMPT_LIMIT_REGISTER",
+            Self::Login => "AUTH_ATTEMPT_LIMIT_LOGIN",
+            Self::Redeem => "AUTH_ATTEMPT_LIMIT_REDEEM",
+        }
+    }
+}
+
+/// 三个端点**各自**的上限与窗口。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct AuthAttemptLimits {
+    register: AuthAttemptLimit,
+    login: AuthAttemptLimit,
+    redeem: AuthAttemptLimit,
+}
+
+impl AuthAttemptLimits {
+    #[must_use]
+    pub fn default_limits() -> Self {
+        Self {
+            register: AuthAttemptLimit::default_limit(),
+            login: AuthAttemptLimit::default_limit(),
+            redeem: AuthAttemptLimit::default_limit(),
+        }
+    }
+
+    pub fn from_env() -> Result<Self, ApplicationError> {
+        Ok(Self {
+            register: AuthAttemptLimit::from_env(AuthAttemptEndpoint::Register)?,
+            login: AuthAttemptLimit::from_env(AuthAttemptEndpoint::Login)?,
+            redeem: AuthAttemptLimit::from_env(AuthAttemptEndpoint::Redeem)?,
+        })
+    }
+
+    #[must_use]
+    pub fn for_endpoint(self, endpoint: AuthAttemptEndpoint) -> AuthAttemptLimit {
+        match endpoint {
+            AuthAttemptEndpoint::Register => self.register,
+            AuthAttemptEndpoint::Login => self.login,
+            AuthAttemptEndpoint::Redeem => self.redeem,
+        }
+    }
+}
+
+/// 失败计数的两个维度：来源（客户端地址）或身份（邮箱 / 重置码所属客户）。
+///
+/// 两个维度各自独立成键：同一来源换身份、同一身份换来源都会各记一份，任一维到上限即拒。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum AuthAttemptScope {
+    Source,
+    Identity,
+}
+
+impl AuthAttemptScope {
+    #[must_use]
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Source => "source",
+            Self::Identity => "identity",
+        }
+    }
+}
+
+/// 计数键里放的是**摘要**而不是来源地址或邮箱原文：与凭据不进存储同一道理。
+#[must_use]
+pub fn auth_attempt_digest(value: &str) -> String {
+    sha256_hex(value.as_bytes())
+}
+
+/// 一次失败的鉴权尝试是否计入失败次数。
+///
+/// 只数"这次尝试被判失败"（凭据或身份不存在、参数不成立、冲突、名称占用）；平台侧故障（配置、
+/// 持久化、对账）不是尝试的结论，不数——否则一次数据库故障会把所有来源与身份都锁住。
+#[must_use]
+fn counts_as_auth_failure(error: &ApplicationError) -> bool {
+    matches!(
+        error,
+        ApplicationError::InvalidParameter(_)
+            | ApplicationError::Validation(_)
+            | ApplicationError::NotFound(_)
+            | ApplicationError::Conflict(_)
+            | ApplicationError::NameTaken(_)
+    )
+}
+
 /// 每账户**当天已经花掉**多少（microusd）的**上限配置**：默认值与它算不算产品档位。
 ///
 /// 判据本身——每天一行的已完成实收合计、成功结算在写 `capture` 的同一事务累加、受理只读
@@ -3345,6 +3507,16 @@ pub struct ApiKeyIdentity {
     pub key_id: Uuid,
 }
 
+/// 一次公开鉴权尝试的计数上下文：端点、来源摘要、能解析出时的身份摘要与时刻。
+///
+/// 三个值一起在"受理前查"与"判定失败后写"之间传递；打包成一个类型，两处不再各自重复拼装。
+struct AuthAttemptContext {
+    endpoint: AuthAttemptEndpoint,
+    source_digest: String,
+    identity_digest: Option<String>,
+    now: DateTime<Utc>,
+}
+
 #[derive(Clone)]
 pub struct IdentityService {
     repository: Arc<dyn HubRepository>,
@@ -3353,6 +3525,8 @@ pub struct IdentityService {
     acceleration: Arc<AccelerationService>,
     /// 每把密钥的请求速率上限。
     rate_limit: GenerationRateLimit,
+    /// 公开鉴权端点（客户注册、登录、重置码兑换）各自的上限与窗口。
+    auth_attempt_limits: AuthAttemptLimits,
 }
 
 impl IdentityService {
@@ -3364,6 +3538,7 @@ impl IdentityService {
             repository,
             acceleration,
             rate_limit: GenerationRateLimit::default_limit(),
+            auth_attempt_limits: AuthAttemptLimits::default_limits(),
         }
     }
 
@@ -3380,6 +3555,14 @@ impl IdentityService {
     ) -> Self {
         self.acceleration = acceleration;
         self.rate_limit = rate_limit;
+        self
+    }
+
+    /// 装上公开鉴权端点各自的上限与窗口。与 [`Self::with_rate_limit`] 分开，是因为两者的判据不同：
+    /// 那个数每密钥的**请求数**，这个数来源与身份的**失败次数**。
+    #[must_use]
+    pub fn with_auth_attempt_limits(mut self, limits: AuthAttemptLimits) -> Self {
+        self.auth_attempt_limits = limits;
         self
     }
 
@@ -3520,27 +3703,51 @@ impl IdentityService {
     ///
     /// **账户与身份同一个事务**（仓储那一层保证）：注册出来的账户必须能立刻登录、立刻发 Key，
     /// 不能出现"有账户没身份"或反过来的半截状态。
+    ///
+    /// `source` 是调用方给出的权威客户端来源；受理前按来源与身份查失败计数，判定失败后写回。
     pub async fn register_customer(
         &self,
         email: &str,
         password: &str,
         ttl: ChronoDuration,
+        source: &str,
     ) -> Result<CustomerLogin, ApplicationError> {
-        let email = normalize_email(email)?;
+        let normalized = normalize_email(email);
+        let context = self.auth_attempt_context(
+            AuthAttemptEndpoint::Register,
+            source,
+            normalized.as_ref().ok().map(String::as_str),
+        );
+        self.admit_auth_attempt(&context).await?;
+        let result = match normalized {
+            Ok(email) => self.register_customer_verified(&email, password, ttl).await,
+            Err(error) => Err(error),
+        };
+        self.observe_auth_failure(&context, &result).await;
+        result
+    }
+
+    /// 注册的实际动作；邮箱已经过 [`normalize_email`]，失败计数由调用方负责。
+    async fn register_customer_verified(
+        &self,
+        email: &str,
+        password: &str,
+        ttl: ChronoDuration,
+    ) -> Result<CustomerLogin, ApplicationError> {
         check_secret(password, "password")?;
         let hash = hash_password(password)?;
         // 自助注册不给名称输入：账户 id 与名称都在这里定下来，再交给仓储写。名称撞了就换更长的
         // id 片段再试——注册不该因为"生成的短名字恰好被占用"而失败。
         let account_id = AccountId::new();
         // 名称撞了就换更长的 id 片段再试（候选序列见 `generated_account_name_attempts`）。
-        let mut candidates = generated_account_name_attempts(account_id, Some(&email)).into_iter();
+        let mut candidates = generated_account_name_attempts(account_id, Some(email)).into_iter();
         let customer_id = loop {
             let Some(candidate) = candidates.next() else {
                 return Err(name_taken_error());
             };
             match self
                 .repository
-                .create_customer(account_id, &candidate, &email, &hash)
+                .create_customer(account_id, &candidate, email, &hash)
                 .await
             {
                 Ok(customer_id) => break customer_id,
@@ -3556,21 +3763,45 @@ impl IdentityService {
         Ok(CustomerLogin {
             customer_id,
             account_id: account_id.0,
-            email,
+            email: email.to_owned(),
             token,
             expires_at,
         })
     }
 
     /// 对客登录：与管理员那条同一条判据（邮箱不存在与口令不对回同一个错误、都算一遍哈希）。
+    ///
+    /// `source` 是调用方给出的权威客户端来源；受理前按来源与身份查失败计数，判定失败后写回。
     pub async fn login_customer(
         &self,
         email: &str,
         password: &str,
         ttl: ChronoDuration,
+        source: &str,
     ) -> Result<CustomerLogin, ApplicationError> {
-        let email = normalize_email(email)?;
-        let found = self.repository.find_customer_by_email(&email).await?;
+        let normalized = normalize_email(email);
+        let context = self.auth_attempt_context(
+            AuthAttemptEndpoint::Login,
+            source,
+            normalized.as_ref().ok().map(String::as_str),
+        );
+        self.admit_auth_attempt(&context).await?;
+        let result = match normalized {
+            Ok(email) => self.login_customer_verified(&email, password, ttl).await,
+            Err(error) => Err(error),
+        };
+        self.observe_auth_failure(&context, &result).await;
+        result
+    }
+
+    /// 登录的实际动作；邮箱已经过 [`normalize_email`]，失败计数由调用方负责。
+    async fn login_customer_verified(
+        &self,
+        email: &str,
+        password: &str,
+        ttl: ChronoDuration,
+    ) -> Result<CustomerLogin, ApplicationError> {
+        let found = self.repository.find_customer_by_email(email).await?;
         // 同 `login_admin`：账号不存在也付一次 argon2 校验的代价，两条路不能从快慢上分开。
         let verified = verify_login_secret(
             found.as_ref().map(|(_, _, stored)| stored.as_str()),
@@ -3588,10 +3819,90 @@ impl IdentityService {
         Ok(CustomerLogin {
             customer_id,
             account_id,
-            email,
+            email: email.to_owned(),
             token,
             expires_at,
         })
+    }
+
+    /// 组装一次公开鉴权尝试的计数上下文：端点、来源摘要、能解析出时的身份摘要与时刻。
+    fn auth_attempt_context(
+        &self,
+        endpoint: AuthAttemptEndpoint,
+        source: &str,
+        identity: Option<&str>,
+    ) -> AuthAttemptContext {
+        AuthAttemptContext {
+            endpoint,
+            source_digest: auth_attempt_digest(source),
+            identity_digest: identity.map(auth_attempt_digest),
+            now: Utc::now(),
+        }
+    }
+
+    /// 受理一次公开鉴权尝试：来源维必查，能解析出身份时身份维也查；任一维到上限即拒。
+    async fn admit_auth_attempt(
+        &self,
+        context: &AuthAttemptContext,
+    ) -> Result<(), ApplicationError> {
+        let limit = self.auth_attempt_limits.for_endpoint(context.endpoint);
+        self.acceleration
+            .auth_attempt_allowed(
+                context.endpoint,
+                AuthAttemptScope::Source,
+                &context.source_digest,
+                limit,
+                context.now,
+            )
+            .await?;
+        if let Some(identity) = &context.identity_digest {
+            self.acceleration
+                .auth_attempt_allowed(
+                    context.endpoint,
+                    AuthAttemptScope::Identity,
+                    identity,
+                    limit,
+                    context.now,
+                )
+                .await?;
+        }
+        Ok(())
+    }
+
+    /// 服务端判定失败后写回计数；成功尝试不写。哪些错误算"尝试被判失败"见
+    /// [`counts_as_auth_failure`]。
+    async fn observe_auth_failure<T>(
+        &self,
+        context: &AuthAttemptContext,
+        result: &Result<T, ApplicationError>,
+    ) {
+        let Err(error) = result else {
+            return;
+        };
+        if !counts_as_auth_failure(error) {
+            return;
+        }
+        let limit = self.auth_attempt_limits.for_endpoint(context.endpoint);
+        self.acceleration
+            .record_auth_failure(
+                context.endpoint,
+                AuthAttemptScope::Source,
+                &context.source_digest,
+                limit,
+                context.now,
+            )
+            .await;
+        if let Some(identity) = &context.identity_digest {
+            self.acceleration
+                .record_auth_failure(
+                    context.endpoint,
+                    AuthAttemptScope::Identity,
+                    identity,
+                    limit,
+                    context.now,
+                )
+                .await;
+        }
     }
 
     /// 用会话令牌认一次客户：有效则返回 `(customer_id, account_id)`。
@@ -3705,6 +4016,41 @@ impl IdentityService {
             )));
         }
         Ok(())
+    }
+
+    /// 对客重置码兑换：在 [`Self::redeem_password_reset`] 外包一层按来源与身份的失败计数。
+    ///
+    /// 身份维取重置码所属客户；码不存在、已用或过期时没有身份维，该次失败只计来源维——拒绝结果
+    /// 也因此不区分码是否存在或已用（Spec 0004 §1 S5）。
+    pub async fn redeem_customer_password_reset(
+        &self,
+        token: &str,
+        new_password: &str,
+        source: &str,
+    ) -> Result<(), ApplicationError> {
+        let identity_digest = self.reset_token_identity_digest(token).await;
+        let context = self.auth_attempt_context(
+            AuthAttemptEndpoint::Redeem,
+            source,
+            identity_digest.as_deref(),
+        );
+        self.admit_auth_attempt(&context).await?;
+        let result = self.redeem_password_reset(token, new_password).await;
+        self.observe_auth_failure(&context, &result).await;
+        result
+    }
+
+    /// 一枚重置码所属客户的摘要；码不存在、已用或过期都回 `None`（该次失败只计来源维）。
+    async fn reset_token_identity_digest(&self, token: &str) -> Option<String> {
+        let hash = session_token_hash(token);
+        match self.repository.find_password_reset(&hash).await {
+            Ok(Some((_kind, subject_id, expires_at, redeemed_at)))
+                if redeemed_at.is_none() && expires_at > Utc::now() =>
+            {
+                Some(auth_attempt_digest(&subject_id.to_string()))
+            }
+            _ => None,
+        }
     }
 
     /// 客户改自己的口令（需当前口令）。改完吊销该客户全部会话。
@@ -4475,12 +4821,10 @@ impl AccelerationService {
         now: DateTime<Utc>,
     ) -> Result<(), ApplicationError> {
         let window = self.rate_limit_window(limit.window, now);
-        let current = match self.read_rate_limit(key_id, window).await {
-            Some(cached) => cached,
-            // 读不到（缓存不可用、或这个窗口还没有计数）就当从零开始：放行。
-            None => CachedRateLimit { window, count: 0 },
-        };
-        let count = current.count.saturating_add(1);
+        let count = self
+            .read_counter(&Self::rate_limit_key(key_id, window), window)
+            .await
+            .saturating_add(1);
         self.write(
             &Self::rate_limit_key(key_id, window),
             &json!({ "window": window, "count": count }).to_string(),
@@ -4493,6 +4837,76 @@ impl AccelerationService {
             });
         }
         Ok(())
+    }
+
+    /// 公开鉴权端点的计数键：**端点 + 维度 + 摘要 + 窗口序号**，与每密钥速率的形状一致。
+    ///
+    /// 端点进键：三个端点各自计数、各自配置上限与窗口（Spec 0004 §1 S5、设计 0016 §3）。
+    fn auth_attempt_key(
+        endpoint: AuthAttemptEndpoint,
+        scope: AuthAttemptScope,
+        digest: &str,
+        window: i64,
+    ) -> String {
+        format!(
+            "rate_limit:auth:{}:{}:{}:{}",
+            endpoint.as_str(),
+            scope.as_str(),
+            digest,
+            window
+        )
+    }
+
+    /// 这一来源/身份在当前窗口还能不能尝试。已到上限就返回带剩余等待时长的拒绝。
+    ///
+    /// 判定在**受理之前**：等待期内即使凭据正确也被拒。降级与每密钥速率同一条（见
+    /// [`Self::consume_request_slot`]）。
+    pub async fn auth_attempt_allowed(
+        &self,
+        endpoint: AuthAttemptEndpoint,
+        scope: AuthAttemptScope,
+        digest: &str,
+        limit: AuthAttemptLimit,
+        now: DateTime<Utc>,
+    ) -> Result<(), ApplicationError> {
+        let window = self.rate_limit_window(limit.window, now);
+        let count = self
+            .read_counter(
+                &Self::auth_attempt_key(endpoint, scope, digest, window),
+                window,
+            )
+            .await;
+        if count >= limit.max_failures {
+            return Err(ApplicationError::RateLimitExceeded {
+                retry_after: self.rate_limit_retry_after(limit.window, now),
+            });
+        }
+        Ok(())
+    }
+
+    /// 记一次**服务端判定失败**。成功的尝试不调用它；窗口内的失败累计，窗口到期从零。
+    pub async fn record_auth_failure(
+        &self,
+        endpoint: AuthAttemptEndpoint,
+        scope: AuthAttemptScope,
+        digest: &str,
+        limit: AuthAttemptLimit,
+        now: DateTime<Utc>,
+    ) {
+        let window = self.rate_limit_window(limit.window, now);
+        let count = self
+            .read_counter(
+                &Self::auth_attempt_key(endpoint, scope, digest, window),
+                window,
+            )
+            .await
+            .saturating_add(1);
+        self.write(
+            &Self::auth_attempt_key(endpoint, scope, digest, window),
+            &json!({ "window": window, "count": count }).to_string(),
+            self.rate_limit_ttl(limit.window, now),
+        )
+        .await;
     }
 
     /// 这次请求落在第几个窗口。窗口按钟点等分，序号本身没有含义，只用来判断"是不是同一个窗口"。
@@ -4522,21 +4936,23 @@ impl AccelerationService {
         Duration::from_millis(millis - (now_millis % millis))
     }
 
-    async fn read_rate_limit(&self, key_id: Uuid, window: i64) -> Option<CachedRateLimit> {
-        let key = Self::rate_limit_key(key_id, window);
-        let raw = self.read(&key).await?;
+    /// 读一个窗口里的计数；缓存不可用、值不存在、读不出来或属于别的窗口都算 **0**。
+    ///
+    /// 往"还没数过"退化而不往高里算：取舍见 [`Self::consume_request_slot`]。
+    async fn read_counter(&self, key: &str, window: i64) -> u64 {
+        let Some(raw) = self.read(key).await else {
+            return 0;
+        };
         match serde_json::from_str::<CachedRateLimit>(&raw) {
-            Ok(cached) if cached.window == window => Some(cached),
-            // 值读不出来、或它是**别的窗口**留下的：当这个窗口还没数过。计数偏高会拒掉合规的
-            // 请求，偏低只是少挡几次——两种错里只有前者会伤到调用方。
-            Ok(_) => None,
+            Ok(cached) if cached.window == window => cached.count,
+            Ok(_) => 0,
             Err(error) => {
                 tracing::warn!(
                     key,
                     error = %error,
-                    "the cached rate limit counter is unreadable; counting this window from zero"
+                    "the cached counter is unreadable; counting this window from zero"
                 );
-                None
+                0
             }
         }
     }

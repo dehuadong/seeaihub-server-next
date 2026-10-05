@@ -47,6 +47,14 @@ pub use connection::{TransportConfig, TransportObservability, serve};
 #[cfg(target_os = "linux")]
 pub use monitor::MonitorConfig;
 
+/// 连接对端地址，作为请求扩展挂到每个请求上。
+///
+/// 这是**连接层**能给的最权威的客户端地址：`X-Forwarded-For` 之类的头由调用方自带，不能直接当
+/// 来源。生产在反向代理之后时，由 `apps/api` 按运维配置决定采信哪个受信头，否则退回这里。
+/// 类型定义在平台无关的模块里，非 Linux 构建也能编译（那种构建会在启动时明确拒绝服务）。
+#[derive(Debug, Clone)]
+pub struct ClientAddr(pub Option<std::net::SocketAddr>);
+
 /// 执行所有权续约的装配：续约端口与租约时长。没有它就不起续约任务。
 #[derive(Clone)]
 pub struct OwnershipRenewalConfig {

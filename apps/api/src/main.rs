@@ -14,8 +14,8 @@ use seeai_adapter_sdk::{DecodedImage, InputImage};
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
-    CachePolicy, CursorPosition, CustomerBillingQuery, CustomerLedgerQuery, CustomerUsageKind,
-    CustomerUsageQuery, CustomerUsageScope, CustomerUsageStatus, CustomerView,
+    AuthAttemptLimits, CachePolicy, CursorPosition, CustomerBillingQuery, CustomerLedgerQuery,
+    CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope, CustomerUsageStatus, CustomerView,
     DirectExecutionError, DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService,
     ExecutionLookup, ExecutionRepository, GatewayModelView, GeneratedImage,
     GenerationDailySpendLimit, GenerationRateLimit, HISTORY_CURSOR_KEY_LEN, HistoryFilter,
@@ -47,8 +47,8 @@ use uuid::Uuid;
 
 mod supervisor;
 use supervisor::{
-    AuthenticatedAccount, ConnectionScope, ExecutionHandle, ExecutionLease, OwnershipRenewalConfig,
-    SendHold, SendLease, SlowRead, Supervisor, SupervisorConfig,
+    AuthenticatedAccount, ClientAddr, ConnectionScope, ExecutionHandle, ExecutionLease,
+    OwnershipRenewalConfig, SendHold, SendLease, SlowRead, Supervisor, SupervisorConfig,
 };
 #[cfg(target_os = "linux")]
 use supervisor::{TransportConfig, TransportObservability, serve as serve_transport};
@@ -112,6 +112,8 @@ struct AppState {
     /// 客户历史翻页游标的加密密钥：部署期配置，同一部署的所有 API 实例必须一致；缺失或格式无效时
     /// 进程启动失败（`docs/design/0014-customer-console-navigation-and-history.md` §5）。
     history_cursor_key: [u8; HISTORY_CURSOR_KEY_LEN],
+    /// 公开鉴权端点来源维采信的受信头（`AUTH_SOURCE_HEADER`）；不设时退回连接对端地址。
+    auth_source_header: Option<header::HeaderName>,
 }
 
 impl AppState {
@@ -145,6 +147,25 @@ impl AppState {
             Ok(Some(identity)) => Ok(identity),
             Ok(None) => Err(admin_forbidden()),
             Err(error) => Err(ApiError::from(error)),
+        }
+    }
+
+    /// 这次请求的**来源**：按运维配置采信受信头，否则退回连接对端地址。
+    ///
+    /// 采信哪个头与它的部署前提见 [`auth_source_header`] 与设计 0016 §3。
+    fn request_source(&self, headers: &HeaderMap, client: &ClientAddr) -> String {
+        if let Some(name) = &self.auth_source_header
+            && let Some(value) = headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+        {
+            return value.to_owned();
+        }
+        match client.0 {
+            Some(addr) => addr.ip().to_string(),
+            None => "unknown".to_owned(),
         }
     }
 
@@ -405,7 +426,8 @@ async fn main() -> Result<()> {
     let state = AppState {
         admin_token,
         identity: IdentityService::new(repository_port.clone())
-            .with_rate_limit(acceleration.clone(), generation_rate_limit()?),
+            .with_rate_limit(acceleration.clone(), generation_rate_limit()?)
+            .with_auth_attempt_limits(AuthAttemptLimits::from_env()?),
         runtime: RuntimeService::new(repository_port.clone(), adapters)
             .with_acceleration(acceleration.clone())
             .with_cost_ceiling(cost_ceiling()?),
@@ -421,6 +443,7 @@ async fn main() -> Result<()> {
         session_ttl: session_ttl()?,
         password_reset_ttl: password_reset_ttl()?,
         history_cursor_key: history_cursor_key()?,
+        auth_source_header: auth_source_header()?,
         direct: direct_execution.clone(),
     };
     // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
@@ -1714,11 +1737,14 @@ struct CustomerLoginResponse {
 /// 对客注册（`POST /v1/customers`，无需凭据）：新建账户与身份，一步到位。
 async fn register_customer(
     State(state): State<AppState>,
+    Extension(client): Extension<ClientAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Result<(StatusCode, Json<CustomerLoginResponse>), ApiError> {
+    let source = state.request_source(&headers, &client);
     let login = state
         .identity
-        .register_customer(&body.email, &body.password, state.session_ttl)
+        .register_customer(&body.email, &body.password, state.session_ttl, &source)
         .await?;
     Ok((
         StatusCode::CREATED,
@@ -1734,11 +1760,14 @@ async fn register_customer(
 /// 对客登录（`POST /v1/customer/sessions`，无需凭据）。失败语义与管理员那条相同。
 async fn login_customer(
     State(state): State<AppState>,
+    Extension(client): Extension<ClientAddr>,
+    headers: HeaderMap,
     Json(body): Json<LoginBody>,
 ) -> Result<Json<CustomerLoginResponse>, ApiError> {
+    let source = state.request_source(&headers, &client);
     let login = state
         .identity
-        .login_customer(&body.email, &body.password, state.session_ttl)
+        .login_customer(&body.email, &body.password, state.session_ttl, &source)
         .await?;
     Ok(Json(CustomerLoginResponse {
         token: login.token,
@@ -1791,11 +1820,14 @@ async fn change_customer_password(
 /// "知道邮箱就能接管账户"。令牌只由运营在管理端签发后转交。
 async fn redeem_customer_password_reset(
     State(state): State<AppState>,
+    Extension(client): Extension<ClientAddr>,
+    headers: HeaderMap,
     Json(body): Json<RedeemPasswordResetBody>,
 ) -> Result<StatusCode, ApiError> {
+    let source = state.request_source(&headers, &client);
     state
         .identity
-        .redeem_password_reset(&body.reset_token, &body.new_password)
+        .redeem_customer_password_reset(&body.reset_token, &body.new_password, &source)
         .await?;
     Ok(StatusCode::NO_CONTENT)
 }
@@ -3424,11 +3456,11 @@ impl ApiError {
 
 impl From<ApplicationError> for ApiError {
     fn from(error: ApplicationError) -> Self {
-        // 每日扣费上限那条路要把"到次日零点还有多久"带到对客响应上，所以它在匹配之前先被
-        // 取出来。这是这个转换里**唯一**需要另带走一个值的错误：`Retry-After` 不是"你错了"，
-        // 是"什么时候再来"，消费者要的答案就在那个数里。
+        // 两类"等一下再来"的错误要把等待时长带到对客响应上，所以它们在匹配之前先被取出来。
+        // `Retry-After` 不是"你错了"，是"什么时候再来"，消费者要的答案就在那个数里。
         let retry_after = match &error {
-            ApplicationError::DailySpendLimitExceeded { retry_after } => Some(*retry_after),
+            ApplicationError::DailySpendLimitExceeded { retry_after }
+            | ApplicationError::RateLimitExceeded { retry_after } => Some(*retry_after),
             _ => None,
         };
         // 两条平台侧故障有自己的 warn（它们更常见、更值得被看见），5xx 的兜底日志因此要避开它们，
@@ -3475,8 +3507,8 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::ExecutionDeadlineExceeded => {
                 (StatusCode::GATEWAY_TIMEOUT, "request_timeout")
             }
-            // 速率超限走到这里时（不是入口那条路径），也只说"太密了"：`Retry-After` 在
-            // [`ApiError::from`] 的通用路径上没有位置放，因此认证入口自己那条分支才是对客的正常路径。
+            // 速率超限（每密钥速率，或公开鉴权端点的失败尝试）都是"太密了"：等待时长由上面的
+            // `retry_after` 提取带出去，`Retry-After` 头对两条路都成立。
             ApplicationError::RateLimitExceeded { .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
             }
@@ -3812,6 +3844,20 @@ fn generation_env_u64(name: &str, default: u64) -> Result<u64> {
 /// 所以留成部署期可调，而不是写死在代码里。
 fn generation_rate_limit() -> Result<GenerationRateLimit> {
     Ok(GenerationRateLimit::from_env()?)
+}
+
+/// 公开鉴权端点来源维采信哪个受信头：`AUTH_SOURCE_HEADER`（例如 `x-real-ip`）。
+///
+/// 不设时退回**连接对端地址**：开发直连与没有代理的部署都靠它。采信受信头要求 API 不能被绕过
+/// 代理直连——否则调用方自带同名头就能伪造来源；这条部署边界的取舍见设计 0016 §3。
+fn auth_source_header() -> Result<Option<header::HeaderName>> {
+    let name = match env::var("AUTH_SOURCE_HEADER") {
+        Ok(value) if !value.trim().is_empty() => value,
+        _ => return Ok(None),
+    };
+    let name = header::HeaderName::from_bytes(name.trim().as_bytes())
+        .with_context(|| format!("AUTH_SOURCE_HEADER must be a valid header name: {name}"))?;
+    Ok(Some(name))
 }
 
 /// 每账户每日扣费上限（默认每天 50 美元等值）。读法与上面两项相同，一个环境变量：

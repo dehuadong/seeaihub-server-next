@@ -51,7 +51,7 @@ use tokio::{
 };
 
 use super::{
-    ConnectionScope, DisconnectSignal, SendHold,
+    ClientAddr, ConnectionScope, DisconnectSignal, SendHold,
     monitor::{DisconnectMonitor, MonitorConfig},
 };
 
@@ -444,6 +444,8 @@ async fn run_connection(
     shutdown: watch::Receiver<bool>,
 ) {
     let config = registry.config;
+    // 连接对端地址必须在 `stream` 被移进 Hyper 之前取下来：之后就拿不到了。
+    let client = ClientAddr(stream.peer_addr().ok());
     let fd = match rustix::io::fcntl_dupfd_cloexec(&stream, 0) {
         Ok(fd) => Arc::new(fd),
         Err(error) => {
@@ -500,6 +502,7 @@ async fn run_connection(
     let guard_state = GuardState {
         owner: Arc::clone(&owner),
         scope: Arc::clone(&scope),
+        client,
     };
     let service = TowerToHyperService::new(router.layer(axum::middleware::from_fn_with_state(
         guard_state,
@@ -611,11 +614,12 @@ enum Outcome {
     SendDeadline,
 }
 
-/// 连接中间件的共享状态：owner 收编发送许可，scope 交给 handler 跟踪在飞执行。
+/// 连接中间件的共享状态：owner 收编发送许可，scope 交给 handler 跟踪在飞执行，client 是连接对端。
 #[derive(Clone)]
 struct GuardState {
     owner: Arc<ConnectionOwner>,
     scope: Arc<ConnectionScope>,
+    client: ClientAddr,
 }
 
 /// 连接级中间件：拒绝图片路由上的 Upgrade/CONNECT，收编图片响应的发送许可并设置 HTTP/1 关闭语义。
@@ -629,6 +633,7 @@ async fn connection_guard(
     }
     let http1 = matches!(request.version(), Version::HTTP_11 | Version::HTTP_10);
     request.extensions_mut().insert(Arc::clone(&state.scope));
+    request.extensions_mut().insert(state.client.clone());
     let mut response = next.run(request).await;
     if let Some(hold) = response.extensions_mut().remove::<SendHold>() {
         state.owner.register_send(hold);
