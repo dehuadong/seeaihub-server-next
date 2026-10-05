@@ -1,6 +1,6 @@
 # 交接：模型目录关联独立使用文档
 
-生成时间：2026-10-05。仓库：`D:\workspace\seeaihub-server-next`。本交接按用户指定放在 `.agents/handoff/`，覆盖 handoff 技能的临时目录默认位置。
+生成时间：2026-10-05。仓库 `/home/mypc/work/seeaihub-server-next`。本交接按用户指定放在 `.agents/handoff/`，覆盖 handoff 技能的临时目录默认位置。
 
 ## 当前状态
 
