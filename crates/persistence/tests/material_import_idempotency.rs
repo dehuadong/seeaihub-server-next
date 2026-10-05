@@ -16,6 +16,11 @@ fn material_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/bootstrap")
 }
 
+/// 公开文档目录：显式传给导入，用例的工作目录不影响解析。
+fn repo_public_docs() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public-docs")
+}
+
 async fn isolated_database_url() -> (String, String) {
     let base = std::env::var("HTTP_CONTRACT_DATABASE_URL")
         .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored material import test");
@@ -80,7 +85,7 @@ async fn importing_the_same_material_twice_adds_no_rows() {
     repository.migrate().await.expect("the migrations apply");
     let pool = repository.pool().clone();
 
-    let first = import_supply_materials(&pool, &material_dir())
+    let first = import_supply_materials(&pool, &material_dir(), &repo_public_docs())
         .await
         .expect("the first import");
     let after_first = table_counts(&pool).await;
@@ -94,7 +99,7 @@ async fn importing_the_same_material_twice_adds_no_rows() {
         "one offering row per candidate in the material"
     );
 
-    let second = import_supply_materials(&pool, &material_dir())
+    let second = import_supply_materials(&pool, &material_dir(), &repo_public_docs())
         .await
         .expect("the second import");
     let after_second = table_counts(&pool).await;
@@ -135,13 +140,13 @@ async fn a_documentation_change_appends_a_material_version() {
     repository.migrate().await.expect("the migrations apply");
     let pool = repository.pool().clone();
 
-    import_supply_materials(&pool, &material_dir())
+    import_supply_materials(&pool, &material_dir(), &repo_public_docs())
         .await
         .expect("the first import");
     assert_eq!(material_versions(&pool, "gpt-image-2.5-flare").await, 1);
 
     // 同一内容再导一遍：不产生第二个素材版本。
-    import_supply_materials(&pool, &material_dir())
+    import_supply_materials(&pool, &material_dir(), &repo_public_docs())
         .await
         .expect("the second import");
     assert_eq!(material_versions(&pool, "gpt-image-2.5-flare").await, 1);
@@ -161,7 +166,7 @@ async fn a_documentation_change_appends_a_material_version() {
         serde_json::to_string(&value).expect("serialize the edited material"),
     )
     .expect("write the edited material");
-    import_supply_materials(&pool, &edited)
+    import_supply_materials(&pool, &edited, &repo_public_docs())
         .await
         .expect("the changed import");
     assert_eq!(material_versions(&pool, "gpt-image-2.5-flare").await, 2);
@@ -213,7 +218,7 @@ async fn changing_the_type_of_an_existing_revision_is_rejected() {
     repository.migrate().await.expect("the migrations apply");
     let pool = repository.pool().clone();
 
-    import_supply_materials(&pool, &material_dir())
+    import_supply_materials(&pool, &material_dir(), &repo_public_docs())
         .await
         .expect("the first import");
     let before = table_counts(&pool).await;
@@ -233,7 +238,7 @@ async fn changing_the_type_of_an_existing_revision_is_rejected() {
     )
     .expect("write the edited material");
 
-    let error = import_supply_materials(&pool, &edited)
+    let error = import_supply_materials(&pool, &edited, &repo_public_docs())
         .await
         .expect_err("changing the type must be rejected");
     assert!(
@@ -284,7 +289,7 @@ async fn a_material_without_a_type_is_rejected_without_writing_a_row() {
     )
     .expect("write the untyped material");
 
-    let error = import_supply_materials(&pool, &edited)
+    let error = import_supply_materials(&pool, &edited, &repo_public_docs())
         .await
         .expect_err("a material without type must be rejected");
     assert!(

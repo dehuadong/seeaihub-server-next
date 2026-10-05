@@ -71,7 +71,7 @@ pub async fn import_supply_materials_from_env(
     else {
         return Ok(MaterialImportSummary::default());
     };
-    import_supply_materials(pool, &dir).await
+    import_supply_materials(pool, &dir, &public_docs_dir()).await
 }
 
 /// 从环境变量的取值决定素材目录。
@@ -86,14 +86,18 @@ fn material_dir_from(value: Option<&str>) -> Option<PathBuf> {
 }
 
 /// 把 `dir` 下的素材逐个导入。每份素材一个事务：一份写坏不影响别的，也不留半份进去的状态。
+///
+/// `public_docs` 是素材 `documentation.narrative_path` 的解析根：显式传入，导入行为不随进程
+/// 工作目录变化（服务在生产从 `public-docs/` 读，测试从仓库根读，用同一段逻辑）。
 pub async fn import_supply_materials(
     pool: &PgPool,
     dir: &Path,
+    public_docs: &Path,
 ) -> Result<MaterialImportSummary, ApplicationError> {
     let materials = read_materials(dir)?;
     let mut summary = MaterialImportSummary::default();
     for (path, material) in &materials {
-        let one = import_material(pool, path, material).await?;
+        let one = import_material(pool, path, material, public_docs).await?;
         summary.materials += 1;
         summary.offerings += one.offerings;
         summary.price_plans += one.price_plans;
@@ -138,10 +142,11 @@ async fn import_material(
     pool: &PgPool,
     path: &Path,
     material: &Material,
+    public_docs: &Path,
 ) -> Result<MaterialImportSummary, ApplicationError> {
     let mut tx = pool.begin().await.map_err(database_error)?;
     let vendor_model_id = upsert_vendor_model(&mut tx, path, material).await?;
-    let documentation = resolve_documentation(&public_docs_dir(), path, material)?;
+    let documentation = resolve_documentation(public_docs, path, material)?;
     let model_type = material_model_type(path, material)?;
     // 导入期就把素材与合同对齐校验一遍：缺字段释义、引用不存在的合同位置、模板缺插入点或正文
     // 链接越界都当场拒，不等到发布。平台对客名这时还不知道，用厂商原生名占位，只校验结构。
