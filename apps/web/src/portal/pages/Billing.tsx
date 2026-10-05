@@ -17,6 +17,7 @@ import { useState } from 'react';
 import type { CustomerClient } from '../client';
 import type { CustomerLedgerResponse, LedgerEntry } from '../../shared/types';
 import { whenText, yuanText } from '../../shared/format';
+import { MODEL_TYPES, modelTypeLabel, usageText } from '../../shared/model-usage';
 import { useLoadable } from '../../shared/ui';
 import { useCursorPage } from '../history';
 import { rangeFromLocalDates, rangeLabel, useHistoryRange } from '../dates';
@@ -141,7 +142,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
         </Typography.Paragraph>
         {billing.error ? <Alert type="error" showIcon message={billing.error} /> : null}
         <Row gutter={[24, 16]}>
-          <Col xs={8}>
+          <Col xs={12} sm={8}>
             <span data-testid="portal-billing-requests">
               <Statistic
                 title="请求数"
@@ -151,16 +152,19 @@ export function BillingPage({ client }: { client: CustomerClient }) {
               />
             </span>
           </Col>
-          <Col xs={8}>
-            <span data-testid="portal-billing-images">
-              <Statistic
-                title="产出图片数"
-                value={billing.data ? billing.data.images : '—'}
-                loading={billing.loading}
-              />
-            </span>
-          </Col>
-          <Col xs={8}>
+          {MODEL_TYPES.map((type) => (
+            <Col xs={12} sm={8} key={type}>
+              <span data-testid={`portal-billing-usage-${type}`}>
+                <Statistic
+                  title={`${modelTypeLabel(type)}用量`}
+                  // 该类型没有量时显示占位「—」，不画成 0；汇总始终按类型列出（Spec §4.3）。
+                  value={billing.data ? usageText(type, billing.data.usage) : '—'}
+                  loading={billing.loading}
+                />
+              </span>
+            </Col>
+          ))}
+          <Col xs={12} sm={8}>
             <span data-testid="portal-billing-net">
               <Statistic
                 title="扣费净额"

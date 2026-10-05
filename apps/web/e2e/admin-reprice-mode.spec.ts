@@ -26,6 +26,7 @@ test('改价：界面不出现渠道地址与凭证变量名，发布后仍指�
       native_model_id: vendorModel,
       gateway_model: model,
       native_revision: 'e2e-reprice-1.0',
+      type: 'image',
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: {

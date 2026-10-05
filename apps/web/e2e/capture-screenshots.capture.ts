@@ -106,6 +106,7 @@ async function publishCaptureFixture(request: APIRequestContext): Promise<void> 
       native_model_id: vendorModel,
       gateway_model: CAPTURE_GATEWAY_MODEL,
       native_revision: 'shot-1',
+      type: 'image',
       actor: 'capture',
       markup_bps: 2000,
       capability_schema: capability,

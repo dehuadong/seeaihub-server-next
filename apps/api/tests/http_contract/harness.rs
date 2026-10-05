@@ -64,6 +64,8 @@ mod cases_kill_matrix;
 mod cases_lifecycle;
 #[path = "cases_migrations.rs"]
 mod cases_migrations;
+#[path = "cases_model_type.rs"]
+mod cases_model_type;
 #[path = "cases_parameter_mapping.rs"]
 mod cases_parameter_mapping;
 #[path = "cases_parameters.rs"]
@@ -2864,6 +2866,7 @@ async fn publish_with_mappings(
         "vendor_id": "OpenAI",
         "native_model_id": model,
         "native_revision": revision,
+        "type": "image",
         "actor": "contract-test",
         "capability_schema": contract,
         "offerings": offerings
@@ -3064,6 +3067,7 @@ fn publication_body(
         "vendor_id": "OpenAI",
         "native_model_id": model,
         "native_revision": revision,
+        "type": "image",
         "actor": "contract-test",
         "offerings": offerings
     });

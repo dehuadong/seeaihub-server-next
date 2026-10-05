@@ -98,8 +98,8 @@ async fn seed_fixture(pool: &PgPool) -> Fixture {
     .expect("seed channel");
     sqlx::query(
         "INSERT INTO catalog.vendor_models
-             (id, vendor_id, native_model_id, native_revision, capability_schema)
-         VALUES ($1, 'fake-vendor', 'fake-model', 'v1', '{}'::jsonb)",
+             (id, vendor_id, native_model_id, native_revision, model_type, capability_schema)
+         VALUES ($1, 'fake-vendor', 'fake-model', 'v1', 'image', '{}'::jsonb)",
     )
     .bind(fixture.vendor_model_id.0)
     .execute(pool)

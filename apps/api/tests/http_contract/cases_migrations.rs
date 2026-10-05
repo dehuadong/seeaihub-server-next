@@ -1125,8 +1125,8 @@ async fn the_supply_identity_migration_adds_unique_indexes_and_refuses_duplicate
     });
     sqlx::query(
         "INSERT INTO catalog.vendor_models
-             (id, vendor_id, native_model_id, native_revision, capability_schema)
-         VALUES ($1,'OpenAI','supply-identity','revision-1',$2)",
+             (id, vendor_id, native_model_id, native_revision, model_type, capability_schema)
+         VALUES ($1,'OpenAI','supply-identity','revision-1','image',$2)",
     )
     .bind(vendor_model)
     .bind(&contract)
@@ -1851,6 +1851,64 @@ async fn the_identity_email_migration_refuses_a_cross_domain_duplicate() {
         (1, 1, 1),
         "迁移不静默改动登录身份"
     );
+
+    pool.close().await;
+    let _ = std::fs::remove_dir_all(&staged);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 迁移 0041 给存量 Vendor Model 行回填 `image`，并把列置为非空：到本次改动为止仓库的驱动、
+/// 承载面与计价形态只覆盖图片模型，回填是事实而不是默认值（模型类型设计 0020 §7）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_model_type_migration_backfills_existing_vendor_models() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用 0041 之前的迁移，造一行没有 `model_type` 的存量行。
+    let staged = stage_migrations(&migrations, "0041", "model-type");
+    sqlx::migrate::Migrator::new(staged.clone())
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+    let vendor_model = Uuid::new_v4();
+    sqlx::query(
+        "INSERT INTO catalog.vendor_models
+             (id, vendor_id, native_model_id, native_revision, capability_schema)
+         VALUES ($1,'OpenAI','legacy-typed','revision-1','{}'::jsonb)",
+    )
+    .bind(vendor_model)
+    .execute(&pool)
+    .await
+    .expect("legacy vendor model row");
+
+    // 2) 应用整批迁移：0041 必须能升上来，并把存量行回填成 image、列置为非空。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("migrator")
+        .run(&pool)
+        .await
+        .expect("the model type migration must apply on an already-built database");
+    let model_type: String =
+        sqlx::query_scalar("SELECT model_type FROM catalog.vendor_models WHERE id = $1")
+            .bind(vendor_model)
+            .fetch_one(&pool)
+            .await
+            .expect("model type");
+    assert_eq!(model_type, "image", "存量行回填成 image");
+    let is_nullable: String = sqlx::query_scalar(
+        "SELECT is_nullable FROM information_schema.columns
+         WHERE table_schema = 'catalog' AND table_name = 'vendor_models' AND column_name = 'model_type'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("column probe");
+    assert_eq!(is_nullable, "NO", "迁移之后列是非空且无默认值");
 
     pool.close().await;
     let _ = std::fs::remove_dir_all(&staged);

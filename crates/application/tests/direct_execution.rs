@@ -399,6 +399,7 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
             native_model_id: Some("gw".to_owned()),
             gateway_model: Some("gw".to_owned()),
             native_revision: Some("v1".to_owned()),
+            model_type: Some("image".to_owned()),
             capability_schema: Some(surface()),
             offerings: Some(vec![OfferingDraft {
                 offering_id: None,

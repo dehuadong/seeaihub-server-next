@@ -768,3 +768,34 @@ fn a_consumer_per_image_form_is_rejected() {
         "{error}"
     );
 }
+
+/// 内联发布的类型必给且落在三种之内；报错点名型号与修订（Spec 0006 §4.4）。
+#[test]
+fn normalize_rejects_an_inline_publication_without_a_known_type() {
+    let with_type = |model_type: Option<&str>| PublishRuntimeCommand {
+        model_type: model_type.map(str::to_owned),
+        offerings: Some(vec![draft("mt-a")]),
+        ..base_command()
+    };
+
+    let missing = with_type(None).normalize().expect_err("type is required");
+    assert!(
+        missing.to_string().contains("type is required"),
+        "{missing}"
+    );
+    assert!(
+        missing.to_string().contains("gpt-image-2.5-flare"),
+        "{missing}"
+    );
+
+    let unknown = with_type(Some("audio"))
+        .normalize()
+        .expect_err("an unknown type is rejected");
+    assert!(unknown.to_string().contains("audio"), "{unknown}");
+
+    for known in ["image", "video", "chat"] {
+        with_type(Some(known))
+            .normalize()
+            .unwrap_or_else(|error| panic!("{known} must be accepted: {error}"));
+    }
+}

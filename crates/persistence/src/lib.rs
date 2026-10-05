@@ -12,7 +12,7 @@ use seeai_application::{
     ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
     PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance, ReferencedOffering,
     RefundReconciliationCommand, SelectableOfferingView, SettleExecution, SubmissionStarted,
-    TakenOverExecution, customer_usage_status, declared_output_images,
+    TakenOverExecution, UsageAmounts, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
@@ -215,6 +215,7 @@ impl HubRepository for PgHubRepository {
             native_model_id,
             gateway_model,
             native_revision,
+            model_type,
             actor,
             capability_schema,
             markup_bps,
@@ -284,8 +285,8 @@ impl HubRepository for PgHubRepository {
         let vendor_model_id = match sqlx::query_scalar::<_, Uuid>(
             r#"
             INSERT INTO catalog.vendor_models
-                (id, vendor_id, native_model_id, native_revision, capability_schema)
-            VALUES ($1, $2, $3, $4, $5)
+                (id, vendor_id, native_model_id, native_revision, model_type, capability_schema)
+            VALUES ($1, $2, $3, $4, $5, $6)
             ON CONFLICT (vendor_id, native_model_id, native_revision) DO NOTHING
             RETURNING id
             "#,
@@ -294,6 +295,7 @@ impl HubRepository for PgHubRepository {
         .bind(&vendor_id)
         .bind(&native_model_id)
         .bind(&native_revision)
+        .bind(&model_type)
         .bind(&capability_schema)
         .fetch_optional(&mut *transaction)
         .await
@@ -303,7 +305,7 @@ impl HubRepository for PgHubRepository {
             None => {
                 let existing = sqlx::query(
                     r#"
-                    SELECT id, capability_schema FROM catalog.vendor_models
+                    SELECT id, capability_schema, model_type FROM catalog.vendor_models
                     WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = $3
                     "#,
                 )
@@ -321,6 +323,14 @@ impl HubRepository for PgHubRepository {
                     return Err(ApplicationError::Validation(format!(
                         "vendor model {native_model_id} already has a contract for revision {native_revision}; \
                          the contract is immutable, so publish a new revision"
+                    )));
+                }
+                let stored_type: String = existing.try_get("model_type").map_err(database_error)?;
+                if stored_type != model_type {
+                    transaction.rollback().await.map_err(database_error)?;
+                    return Err(ApplicationError::Validation(format!(
+                        "vendor model {native_model_id} is already in the catalog as {stored_type} for \
+                         revision {native_revision}; the type is immutable, so publish a new revision"
                     )));
                 }
                 VendorModelId(existing.try_get("id").map_err(database_error)?)
@@ -809,7 +819,8 @@ impl HubRepository for PgHubRepository {
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 o.carrier_schema, o.parameter_mapping, o.formula, o.cost_unit_price_microusd,
-                vm.vendor_id, vm.native_model_id, vm.native_revision, vm.capability_schema,
+                vm.vendor_id, vm.native_model_id, vm.native_revision, vm.model_type,
+                vm.capability_schema,
                 c.provider_kind, c.base_url, c.credential_env,
                 p.currency AS plan_currency,
                 p.text_input_microusd_per_million,
@@ -885,6 +896,7 @@ impl HubRepository for PgHubRepository {
                     vendor_id: row.try_get("vendor_id").map_err(database_error)?,
                     native_model_id: row.try_get("native_model_id").map_err(database_error)?,
                     native_revision: row.try_get("native_revision").map_err(database_error)?,
+                    model_type: row.try_get("model_type").map_err(database_error)?,
                     capability_schema: row.try_get("capability_schema").map_err(database_error)?,
                     provider_kind: row.try_get("provider_kind").map_err(database_error)?,
                     base_url: row.try_get("base_url").map_err(database_error)?,
@@ -1054,7 +1066,8 @@ impl HubRepository for PgHubRepository {
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT DISTINCT ON (re.gateway_model)
-                re.gateway_model, vm.vendor_id, vm.native_revision, vm.capability_schema
+                re.gateway_model, vm.vendor_id, vm.native_revision, vm.model_type,
+                vm.capability_schema
             FROM publication.runtime_entries re
             JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
@@ -1073,6 +1086,7 @@ impl HubRepository for PgHubRepository {
                     gateway_model: row.try_get("gateway_model").map_err(database_error)?,
                     vendor_id: row.try_get("vendor_id").map_err(database_error)?,
                     native_revision: row.try_get("native_revision").map_err(database_error)?,
+                    model_type: row.try_get("model_type").map_err(database_error)?,
                     capability_schema: row.try_get("capability_schema").map_err(database_error)?,
                 })
             })
@@ -1402,12 +1416,14 @@ impl HubRepository for PgHubRepository {
                 j.created_at,
                 j.terminal_at,
                 COALESCE(j.image_count, 0)::bigint AS image_count,
+                vm.model_type,
                 COALESCE((
                     SELECT SUM(e.amount_microusd)
                     FROM ledger.entries e
                     WHERE e.job_id = j.id AND e.kind = 'capture'
                 ), 0)::bigint AS charged_microusd
             FROM generation.jobs j
+            JOIN catalog.vendor_models vm ON vm.id = j.vendor_model_id
             WHERE j.account_id = $1
               AND ({predicate})
               AND {cursor}
@@ -1429,6 +1445,17 @@ impl HubRepository for PgHubRepository {
                 let state: String = row.try_get("state").map_err(database_error)?;
                 let branch: String = row.try_get("branch").map_err(database_error)?;
                 let image_count: i64 = row.try_get("image_count").map_err(database_error)?;
+                let model_type: String = row.try_get("model_type").map_err(database_error)?;
+                // 装配按类型取值：图片给产出张数（未产出沿用现有口径显示 0），视频与对话的量落点
+                // 还没有，视图里是 `None`，读取端按缺失处理（模型类型设计 0020 §4）。
+                let usage = if model_type == "image" {
+                    UsageAmounts {
+                        images: Some(image_count),
+                        ..UsageAmounts::default()
+                    }
+                } else {
+                    UsageAmounts::default()
+                };
                 Ok(CustomerUsageView {
                     job_id: JobId(row.try_get("job_id").map_err(database_error)?),
                     gateway_model: row.try_get("gateway_model").map_err(database_error)?,
@@ -1439,7 +1466,8 @@ impl HubRepository for PgHubRepository {
                     },
                     created_at: row.try_get("created_at").map_err(database_error)?,
                     terminal_at: row.try_get("terminal_at").map_err(database_error)?,
-                    image_count: u32::try_from(image_count).unwrap_or(0),
+                    model_type,
+                    usage,
                     charged_microusd: row.try_get("charged_microusd").map_err(database_error)?,
                 })
             })
@@ -1516,8 +1544,11 @@ impl HubRepository for PgHubRepository {
         account_id: AccountId,
         query: CustomerBillingQuery,
     ) -> Result<CustomerBillingSummary, ApplicationError> {
-        // 请求数与产出张数按**已完成**执行记录的终态时刻归属（处理中不计）；扣费与正式调整按
+        // 请求数与按类型的量按**已完成**执行记录的终态时刻归属（处理中不计）；扣费与正式调整按
         // 各自流水的入账时刻归属：同一区间里明细求和与汇总说的是同一批事实（`0013` §5）。
+        //
+        // 量按 `model_type` 分列，`SUM` 在零行时是 NULL：某类型区间内没有请求、或它的量落点还没
+        // 有值，对应的键就缺省，界面显示占位而不是 0（模型类型 Spec 0006 §4.3）。
         let row = sqlx::query(
             r#"
             SELECT
@@ -1525,9 +1556,11 @@ impl HubRepository for PgHubRepository {
                  WHERE j.account_id = $1 AND j.terminal_at IS NOT NULL
                    AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
                    AND ($3::timestamptz IS NULL OR j.terminal_at < $3)) AS requests,
-                (SELECT COALESCE(SUM(COALESCE(j.image_count, 0)), 0)::bigint
+                (SELECT SUM(COALESCE(j.image_count, 0))::bigint
                  FROM generation.jobs j
+                 JOIN catalog.vendor_models vm ON vm.id = j.vendor_model_id
                  WHERE j.account_id = $1 AND j.terminal_at IS NOT NULL
+                   AND vm.model_type = 'image'
                    AND ($2::timestamptz IS NULL OR j.terminal_at >= $2)
                    AND ($3::timestamptz IS NULL OR j.terminal_at < $3)) AS images,
                 (SELECT COALESCE(SUM(e.amount_microusd), 0)::bigint FROM ledger.entries e
@@ -1542,9 +1575,13 @@ impl HubRepository for PgHubRepository {
         .fetch_one(&self.pool)
         .await
         .map_err(database_error)?;
+        let images: Option<i64> = row.try_get("images").map_err(database_error)?;
         Ok(CustomerBillingSummary {
             requests: row.try_get("requests").map_err(database_error)?,
-            images: row.try_get("images").map_err(database_error)?,
+            usage: UsageAmounts {
+                images,
+                ..UsageAmounts::default()
+            },
             charged_microusd: row.try_get("charged_microusd").map_err(database_error)?,
         })
     }

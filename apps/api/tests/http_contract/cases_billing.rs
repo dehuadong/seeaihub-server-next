@@ -92,7 +92,8 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
     assert_eq!(row["status"], json!("succeeded"));
     assert_eq!(row["kind"], json!("generation"));
     // 产出张数落在 `image_count`：这一笔实际产出一张，用量读的就是那个落点。
-    assert_eq!(row["image_count"], json!(1), "{usage}");
+    assert_eq!(row["type"], json!("image"), "{usage}");
+    assert_eq!(row["usage"]["images"], json!(1), "{usage}");
     assert_eq!(row["gateway_model"], json!(harness.model));
     // **对客不可见**：不出现任务号与内部状态取值。
     let rendered = usage.to_string();
@@ -115,6 +116,22 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
         json!(charged),
         "用量里的扣费必须来自账本"
     );
+
+    // 管理端读同一条记录：类型与用量与客户侧一致（Spec A2）。
+    let admin: Value = client
+        .get(format!(
+            "{}/api/v1/accounts/{}/usage",
+            harness.base_url, account_id
+        ))
+        .bearer_auth(&harness.admin_token)
+        .send()
+        .await
+        .expect("admin usage request")
+        .json()
+        .await
+        .expect("admin usage body");
+    assert_eq!(admin["usage"][0]["type"], row["type"], "{admin}");
+    assert_eq!(admin["usage"][0]["usage"], row["usage"], "{admin}");
 
     // 判据要求用量里出现这一笔的**时间**：它是这一笔受理的时刻（执行记录的 `created_at`），不是
     // 这次查询的时刻——所以断言它与库里那条执行记录逐位相同，"看起来像最近"证明不了是同一笔。
@@ -231,7 +248,7 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
         .expect("billing body");
     assert_eq!(billing["requests"], json!(2), "汇总不随明细页大小变化");
     assert_eq!(
-        billing["images"],
+        billing["usage"]["images"],
         json!(2),
         "两次请求各产出一张，汇总按落点算"
     );
@@ -260,10 +277,10 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
         .as_array()
         .expect("usage array")
         .iter()
-        .map(|row| row["image_count"].as_i64().expect("image count"))
+        .map(|row| row["usage"]["images"].as_i64().expect("image count"))
         .sum();
     assert_eq!(
-        billing["images"],
+        billing["usage"]["images"],
         json!(summed_images),
         "汇总的产出张数必须等于全量明细的求和"
     );
@@ -833,10 +850,9 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         "跨天结算的那一笔不该落在受理日：{request_day_billing}"
     );
     assert_eq!(request_day_billing["charged_microusd"], json!(0));
-    assert_eq!(
-        request_day_billing["images"],
-        json!(0),
-        "受理日还没有产出事实：张数按结算日入桶"
+    assert!(
+        request_day_billing["usage"].get("images").is_none(),
+        "受理日没有已完成的图片请求，用量键缺省：{request_day_billing}"
     );
 
     let settled_day_billing = read_billing(&settled_day, &next_day).await;
@@ -846,7 +862,7 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         "跨天结算的那一笔必须落在结算日：{settled_day_billing}"
     );
     assert_eq!(
-        settled_day_billing["images"],
+        settled_day_billing["usage"]["images"],
         json!(1),
         "结算日的那笔产出一张，随终态时刻入桶"
     );
@@ -1058,7 +1074,8 @@ async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
         json!(0),
         "没结算就没有扣费：{usage}"
     );
-    assert_eq!(row["image_count"], json!(0), "没有交付结果图：{usage}");
+    assert_eq!(row["type"], json!("image"), "{usage}");
+    assert_eq!(row["usage"]["images"], json!(0), "没有交付结果图：{usage}");
 
     // 窗口挪到受理之后：`terminal_at IS NULL` 分支按受理时刻过滤，这一笔不该漏进来。
     let after = stamp(chrono::Utc::now() + chrono::Duration::hours(1));
@@ -1097,7 +1114,10 @@ async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
         json!(0),
         "处理中的 Job 不计入已完成请求数：{billing}"
     );
-    assert_eq!(billing["images"], json!(0), "{billing}");
+    assert!(
+        billing["usage"].get("images").is_none(),
+        "没有已完成的图片请求，用量键缺省：{billing}"
+    );
     assert_eq!(
         billing["charged_microusd"],
         json!(0),

@@ -207,7 +207,10 @@ export interface AdminUsageRow {
   status: 'succeeded' | 'failed' | 'pending' | 'canceled';
   kind: 'generation' | 'edit';
   created_at: string;
-  image_count: number;
+  /// 模型类型：受理时引用的 Vendor Model 的类型。
+  type: ModelType;
+  /// 本次执行按类型给出的量。
+  usage: UsageAmounts;
   charged_microusd: number;
 }
 
@@ -249,6 +252,8 @@ export interface PublicModel {
   name: string;
   vendor_id: string;
   revision: string;
+  /// 模型类型：客户端据此判断用量单位与表单参数面。
+  type: ModelType;
   contract: unknown;
 }
 
@@ -301,7 +306,10 @@ export interface CustomerUsageRow {
   created_at: string;
   /// 终态时刻；处理中（结果未定）时为 `null`。已结束历史按它归属日期区间。
   terminal_at: string | null;
-  image_count: number;
+  /// 模型类型：受理时引用的 Vendor Model 的类型。
+  type: ModelType;
+  /// 本次执行按类型给出的量。
+  usage: UsageAmounts;
   charged_microusd: number;
 }
 
@@ -324,11 +332,23 @@ export interface CustomerLedgerResponse {
   next_cursor: string | null;
 }
 
+/// 模型类型：与 `/v1/models`、用量记录与账单里的 `type` 同值。
+export type ModelType = 'image' | 'video' | 'chat';
+
+/// 一次执行（或一段区间）按模型类型给出的用量；只有有值的键出现。
+export interface UsageAmounts {
+  images?: number;
+  seconds?: number;
+  input_tokens?: number;
+  output_tokens?: number;
+}
+
 /// 账单汇总：按区间**全量**算，不随明细条数上限变化。
 export interface CustomerBilling {
   since: string | null;
   until: string | null;
   requests: number;
-  images: number;
+  /// 区间内按类型分别合计的量；某类型没有值时对应的键缺省。
+  usage: UsageAmounts;
   charged_microusd: number;
 }

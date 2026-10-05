@@ -35,6 +35,7 @@ test('停用的供给在清单里标明不能选，而不是消失', async ({ re
       native_model_id: vendorModel,
       gateway_model: `e2e-disabled-seed-${suffix}`,
       native_revision: 'e2e-1',
+      type: 'image',
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: capability,

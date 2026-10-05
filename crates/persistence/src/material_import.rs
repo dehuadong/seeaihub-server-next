@@ -162,11 +162,12 @@ async fn upsert_vendor_model(
     path: &Path,
     material: &Material,
 ) -> Result<VendorModelId, ApplicationError> {
+    let model_type = material_model_type(path, material)?;
     let inserted: Option<Uuid> = sqlx::query_scalar(
         r#"
         INSERT INTO catalog.vendor_models
-            (id, vendor_id, native_model_id, native_revision, capability_schema)
-        VALUES ($1, $2, $3, $4, $5)
+            (id, vendor_id, native_model_id, native_revision, model_type, capability_schema)
+        VALUES ($1, $2, $3, $4, $5, $6)
         ON CONFLICT (vendor_id, native_model_id, native_revision) DO NOTHING
         RETURNING id
         "#,
@@ -175,6 +176,7 @@ async fn upsert_vendor_model(
     .bind(&material.vendor_id)
     .bind(&material.native_model_id)
     .bind(&material.native_revision)
+    .bind(model_type)
     .bind(&material.capability_schema)
     .fetch_optional(&mut *conn)
     .await
@@ -184,7 +186,7 @@ async fn upsert_vendor_model(
     }
     let existing = sqlx::query(
         r#"
-        SELECT id, capability_schema FROM catalog.vendor_models
+        SELECT id, capability_schema, model_type FROM catalog.vendor_models
         WHERE vendor_id = $1 AND native_model_id = $2 AND native_revision = $3
         "#,
     )
@@ -206,9 +208,44 @@ async fn upsert_vendor_model(
             material.native_revision
         )));
     }
+    let stored_type: String = existing.try_get("model_type").map_err(database_error)?;
+    if stored_type != model_type {
+        return Err(ApplicationError::Validation(format!(
+            "{}: vendor model {} revision {} is already in the catalog as {}; \
+             the type is immutable, so publish the change under a new native_revision",
+            path.display(),
+            material.native_model_id,
+            material.native_revision,
+            stored_type
+        )));
+    }
     Ok(VendorModelId(
         existing.try_get("id").map_err(database_error)?,
     ))
+}
+
+/// 读出并校验素材声明的模型类型。
+///
+/// serde 的缺字段与未知取值发生在反序列化时，那时还不知道型号；所以按原始值收下、写出前校验，报错
+/// 串带素材文件与 `native_model_id`（模型类型设计 0020 §2）。列上的 CHECK 只是兜底——落成约束名对
+/// 工程师没有指向。
+fn material_model_type<'a>(
+    path: &Path,
+    material: &'a Material,
+) -> Result<&'a str, ApplicationError> {
+    match material.model_type.as_deref() {
+        Some(value @ ("image" | "video" | "chat")) => Ok(value),
+        Some(value) => Err(ApplicationError::Validation(format!(
+            "{}: vendor model {} declares unknown type \"{value}\"; it must be image / video / chat",
+            path.display(),
+            material.native_model_id
+        ))),
+        None => Err(ApplicationError::Validation(format!(
+            "{}: vendor model {} does not declare type; it must be image / video / chat",
+            path.display(),
+            material.native_model_id
+        ))),
+    }
 }
 
 /// 渠道按身份三要素 `(provider_kind, base_url, credential_env)` 复用，命中时**什么都不更新**。
@@ -406,6 +443,9 @@ struct Material {
     vendor_id: String,
     native_model_id: String,
     native_revision: String,
+    /// 模型类型（`image` / `video` / `chat`）：按原始值收下，写出前校验取值域。
+    #[serde(rename = "type", default)]
+    model_type: Option<String>,
     capability_schema: Value,
     /// 谁写的这份素材；落进价目表那行的来源标注。
     actor: Option<String>,

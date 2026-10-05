@@ -50,6 +50,7 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
     native_model_id: model,
     gateway_model: `e2e-cf-seed-${suffix}`,
     native_revision: 'e2e-1',
+    type: 'image',
     actor: 'e2e',
     markup_bps: 2000,
     capability_schema: capability(model),

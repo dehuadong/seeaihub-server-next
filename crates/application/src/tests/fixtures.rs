@@ -121,6 +121,7 @@ pub(super) fn base_command() -> PublishRuntimeCommand {
         native_model_id: Some("gpt-image-2.5-flare".to_owned()),
         gateway_model: None,
         native_revision: Some("test-1".to_owned()),
+        model_type: Some("image".to_owned()),
         capability_schema: None,
         offerings: None,
         references: None,

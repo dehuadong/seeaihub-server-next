@@ -31,6 +31,7 @@ test('选厂商、勾供给、给价，发布一个平台模型', async ({ reque
       native_model_id: vendorModel,
       gateway_model: `e2e-seed-model-${suffix}`,
       native_revision: 'e2e-1',
+      type: 'image',
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: {

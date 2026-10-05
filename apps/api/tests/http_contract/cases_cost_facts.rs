@@ -449,8 +449,9 @@ async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
     let usage: Value = usage.json().await.expect("usage body");
     let row = &usage["usage"][0];
     assert_eq!(row["job_id"], json!(job_id.to_string()), "{usage}");
+    assert_eq!(row["type"], json!("image"), "{usage}");
     assert_eq!(
-        row["image_count"],
+        row["usage"]["images"],
         json!(1),
         "per_image 请求的用量张数必须等于实际张数：{usage}"
     );

@@ -51,6 +51,7 @@ fn the_bootstrap_materials_parse_into_their_offerings() {
     let flare = parse("gpt-image-2.5-flare.json");
     assert_eq!(flare.vendor_id, "OpenAI");
     assert_eq!(flare.native_model_id, "gpt-image-2.5-flare");
+    assert_eq!(flare.model_type.as_deref(), Some("image"));
     assert_eq!(flare.offerings.len(), 2);
     // 两种计价形态各一条：AIHubMix 按 token 计量量、APIMart 由上游直接给金额。
     assert_eq!(flare.offerings[0].formula, PricingFormula::TokenRates);
@@ -144,6 +145,23 @@ fn an_offering_whose_formula_contradicts_its_parameters_is_rejected() {
             "the error names the candidate: {error}"
         );
     }
+}
+
+/// 类型必须声明、且落在三种之内；报错要点名素材文件与型号（Spec 0006 §4.4、设计 0020 §2）。
+#[test]
+fn a_material_must_declare_a_known_type() {
+    let mut material = parse("gpt-image-2.5-flare.json");
+    material.model_type = None;
+    let error = material_model_type(Path::new("material.json"), &material)
+        .expect_err("a material without type is rejected");
+    assert!(error.to_string().contains("material.json"), "{error}");
+    assert!(error.to_string().contains("gpt-image-2.5-flare"), "{error}");
+
+    material.model_type = Some("audio".to_owned());
+    let error = material_model_type(Path::new("material.json"), &material)
+        .expect_err("a material with an unknown type is rejected");
+    assert!(error.to_string().contains("audio"), "{error}");
+    assert!(error.to_string().contains("gpt-image-2.5-flare"), "{error}");
 }
 
 /// 目录不存在或里面没有素材时，导入什么都没读——调用方据此静默跳过，开发库与测试库因此不会被

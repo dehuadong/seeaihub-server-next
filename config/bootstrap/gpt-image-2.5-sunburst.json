@@ -32,6 +32,7 @@
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-sunburst",
   "native_revision": "2026-09-20-contract-1.0",
+  "type": "image",
   "actor": "bootstrap",
   "markup_bps": 2000,
   "capability_schema": {

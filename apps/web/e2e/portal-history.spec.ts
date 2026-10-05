@@ -190,3 +190,78 @@ test('多于一页的资金流水：继续查看取到更早的那一页，汇�
   expect(await text('portal-billing-requests')).toBe(requests);
   expect(await text('portal-billing-net')).toBe(net);
 });
+
+test('用量与账单按模型类型显示：缺量的类型显示占位而不是 0', async ({ page }) => {
+  await registerCustomer(page, uniqueEmail('portal-history-usage-types'));
+
+  // 用量记录：一条 video（秒数落点缺失）与一条 image（产出 1 张）。e2e 不起 Worker，直接拦读数。
+  await page.route('**/v1/customer/usage**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        usage: [
+          {
+            gateway_model: 'video-model',
+            status: 'succeeded',
+            kind: 'generation',
+            created_at: '2026-01-15T12:00:00.000Z',
+            terminal_at: '2026-01-15T12:00:05.000Z',
+            type: 'video',
+            usage: {},
+            charged_microusd: 0,
+          },
+          {
+            gateway_model: 'image-model',
+            status: 'succeeded',
+            kind: 'generation',
+            created_at: '2026-01-15T12:01:00.000Z',
+            terminal_at: '2026-01-15T12:01:05.000Z',
+            type: 'image',
+            usage: { images: 1 },
+            charged_microusd: 0,
+          },
+          {
+            gateway_model: 'image-model',
+            status: 'pending',
+            kind: 'generation',
+            created_at: '2026-01-15T12:02:00.000Z',
+            terminal_at: null,
+            type: 'image',
+            usage: { images: 0 },
+            charged_microusd: 0,
+          },
+        ],
+        count: 3,
+        truncated: false,
+        next_cursor: null,
+      }),
+    });
+  });
+  // 账单汇总：只有 image 的量键，video 与 chat 缺省。
+  await page.route('**/v1/customer/billing**', async (route) => {
+    await route.fulfill({
+      status: 200,
+      contentType: 'application/json',
+      body: JSON.stringify({
+        since: null,
+        until: null,
+        requests: 2,
+        usage: { images: 1 },
+        charged_microusd: 0,
+      }),
+    });
+  });
+
+  await nav(page, '调用记录');
+  const history = page.getByTestId('portal-usage-history-table');
+  await expect(history).toContainText('1 张');
+  await expect(history).toContainText('—');
+  // 图片未产出沿用现有口径显示 0，而不是占位（Spec A7）。
+  await expect(history).toContainText('0 张');
+
+  await nav(page, '账单与资金记录');
+  await expect(page.getByTestId('portal-billing-usage-image')).toContainText('1 张');
+  await expect(page.getByTestId('portal-billing-usage-video')).toContainText('—');
+  await expect(page.getByTestId('portal-billing-usage-chat')).toContainText('—');
+});

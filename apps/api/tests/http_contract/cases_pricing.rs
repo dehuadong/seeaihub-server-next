@@ -112,7 +112,8 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     assert_eq!(row["job_id"], json!(job_id.to_string()), "{usage}");
     assert_eq!(row["gateway_model"], json!(harness.model));
     // 产出张数落在 `image_count`：假上游只回一张，这里就是这次执行的实际张数。
-    assert_eq!(row["image_count"], json!(1), "{usage}");
+    assert_eq!(row["type"], json!("image"), "{usage}");
+    assert_eq!(row["usage"]["images"], json!(1), "{usage}");
     // 账本里的 `capture` 是负数（钱从账上出去），明细直接给这个和；界面上按"扣费"显示绝对值。
     assert_eq!(row["charged_microusd"], json!(-43_680));
     // **账本读能按类别过滤**：充值记录只看 `credit`；未知类别**拒**而不是静默回空。

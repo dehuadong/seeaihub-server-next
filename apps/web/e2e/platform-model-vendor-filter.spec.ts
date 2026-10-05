@@ -36,6 +36,7 @@ test('清单只列所选厂商的供给', async ({ request, page }) => {
         native_model_id: vendorModel,
         gateway_model: `e2e-vendor-seed-${vendor}-${suffix}`,
         native_revision: 'e2e-1',
+        type: 'image',
         actor: 'e2e',
         markup_bps: 2000,
         capability_schema: capability,

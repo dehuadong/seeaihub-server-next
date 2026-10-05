@@ -1234,6 +1234,8 @@ pub struct PublishedModel {
     pub vendor_id: String,
     /// 合同修订。
     pub native_revision: String,
+    /// 模型类型（`image` / `video` / `chat`）：随发布引用的 Vendor Model 冻结，决定用量单位。
+    pub model_type: String,
     /// 该模型的调用方合同：**发布的那一份**，客户端据此建表单。
     pub capability_schema: Value,
 }

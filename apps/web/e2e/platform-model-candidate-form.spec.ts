@@ -32,6 +32,7 @@ test('展开候选显示对客计价形态：按 token 四档与上游声明金�
       native_model_id: vendorModel,
       gateway_model: platformName,
       native_revision: 'e2e-candidate-form-1',
+      type: 'image',
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: capability,

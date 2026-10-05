@@ -3,6 +3,7 @@ import dayjs from 'dayjs';
 import type { CustomerClient } from '../client';
 import type { CustomerUsageResponse, CustomerUsageRow } from '../../shared/types';
 import { whenText, yuanText } from '../../shared/format';
+import { usageText } from '../../shared/model-usage';
 import { useLoadable } from '../../shared/ui';
 import { useCursorPage } from '../history';
 import { rangeFromLocalDates, rangeLabel, useHistoryRange } from '../dates';
@@ -113,7 +114,12 @@ export function UsagePage({ client }: { client: CustomerClient }) {
               ),
             },
             // 还没结束就没有结果、也还没扣费：这两列按 0 显示——"没收费"与"读不到"要分得开（C9）。
-            { title: '张数', dataIndex: 'image_count', align: 'right' },
+            {
+              title: '用量',
+              dataIndex: 'usage',
+              align: 'right',
+              render: (_: unknown, row: CustomerUsageRow) => usageText(row.type, row.usage),
+            },
             {
               title: '扣费（元）',
               dataIndex: 'charged_microusd',
@@ -192,7 +198,12 @@ export function UsagePage({ client }: { client: CustomerClient }) {
                 <Tag color={statusColor(value)}>{statusLabel(value)}</Tag>
               ),
             },
-            { title: '张数', dataIndex: 'image_count', align: 'right' },
+            {
+              title: '用量',
+              dataIndex: 'usage',
+              align: 'right',
+              render: (_: unknown, row: CustomerUsageRow) => usageText(row.type, row.usage),
+            },
             {
               title: '扣费（元）',
               dataIndex: 'charged_microusd',

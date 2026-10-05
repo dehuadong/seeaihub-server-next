@@ -31,6 +31,7 @@ test('缺折算率时在定价处当场录，录完立刻出人民币价', async
       native_model_id: vendorModel,
       gateway_model: 'e2e-inline-fx-seed-' + suffix,
       native_revision: 'e2e-1',
+      type: 'image',
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: capability,

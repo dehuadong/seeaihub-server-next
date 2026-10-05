@@ -122,3 +122,109 @@ async fn importing_the_same_material_twice_adds_no_rows() {
     drop(repository);
     drop_isolated_database(&database_name).await;
 }
+
+/// 同一 Vendor Model 修订改 `type` 与改合同同一条处置：拒并点名型号，不产生第二行、不改写既有行
+/// （Spec 0006 §4.4、A4）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL; derives a throwaway database"]
+async fn changing_the_type_of_an_existing_revision_is_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    let pool = repository.pool().clone();
+
+    import_supply_materials(&pool, &material_dir())
+        .await
+        .expect("the first import");
+    let before = table_counts(&pool).await;
+
+    // 同一身份、只把顶层 type 改成 video：导入必须拒并点名型号，既有行不动。
+    let edited =
+        std::env::temp_dir().join(format!("seeai-typed-material-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&edited).expect("temp material dir");
+    let original = std::fs::read_to_string(material_dir().join("gpt-image-2.5-flare.json"))
+        .expect("the bootstrap material");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&original).expect("the material is json");
+    value["type"] = serde_json::json!("video");
+    std::fs::write(
+        edited.join("gpt-image-2.5-flare.json"),
+        serde_json::to_string(&value).expect("serialize the edited material"),
+    )
+    .expect("write the edited material");
+
+    let error = import_supply_materials(&pool, &edited)
+        .await
+        .expect_err("changing the type must be rejected");
+    assert!(
+        error.to_string().contains("gpt-image-2.5-flare"),
+        "the error names the vendor model: {error}"
+    );
+    assert!(
+        error.to_string().contains("type is immutable"),
+        "the error says the type is immutable: {error}"
+    );
+    assert_eq!(
+        table_counts(&pool).await,
+        before,
+        "a rejected import must not add or rewrite any row"
+    );
+
+    std::fs::remove_dir_all(&edited).expect("clean the temp material dir");
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 素材缺 `type` 时导入失败并点名型号，库里不产生该 Vendor Model 行（Spec 0006 §4.4、A3）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL; derives a throwaway database"]
+async fn a_material_without_a_type_is_rejected_without_writing_a_row() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    let pool = repository.pool().clone();
+    let before = table_counts(&pool).await;
+
+    let edited = std::env::temp_dir().join(format!(
+        "seeai-untyped-material-{}",
+        Uuid::new_v4().simple()
+    ));
+    std::fs::create_dir_all(&edited).expect("temp material dir");
+    let original = std::fs::read_to_string(material_dir().join("gpt-image-2.5-flare.json"))
+        .expect("the bootstrap material");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&original).expect("the material is json");
+    value.as_object_mut().expect("object").remove("type");
+    std::fs::write(
+        edited.join("gpt-image-2.5-flare.json"),
+        serde_json::to_string(&value).expect("serialize the untyped material"),
+    )
+    .expect("write the untyped material");
+
+    let error = import_supply_materials(&pool, &edited)
+        .await
+        .expect_err("a material without type must be rejected");
+    assert!(
+        error.to_string().contains("gpt-image-2.5-flare"),
+        "the error names the vendor model: {error}"
+    );
+    assert!(
+        error.to_string().contains("does not declare type"),
+        "the error says the type is missing: {error}"
+    );
+    assert_eq!(
+        table_counts(&pool).await,
+        before,
+        "a rejected import must not write any row"
+    );
+
+    std::fs::remove_dir_all(&edited).expect("clean the temp material dir");
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}

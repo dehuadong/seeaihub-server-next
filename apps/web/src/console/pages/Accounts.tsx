@@ -30,6 +30,7 @@ import type {
   LedgerEntry,
 } from '../../shared/types';
 import { useLoadable } from '../../shared/ui';
+import { usageText } from '../../shared/model-usage';
 import { useScreenState } from '../screen-state';
 import { ConsoleNotFound, ConsolePage, Panel, whenText, yuanText } from '../ui';
 
@@ -711,7 +712,13 @@ function UsageModule({ client, accountId }: { client: AdminClient; accountId: st
               </Tag>
             ),
           },
-          { title: '张数', dataIndex: 'image_count', align: 'right', width: 80 },
+          {
+            title: '用量',
+            dataIndex: 'usage',
+            align: 'right',
+            width: 140,
+            render: (_: unknown, row: AdminUsageRow) => usageText(row.type, row.usage),
+          },
           {
             title: '扣费（元）',
             dataIndex: 'charged_microusd',

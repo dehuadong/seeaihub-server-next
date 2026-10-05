@@ -149,6 +149,10 @@ pub struct PublishRuntimeCommand {
     /// 厂商的修订标识。与 `vendor_id` 同理，引用式发布里可以不给。
     #[serde(default)]
     pub native_revision: Option<String>,
+    /// **模型类型**（`image` / `video` / `chat`）：内联发布必给；引用式发布由被引 Offering 所属的
+    /// Vendor Model 决定，调用方不给。
+    #[serde(rename = "type", default)]
+    pub model_type: Option<String>,
     /// **Vendor Model Contract**：调用方合同的唯一一份，模型级。
     ///
     /// 顶层可以省略：省略时回退用候选自带的旧字段（承载面与合同还是同一份），
@@ -229,6 +233,8 @@ pub struct PublishRuntimeRequest {
     /// 平台对客名：这次发布定义并原子替换的那个网关模型。
     pub gateway_model: String,
     pub native_revision: String,
+    /// 模型类型（`image` / `video` / `chat`）：随这次发布落进 Vendor Model 行。
+    pub model_type: String,
     pub actor: String,
     /// 该模型的调用方合同（模型级唯一一份，落库后不再改）。
     pub capability_schema: Value,
@@ -478,6 +484,7 @@ impl PublishRuntimeCommand {
             native_model_id,
             gateway_model,
             native_revision,
+            model_type: self.model_type.unwrap_or_default(),
             actor: self.actor,
             capability_schema,
             markup_bps: self.markup_bps,
@@ -515,6 +522,22 @@ impl PublishRuntimeCommand {
                     .to_owned(),
             )
         })?;
+        // 模型类型：内联发布必须给，引用式发布已由被引 Offering 所属的 Vendor Model 填好。取值域在
+        // 归一阶段拒（serde 的缺字段与未知取值发生在反序列化时，那时还不知道型号），点名型号与修订。
+        if !self
+            .model_type
+            .as_deref()
+            .is_some_and(|value| matches!(value, "image" | "video" | "chat"))
+        {
+            return Err(ApplicationError::Validation(format!(
+                "type is required and must be image / video / chat: vendor model {} revision {} declared {}",
+                self.native_model_id.as_deref().unwrap_or_default(),
+                self.native_revision.as_deref().unwrap_or_default(),
+                self.model_type
+                    .as_deref()
+                    .map_or("nothing".to_owned(), |value| format!("\"{value}\"")),
+            )));
+        }
         let offerings = self.normalize_array(drafts)?;
         self.validate_markup(&offerings)?;
         Ok(NormalizedPublication {
@@ -2234,8 +2257,10 @@ pub struct CustomerUsageView {
     ///
     /// 已完成请求按它归属区间，所以跨 UTC 日结算的扣费落在结算日那一笔（`0002` §5）。
     pub terminal_at: Option<DateTime<Utc>>,
-    /// 产出张数；失败或未完成时是 0。
-    pub image_count: u32,
+    /// 模型类型（`image` / `video` / `chat`）：受理时引用的 Vendor Model 的类型，之后改绑不改它。
+    pub model_type: String,
+    /// 本次执行按类型给出的量；该类型还没有量落点时为全空。
+    pub usage: UsageAmounts,
     /// 这一次实际扣掉的钱（人民币微单位）。
     pub charged_microusd: i64,
 }
@@ -2287,8 +2312,25 @@ pub fn customer_usage_status(state: seeai_domain::JobState) -> CustomerUsageStat
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 pub struct CustomerBillingSummary {
     pub requests: i64,
-    pub images: i64,
+    /// 区间内按类型分别合计的量；某类型没有值时对应的键缺省。
+    pub usage: UsageAmounts,
     pub charged_microusd: i64,
+}
+
+/// 一次执行（或一段区间）按模型类型给出的用量。
+///
+/// 四个键各自可有值：图片给产出张数、视频给秒数、对话给输入与输出 token。键之间不相加——张、秒、
+/// token 是三种量。只有有值的键出现，对象可以为空。
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UsageAmounts {
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub images: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub seconds: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<i64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<i64>,
 }
 
 /// 对客账务读的查询条件：**半开区间 `[since, until)`**，按 UTC 解释。
@@ -5621,11 +5663,13 @@ impl RuntimeService {
         command.native_model_id = Some(first.native_model_id.clone());
         command.native_revision = Some(first.native_revision.clone());
         command.capability_schema = Some(first.capability_schema.clone());
+        command.model_type = Some(first.model_type.clone());
         PublishRuntimeCommand {
             vendor_id: Some(first.vendor_id.clone()),
             native_model_id: Some(first.native_model_id.clone()),
             gateway_model: command.gateway_model.clone(),
             native_revision: Some(first.native_revision.clone()),
+            model_type: Some(first.model_type.clone()),
             capability_schema: Some(first.capability_schema.clone()),
             offerings: Some(offerings),
             references: None,
@@ -6131,6 +6175,8 @@ pub struct ReferencedOffering {
     pub vendor_id: String,
     pub native_model_id: String,
     pub native_revision: String,
+    /// 该 Vendor Model 的模型类型：引用式发布的类型由它决定。
+    pub model_type: String,
     /// 该厂商模型的调用方合同（模型级唯一一份）。
     pub capability_schema: Value,
     /// 渠道三要素：这次发布要按它把候选落到既有的那条供给行上。

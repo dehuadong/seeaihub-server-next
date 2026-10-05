@@ -51,6 +51,7 @@ async function publishHoldFixture(
       native_model_id: vendorModel,
       gateway_model: gatewayModel,
       native_revision: 'e2e-settled-1',
+      type: 'image',
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: schema,

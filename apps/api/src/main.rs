@@ -27,8 +27,8 @@ use seeai_application::{
     ProviderFailureView, PublicErrorCode, PublishRuntimeCommand, ReconciliationService,
     RecordedRequestInput, RefundReconciliationCommand, RequestCostCeiling, RequestFingerprintKeys,
     RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
-    decode_history_cursor, encode_history_cursor, invalid_history_cursor, settle_reserve_from_env,
-    with_admin_id,
+    UsageAmounts, decode_history_cursor, encode_history_cursor, invalid_history_cursor,
+    settle_reserve_from_env, with_admin_id,
 };
 use seeai_application::{
     ApiKeyIdentity, HeadObjectRequest, ImageUploadConfig, ImageUploadError, ImageUploadService,
@@ -1274,7 +1274,11 @@ struct AdminUsageRow {
     created_at: DateTime<Utc>,
     /// 终态时刻；已完成请求按它归属查询区间，未定终态时为空。
     terminal_at: Option<DateTime<Utc>>,
-    image_count: u32,
+    /// 模型类型（`image` / `video` / `chat`）：受理时引用的 Vendor Model 的类型。
+    #[serde(rename = "type")]
+    model_type: String,
+    /// 本次执行按类型给出的量；该类型还没有量落点时为全空。
+    usage: UsageAmounts,
     charged_microusd: i64,
 }
 
@@ -1313,7 +1317,8 @@ async fn list_account_usage(
             kind: row.kind,
             created_at: row.created_at,
             terminal_at: row.terminal_at,
-            image_count: row.image_count,
+            model_type: row.model_type,
+            usage: row.usage,
             charged_microusd: row.charged_microusd,
         })
         .collect::<Vec<_>>();
@@ -1929,7 +1934,11 @@ struct CustomerUsageRow {
     created_at: DateTime<Utc>,
     /// 终态时刻；已完成请求按它归属查询区间，未定终态时为空。
     terminal_at: Option<DateTime<Utc>>,
-    image_count: u32,
+    /// 模型类型（`image` / `video` / `chat`）：受理时引用的 Vendor Model 的类型。
+    #[serde(rename = "type")]
+    model_type: String,
+    /// 本次执行按类型给出的量；该类型还没有量落点时为全空。
+    usage: UsageAmounts,
     charged_microusd: i64,
 }
 
@@ -2263,7 +2272,8 @@ async fn read_customer_usage(
             kind: row.kind,
             created_at: row.created_at,
             terminal_at: row.terminal_at,
-            image_count: row.image_count,
+            model_type: row.model_type,
+            usage: row.usage,
             charged_microusd: row.charged_microusd,
         })
         .collect::<Vec<_>>();
@@ -2291,7 +2301,7 @@ async fn read_customer_billing(
         "since": billing.since,
         "until": billing.until,
         "requests": summary.requests,
-        "images": summary.images,
+        "usage": summary.usage,
         "charged_microusd": summary.charged_microusd,
     })))
 }
@@ -2592,6 +2602,9 @@ struct ModelCatalogEntry {
     vendor_id: String,
     /// 合同修订。
     revision: String,
+    /// 模型类型（`image` / `video` / `chat`）：客户端据此判断用量单位与表单参数面。
+    #[serde(rename = "type")]
+    model_type: String,
     /// 该模型的调用方合同（发布的 JSON Schema），客户端据此建表单。
     contract: Value,
 }
@@ -2602,12 +2615,14 @@ impl From<PublishedModel> for ModelCatalogEntry {
             gateway_model,
             vendor_id,
             native_revision,
+            model_type,
             capability_schema,
         } = model;
         Self {
             name: gateway_model.clone(),
             vendor_id,
             revision: native_revision,
+            model_type,
             contract: consumer_contract(capability_schema, &gateway_model),
         }
     }

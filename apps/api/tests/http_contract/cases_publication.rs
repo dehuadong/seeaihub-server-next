@@ -1195,9 +1195,10 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["contract", "name", "revision", "vendor_id"],
-            "目录条目只有 name / vendor_id / revision / contract 四个字段：{entry}"
+            vec!["contract", "name", "revision", "type", "vendor_id"],
+            "目录条目只有 name / vendor_id / revision / type / contract 五个字段：{entry}"
         );
+        assert_eq!(entry["type"].as_str(), Some("image"), "{entry}");
         assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
         assert_eq!(entry["revision"].as_str(), Some(revision));
         // 厂商原生名不进对客面：这两个型号的对客名恰好等于原生名，因此这里只钉住"响应里
@@ -1643,6 +1644,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         "vendor_id": "OpenAI",
         "native_model_id": "gpt-image-2",
         "native_revision": "2026-09-18-validated-1.3",
+        "type": "image",
         "actor": "bootstrap",
         "capability_schema": contract.clone(),
         "offerings": [{
@@ -1686,7 +1688,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         "不带对客名的命令必须照常可发布：{body}"
     );
 
-    // ── 目录逐位一致：name 是厂商原生名，形状就是新的四字段形状 ──
+    // ── 目录逐位一致：name 是厂商原生名，形状就是新的五字段形状 ──
     let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK, "{catalog}");
     assert_eq!(
@@ -1695,9 +1697,10 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
             "name": "gpt-image-2",
             "vendor_id": "OpenAI",
             "revision": "2026-09-18-validated-1.3",
+            "type": "image",
             "contract": contract,
         }]}),
-        "缺省回退之后目录与今天逐位一致：{catalog}"
+        "缺省回退之后目录与新增 type 逐位一致：{catalog}"
     );
 
     // ── 受理行为同样照旧：按回退出来的名字跑通 ──
@@ -2647,6 +2650,7 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
                 "vendor_id": vendor_id,
                 "native_model_id": model,
                 "native_revision": "route-test-1",
+                "type": "image",
                 "actor": "contract-test",
                 "capability_schema": contract,
                 "offerings": [full]
@@ -2679,8 +2683,8 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
     let channel = Uuid::new_v4();
     sqlx::query(
         "INSERT INTO catalog.vendor_models
-             (id, vendor_id, native_model_id, native_revision, capability_schema)
-         VALUES ($1, 'AIHubMix', $2, 'route-test-1', '{}'::jsonb)",
+             (id, vendor_id, native_model_id, native_revision, model_type, capability_schema)
+         VALUES ($1, 'AIHubMix', $2, 'route-test-1', 'image', '{}'::jsonb)",
     )
     .bind(vendor_model)
     .bind(per_image_model)
@@ -2954,6 +2958,7 @@ async fn the_offering_list_reports_whether_the_channel_declares_a_cost() {
             "vendor_id": "OpenAI",
             "native_model_id": model,
             "native_revision": "route-test-1",
+            "type": "image",
             "actor": "contract-test",
             "capability_schema": contract,
             "offerings": [full]
