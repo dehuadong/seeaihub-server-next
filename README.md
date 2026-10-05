@@ -18,6 +18,7 @@
 
 | 想知道什么 | 看哪 |
 | --- | --- |
+| **API 使用文档**（模型查询、各模型说明、素材上传与错误处理） | [`public-docs/`](public-docs/README.md) |
 | **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
 | **怎么上生产**（构建顺序、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
