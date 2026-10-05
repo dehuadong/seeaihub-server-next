@@ -65,6 +65,5 @@ curl -sS -X POST "$BASE/v1/uploads/images" \
 - 2026-10-05 平台签名与真实服务端联调（本机 `API_BIND=127.0.0.1:8081` 的 API；`UPLOAD_STORAGE_REGION` / `UPLOAD_STORAGE_BUCKET` / `UPLOAD_STORAGE_ACCESS_KEY_ID` / `UPLOAD_STORAGE_ACCESS_KEY_SECRET` 已配置，endpoint 省略、按 region 派生）：
   - §1 配置形状：进程照常启动，上传端点不回 `503 upload_storage_unavailable`。
   - §4 探针上传：`POST /v1/uploads/images` 发一次，`200`，`media_type=image/png`、`byte_length=67`；对象键 `reference-media/2026-10-05/12f251db-2154-4225-9bc0-bfca0a505fe1.png`。带禁覆盖头的 PUT 与 HEAD 元数据核验都被真实服务端接受，证明签名与 `/{bucket}/{key}` canonical URI 的拼装正确。
-  - §3 匿名读回：**不通过**。不带凭证读该对象返回 `403 AccessDenied`（`You have no right to access this object because of bucket acl.`，`EC 0003-00000001`），带与不带代理环境变量各试一次、结果相同。桶 `seeai` 当前不是匿名可读，不满足 Spec 0007 §8 的前置条件。
-  - 处置：按 Spec 0007 §8 把桶改成**公共读**，或对 `reference-media/*` 授予匿名 `GetObject`，再重跑本清单 §3；平台侧不做运行期降级。
+  - §3 匿名读回：**通过**。桶 `seeai` 改为匿名可读后，不带凭证读该对象返回 `200`、`image/png`、67 字节，与探针逐字节相同（带与不带代理环境变量各一次）。首次联调时桶 ACL 为私有，同样的一次读返回 `403 AccessDenied`（`EC 0003-00000001`）；按 Spec 0007 §8 改为公共读后通过。
   - 未做：本机没有 `ossutil` / `aliyun` CLI，带签名的逐字节读回没跑（PUT 后 HEAD 已按字节长度与内容类型核验）；探针对象由部署侧按保留策略清理。
