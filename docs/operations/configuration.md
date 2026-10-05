@@ -33,6 +33,9 @@
 | `GENERATION_MAX_CONCURRENT_JOBS` | `1` | **每账户**同时能有多少个在跑的生成任务（**不是**每个 worker 的并发） |
 | `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | 受理侧限流（每窗口请求数） |
 | `GENERATION_RATE_LIMIT_WINDOW_MS` | `60000` | 限流窗口（即默认每分钟 60 次） |
+| `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` | `10` | 公开鉴权端点（`<ENDPOINT>` 取 `REGISTER` / `LOGIN` / `REDEEM`）每窗口的失败尝试上限；超限对客 `429 rate_limit_exceeded` 带 `Retry-After` |
+| `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS` | `60000` | 上述三个端点各自的计数窗口 |
+| `AUTH_SOURCE_HEADER` | 不设 | 公开鉴权来源维采信的受信头（如 `x-real-ip`）；**不设时退回连接对端地址**。采信它要求 API 不能被绕过代理直连，见 [生产运维 §2.5](production.md#25-反向代理与-tls) |
 | `GENERATION_SYNC_WAIT_SECONDS` | `PROVIDER_TIMEOUT_SECONDS + 30` | 对客同步等待窗口。**必须 ≥ `PROVIDER_TIMEOUT_SECONDS`**，否则启动时拒绝并点名 |
 | `PROVIDER_TIMEOUT_SECONDS` | 按合同最大输出张数算出 | 上游调用超时上限：`基数 + max(0, n − 含张数) × 每张`。显式设了就以它为准 |
 | `PROVIDER_TIMEOUT_BASE_SECONDS` | `180` | 超时链的固定基数 |
@@ -136,7 +139,7 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 
 缓存**不是事实来源**：余额以数据库为准，不可达时读写都当未命中，不挂住请求。所以 Redis 故障是**降级**，不是故障。
 
-受理**不从缓存取候选**：直接执行每次受理直读数据库的 `supply` 候选查询。缓存里只放提交后的余额快照（写穿）、每把 API Key 的速率计数，以及历史 route 条目——后者由对账器按修订标识与网关模型开关清理，并写 `cache.route_invalidated` 审计。
+受理**不从缓存取候选**：直接执行每次受理直读数据库的 `supply` 候选查询。缓存里只放提交后的余额快照（写穿）、每把 API Key 的速率计数、公开鉴权端点的失败尝试计数（按端点、来源与身份），以及历史 route 条目——后者由对账器按修订标识与网关模型开关清理，并写 `cache.route_invalidated` 审计。
 
 ## 5. 渠道凭证
 

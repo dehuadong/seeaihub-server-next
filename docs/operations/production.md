@@ -284,6 +284,9 @@ sudo nginx -t && sudo systemctl reload nginx
 - `client_max_body_size` 要盖住生成入口的 16 MiB 正文上限（示例 `16m`）；`proxy_read_timeout` 不小于 `GENERATION_SYNC_WAIT_SECONDS`（默认是 `PROVIDER_TIMEOUT_SECONDS + 30`）；
 - 上传端点落地时，这条 `client_max_body_size` 必须盖住 `UPLOAD_MAX_REQUEST_BYTES`（单文件上限 20 MiB 加 multipart 协议余量；示例 `24m` 即 20 MiB 加 4 MiB 余量，实际取值以部署配的 `UPLOAD_MAX_REQUEST_BYTES` 为准）；上限不足的后果见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8；
 - API 绑在回环（`API_BIND=127.0.0.1:8081`），只让 nginx 够得到；证书用 certbot 之类签发即可。
+- 公开鉴权端点的来源维默认用**连接对端地址**；部署在反代之后时对端是 nginx 本身，要在 API 进程配
+  `AUTH_SOURCE_HEADER=x-real-ip`（nginx 用 `$remote_addr` 覆盖写它）才能区分真实客户端。**采信这个头
+  的前提是 API 不能被绕过代理直连**（示例已把 API 绑在回环）；能直连的调用方可以自带同名头伪造来源。
 
 ## 3. 启动与探活
 
