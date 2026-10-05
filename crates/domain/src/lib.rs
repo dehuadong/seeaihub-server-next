@@ -11,6 +11,7 @@ mod image_parameters;
 mod parameter_mapping;
 mod request_structure;
 mod size_spec;
+mod upload_media;
 pub use execution_protocol::{
     AttemptStage, ExecutionStage, FencingToken, MAX_PROVIDER_IDENTIFIER_BYTES, ProviderTaskHandle,
     ProviderTaskState, ProviderTraceId, RECEIPT_CREDENTIAL_HEX_LEN, ReceiptCredential,
@@ -36,6 +37,10 @@ pub use request_structure::{
     RequestStructureViolation, SUPPORTED_REQUEST_WIRE_BYTES,
 };
 pub use size_spec::{SizeForm, SizeProfile, SizeSpec, convert_size};
+pub use upload_media::{
+    MAX_UPLOAD_BYTES, OBJECT_KEY_PREFIX, UploadMediaType, UploadWriteFailure, new_object_key,
+    object_key, within_single_file_limit,
+};
 
 macro_rules! id_type {
     ($name:ident) => {
