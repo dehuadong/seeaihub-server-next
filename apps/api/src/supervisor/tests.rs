@@ -10,6 +10,10 @@ fn config(execution_slots: usize, max_memory_bytes: usize) -> SupervisorConfig {
         execution_memory_bytes: EXECUTION_MEMORY_BYTES,
         send_slots: 4,
         read_slots: 4,
+        upload_slots: 2,
+        upload_memory_bytes: 1024 * 1024,
+        upload_max_buffer_bytes: 2 * 1024 * 1024,
+        upload_slow_read_timeout: Duration::from_secs(1),
         slow_read_timeout: Duration::from_secs(1),
         shutdown_grace: Duration::from_secs(1),
         total_deadline: Duration::from_secs(30),
@@ -17,6 +21,19 @@ fn config(execution_slots: usize, max_memory_bytes: usize) -> SupervisorConfig {
         send_window: Duration::from_secs(5),
         ownership: None,
     }
+}
+
+#[test]
+fn upload_capacity_must_fit_the_upload_budget() {
+    // 上传侧容量组合：全部上传许可各预留一次请求体，预算盖不住就拒绝启动。
+    let mut oversized = config(1, EXECUTION_MEMORY_BYTES);
+    oversized.upload_slots = 4;
+    oversized.upload_memory_bytes = 1024 * 1024;
+    oversized.upload_max_buffer_bytes = 3 * 1024 * 1024;
+    assert!(Supervisor::new(oversized).is_err());
+    let mut zero_slots = config(1, EXECUTION_MEMORY_BYTES);
+    zero_slots.upload_slots = 0;
+    assert!(Supervisor::new(zero_slots).is_err());
 }
 
 #[test]

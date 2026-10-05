@@ -79,6 +79,14 @@ pub struct SupervisorConfig {
     pub read_slots: usize,
     /// 正文从开始接收到读完的上限。
     pub slow_read_timeout: Duration,
+    /// 本机同时读上传正文的许可数。
+    pub upload_slots: usize,
+    /// 单次上传要预留的字节：就是上传路由的请求体上限，不另立常数。
+    pub upload_memory_bytes: usize,
+    /// 本机上传内存预算。
+    pub upload_max_buffer_bytes: usize,
+    /// 上传正文从开始接收到读完的上限。
+    pub upload_slow_read_timeout: Duration,
     /// 停机的有限排空宽限期。
     pub shutdown_grace: Duration,
     /// Handler 等待执行结果的总期限 D。
@@ -208,6 +216,12 @@ impl Drop for SendLease {
             .active_sends
             .fetch_sub(1, Ordering::AcqRel);
     }
+}
+
+/// 一次上传正文读取的许可：上传读名额与单次上传的内存预留，`Drop` 时一起释放。
+pub struct UploadLease {
+    _slot: OwnedSemaphorePermit,
+    _memory: ByteBudgetPermit,
 }
 
 /// 一个本机正文读取名额。
@@ -472,6 +486,11 @@ pub struct Supervisor {
     memory: Arc<ByteBudget>,
     /// 单次执行预留的字节数（构造时校验过的取值）。
     execution_memory_bytes: usize,
+    /// 上传正文读取名额与上传内存预算：与生成的那一套互不相干。
+    upload_slots: Arc<Semaphore>,
+    upload_memory: Arc<ByteBudget>,
+    upload_memory_bytes: usize,
+    upload_slow_read_timeout: Duration,
     /// 停机取消的根闸；每次执行从它派生自己的取消/发送闸。
     gate: Arc<DispatchGate>,
     /// 每次执行各自的取消/发送闸；续约失败只置它自己那一份。Weak 不延命执行任务。
@@ -509,6 +528,27 @@ impl Supervisor {
                 config.execution_memory_bytes
             )));
         }
+        if config.upload_slots == 0 || config.upload_memory_bytes == 0 {
+            return Err(ApplicationError::Configuration(
+                "UPLOAD_SLOTS and UPLOAD_MAX_REQUEST_BYTES must be positive".to_owned(),
+            ));
+        }
+        // 上传侧容量组合：全部上传许可各预留一次请求体，预算必须盖得住，否则拒绝启动。
+        let upload_required = config
+            .upload_slots
+            .checked_mul(config.upload_memory_bytes)
+            .ok_or_else(|| {
+                ApplicationError::Configuration(
+                    "UPLOAD_SLOTS multiplied by UPLOAD_MAX_REQUEST_BYTES overflows".to_owned(),
+                )
+            })?;
+        if upload_required > config.upload_max_buffer_bytes {
+            return Err(ApplicationError::Configuration(format!(
+                "UPLOAD_SLOTS ({}) multiplied by UPLOAD_MAX_REQUEST_BYTES ({}) exceeds \
+                 UPLOAD_MAX_BUFFER_BYTES ({}); the upload capacity is not usable",
+                config.upload_slots, config.upload_memory_bytes, config.upload_max_buffer_bytes
+            )));
+        }
         Ok(Arc::new(Self {
             owner_id: format!("api-{}-{}", std::process::id(), Uuid::new_v4()),
             execution_slots: Arc::new(Semaphore::new(config.execution_slots)),
@@ -516,6 +556,10 @@ impl Supervisor {
             read_slots: Arc::new(Semaphore::new(config.read_slots)),
             memory: ByteBudget::new(config.max_memory_bytes),
             execution_memory_bytes: config.execution_memory_bytes,
+            upload_slots: Arc::new(Semaphore::new(config.upload_slots)),
+            upload_memory: ByteBudget::new(config.upload_max_buffer_bytes),
+            upload_memory_bytes: config.upload_memory_bytes,
+            upload_slow_read_timeout: config.upload_slow_read_timeout,
             gate: Arc::new(DispatchGate::new()),
             live_executions: Arc::new(Mutex::new(HashMap::new())),
             next_execution_id: AtomicU64::new(0),
@@ -798,12 +842,46 @@ impl Supervisor {
         }
     }
 
+    /// 取一个上传正文读取名额与单次上传的内存预留；任一取不到就拒绝，不排队。
+    ///
+    /// 它用**独立的一套**名额与字节预算，不挤占生成的读取名额与执行内存。
+    #[must_use]
+    pub fn try_reserve_upload(&self) -> Option<UploadLease> {
+        let slot = match self.upload_slots.clone().try_acquire_owned() {
+            Ok(slot) => slot,
+            Err(_) => {
+                tracing::warn!("refusing an upload: the upload read slots are exhausted");
+                return None;
+            }
+        };
+        let Some(memory) = self.upload_memory.try_acquire(self.upload_memory_bytes) else {
+            tracing::warn!(
+                upload_memory_bytes = self.upload_memory_bytes,
+                "refusing an upload: the upload memory budget cannot cover one request body"
+            );
+            return None;
+        };
+        Some(UploadLease {
+            _slot: slot,
+            _memory: memory,
+        })
+    }
+
+    /// 给上传正文套一个有界读完期限；与生成的慢读上限分开。
+    pub fn limit_upload_slow_read(&self, body: Body) -> (Body, SlowRead) {
+        self.limit_slow_read_with(body, self.upload_slow_read_timeout)
+    }
+
     /// 给请求正文套一个有界读完期限；超时置位共享标志，并把读取错误交给提取器。
     pub fn limit_slow_read(&self, body: Body) -> (Body, SlowRead) {
+        self.limit_slow_read_with(body, self.slow_read_timeout)
+    }
+
+    fn limit_slow_read_with(&self, body: Body, timeout: Duration) -> (Body, SlowRead) {
         let slow = SlowRead::default();
         let stream = DeadlineBody {
             inner: Box::pin(body.into_data_stream()),
-            timer: Box::pin(tokio::time::sleep(self.slow_read_timeout)),
+            timer: Box::pin(tokio::time::sleep(timeout)),
             timed_out: slow.timed_out.clone(),
             expired: false,
         };

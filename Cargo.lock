@@ -2139,6 +2139,7 @@ dependencies = [
  "rustix",
  "seeai-adapter-aihubmix",
  "seeai-adapter-apimart",
+ "seeai-adapter-object-storage",
  "seeai-adapter-sdk",
  "seeai-alert-webhook",
  "seeai-application",

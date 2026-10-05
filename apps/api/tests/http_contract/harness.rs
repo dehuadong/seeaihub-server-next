@@ -77,6 +77,8 @@ mod cases_publication;
 mod cases_retry;
 #[path = "cases_routing.rs"]
 mod cases_routing;
+#[path = "cases_upload.rs"]
+mod cases_upload;
 
 // 夹具自身的检查：不启平台进程、不用数据库，因此不进 `#[ignore]`，由 workspace 单测那一步跑。
 #[path = "harness_check.rs"]
@@ -91,6 +93,10 @@ const CONTRACT_CURSOR_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 const CONTRACT_FINGERPRINT_KEY: &str = "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
 /// 直接执行时渠道凭证的假值：只在本机假上游上用过，不写配置、日志或响应。
 const CONTRACT_PROVIDER_KEY: &str = "contract-test-key";
+/// 假对象存储的桶名与访问密钥：只在测试进程与子进程环境里用，不写进配置或响应。
+const UPLOAD_BUCKET: &str = "contract-upload-bucket";
+const UPLOAD_ACCESS_KEY_ID: &str = "contract-upload-id";
+const UPLOAD_ACCESS_KEY_SECRET: &str = "contract-upload-secret";
 
 /// 一个最小合法 PNG（1×1），用作假上游返回的结果图，也用作调用方传的参考图。
 const PNG_FIXTURE: &[u8] = &[
@@ -658,6 +664,217 @@ async fn read_request(
     Ok((method, path, body))
 }
 
+/// 假对象存储的行为：脚本化的失败与元数据，用来构造失败分类、重试与核验不一致的形态。
+#[derive(Clone, Default)]
+struct ObjectStorageBehaviour {
+    /// 依次给前几次 PUT 的状态码；用完之后一律成功。`0` 表示成功。
+    put_statuses: Vec<u16>,
+    /// 依次给前几次 HEAD 的状态码；用完之后一律成功。`0` 表示成功。
+    head_statuses: Vec<u16>,
+    /// HEAD 报告的字节长度相对写入值的偏移：非零即"写入后元数据与提交不一致"。
+    head_byte_length_delta: i64,
+    /// HEAD 报告的内容类型覆盖；`None` 表示按对象键扩展名推导。
+    head_content_type: Option<String>,
+    /// 让假对象存储把 PUT 停住等用例放行：用来把上传名额占住，观察 429 upload_busy。
+    hold_put: Option<Arc<UpstreamGate>>,
+}
+
+/// 一次假对象存储上的调用。
+struct ObjectStoreCall {
+    method: String,
+    path: String,
+    byte_length: usize,
+}
+
+/// 一个存下来的对象。
+struct StoredObject {
+    content_type: String,
+    bytes: Vec<u8>,
+}
+
+/// 进程内假对象存储：接收平台的 PUT 与 HEAD，并对外提供匿名 GET（用例读公网 URL）。
+struct FakeObjectStorage {
+    endpoint: String,
+    calls: Arc<Mutex<Vec<ObjectStoreCall>>>,
+    _task: tokio::task::JoinHandle<()>,
+}
+
+impl FakeObjectStorage {
+    fn calls(&self) -> Vec<(String, String, usize)> {
+        self.calls
+            .lock()
+            .expect("object store calls lock")
+            .iter()
+            .map(|call| (call.method.clone(), call.path.clone(), call.byte_length))
+            .collect()
+    }
+
+}
+
+async fn start_fake_object_storage(behaviour: ObjectStorageBehaviour) -> FakeObjectStorage {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("fake object storage binds");
+    let port = listener.local_addr().expect("addr").port();
+    let objects: Arc<Mutex<std::collections::HashMap<String, StoredObject>>> =
+        Arc::new(Mutex::new(std::collections::HashMap::new()));
+    let calls = Arc::new(Mutex::new(Vec::new()));
+    let behaviour = Arc::new(behaviour);
+    let put_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let head_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let task = {
+        let objects = objects.clone();
+        let calls = calls.clone();
+        let behaviour = behaviour.clone();
+        let put_count = put_count.clone();
+        let head_count = head_count.clone();
+        tokio::spawn(async move {
+            loop {
+                let Ok((mut socket, _)) = listener.accept().await else {
+                    break;
+                };
+                let objects = objects.clone();
+                let calls = calls.clone();
+                let behaviour = behaviour.clone();
+                let put_count = put_count.clone();
+                let head_count = head_count.clone();
+                tokio::spawn(async move {
+                    let _ = serve_fake_object_storage(
+                        &mut socket,
+                        objects,
+                        calls,
+                        behaviour,
+                        put_count,
+                        head_count,
+                    )
+                    .await;
+                });
+            }
+        })
+    };
+    FakeObjectStorage {
+        endpoint: format!("http://127.0.0.1:{port}"),
+        calls,
+        _task: task,
+    }
+}
+
+async fn serve_fake_object_storage(
+    socket: &mut tokio::net::TcpStream,
+    objects: Arc<Mutex<std::collections::HashMap<String, StoredObject>>>,
+    calls: Arc<Mutex<Vec<ObjectStoreCall>>>,
+    behaviour: Arc<ObjectStorageBehaviour>,
+    put_count: Arc<std::sync::atomic::AtomicUsize>,
+    head_count: Arc<std::sync::atomic::AtomicUsize>,
+) -> std::io::Result<()> {
+    use std::sync::atomic::Ordering;
+    let (method, path, body) = read_request(socket).await?;
+    if let Ok(mut calls) = calls.lock() {
+        calls.push(ObjectStoreCall {
+            method: method.clone(),
+            path: path.clone(),
+            byte_length: body.len(),
+        });
+    }
+    match method.as_str() {
+        "PUT" => {
+            if let Some(gate) = behaviour.hold_put.as_ref() {
+                let ordinal = gate.arrivals.fetch_add(1, Ordering::SeqCst) + 1;
+                gate.arrival_notify.notify_waiters();
+                gate.arrive_and_hold(ordinal).await;
+            }
+            let index = put_count.fetch_add(1, Ordering::SeqCst);
+            let status = behaviour.put_statuses.get(index).copied().unwrap_or(0);
+            if status != 0 {
+                return write_response(socket, status, "Error", "application/xml", b"<Error/>").await;
+            }
+            let content_type = content_type_for_path(&path);
+            objects
+                .lock()
+                .expect("object store objects lock")
+                .insert(
+                    path,
+                    StoredObject {
+                        content_type,
+                        bytes: body,
+                    },
+                );
+            write_response(socket, 200, "OK", "application/xml", b"").await
+        }
+        "HEAD" => {
+            let index = head_count.fetch_add(1, Ordering::SeqCst);
+            let status = behaviour.head_statuses.get(index).copied().unwrap_or(0);
+            if status != 0 {
+                return write_response(socket, status, "Error", "application/xml", b"").await;
+            }
+            let stored = objects
+                .lock()
+                .expect("object store objects lock")
+                .get(&path)
+                .map(|object| (object.bytes.len(), object.content_type.clone()));
+            match stored {
+                Some((length, content_type)) => {
+                    let reported = if behaviour.head_byte_length_delta == 0 {
+                        length
+                    } else {
+                        usize::try_from(
+                            i64::try_from(length).unwrap_or(i64::MAX)
+                                + behaviour.head_byte_length_delta,
+                        )
+                        .unwrap_or(0)
+                    };
+                    let content_type = behaviour
+                        .head_content_type
+                        .clone()
+                        .unwrap_or(content_type);
+                    write_head_response(socket, 200, reported, &content_type).await
+                }
+                None => write_response(socket, 404, "Not Found", "application/xml", b"").await,
+            }
+        }
+        "GET" => {
+            let stored = objects
+                .lock()
+                .expect("object store objects lock")
+                .get(&path)
+                .map(|object| (object.bytes.clone(), object.content_type.clone()));
+            match stored {
+                Some((bytes, content_type)) => {
+                    write_response(socket, 200, "OK", &content_type, &bytes).await
+                }
+                None => write_response(socket, 404, "Not Found", "text/plain", b"").await,
+            }
+        }
+        _ => write_response(socket, 405, "Method Not Allowed", "text/plain", b"").await,
+    }
+}
+
+/// HEAD 响应：有 content-length 与 content-type，但没有正文。
+async fn write_head_response(
+    socket: &mut tokio::net::TcpStream,
+    status: u16,
+    content_length: usize,
+    content_type: &str,
+) -> std::io::Result<()> {
+    use tokio::io::AsyncWriteExt;
+    let head = format!(
+        "HTTP/1.1 {status} OK\r\ncontent-type: {content_type}\r\ncontent-length: {content_length}\r\nconnection: close\r\n\r\n"
+    );
+    socket.write_all(head.as_bytes()).await?;
+    socket.flush().await
+}
+
+/// 对象键扩展名反推内容类型：平台写入时用的就是同一个规范 MIME。
+fn content_type_for_path(path: &str) -> String {
+    if path.ends_with(".png") {
+        "image/png".to_owned()
+    } else if path.ends_with(".webp") {
+        "image/webp".to_owned()
+    } else {
+        "image/jpeg".to_owned()
+    }
+}
+
 /// 一个只收告警的本地接收器：记下每条请求的正文（告警就是 JSON），按给定状态码应答。
 ///
 /// 告警是**旁路**，所以接收器可以正常应答、回错、或者根本不存在：三种都只该影响"送出去了没有"，
@@ -910,6 +1127,7 @@ fn api_probe_command(database_url: &str, port: u16, admin_token: &str) -> Comman
         .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
         .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
         .current_dir(std::env::temp_dir());
+    remove_upload_env(&mut command);
     command
 }
 
@@ -1045,6 +1263,21 @@ async fn probe_api_startup_with_execution_capacity(
     probe_running_and_stderr(command).await
 }
 
+/// 起一个 API 进程，只额外给上传存储的环境变量，回报"还在跑吗"与 stderr。
+///
+/// 上传存储的其他变量由 `api_probe_command` 显式移除，所以这里给的每一个都是"探针要探的那一个"。
+async fn probe_api_startup_with_upload_env(
+    database_url: &str,
+    env: &[(&str, &str)],
+) -> (bool, String) {
+    let mut command = api_probe_command(database_url, probe_port(), "upload-probe-token");
+    command.stdout(Stdio::null()).stderr(Stdio::piped());
+    for (name, value) in env {
+        command.env(name, value);
+    }
+    probe_running_and_stderr(command).await
+}
+
 /// 起一个已经装配好的命令，等它要么退出一场配置错误、要么真的开始服务，并回报 stderr。
 ///
 /// 只用于"启动该失败/该成功"这一类判据：不查 `/health`、不写夹具，也不会把一个还在跑的探针
@@ -1139,6 +1372,34 @@ struct ApiProcessSettings {
     auth_attempt_limit: Option<(u64, u64)>,
     /// 公开鉴权端点来源维采信的受信头。缺省不配，进程退回连接对端地址。
     auth_source_header: Option<String>,
+    /// 上传存储夹具：给了就在起进程时配上假对象存储（region/bucket/密钥固定，endpoint 由
+    /// `Harness::build` 填）。缺省不配——进程按"上传存储未配置"启动，上传端点回 503。
+    upload_storage: Option<UploadStorageFixture>,
+}
+
+/// 一次用例的上传存储夹具：假对象存储的行为与进程级上传上限。
+#[derive(Clone, Default)]
+struct UploadStorageFixture {
+    behaviour: ObjectStorageBehaviour,
+    /// 假对象存储地址；由 `Harness::build` 在起进程之前填上。
+    endpoint: Option<String>,
+    max_request_bytes: Option<usize>,
+    slots: Option<usize>,
+    max_buffer_bytes: Option<usize>,
+    slow_read_timeout_seconds: Option<u64>,
+    retry_max_attempts: Option<u32>,
+    retry_backoff_base_seconds: Option<u64>,
+    /// 每 API Key 每窗口的上传请求数与窗口毫秒数。
+    rate_limit: Option<(u64, u64)>,
+}
+
+impl UploadStorageFixture {
+    fn with_behaviour(behaviour: ObjectStorageBehaviour) -> Self {
+        Self {
+            behaviour,
+            ..Self::default()
+        }
+    }
 }
 
 /// 一次用例的全部进程配置：API 进程那一套与发布时的修订级加价系数。
@@ -1359,6 +1620,7 @@ async fn start_api_with(
                 command.env(name, value.to_string());
             }
         }
+        apply_upload_env(&mut command, settings.upload_storage.as_ref());
         let child = command.spawn().expect("API process should start");
         // 拿住这个进程：重试时要先杀掉它，端口才真的回到空闲池。
         let mut process = ApiProcess { child };
@@ -1460,6 +1722,8 @@ struct Harness {
     cache: Option<CacheFixture>,
     /// 这次用例假上游上的闸门（没配 [`UpstreamBehaviour::holding`] 时为 `None`）。
     hold: Option<Arc<UpstreamGate>>,
+    /// 这次用例的假对象存储；没配上传夹具时为 `None`。
+    upload_storage: Option<FakeObjectStorage>,
 }
 
 impl Harness {
@@ -1574,6 +1838,65 @@ impl Harness {
             max_concurrent_jobs,
             sync_wait_seconds,
             CaseSettings::default(),
+        )
+        .await
+    }
+
+    /// 起一套带上传存储夹具的装置：假上游照旧，上传端点指向进程内假对象存储。
+    ///
+    /// 上传与生成共用同一个 Supervisor（第二套上传名额与预算）与同一套客户凭证，因此这里照常
+    /// 发布一条供给、签发一把密钥，只是用例发的是上传请求。
+    async fn start_with_upload_storage(
+        upload: UploadStorageFixture,
+        behaviour: UpstreamBehaviour,
+    ) -> Self {
+        Self::build(
+            candidate(
+                "APIMart",
+                "apimart-image-v1",
+                &["prompt_only", "image_conditioned", "masked"],
+            ),
+            None,
+            behaviour,
+            64,
+            30,
+            CaseSettings {
+                api: ApiProcessSettings {
+                    upload_storage: Some(upload),
+                    ..ApiProcessSettings::default()
+                },
+                ..CaseSettings::default()
+            },
+        )
+        .await
+    }
+
+    /// 同 [`Self::start_with_upload_storage`]，但给 API 配上**加速层**（假 Redis）。
+    ///
+    /// 上传的每 API Key 限流与生成的限流一样落在缓存上：没有缓存时计数无处可落，限流不生效。
+    async fn start_with_upload_storage_and_cache(
+        upload: UploadStorageFixture,
+        behaviour: UpstreamBehaviour,
+        cache: CacheFixture,
+    ) -> Self {
+        Self::build(
+            candidate(
+                "APIMart",
+                "apimart-image-v1",
+                &["prompt_only", "image_conditioned", "masked"],
+            ),
+            None,
+            behaviour,
+            64,
+            30,
+            CaseSettings {
+                api: ApiProcessSettings {
+                    upload_storage: Some(upload),
+                    cache: Some(cache),
+                    ..ApiProcessSettings::default()
+                },
+                ..CaseSettings::default()
+            },
         )
         .await
     }
@@ -1805,13 +2128,23 @@ impl Harness {
         behaviour: UpstreamBehaviour,
         max_concurrent_jobs: u64,
         sync_wait_seconds: u64,
-        settings: CaseSettings,
+        mut settings: CaseSettings,
     ) -> Self {
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
         // 闸门句柄要在 behaviour 交给假上游之前取出来：用例侧拿它等到达、放行。
         let hold = behaviour.hold.as_ref().map(|(_, gate)| gate.clone());
         let upstream = start_fake_upstream_with(calls.clone(), behaviour).await;
+        // 上传夹具：先把假对象存储起起来，再把它的地址填进进程配置，API 子进程才连得上。
+        let upload_storage = match settings.api.upload_storage.take() {
+            Some(mut fixture) => {
+                let storage = start_fake_object_storage(fixture.behaviour.clone()).await;
+                fixture.endpoint = Some(storage.endpoint.clone());
+                settings.api.upload_storage = Some(fixture);
+                Some(storage)
+            }
+            None => None,
+        };
         let (base_url, admin_token, process) = start_api_with(
             &database_url,
             sync_wait_seconds,
@@ -1877,6 +2210,7 @@ impl Harness {
             _upstream: upstream,
             cache: settings.api.cache,
             hold,
+            upload_storage,
         }
     }
 
@@ -1942,6 +2276,44 @@ impl Harness {
             // 上面这行在解析失败时把原文留在 Value 里，断言失败时看得见响应体。
         )
     }
+    /// 走上传端点发一次 multipart 请求（字段名固定 `file`）。
+    async fn upload(&self, part: reqwest::multipart::Part) -> (StatusCode, Value) {
+        let form = reqwest::multipart::Form::new().part("file", part);
+        self.upload_form(form).await
+    }
+
+    /// 走上传端点发一次任意 multipart 表单：缺 `file`、多个部件等形态由用例自己构造。
+    async fn upload_form(&self, form: reqwest::multipart::Form) -> (StatusCode, Value) {
+        let response = Client::new()
+            .post(format!("{}/v1/uploads/images", self.base_url))
+            .bearer_auth(&self.api_key)
+            .multipart(form)
+            .send()
+            .await
+            .expect("upload request");
+        let status = response.status();
+        let body = response.text().await.expect("upload response body");
+        (
+            status,
+            serde_json::from_str(&body).unwrap_or(Value::String(body)),
+        )
+    }
+
+    /// 这次用例的假对象存储。
+    fn object_storage(&self) -> &FakeObjectStorage {
+        self.upload_storage
+            .as_ref()
+            .expect("this case must run with the upload storage fixture")
+    }
+
+    /// 用不带凭证的客户端读一个公网 URL，返回状态码与字节。
+    async fn read_public(&self, url: &str) -> (StatusCode, Vec<u8>) {
+        let response = Client::new().get(url).send().await.expect("public read");
+        let status = response.status();
+        let bytes = response.bytes().await.expect("public read body").to_vec();
+        (status, bytes)
+    }
+
 
     /// 按幂等键取回这次请求内部的执行记录：`(job_id, state)`。
     ///
@@ -3592,6 +3964,86 @@ impl CacheFixture {
 }
 
 /// 给子进程装上加速层的那几个环境变量。
+/// 上传存储的全部环境变量：显式移除它们，让"没配"是真的没配（本机 `.env` 或 shell 里可能有）。
+const UPLOAD_ENV_NAMES: [&str; 14] = [
+    "UPLOAD_STORAGE_REGION",
+    "UPLOAD_STORAGE_BUCKET",
+    "UPLOAD_STORAGE_ENDPOINT",
+    "UPLOAD_STORAGE_ACCESS_KEY_ID",
+    "UPLOAD_STORAGE_ACCESS_KEY_SECRET",
+    "UPLOAD_MAX_REQUEST_BYTES",
+    "UPLOAD_SLOTS",
+    "UPLOAD_MAX_BUFFER_BYTES",
+    "UPLOAD_REQUEST_TIMEOUT_SECONDS",
+    "UPLOAD_SLOW_READ_TIMEOUT_SECONDS",
+    "UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW",
+    "UPLOAD_RATE_LIMIT_WINDOW_MS",
+    "UPLOAD_RETRY_MAX_ATTEMPTS",
+    "UPLOAD_RETRY_BACKOFF_BASE_SECONDS",
+];
+
+/// 显式移除上传存储的整组环境变量。
+fn remove_upload_env(command: &mut Command) {
+    for name in UPLOAD_ENV_NAMES {
+        command.env_remove(name);
+    }
+}
+
+/// 按夹具给上传存储配上环境变量；夹具没有 endpoint 时保持"未配置"。
+fn apply_upload_env(command: &mut Command, upload: Option<&UploadStorageFixture>) {
+    remove_upload_env(command);
+    let Some(upload) = upload else {
+        return;
+    };
+    let Some(endpoint) = upload.endpoint.as_ref() else {
+        return;
+    };
+    command
+        .env("UPLOAD_STORAGE_REGION", "cn-hangzhou")
+        .env("UPLOAD_STORAGE_BUCKET", UPLOAD_BUCKET)
+        .env("UPLOAD_STORAGE_ENDPOINT", endpoint)
+        .env("UPLOAD_STORAGE_ACCESS_KEY_ID", UPLOAD_ACCESS_KEY_ID)
+        .env("UPLOAD_STORAGE_ACCESS_KEY_SECRET", UPLOAD_ACCESS_KEY_SECRET);
+    for (name, value) in [
+        (
+            "UPLOAD_MAX_REQUEST_BYTES",
+            upload.max_request_bytes.map(|value| value.to_string()),
+        ),
+        (
+            "UPLOAD_SLOTS",
+            upload.slots.map(|value| value.to_string()),
+        ),
+        (
+            "UPLOAD_MAX_BUFFER_BYTES",
+            upload.max_buffer_bytes.map(|value| value.to_string()),
+        ),
+        (
+            "UPLOAD_SLOW_READ_TIMEOUT_SECONDS",
+            upload.slow_read_timeout_seconds.map(|value| value.to_string()),
+        ),
+        (
+            "UPLOAD_RETRY_MAX_ATTEMPTS",
+            upload.retry_max_attempts.map(|value| value.to_string()),
+        ),
+        (
+            "UPLOAD_RETRY_BACKOFF_BASE_SECONDS",
+            upload.retry_backoff_base_seconds.map(|value| value.to_string()),
+        ),
+        (
+            "UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW",
+            upload.rate_limit.map(|value| value.0.to_string()),
+        ),
+        (
+            "UPLOAD_RATE_LIMIT_WINDOW_MS",
+            upload.rate_limit.map(|value| value.1.to_string()),
+        ),
+    ] {
+        if let Some(value) = value {
+            command.env(name, value);
+        }
+    }
+}
+
 fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
     let Some(cache) = cache else {
         // **显式**把 `REDIS_URL` 置空来表达"没有缓存"：API 与 Worker 进程用 `dotenvy` 加载仓库

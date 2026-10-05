@@ -1,4 +1,5 @@
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use axum::{
     Json, Router,
     extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State, multipart::Field},
@@ -10,6 +11,7 @@ use base64::{Engine, engine::general_purpose::STANDARD};
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
+use seeai_adapter_object_storage::OssObjectStorage;
 use seeai_adapter_sdk::{DecodedImage, InputImage};
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
@@ -28,11 +30,17 @@ use seeai_application::{
     decode_history_cursor, encode_history_cursor, invalid_history_cursor, settle_reserve_from_env,
     with_admin_id,
 };
+use seeai_application::{
+    ApiKeyIdentity, HeadObjectRequest, ImageUploadConfig, ImageUploadError, ImageUploadService,
+    NeverCancelled, ObjectMetadata, ObjectStorage, ObjectStorageCredentials, PutObjectRequest,
+    UploadCancellation,
+};
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
     AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, LedgerEntryKind, OfferingId,
     PublishedModel, RequestJsonError, RequestJsonLimits, RequestParameters, RoutePolicy,
-    RouteStrategy, contract_image_parameter_kind, replace_contract_model_identity,
+    RouteStrategy, UploadWriteFailure, contract_image_parameter_kind,
+    replace_contract_model_identity,
 };
 use seeai_persistence::{
     PgHubRepository, material_import::import_supply_materials_from_env, max_declared_output_images,
@@ -63,6 +71,44 @@ struct DirectGeneration {
     supervisor: Arc<Supervisor>,
     /// 请求 JSON 结构的四条计数上限：缺省从支持的 wire 范围推导，配置只能收紧（RFC 0018 §2.2）。
     request_json_limits: RequestJsonLimits,
+}
+
+/// 上传端点随进程装配的一份用例、限流与配置。
+#[derive(Clone)]
+struct ImageUpload {
+    service: Arc<ImageUploadService>,
+    /// 上传的每 API Key 限流走独立命名空间，不挤占生成的配额。
+    acceleration: Arc<AccelerationService>,
+    config: Arc<ImageUploadConfig>,
+}
+
+/// 未配置上传存储时占位的对象存储端口：上传用例在碰它之前就返回 503，它不该被调用。
+struct UnconfiguredObjectStorage;
+
+#[async_trait]
+impl ObjectStorage for UnconfiguredObjectStorage {
+    async fn put_object(
+        &self,
+        _request: PutObjectRequest<'_>,
+        _credentials: ObjectStorageCredentials<'_>,
+    ) -> Result<(), UploadWriteFailure> {
+        Err(UploadWriteFailure::Terminal)
+    }
+
+    async fn head_object(
+        &self,
+        _request: HeadObjectRequest<'_>,
+        _credentials: ObjectStorageCredentials<'_>,
+    ) -> Result<ObjectMetadata, UploadWriteFailure> {
+        Err(UploadWriteFailure::Terminal)
+    }
+}
+
+/// 客户端断开就是上传的取消信号：重试编排读到它就停止取退避与下一次 PUT。
+impl UploadCancellation for ConnectionScope {
+    fn is_cancelled(&self) -> bool {
+        ConnectionScope::is_cancelled(self)
+    }
 }
 
 /// 直接执行的渠道凭证：只从环境变量读，交给 Adapter，不落库、不日志。
@@ -103,6 +149,8 @@ struct AppState {
     route_policies: RoutePolicyService,
     /// 同步直接执行：唯一执行路径，没有开关。
     direct: Arc<DirectGeneration>,
+    /// 上传端点：写入上传存储换公网 URL，不计费、不计量、不建执行记录。
+    upload: Arc<ImageUpload>,
     /// 健康探测的依赖判据：探一次事实源是否可达（只 `SELECT 1`）。
     repository: Arc<dyn HubRepository>,
     /// 会话有效期（管理员与客户同一档）：部署期配置，缺省 12 小时。
@@ -259,6 +307,10 @@ async fn main() -> Result<()> {
         );
     }
 
+    // 上传端点与上传存储的配置：整组上传存储变量都不给＝未配置，进程照常启动；只给一部分或
+    // 形状不合法＝拒绝启动并点名变量。对象存储只有阿里云 OSS 一种，不读数据库、不做活体探测。
+    let upload_config = ImageUploadConfig::from_env().map_err(anyhow::Error::from)?;
+
     // 图片生成只有这一条执行路径：本进程直接调 Provider，不建生成 Job、不轮询结果。指纹密钥与
     // 渠道凭证在这里无条件读取，缺任何一项都拒绝启动——不存在"关掉它就走旧路径"的开关。
     let direct_execution = {
@@ -369,6 +421,10 @@ async fn main() -> Result<()> {
             execution_memory_bytes,
             send_slots,
             read_slots,
+            upload_slots: upload_config.slots,
+            upload_memory_bytes: upload_config.max_request_bytes,
+            upload_max_buffer_bytes: upload_config.max_buffer_bytes,
+            upload_slow_read_timeout: upload_config.slow_read_timeout,
             slow_read_timeout: Duration::from_secs(generation_env_u64(
                 "GENERATION_SLOW_READ_TIMEOUT_SECONDS",
                 30,
@@ -406,6 +462,27 @@ async fn main() -> Result<()> {
             request_json_limits,
         })
     };
+    // 上传用例：存储配置缺失时用占位端口（用例在碰它之前就返回 503），配置齐全时用 OSS 适配器。
+    // 访问密钥不进这里：它们按请求经凭证端口解析。
+    let upload = {
+        let storage: Arc<dyn ObjectStorage> = match upload_config.storage.as_ref() {
+            Some(storage) => Arc::new(
+                OssObjectStorage::new(storage.region.clone(), upload_config.request_timeout)
+                    .map_err(anyhow::Error::from)?,
+            ),
+            None => Arc::new(UnconfiguredObjectStorage),
+        };
+        Arc::new(ImageUpload {
+            service: Arc::new(ImageUploadService::new(
+                storage,
+                Arc::new(EnvironmentCredentialProvider),
+                upload_config.clone(),
+            )),
+            acceleration: acceleration.clone(),
+            config: Arc::new(upload_config.clone()),
+        })
+    };
+
     // 账实核对：比对**账户当前值**与它自己的**明细**。它**不是**上面那个缓存对账——那个问的是
     // "缓存里的值还是不是库里的值"，做法是以库为准覆盖缓存，改的是缓存；这条问的是"库里那个
     // 余额与占用还是不是它自己那本账的和"，两边都是库里的**事实**。它只发现、不改账：不一致就
@@ -445,6 +522,7 @@ async fn main() -> Result<()> {
         history_cursor_key: history_cursor_key()?,
         auth_source_header: auth_source_header()?,
         direct: direct_execution.clone(),
+        upload: upload.clone(),
     };
     // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
     seed_admin_account(&state).await?;
@@ -532,6 +610,17 @@ async fn main() -> Result<()> {
             state.clone(),
             require_generation_access,
         ));
+    // 上传入口：路由级正文上限盖过合并后的全局 16 MiB 上限（Spec 0007 §2.2）；认证、上传速率与
+    // 本机上传读取许可都在消费正文之前完成。
+    let upload_routes = Router::new()
+        .route("/v1/uploads/images", post(upload_image))
+        .route_layer(DefaultBodyLimit::max(
+            state.upload.config.max_request_bytes,
+        ))
+        .route_layer(axum::middleware::from_fn_with_state(
+            state.clone(),
+            require_upload_access,
+        ));
     // **公开与对客面**：不挂管理认证。登录、退出、凭令牌兑换各自认自己的凭据。
     let public = Router::new()
         .route("/health", get(health))
@@ -568,7 +657,8 @@ async fn main() -> Result<()> {
         .route("/v1/customer/ledger", get(read_customer_ledger))
         .route("/v1/customer/usage", get(read_customer_usage))
         .route("/v1/customer/billing", get(read_customer_billing))
-        .merge(image_routes);
+        .merge(image_routes)
+        .merge(upload_routes);
     let app = admin
         .merge(public)
         .layer(DefaultBodyLimit::max(
@@ -2922,6 +3012,211 @@ async fn require_generation_access(
     parts.extensions.insert(slow);
     let request = axum::extract::Request::from_parts(parts, body);
     Ok(next.run(request).await)
+}
+
+/// 没有连接监视时的上传取消信号。
+static NEVER_CANCELLED: NeverCancelled = NeverCancelled;
+
+/// 上传端点的成功响应：公网可读 URL、服务端判定的规范 MIME 与实际写入字节数。
+#[derive(Debug, Serialize)]
+struct UploadImageResponse {
+    url: String,
+    media_type: &'static str,
+    byte_length: u64,
+}
+
+/// 上传入口的认证与准入：认证、独立命名空间的速率、本机上传读取许可都在消费正文之前完成。
+///
+/// 读取许可在中间件里持有到 handler 结束，因此正文读取与写入都在它的名额与预算之下；取不到就
+/// 直接 429 upload_busy，不排队。
+async fn require_upload_access(
+    State(state): State<AppState>,
+    request: axum::extract::Request,
+    next: axum::middleware::Next,
+) -> Result<axum::response::Response, ApiError> {
+    let identity = authenticate_upload(&state, request.headers()).await?;
+    state
+        .upload
+        .acceleration
+        .consume_upload_request_slot(identity.key_id, state.upload.config.rate_limit, Utc::now())
+        .await
+        .map_err(ApiError::from)?;
+    let _lease = state
+        .direct
+        .supervisor
+        .try_reserve_upload()
+        .ok_or_else(upload_busy)?;
+    // 声明的 Content-Length 超上限时零正文读取直接拒：慢读流没有长度信息，这一判要在包流之前做。
+    if let Some(length) = request
+        .headers()
+        .get(header::CONTENT_LENGTH)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        && length > state.upload.config.max_request_bytes as u64
+    {
+        return Err(request_too_large());
+    }
+    let (mut parts, body) = request.into_parts();
+    let (body, slow) = state.direct.supervisor.limit_upload_slow_read(body);
+    parts.extensions.insert(slow);
+    let request = axum::extract::Request::from_parts(parts, body);
+    Ok(next.run(request).await)
+}
+
+/// 上传端点的认证：与生成同一套凭证校验，但不占生成的速率名额（速率走独立命名空间）。
+async fn authenticate_upload(
+    state: &AppState,
+    headers: &HeaderMap,
+) -> Result<ApiKeyIdentity, ApiError> {
+    let token = bearer_token(headers)?;
+    match state.identity.authenticate_identity(token).await {
+        Ok(identity) => Ok(identity),
+        Err(_) => Err(ApiError {
+            status: StatusCode::UNAUTHORIZED,
+            code: "invalid_api_key",
+            message: "API key is invalid or revoked".to_owned(),
+            retry_after: None,
+        }),
+    }
+}
+
+/// 上传端点：单文件 multipart，写入上传存储换公网 URL。
+async fn upload_image(
+    State(state): State<AppState>,
+    slow: Option<Extension<SlowRead>>,
+    scope: Option<Extension<Arc<ConnectionScope>>>,
+    multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
+) -> Result<Json<UploadImageResponse>, ApiError> {
+    let mut multipart = multipart
+        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
+    let parsed = read_upload_file(&mut multipart).await;
+    // 慢读超时不写对象：它发生在受理前，按 408 回应；读错误先让位给这个更具体的判据。
+    if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
+        return Err(slow_read_timeout());
+    }
+    let file = parsed?;
+    let cancellation: &dyn UploadCancellation = match &scope {
+        Some(scope) => scope.0.as_ref(),
+        None => &NEVER_CANCELLED,
+    };
+    let uploaded = state
+        .upload
+        .service
+        .upload(&file.bytes, file.declared_content_type.as_deref(), cancellation)
+        .await
+        .map_err(upload_error)?;
+    Ok(Json(UploadImageResponse {
+        url: uploaded.url,
+        media_type: uploaded.media_type,
+        byte_length: uploaded.byte_length,
+    }))
+}
+
+/// 一次上传请求解析出的文件：字节与部件声明的 `Content-Type`。
+struct UploadFile {
+    bytes: Vec<u8>,
+    declared_content_type: Option<String>,
+}
+
+/// 读上传的 multipart：恰好一个带文件名的 `file` 部件，其余部件一律拒绝。
+async fn read_upload_file(multipart: &mut Multipart) -> Result<UploadFile, ApiError> {
+    let mut file: Option<UploadFile> = None;
+    while let Some(field) = multipart
+        .next_field()
+        .await
+        .map_err(upload_multipart_error)?
+    {
+        let name = field.name().unwrap_or_default().to_owned();
+        if name != "file" {
+            return Err(invalid_multipart(
+                "the request may carry only one file part named file",
+            ));
+        }
+        if field.file_name().is_none() {
+            return Err(invalid_multipart("the file part must carry a file name"));
+        }
+        if file.is_some() {
+            return Err(invalid_multipart(
+                "the request may carry only one file part named file",
+            ));
+        }
+        let declared_content_type = field.content_type().map(str::to_owned);
+        let bytes = field.bytes().await.map_err(upload_multipart_error)?;
+        file = Some(UploadFile {
+            bytes: bytes.to_vec(),
+            declared_content_type,
+        });
+    }
+    file.ok_or_else(|| invalid_multipart("the request must carry a file part named file"))
+}
+
+/// 把 multipart 读取失败映射成对客码：正文超上限是 413 request_too_large，其余是 400 invalid_multipart。
+fn upload_multipart_error(error: axum::extract::multipart::MultipartError) -> ApiError {
+    if error.status() == StatusCode::PAYLOAD_TOO_LARGE {
+        return request_too_large();
+    }
+    invalid_multipart(&error.to_string())
+}
+
+/// 上传正文超过路由级上限：平台信封 413 request_too_large。
+fn request_too_large() -> ApiError {
+    ApiError {
+        status: StatusCode::PAYLOAD_TOO_LARGE,
+        code: "request_too_large",
+        message: "the upload request body exceeds the configured limit".to_owned(),
+        retry_after: None,
+    }
+}
+
+fn invalid_multipart(message: &str) -> ApiError {
+    ApiError::bad_request("invalid_multipart", message.to_owned())
+}
+
+/// 本机上传并发或内存预算取不到：429 upload_busy，不排队。
+fn upload_busy() -> ApiError {
+    ApiError {
+        status: StatusCode::TOO_MANY_REQUESTS,
+        code: "upload_busy",
+        message: "the local upload capacity is exhausted; retry later".to_owned(),
+        retry_after: Some(Duration::from_secs(1)),
+    }
+}
+
+/// 上传失败到对客码的收口；客户端断开不对客返回错误码（连接已经断开，响应发不出去）。
+fn upload_error(error: ImageUploadError) -> ApiError {
+    let message = error.to_string();
+    match error {
+        ImageUploadError::UnsupportedMediaType => {
+            ApiError::bad_request("unsupported_media_type", message)
+        }
+        ImageUploadError::MediaTypeMismatch => {
+            ApiError::bad_request("media_type_mismatch", message)
+        }
+        ImageUploadError::ImageTooLarge => ApiError {
+            status: StatusCode::PAYLOAD_TOO_LARGE,
+            code: "image_too_large",
+            message,
+            retry_after: None,
+        },
+        ImageUploadError::UploadStorageUnavailable => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "upload_storage_unavailable",
+            message,
+            retry_after: None,
+        },
+        ImageUploadError::ObjectStoreUnavailable => ApiError {
+            status: StatusCode::SERVICE_UNAVAILABLE,
+            code: "object_store_unavailable",
+            message,
+            retry_after: None,
+        },
+        ImageUploadError::ClientDisconnected => ApiError {
+            status: StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            code: "client_disconnected",
+            message,
+            retry_after: None,
+        },
+    }
 }
 
 /// JSON 入口转直接执行请求：**先查记录**，未命中才按当前合同摘图片字段、判型号。
