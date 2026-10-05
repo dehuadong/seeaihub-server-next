@@ -9,7 +9,10 @@
 
 use base64::{Engine, engine::general_purpose::STANDARD};
 use reqwest::{Client, StatusCode};
-use seeai_application::{DEFAULT_SETTLE_RESERVE_SECONDS, idempotency_key_digest};
+use seeai_application::{
+    DEFAULT_SETTLE_RESERVE_SECONDS, RequestFingerprintInput, RequestFingerprintKeys,
+    idempotency_key_digest,
+};
 use seeai_domain::replace_contract_model_identity;
 use serde_json::{Value, json};
 use sha2::{Digest, Sha256};
@@ -91,6 +94,15 @@ const CONTRACT_CURSOR_KEY: &str = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8="
 ///
 /// 夹具里只是让进程起得来、让摘要可复现；真实部署的密钥来自环境变量，不进仓库。
 const CONTRACT_FINGERPRINT_KEY: &str = "Hx4dHBsaGRgXFhUUExIREA8ODQwLCgkIBwYFBAMCAQA=";
+
+/// 夹具用的请求指纹密钥（与子进程环境里那份同值）：重放用例要按同一版本重算摘要。
+fn contract_fingerprint_keys() -> RequestFingerprintKeys {
+    let key = STANDARD
+        .decode(CONTRACT_FINGERPRINT_KEY)
+        .expect("the fixture fingerprint key decodes");
+    RequestFingerprintKeys::new(BTreeMap::from([(1_i16, key)]), 1)
+        .expect("the fixture fingerprint keys are valid")
+}
 /// 直接执行时渠道凭证的假值：只在本机假上游上用过，不写配置、日志或响应。
 const CONTRACT_PROVIDER_KEY: &str = "contract-test-key";
 /// 假对象存储的桶名与访问密钥：只在测试进程与子进程环境里用，不写进配置或响应。
@@ -107,8 +119,9 @@ const PNG_FIXTURE: &[u8] = &[
     0x4E, 0x44, 0xAE, 0x42, 0x60, 0x82,
 ];
 
-/// 调用方以内联 data URL 给出参考图的形态。
-fn png_data_url() -> String {
+/// 调用方以内联 data URL 给图片的形态：生成入口只收公网 URL，这个取值在受理前一律被拒
+/// （400 public_image_url_required）。夹具只在拒绝用例里用它构造输入。
+fn inline_png_data_url() -> String {
     format!("data:image/png;base64,{}", STANDARD.encode(PNG_FIXTURE))
 }
 
@@ -124,11 +137,10 @@ type UpstreamCalls = Arc<Mutex<Vec<UpstreamCall>>>;
 
 /// 假上游要在哪一类请求上停住，等用例放行。
 ///
-/// 三类正是强杀矩阵要用屏障钉住的几个注入点：上传（提交前，生成请求还没发）、生成提交
-/// （提交中／接受后句柄未写入）、任务查询（轮询中，终态还没回）。
+/// 两类正是强杀矩阵要用屏障钉住的注入点：生成提交（提交中／接受后句柄未写入）与任务查询
+/// （轮询中，终态还没回）。生成入口收敛后不再有"内联图片先上传换 URL"这一格。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum HeldRequest {
-    Upload,
     Create,
     Query,
 }
@@ -136,7 +148,6 @@ enum HeldRequest {
 impl HeldRequest {
     fn matches(self, method: &str, path: &str) -> bool {
         match self {
-            Self::Upload => method == "POST" && path == "/v1/uploads/images",
             Self::Create => {
                 method == "POST"
                     && (path.ends_with("/images/generations") || path.ends_with("/images/edits"))
@@ -244,7 +255,7 @@ enum SubmitBehaviour {
     Rejected { status: u16, body: Value },
 }
 
-/// 假上游的可配置行为：覆盖重试、未知状态、在飞、上传失败与提交被拒。
+/// 假上游的可配置行为：覆盖重试、未知状态、在飞、参考图取用与提交被拒。
 #[derive(Clone)]
 struct UpstreamBehaviour {
     provider: ProviderShape,
@@ -254,13 +265,16 @@ struct UpstreamBehaviour {
     unknown_status_times: usize,
     /// 任务查询先返回这么多次"仍在跑"，用来把一次请求留在在飞状态。
     pending_times: usize,
-    /// 非 0 时，上传接口固定返回这个错误状态码 —— 覆盖"上传失败即确定未受理"。
-    upload_failure_status: u16,
-    /// 上面那种上传失败**前几次**（0 表示一直失败）。
+    /// 参考图 GET 先失败这么多次（返回 500），之后回图片。
     ///
-    /// 上传失败是可证明未受理（生成任务此时还没提交），所以"失败一次就恢复"正好是重投要覆盖的
-    /// 那个形态：第一次上游没受理、第二次成功，中间只多了一次上传。
-    upload_failure_times: usize,
+    /// AIHubMix 的参考图由 Adapter 自己按公网 URL 取，取不到是**可证明未受理**；"失败一次就恢复"
+    /// 正好是重投要覆盖的形态。
+    reference_get_failures: usize,
+    /// 参考图 GET 回的字节数（0 表示用夹具那张小图）。
+    ///
+    /// 生成入口收敛为只收公网 URL 之后，参考图字节不再随请求体进来；内存观测用例靠这条下载路
+    /// 把大图送进进程，压的仍是"取图 + 编码进 multipart"那一段。
+    reference_image_bytes: usize,
     /// 生成请求**前几次**直接以这个状态码被拒（之后正常应答）。
     ///
     /// 它用来观察重投：上游明确拒绝受理这类失败是"可证明未受理"，重投不会付两次上游成本。
@@ -294,8 +308,8 @@ impl UpstreamBehaviour {
             query_failures: 0,
             unknown_status_times: 0,
             pending_times: 0,
-            upload_failure_status: 0,
-            upload_failure_times: 0,
+            reference_get_failures: 0,
+            reference_image_bytes: 0,
             create_rejection_status: 0,
             create_rejection_times: 0,
             submit: SubmitBehaviour::Accepted,
@@ -336,9 +350,9 @@ async fn start_fake_upstream_with(
         .await
         .expect("fake upstream binds");
     let port = listener.local_addr().expect("addr").port();
-    // 查询与上传的行为按调用次数推进。
+    // 查询、参考图取用与生成的行为按调用次数推进。
     let query_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
-    let upload_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let reference_get_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let create_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
     let handle = tokio::spawn(async move {
         loop {
@@ -348,7 +362,7 @@ async fn start_fake_upstream_with(
             let calls = calls.clone();
             let behaviour = behaviour.clone();
             let query_count = query_count.clone();
-            let upload_count = upload_count.clone();
+            let reference_get_count = reference_get_count.clone();
             let create_count = create_count.clone();
             tokio::spawn(async move {
                 let _ = serve_fake_upstream(
@@ -356,7 +370,7 @@ async fn start_fake_upstream_with(
                     calls,
                     behaviour,
                     query_count,
-                    upload_count,
+                    reference_get_count,
                     create_count,
                 )
                 .await;
@@ -374,7 +388,7 @@ async fn serve_fake_upstream(
     calls: UpstreamCalls,
     behaviour: UpstreamBehaviour,
     query_count: Arc<std::sync::atomic::AtomicUsize>,
-    upload_count: Arc<std::sync::atomic::AtomicUsize>,
+    reference_get_count: Arc<std::sync::atomic::AtomicUsize>,
     create_count: Arc<std::sync::atomic::AtomicUsize>,
 ) -> std::io::Result<()> {
     // 正经读完一个请求：请求行 + 头 + 按 Content-Length 读满请求体。
@@ -403,38 +417,6 @@ async fn serve_fake_upstream(
         let ordinal = gate.arrivals.fetch_add(1, Ordering::SeqCst) + 1;
         gate.arrival_notify.notify_waiters();
         gate.arrive_and_hold(ordinal).await;
-    }
-
-    // 上传：内联图片换公网 URL。这个分支必须在生成分支之前判断，
-    // 而且它的失败**不**代表"生成可能已发生"——生成任务此时还没提交。
-    if method == "POST" && path == "/v1/uploads/images" {
-        let index = upload_count.fetch_add(1, std::sync::atomic::Ordering::SeqCst) + 1;
-        if behaviour.upload_failure_status != 0
-            && (behaviour.upload_failure_times == 0 || index <= behaviour.upload_failure_times)
-        {
-            // 上游上传失败的错误体只有 type 与 message，**没有** error.code。
-            let payload = serde_json::to_vec(&json!({
-                "error": {"type": "invalid_request_error", "message": "unsupported image type"}
-            }))
-            .expect("upload failure body");
-            return write_response(
-                socket,
-                behaviour.upload_failure_status,
-                "Error",
-                "application/json",
-                &payload,
-            )
-            .await;
-        }
-        let payload = serde_json::to_vec(&json!({
-            "url": format!("http://127.0.0.1:{port}/uploaded-{index}.png"),
-            "filename": format!("image-{index}.png"),
-            "content_type": "image/png",
-            "bytes": PNG_FIXTURE.len(),
-            "created_at": 1_790_000_000u64
-        }))
-        .expect("upload body");
-        return write_response(socket, 200, "OK", "application/json", &payload).await;
     }
 
     // 提交生成请求被上游直接拒：欠费、凭证、参数错误、限流都从这里进。
@@ -566,9 +548,28 @@ async fn serve_fake_upstream(
         return write_response(socket, 200, "OK", "application/json", &payload).await;
     }
 
-    // 其余 GET：把 PNG 交出去。参考图走公网 URL 时由 Adapter 自己来取；
+    // 其余 GET：把参考图交出去。参考图走公网 URL 时由 Adapter 自己来取；
     // 结果 URL 则**不该**被平台来取（平台不下载结果）。
     if method == "GET" {
+        let seen = reference_get_count.fetch_add(1, Ordering::SeqCst) + 1;
+        if behaviour.reference_get_failures != 0 && seen <= behaviour.reference_get_failures {
+            let payload = serde_json::to_vec(&json!({
+                "error": {"code": 500, "message": "reference image unavailable"}
+            }))
+            .expect("reference failure body");
+            return write_response(
+                socket,
+                500,
+                "Internal Server Error",
+                "application/json",
+                &payload,
+            )
+            .await;
+        }
+        if behaviour.reference_image_bytes > 0 {
+            let body = vec![0_u8; behaviour.reference_image_bytes];
+            return write_response(socket, 200, "OK", "image/png", &body).await;
+        }
         return write_response(socket, 200, "OK", "image/png", PNG_FIXTURE).await;
     }
 
@@ -708,7 +709,6 @@ impl FakeObjectStorage {
             .map(|call| (call.method.clone(), call.path.clone(), call.byte_length))
             .collect()
     }
-
 }
 
 async fn start_fake_object_storage(behaviour: ObjectStorageBehaviour) -> FakeObjectStorage {
@@ -786,19 +786,17 @@ async fn serve_fake_object_storage(
             let index = put_count.fetch_add(1, Ordering::SeqCst);
             let status = behaviour.put_statuses.get(index).copied().unwrap_or(0);
             if status != 0 {
-                return write_response(socket, status, "Error", "application/xml", b"<Error/>").await;
+                return write_response(socket, status, "Error", "application/xml", b"<Error/>")
+                    .await;
             }
             let content_type = content_type_for_path(&path);
-            objects
-                .lock()
-                .expect("object store objects lock")
-                .insert(
-                    path,
-                    StoredObject {
-                        content_type,
-                        bytes: body,
-                    },
-                );
+            objects.lock().expect("object store objects lock").insert(
+                path,
+                StoredObject {
+                    content_type,
+                    bytes: body,
+                },
+            );
             write_response(socket, 200, "OK", "application/xml", b"").await
         }
         "HEAD" => {
@@ -823,10 +821,7 @@ async fn serve_fake_object_storage(
                         )
                         .unwrap_or(0)
                     };
-                    let content_type = behaviour
-                        .head_content_type
-                        .clone()
-                        .unwrap_or(content_type);
+                    let content_type = behaviour.head_content_type.clone().unwrap_or(content_type);
                     write_head_response(socket, 200, reported, &content_type).await
                 }
                 None => write_response(socket, 404, "Not Found", "application/xml", b"").await,
@@ -1113,6 +1108,7 @@ async fn start_api_with_auth_attempts(
 /// 是两回事，探针要能造出真的没配）。
 fn api_probe_command(database_url: &str, port: u16, admin_token: &str) -> Command {
     let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    remove_proxy_env(&mut command);
     command
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
@@ -1197,6 +1193,7 @@ async fn probe_api_startup_with_cursor_key(
     let port = listener.local_addr().expect("test address").port();
     drop(listener);
     let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    remove_proxy_env(&mut command);
     command
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
@@ -1235,6 +1232,7 @@ async fn probe_api_startup_with_execution_capacity(
     let port = listener.local_addr().expect("test address").port();
     drop(listener);
     let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+    remove_proxy_env(&mut command);
     command
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
@@ -1487,6 +1485,7 @@ async fn start_api_with(
         // 逼着校验放宽。
         let test_chain_seconds = sync_wait_seconds.max(10);
         let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
+        remove_proxy_env(&mut command);
         command
             .env("DATABASE_URL", database_url)
             .env("API_BIND", format!("127.0.0.1:{port}"))
@@ -2249,6 +2248,19 @@ impl Harness {
             .expect("this case must pin the fake upstream with UpstreamBehaviour::holding")
     }
 
+    /// 一个指向**本用例假上游**的公网参考图 URL。
+    ///
+    /// 生成入口只收公网 URL：APIMart 逐字透传，AIHubMix 自己来取。假上游对任何 GET 都回
+    /// PNG_FIXTURE（见 `serve_fake_upstream`），所以这份地址对两家都能当合法参考图。
+    fn png_url(&self) -> String {
+        self.input_url("ref.png")
+    }
+
+    /// 假上游上一个具名的输入图地址：同一个用例要区分多张参考图时用它（下载计数才分得开）。
+    fn input_url(&self, name: &str) -> String {
+        format!("{}/inputs/{name}", self.upstream_base_url)
+    }
+
     /// 走同步入口发一次 JSON 请求：这一次执行在本进程内跑完才返回。
     async fn sync_json(&self, path: &str, key: &str, body: Value) -> (StatusCode, Value) {
         post_json(&self.base_url, &self.api_key, path, key, &body).await
@@ -2313,7 +2325,6 @@ impl Harness {
         let bytes = response.bytes().await.expect("public read body").to_vec();
         (status, bytes)
     }
-
 
     /// 按幂等键取回这次请求内部的执行记录：`(job_id, state)`。
     ///
@@ -3963,7 +3974,6 @@ impl CacheFixture {
     }
 }
 
-/// 给子进程装上加速层的那几个环境变量。
 /// 上传存储的全部环境变量：显式移除它们，让"没配"是真的没配（本机 `.env` 或 shell 里可能有）。
 const UPLOAD_ENV_NAMES: [&str; 14] = [
     "UPLOAD_STORAGE_REGION",
@@ -3981,6 +3991,21 @@ const UPLOAD_ENV_NAMES: [&str; 14] = [
     "UPLOAD_RETRY_MAX_ATTEMPTS",
     "UPLOAD_RETRY_BACKOFF_BASE_SECONDS",
 ];
+
+/// 显式清掉代理环境变量：本装置的进程只连回环（假上游、假对象存储），环境里的代理会把
+/// "连不上就立刻失败"变成"经代理挂住"，用例因此要等到执行期限才收口。
+fn remove_proxy_env(command: &mut Command) {
+    for name in [
+        "http_proxy",
+        "HTTP_PROXY",
+        "https_proxy",
+        "HTTPS_PROXY",
+        "all_proxy",
+        "ALL_PROXY",
+    ] {
+        command.env_remove(name);
+    }
+}
 
 /// 显式移除上传存储的整组环境变量。
 fn remove_upload_env(command: &mut Command) {
@@ -4009,17 +4034,16 @@ fn apply_upload_env(command: &mut Command, upload: Option<&UploadStorageFixture>
             "UPLOAD_MAX_REQUEST_BYTES",
             upload.max_request_bytes.map(|value| value.to_string()),
         ),
-        (
-            "UPLOAD_SLOTS",
-            upload.slots.map(|value| value.to_string()),
-        ),
+        ("UPLOAD_SLOTS", upload.slots.map(|value| value.to_string())),
         (
             "UPLOAD_MAX_BUFFER_BYTES",
             upload.max_buffer_bytes.map(|value| value.to_string()),
         ),
         (
             "UPLOAD_SLOW_READ_TIMEOUT_SECONDS",
-            upload.slow_read_timeout_seconds.map(|value| value.to_string()),
+            upload
+                .slow_read_timeout_seconds
+                .map(|value| value.to_string()),
         ),
         (
             "UPLOAD_RETRY_MAX_ATTEMPTS",
@@ -4027,7 +4051,9 @@ fn apply_upload_env(command: &mut Command, upload: Option<&UploadStorageFixture>
         ),
         (
             "UPLOAD_RETRY_BACKOFF_BASE_SECONDS",
-            upload.retry_backoff_base_seconds.map(|value| value.to_string()),
+            upload
+                .retry_backoff_base_seconds
+                .map(|value| value.to_string()),
         ),
         (
             "UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW",
@@ -4044,6 +4070,7 @@ fn apply_upload_env(command: &mut Command, upload: Option<&UploadStorageFixture>
     }
 }
 
+/// 给子进程装上加速层的那几个环境变量。
 fn apply_cache_env(command: &mut Command, cache: Option<&CacheFixture>) {
     let Some(cache) = cache else {
         // **显式**把 `REDIS_URL` 置空来表达"没有缓存"：API 与 Worker 进程用 `dotenvy` 加载仓库

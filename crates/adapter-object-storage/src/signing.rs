@@ -41,6 +41,30 @@ pub(crate) fn is_default_signed_header(name: &str) -> bool {
     name.starts_with("x-oss-") || name == "content-type" || name == "content-md5"
 }
 
+/// 对象地址的 canonical URI：`/{bucket}/{key}`；路径段按 `quote(s, safe)` 编码，`/` 保留为分隔符。
+pub(crate) fn canonical_uri(bucket: &str, key: &str) -> String {
+    let encoded_key = key
+        .split('/')
+        .map(percent_encode)
+        .collect::<Vec<_>>()
+        .join("/");
+    format!("/{}/{}", percent_encode(bucket), encoded_key)
+}
+
+/// `quote(s, safe)` 口径：未保留字符不编码，其余按大写十六进制。
+pub(crate) fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.as_bytes() {
+        let character = char::from(*byte);
+        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~') {
+            encoded.push(character);
+        } else {
+            encoded.push_str(&format!("%{byte:02X}"));
+        }
+    }
+    encoded
+}
+
 /// 派生签名密钥：`HMAC("aliyun_v4" + SK, date) → region → "oss" → "aliyun_v4_request"`。
 pub(crate) fn signing_key(secret: &str, date: &str, region: &str) -> [u8; 32] {
     let k_date = hmac_sha256(format!("aliyun_v4{secret}").as_bytes(), date.as_bytes());

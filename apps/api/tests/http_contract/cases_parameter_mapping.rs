@@ -995,7 +995,7 @@ async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_paramete
         .expect("job count");
     let key = format!("image-boundary-{}", Uuid::new_v4());
     let mut request = route_request(model, "an image the contract never declared");
-    request["image"] = json!(png_data_url());
+    request["image"] = json!("https://example.invalid/image.png");
     let (status, body) = post_json(
         &base_url,
         &api_key,
@@ -1047,7 +1047,7 @@ async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_paramete
 /// - 带参考图：先把 AIHubMix 这条供给收窄成只允许文生图（**限制差异由测试自己构造**，不拿承载面
 ///   字段的有无制造差异），于是它因**分支限制**不合格（判定记录写明原因）、改道 APIMart；合同
 ///   字段叫 `image`，APIMart 线上叫 `image_urls`，靠改名落到渠道字段名上（报文里不许出现
-///   `image`），内联图先经上传接口换成公网 URL；
+///   `image`），公网 URL 逐字透传；
 ///
 /// 两家渠道各起一个进程内假上游：线上形状不同（一家同步回图、一家任务式），所以"报文里到底是
 /// 哪个字段名"只能按真正收到请求的那一方来判。全程零外部调用。
@@ -1414,7 +1414,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         &json!({
             "model": "gpt-image-2.5-flare",
             "prompt": "保留商品主体，把背景换成米白色摄影棚",
-            "image": [png_data_url()]
+            "image": ["https://example.invalid/ref.png"]
         }),
     )
     .await;
@@ -1438,26 +1438,21 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "APIMart",
         "第一条不合格就该落到下一条：{considered:?}"
     );
-    // 内联图先换成渠道要的公网 URL，再按**渠道字段名**装进生成请求。
+    // 公网 URL 由 APIMart 逐字透传，按**渠道字段名**装进生成请求。
     let submit = last_submit_body(&apimart_calls, "/v1/images/generations");
     assert!(
         submit.get("image").is_none(),
         "合同字段名 `image` 不许出现在 APIMart 的报文里：{submit}"
     );
-    let urls = submit["image_urls"]
-        .as_array()
-        .unwrap_or_else(|| panic!("APIMart 线上字段名是 image_urls 数组：{submit}"));
-    assert_eq!(urls.len(), 1, "{submit}");
-    assert!(
-        urls[0]
-            .as_str()
-            .is_some_and(|url| url.starts_with("http://127.0.0.1:")),
-        "上传换回来的公网 URL 才该上行：{submit}"
+    assert_eq!(
+        submit["image_urls"],
+        json!(["https://example.invalid/ref.png"]),
+        "公网 URL 必须逐字透传：{submit}"
     );
     assert_eq!(
         count_calls(&apimart_calls, "POST", "/v1/uploads/images") - uploads_before,
-        1,
-        "内联参考图必须先上传换成公网 URL"
+        0,
+        "公网 URL 不需要上传"
     );
 
     let key = format!("contract-masked-{}", Uuid::new_v4());
@@ -1469,8 +1464,8 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         &json!({
             "model": "gpt-image-2.5-sunburst",
             "prompt": "只改遮罩圈出的背景",
-            "image": [png_data_url()],
-            "mask": png_data_url()
+            "image": ["https://example.invalid/ref.png"],
+            "mask": "https://example.invalid/mask.png"
         }),
     )
     .await;
@@ -1494,18 +1489,19 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "合同字段名 `image` / `mask` 都不许出现在 APIMart 的报文里：{submit}"
     );
     assert_eq!(
-        submit["image_urls"].as_array().map(Vec::len),
-        Some(1),
-        "{submit}"
+        submit["image_urls"],
+        json!(["https://example.invalid/ref.png"]),
+        "公网 URL 必须逐字透传：{submit}"
     );
-    assert!(
-        submit["mask_url"].as_str().is_some(),
-        "遮罩要按渠道字段名 `mask_url` 上线：{submit}"
+    assert_eq!(
+        submit["mask_url"],
+        json!("https://example.invalid/mask.png"),
+        "遮罩同样按渠道字段名逐字透传公网 URL：{submit}"
     );
     assert_eq!(
         count_calls(&apimart_calls, "POST", "/v1/uploads/images") - uploads_before,
-        3,
-        "用例 3 的参考图与用例 4 的参考图、遮罩各上传一次"
+        0,
+        "公网 URL 不需要任何上传"
     );
 
     pool.close().await;

@@ -2,7 +2,8 @@ use super::*;
 
 /// AIHubMix：两条同步路径都能跑通，且**渠道给什么就返回什么**。
 ///
-/// 覆盖 data URL 输入、公网 URL 输入与 `url` / `b64_json` 两种上游形态。
+/// 覆盖公网 URL 输入、`url` / `b64_json` 两种上游形态，以及 data URL 与 multipart 文件部件
+/// 在受理前被拒（Spec 0005 A12）。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() {
@@ -57,24 +58,38 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     // 平台不落盘：这次执行没有调用渠道的上传端点，参考图字节由 Adapter 自己从 URL 取。
     assert_eq!(harness.count("POST", "/v1/uploads/images"), 0);
 
-    // 3) 参考图走**data URL**：就地解码成字节，仍然不落盘。
+    // 3) data URL 参考图：生成入口只收公网 URL，受理前拒绝。
+    let creates_before = harness.create_calls();
     let key = format!("sync-inline-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "edit with an inline image");
-    request["image"] = json!(png_data_url());
-    let (status, body) = harness
-        .sync_json("/v1/images/generations", &key, request.clone())
-        .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("data URL 参考图", &body);
-    let edits = harness.submit_bytes("/v1/images/edits");
-    assert!(
-        body_contains_bytes(&edits, PNG_FIXTURE),
-        "data URL 必须就地解码进文件部件"
+    request["image"] = json!(inline_png_data_url());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("public_image_url_required"),
+        "{body}"
     );
-    let (_, state) = harness.job(&key).await;
-    assert_eq!(state, "succeeded");
+    assert_public_only("data URL 参考图", &body);
+    // 拒绝发生在受理前：不调上游、不建执行记录。
+    assert_eq!(harness.create_calls(), creates_before, "被拒请求不调上游");
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.jobs WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(&key))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job count");
+    assert_eq!(jobs, 0, "被拒的 data URL 不建执行记录");
 
-    // 4) edits 入口（multipart 文件部件）：与 generations 是**同一个能力**。
+    // 4) edits 入口（multipart 文件部件）：同一份公网 URL 合同，文件部件在受理前被拒。
     let key = format!("sync-edit-{}", Uuid::new_v4());
     let form = reqwest::multipart::Form::new()
         .part(
@@ -94,22 +109,19 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         .text("model", harness.model.to_owned())
         .text("prompt", "edit through the multipart entry");
     let (status, body) = harness.sync_multipart(&key, form).await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("edits 入口", &body);
-    let edits = harness.submit_bytes("/v1/images/edits");
-    let rendered = String::from_utf8_lossy(&edits);
-    assert!(rendered.contains("name=\"image\"") && rendered.contains("name=\"mask\""));
-    assert!(
-        body_contains_bytes(&edits, PNG_FIXTURE),
-        "两个文件部件的字节都必须到上游"
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("public_image_url_required"),
+        "{body}"
     );
-    // 文件部件的字节在受理期原样保留、落到候选声明的参数名上；可见判据就是上面那条"字节原样进
-    // 文件部件"——载荷本身不落库。
+    assert_public_only("文件部件参考图", &body);
+    assert_eq!(harness.create_calls(), creates_before, "被拒请求不调上游");
 
     // 5) 同义字段只能给一个；只给遮罩是结构性错误。
     let key = format!("sync-conflict-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "both synonyms");
-    request["image"] = json!(png_data_url());
+    request["image"] = json!(harness.png_url());
     request["image_urls"] = json!(["https://example.invalid/a.png"]);
     let (status, body) = post_json(
         &harness.base_url,
@@ -125,7 +137,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
 
     let key = format!("sync-mask-only-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "mask without an image");
-    request["mask"] = json!(png_data_url());
+    request["mask"] = json!(harness.png_url());
     let (status, body) = post_json(
         &harness.base_url,
         &harness.api_key,
@@ -148,7 +160,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
 /// 选路时这条候选表达得了、装图时两张都落到它声明的名字上、最后按张数编码。上面任何一处只留下
 /// 第一张，对客响应照样是 200，只有看发给上游的报文才暴露出来。
 ///
-/// 两张都用内联 data URL：图片字节就地解码，这条链路不必让假上游提供图片文件。
+/// 两张都指向假上游的公网 URL：字节由 Adapter 自己取，线上按张数编码。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
@@ -158,7 +170,7 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
     // 1) 两张参考图：线上是两个 `image[]` 部件，不出现单值 `image`，也没有遮罩部件。
     let key = format!("sync-two-refs-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "edit with two reference images");
-    request["image"] = json!([png_data_url(), png_data_url()]);
+    request["image"] = json!([harness.png_url(), harness.input_url("ref-2.png")]);
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request)
         .await;
@@ -193,7 +205,7 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
     // 2) 一张参考图：同一份声明面下仍是单值 `image`——列表形态只属于多张。
     let key = format!("sync-one-ref-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "edit with one reference image");
-    request["image"] = json!([png_data_url()]);
+    request["image"] = json!([harness.png_url()]);
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request)
         .await;

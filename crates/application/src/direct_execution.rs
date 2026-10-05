@@ -78,9 +78,9 @@ pub fn settle_reserve_from_env() -> Result<Duration, ApplicationError> {
 
 /// 已经解析好的一次同步图片请求。
 ///
-/// 图片是**三态**（公网 URL / data URL / 上传字节），由接口层解析 multipart 与 JSON 后给出；
-/// 本用例只把它们交给适配器，不落盘、不写日志。`endpoint` 进请求指纹：JSON 与 multipart
-/// 两个端点不承诺共享指纹。
+/// 图片是**两态**（公网 URL，或 multipart 文件部件的字节——后者只供同键重放比对），由接口层
+/// 解析 multipart 与 JSON 后给出；本用例只把它们交给适配器，不落盘、不写日志。`endpoint`
+/// 进请求指纹：JSON 与 multipart 两个端点不承诺共享指纹。
 pub struct DirectExecutionRequest {
     pub account_id: AccountId,
     /// 对外的平台型号名（网关模型）。
@@ -1530,8 +1530,8 @@ impl DirectExecutionService {
     }
 }
 
-/// 已解析请求 → 旧路径的受理请求形状：图片统一成字符串（URL 或 data URL）只用于指纹与选路，
-/// 上传字节在这里编码成 data URL。真正的三态图片仍原样交给 [`GatewayInput`]。
+/// 已解析请求 → 旧路径的受理请求形状：图片统一成字符串（公网 URL，或 multipart 文件部件编码
+/// 成的 data URL）只用于指纹与选路。真正的两态图片仍原样交给 [`GatewayInput`]。
 fn routing_request(
     request: &DirectExecutionRequest,
 ) -> Result<CreateImageGenerationRequest, ApplicationError> {
@@ -1551,7 +1551,7 @@ fn routing_request(
     })
 }
 
-/// 图片进指纹与选路的字符串形态：URL / data URL 借用原值，上传字节编码一次。
+/// 图片进指纹与选路的字符串形态：公网 URL 借用原值，multipart 文件部件的字节编码一次。
 fn image_text(image: &InputImage) -> Result<String, ApplicationError> {
     image
         .to_data_url()

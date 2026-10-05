@@ -22,8 +22,8 @@ const LOOKUP_DOMAIN: &[u8] = b"seeai/idempotency-lookup/v1";
 
 /// 一次请求里参与指纹的**已识别**输入。
 ///
-/// 未知字段在进入这里之前就被冻结合同过滤掉；图片是公网 URL 或 data URL 的**原值**，平台不下载、
-/// 不解码，摘要只吃内容本身。n 是候选截断前的输出张数。
+/// 未知字段在进入这里之前就被冻结合同过滤掉；图片是公网 URL 的**原值**（multipart 文件部件的
+/// 字节编码成 data URL 参与比对），平台不下载、不解码，摘要只吃内容本身。n 是候选截断前的输出张数。
 #[derive(Debug, Clone)]
 pub struct RequestFingerprintInput<'a> {
     pub endpoint: &'a str,

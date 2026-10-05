@@ -97,7 +97,7 @@ impl GeneratedImage {
     }
 }
 
-/// 是不是公网 http(s) 地址：参考图与遮罩允许的另一种形态（另一种是 data URL）。
+/// 是不是公网 http(s) 地址：生成入口的参考图与遮罩只允许这一种形态。
 #[must_use]
 pub fn is_http_url(value: &str) -> bool {
     value.starts_with("http://") || value.starts_with("https://")
@@ -115,8 +115,8 @@ pub struct DecodedImage {
 
 /// 解一个 `data:<media-type>;base64,<payload>`。
 ///
-/// 不是 data URL、或者载荷不是 base64，都返回 `Err`：调用方据此改按公网 URL 处理，
-/// 而不是拿到一堆坏字节。
+/// 不是 data URL、或者载荷不是 base64，都返回 `Err`：调用方据此拒绝该取值，而不是拿到一堆
+/// 坏字节。
 pub fn decode_data_url(value: &str) -> Result<DecodedImage, String> {
     let rest = value
         .strip_prefix("data:")
@@ -317,7 +317,7 @@ pub struct GatewayByteLimits {
 /// 一个数。
 pub const GATEWAY_REQUEST_WIRE_BYTES: usize = seeai_domain::SUPPORTED_REQUEST_WIRE_BYTES;
 
-/// 实测：贴住 [`GATEWAY_REQUEST_WIRE_BYTES`] 的**已支持输入形态**（一个 data URL 参考图加普通
+/// 实测：贴住 [`GATEWAY_REQUEST_WIRE_BYTES`] 的**已支持输入形态**（一个贴满上限的大字符串
 /// 参数）经 API 真实解析路径（[`seeai_domain::RequestParameters::parse`]）之后，解析结构在峰值时
 /// 额外持有的字节数，不含 wire 本身。
 ///
@@ -344,7 +344,7 @@ pub const GATEWAY_REQUEST_WIRE_BYTES: usize = seeai_domain::SUPPORTED_REQUEST_WI
 /// `crates/domain/src/request_structure.rs` 的模块注释里，探针在 `apps/api/src/tests.rs`。
 ///
 /// 剩余边界：累计字符串字节那条上限等于 wire 上限（解码后的字符串字节恒 ≤ wire 字节，再紧就会
-/// 拒绝已支持的 16 MiB data URL），所以它在缺省配置下永远不会是先被撞到的一条——真正的收口
+/// 拒绝已支持的最大字符串参数），所以它在缺省配置下永远不会是先被撞到的一条——真正的收口
 /// 是正文上限。转义密集的字符串在 `serde_json` 的内部暂存里可能短暂多占一份，其大小仍被同一
 /// wire 上限约束（转义序列的解码产出 ≤ 其 wire 占用的一半），未单独实测。
 pub const GATEWAY_REQUEST_PARSE_BYTES: usize = 18 * 1024 * 1024;

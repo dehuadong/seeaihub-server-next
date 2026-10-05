@@ -90,10 +90,10 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     harness.cleanup().await;
 }
 
-/// 公网 URL 原样透传（不下载、不上传），内联 data URL 才需要上传换 URL。
+/// 公网 URL 原样透传（不下载、不上传）；内联 data URL 在受理前被拒。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn apimart_passes_public_urls_through_and_uploads_inline_images() {
+async fn apimart_passes_public_urls_through_and_rejects_inline_images() {
     let harness = Harness::start(UpstreamBehaviour::apimart()).await;
 
     // 1) 公网 URL：原样写进 `image_urls`，一次上传都没有。
@@ -123,40 +123,41 @@ async fn apimart_passes_public_urls_through_and_uploads_inline_images() {
     );
     harness.assert_only_declared_fields(&request);
 
-    // 2) 内联 data URL + 遮罩：各自上传一次换 URL，再填进 `image_urls` / `mask_url`。
+    // 2) 内联 data URL + 遮罩：上游只收公网 URL，取值在受理前一律被拒，不调上游、不建记录。
+    let creates_before = harness.create_calls();
     let key = format!("driver-inline-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "masked edit");
-    request["image_urls"] = json!([png_data_url()]);
-    request["mask"] = json!(png_data_url());
-    let (status, body) = harness
-        .sync_json("/v1/images/generations", &key, request.clone())
-        .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
+    request["image_urls"] = json!([inline_png_data_url()]);
+    request["mask"] = json!(inline_png_data_url());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("public_image_url_required"),
+        "{body}"
+    );
+    assert_public_only("内联 data URL 与遮罩", &body);
     assert_eq!(
         harness.count("POST", "/v1/uploads/images"),
-        2,
-        "参考图与遮罩各上传一次"
+        0,
+        "平台不再把内联图片上传到上游"
     );
-    let submit_body = harness.submit_body("/v1/images/generations");
-    let image_urls = submit_body["image_urls"]
-        .as_array()
-        .expect("image_urls must be an array");
-    assert_eq!(image_urls.len(), 1);
-    let uploaded_image = image_urls[0].as_str().expect("image url");
-    let uploaded_mask = submit_body["mask_url"].as_str().expect("mask url");
-    for url in [uploaded_image, uploaded_mask] {
-        assert!(
-            url.contains("/uploaded-"),
-            "data URL 必须先换成公网 URL，got {url}"
-        );
-    }
-    assert_ne!(uploaded_image, uploaded_mask, "两张图是两次上传");
-    let rendered = submit_body.to_string();
-    assert!(
-        !rendered.contains("data:image"),
-        "内联图片绝不能以 data URL 形态发给上游：{rendered}"
-    );
-    harness.assert_only_declared_fields(&request);
+    assert_eq!(harness.create_calls(), creates_before, "被拒请求不调上游");
+    let jobs: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM generation.jobs WHERE idempotency_key_digest = $1",
+    )
+    .bind(idempotency_key_digest(&key))
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job count");
+    assert_eq!(jobs, 0, "被拒的 data URL 不建执行记录");
 
     // 3) 上游不发结果以外的任何东西：平台也不去取结果。
     assert_eq!(harness.count("GET", "/result.png"), 0);

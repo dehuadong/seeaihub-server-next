@@ -114,7 +114,11 @@ fn object_url() -> Url {
 }
 
 fn build_storage(transport: Arc<ScriptedTransport>, clock: Arc<dyn Clock>) -> OssObjectStorage {
-    OssObjectStorage::with_parts("cn-hangzhou", transport, clock)
+    OssObjectStorage {
+        region: "cn-hangzhou".to_owned(),
+        transport,
+        clock,
+    }
 }
 
 async fn put(storage: &OssObjectStorage, body: &[u8]) -> Result<(), UploadWriteFailure> {

@@ -39,8 +39,7 @@ use sqlx::PgPool;
 /// 这些用例的同步等待窗口：要留得下"卡住某一格 + 杀进程 + 恢复"，所以比别的用例宽。
 const KILL_SYNC_WAIT_SECONDS: u64 = 30;
 
-/// 强杀矩阵用的候选：任务式（APIMart）渠道覆盖句柄入库与轮询两格；分支声明齐全，
-/// 参考图走 data URL 时先上传换 URL（"提交前"那一格用它把 API 停在生成请求之前）。
+/// 强杀矩阵用的候选：任务式（APIMart）渠道覆盖句柄入库与轮询两格；分支声明齐全。
 fn apimart_draft() -> Value {
     candidate(
         "APIMart",
@@ -406,83 +405,6 @@ async fn sigkill_before_the_submission_declaration_reaps_the_orphan_admission() 
         "the same-key replay must not send a generation request"
     );
     drop(replica);
-
-    drop(service);
-    drop(repository);
-    observation.close().await;
-    harness.cleanup().await;
-}
-
-/// **格 1b：提交前（生成请求还没发出，但提交声明已经落库）**。
-///
-/// 注入点：请求带 data URL 参考图，Adapter 必须先用 `POST /v1/uploads/images` 换公网 URL。
-/// 假上游把这条上传请求停住——此刻提交声明已入库、生成请求一次都没发。
-///
-/// 恢复：库里是 `executing` + Attempt `submitting`、没有句柄。崩溃后的 `submitting` 与"正在发"
-/// 不可区分，§5 因此保留 Hold 与渠道槽位并建案，绝不重提；即使用例知道生成请求没发出去，
-/// 已落库的事实也证明不了这一点，平台按合同不能据此重投。
-#[tokio::test]
-#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; SIGKILLs a real API child process (Linux only)"]
-async fn sigkill_with_the_submission_declared_but_before_the_create_request_keeps_the_hold() {
-    let mut harness =
-        direct_with_hold(UpstreamBehaviour::apimart().holding(HeldRequest::Upload)).await;
-    let observation = observation_pool(&harness).await;
-    let account_id = fixture_account(&harness);
-
-    let key = format!("kill-before-create-{}", Uuid::new_v4());
-    let mut body = route_request(harness.model, "kill before the create request");
-    body["image_urls"] = json!([png_data_url()]);
-    let request = spawn_generation(&harness, key.clone(), body);
-
-    // 屏障信号：假上游真的收到了上传请求（生成请求一定还没发）。
-    harness.gate().wait_for_arrival(1).await;
-    let job_id = the_job_id(&observation, account_id).await;
-    let hold = active_hold(&observation, job_id).await;
-    assert_eq!(job_state(&observation, job_id).await, "executing");
-    assert_eq!(
-        latest_attempt(&observation, job_id).await.as_deref(),
-        Some("submitting")
-    );
-    assert_eq!(handle_of(&observation, job_id).await, None);
-    assert_eq!(harness.count("POST", "/v1/uploads/images"), 1);
-    assert_eq!(harness.create_calls(), 0);
-
-    harness._api.sigkill();
-    request.abort();
-    harness.gate().release_all();
-    expire_lease(&observation, job_id).await;
-
-    let repository = recovery_repository(&harness).await;
-    let service = reconciler(repository.clone());
-    let report = service.run_once().await.expect("one reconciliation round");
-    assert_eq!(report.reconciled, 1);
-
-    assert_eq!(
-        job_state(&observation, job_id).await,
-        "reconciliation_required"
-    );
-    assert_eq!(
-        latest_attempt(&observation, job_id).await.as_deref(),
-        Some("unknown")
-    );
-    assert_eq!(open_cases(&observation, job_id).await, 1);
-    assert_eq!(
-        held_microusd(&observation, account_id).await,
-        hold,
-        "the hold is retained: a crash cannot prove the provider was not asked"
-    );
-    assert_eq!(capacity_state(&observation, job_id).await, "held");
-    assert_eq!(captures(&observation, job_id).await, 0);
-    assert_eq!(
-        harness.create_calls(),
-        0,
-        "recovery must not send a generation request"
-    );
-    assert_eq!(
-        harness.count("GET", "/v1/tasks/"),
-        0,
-        "no handle means no read-only query"
-    );
 
     drop(service);
     drop(repository);

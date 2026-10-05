@@ -286,7 +286,7 @@ mod memory_measurement {
     use seeai_adapter_aihubmix::{ADAPTER_KEY as AIHUBMIX_ADAPTER_KEY, AihubmixAdapterFactory};
     use seeai_adapter_sdk::{
         AcceptanceError, AcceptedHandle, Deadline, ExecutionContext, ExternalActionRefused,
-        GATEWAY_REQUEST_WIRE_BYTES, GatewayInput, ImageSites, InputImage, ProviderCredential,
+        GATEWAY_REQUEST_WIRE_BYTES, GatewayInput, ImageSites, ProviderCredential,
     };
     use seeai_application::{AdapterFactory, GeneratedImage};
     use seeai_domain::{
@@ -321,7 +321,7 @@ mod memory_measurement {
     /// 那些页随后被解析复用，`VmHWM` 的增量就会被抹平（第一次实测就踩到，量出来是 0）。
     fn max_wire_request_body() -> Vec<u8> {
         let budget = GATEWAY_REQUEST_WIRE_BYTES;
-        let head = b"{\"model\":\"measure-model\",\"prompt\":\"measure\",\"image\":\"data:image/png;base64,";
+        let head = b"{\"model\":\"measure-model\",\"prompt\":\"";
         let tail = b"\",\"n\":1}";
         let payload = budget - head.len() - tail.len();
         let mut body = Vec::with_capacity(budget);
@@ -438,17 +438,18 @@ mod memory_measurement {
         let mut parsed = RequestParameters::parse(&body).expect("the max-wire request parses");
         let before = process_peak_rss_kib();
         let inputs = take_contract_image_inputs(&mut parsed).expect("image fields");
+        // 生成入口只收公网 URL：贴着上限的正文里没有图片字段，映射这一档不再搬运图片字节。
         let reference_images = inputs
             .reference_images
             .into_iter()
-            .map(InputImage::from_raw)
+            .map(crate::public_image_url)
             .collect::<Result<Vec<_>, _>>()
-            .expect("the data url is a valid image value");
+            .expect("no inline image is left to map");
         let mask = inputs
             .mask
-            .map(InputImage::from_raw)
+            .map(crate::public_image_url)
             .transpose()
-            .expect("the data url is a valid image value");
+            .expect("no inline mask is left to map");
         let after = process_peak_rss_kib();
         println!(
             "映射后参数：参考图 {} 张、遮罩 {}，额外峰值 {} KiB",
@@ -456,7 +457,8 @@ mod memory_measurement {
             mask.is_some() as usize,
             after - before
         );
-        assert_eq!(reference_images.len(), 1);
+        assert!(reference_images.is_empty());
+        assert!(mask.is_none());
     }
 
     /// 上游响应原缓冲 → 解析出的图片字符串（RFC 0018 §2.1 的 `U` + `P`）。

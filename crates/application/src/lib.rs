@@ -1265,7 +1265,7 @@ fn weight_split_draw(account_id: AccountId, idempotency_key: &str) -> u64 {
     u64::from_be_bytes(bytes)
 }
 
-/// 对客受理请求：调用方按**合同**给字段，图片直接给公网 URL 或 data URL。
+/// 对客受理请求：调用方按**合同**给字段，图片只给公网 URL。
 ///
 /// 这是**接收入口**的形状，直接执行就在它上面工作：调用方只给 `image` / `image_urls` / `mask`，
 /// 选中候选之后由 Offering Parameter Mapping 在内存里把图片落到该候选声明的参数名上
@@ -1278,10 +1278,10 @@ pub struct CreateImageGenerationRequest {
     pub model: String,
     /// 合同里的模型参数（扁平放在顶层；图片不走这里）。
     pub native_parameters: Value,
-    /// 参考图：调用方给的 `image` / `image_urls`（同义）归一到这里，每项是公网 URL 或 data URL。
+    /// 参考图：调用方给的 `image` / `image_urls`（同义）归一到这里，每项是公网 URL。
     #[serde(default)]
     pub reference_images: Vec<String>,
-    /// 遮罩：公网 URL 或 data URL。
+    /// 遮罩：公网 URL。
     #[serde(default)]
     pub mask: Option<String>,
     /// 幂等键：来自 `Idempotency-Key` 请求头，缺省时由接口层生成一个。

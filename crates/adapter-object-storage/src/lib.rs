@@ -52,19 +52,6 @@ impl OssObjectStorage {
         })
     }
 
-    #[cfg(test)]
-    pub(crate) fn with_parts(
-        region: impl Into<String>,
-        transport: Arc<dyn HttpTransport>,
-        clock: Arc<dyn Clock>,
-    ) -> Self {
-        Self {
-            region: region.into(),
-            transport,
-            clock,
-        }
-    }
-
     /// 这次请求的 `x-oss-date` 与 scope 日期。
     fn request_time(&self) -> (String, String) {
         let now = self.clock.now();
@@ -72,6 +59,35 @@ impl OssObjectStorage {
             now.format("%Y%m%dT%H%M%SZ").to_string(),
             now.format("%Y%m%d").to_string(),
         )
+    }
+
+    /// 给一组请求头补上 V4 签名；canonical URI 恒为 `/{bucket}/{key}`，`host` 不进 canonical headers。
+    fn signed_headers(
+        &self,
+        method: &str,
+        canonical_uri: &str,
+        headers: Vec<(String, String)>,
+        timestamp: &str,
+        date: &str,
+        credentials: ObjectStorageCredentials<'_>,
+    ) -> Vec<(String, String)> {
+        let signed = SignedRequest {
+            method,
+            canonical_uri,
+            canonical_query: "",
+            headers: &headers,
+            additional_headers: &[],
+            hashed_payload: UNSIGNED_PAYLOAD,
+            timestamp,
+            date,
+            region: &self.region,
+            access_key_id: credentials.access_key_id.expose(),
+            access_key_secret: credentials.access_key_secret.expose(),
+        };
+        let authorization = signing::authorization(&signed);
+        let mut outgoing = headers;
+        outgoing.push(("authorization".to_owned(), authorization));
+        outgoing
     }
 }
 
@@ -82,7 +98,6 @@ impl ObjectStorage for OssObjectStorage {
         request: PutObjectRequest<'_>,
         credentials: ObjectStorageCredentials<'_>,
     ) -> Result<(), UploadWriteFailure> {
-        let canonical_uri = format!("/{}/{}", request.bucket, request.key);
         let (timestamp, date) = self.request_time();
         let headers = vec![
             ("content-type".to_owned(), request.content_type.to_owned()),
@@ -93,22 +108,14 @@ impl ObjectStorage for OssObjectStorage {
             ("x-oss-date".to_owned(), timestamp.clone()),
             ("x-oss-forbid-overwrite".to_owned(), "true".to_owned()),
         ];
-        let signed = SignedRequest {
-            method: "PUT",
-            canonical_uri: &canonical_uri,
-            canonical_query: "",
-            headers: &headers,
-            additional_headers: &[],
-            hashed_payload: UNSIGNED_PAYLOAD,
-            timestamp: &timestamp,
-            date: &date,
-            region: &self.region,
-            access_key_id: credentials.access_key_id.expose(),
-            access_key_secret: credentials.access_key_secret.expose(),
-        };
-        let authorization = signing::authorization(&signed);
-        let mut outgoing = headers;
-        outgoing.push(("authorization".to_owned(), authorization));
+        let outgoing = self.signed_headers(
+            "PUT",
+            &signing::canonical_uri(request.bucket, request.key),
+            headers,
+            &timestamp,
+            &date,
+            credentials,
+        );
         classify(
             self.transport
                 .execute(HttpRequest {
@@ -127,7 +134,6 @@ impl ObjectStorage for OssObjectStorage {
         request: HeadObjectRequest<'_>,
         credentials: ObjectStorageCredentials<'_>,
     ) -> Result<ObjectMetadata, UploadWriteFailure> {
-        let canonical_uri = format!("/{}/{}", request.bucket, request.key);
         let (timestamp, date) = self.request_time();
         let headers = vec![
             (
@@ -136,22 +142,14 @@ impl ObjectStorage for OssObjectStorage {
             ),
             ("x-oss-date".to_owned(), timestamp.clone()),
         ];
-        let signed = SignedRequest {
-            method: "HEAD",
-            canonical_uri: &canonical_uri,
-            canonical_query: "",
-            headers: &headers,
-            additional_headers: &[],
-            hashed_payload: UNSIGNED_PAYLOAD,
-            timestamp: &timestamp,
-            date: &date,
-            region: &self.region,
-            access_key_id: credentials.access_key_id.expose(),
-            access_key_secret: credentials.access_key_secret.expose(),
-        };
-        let authorization = signing::authorization(&signed);
-        let mut outgoing = headers;
-        outgoing.push(("authorization".to_owned(), authorization));
+        let outgoing = self.signed_headers(
+            "HEAD",
+            &signing::canonical_uri(request.bucket, request.key),
+            headers,
+            &timestamp,
+            &date,
+            credentials,
+        );
         let response = classify(
             self.transport
                 .execute(HttpRequest {

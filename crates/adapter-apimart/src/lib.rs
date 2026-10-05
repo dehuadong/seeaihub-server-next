@@ -22,13 +22,13 @@ use seeai_adapter_sdk::{
     InputImage, PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential,
     ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTaskHandle, ProviderTaskState,
     ProviderTraceId, QueryAccountingCapability, ResponsePayload, RetrySafety,
-    begin_generation_send, decode_data_url, ensure_external_call_allowed, ensure_read_call_allowed,
+    begin_generation_send, ensure_external_call_allowed, ensure_read_call_allowed,
     external_call_timeout, gateway_passthrough_parameters, is_http_url,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{
-    ImageBranch, ImageParameterKind, TokenUsage, image_inputs, image_parameter_kind,
-    image_parameter_values, mask_value,
+    ImageBranch, ImageParameterKind, TokenUsage, image_parameter_kind, image_parameter_values,
+    mask_value,
 };
 use serde::Deserialize;
 use serde_json::{Map, Value};
@@ -90,9 +90,8 @@ impl AdapterFactory for ApimartAdapterFactory {
                 "mask_url",
             ],
             supported_extra_parameters: &[],
-            // 参考图与遮罩走 `POST /v1/uploads/images`：上游要求**公网可访问的 HTTP(S) URL**，
-            // 且明确不再接受在生成请求里直接传 base64。因此 Driver 先把平台资产上传换 url，
-            // 再用 url 组装生成请求（同样属 ② 层内部实现，不外泄到平台）。
+            // 参考图与遮罩只收**公网可访问的 HTTP(S) URL**：上游明确不再接受在生成请求里直接传
+            // base64，所以 Driver 把取值逐字透传、不下载也不上传（属 ② 层内部实现，不外泄到平台）。
             //
             // 注意：这里声明的是**本 Driver 已实现的能力面**，不等于"已获准发布"。
             // 两个 APIMart 素材的 `allowed_branches` 已在受控验证后开放三条分支；
@@ -264,38 +263,15 @@ impl ApimartImageAdapter {
             .map_err(|error| AdapterError::Configuration(error.to_string()))
     }
 
-    /// 把一种图片输入换成"可以直接发给上游"的公网 URL。
+    /// 上游只接受**公网可访问的 URL**：原样透传，平台不下载、不搬运、也不改写它。
     ///
-    /// 上游只接受**公网可访问的 URL**，不接受生成请求里直接带 base64。因此：
-    /// - `data:` URL 就地解码后上传换 URL（内存里做，平台不保存）；
-    /// - 公网 URL 原样透传（平台不下载、不搬运，也不改写它）。
-    ///
-    /// 这一步发生在**提交生成任务之前**，因此任何失败都只能推出同一个结论：
-    /// 生成任务**可证明未受理**（`SafeBeforeAcceptance`）——按失败处置、释放预授权，
-    /// 不进对账。至于那次上传请求本身有没有被上游受理，与平台的处置无关：
-    /// 上传没有需要人工对账的副作用。
-    async fn resolve_url(
-        &self,
-        value: &str,
-        credential: &ProviderCredential,
-    ) -> Result<String, AdapterError> {
-        if value.starts_with("data:") {
-            let decoded = decode_data_url(value).map_err(AdapterError::UnsupportedInput)?;
-            if decoded.bytes.len() > MAX_UPLOAD_BYTES {
-                return Err(AdapterError::UnsupportedInput(format!(
-                    "an inline image is {} bytes, above the provider upload limit of {MAX_UPLOAD_BYTES} bytes",
-                    decoded.bytes.len()
-                )));
-            }
-            return self
-                .upload_image(&decoded.bytes, &decoded.media_type, credential)
-                .await;
-        }
+    /// 生成入口只收公网 URL，其余取值在受理前就被拒了；这里只兜住被绕过的输入。
+    fn resolve_url(&self, value: &str) -> Result<String, AdapterError> {
         if is_http_url(value) {
             return Ok(value.to_owned());
         }
         Err(AdapterError::UnsupportedInput(format!(
-            "a reference image must be an http(s) url or a data url, got {value}"
+            "a reference image must be an http(s) url, got {value}"
         )))
     }
 
@@ -309,7 +285,6 @@ impl ApimartImageAdapter {
     async fn resolve_images(
         &self,
         request: &PreparedImageRequest,
-        credential: &ProviderCredential,
     ) -> Result<Map<String, Value>, AdapterError> {
         let parameters = request.native_parameters.as_object().ok_or_else(|| {
             AdapterError::UnsupportedInput("parameters must be an object".to_owned())
@@ -328,7 +303,7 @@ impl ApimartImageAdapter {
                         .map_err(AdapterError::UnsupportedInput)?;
                     let mut urls = Vec::with_capacity(values.len());
                     for text in values {
-                        urls.push(Value::String(self.resolve_url(text, credential).await?));
+                        urls.push(Value::String(self.resolve_url(text)?));
                     }
                     if urls.is_empty() {
                         continue;
@@ -347,85 +322,12 @@ impl ApimartImageAdapter {
                     else {
                         continue;
                     };
-                    let url = self.resolve_url(text, credential).await?;
+                    let url = self.resolve_url(text)?;
                     resolved.insert(name.clone(), Value::String(url));
                 }
             }
         }
         Ok(resolved)
-    }
-
-    /// 上传一份字节，换回可用于生成请求的公网 URL。
-    async fn upload_image(
-        &self,
-        bytes: &[u8],
-        media_type: &str,
-        credential: &ProviderCredential,
-    ) -> Result<String, AdapterError> {
-        self.upload_image_within(bytes, media_type, credential, REQUEST_TIMEOUT)
-            .await
-    }
-
-    /// 带显式单次超时的上传；新协议用总期限剩余夹住它（RFC 0017 §6）。
-    async fn upload_image_within(
-        &self,
-        bytes: &[u8],
-        media_type: &str,
-        credential: &ProviderCredential,
-        timeout: Duration,
-    ) -> Result<String, AdapterError> {
-        let part = reqwest::multipart::Part::bytes(bytes.to_vec())
-            .file_name(upload_filename(bytes, media_type))
-            .mime_str(media_type)
-            .map_err(|error| {
-                AdapterError::UnsupportedInput(format!(
-                    "unsupported image media type {media_type}: {error}"
-                ))
-            })?;
-        let form = reqwest::multipart::Form::new().part("file", part);
-        let response = self
-            .client
-            .post(self.endpoint("v1/uploads/images")?)
-            .timeout(timeout)
-            .bearer_auth(credential.expose())
-            .multipart(form)
-            .send()
-            .await
-            .map_err(upload_transport_error)?;
-        // 上传失败 ⇒ 生成任务可证明未受理（释放预授权），不是对账。
-        let body = read_body(response).await.map_err(upload_failure)?;
-        let parsed: UploadResponse = serde_json::from_slice(&body).map_err(|error| {
-            upload_failure(provider_error(
-                "provider_response_invalid",
-                error.to_string(),
-                RetrySafety::SafeBeforeAcceptance,
-                ProviderFailureKind::Unknown,
-            ))
-        })?;
-        // 这个 URL 会被原样写进生成请求，因此先确认它真的是个 http(s) 地址。
-        validate_uploaded_url(&parsed.url).map_err(upload_failure)
-    }
-
-    /// 一次请求里所有内联图片的总量上限（上游口径：单次生成请求 256MB）。
-    ///
-    /// 只统计**平台自己的名单**里那些图片参数：名单外的取值平台不上传，也就不该为它申请内存。
-    fn ensure_total_upload_within_limit(
-        request: &PreparedImageRequest,
-    ) -> Result<(), AdapterError> {
-        let inputs = image_inputs(&request.native_parameters, &request.platform_parameters)
-            .map_err(AdapterError::UnsupportedInput)?;
-        let mut total = 0_usize;
-        for text in inputs.reference_images.iter().chain(inputs.mask.iter()) {
-            if let Ok(decoded) = decode_data_url(text) {
-                total = total.saturating_add(decoded.bytes.len());
-            }
-        }
-        if total > MAX_TOTAL_UPLOAD_BYTES {
-            return Err(AdapterError::UnsupportedInput(format!(
-                "inline images total {total} bytes, above the provider limit of {MAX_TOTAL_UPLOAD_BYTES} bytes"
-            )));
-        }
-        Ok(())
     }
 
     /// 提交生成请求，返回 `task_id`。
@@ -622,11 +524,8 @@ impl ImageAdapter for ApimartImageAdapter {
         request: PreparedImageRequest,
         credential: &ProviderCredential,
     ) -> Result<ProviderSuccess, AdapterError> {
-        // 0) 参考图与遮罩：上游只接受**公网可访问的 URL**（且不再接受 base64），
-        //    所以内联 data URL 先上传换 url、公网 URL 原样透传。失败时生成任务**尚未提交**，
-        //    处置是失败，不是对账——预授权照常释放。
-        Self::ensure_total_upload_within_limit(&request)?;
-        let resolved = self.resolve_images(&request, credential).await?;
+        // 0) 参考图与遮罩：上游只接受**公网可访问的 URL**，平台原样透传。
+        let resolved = self.resolve_images(&request).await?;
         // 1) 提交。**这一步之后绝不能重发**（创建请求绝不重发）；
         //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
         let task_id = self.submit(&request, &resolved, credential).await?;
@@ -740,7 +639,7 @@ fn generation_body(
     // 就按声明面丢掉了），所以这里不做"认不认识"的判别，只跳过多出来的 `model`/`prompt` 与
     // **平台装载过的那些图片参数名**（名单由受理时算好，见
     // [`PreparedImageRequest::platform_parameters`]）——图片在下面回填成换算后的公网 URL，
-    // 原值再进一次只会把 data URL 一起发上去。其余名字逐字过去，取值一个都不改：归属不看取值
+    // 原值再进一次会把图片取值当普通参数重复发上去。其余名字逐字过去，取值一个都不改：归属不看取值
     // 的形状，所以名字像图也不会被认领或改写。`null` 表示"这一处没有给"，不是参数值，照旧不进请求体。
     if let Value::Object(parameters) = &request.native_parameters {
         for (name, value) in parameters {
@@ -1213,60 +1112,6 @@ fn parse_provider_error(status: StatusCode, body: &[u8]) -> ProviderCallError {
     }
 }
 
-/// 上传接口的文件大小上限（上游文档：20MB）。
-const MAX_UPLOAD_BYTES: usize = 20 * 1024 * 1024;
-/// 单次生成请求里图片的总量上限（上游文档：256MB）。只对**内联**图片有意义：
-/// 公网 URL 是原样透传的，平台不去读它的字节。
-const MAX_TOTAL_UPLOAD_BYTES: usize = 256 * 1024 * 1024;
-
-#[derive(Debug, Deserialize)]
-struct UploadResponse {
-    url: String,
-}
-
-/// 上传接口的失败分类：它发生在**生成任务提交之前**，因此一律按"可证明未受理"
-/// 处理（失败并释放预授权），而不是像生成那样进对账。
-///
-/// 这里**只改 `retry_safety`，不改 `code`/`message`**：`code` 仍由
-/// [`parse_provider_error`] 按 `error.code` 判定（上游上传失败的错误体多数没有
-/// `error.code`，只有 `type`/`message`，429 例外）。两件事不冲突——生成侧"错误分类
-/// 以 `error.code` 为主"说的是**创建请求**的分类，而这里的结论来自"创建请求根本没发出去"。
-fn upload_failure(error: AdapterError) -> AdapterError {
-    with_retry_safety(error, RetrySafety::SafeBeforeAcceptance)
-}
-
-fn upload_transport_error(error: reqwest::Error) -> AdapterError {
-    provider_error(
-        "provider_transport_error",
-        error.to_string(),
-        RetrySafety::SafeBeforeAcceptance,
-        ProviderFailureKind::UpstreamUnavailable,
-    )
-}
-
-/// 上传返回的 URL 会被原样写进生成请求，因此必须是可用的 http(s) 绝对地址。
-fn validate_uploaded_url(raw: &str) -> Result<String, AdapterError> {
-    match Url::parse(raw) {
-        Ok(url) if matches!(url.scheme(), "http" | "https") => Ok(raw.to_owned()),
-        _ => Err(provider_error(
-            "provider_response_invalid",
-            format!("upload response carried no usable http(s) url: {raw}"),
-            RetrySafety::SafeBeforeAcceptance,
-            ProviderFailureKind::Unknown,
-        )),
-    }
-}
-
-/// 上传时的文件名。上游按扩展名与 MIME 判定类型，因此按媒体类型给一个规整的名字。
-fn upload_filename(bytes: &[u8], media_type: &str) -> String {
-    let extension = match media_type {
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        _ => "png",
-    };
-    format!("image-{}.{extension}", sha256_hex(bytes))
-}
 fn provider_error(
     code: &str,
     message: String,
@@ -1417,55 +1262,13 @@ fn gateway_generation_body(
 }
 
 impl ApimartImageAdapter {
-    /// 新协议下内联图片的总量上限：`Bytes` 直接按字节数，`DataUrl` 就地解码后计数，
-    /// 公网 URL 不计（平台不读它、也不上传）。
-    fn gateway_ensure_total_upload_within_limit(input: &GatewayInput) -> Result<(), AdapterError> {
-        let mut total = 0_usize;
-        for image in input.reference_images.iter().chain(input.mask.iter()) {
-            match image {
-                InputImage::Url(_) => {}
-                InputImage::Bytes(bytes) => total = total.saturating_add(bytes.bytes.len()),
-                InputImage::DataUrl(value) => {
-                    if let Ok(decoded) = decode_data_url(value) {
-                        total = total.saturating_add(decoded.bytes.len());
-                    }
-                }
-            }
-        }
-        if total > MAX_TOTAL_UPLOAD_BYTES {
-            return Err(AdapterError::UnsupportedInput(format!(
-                "inline images total {total} bytes, above the provider limit of {MAX_TOTAL_UPLOAD_BYTES} bytes"
-            )));
-        }
-        Ok(())
-    }
-
-    /// 把一份内存输入图换成可发给上游的公网 URL：公网 URL 原样透传，DataUrl/Bytes 走既有上传。
-    async fn gateway_resolve_url(
-        &self,
-        image: &InputImage,
-        credential: &ProviderCredential,
-        context: &dyn ExecutionContext,
-    ) -> Result<String, AdapterError> {
+    /// 公网 URL 原样透传：生成入口只收公网 URL，平台不下载、不上传、不改写。
+    fn gateway_resolve_url(&self, image: &InputImage) -> Result<String, AdapterError> {
         match image {
             InputImage::Url(url) => Ok(url.clone()),
-            InputImage::DataUrl(_) | InputImage::Bytes(_) => {
-                let decoded = image.decoded()?;
-                if decoded.bytes.len() > MAX_UPLOAD_BYTES {
-                    return Err(AdapterError::UnsupportedInput(format!(
-                        "an inline image is {} bytes, above the provider upload limit of {MAX_UPLOAD_BYTES} bytes",
-                        decoded.bytes.len()
-                    )));
-                }
-                ensure_external_call_allowed(context)?;
-                self.upload_image_within(
-                    &decoded.bytes,
-                    &decoded.media_type,
-                    credential,
-                    external_call_timeout(REQUEST_TIMEOUT, context),
-                )
-                .await
-            }
+            InputImage::Bytes(_) => Err(AdapterError::UnsupportedInput(
+                "the generation entry only accepts public image urls".to_owned(),
+            )),
         }
     }
 
@@ -1474,8 +1277,6 @@ impl ApimartImageAdapter {
     async fn gateway_resolve_images(
         &self,
         input: &GatewayInput,
-        credential: &ProviderCredential,
-        context: &dyn ExecutionContext,
     ) -> Result<Map<String, Value>, AdapterError> {
         if !input.reference_images.is_empty() && input.image_sites.reference.is_none() {
             return Err(AdapterError::UnsupportedInput(
@@ -1495,9 +1296,7 @@ impl ApimartImageAdapter {
         {
             let mut urls = Vec::with_capacity(input.reference_images.len());
             for image in &input.reference_images {
-                urls.push(Value::String(
-                    self.gateway_resolve_url(image, credential, context).await?,
-                ));
+                urls.push(Value::String(self.gateway_resolve_url(image)?));
             }
             // 形状跟候选声明走：数组参数发数组，单值参数只发第一张。
             let value = match site.shape {
@@ -1511,7 +1310,7 @@ impl ApimartImageAdapter {
         {
             resolved.insert(
                 site.parameter.clone(),
-                Value::String(self.gateway_resolve_url(mask, credential, context).await?),
+                Value::String(self.gateway_resolve_url(mask)?),
             );
         }
         Ok(resolved)
@@ -1703,10 +1502,9 @@ impl GatewayAdapter for ApimartImageAdapter {
         context: &dyn ExecutionContext,
         credential: &ProviderCredential,
     ) -> Result<ProviderOutput, AdapterError> {
-        // 0) 参考图与遮罩先换算成公网 URL。失败时生成任务尚未提交 ⇒ 可证明未受理。
-        Self::gateway_ensure_total_upload_within_limit(&input)?;
+        // 0) 参考图与遮罩是公网 URL，原样透传。
         let resolved = self
-            .gateway_resolve_images(&input, credential, context)
+            .gateway_resolve_images(&input)
             .await
             .map_err(gateway_error)?;
         // 1) 提交。这一步之后绝不重发；后续任何失败都进对账。

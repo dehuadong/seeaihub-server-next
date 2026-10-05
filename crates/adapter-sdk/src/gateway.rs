@@ -2,7 +2,7 @@
 
 use crate::{
     AdapterError, DecodedImage, GeneratedImage, ProviderCallError, ProviderCost,
-    ProviderCredential, ProviderFailureKind, RetrySafety, decode_data_url, is_http_url,
+    ProviderCredential, ProviderFailureKind, RetrySafety,
 };
 use async_trait::async_trait;
 use base64::{Engine, engine::general_purpose::STANDARD};
@@ -30,38 +30,23 @@ pub enum ExternalActionRefused {
 /// Provider 有界标识与 trace：权威定义在 [`seeai_domain`]，SDK 只重导出，不另立一套校验。
 pub use seeai_domain::{ProviderTaskHandle, ProviderTraceId};
 
-/// 一处输入图片的形态：公网 URL、未解码的 data URL，或已解码的字节。
+/// 一处输入图片的形态：公网 URL，或 multipart 文件部件的字节。
 ///
-/// 文件部件优先保留 DecodedImage（字节 + 声明媒体类型），需要 data URL 的渠道在 wire
-/// 序列化阶段编码一次，需上传或 multipart 的渠道直接借用字节（RFC 0017 §2）。
+/// 生成入口只收公网 URL；`Bytes` 只为 **multipart 重放比对**保留（受理时按记录冻结的规则
+/// 重算指纹），不参与执行（RFC 0017 §2）。
 #[derive(Clone)]
 pub enum InputImage {
     /// 公网 http(s) 地址：平台不下载，原样交给上游。
     Url(String),
-    /// 未解码的 data URL。
-    DataUrl(String),
-    /// 已解码的字节与声明的媒体类型。
+    /// multipart 文件部件的已解码字节与声明的媒体类型。
     Bytes(DecodedImage),
 }
 
 impl InputImage {
-    /// 把调用方给的图片值分成三态：data URL、公网 URL，其余一律拒绝（平台不猜内容）。
-    pub fn from_raw(value: String) -> Result<Self, AdapterError> {
-        if value.starts_with("data:") {
-            Ok(Self::DataUrl(value))
-        } else if is_http_url(&value) {
-            Ok(Self::Url(value))
-        } else {
-            Err(AdapterError::UnsupportedInput(
-                "an input image must be a public http(s) url or a data url".to_owned(),
-            ))
-        }
-    }
-
-    /// 需要 data URL 的渠道用它取 wire 值：URL 与 data URL 借用原值，字节只编码一次。
+    /// 需要 data URL 的渠道用它取 wire 值：URL 借用原值，字节只编码一次。
     pub fn to_data_url(&self) -> Result<Cow<'_, str>, AdapterError> {
         match self {
-            Self::Url(url) | Self::DataUrl(url) => Ok(Cow::Borrowed(url)),
+            Self::Url(url) => Ok(Cow::Borrowed(url)),
             Self::Bytes(image) => Ok(Cow::Owned(format!(
                 "data:{};base64,{}",
                 image.media_type,
@@ -70,13 +55,10 @@ impl InputImage {
         }
     }
 
-    /// 需要字节的渠道用它取解码结果：data URL 就地解码，公网 URL 没有字节。
+    /// 需要字节的渠道用它取解码结果：公网 URL 没有字节。
     pub fn decoded(&self) -> Result<Cow<'_, DecodedImage>, AdapterError> {
         match self {
             Self::Bytes(image) => Ok(Cow::Borrowed(image)),
-            Self::DataUrl(value) => decode_data_url(value)
-                .map(Cow::Owned)
-                .map_err(AdapterError::UnsupportedInput),
             Self::Url(_) => Err(AdapterError::UnsupportedInput(
                 "a public url carries no bytes; the adapter must fetch it".to_owned(),
             )),
@@ -89,7 +71,6 @@ impl Debug for InputImage {
         // 图片值不进日志或 Debug（RFC 0017 §4）：只打印形态与长度。
         match self {
             Self::Url(value) => write!(formatter, "InputImage::Url({} chars)", value.len()),
-            Self::DataUrl(value) => write!(formatter, "InputImage::DataUrl({} chars)", value.len()),
             Self::Bytes(image) => write!(
                 formatter,
                 "InputImage::Bytes({} bytes, {})",

@@ -291,17 +291,3 @@ fn presigned_signature(
         access_key_secret,
     })
 }
-
-/// `quote(s, safe)` 口径：未保留字符不编码，其余按大写十六进制。
-fn percent_encode(value: &str) -> String {
-    let mut encoded = String::new();
-    for byte in value.as_bytes() {
-        let character = char::from(*byte);
-        if character.is_ascii_alphanumeric() || matches!(character, '-' | '_' | '.' | '~') {
-            encoded.push(character);
-        } else {
-            encoded.push_str(&format!("%{byte:02X}"));
-        }
-    }
-    encoded
-}

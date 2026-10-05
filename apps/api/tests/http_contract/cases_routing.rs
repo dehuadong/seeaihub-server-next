@@ -457,7 +457,7 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
         "两条候选分走两个渠道后发布必须成功：{published_body}"
     );
     let mut request = route_request(model, "an edit neither candidate can carry");
-    request["image"] = json!(png_data_url());
+    request["image"] = json!("https://example.invalid/ref.png");
     let (status, body) = post_json(
         &base_url,
         &api_key,
@@ -532,7 +532,8 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
         StatusCode::OK
     );
     let mut request = route_request(model, "an edit only the light candidate can carry");
-    request["image"] = json!(png_data_url());
+    // 选中那条 AIHubMix 的入口地址连不上；它会先按公网 URL 取参考图，同样连不上（端口 1 没人听）。
+    request["image"] = json!("http://127.0.0.1:1/ref.png");
     for index in 0..4 {
         let key = format!("weight-eligibility-{index}");
         let (status, body) = post_json(

@@ -859,8 +859,12 @@ async fn gateway_edit_form_is_byte_identical_to_the_legacy_multipart_entry() {
         provider_model_id: legacy.provider_model_id.clone(),
         branch: ImageBranch::Masked,
         native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
-        reference_images: vec![InputImage::DataUrl(image.to_owned())],
-        mask: Some(InputImage::DataUrl(mask.to_owned())),
+        reference_images: vec![InputImage::Bytes(
+            decode_inline_image(image).expect("the inline reference image decodes"),
+        )],
+        mask: Some(InputImage::Bytes(
+            decode_inline_image(mask).expect("the inline mask decodes"),
+        )),
         image_sites: gateway_sites(&schema, ImageBranch::Masked),
         cost_currency: "USD".to_owned(),
     };
@@ -921,24 +925,11 @@ async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
     assert_eq!(receiver.requests(), 2, "两个入口各自下载一次公网参考图");
 }
 
-/// 内存态不发生网络往返：data URL 就地解码、Bytes 直接借用，只有 URL 才走下载。
+/// 内存态不发生网络往返：multipart 文件部件的 `Bytes` 直接借用，只有 URL 才走下载。
 #[tokio::test]
-async fn gateway_input_images_decode_in_memory_without_network() {
+async fn gateway_input_images_borrow_bytes_without_network() {
     let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
         .expect("adapter config should be valid");
-    let legacy = decode_inline_image("data:image/png;base64,AAAA").expect("legacy decodes inline");
-    let data_url = adapter
-        .gateway_image_bytes(
-            &InputImage::DataUrl("data:image/png;base64,AAAA".to_owned()),
-            &FakeContext::fresh(),
-        )
-        .await
-        .expect("a data url decodes in place");
-    assert_eq!(data_url.media_type, "image/png");
-    assert_eq!(
-        data_url.bytes, legacy.bytes,
-        "data URL 态与旧入口解出同一份字节"
-    );
     let borrowed = adapter
         .gateway_image_bytes(
             &InputImage::Bytes(DecodedImage {

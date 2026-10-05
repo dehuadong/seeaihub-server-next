@@ -112,6 +112,8 @@ async fn filtering_never_drops_the_images_the_platform_places() {
 /// AIHubMix 的编辑端点收的是表单部件：标量参数进文本部件、参考图进文件部件。这里断言两个方向——
 /// 声明过的 `quality` 确实进了发给假上游的表单（文本部件里能读到它的名字），而 `seed` 与
 /// `image_with_roles` 在整份表单字节里都不出现。
+///
+/// 平台这一侧只收公网 URL：参考图走 `image` 文本部件，字节由 Adapter 自己取回后再进上游的文件部件。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_multipart_edit_path_keeps_declared_parameters_and_drops_undeclared_ones() {
@@ -128,13 +130,7 @@ async fn the_multipart_edit_path_keeps_declared_parameters_and_drops_undeclared_
             "image_with_roles",
             json!([{"role": "reference", "url": "https://example.invalid/a.png"}]).to_string(),
         )
-        .part(
-            "image",
-            reqwest::multipart::Part::bytes(PNG_FIXTURE.to_vec())
-                .file_name("input.png")
-                .mime_str("image/png")
-                .expect("mime"),
-        );
+        .text("image", harness.png_url());
     let (status, body) = harness.sync_multipart(&key, form).await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("编辑路径的声明面过滤", &body);
@@ -163,7 +159,7 @@ async fn the_multipart_edit_path_keeps_declared_parameters_and_drops_undeclared_
 }
 
 /// multipart 入口的图片也可以走**文本部件**（不带文件名）：与 JSON 入口同一套语义，
-/// 值就是公网 URL 或 data URL，平台认的字段名照样只有 `image` / `image_urls` / `mask`。
+/// 值就是公网 URL，平台认的字段名照样只有 `image` / `image_urls` / `mask`。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn multipart_text_image_fields_follow_the_same_contract() {
@@ -174,14 +170,14 @@ async fn multipart_text_image_fields_follow_the_same_contract() {
     let form = reqwest::multipart::Form::new()
         .text("model", harness.model.to_owned())
         .text("prompt", "edit through a text field")
-        .text("image_urls", png_data_url());
+        .text("image_urls", harness.png_url());
     let (status, body) = harness.sync_multipart(&key, form).await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("文本部件参考图", &body);
     let edits = harness.submit_bytes("/v1/images/edits");
     assert!(
         body_contains_bytes(&edits, PNG_FIXTURE),
-        "文本部件里的 data URL 必须就地解码进文件部件"
+        "文本部件里的公网 URL 取回的字节必须进文件部件"
     );
 
     // 2) `image` 与 `image_urls` 同时给非空值：同义字段含糊，受理前 400。
@@ -189,8 +185,8 @@ async fn multipart_text_image_fields_follow_the_same_contract() {
     let form = reqwest::multipart::Form::new()
         .text("model", harness.model.to_owned())
         .text("prompt", "both synonyms as text fields")
-        .text("image", png_data_url())
-        .text("image_urls", png_data_url());
+        .text("image", "https://example.invalid/a.png")
+        .text("image_urls", "https://example.invalid/b.png");
     let (status, body) = harness.sync_multipart(&key, form).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
     assert_eq!(body["error"]["code"].as_str(), Some("invalid_parameter"));
@@ -198,43 +194,45 @@ async fn multipart_text_image_fields_follow_the_same_contract() {
     harness.cleanup().await;
 }
 
-/// 上传失败 = 生成任务**可证明未受理**：重投到额度用完仍失败时，Job 走失败、预授权释放，不进对账。
+/// 参考图取不到 = 生成任务**可证明未受理**：重投到额度用完仍失败时，Job 走失败、预授权释放，
+/// 不进对账。
 ///
-/// 这与"提交之后出错进对账"是两条路径，不能混为一谈。注意这里验的是**用尽额度之后**的处置：
-/// 单次上传失败本身是可证明未受理的失败，重投它的意义在于"也许下一次上传就通了"（见
-/// `cases_retry.rs`）；一直失败时按既有失败处置落失败终态。
+/// 这与"提交之后出错进对账"是两条路径，不能混为一谈。AIHubMix 的参考图由 Adapter 自己按公网 URL
+/// 取，取不到时生成请求还没发出去；单次失败可重投（见 `cases_retry.rs`），一直失败就按既有失败
+/// 处置落失败终态。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn upload_failure_fails_the_job_before_the_create_request() {
-    let behaviour = UpstreamBehaviour {
-        upload_failure_status: 400,
-        ..UpstreamBehaviour::apimart()
-    };
-    let harness = Harness::start(behaviour).await;
-    let key = format!("driver-upload-failure-{}", Uuid::new_v4());
+async fn reference_image_failure_fails_the_job_before_the_create_request() {
+    // 假上游对参考图的 GET 一律回 500：取图失败发生在生成请求提交之前，可证明未受理。
+    let harness = Harness::start(UpstreamBehaviour {
+        reference_get_failures: usize::MAX,
+        ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+    })
+    .await;
+    let key = format!("driver-reference-failure-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "edit this image");
-    request["image"] = json!(png_data_url());
+    request["image"] = json!(harness.png_url());
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request.clone())
         .await;
     assert_eq!(
         status,
         StatusCode::BAD_GATEWAY,
-        "an upload failure is a platform-side failure: {body}"
+        "a reference image failure is a platform-side failure: {body}"
     );
     assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
-    assert_public_only("上传失败", &body);
+    assert_public_only("参考图取不到", &body);
 
     let (job_id, state) = harness.job(&key).await;
     assert_eq!(
         state, "failed",
-        "an upload failure happens before the create request, so the job is simply failed"
+        "a reference image failure happens before the create request, so the job is simply failed"
     );
     // 生成请求根本没发出去。
     assert_eq!(
         harness.count("POST", "/v1/images/generations"),
         0,
-        "the create request must not be sent when the reference image could not be uploaded"
+        "the create request must not be sent when the reference image could not be fetched"
     );
     // 预授权释放：这台 Job 的 hold 不再是 active。
     let hold_status: String =
@@ -630,18 +628,21 @@ async fn oversized_string_data_is_rejected_before_acceptance() {
     harness.cleanup().await;
 }
 
-/// 边界之内的合法大请求仍然通过：一份约 1 MiB 的 data URL 参考图照旧走完受理与生成。
+/// 边界之内的合法大请求仍然通过：近 1 MiB 的长参数照旧走完受理与生成。
 ///
 /// 16 MiB 的边界由 `crates/domain` 的 `a_full_size_image_request_still_parses` 与 API 的内存探针
-/// （`apps/api/src/tests.rs`）在解析层钉住；这条用例验的是它端到端不被结构上限误伤。
+/// （`apps/api/src/tests.rs`）在解析层钉住；这条用例验的是它端到端不被结构上限误伤。生成入口收敛
+/// 为只收公网 URL 后，参考图字节不再随正文进来，改用近上限的长参数承载同样的正文规模。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_large_but_bounded_reference_image_still_passes() {
+async fn a_large_but_bounded_request_still_passes() {
     let harness =
         Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
     let key = format!("structure-large-ok-{}", Uuid::new_v4());
-    let mut request = route_request(harness.model, "a large but legitimate reference image");
-    request["image"] = json!(format!("data:image/png;base64,{}", "A".repeat(1024 * 1024)));
+    let mut request = route_request(harness.model, "a large but legitimate request");
+    // 近 1 MiB 的 `prompt`：声明的普通参数，正文因此贴近结构上限；参考图仍是一个普通公网 URL。
+    request["prompt"] = json!("p".repeat(1024 * 1024));
+    request["image"] = json!(harness.png_url());
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request)
         .await;

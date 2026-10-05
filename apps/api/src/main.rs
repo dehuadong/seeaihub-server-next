@@ -614,9 +614,7 @@ async fn main() -> Result<()> {
     // 本机上传读取许可都在消费正文之前完成。
     let upload_routes = Router::new()
         .route("/v1/uploads/images", post(upload_image))
-        .route_layer(DefaultBodyLimit::max(
-            state.upload.config.max_request_bytes,
-        ))
+        .route_layer(DefaultBodyLimit::max(state.upload.config.max_request_bytes))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_upload_access,
@@ -2924,10 +2922,10 @@ async fn generate_image(
     .await
 }
 
-/// edits 入口（`multipart/form-data`）：`image` 与 `mask` 可以是**文件部件**，文本部件也认。
+/// edits 入口（`multipart/form-data`）：`image` 与 `mask` 的文本部件按公网 URL 读，文件部件在受理前被拒。
 ///
-/// 值按 `http(s)` 公网 URL 或 `data:` URL 解释（与 JSON 入口同一套语义）；文件部件只留在内存里
-/// （`InputImage::Bytes`），**不落盘**。同一个字段不能既给文件又给文本。
+/// 文件部件的字节仍被解析出来（`InputImage::Bytes`）供同键重放比对，**不落盘**；命中幂等记录时
+/// 按记录冻结的规则比对，未命中才按当前合同解释——那时文件部件一律 `400 public_image_url_required`。
 /// 没有 `image` 的 edits 同样合法（那就是文生图）。
 async fn edit_image(
     State(state): State<AppState>,
@@ -3071,12 +3069,7 @@ async fn authenticate_upload(
     let token = bearer_token(headers)?;
     match state.identity.authenticate_identity(token).await {
         Ok(identity) => Ok(identity),
-        Err(_) => Err(ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            code: "invalid_api_key",
-            message: "API key is invalid or revoked".to_owned(),
-            retry_after: None,
-        }),
+        Err(_) => Err(invalid_api_key()),
     }
 }
 
@@ -3086,9 +3079,9 @@ async fn upload_image(
     slow: Option<Extension<SlowRead>>,
     scope: Option<Extension<Arc<ConnectionScope>>>,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
-) -> Result<Json<UploadImageResponse>, ApiError> {
-    let mut multipart = multipart
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
+) -> Result<Response, ApiError> {
+    let mut multipart =
+        multipart.map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
     let parsed = read_upload_file(&mut multipart).await;
     // 慢读超时不写对象：它发生在受理前，按 408 回应；读错误先让位给这个更具体的判据。
     if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
@@ -3099,17 +3092,35 @@ async fn upload_image(
         Some(scope) => scope.0.as_ref(),
         None => &NEVER_CANCELLED,
     };
-    let uploaded = state
+    let uploaded = match state
         .upload
         .service
-        .upload(&file.bytes, file.declared_content_type.as_deref(), cancellation)
+        .upload(
+            &file.bytes,
+            file.declared_content_type.as_deref(),
+            cancellation,
+        )
         .await
-        .map_err(upload_error)?;
+    {
+        Ok(uploaded) => uploaded,
+        Err(ImageUploadError::ClientDisconnected) => {
+            // Spec 0007 §5：断开不对客返回错误码。连接已经断开，这个状态码发不到对端，也不携带
+            // 错误信封与 URL；对象若已写入按孤儿处置，账户与账本不变。
+            return Ok(client_disconnected().into_response());
+        }
+        Err(error) => return Err(upload_error(error)),
+    };
     Ok(Json(UploadImageResponse {
         url: uploaded.url,
         media_type: uploaded.media_type,
         byte_length: uploaded.byte_length,
-    }))
+    })
+    .into_response())
+}
+
+/// 客户端已离开：只为本地观测，不构造对客错误信封。
+fn client_disconnected() -> StatusCode {
+    StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
 /// 一次上传请求解析出的文件：字节与部件声明的 `Content-Type`。
@@ -3211,7 +3222,8 @@ fn upload_error(error: ImageUploadError) -> ApiError {
             retry_after: None,
         },
         ImageUploadError::ClientDisconnected => ApiError {
-            status: StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR),
+            // 理论上到不了这里：`upload_image` 在断开时直接回一个无信封的状态码（Spec 0007 §5）。
+            status: client_disconnected(),
             code: "client_disconnected",
             message,
             retry_after: None,
@@ -3296,51 +3308,47 @@ fn replay_recorded(
         .map_err(ApiError::from)
 }
 
-/// 按**当前合同**解释有界解析后的入口输入：摘出契约字段名下的文本图片，与 multipart 文件部件合并。
+/// 按**当前合同**解释有界解析后的入口输入：图片值只收公网 URL。
 ///
 /// 只在幂等键未命中记录之后调用。命中时按记录冻结的合同比对，不用这里的新规则重新解释原请求
-/// （Spec 0005 §4）。同一个字段既给文件又给文本一律拒绝：宁可报错也不替调用方挑一个。
+/// （Spec 0005 §4）。参考图或遮罩的取值不是 `http(s)` 公网 URL（含 `data:` URL、multipart
+/// 文件部件与任何其他非法文本）时一律 `400 public_image_url_required`：不建记录、不取占用、不调上游。
+/// multipart 文件部件的字节仍被解析出来，但只供重放比对用，不参与执行。
 fn interpret_current_inputs(
     mut parameters: RequestParameters,
     file_references: Vec<InputImage>,
     file_mask: Option<InputImage>,
 ) -> Result<(RequestParameters, Vec<InputImage>, Option<InputImage>), ApiError> {
+    if !file_references.is_empty() || file_mask.is_some() {
+        return Err(public_image_url_required());
+    }
     let text_inputs = take_contract_image_inputs(&mut parameters)?;
-    if !text_inputs.reference_images.is_empty() && !file_references.is_empty() {
-        return Err(ApiError::bad_request(
-            "invalid_parameter",
-            "image was given both as a file part and as a text field",
-        ));
-    }
-    if text_inputs.mask.is_some() && file_mask.is_some() {
-        return Err(ApiError::bad_request(
-            "invalid_parameter",
-            "mask was given both as a file part and as a text field",
-        ));
-    }
-    let reference_images = if file_references.is_empty() {
-        text_inputs
-            .reference_images
-            .into_iter()
-            .map(InputImage::from_raw)
-            .collect::<Result<Vec<_>, _>>()
-            .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?
-    } else {
-        file_references
-    };
-    let mask = if file_mask.is_some() {
-        file_mask
-    } else {
-        text_inputs
-            .mask
-            .map(InputImage::from_raw)
-            .transpose()
-            .map_err(|error| ApiError::bad_request("invalid_parameter", error.to_string()))?
-    };
+    let reference_images = text_inputs
+        .reference_images
+        .into_iter()
+        .map(public_image_url)
+        .collect::<Result<Vec<_>, _>>()?;
+    let mask = text_inputs.mask.map(public_image_url).transpose()?;
     Ok((parameters, reference_images, mask))
 }
 
-/// multipart 图片部件：**直接保留字节**与声明的媒体类型，不再先编码成 data URL 再解码（RFC 0017 §2）。
+/// 一个文本图片值必须是 `http(s)` 公网 URL；其余一律 `400 public_image_url_required`。
+fn public_image_url(value: String) -> Result<InputImage, ApiError> {
+    if seeai_adapter_sdk::is_http_url(&value) {
+        return Ok(InputImage::Url(value));
+    }
+    Err(public_image_url_required())
+}
+
+/// 受理前的图片形态拒绝：不建记录、不取占用、不调上游。
+fn public_image_url_required() -> ApiError {
+    ApiError::bad_request(
+        "public_image_url_required",
+        "an input image must be a public http(s) url".to_owned(),
+    )
+}
+
+/// multipart 图片部件：**直接保留字节**与声明的媒体类型；字节只供同键重放比对，不参与执行。
 async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
     let media_type = field
         .content_type()
@@ -3647,12 +3655,17 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId
                 .to_owned(),
             retry_after: Some(retry_after),
         }),
-        Err(_) => Err(ApiError {
-            status: StatusCode::UNAUTHORIZED,
-            code: "invalid_api_key",
-            message: "API key is invalid or revoked".to_owned(),
-            retry_after: None,
-        }),
+        Err(_) => Err(invalid_api_key()),
+    }
+}
+
+/// 无效或已吊销的 API Key：生成与上传两个入口共用同一份对客信封。
+fn invalid_api_key() -> ApiError {
+    ApiError {
+        status: StatusCode::UNAUTHORIZED,
+        code: "invalid_api_key",
+        message: "API key is invalid or revoked".to_owned(),
+        retry_after: None,
     }
 }
 

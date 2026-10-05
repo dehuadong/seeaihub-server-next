@@ -194,7 +194,7 @@ fn validate_aihubmix_publication(
                 Value::String("masked".to_owned()),
             ]
         });
-    // 最小请求用的图片取值就是调用方能给的形态：内联 data URL 或公网 URL。
+    // 最小请求用的图片取值是生成入口收的公网 URL 形态。
     // 平台不再有"资产引用"这种值，承载面也不该按它校验。
     // 取值要跟着**这份承载面自己声明的形态**走：声明成数组就给只装一张的数组，否则最小请求本身
     // 就被这份 schema 判成非法，拒它的理由（"连最小请求都过不了"）是假的。
@@ -207,7 +207,7 @@ fn validate_aihubmix_publication(
         Some("array") => serde_json::json!([image]),
         _ => serde_json::json!(image),
     };
-    let mask = "data:image/png;base64,AAAA";
+    let mask = "https://example.invalid/mask.png";
     let cases = [
         (
             "prompt_only",
@@ -770,9 +770,8 @@ impl AihubmixImageAdapter {
         Ok(form)
     }
 
-    /// 一份内存输入图取成字节：`Bytes` 借用、`DataUrl` 就地解码，公网 URL 在自己下载前
-    /// 先过取消/期限闸，单次超时取 min(自身配置, 总期限剩余)。两种内存形态都不发生网络往返
-    /// （RFC 0017 §2、§6）。
+    /// 一份输入图取成字节：multipart 文件部件的 `Bytes` 借用，公网 URL 在自己下载前先过取消/
+    /// 期限闸，单次超时取 min(自身配置, 总期限剩余)。内存形态不发生网络往返（RFC 0017 §2、§6）。
     async fn gateway_image_bytes(
         &self,
         image: &InputImage,
@@ -784,7 +783,7 @@ impl AihubmixImageAdapter {
                 self.download_image_within(url, external_call_timeout(self.timeout, context))
                     .await
             }
-            InputImage::DataUrl(_) | InputImage::Bytes(_) => {
+            InputImage::Bytes(_) => {
                 let decoded = image.decoded()?;
                 ensure_input_size(decoded.bytes.len())?;
                 Ok(decoded.into_owned())

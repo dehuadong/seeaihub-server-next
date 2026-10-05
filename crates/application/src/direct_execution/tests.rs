@@ -102,13 +102,13 @@ fn gateway_input_hoists_images_out_of_native_parameters() {
     }));
     let request = request(
         vec![InputImage::Url("https://img.example/a.png".to_owned())],
-        Some(InputImage::DataUrl("data:image/png;base64,AAAA".to_owned())),
+        Some(InputImage::Url("https://img.example/mask.png".to_owned())),
     );
     // 这一份是承载准备后的参数面：图片位上的取值已经由 place_image_inputs 装载。
     let prepared = json!({
         "prompt": "draw",
         "image": "https://img.example/a.png",
-        "mask": "data:image/png;base64,AAAA"
+        "mask": "https://img.example/mask.png"
     });
     let input = build_gateway_input(&offering, ImageBranch::Masked, prepared, &request)
         .expect("the gateway input");

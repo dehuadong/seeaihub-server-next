@@ -442,8 +442,8 @@ async fn direct_replay_with_a_reference_image_uses_the_recorded_fingerprint() {
         Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
             .await;
     let key = format!("direct-image-replay-{}", Uuid::new_v4());
-    let mut request = route_request(harness.model, "edit with an inline image twice");
-    request["image"] = json!(png_data_url());
+    let mut request = route_request(harness.model, "edit with a public url twice");
+    request["image"] = json!(harness.png_url());
     let (status, body) = post_json(
         &harness.base_url,
         &harness.api_key,
@@ -467,6 +467,80 @@ async fn direct_replay_with_a_reference_image_uses_the_recorded_fingerprint() {
         body["error"]["code"].as_str(),
         Some("result_not_retained"),
         "带图的同键重发必须命中同一条记录：{body}"
+    );
+    assert_eq!(harness.create_calls(), 1, "重放不再调上游");
+    assert_eq!(account_job_count(&harness).await, 1, "不新建执行记录");
+    harness.cleanup().await;
+}
+
+/// Spec 0005 A12：以 `data:` URL 受理的历史记录在改版后仍按原记录回应。
+///
+/// 生成入口现在只收公网 URL，这样的历史记录已经造不出来：先用公网 URL 走一遍，留下记录与冻结的
+/// 合同；再把记录里的请求摘要换成"同一份请求、图片取值是 data URL"的摘要——那正是历史记录当时写下
+/// 的那份材料。重发同一幂等键的 data URL 请求必须走重放（`409 result_not_retained`），而不是按
+/// 新入口规则回 `400 public_image_url_required`。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_historical_data_url_record_replays_by_the_recorded_rules() {
+    let harness =
+        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
+            .await;
+    let key = format!("direct-data-url-replay-{}", Uuid::new_v4());
+    let prompt = "edit with a historically recorded inline image";
+    let data_url = inline_png_data_url();
+    let mut request = route_request(harness.model, prompt);
+    request["image"] = json!(harness.png_url());
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK, "got {body}");
+
+    // 历史记录写下的摘要：同一份请求面（模型与普通参数）配 data URL 的图片取值。
+    let digest = contract_fingerprint_keys()
+        .request_fingerprint(
+            1,
+            &RequestFingerprintInput {
+                endpoint: "/v1/images/generations",
+                gateway_model: harness.model,
+                parameters: &json!({"model": harness.model, "prompt": prompt}),
+                reference_images: std::slice::from_ref(&data_url),
+                mask: None,
+                n: 1,
+            },
+        )
+        .expect("the fixture fingerprint computes")
+        .expect("key version 1 is configured");
+    let updated = sqlx::query(
+        "UPDATE generation.jobs SET request_digest = $1 WHERE idempotency_key_digest = $2",
+    )
+    .bind(&digest)
+    .bind(idempotency_key_digest(&key))
+    .execute(&harness.pool)
+    .await
+    .expect("rewrite the recorded request digest");
+    assert_eq!(updated.rows_affected(), 1, "必须真的改到了一行");
+
+    // 用 data URL 重发同一幂等键：命中记录并按原记录回应，不被新入口规则拦下。
+    let mut request = route_request(harness.model, prompt);
+    request["image"] = json!(data_url);
+    let (status, body) = post_json(
+        &harness.base_url,
+        &harness.api_key,
+        "/v1/images/generations",
+        &key,
+        &request,
+    )
+    .await;
+    assert_eq!(status, StatusCode::CONFLICT, "got {body}");
+    assert_eq!(
+        body["error"]["code"].as_str(),
+        Some("result_not_retained"),
+        "历史 data URL 记录必须按原记录回应：{body}"
     );
     assert_eq!(harness.create_calls(), 1, "重放不再调上游");
     assert_eq!(account_job_count(&harness).await, 1, "不新建执行记录");
@@ -951,9 +1025,11 @@ fn peak_rss_kib(pid: u32) -> u64 {
 ///
 /// 预算在这里是进程级上界而不是"每执行预留"：RFC §8 要求最大合法输入与慢发送下 RSS 落在配置的
 /// 预算内。夹具把预算压到**刚好一次执行的预留**（按 Driver 字节上限实测钉出来的那个数），断言
-/// 才有判别力。抖动来源：进程基线与 tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的内存
-/// 留在 arena 里不还给内核、以及 data URL 解码与 multipart 编码的同尺寸副本。VmHWM 是内核对整段
-/// 生命周期的最高水位，只单调上升，不会漏记峰值。
+/// 才有判别力。生成入口收敛为只收公网 URL 后，参考图字节不再随请求体进来，而是由 Adapter 从公网
+/// URL 取回后再编码进 multipart：假上游按 `reference_image_bytes` 交出一张大图，压的仍是
+/// "取图 + 编码"那一段。抖动来源：进程基线与 tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的
+/// 内存留在 arena 里不还给内核、以及 multipart 编码的同尺寸副本。VmHWM 是内核对整段生命周期的
+/// 最高水位，只单调上升，不会漏记峰值。
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
@@ -966,7 +1042,10 @@ async fn direct_peak_rss_stays_within_the_memory_budget() {
             "aihubmix-image-v1",
             &["prompt_only", "image_conditioned", "masked"],
         ),
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        UpstreamBehaviour {
+            reference_image_bytes: REFERENCE_IMAGE_BYTES,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         4,
         30,
         ApiProcessSettings {
@@ -975,13 +1054,9 @@ async fn direct_peak_rss_stays_within_the_memory_budget() {
         },
     )
     .await;
-    // 接近正文上限的大图：base64 之后约 8MiB，触发解码与 multipart 编码的多份同尺寸副本。
-    let data_url = format!(
-        "data:image/png;base64,{}",
-        STANDARD.encode(vec![0_u8; REFERENCE_IMAGE_BYTES])
-    );
+    // 调用方只给公网 URL；参考图的 6 MiB 字节由 Adapter 自己从假上游取回。
     let mut request = route_request(harness.model, "a large reference image");
-    request["image"] = json!(data_url);
+    request["image"] = json!(harness.png_url());
     let key = format!("direct-peak-rss-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &harness.base_url,

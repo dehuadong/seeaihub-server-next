@@ -397,9 +397,8 @@ fn build_request_failed_is_recognised_by_message_prefix_not_by_code() {
 }
 
 #[test]
-fn descriptor_declares_the_edit_branches_now_that_upload_exists() {
-    // 参考图与遮罩以前被拒绝，因为上游只收公网可访问的 URL，而我们没有上传链路。
-    // 上传实现之后三条分支都可以声明了。
+fn descriptor_declares_the_edit_branches() {
+    // 参考图与遮罩只收公网 URL，APIMart 逐字透传，所以三条分支都可以声明。
     let descriptor = ApimartAdapterFactory
         .descriptor(ADAPTER_KEY)
         .expect("descriptor is declared");
@@ -544,59 +543,8 @@ fn post_acceptance_failures_are_never_narrowed() {
 }
 
 #[test]
-fn upload_filename_follows_the_media_type() {
-    let bytes = b"image";
-    assert!(upload_filename(bytes, "image/jpeg").ends_with(".jpg"));
-    assert!(upload_filename(bytes, "image/webp").ends_with(".webp"));
-    assert!(upload_filename(bytes, "image/gif").ends_with(".gif"));
-    assert!(upload_filename(bytes, "image/png").ends_with(".png"));
-    // 文件名里带上内容摘要：同一张图重复上传时上游看到同一个名字。
-    assert_eq!(
-        upload_filename(bytes, "image/png"),
-        upload_filename(bytes, "image/png")
-    );
-}
-
-#[test]
-fn upload_failures_are_safe_before_acceptance() {
-    // 上传发生在提交生成任务之前，所以它的失败不是"受理状态不确定"，
-    // 而是**可证明未受理**（`SafeBeforeAcceptance`）——本阶段同样映射为
-    // 失败并释放预授权，但不该被标成"确定性拒绝"。
-    let raw = parse_provider_error(
-        StatusCode::BAD_REQUEST,
-        br#"{"error":{"message":"unsupported image type","type":"invalid_request_error"}}"#,
-    );
-    // `parse_provider_error` 只看 `error.code`；这份错误体没有 code，所以是"不确定"。
-    assert_eq!(raw.retry_safety, RetrySafety::AcceptanceUnknown);
-    match upload_failure(AdapterError::Provider(raw)) {
-        AdapterError::Provider(provider) => {
-            assert_eq!(provider.retry_safety, RetrySafety::SafeBeforeAcceptance);
-            // code 与 message 原样保留：平台仍能看出这是哪一类失败。
-            assert_eq!(provider.code, "invalid_request_error");
-        }
-        other => panic!("expected a provider error, got {other:?}"),
-    }
-}
-
-#[tokio::test]
-async fn upload_transport_failures_are_safe_before_acceptance() {
-    // 连不上上游：生成任务同样从未发出 ⇒ 可证明未受理，不是"不确定"。
-    let error = reqwest::Client::new()
-        .get("http://127.0.0.1:1/never")
-        .send()
-        .await
-        .expect_err("nothing listens on port 1");
-    match upload_transport_error(error) {
-        AdapterError::Provider(provider) => {
-            assert_eq!(provider.retry_safety, RetrySafety::SafeBeforeAcceptance);
-        }
-        other => panic!("expected a provider error, got {other:?}"),
-    }
-}
-
-#[test]
 fn credential_failures_are_not_retryable_even_without_an_error_code() {
-    // 实测（零费用、无凭证）：`POST /v1/uploads/images` 的 401 信封是
+    // 实测（零费用、无凭证）：APIMart 的 401 信封是
     // `{"error":{"code":"","message":"invalid API key (request id: …)","param":"","type":"apimart_error"}}`
     // ——没有可用的 `error.code`。凭据问题不该被当成"受理状态不确定"而送进对账。
     let body = br#"{"error":{"code":"","message":"invalid API key (request id: 20260919182056471923385yBRUUrTx)","param":"","type":"apimart_error"}}"#;
@@ -655,64 +603,6 @@ fn post_acceptance_failures_carry_the_task_id_for_reconciliation() {
     ));
 }
 
-#[test]
-fn uploaded_urls_must_be_absolute_http_addresses() {
-    assert_eq!(
-        validate_uploaded_url("https://upload.example/a.png").expect("https is fine"),
-        "https://upload.example/a.png"
-    );
-    for bad in ["", "asset://abc", "file:///etc/passwd", "not a url"] {
-        assert!(
-            validate_uploaded_url(bad).is_err(),
-            "`{bad}` must not be forwarded into the generation request"
-        );
-    }
-}
-
-#[test]
-fn total_inline_upload_size_is_capped_like_the_per_file_limit() {
-    // 公网 URL 不计入：平台不读它的字节。只有内联 data URL 需要挡住总量。
-    let inline = |payload: String| PreparedImageRequest {
-        provider_model_id: "gpt-image-2.5-flare".to_owned(),
-        branch: ImageBranch::ImageConditioned,
-        native_parameters: serde_json::json!({
-            "prompt": "x",
-            "image_urls": [format!("data:image/png;base64,{payload}")]
-        }),
-        platform_parameters: vec!["image_urls".to_owned()],
-        cost_currency: "USD".to_owned(),
-    };
-    assert!(
-        ApimartImageAdapter::ensure_total_upload_within_limit(&inline("A".repeat(1024))).is_ok()
-    );
-    let mut public = inline("A".repeat(1024));
-    public.native_parameters = serde_json::json!({
-        "prompt": "x",
-        "image_urls": ["https://example.invalid/very-large.png"]
-    });
-    assert!(
-        ApimartImageAdapter::ensure_total_upload_within_limit(&public).is_ok(),
-        "a public url is passed through, so it costs the platform nothing"
-    );
-    // 名单外的图名参数不参与统计：平台不上传它，也就不为它申请内存。
-    // （这类没声明的名字在受理期就按声明面丢掉了，到不了 Driver；这条钉的是换算只看名单。）
-    let mut unclaimed = inline("A".repeat(1024));
-    unclaimed.native_parameters = serde_json::json!({
-        "prompt": "x",
-        "images": [format!("data:image/png;base64,{}", "A".repeat(MAX_TOTAL_UPLOAD_BYTES))]
-    });
-    assert!(
-        ApimartImageAdapter::ensure_total_upload_within_limit(&unclaimed).is_ok(),
-        "名单外的参数不是平台的图，不算进上传总量"
-    );
-    // 超过上游总量上限的内联图片直接拒绝，不去为它申请那么多内存。
-    let oversized = (MAX_TOTAL_UPLOAD_BYTES / 3 + 8) * 4;
-    assert!(
-        ApimartImageAdapter::ensure_total_upload_within_limit(&inline("A".repeat(oversized)))
-            .is_err()
-    );
-}
-
 /// Driver 收到的参数面**已经**是候选声明面里的子集：受理期按声明面过滤过了。
 ///
 /// 所以这里没有"认不认识这个参数"的判别——到手的每个名字（声明过的 `n`、`resolution`
@@ -756,7 +646,6 @@ fn every_parameter_it_receives_goes_upstream_verbatim() {
 async fn an_images_array_outside_the_platform_list_is_not_converted() {
     let adapter =
         ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(1)).expect("config");
-    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
     let inline = "data:image/png;base64,AAAA";
     let prepared = PreparedImageRequest {
         provider_model_id: "gpt-image-2.5-flare".to_owned(),
@@ -771,7 +660,7 @@ async fn an_images_array_outside_the_platform_list_is_not_converted() {
     // `http://127.0.0.1:1` 上没有任何东西可以连：一旦它真去上传就会失败，
     // 因此这个用例通过本身就证明 data URL 没有被拿去上传。
     let resolved = adapter
-        .resolve_images(&prepared, &credential)
+        .resolve_images(&prepared)
         .await
         .expect("名单外没有图片要换算");
     assert!(resolved.is_empty(), "名单外没有可换算的图片：{resolved:?}");
@@ -828,19 +717,16 @@ fn generation_body_carries_the_resolved_image_urls_at_their_parameter_names() {
 
 #[tokio::test]
 async fn public_urls_pass_through_without_being_uploaded_or_downloaded() {
-    // 上游只吃公网 URL：data URL 才需要上传换 URL，公网 URL 原样透传。
+    // 上游只吃公网 URL：平台原样透传，不下载、不上传。
     let adapter =
         ApimartImageAdapter::new("http://127.0.0.1:1", Duration::from_secs(1)).expect("config");
-    let credential = ProviderCredential::new("test-key".to_owned()).expect("credential");
     let resolved = adapter
-        .resolve_url("https://example.invalid/a.png", &credential)
-        .await
+        .resolve_url("https://example.invalid/a.png")
         .expect("a public url needs no network round trip");
     assert_eq!(resolved, "https://example.invalid/a.png");
-    // 不是 http(s) 也不是 data URL 的值一律拒绝，不猜。
+    // 不是 http(s) 的值一律拒绝，不猜。
     let error = adapter
-        .resolve_url("asset://not-a-thing", &credential)
-        .await
+        .resolve_url("asset://not-a-thing")
         .expect_err("an unknown shape must be rejected");
     assert!(error.to_string().contains("http(s) url"));
 }

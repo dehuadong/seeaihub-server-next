@@ -2,7 +2,7 @@
 //!
 //! 这条纪律的账上含义就是"不会为同一个请求付两次上游成本"：
 //!
-//! - 可证明未受理（上传失败、参考图取不到、上游明确拒绝受理）⇒ 上游没开始计费 ⇒ 按指数退避
+//! - 可证明未受理（参考图取不到、上游明确拒绝受理）⇒ 上游没开始计费 ⇒ 按指数退避
 //!   重投，直到成功或用完额度；
 //! - 状态不确定（超时、5xx、响应读不出）⇒ 上游**可能已经受理并计费** ⇒ 一律不重投，按既有
 //!   口径进对账。宁可进对账，也不重投。
@@ -18,18 +18,17 @@ use super::*;
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
-    // 参考图上传先失败一次再恢复：上传发生在生成任务提交**之前**，所以这一次失败是**可证明
-    // 未受理**（上游没开始计费），重投不会付两次。用"恢复"而不是"一直失败"，是为了看到
+    // 参考图取用先失败一次再恢复：AIHubMix 的取图发生在生成请求提交**之前**，所以这一次失败是
+    // **可证明未受理**（上游没开始计费），重投不会付两次。用"恢复"而不是"一直失败"，是为了看到
     // 第二次执行真的成功——那正是重投要换来的结果。
     let behaviour = UpstreamBehaviour {
-        upload_failure_status: 500,
-        upload_failure_times: 1,
-        ..UpstreamBehaviour::apimart()
+        reference_get_failures: 1,
+        ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
     };
     let harness = Harness::start_with_retry(
         candidate(
-            "APIMart",
-            "apimart-image-v1",
+            "AIHubMix",
+            "aihubmix-image-v1",
             &["prompt_only", "image_conditioned"],
         ),
         behaviour,
@@ -42,7 +41,7 @@ async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
     .await;
     let key = format!("retry-then-succeed-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "retry me");
-    request["image"] = json!(png_data_url());
+    request["image"] = json!(harness.png_url());
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request)
         .await;
@@ -52,16 +51,16 @@ async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
     let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "重投成功之后 Job 落成功终态");
 
-    // 上游被调了两次：第一次上传失败（生成请求没发出去）、第二次成功。
+    // 参考图被取了两次：第一次失败（生成请求没发出去）、第二次成功。
     assert_eq!(
-        harness.count("POST", "/v1/uploads/images"),
+        harness.count("GET", "/inputs/ref.png"),
         2,
-        "两次执行各上传了一次参考图"
+        "两次执行各取了一次参考图"
     );
     assert_eq!(
         harness.create_calls(),
         1,
-        "第一次执行连生成请求都没发出去（上传就失败了），重投那次才发"
+        "第一次执行连生成请求都没发出去（参考图就取失败了），重投那次才发"
     );
 
     // 两次执行各占一行，号按执行顺序从 1 起。
@@ -255,19 +254,19 @@ async fn a_deterministic_rejection_is_not_retried() {
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn retries_stop_at_the_configured_limit() {
-    // 上传接口一直失败：这是**可证明未受理**（生成任务此时还没提交），所以每次执行都会走到
+    // 参考图一直取不到：这是**可证明未受理**（生成任务此时还没提交），所以每次执行都会走到
     // 重投判据上；额度用完时就停在失败终态。
-    let behaviour = UpstreamBehaviour {
-        upload_failure_status: 400,
-        ..UpstreamBehaviour::apimart()
-    };
     let harness = Harness::start_with_retry(
         candidate(
-            "APIMart",
-            "apimart-image-v1",
+            "AIHubMix",
+            "aihubmix-image-v1",
             &["prompt_only", "image_conditioned"],
         ),
-        behaviour,
+        // 假上游对参考图的 GET 一律回 500：每次执行都在取图那一步失败。
+        UpstreamBehaviour {
+            reference_get_failures: usize::MAX,
+            ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
+        },
         64,
         RetrySettings {
             max_attempts: 2,
@@ -277,7 +276,7 @@ async fn retries_stop_at_the_configured_limit() {
     .await;
     let key = format!("retry-until-limit-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "always fails");
-    request["image"] = json!(png_data_url());
+    request["image"] = json!(harness.png_url());
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request)
         .await;
@@ -289,7 +288,7 @@ async fn retries_stop_at_the_configured_limit() {
         "用尽额度之后按既有失败处置：不新增对账态语义"
     );
 
-    // 上限是 2：执行两次，每次都试过上传（上传失败时生成请求根本不会发出去）。
+    // 上限是 2：执行两次，每次都试过取参考图（取图失败时生成请求根本不会发出去）。
     let attempts: Vec<i32> = sqlx::query_scalar(
         "SELECT attempt_no FROM generation.attempts WHERE job_id = $1 ORDER BY attempt_no",
     )
@@ -299,14 +298,9 @@ async fn retries_stop_at_the_configured_limit() {
     .expect("attempt rows");
     assert_eq!(attempts, vec![1, 2], "重投停在上限次数上，不多不少");
     assert_eq!(
-        harness.count("POST", "/v1/uploads/images"),
-        2,
-        "每一次执行都真的被重投过（上传失败＝生成请求没发出去，所以看得到的是两次上传）"
-    );
-    assert_eq!(
         harness.create_calls(),
         0,
-        "上传失败意味着生成请求根本没发出去"
+        "参考图取不到意味着生成请求根本没发出去"
     );
     let hold_status: String =
         sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")

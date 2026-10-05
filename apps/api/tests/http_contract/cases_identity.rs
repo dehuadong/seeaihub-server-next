@@ -1815,6 +1815,8 @@ fn probe_body(method: &str, path: &str) -> ProbeBody {
     match path {
         "/v1/images/generations" => ProbeBody::Json(json!({})),
         "/v1/images/edits" => ProbeBody::Multipart,
+        // 上传端点要 multipart 正文；合法 multipart 的探针体仍要走到鉴权那一步。
+        "/v1/uploads/images" => ProbeBody::Multipart,
         "/v1/customers" => ProbeBody::Json(json!({
             "email": "credential-free-probe@example.com",
             "password": "a-long-enough-password",

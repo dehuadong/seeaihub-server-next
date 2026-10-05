@@ -400,11 +400,6 @@ impl ImageUploadService {
         }
     }
 
-    #[must_use]
-    pub fn config(&self) -> &ImageUploadConfig {
-        &self.config
-    }
-
     /// 上传一个文件：校验 → 构造对象键 → PUT（同一键重试）→ HEAD 核验 → 返回公网 URL。
     ///
     /// 上传不触碰账户、账本与执行记录：它不计费、不计量、不限配额，也不产生执行记录。
@@ -490,21 +485,9 @@ impl ImageUploadService {
             };
             match self.storage.put_object(request, target.credentials).await {
                 Ok(()) => return Ok(()),
-                Err(UploadWriteFailure::Terminal) => {
-                    return Err(ImageUploadError::ObjectStoreUnavailable);
-                }
-                Err(UploadWriteFailure::Retryable {
-                    retry_after_seconds,
-                }) => {
-                    if attempt >= self.config.retry_max_attempts {
-                        return Err(ImageUploadError::ObjectStoreUnavailable);
-                    }
-                    if !self
-                        .wait_backoff(retry_after_seconds, target.cancellation)
-                        .await
-                    {
-                        return Err(ImageUploadError::ClientDisconnected);
-                    }
+                Err(failure) => {
+                    self.after_failure(failure, attempt, target.cancellation)
+                        .await?;
                     attempt += 1;
                 }
             }
@@ -527,25 +510,37 @@ impl ImageUploadService {
             };
             match self.storage.head_object(request, target.credentials).await {
                 Ok(metadata) => return Ok(metadata),
-                Err(UploadWriteFailure::Terminal) => {
-                    return Err(ImageUploadError::ObjectStoreUnavailable);
-                }
-                Err(UploadWriteFailure::Retryable {
-                    retry_after_seconds,
-                }) => {
-                    if attempt >= self.config.retry_max_attempts {
-                        return Err(ImageUploadError::ObjectStoreUnavailable);
-                    }
-                    if !self
-                        .wait_backoff(retry_after_seconds, target.cancellation)
-                        .await
-                    {
-                        return Err(ImageUploadError::ClientDisconnected);
-                    }
+                Err(failure) => {
+                    self.after_failure(failure, attempt, target.cancellation)
+                        .await?;
                     attempt += 1;
                 }
             }
         }
+    }
+
+    /// 一次失败之后：终态直接收口；可重试且还有额度就退避，否则按终态收口。
+    async fn after_failure(
+        &self,
+        failure: UploadWriteFailure,
+        attempt: u32,
+        cancellation: &dyn UploadCancellation,
+    ) -> Result<(), ImageUploadError> {
+        let retry_after_seconds = match failure {
+            UploadWriteFailure::Terminal => {
+                return Err(ImageUploadError::ObjectStoreUnavailable);
+            }
+            UploadWriteFailure::Retryable {
+                retry_after_seconds,
+            } => retry_after_seconds,
+        };
+        if attempt >= self.config.retry_max_attempts {
+            return Err(ImageUploadError::ObjectStoreUnavailable);
+        }
+        if !self.wait_backoff(retry_after_seconds, cancellation).await {
+            return Err(ImageUploadError::ClientDisconnected);
+        }
+        Ok(())
     }
 
     /// 退避：对象存储给了有界整数秒 `Retry-After` 就按它等，否则按固定基准。
