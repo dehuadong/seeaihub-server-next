@@ -391,3 +391,43 @@ test('晚到的登录响应不污染已离开的页面，也不替它建会话',
   expect(pathnameOf(page), '晚到响应不该把页面带回控制台').toBe('/forgot-password');
   expect(await page.evaluate(() => sessionStorage.getItem('seeai.portal.session'))).toBeNull();
 });
+
+test('响应丢失保守归为结果未知，不自动重试', async ({ page }) => {
+  await page.goto(portalAt('/reset-password'));
+  let calls = 0;
+  await page.route(RESET_ENDPOINT, (route) => {
+    calls += 1;
+    return route.abort();
+  });
+  await fillReset(page, 'code-123', 'a-long-enough-password');
+  await page.getByTestId('portal-reset-submit').click();
+  await expect(page.getByTestId('portal-reset-error')).toContainText('暂时无法确认密码是否已更新');
+  await expect(page.getByTestId('portal-reset-done')).toHaveCount(0);
+  expect(calls, '未知结果不自动重试').toBe(1);
+});
+
+test('窄屏下三个认证页无横向溢出，字段有可访问标签', async ({ page }) => {
+  await page.setViewportSize({ width: 360, height: 740 });
+  const pages: [string, string][] = [
+    ['/login', '登录'],
+    ['/forgot-password', '忘记密码'],
+    ['/reset-password', '重置密码'],
+  ];
+  for (const [path, title] of pages) {
+    await page.goto(portalAt(path));
+    await expect(page.getByTestId('portal-auth-title')).toHaveText(title);
+    const overflow = await page.evaluate(
+      () => document.documentElement.scrollWidth - document.documentElement.clientWidth,
+    );
+    expect(overflow, `${path} 在窄屏下不应横向溢出`).toBeLessThanOrEqual(1);
+  }
+
+  // 输入框有可见标签（可访问名）。
+  await page.goto(portalAt('/login'));
+  await expect(page.getByLabel('邮箱')).toBeVisible();
+  await expect(page.getByLabel('密码（至少 8 个字符）')).toBeVisible();
+  await page.goto(portalAt('/reset-password'));
+  for (const label of ['重置码', '新密码（至少 8 个字符）', '确认新密码']) {
+    await expect(page.getByLabel(label)).toBeVisible();
+  }
+});

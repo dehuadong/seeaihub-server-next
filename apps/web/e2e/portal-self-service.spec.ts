@@ -221,4 +221,12 @@ test('凭客服转交的重置码在独立重置页设置新密码，之后能�
   await page.getByTestId('portal-password').fill(next);
   await page.getByTestId('portal-submit').click();
   await expect(page.getByTestId('portal-balance')).toBeVisible();
+
+  // 旧密码不可用：退出后用旧密码登录被拒，且与“邮箱不存在”同一句。
+  await nav(page, '账户设置');
+  await page.getByRole('button', { name: '退出登录' }).first().click();
+  await page.getByTestId('portal-email').fill(email);
+  await page.getByTestId('portal-password').fill(PORTAL_PASSWORD);
+  await page.getByTestId('portal-submit').click();
+  await expect(page.getByTestId('portal-auth-error')).toContainText('邮箱或密码不正确');
 });
