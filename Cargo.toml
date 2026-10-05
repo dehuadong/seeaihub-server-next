@@ -7,6 +7,7 @@ members = [
   "crates/adapter-sdk",
   "crates/adapter-aihubmix",
   "crates/adapter-apimart",
+  "crates/adapter-object-storage",
   "crates/persistence",
   "crates/cache-redis",
   "crates/alert-webhook",
@@ -33,6 +34,7 @@ futures-util = "0.3.32"
 h2 = "0.4.19"
 http = "1.4.0"
 hex = "0.4.3"
+hmac = "0.13.0"
 hyper = { version = "1.11.1", features = ["http1", "http2", "server"] }
 hyper-util = { version = "0.1.20", features = ["server-auto", "service", "tokio"] }
 jsonschema = { version = "0.56.0", default-features = false }

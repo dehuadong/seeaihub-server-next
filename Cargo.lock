@@ -2073,6 +2073,25 @@ dependencies = [
 ]
 
 [[package]]
+name = "seeai-adapter-object-storage"
+version = "0.1.0"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "hex",
+ "hmac",
+ "reqwest",
+ "seeai-adapter-sdk",
+ "seeai-application",
+ "seeai-domain",
+ "sha2 0.11.0",
+ "thiserror",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "seeai-adapter-sdk"
 version = "0.1.0"
 dependencies = [
