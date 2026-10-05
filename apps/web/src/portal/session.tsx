@@ -7,6 +7,7 @@ import {
   useState,
   type ReactNode,
 } from 'react';
+import { clearReturnTo } from './return-to';
 
 /// 客户会话的存放位置。
 ///
@@ -66,13 +67,18 @@ export function CustomerSessionProvider({ children }: { children: ReactNode }) {
   /// 本地会话与页面数据、回登录页（`docs/design/0014` §4）。
   useEffect(() => {
     if (!token || !expiresAt) return;
+    const expire = () => {
+      // 与 401 清屏同一规则：会话失效时连旧回跳目标一起去掉（设计 0016 §2）。
+      clearReturnTo();
+      signOut();
+    };
     const remaining = new Date(expiresAt).getTime() - Date.now();
     if (Number.isNaN(remaining)) return;
     if (remaining <= 0) {
-      signOut();
+      expire();
       return;
     }
-    const timer = setTimeout(signOut, remaining);
+    const timer = setTimeout(expire, remaining);
     return () => clearTimeout(timer);
   }, [token, expiresAt, signOut]);
 

@@ -12,7 +12,9 @@ function portalDevDeepLinks(): Plugin {
     configureServer(server) {
       server.middlewares.use((request, _response, next) => {
         const path = (request.url ?? '').split('?')[0];
-        if (PORTAL_DEEP_LINKS.has(path)) request.url = '/portal.html';
+        // 尾斜杠按路由模块同一条归一化规则收掉：`/login/` 与 `/login` 都要回退到入口。
+        const normalized = path.length > 1 ? path.replace(/\/+$/, '') : path;
+        if (PORTAL_DEEP_LINKS.has(normalized)) request.url = '/portal.html';
         next();
       });
     },

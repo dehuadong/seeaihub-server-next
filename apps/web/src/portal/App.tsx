@@ -17,11 +17,14 @@ import {
   MenuOutlined,
   SettingOutlined,
 } from '@ant-design/icons';
-import { useCallback, useMemo, useState, type ReactNode } from 'react';
-import { AuthPage } from './Auth';
+import { useCallback, useEffect, useMemo, useState, type ReactNode } from 'react';
+import { ForgotPasswordPage } from './auth/ForgotPasswordPage';
+import { LoginPage } from './auth/LoginPage';
+import { ResetPasswordPage } from './auth/ResetPasswordPage';
 import { CustomerClient } from './client';
+import { clearReturnTo } from './return-to';
 import { CustomerSessionProvider, useCustomerSession } from './session';
-import { portalPath, usePortalRoute } from './routes';
+import { isAuthRoute, portalPath, usePortalRoute } from './routes';
 import type { PortalRoute } from './paths';
 import { BillingPage } from './pages/Billing';
 import { KeysPage } from './pages/Keys';
@@ -39,7 +42,17 @@ const NAV: { route: PortalRoute; label: string; icon: ReactNode }[] = [
   { route: 'settings', label: '账户设置', icon: <SettingOutlined /> },
 ];
 
-function Portal() {
+/// 有会话访问 `/login` 或 `/forgot-password`：回概览，不请求新的登录会话（Spec §3）。
+function RedirectToOverview() {
+  const { replace } = usePortalRoute();
+  useEffect(() => {
+    replace(portalPath('overview'));
+  }, [replace]);
+  return null;
+}
+
+/// 已登录的客户外壳：固定导航与五页内容。
+function CustomerShell() {
   const { token, email, signOut } = useCustomerSession();
   const { route, navigate } = usePortalRoute();
   const [menuOpen, setMenuOpen] = useState(false);
@@ -48,19 +61,20 @@ function Portal() {
   const isDesktop = screens.md !== false;
 
   // 服务端回 401 就是"这次会话不被接受"：集中清屏，不让旧账务或密钥留在可见页面上（设计 0014 §4）。
-  const onUnauthorized = useCallback(() => signOut(), [signOut]);
+  // 同时清掉旧回跳目标——失效会话不该把用户带回上一次的账单区间（设计 0016 §2）。
+  const onUnauthorized = useCallback(() => {
+    signOut();
+    clearReturnTo();
+  }, [signOut]);
   const tokenGetter = useCallback(() => token, [token]);
   const client = useMemo(
     () => new CustomerClient(tokenGetter, onUnauthorized),
     [tokenGetter, onUnauthorized],
   );
 
-  // **路由守卫**：没有会话就只渲染登录/注册页，账户、密钥与账务的组件在登录之前根本不挂载，
-  // 因此不会发出任何取数请求（Spec C11）。地址**保持不变**，登录成功后自然回到原定页面（Spec D5）。
-  if (!token) return <AuthPage />;
-
   const onSignOut = () => {
     signOut();
+    clearReturnTo();
     navigate(portalPath('overview'));
   };
 
@@ -148,6 +162,24 @@ function Portal() {
       </Drawer>
     </Layout>
   );
+}
+
+/// 公开认证地址与受保护地址的分发（设计 0016 §1）。
+///
+/// 公开认证页在会话守卫**之前**识别：未登录直达受保护或未知地址仍在原地址显示登录、不挂载账户组件；
+/// 有会话访问登录或忘记密码回概览，重置页始终可开且不展示账户数据。
+function Portal() {
+  const { token, signOut } = useCustomerSession();
+  const { route } = usePortalRoute();
+
+  if (isAuthRoute(route)) {
+    if (route === 'resetPassword') return <ResetPasswordPage onSignOut={signOut} />;
+    if (token) return <RedirectToOverview />;
+    return route === 'login' ? <LoginPage context="public" /> : <ForgotPasswordPage />;
+  }
+
+  if (!token) return <LoginPage context="guard" />;
+  return <CustomerShell />;
 }
 
 /// 与运营后台同一套主题与语言：两边的组件库与观感一致，运维与客户看到的不是两种东西。

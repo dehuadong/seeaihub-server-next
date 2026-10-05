@@ -1,5 +1,6 @@
 import { expect, test } from '@playwright/test';
-import { consoleUrl, portalUrl, settings } from './settings';
+import { consoleUrl, settings } from './settings';
+import { portalAt } from './portal';
 
 /// **替客户开户不需要先抄账户标识**（Spec V-D11）。
 ///
@@ -54,12 +55,14 @@ test('开户并签发重置令牌，客户能用它设新口令', async ({ page 
   await expect(page).toHaveURL(/#\/customers\/[0-9a-f-]{36}$/);
   await expect(page.getByTestId('customers-detail-email')).toHaveText(email);
 
-  // **令牌真的能用**：客户凭它在客户端设新口令，然后用新口令登录。
-  await page.goto(portalUrl);
+  // **重置码真的能用**：客户在独立重置页凭它设置新密码，然后用新密码登录。
+  await page.goto(portalAt('/reset-password'));
   await page.getByTestId('portal-reset-token').fill(token);
   await page.getByTestId('portal-reset-password').fill(reset);
+  await page.getByTestId('portal-reset-confirm').fill(reset);
   await page.getByTestId('portal-reset-submit').click();
-  await expect(page.getByText('口令已重置').first()).toBeVisible();
+  await expect(page.getByTestId('portal-reset-done')).toContainText('密码已更新');
+  await page.getByTestId('portal-reset-back').click();
 
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(reset);

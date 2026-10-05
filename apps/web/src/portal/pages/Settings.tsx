@@ -2,12 +2,13 @@ import { Alert, App as AntApp, Button, Card, Descriptions, Flex, Form, Input, Sp
 import { LockOutlined } from '@ant-design/icons';
 import { useEffect, useState } from 'react';
 import type { CustomerClient } from '../client';
+import { passwordErrorMessage } from '../messages';
 import { NO_ONLINE_PAYMENT, RESET_VIA_OPERATIONS } from '../notices';
 import { useCustomerSession } from '../session';
 import { useLoadable } from '../../shared/ui';
 import { accountNameConflictHint, accountNameProblem } from '../../shared/account-name';
 
-/// 账户设置：登录邮箱、可复制的账户 id、改口令与退出。低频资料与低频动作收在这里，不占概览首屏。
+/// 账户设置：登录邮箱、可复制的账户 id、改密码与退出。低频资料与低频动作收在这里，不占概览首屏。
 ///
 /// 退出由外壳传入（`onSignOut`）：清掉本地会话与页面数据、把地址带回概览（Spec D5）。
 export function SettingsPage({
@@ -115,12 +116,12 @@ export function SettingsPage({
         title={
           <Space size={8}>
             <LockOutlined />
-            改口令
+            改密码
           </Space>
         }
       >
         <Typography.Paragraph type="secondary" style={{ marginTop: 0 }}>
-          改完之后此前所有登录会话都会失效，需要用新口令重新登录。
+          改完之后此前所有登录会话都会失效，需要用新密码重新登录。
         </Typography.Paragraph>
         <Form
           form={form}
@@ -134,9 +135,10 @@ export function SettingsPage({
               await client.changePassword(values.current, values.next);
               setDone(true);
               form.resetFields();
-              message.success('口令已改，请用新口令重新登录');
+              message.success('密码已改，请用新密码重新登录');
             } catch (failure) {
-              const text = failure instanceof Error ? failure.message : String(failure);
+              // 客户面自己映射成“密码”措辞：共享传输那句是给管理端的，仍带“口令”。
+              const text = passwordErrorMessage(failure);
               setError(text);
               message.error(text);
             } finally {
@@ -146,8 +148,8 @@ export function SettingsPage({
         >
           <Form.Item
             name="current"
-            label="当前口令"
-            rules={[{ required: true, message: '请输入当前口令' }]}
+            label="当前密码"
+            rules={[{ required: true, message: '请输入当前密码' }]}
           >
             <Input.Password
               data-testid="portal-current-password"
@@ -157,9 +159,9 @@ export function SettingsPage({
           </Form.Item>
           <Form.Item
             name="next"
-            label="新口令"
+            label="新密码"
             rules={[
-              { required: true, message: '请输入新口令' },
+              { required: true, message: '请输入新密码' },
               { min: 8, message: '至少 8 个字符' },
             ]}
           >
@@ -172,17 +174,26 @@ export function SettingsPage({
               htmlType="submit"
               loading={busy}
             >
-              改口令
+              改密码
             </Button>
           </Form.Item>
         </Form>
-        {error ? <Alert style={{ marginTop: 12 }} type="error" showIcon message={error} /> : null}
+        {error ? (
+          <Alert
+            data-testid="portal-change-password-error"
+            style={{ marginTop: 12 }}
+            type="error"
+            showIcon
+            message={error}
+          />
+        ) : null}
         {done ? (
           <Alert
+            data-testid="portal-change-password-done"
             style={{ marginTop: 12 }}
             type="success"
             showIcon
-            message="口令已改。此前所有登录会话都已失效。"
+            message="密码已改。此前所有登录会话都已失效。"
             action={
               <Button size="small" onClick={onSignOut}>
                 回登录页

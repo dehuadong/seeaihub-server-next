@@ -11,7 +11,7 @@ import {
 } from './portal';
 
 /// 客户自助与账务：**只有浏览器才观测得到**的那一层——注册后进概览、概览只有一个「余额」、密钥
-/// 明文只显示一次、改口令后旧会话失效、凭运营签发的令牌设新口令。
+/// 明文只显示一次、改密码后旧会话失效、凭客服转交的重置码在独立重置页设新密码。
 ///
 /// 这些行为的接口契约由 `apps/api/tests/http_contract/cases_identity.rs` 管；这里验的是"人在浏览器里
 /// 点下去会发生什么"。页面地址与导航在 `portal-navigation.spec.ts`。
@@ -157,26 +157,30 @@ test('新建密钥时明文只出现一次，列表里之后再也拿不到', as
   expect(await page.content()).not.toContain(key);
 });
 
-test('改口令成功后旧会话立即失效，回到登录页', async ({ page }) => {
+test('改密码成功后旧会话立即失效，回到登录页', async ({ page }) => {
   await registerCustomer(page, uniqueEmail('portal-e2e'));
-  // 改口令是低频动作，收在"账户设置"里——这正是它不该占概览的原因。
+  // 改密码是低频动作，收在"账户设置"里——这正是它不该占概览的原因。
   await nav(page, '账户设置');
   await expect(page.getByTestId('portal-change-password')).toBeVisible();
 
   const next = 'e2e-customer-password-changed';
+  // 当前密码不对：显示客户面的“密码”措辞，不透出共享传输那句带“口令”的通用文案。
+  await page.getByTestId('portal-current-password').fill('not-the-password');
+  await page.getByTestId('portal-new-password').fill(next);
+  await page.getByTestId('portal-change-password').click();
+  await expect(page.getByTestId('portal-change-password-error')).toContainText('当前密码不正确');
+
   await page.getByTestId('portal-current-password').fill(PORTAL_PASSWORD);
   await page.getByTestId('portal-new-password').fill(next);
   await page.getByTestId('portal-change-password').click();
-
-  // antd 的 `Alert` 会把消息渲染在两层同名元素里，所以取第一个。
-  await expect(page.getByText('口令已改').first()).toBeVisible();
+  await expect(page.getByTestId('portal-change-password-done')).toBeVisible();
   // 该客户的**全部**会话都失效了，包括刚发起这次改动的那一条：回登录页。
   await page.getByRole('button', { name: '回登录页' }).first().click();
   await expect(page.getByTestId('portal-submit')).toBeVisible();
   await expect(page.locator('.ant-statistic')).toHaveCount(0);
 });
 
-test('凭运营签发的重置令牌设置新口令，之后能用新口令登录', async ({ page, request }) => {
+test('凭客服转交的重置码在独立重置页设置新密码，之后能用新密码登录', async ({ page, request }) => {
   const email = uniqueEmail('portal-e2e');
   await registerCustomer(page, email);
   const accountId = await page.evaluate(() =>
@@ -184,7 +188,7 @@ test('凭运营签发的重置令牌设置新口令，之后能用新口令登�
   );
   expect(accountId).toBeTruthy();
 
-  // 运营那一侧：用共享令牌签发一枚一次性重置令牌（运营后台里也有这一步，那是界面的事）。
+  // 运营那一侧：用共享令牌签发一枚一次性重置码（运营后台里也有这一步，那是界面的事）。
   //
   // 这里用 `127.0.0.1` 而不是 `admin.localhost`：**Node 的解析器不认 `.localhost`**（Chrome 认），
   // 而这条签发只认凭据、不认主机名，所以直连回环即可。
@@ -196,16 +200,23 @@ test('凭运营签发的重置令牌设置新口令，之后能用新口令登�
   const resetToken = (await issued.json()).reset_token as string;
   expect(resetToken).toBeTruthy();
 
-  // 客户那一侧：清掉会话（忘了口令的人本来就进不来），用令牌设新口令。
+  // 客户那一侧：清掉会话（忘了密码的人本来就进不来），从忘记密码页进入独立重置页。
   const next = 'e2e-customer-password-reset';
   await page.evaluate(() => sessionStorage.clear());
-  await page.goto(portalAt('/'));
+  await page.goto(portalAt('/forgot-password'));
+  await expect(page.getByTestId('portal-forgot-hint')).toContainText('请联系平台客服获取重置码');
+  await page.getByTestId('portal-forgot-have-code').click();
+  expect(pathnameOf(page)).toBe('/reset-password');
+
   await page.getByTestId('portal-reset-token').fill(resetToken);
   await page.getByTestId('portal-reset-password').fill(next);
+  await page.getByTestId('portal-reset-confirm').fill(next);
   await page.getByTestId('portal-reset-submit').click();
-  await expect(page.getByText('口令已重置').first()).toBeVisible();
+  await expect(page.getByTestId('portal-reset-done')).toContainText('密码已更新，请重新登录');
 
-  // 新口令能登录、旧口令不行。
+  // 重置成功不自动登录：返回登录页后用新密码登录。
+  await page.getByTestId('portal-reset-back').click();
+  expect(pathnameOf(page)).toBe('/login');
   await page.getByTestId('portal-email').fill(email);
   await page.getByTestId('portal-password').fill(next);
   await page.getByTestId('portal-submit').click();

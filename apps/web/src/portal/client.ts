@@ -22,8 +22,14 @@ export class CustomerClient {
     return this.observe(apiFetch<T>(path, this.token));
   }
 
-  private send<T>(path: string, method: string, body?: unknown, admin = true): Promise<T> {
-    return this.observe(apiFetch<T>(path, this.token, { method, body, admin }));
+  private send<T>(
+    path: string,
+    method: string,
+    body?: unknown,
+    admin = true,
+    expectedStatus?: number,
+  ): Promise<T> {
+    return this.observe(apiFetch<T>(path, this.token, { method, body, admin, expectedStatus }));
   }
 
   /// 401 是"这次会话不被接受"：集中清屏，不让旧账务或密钥留在可见页面上（`docs/design/0014` §4）。
@@ -57,13 +63,16 @@ export class CustomerClient {
     });
   }
 
-  /// 凭运营转交的一次性令牌设置新口令（**无需登录**：忘了口令的人本来就进不来）。
+  /// 凭客服转交的一次性重置码设置新密码（**无需登录**：忘了密码的人本来就进不来）。
+  ///
+  /// 兑换只认 204：其余 2xx（含 200 空体或 JSON）由传输按失败抛出，认证页映射为结果未知。
   redeemPasswordReset(resetToken: string, newPassword: string): Promise<void> {
     return this.send(
       '/v1/customer/password-resets/redeem',
       'POST',
       { reset_token: resetToken, new_password: newPassword },
       false,
+      204,
     );
   }
 

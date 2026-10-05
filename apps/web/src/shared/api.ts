@@ -6,12 +6,20 @@ export interface ApiErrorBody {
 export class ApiError extends Error {
   readonly status: number;
   readonly code: string;
+  /// `Retry-After`（秒）；只有“等一下再来”这类失败有它。调用方用它告诉用户等多久。
+  readonly retryAfterSeconds: number | null;
 
-  constructor(status: number, code: string, message: string) {
+  constructor(
+    status: number,
+    code: string,
+    message: string,
+    retryAfterSeconds: number | null = null,
+  ) {
     super(message);
     this.name = 'ApiError';
     this.status = status;
     this.code = code;
+    this.retryAfterSeconds = retryAfterSeconds;
   }
 }
 
@@ -23,12 +31,17 @@ export interface RequestOptions {
   body?: unknown;
   /// 缺省带管理员令牌；置 `false` 用于 `/health` 这类公开端点。
   admin?: boolean;
+  /// 期望的**成功**状态；给了就要求实际状态与它逐位相符，其余 2xx（含 204 与 JSON 体）也当失败。
+  expectedStatus?: number;
 }
 
 /// 调一次管理 API。
 ///
 /// 这是**唯一**出网的地方：页面只描述"要点什么"，令牌、错误形状与 JSON 编解码都在这里收口。
 /// 非 2xx 一律抛 [`ApiError`]，页面不必各自解析错误体；204 回 `undefined`。
+///
+/// 传 `expectedStatus` 时，成功状态必须与它逐位相符——重置兑换只认 204，其余 2xx 也按失败抛错，
+/// 免得把“200 空体/JSON”当成确定成功。
 ///
 /// **答复体不一定是 JSON**：平台自己的失败响应是 `{"error":{...}}`，但框架层抛出的错误（例如拒绝
 /// 构造响应时的 `500 Failed to …`）是纯文本。硬按 JSON 解析会把那些错误吞成一句"不是合法 JSON"，
@@ -52,8 +65,7 @@ export async function apiFetch<T>(
     body: options.body === undefined ? undefined : JSON.stringify(options.body),
   });
 
-  if (response.status === 204) return undefined as T;
-  const text = await response.text();
+  const text = response.status === 204 ? '' : await response.text();
   const payload = parseJsonOrNull(text);
   if (!response.ok) {
     const failure = payload as ApiErrorBody | null;
@@ -61,13 +73,32 @@ export async function apiFetch<T>(
       response.status,
       failure?.error?.code ?? 'unknown',
       messageFor(response.status, failure, text),
+      retryAfterSeconds(response),
     );
   }
+  // 给了期望状态就要求逐位相符：204 的“成功”与 200 空体的“成功”不是一回事（设计 0016 §3）。
+  if (options.expectedStatus !== undefined && response.status !== options.expectedStatus) {
+    throw new ApiError(
+      response.status,
+      'unexpected_status',
+      `答复状态不是预期的 ${options.expectedStatus}（HTTP ${response.status}）`,
+      retryAfterSeconds(response),
+    );
+  }
+  if (response.status === 204) return undefined as T;
   if (text && payload === null) {
     // 2xx 却不是 JSON：调用方拿不到它要的形状，与其让它读到 `null` 之后在别处炸，不如在这里说清。
     throw new ApiError(response.status, 'invalid_body', `答复不是合法 JSON：${preview(text)}`);
   }
   return payload as T;
+}
+
+/// `Retry-After` 只认秒数（平台自己发的就是秒）；HTTP-date 或缺失都不回值。
+function retryAfterSeconds(response: Response): number | null {
+  const raw = response.headers.get('Retry-After');
+  if (!raw) return null;
+  const seconds = Number(raw.trim());
+  return Number.isFinite(seconds) && seconds >= 0 ? Math.ceil(seconds) : null;
 }
 
 /// 解析 JSON；不是 JSON 就回 `null`（由调用方决定怎么处理，不在这里抛）。

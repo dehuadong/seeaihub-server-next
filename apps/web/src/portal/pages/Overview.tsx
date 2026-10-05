@@ -31,7 +31,7 @@ export function OverviewPage({
     { route: 'usage' as const, label: '调用记录', hint: '每一次生成请求与对客状态', icon: <HistoryOutlined /> },
     { route: 'billing' as const, label: '账单与资金记录', hint: '区间汇总与真实收支流水', icon: <AccountBookOutlined /> },
     { route: 'keys' as const, label: 'API Key', hint: '新建、查看与吊销密钥', icon: <KeyOutlined /> },
-    { route: 'settings' as const, label: '账户设置', hint: '账户 id、改口令与退出', icon: <SettingOutlined /> },
+    { route: 'settings' as const, label: '账户设置', hint: '账户 id、改密码与退出', icon: <SettingOutlined /> },
   ];
 
   return (
