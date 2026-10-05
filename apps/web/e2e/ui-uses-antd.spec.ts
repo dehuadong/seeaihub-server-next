@@ -56,9 +56,10 @@ test('运营后台的外壳与六个页面都渲染 Ant Design 组件', async ({
 test('客户控制台的登录页与五个页面都渲染 Ant Design 组件', async ({ page }) => {
   await page.goto(portalUrl);
 
-  // 登录/注册页：一张 `Card`、一个 `Segmented`（登录/注册切换）与表单控件。
+  // 登录/注册页：一张 `Card`、一个表单、切换模式/找回的按钮与输入控件。
   await expect(page.locator('.ant-card').first()).toBeVisible();
-  await expect(page.locator('.ant-segmented')).toBeVisible();
+  await expect(page.locator('.ant-form').first()).toBeVisible();
+  await expect(page.locator('.ant-btn').first()).toBeVisible();
   await expect(page.locator('.ant-input').first()).toBeVisible();
 
   // 注册一个客户，看五个页面。页面按**使用频次**拆分：概览只放一个「余额」，其余各自成页。
