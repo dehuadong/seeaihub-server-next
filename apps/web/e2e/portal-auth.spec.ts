@@ -431,3 +431,24 @@ test('窄屏下三个认证页无横向溢出，字段有可访问标签', async
     await expect(page.getByLabel(label)).toBeVisible();
   }
 });
+
+test('未登录直达未知客户地址：先登录，登录后显示客户侧 404', async ({ page }) => {
+  const email = uniqueEmail('portal-auth-unknown');
+  await registerCustomer(page, email);
+  await page.evaluate(() => sessionStorage.clear());
+
+  await page.goto(portalAt('/no-such-page'));
+  await expect(page.getByTestId('portal-submit')).toBeVisible();
+  expect(pathnameOf(page)).toBe('/no-such-page');
+  await signInCustomer(page, email);
+  expect(pathnameOf(page), '未知地址登录后保留原地址').toBe('/no-such-page');
+  await expect(page.getByTestId('portal-not-found')).toBeVisible();
+
+  // 从未知地址进找回不保存该地址：返回登录并完成登录后进概览。
+  await page.evaluate(() => sessionStorage.clear());
+  await page.goto(portalAt('/no-such-page'));
+  await page.getByTestId('portal-forgot-link').click();
+  await page.getByTestId('portal-forgot-back').click();
+  await signInCustomer(page, email);
+  expect(pathnameOf(page), '未知地址不作为回跳目标').toBe('/');
+});
