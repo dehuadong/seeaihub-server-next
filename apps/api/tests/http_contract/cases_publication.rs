@@ -1366,6 +1366,20 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
         "目录里的合同是发布的那一份，只有 model.const 换成对客名"
     );
     assert_eq!(entry["contract"]["properties"]["model"]["const"], GATEWAY);
+    // 模型级的组合约束随合同一并交给客户端：取值由上游判，客户端要知道这两个参数怎么一起用。
+    let declares_joint = entry["contract"]["allOf"]
+        .as_array()
+        .is_some_and(|clauses| {
+            clauses.iter().any(|clause| {
+                clause["if"]["properties"]["background"]["const"] == json!("transparent")
+                    && clause["then"]["properties"]["output_format"]["enum"]
+                        == json!(["png", "webp"])
+            })
+        });
+    assert!(
+        declares_joint,
+        "对客合同必须声明 transparent => png/webp：{entry}"
+    );
 
     // ── 存的那份合同**不动**：库里那个常量仍是厂商原生名 ──
     let stored_contract: Value = sqlx::query_scalar(

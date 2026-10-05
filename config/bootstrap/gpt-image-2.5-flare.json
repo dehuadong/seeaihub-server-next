@@ -68,7 +68,14 @@
       "mask": { "type": "string" }
     },
     "allOf": [
-      { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
+      { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
+      {
+        "if": {
+          "properties": { "background": { "const": "transparent" } },
+          "required": ["background"]
+        },
+        "then": { "properties": { "output_format": { "enum": ["png", "webp"] } } }
+      }
     ]
   },
   "offerings": [
@@ -182,14 +189,7 @@
           "mask_url": { "type": "string" }
         },
         "allOf": [
-          { "if": { "required": ["mask_url"] }, "then": { "required": ["image_urls"] } },
-          {
-            "if": {
-              "properties": { "background": { "const": "transparent" } },
-              "required": ["background"]
-            },
-            "then": { "properties": { "output_format": { "enum": ["png", "webp"] } } }
-          }
+          { "if": { "required": ["mask_url"] }, "then": { "required": ["image_urls"] } }
         ]
       },
       "parameter_mapping": {

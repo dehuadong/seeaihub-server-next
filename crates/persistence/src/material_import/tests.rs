@@ -207,3 +207,37 @@ fn an_explicit_material_dir_is_used_as_given() {
         Some(PathBuf::from("/tmp/materials"))
     );
 }
+
+/// 顶层合同必须声明 `background=transparent` 与 `output_format` 的组合约束：取值由上游判，
+/// 但客户端要能从合同知道这两个参数怎么一起用（用户 2026-10-05 的决定）。
+#[test]
+fn the_contract_declares_the_transparent_output_format_constraint() {
+    for name in ["gpt-image-2.5-flare.json", "gpt-image-2.5-sunburst.json"] {
+        let material = parse(name);
+        let all_of = material.capability_schema["allOf"]
+            .as_array()
+            .unwrap_or_else(|| panic!("{name}: the contract declares allOf"));
+        let declares = all_of.iter().any(|clause| {
+            clause["if"]["properties"]["background"]["const"] == json!("transparent")
+                && clause["if"]["required"] == json!(["background"])
+                && clause["then"]["properties"]["output_format"]["enum"] == json!(["png", "webp"])
+        });
+        assert!(
+            declares,
+            "{name}: the contract must declare transparent => png/webp"
+        );
+        // 模型级组合约束归合同，承载面不重复它——按 `allOf` 整段文本判，换一种写法也漏不掉。
+        for offering in &material.offerings {
+            let carrier_all_of = offering.carrier_schema["allOf"]
+                .as_array()
+                .cloned()
+                .unwrap_or_default();
+            let rendered = Value::Array(carrier_all_of).to_string();
+            assert!(
+                !rendered.contains("output_format"),
+                "{name}: {} must not repeat the model-level constraint: {rendered}",
+                offering.provider_kind
+            );
+        }
+    }
+}

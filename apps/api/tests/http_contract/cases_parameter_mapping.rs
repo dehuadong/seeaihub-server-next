@@ -1293,11 +1293,14 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "没落到 APIMart 就不该有它的生成请求"
     );
 
-    // ── 用例 2：带 background / output_compression / moderation → 两家都承载得了，首选照旧 ──
+    // ── 用例 2：带 background / output_format / output_compression / moderation → 两家都承载得了，首选照旧 ──
     //
-    // 承载面按**厂商契约**声明，这三项不是"APIMart 特有的差异"：AIHubMix 这条供给同样声明了
-    // 它们，所以请求落在首选上，三个字段逐字上行。渠道不接受某个取值时表现为渠道报错——平台
+    // 承载面按**厂商契约**声明，这几项不是"APIMart 特有的差异"：AIHubMix 这条供给同样声明了
+    // 它们，所以请求落在首选上，字段逐字上行。渠道不接受某个取值时表现为渠道报错——平台
     // 不静默丢字段、也不替调用方改值。
+    //
+    // 合同声明了 `background=transparent ⇒ output_format ∈ {png,webp}` 的**组合约束**，但那是
+    // 给客户端建表单用的：平台不判取值，透明 + jpeg 照样原样上行（用户 2026-10-05 的决定）。
     let key = format!("contract-optional-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &base_url,
@@ -1308,6 +1311,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             "model": "gpt-image-2.5-flare",
             "prompt": "白色运动鞋，透明背景",
             "background": "transparent",
+            "output_format": "jpeg",
             "output_compression": 80,
             "moderation": "low"
         }),
@@ -1331,6 +1335,10 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
     assert_eq!(
         submit["background"], "transparent",
         "承载得了的字段必须原样上行：{submit}"
+    );
+    assert_eq!(
+        submit["output_format"], "jpeg",
+        "合同的组合约束由客户端判，平台不判取值、原样交上游：{submit}"
     );
     assert_eq!(submit["output_compression"], 80, "{submit}");
     assert_eq!(submit["moderation"], "low", "{submit}");
