@@ -445,7 +445,7 @@ async fn unsupported_and_mismatched_media_are_rejected_before_writing() {
     harness.cleanup().await;
 }
 
-/// A5 / A10：对象键形如 reference-media/{UTC 日期}/{uuid}.{ext}，不含调用方文件名，两次上传键不同；
+/// A5 / A10：对象键形如 reference-media/{调用者账户 id}/{uuid}.{ext}，不含调用方文件名，两次上传键不同；
 /// 文件名扩展名不影响受理与对象键。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
@@ -470,12 +470,14 @@ async fn object_keys_are_random_and_ignore_the_caller_file_name() {
             .rsplit_once("/reference-media/")
             .map(|(_, key)| format!("reference-media/{key}"))
             .expect("the object key prefix");
-        let (date, rest) = key
+        let (account, rest) = key
             .trim_start_matches("reference-media/")
             .split_once('/')
-            .expect("a date segment");
-        assert_eq!(date.len(), 10, "日期段是 UTC 日期：{key}");
-        assert!(date.as_bytes()[4] == b'-' && date.as_bytes()[7] == b'-');
+            .expect("an account segment");
+        assert_eq!(
+            account, harness.account_id,
+            "第一段是鉴权得到的调用者账户：{key}"
+        );
         let (uuid, extension) = rest.split_once('.').expect("a uuid and an extension");
         assert_eq!(extension, "png");
         assert_eq!(uuid.len(), 36, "随机 v4 标识：{key}");

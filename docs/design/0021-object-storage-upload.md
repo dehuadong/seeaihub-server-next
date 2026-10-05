@@ -1,5 +1,5 @@
 主题: 对象存储上传：模块划分、签名与上传存储配置
-当前修订: v2
+当前修订: v3
 状态: 已接受
 承接: [图片上传与对象存储 Spec v2](../specs/0007-image-upload-and-object-storage.md) §2–§8；并与[同步图片网关 Spec v3](../specs/0005-synchronous-image-gateway.md) §1、§3 的输入图片形态收敛同一变更实施；生成入口的指纹输入域与验收见 Spec 0005 §4、§8（A12）。
 依赖: [分层架构](0004-layered-architecture.md)、[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)、[同步网关设计](0017-synchronous-image-gateway.md) §2、[图片透传决定](../adr/0019-images-pass-through-without-asset-storage.md)（结果侧不落盘与只有同步形态的结论继续适用）、[参考图上传决定](../adr/0022-reference-image-upload-endpoint.md)
@@ -74,7 +74,7 @@ AIHubMix 的取图路径形态不变：它的 edits 端点要文件部件，所�
 
 ## 5. 对象键与签名
 
-对象键是 `reference-media/{YYYY-MM-DD}/{uuid}.{ext}`：日期取写入时的 UTC 日期，`uuid` 是随机 v4，`ext` 由规范 MIME 反推（`image/jpeg` → `jpg`，`image/png` → `png`，`image/webp` → `webp`）。调用方文件名不进键、不进对象元数据。
+对象键是 `reference-media/{调用者账户 id}/{uuid}.{ext}`：第一段是上传端点鉴权得到的调用者账户（把同一账号的素材归在同一前缀下，不再带写入日期），`uuid` 是随机 v4，`ext` 由规范 MIME 反推（`image/jpeg` → `jpg`，`image/png` → `png`，`image/webp` → `webp`）。调用方文件名不进键、不进对象元数据。
 
 签名用阿里云 OSS V4，header 模式：
 
@@ -99,7 +99,7 @@ AIHubMix 的取图路径形态不变：它的 edits 端点要文件部件，所�
 
 ## 6. 桶匿名可读的部署自检
 
-桶的匿名可读是启用上传的运维前置条件，合同与后果见[Spec 0007](../specs/0007-image-upload-and-object-storage.md) §8。部署侧在启用上传前用对象存储控制台或命令行工具自己执行下面的自检（工具自己完成签名），用一个 1×1 合法 PNG 探针字节与独立对象键 `reference-media/{UTC 日期}/probe-{uuid}.png`：
+桶的匿名可读是启用上传的运维前置条件，合同与后果见[Spec 0007](../specs/0007-image-upload-and-object-storage.md) §8。部署侧在启用上传前用对象存储控制台或命令行工具自己执行下面的自检（工具自己完成签名），用一个 1×1 合法 PNG 探针字节与独立对象键 `reference-media/{调用者账户 id}/probe-{uuid}.png`（运维用控制台或命令行自检时，这段账户标识由操作者自定，只要不与调用方素材混用）：
 
 1. 写入探针对象（对象键随机唯一，不复用既有键）；
 2. 核验探针对象的字节长度与内容类型与写入一致；

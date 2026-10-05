@@ -3057,6 +3057,8 @@ async fn require_upload_access(
     let (mut parts, body) = request.into_parts();
     let (body, slow) = state.direct.supervisor.limit_upload_slow_read(body);
     parts.extensions.insert(slow);
+    // 调用者账户只用于对象键前缀，随扩展递给 handler；鉴权已经在这里完成，handler 不再重复解析凭证。
+    parts.extensions.insert(identity.account_id);
     let request = axum::extract::Request::from_parts(parts, body);
     Ok(next.run(request).await)
 }
@@ -3074,8 +3076,11 @@ async fn authenticate_upload(
 }
 
 /// 上传端点：单文件 multipart，写入上传存储换公网 URL。
+///
+/// 调用者账户由 `require_upload_access` 完成鉴权后随扩展递进来，只用于对象键前缀。
 async fn upload_image(
     State(state): State<AppState>,
+    Extension(account_id): Extension<AccountId>,
     slow: Option<Extension<SlowRead>>,
     scope: Option<Extension<Arc<ConnectionScope>>>,
     multipart: Result<Multipart, axum::extract::multipart::MultipartRejection>,
@@ -3096,6 +3101,7 @@ async fn upload_image(
         .upload
         .service
         .upload(
+            account_id,
             &file.bytes,
             file.declared_content_type.as_deref(),
             cancellation,

@@ -15,6 +15,8 @@
 | `x-oss-date`（scope 日期） | `20260812T103000Z`（`20260812`） |
 | 算法与 `Authorization` 前缀 | `OSS4-HMAC-SHA256 Credential=AKIDEXAMPLE/20260812/cn-hangzhou/oss/aliyun_v4_request,Signature=` |
 
+上表里的 object 是参考实现测试的固定输入，只用来算签名；本设计的对象键形态是 `reference-media/{调用者账户 id}/{uuid}.{ext}`（见 [Spec 0007](../docs/specs/0007-image-upload-and-object-storage.md) §4），签名算法与键怎么分段无关。
+
 ## 2. header 模式向量
 
 | 操作 | 输入 | 期望 Signature |

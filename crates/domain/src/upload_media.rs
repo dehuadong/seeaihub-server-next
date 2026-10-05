@@ -5,7 +5,7 @@
 //! 取值域与机制由[对象存储上传设计](../../docs/design/0021-object-storage-upload.md)拥有，
 //! 对客行为合同由[图片上传与对象存储 Spec](../../docs/specs/0007-image-upload-and-object-storage.md)拥有。
 
-use chrono::{DateTime, Utc};
+use crate::AccountId;
 use uuid::Uuid;
 
 /// 单文件字节上限：**严格小于** 20 MiB。它不随部署配置变化，因此是领域常量而不是环境变量。
@@ -73,27 +73,22 @@ pub fn within_single_file_limit(byte_length: u64) -> bool {
     byte_length < MAX_UPLOAD_BYTES
 }
 
-/// 构造对象键：`reference-media/{UTC 日期}/{uuid}.{ext}`。
+/// 构造对象键：`reference-media/{调用者账户 id}/{uuid}.{ext}`。
 ///
-/// 日期取写入时刻的 UTC 日期，`identifier` 是随机 v4，扩展名由规范 MIME 反推；调用方文件名
-/// 不进键，也不进对象元数据。
+/// 账户 id 来自上传端点的 API Key 鉴权结果，把同一账号的素材归在同一个前缀下；`identifier`
+/// 是随机 v4，扩展名由规范 MIME 反推；调用方文件名不进键，也不进对象元数据。
 #[must_use]
-pub fn object_key(
-    written_at: DateTime<Utc>,
-    identifier: Uuid,
-    media_type: UploadMediaType,
-) -> String {
+pub fn object_key(account_id: AccountId, identifier: Uuid, media_type: UploadMediaType) -> String {
     format!(
-        "{OBJECT_KEY_PREFIX}/{}/{identifier}.{}",
-        written_at.format("%Y-%m-%d"),
+        "{OBJECT_KEY_PREFIX}/{account_id}/{identifier}.{}",
         media_type.object_key_extension()
     )
 }
 
-/// 用当前 UTC 时刻与一个新的随机 v4 构造对象键。
+/// 用一个新的随机 v4 构造对象键。
 #[must_use]
-pub fn new_object_key(media_type: UploadMediaType) -> String {
-    object_key(Utc::now(), Uuid::new_v4(), media_type)
+pub fn new_object_key(account_id: AccountId, media_type: UploadMediaType) -> String {
+    object_key(account_id, Uuid::new_v4(), media_type)
 }
 
 /// 一次对象存储写入的失败分类：决定编排层重试同一对象键还是终止。

@@ -9,7 +9,9 @@
 use crate::{ApplicationError, CredentialProvider, GenerationRateLimit};
 use async_trait::async_trait;
 use seeai_adapter_sdk::ProviderCredential;
-use seeai_domain::{UploadMediaType, UploadWriteFailure, new_object_key, within_single_file_limit};
+use seeai_domain::{
+    AccountId, UploadMediaType, UploadWriteFailure, new_object_key, within_single_file_limit,
+};
 use std::{sync::Arc, time::Duration};
 use thiserror::Error;
 use url::{Host, Url};
@@ -402,9 +404,11 @@ impl ImageUploadService {
 
     /// 上传一个文件：校验 → 构造对象键 → PUT（同一键重试）→ HEAD 核验 → 返回公网 URL。
     ///
+    /// `account_id` 是上传端点鉴权得到的调用者账户，只用于对象键前缀（`reference-media/{account_id}/…`）。
     /// 上传不触碰账户、账本与执行记录：它不计费、不计量、不限配额，也不产生执行记录。
     pub async fn upload(
         &self,
+        account_id: AccountId,
         bytes: &[u8],
         declared_content_type: Option<&str>,
         cancellation: &dyn UploadCancellation,
@@ -433,7 +437,7 @@ impl ImageUploadService {
             access_key_id: &access_key_id,
             access_key_secret: &access_key_secret,
         };
-        let key = new_object_key(media_type);
+        let key = new_object_key(account_id, media_type);
         let url = storage
             .object_url(&key)
             .map_err(|_| ImageUploadError::UploadStorageUnavailable)?;

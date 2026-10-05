@@ -1,5 +1,4 @@
 use super::*;
-use chrono::TimeZone;
 
 fn png() -> Vec<u8> {
     let mut bytes = vec![0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A];
@@ -73,33 +72,32 @@ fn single_file_limit_is_strictly_less() {
 }
 
 #[test]
-fn object_key_carries_utc_date_identifier_and_extension() {
-    let written_at = Utc
-        .with_ymd_and_hms(2026, 8, 12, 10, 30, 0)
-        .single()
-        .expect("a valid UTC instant");
+fn object_key_carries_the_caller_account_identifier_and_extension() {
+    let account = AccountId(
+        Uuid::parse_str("11111111-2222-4333-8444-555555555555").expect("an account uuid"),
+    );
     let identifier = Uuid::parse_str("6f1d0f0e-0000-4000-8000-000000000001").expect("a uuid");
     assert_eq!(
-        object_key(written_at, identifier, UploadMediaType::Jpeg),
-        "reference-media/2026-08-12/6f1d0f0e-0000-4000-8000-000000000001.jpg"
+        object_key(account, identifier, UploadMediaType::Jpeg),
+        "reference-media/11111111-2222-4333-8444-555555555555/6f1d0f0e-0000-4000-8000-000000000001.jpg"
     );
-    // 日期取 UTC，不看调用方本地时区：同一时刻换一种表示仍是同一个键。
-    let offset = DateTime::parse_from_rfc3339("2026-08-12T18:30:00+08:00").expect("a timestamp");
+    // 同一账号的两次上传只靠随机 identifier 区分，不再带写入日期。
     assert_eq!(
         object_key(
-            offset.with_timezone(&Utc),
-            identifier,
+            account,
+            Uuid::parse_str("6f1d0f0e-0000-4000-8000-000000000002").expect("a uuid"),
             UploadMediaType::Jpeg
         ),
-        "reference-media/2026-08-12/6f1d0f0e-0000-4000-8000-000000000001.jpg"
+        "reference-media/11111111-2222-4333-8444-555555555555/6f1d0f0e-0000-4000-8000-000000000002.jpg"
     );
 }
 
 #[test]
 fn new_object_key_is_unique_and_keeps_prefix_and_extension() {
-    let first = new_object_key(UploadMediaType::Webp);
-    let second = new_object_key(UploadMediaType::Webp);
-    assert!(first.starts_with("reference-media/"));
+    let account = AccountId::new();
+    let first = new_object_key(account, UploadMediaType::Webp);
+    let second = new_object_key(account, UploadMediaType::Webp);
+    assert!(first.starts_with(&format!("reference-media/{account}/")));
     assert!(first.ends_with(".webp"));
     assert_ne!(first, second, "each upload gets its own random object key");
 }
