@@ -43,7 +43,8 @@ use seeai_domain::{
     replace_contract_model_identity,
 };
 use seeai_persistence::{
-    PgHubRepository, material_import::import_supply_materials_from_env, max_declared_output_images,
+    PgHubRepository, material_import::import_supply_materials_from_env,
+    material_import::public_docs_dir, max_declared_output_images,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -524,6 +525,12 @@ async fn main() -> Result<()> {
         direct: direct_execution.clone(),
         upload: upload.clone(),
     };
+    // 首次开放目录 `documentation_url` 之前，为每个当前可调用模型补齐文档快照（Spec 0008 §4）：
+    // 缺素材就让进程起不来并点名，不隐藏模型，也不返回伪造正文。
+    let backfilled = state.runtime.ensure_current_model_documents().await?;
+    if backfilled > 0 {
+        info!(models = backfilled, "current model documents backfilled");
+    }
     // 引导管理员账号：运维给的环境变量只在账号**不存在**时写入，重复启动不会把改过的口令打回原值。
     seed_admin_account(&state).await?;
     // **管理面**挂一条认证中间件：一处认证、一处把"是哪个管理员"放进这次请求的审计上下文，因此所有
@@ -631,6 +638,8 @@ async fn main() -> Result<()> {
             post(redeem_admin_password_reset),
         )
         .route("/v1/models", get(list_models))
+        .route("/v1/models/{name}/llms.txt", get(read_model_document))
+        .route("/v1/docs/{*path}", get(read_public_document))
         .route("/v1/account", get(read_own_account))
         .route("/v1/customers", post(register_customer))
         .route(
@@ -2386,7 +2395,43 @@ async fn publish_runtime(
     Json(mut command): Json<PublishRuntimeCommand>,
 ) -> Result<Json<seeai_domain::PublishedRevision>, ApiError> {
     command.actor = "admin-api".to_owned();
+    resolve_inline_documentation(&mut command)?;
     Ok(Json(state.runtime.publish(command).await?))
+}
+
+/// 内联发布的文档素材可以用 `narrative_path` 引用 `public-docs/` 下的正文：在这里读成正文，
+/// 交给 Application 渲染。引用式发布不带文档，读同一厂商模型已导入的素材。
+fn resolve_inline_documentation(command: &mut PublishRuntimeCommand) -> Result<(), ApiError> {
+    let Some(documentation) = command.documentation.as_mut() else {
+        return Ok(());
+    };
+    if documentation.get("narrative").is_some() {
+        return Ok(());
+    }
+    let Some(path) = documentation
+        .get("narrative_path")
+        .and_then(Value::as_str)
+        .map(str::to_owned)
+    else {
+        return Ok(());
+    };
+    if path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "..")
+    {
+        return Err(ApiError::bad_request(
+            "invalid_documentation",
+            format!("documentation.narrative_path {path} must stay under public-docs"),
+        ));
+    }
+    let body = std::fs::read_to_string(public_docs_dir().join(&path)).map_err(|error| {
+        ApiError::bad_request(
+            "invalid_documentation",
+            format!("cannot read public-docs/{path}: {error}"),
+        )
+    })?;
+    documentation["narrative"] = Value::String(body);
+    Ok(())
 }
 
 async fn list_reconciliation_cases(
@@ -2607,6 +2652,8 @@ struct ModelCatalogEntry {
     model_type: String,
     /// 该模型的调用方合同（发布的 JSON Schema），客户端据此建表单。
     contract: Value,
+    /// 该模型使用文档的公开地址：同源根相对地址，客户端直接使用，不拼路径（Spec 0008 §2）。
+    documentation_url: String,
 }
 
 impl From<PublishedModel> for ModelCatalogEntry {
@@ -2617,15 +2664,35 @@ impl From<PublishedModel> for ModelCatalogEntry {
             native_revision,
             model_type,
             capability_schema,
+            documentation_version,
         } = model;
+        let documentation_url = format!(
+            "/v1/models/{}/llms.txt?version={documentation_version}",
+            encode_path_segment(&gateway_model)
+        );
         Self {
             name: gateway_model.clone(),
             vendor_id,
             revision: native_revision,
             model_type,
             contract: consumer_contract(capability_schema, &gateway_model),
+            documentation_url,
         }
     }
+}
+
+/// 把模型名编成 URL 路径段：`/`、空格、中文与 URI 保留字符都编码，客户端按原值提交 `model`。
+fn encode_path_segment(segment: &str) -> String {
+    let mut encoded = String::with_capacity(segment.len());
+    for byte in segment.as_bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(*byte as char)
+            }
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
 }
 
 /// 对客投射：把合同正文里的 `model.const` 换成**平台对客名**。
@@ -2659,6 +2726,59 @@ async fn list_models(
         .map(ModelCatalogEntry::from)
         .collect();
     Ok(Json(ModelCatalogResponse { data }))
+}
+
+/// 模型使用文档的查询参数：`version` 是目录返回的不透明文档版本标识。
+#[derive(Debug, Deserialize)]
+struct ModelDocumentParams {
+    version: Option<String>,
+}
+
+/// 公开读取模型使用文档：没有 `version` 时读当前可调模型的当前说明；给了则按历史版本读。
+///
+/// 两种请求都不需要 API Key；成功返回 `text/plain; charset=utf-8` 的简体中文 Markdown。
+/// 不可调用、未知或错配的版本一律 `404 not_found`，不重定向、不回退到当前版本（Spec 0008 §2）。
+async fn read_model_document(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    Query(params): Query<ModelDocumentParams>,
+) -> Result<axum::response::Response, ApiError> {
+    let body = match params.version.as_deref() {
+        Some(raw) => {
+            let version = Uuid::parse_str(raw)
+                .map_err(|_| ApiError::not_found("no such model document version"))?;
+            state
+                .runtime
+                .model_document_by_version(&name, version)
+                .await?
+        }
+        None => state.runtime.current_model_document(&name).await?,
+    };
+    let body = body.ok_or_else(|| ApiError::not_found("no such model document"))?;
+    Ok(markdown_response(body))
+}
+
+/// 公开读取一份公共使用文档；名称只允许公开文档清单里的那几份，不提供任意文件读取。
+///
+/// 清单只有一份属主（
+/// [`seeai_application::model_document::PUBLIC_DOCUMENTS`]）：加第四份文档改那里，改这里会漂移。
+async fn read_public_document(
+    Path(path): Path<String>,
+) -> Result<axum::response::Response, ApiError> {
+    if !seeai_application::model_document::PUBLIC_DOCUMENTS
+        .iter()
+        .any(|(name, _)| *name == path)
+    {
+        return Err(ApiError::not_found("no such public document"));
+    }
+    let body = std::fs::read_to_string(public_docs_dir().join(&path))
+        .map_err(|error| ApiError::internal(format!("cannot read public-docs/{path}: {error}")))?;
+    Ok(markdown_response(body))
+}
+
+/// Markdown 正文的响应：对客文档统一 `text/plain; charset=utf-8`（Spec 0008 §2）。
+fn markdown_response(body: String) -> axum::response::Response {
+    ([(header::CONTENT_TYPE, "text/plain; charset=utf-8")], body).into_response()
 }
 
 /// 管理员读：网关模型清单的响应。
@@ -3773,6 +3893,24 @@ struct ApiError {
 }
 
 impl ApiError {
+    fn not_found(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::NOT_FOUND,
+            code: "not_found",
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
+    fn internal(message: impl Into<String>) -> Self {
+        Self {
+            status: StatusCode::INTERNAL_SERVER_ERROR,
+            code: "internal_error",
+            message: message.into(),
+            retry_after: None,
+        }
+    }
+
     fn bad_request(code: &'static str, message: impl Into<String>) -> Self {
         Self {
             status: StatusCode::BAD_REQUEST,

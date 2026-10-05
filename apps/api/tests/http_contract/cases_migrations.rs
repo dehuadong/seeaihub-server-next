@@ -525,10 +525,36 @@ async fn gateway_model_naming_migration_backfills_existing_publications() {
     assert_eq!(switch, "legacy-name");
     assert!(enabled, "既有生效名字回填成启用");
 
+    // 4b) 文档素材：目录开放 `documentation_url` 之前，每个当前可调用模型都要有文档；真实部署在
+    //     切换前导入素材，这里直接落一行，验证启动补齐（Spec 0008 §4、A10）用得上它。
+    sqlx::query(
+        "INSERT INTO publication.model_document_materials (id, vendor_model_id, content_hash, material)
+         VALUES ($1, $2, 'legacy-material', $3)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(vendor_model)
+    .bind(json!({
+        "narrative": "# {{platform_name}}\n\n{{parameter_table}}\n",
+        "fields": {
+            "/properties/model": "目录返回的模型名。",
+            "/properties/prompt": "提示词。"
+        }
+    }))
+    .execute(&pool)
+    .await
+    .expect("legacy document material");
+
     // 5) 迁移后立刻可读、可停用：走管理端接口（不起 Worker，也不连上游）。
     let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    // 启动补齐：既有模型不需要重新发布就拿到当前文档，目录里每条都有可读地址。
+    let (status, catalog) = get_catalog(&client, &base_url, None).await;
+    assert_eq!(status, StatusCode::OK, "{catalog}");
+    assert!(
+        catalog["data"][0]["documentation_url"].is_string(),
+        "补齐后目录里每个模型都要有文档：{catalog}"
+    );
     let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
     assert_eq!(status, StatusCode::OK, "{admin}");
     let view = &admin["gateway_models"][0];

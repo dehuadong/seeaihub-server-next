@@ -39,6 +39,13 @@ test('停用的供给在清单里标明不能选，而不是消失', async ({ re
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: capability,
+      documentation: {
+        narrative: '# {{platform_name}}\n\n{{parameter_table}}\n',
+        fields: {
+          '/properties/model': '目录返回的模型名。',
+          '/properties/prompt': '提示词。',
+        },
+      },
       offerings: [
         {
           provider_kind: channel,

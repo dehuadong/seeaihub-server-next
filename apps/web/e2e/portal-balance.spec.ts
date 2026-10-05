@@ -55,6 +55,13 @@ async function publishHoldFixture(
       actor: 'e2e',
       markup_bps: 2000,
       capability_schema: schema,
+      documentation: {
+        narrative: '# {{platform_name}}\n\n{{parameter_table}}\n',
+        fields: {
+          '/properties/model': '目录返回的模型名。',
+          '/properties/prompt': '提示词。',
+        },
+      },
       offerings: [
         {
           provider_kind: 'AIHubMix',

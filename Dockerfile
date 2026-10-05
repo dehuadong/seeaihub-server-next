@@ -28,6 +28,8 @@ COPY --from=build /app/target/release/seeai-api /app/target/release/seeai-api
 COPY --from=build /app/target/release/seeai-worker /app/target/release/seeai-worker
 COPY --from=web /app/apps/web/dist /app/apps/web/dist
 COPY --from=build /app/config/bootstrap /app/config/bootstrap
+# 对客公开文档随镜像携带：容器里的 /v1/docs/*、素材导入解析 narrative_path 与直接运行一致。
+COPY --from=build /app/public-docs /app/public-docs
 RUN mkdir -p /app/apps/api \
     && useradd --uid 10001 --user-group --home-dir /app --shell /usr/sbin/nologin seeai
 USER seeai

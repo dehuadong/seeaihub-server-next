@@ -41,6 +41,46 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<CustomerBillingSummary, ApplicationError> {
         unimplemented!()
     }
+
+    async fn model_document_material(
+        &self,
+        _vendor_id: &str,
+        _native_model_id: &str,
+        _native_revision: &str,
+    ) -> Result<Option<serde_json::Value>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn current_model_document(
+        &self,
+        _gateway_model: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn model_document_by_version(
+        &self,
+        _gateway_model: &str,
+        _version: uuid::Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn current_models_missing_documents(
+        &self,
+    ) -> Result<Vec<MissingModelDocument>, ApplicationError> {
+        unimplemented!()
+    }
+
+    async fn insert_model_document(
+        &self,
+        _runtime_revision_id: RuntimeRevisionId,
+        _gateway_model: &str,
+        _vendor_model_id: VendorModelId,
+        _body: &str,
+    ) -> Result<(), ApplicationError> {
+        unimplemented!()
+    }
     async fn list_api_keys(
         &self,
         _account_id: AccountId,

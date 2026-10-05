@@ -38,6 +38,13 @@ test('改价：界面不出现渠道地址与凭证变量名，发布后仍指�
           prompt: { type: 'string', minLength: 1 },
         },
       },
+      documentation: {
+        narrative: '# {{platform_name}}\n\n{{parameter_table}}\n',
+        fields: {
+          '/properties/model': '目录返回的模型名。',
+          '/properties/prompt': '提示词。',
+        },
+      },
       offerings: [
         {
           provider_kind: 'E2EChannel',

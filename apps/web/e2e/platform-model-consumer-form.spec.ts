@@ -54,6 +54,13 @@ test('对客计价形态只有两种：token 初始价取 vendor/模型已知价
     actor: 'e2e',
     markup_bps: 2000,
     capability_schema: capability(model),
+    documentation: {
+      narrative: '# {{platform_name}}\n\n{{parameter_table}}\n',
+      fields: {
+        '/properties/model': '目录返回的模型名。',
+        '/properties/prompt': '提示词。',
+      },
+    },
     offerings: [
       {
         provider_kind: 'E2ECfToken',

@@ -109,6 +109,7 @@ pub struct DirectExecutionLimits {
 
 pub mod account_name;
 mod history_cursor;
+pub mod model_document;
 pub(crate) use account_name::name_taken_error;
 pub use account_name::{
     ACCOUNT_NAME_MAX_CHARS, generated_account_name_attempts, normalize_account_name,
@@ -159,6 +160,12 @@ pub struct PublishRuntimeCommand {
     /// 但要求它们彼此完全一致——合同只有一份，同一个模型落成两份合同正是要收掉的分叉。
     #[serde(default)]
     pub capability_schema: Option<Value>,
+    /// **模型使用文档素材**（厂商模型素材的顶层字段，与 `capability_schema` 同级）：内联发布给，
+    /// 引用式发布不给（它读同一厂商模型已导入的素材）。形态见
+    /// [`model_document`]：`{"narrative": "<Markdown 正文>", "fields": {...}}`，正文里的
+    /// `narrative_path` 在 API 层解析成正文。
+    #[serde(default)]
+    pub documentation: Option<Value>,
     /// 本次发布的**完整、有序**候选集合：必填且非空。
     ///
     /// 每条候选自带渠道、承载面与计价；候选的档位缺省取它在数组里的下标，也可以自己声明
@@ -238,6 +245,11 @@ pub struct PublishRuntimeRequest {
     pub actor: String,
     /// 该模型的调用方合同（模型级唯一一份，落库后不再改）。
     pub capability_schema: Value,
+    /// 已渲染的**模型使用文档正文**：发布事务里与合同、候选原子生效；缺失即发布被拒。
+    pub documentation_body: String,
+    /// 内联发布带来的**已解析文档素材**：随发布落成该厂商模型的素材版本，之后的引用式发布读它。
+    /// 引用式发布为 `None`（素材早已导入）。
+    pub documentation_material: Option<Value>,
     /// 加价系数（基点）：随修订发布、随 Job 快照冻结；没有候选带定价时为 `None`。
     pub markup_bps: Option<i32>,
     /// 候选的**技术定义**从哪里取：`true` = 由被引用的 Offering 行决定（引用式发布），`false` = 用
@@ -460,6 +472,8 @@ impl PublishRuntimeCommand {
     pub fn into_request(
         self,
         capability_schema: Value,
+        documentation_body: String,
+        documentation_material: Option<Value>,
         offerings: Vec<NormalizedOffering>,
         definitions_from_offerings: bool,
     ) -> PublishRuntimeRequest {
@@ -487,6 +501,8 @@ impl PublishRuntimeCommand {
             model_type: self.model_type.unwrap_or_default(),
             actor: self.actor,
             capability_schema,
+            documentation_body,
+            documentation_material: documentation_material.or(self.documentation),
             markup_bps: self.markup_bps,
             // 引用式发布的技术定义由仓储从被引用的 Offering 行取：草稿里根本没有它们（那是这次改动的
             // 要点——运营不给技术字段）。内联那条老路自带定义，仓储用请求里的值。
@@ -2579,6 +2595,19 @@ pub enum ApplicationError {
     Reconciliation(String),
 }
 
+/// 一个**当前可调用、却还没有文档**的模型：首次开放目录 `documentation_url` 前用它补齐快照。
+#[derive(Debug, Clone)]
+pub struct MissingModelDocument {
+    pub runtime_revision_id: RuntimeRevisionId,
+    pub gateway_model: String,
+    pub vendor_model_id: VendorModelId,
+    pub vendor_id: String,
+    pub native_model_id: String,
+    pub native_revision: String,
+    pub model_type: String,
+    pub capability_schema: Value,
+}
+
 #[async_trait]
 pub trait HubRepository: Send + Sync {
     /// 发布一次 Runtime Revision。**只接受已核验的请求**（见 [`PublishRuntimeRequest`]）。
@@ -2645,6 +2674,44 @@ pub trait HubRepository: Send + Sync {
     /// 目录里列出的型号必须真的受理得起来——取不到任何候选的型号，受理期对调用方是"不存在"，
     /// 因此也不该出现在目录里。一个可调型号都没有时返回空集合，不是错误。
     async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError>;
+
+    /// 该厂商模型修订**最近导入**的模型文档素材（已解析：`narrative` 是正文内容）。
+    ///
+    /// 引用式发布用它渲染正文；同一内容重复导入复用同一行，内容变化时取最新那一行。没有素材时
+    /// 返回 `None`，由调用方按「发布不能绕开文档要求」拒绝。
+    async fn model_document_material(
+        &self,
+        vendor_id: &str,
+        native_model_id: &str,
+        native_revision: &str,
+    ) -> Result<Option<Value>, ApplicationError>;
+
+    /// 目录当前可调模型的**当前文档正文**：与 [`Self::published_models`] 同一条可调用判据。
+    async fn current_model_document(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Option<String>, ApplicationError>;
+
+    /// 按平台名与文档标识读取**历史正文**：不以模型当前是否启用为条件（Spec 0008 §2）。
+    async fn model_document_by_version(
+        &self,
+        gateway_model: &str,
+        version: Uuid,
+    ) -> Result<Option<String>, ApplicationError>;
+
+    /// 当前可调用、却还没有文档的模型：首次开放新字段前用它补齐（Spec 0008 §4）。
+    async fn current_models_missing_documents(
+        &self,
+    ) -> Result<Vec<MissingModelDocument>, ApplicationError>;
+
+    /// 为一个既有 Runtime Revision 落一条文档（补齐走它；同一修订已有则不产生第二行）。
+    async fn insert_model_document(
+        &self,
+        runtime_revision_id: RuntimeRevisionId,
+        gateway_model: &str,
+        vendor_model_id: VendorModelId,
+        body: &str,
+    ) -> Result<(), ApplicationError>;
 
     /// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。
     ///
@@ -5504,7 +5571,17 @@ impl RuntimeService {
         validate_supply_identities(&normalized)?;
         self.validate_cost_ceiling(&native_model_id, &contract, &normalized)
             .await?;
-        let request = command.into_request(contract, normalized, definitions_from_offerings);
+        let documentation_body = self
+            .render_documentation(&command, &contract, &native_model_id)
+            .await?;
+        let documentation_material = command.documentation.clone();
+        let request = command.into_request(
+            contract,
+            documentation_body,
+            documentation_material,
+            normalized,
+            definitions_from_offerings,
+        );
         validate_gateway_model_identity(&request)?;
         let gateway_model = request.gateway_model.clone();
         let revision = self.repository.publish_runtime(request).await?;
@@ -5512,6 +5589,47 @@ impl RuntimeService {
         // 不影响任何受理结果。
         self.acceleration.invalidate_route(&gateway_model).await;
         Ok(revision)
+    }
+
+    /// 渲染这次发布的模型使用文档正文。
+    ///
+    /// 素材来源：内联发布用命令带来的那份，引用式发布读同一厂商模型最近导入的那份；两者都没有即拒绝
+    /// ——发布不能绕开文档要求。正文的内容边界与校验归 Spec 0008 §3–§4，渲染在
+    /// [`model_document`] 里。
+    async fn render_documentation(
+        &self,
+        command: &PublishRuntimeCommand,
+        contract: &Value,
+        native_model_id: &str,
+    ) -> Result<String, ApplicationError> {
+        let vendor_id = command.vendor_id.as_deref().unwrap_or_default();
+        let native_revision = command.native_revision.as_deref().unwrap_or_default();
+        let material = match command.documentation.clone() {
+            Some(material) => material,
+            None => self
+                .repository
+                .model_document_material(vendor_id, native_model_id, native_revision)
+                .await?
+                .ok_or_else(|| {
+                    ApplicationError::Validation(format!(
+                        "vendor model {native_model_id} revision {native_revision} has no model document material; import its documentation before publishing"
+                    ))
+                })?,
+        };
+        let platform_name = command
+            .gateway_model
+            .as_deref()
+            .map(str::trim)
+            .filter(|name| !name.is_empty())
+            .unwrap_or(native_model_id);
+        model_document::render_model_document(
+            contract,
+            platform_name,
+            vendor_id,
+            command.model_type.as_deref().unwrap_or_default(),
+            native_revision,
+            &material,
+        )
     }
 
     /// 把**引用式**候选解析成一次发布：技术定义与合同都从被引用的 Offering 取。
@@ -5671,6 +5789,8 @@ impl RuntimeService {
             native_revision: Some(first.native_revision.clone()),
             model_type: Some(first.model_type.clone()),
             capability_schema: Some(first.capability_schema.clone()),
+            // 引用式发布的文档读同一厂商模型已导入的素材，命令里不带。
+            documentation: None,
             offerings: Some(offerings),
             references: None,
             markup_bps: command.markup_bps,
@@ -5744,6 +5864,69 @@ impl RuntimeService {
     /// 否则客户端照目录建的表单会被另一套规则拒掉。
     pub async fn published_models(&self) -> Result<Vec<PublishedModel>, ApplicationError> {
         self.repository.published_models().await
+    }
+
+    /// 目录当前可调模型的当前文档正文；不可调用或没有文档时为 `None`（Spec 0008 §2）。
+    pub async fn current_model_document(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        self.repository.current_model_document(gateway_model).await
+    }
+
+    /// 按平台名与文档标识读取历史正文：不以模型当前是否启用为条件（Spec 0008 §2）。
+    pub async fn model_document_by_version(
+        &self,
+        gateway_model: &str,
+        version: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        self.repository
+            .model_document_by_version(gateway_model, version)
+            .await
+    }
+
+    /// 首次开放目录 `documentation_url` 之前补齐：给每个当前可调用、却还没有文档的模型生成快照。
+    ///
+    /// 素材取该厂商模型已导入的那份；缺素材即报错，由启动方让进程起不来——不隐藏模型、不伪造正文。
+    /// 返回补齐的模型数。只新增文档记录，不改既有 Runtime Revision、价格或路由。
+    pub async fn ensure_current_model_documents(&self) -> Result<usize, ApplicationError> {
+        let missing = self.repository.current_models_missing_documents().await?;
+        let mut created = 0;
+        for model in missing {
+            let material = self
+                .repository
+                .model_document_material(
+                    &model.vendor_id,
+                    &model.native_model_id,
+                    &model.native_revision,
+                )
+                .await?
+                .ok_or_else(|| {
+                    ApplicationError::Validation(format!(
+                        "current model {} has no model document material; import its documentation before \
+                         enabling documentation_url",
+                        model.gateway_model
+                    ))
+                })?;
+            let body = model_document::render_model_document(
+                &model.capability_schema,
+                &model.gateway_model,
+                &model.vendor_id,
+                &model.model_type,
+                &model.native_revision,
+                &material,
+            )?;
+            self.repository
+                .insert_model_document(
+                    model.runtime_revision_id,
+                    &model.gateway_model,
+                    model.vendor_model_id,
+                    &body,
+                )
+                .await?;
+            created += 1;
+        }
+        Ok(created)
     }
 
     /// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。

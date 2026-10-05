@@ -22,6 +22,7 @@ use seeai_application::ApplicationError;
 use seeai_domain::{ChannelId, OfferingId, PricingFormula, VendorModelId};
 use serde::Deserialize;
 use serde_json::{Value, json};
+use sha2::{Digest, Sha256};
 use sqlx::{PgConnection, PgPool, Row};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -38,6 +39,12 @@ pub const SUPPLY_MATERIAL_DIR_ENV: &str = "SUPPLY_MATERIAL_DIR";
 /// 仓库、systemd 部署（`WorkingDirectory=/opt/seeai`）与 Docker 镜像（`WORKDIR /app`）都把
 /// `config/bootstrap` 放在工作目录下，所以这一个默认值在三种部署里都指得到素材。
 pub const DEFAULT_SUPPLY_MATERIAL_DIR: &str = "config/bootstrap";
+
+/// 公开文档目录的环境变量名；不设时用 [`DEFAULT_PUBLIC_DOCS_DIR`]（相对进程工作目录）。
+pub const PUBLIC_DOCS_DIR_ENV: &str = "PUBLIC_DOCS_DIR";
+
+/// 公开文档目录的默认值。仓库、systemd 部署与 Docker 镜像都把 `public-docs` 放在工作目录下。
+pub const DEFAULT_PUBLIC_DOCS_DIR: &str = "public-docs";
 
 /// 素材没写 `actor` 时，价目表那行的来源标注。
 const DEFAULT_ACTOR: &str = "supply-material-import";
@@ -134,6 +141,19 @@ async fn import_material(
 ) -> Result<MaterialImportSummary, ApplicationError> {
     let mut tx = pool.begin().await.map_err(database_error)?;
     let vendor_model_id = upsert_vendor_model(&mut tx, path, material).await?;
+    let documentation = resolve_documentation(&public_docs_dir(), path, material)?;
+    let model_type = material_model_type(path, material)?;
+    // 导入期就把素材与合同对齐校验一遍：缺字段释义、引用不存在的合同位置、模板缺插入点或正文
+    // 链接越界都当场拒，不等到发布。平台对客名这时还不知道，用厂商原生名占位，只校验结构。
+    seeai_application::model_document::render_model_document(
+        &material.capability_schema,
+        &material.native_model_id,
+        &material.vendor_id,
+        model_type,
+        &material.native_revision,
+        &documentation,
+    )?;
+    upsert_model_document_material(&mut tx, vendor_model_id, &documentation).await?;
     let mut summary = MaterialImportSummary::default();
     for (index, offering) in material.offerings.iter().enumerate() {
         let label = format!("{}: offerings[{index}]", path.display());
@@ -447,6 +467,10 @@ struct Material {
     #[serde(rename = "type", default)]
     model_type: Option<String>,
     capability_schema: Value,
+    /// **模型使用文档素材**（顶层，与 `capability_schema` 同级）：引用公开叙述正文与按 JSON
+    /// Pointer 绑定的字段释义。厂商模型的身份与参数值由渲染器注入，素材里不写死。
+    #[serde(default)]
+    documentation: Option<Value>,
     /// 谁写的这份素材；落进价目表那行的来源标注。
     actor: Option<String>,
     offerings: Vec<MaterialOffering>,
@@ -480,6 +504,92 @@ struct MaterialPricePlan {
     image_output_microusd_per_million: u64,
     #[serde(default)]
     source_url: String,
+}
+
+/// 解析并校验一份文档素材：把 `narrative_path` 读成正文内容，与字段释义一起交给渲染器校验。
+///
+/// 只读 `public-docs/` 下的文件：路径里出现 `..` 或空段即拒绝，不提供任意文件读取。返回的是
+/// **已解析**形态（`narrative` 是正文），落库与渲染都只认它。
+fn resolve_documentation(
+    public_docs: &Path,
+    path: &Path,
+    material: &Material,
+) -> Result<Value, ApplicationError> {
+    let documentation = material.documentation.as_ref().ok_or_else(|| {
+        ApplicationError::Validation(format!(
+            "{}: vendor model {} declares no documentation; the model usage document is required",
+            path.display(),
+            material.native_model_id
+        ))
+    })?;
+    let narrative_path = documentation
+        .get("narrative_path")
+        .and_then(Value::as_str)
+        .ok_or_else(|| {
+            ApplicationError::Validation(format!(
+                "{}: documentation.narrative_path is required",
+                path.display()
+            ))
+        })?;
+    if narrative_path
+        .split('/')
+        .any(|segment| segment.is_empty() || segment == "..")
+    {
+        return Err(ApplicationError::Validation(format!(
+            "{}: documentation.narrative_path {narrative_path} must stay under public-docs",
+            path.display()
+        )));
+    }
+    let narrative = std::fs::read_to_string(public_docs.join(narrative_path)).map_err(|error| {
+        ApplicationError::Validation(format!(
+            "{}: cannot read public-docs/{narrative_path}: {error}",
+            path.display()
+        ))
+    })?;
+    let fields = documentation.get("fields").cloned().ok_or_else(|| {
+        ApplicationError::Validation(format!(
+            "{}: documentation.fields is required",
+            path.display()
+        ))
+    })?;
+    Ok(json!({ "narrative": narrative, "fields": fields }))
+}
+
+/// `public-docs/` 的目录：不设 [`PUBLIC_DOCS_DIR_ENV`] 时用相对进程工作目录的默认目录。
+pub fn public_docs_dir() -> PathBuf {
+    std::env::var(PUBLIC_DOCS_DIR_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from(DEFAULT_PUBLIC_DOCS_DIR))
+}
+
+/// 文档素材版本按 `(vendor_model_id, content_hash)` 复用：内容相同不产生第二行，内容变化追加一行。
+pub(crate) async fn upsert_model_document_material(
+    conn: &mut PgConnection,
+    vendor_model_id: VendorModelId,
+    material: &Value,
+) -> Result<(), ApplicationError> {
+    let canonical = serde_json::to_string(material)
+        .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
+    let mut hasher = Sha256::new();
+    hasher.update(canonical.as_bytes());
+    let content_hash = hex::encode(hasher.finalize());
+    sqlx::query(
+        r#"
+        INSERT INTO publication.model_document_materials (id, vendor_model_id, content_hash, material)
+        VALUES ($1, $2, $3, $4)
+        ON CONFLICT (vendor_model_id, content_hash) DO NOTHING
+        "#,
+    )
+    .bind(Uuid::new_v4())
+    .bind(vendor_model_id.0)
+    .bind(&content_hash)
+    .bind(material)
+    .execute(conn)
+    .await
+    .map_err(database_error)?;
+    Ok(())
 }
 
 fn empty_object() -> Value {

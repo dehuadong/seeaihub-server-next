@@ -123,6 +123,84 @@ async fn importing_the_same_material_twice_adds_no_rows() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 文档素材版本：同一内容重复导入复用一行，内容变化追加一行；发布取最近导入的那一行
+/// （设计 §持久化与发布：同一内容复用、内容变化追加、发布取最新）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL; derives a throwaway database"]
+async fn a_documentation_change_appends_a_material_version() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    let pool = repository.pool().clone();
+
+    import_supply_materials(&pool, &material_dir())
+        .await
+        .expect("the first import");
+    assert_eq!(material_versions(&pool, "gpt-image-2.5-flare").await, 1);
+
+    // 同一内容再导一遍：不产生第二个素材版本。
+    import_supply_materials(&pool, &material_dir())
+        .await
+        .expect("the second import");
+    assert_eq!(material_versions(&pool, "gpt-image-2.5-flare").await, 1);
+
+    // 改一句释义：追加一行，且发布侧取到的最近一行是新内容。
+    let edited =
+        std::env::temp_dir().join(format!("seeai-doc-material-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&edited).expect("temp material dir");
+    let original = std::fs::read_to_string(material_dir().join("gpt-image-2.5-flare.json"))
+        .expect("the bootstrap material");
+    let mut value: serde_json::Value =
+        serde_json::from_str(&original).expect("the material is json");
+    value["documentation"]["fields"]["/properties/prompt"] =
+        serde_json::json!("改过的提示词释义。");
+    std::fs::write(
+        edited.join("gpt-image-2.5-flare.json"),
+        serde_json::to_string(&value).expect("serialize the edited material"),
+    )
+    .expect("write the edited material");
+    import_supply_materials(&pool, &edited)
+        .await
+        .expect("the changed import");
+    assert_eq!(material_versions(&pool, "gpt-image-2.5-flare").await, 2);
+    let latest: String = sqlx::query_scalar(
+        r#"
+        SELECT m.material->'fields'->>'/properties/prompt'
+        FROM publication.model_document_materials m
+        JOIN catalog.vendor_models vm ON vm.id = m.vendor_model_id
+        WHERE vm.native_model_id = 'gpt-image-2.5-flare'
+        ORDER BY m.created_at DESC, m.id DESC
+        LIMIT 1
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the latest material");
+    assert_eq!(latest, "改过的提示词释义。");
+
+    std::fs::remove_dir_all(&edited).expect("clean the temp material dir");
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 某厂商模型已落库的文档素材版本数。
+async fn material_versions(pool: &PgPool, model: &str) -> i64 {
+    sqlx::query_scalar(
+        r#"
+        SELECT count(*) FROM publication.model_document_materials m
+        JOIN catalog.vendor_models vm ON vm.id = m.vendor_model_id
+        WHERE vm.native_model_id = $1
+        "#,
+    )
+    .bind(model)
+    .fetch_one(pool)
+    .await
+    .expect("material versions")
+}
+
 /// 同一 Vendor Model 修订改 `type` 与改合同同一条处置：拒并点名型号，不产生第二行、不改写既有行
 /// （Spec 0006 §4.4、A4）。
 #[tokio::test]

@@ -1195,8 +1195,15 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
         keys.sort_unstable();
         assert_eq!(
             keys,
-            vec!["contract", "name", "revision", "type", "vendor_id"],
-            "目录条目只有 name / vendor_id / revision / type / contract 五个字段：{entry}"
+            vec![
+                "contract",
+                "documentation_url",
+                "name",
+                "revision",
+                "type",
+                "vendor_id"
+            ],
+            "目录条目是 name / vendor_id / revision / type / contract / documentation_url 六个字段：{entry}"
         );
         assert_eq!(entry["type"].as_str(), Some("image"), "{entry}");
         assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
@@ -1681,7 +1688,8 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
                 "image_output_microusd_per_million": 30000000,
                 "source_url": "https://aihubmix.com/model/gpt-image-2"
             }
-        }]
+        }],
+        "documentation": documentation_for(&contract)
     });
     assert!(
         command.get("gateway_model").is_none(),
@@ -1705,15 +1713,29 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
     // ── 目录逐位一致：name 是厂商原生名，形状就是新的五字段形状 ──
     let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK, "{catalog}");
+    // 文档地址随发布生成（版本标识是随机 UUID），先校验它指对模型，再剥掉它逐位比其余字段。
+    let mut entry = catalog["data"][0].clone();
+    let documentation_url = entry["documentation_url"]
+        .as_str()
+        .expect("catalog entry carries documentation_url")
+        .to_owned();
+    assert!(
+        documentation_url.starts_with("/v1/models/gpt-image-2/llms.txt?version="),
+        "文档地址指向该模型的公开说明：{documentation_url}"
+    );
+    entry
+        .as_object_mut()
+        .expect("entry is an object")
+        .remove("documentation_url");
     assert_eq!(
-        catalog,
-        json!({"data": [{
+        entry,
+        json!({
             "name": "gpt-image-2",
             "vendor_id": "OpenAI",
             "revision": "2026-09-18-validated-1.3",
             "type": "image",
             "contract": contract,
-        }]}),
+        }),
         "缺省回退之后目录与新增 type 逐位一致：{catalog}"
     );
 
@@ -2666,6 +2688,7 @@ async fn the_selectable_offering_list_carries_the_selection_key_without_deployme
                 "native_revision": "route-test-1",
                 "type": "image",
                 "actor": "contract-test",
+                "documentation": documentation_for(&contract),
                 "capability_schema": contract,
                 "offerings": [full]
             }))
@@ -2974,6 +2997,7 @@ async fn the_offering_list_reports_whether_the_channel_declares_a_cost() {
             "native_revision": "route-test-1",
             "type": "image",
             "actor": "contract-test",
+            "documentation": documentation_for(&contract),
             "capability_schema": contract,
             "offerings": [full]
         });

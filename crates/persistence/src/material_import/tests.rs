@@ -1,6 +1,54 @@
 use super::*;
 use std::path::PathBuf;
 
+/// 公开文档目录：单元测试直接指到仓库里那份，不依赖进程工作目录。
+fn public_docs() -> PathBuf {
+    Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public-docs")
+}
+
+#[test]
+fn the_bootstrap_documentation_resolves_into_a_validated_material() {
+    let flare = parse("gpt-image-2.5-flare.json");
+    let material = resolve_documentation(
+        &public_docs(),
+        &material_dir().join("gpt-image-2.5-flare.json"),
+        &flare,
+    )
+    .expect("the bootstrap documentation resolves");
+    let narrative = material["narrative"]
+        .as_str()
+        .expect("the narrative content");
+    assert!(narrative.contains("{{parameter_table}}"), "{narrative}");
+    assert!(material["fields"]["/properties/prompt"].is_string());
+    assert!(material["fields"]["/allOf/0"].is_string());
+}
+
+#[test]
+fn a_material_without_documentation_is_rejected() {
+    let mut flare = parse("gpt-image-2.5-flare.json");
+    flare.documentation = None;
+    let error = resolve_documentation(
+        &public_docs(),
+        &material_dir().join("gpt-image-2.5-flare.json"),
+        &flare,
+    )
+    .expect_err("missing documentation is rejected");
+    assert!(error.to_string().contains("documentation"), "{error}");
+}
+
+#[test]
+fn a_documentation_path_outside_public_docs_is_rejected() {
+    let mut flare = parse("gpt-image-2.5-flare.json");
+    flare.documentation = Some(json!({"narrative_path": "../../etc/passwd", "fields": {}}));
+    let error = resolve_documentation(
+        &public_docs(),
+        &material_dir().join("gpt-image-2.5-flare.json"),
+        &flare,
+    )
+    .expect_err("an escaping path is rejected");
+    assert!(error.to_string().contains("public-docs"), "{error}");
+}
+
 /// 素材目录就是仓库里那份真实素材：解析这一层要对着**真输入**验，不能自己编一份形状好看的。
 fn material_dir() -> PathBuf {
     Path::new(env!("CARGO_MANIFEST_DIR")).join("../../config/bootstrap")

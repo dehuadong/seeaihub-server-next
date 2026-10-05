@@ -78,6 +78,24 @@
       }
     ]
   },
+  "documentation": {
+    "narrative_path": "models/openai/gpt-image-2.5.md",
+    "fields": {
+      "/properties/model": "必填。填写模型目录中该条目返回的 `name`。",
+      "/properties/prompt": "必填。描述希望生成的图片，或希望修改与保留的内容；非空，最多 32000 个字符。",
+      "/properties/n": "生成张数，取 1–10 的整数，默认声明为 1；响应可能少于请求张数，请按实际返回的 `data` 读取结果。",
+      "/properties/size": "输出尺寸，填 `auto` 或 `宽x高` 的像素值（如 `1024x1024`）；宽与高都须为 16 的倍数，长边与短边之比在 1:3 到 3:1 之间，最大 3840x2160，高于 2560x1440 属实验范围。",
+      "/properties/quality": "输出质量，可填 `low`、`medium`、`high`、`xhigh`、`max` 或 `auto`，默认声明为 `auto`。",
+      "/properties/output_format": "输出图片格式，可填 `png`、`jpeg` 或 `webp`，默认声明为 `png`。",
+      "/properties/output_compression": "JPEG/WebP 的压缩百分比，取 0–100 的整数，默认声明为 100；仅在 `output_format` 为 `jpeg` 或 `webp` 时生效。",
+      "/properties/background": "背景处理，可填 `auto`（自动选择）、`opaque`（不透明）或 `transparent`（透明），默认声明为 `auto`；透明背景须搭配 `png` 或 `webp`。",
+      "/properties/moderation": "内容审核强度，可填 `auto`（默认审核）或 `low`（较宽松审核），默认声明为 `auto`。",
+      "/properties/image": "可选。参考图的公网 `http(s)` URL 数组，1–16 张；本地图片先用上传接口换成公网 URL 再填入。",
+      "/properties/mask": "可选。遮罩图的公网 `http(s)` URL，用于指定希望编辑的区域；填 `mask` 时必须同时填写 `image`。",
+      "/allOf/0": "组合约束：填写 `mask` 时必须同时填写 `image`，遮罩单独填写不成立。",
+      "/allOf/1": "组合约束：`background` 为 `transparent` 时，`output_format` 只能填 `png` 或 `webp`。"
+    }
+  },
   "offerings": [
     {
       "provider_kind": "AIHubMix",

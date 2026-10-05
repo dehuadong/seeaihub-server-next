@@ -40,6 +40,13 @@ test('清单只列所选厂商的供给', async ({ request, page }) => {
         actor: 'e2e',
         markup_bps: 2000,
         capability_schema: capability,
+        documentation: {
+          narrative: '# {{platform_name}}\n\n{{parameter_table}}\n',
+          fields: {
+            '/properties/model': '目录返回的模型名。',
+            '/properties/prompt': '提示词。',
+          },
+        },
         offerings: [
           {
             provider_kind: `E2EChannel${vendor}`,

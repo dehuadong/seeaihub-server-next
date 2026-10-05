@@ -110,6 +110,13 @@ async function publishCaptureFixture(request: APIRequestContext): Promise<void> 
       actor: 'capture',
       markup_bps: 2000,
       capability_schema: capability,
+      documentation: {
+        narrative: '# {{platform_name}}\n\n{{parameter_table}}\n',
+        fields: {
+          '/properties/model': '目录返回的模型名。',
+          '/properties/prompt': '提示词。',
+        },
+      },
       offerings: [
         {
           provider_kind: CAPTURE_CHANNEL,

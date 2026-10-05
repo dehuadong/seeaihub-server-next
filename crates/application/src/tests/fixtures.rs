@@ -123,6 +123,7 @@ pub(super) fn base_command() -> PublishRuntimeCommand {
         native_revision: Some("test-1".to_owned()),
         model_type: Some("image".to_owned()),
         capability_schema: None,
+        documentation: None,
         offerings: None,
         references: None,
         markup_bps: None,

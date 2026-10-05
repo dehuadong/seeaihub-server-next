@@ -86,6 +86,46 @@ impl HubRepository for AuditRepository {
     ) -> Result<CustomerBillingSummary, ApplicationError> {
         unused_repository()
     }
+
+    async fn model_document_material(
+        &self,
+        _vendor_id: &str,
+        _native_model_id: &str,
+        _native_revision: &str,
+    ) -> Result<Option<serde_json::Value>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn current_model_document(
+        &self,
+        _gateway_model: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn model_document_by_version(
+        &self,
+        _gateway_model: &str,
+        _version: uuid::Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn current_models_missing_documents(
+        &self,
+    ) -> Result<Vec<crate::MissingModelDocument>, ApplicationError> {
+        unused_repository()
+    }
+
+    async fn insert_model_document(
+        &self,
+        _runtime_revision_id: crate::RuntimeRevisionId,
+        _gateway_model: &str,
+        _vendor_model_id: crate::VendorModelId,
+        _body: &str,
+    ) -> Result<(), ApplicationError> {
+        unused_repository()
+    }
     async fn list_api_keys(
         &self,
         _account_id: AccountId,

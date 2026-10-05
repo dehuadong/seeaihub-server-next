@@ -1238,6 +1238,8 @@ pub struct PublishedModel {
     pub model_type: String,
     /// 该模型的调用方合同：**发布的那一份**，客户端据此建表单。
     pub capability_schema: Value,
+    /// 该模型当前文档的**不透明版本标识**：目录用它拼 `documentation_url`（Spec 0008 §2）。
+    pub documentation_version: String,
 }
 
 /// 合同里声明**型号身份**的那个字段的位置（`properties.model.const`）。

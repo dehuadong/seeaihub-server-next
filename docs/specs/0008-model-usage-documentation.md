@@ -67,7 +67,7 @@
 
 ## 6. 技术设计
 
-[模型使用文档发布设计](../../.agents/notes/proposed/platform/2026-10-05-model-usage-documentation.md)承接 §1–§5。
+[模型使用文档发布设计](../../.agents/notes/implemented/platform/2026-10-05-model-usage-documentation.md)承接 §1–§5。
 
 ## 7. 修订记录
 

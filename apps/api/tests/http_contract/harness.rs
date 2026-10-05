@@ -64,6 +64,8 @@ mod cases_kill_matrix;
 mod cases_lifecycle;
 #[path = "cases_migrations.rs"]
 mod cases_migrations;
+#[path = "cases_model_document.rs"]
+mod cases_model_document;
 #[path = "cases_model_type.rs"]
 mod cases_model_type;
 #[path = "cases_parameter_mapping.rs"]
@@ -1124,6 +1126,11 @@ fn api_probe_command(database_url: &str, port: u16, admin_token: &str) -> Comman
         .env("REQUEST_FINGERPRINT_KEY_V1", CONTRACT_FINGERPRINT_KEY)
         .env("AIHUBMIX_API_KEY", CONTRACT_PROVIDER_KEY)
         .env("APIMART_API_KEY", CONTRACT_PROVIDER_KEY)
+        // 公共文档按绝对路径指到仓库里的 `public-docs/`：探针的工作目录是临时目录，相对路径找不到。
+        .env(
+            "PUBLIC_DOCS_DIR",
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public-docs"),
+        )
         .current_dir(std::env::temp_dir());
     remove_upload_env(&mut command);
     command
@@ -1497,6 +1504,11 @@ async fn start_api_with(
             // **显式不导入供给素材**：每个用例的库是空的、夹具自己造；不设的话默认值
             // （`config/bootstrap`）会让它们先看到仓库那两份素材。
             .env("SUPPLY_MATERIAL_DIR", "")
+            // 公共文档按绝对路径指到仓库的 `public-docs/`：进程在临时目录里起，相对路径找不到。
+            .env(
+                "PUBLIC_DOCS_DIR",
+                std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public-docs"),
+            )
             .env(
                 "GENERATION_MAX_CONCURRENT_JOBS",
                 max_concurrent_jobs.to_string(),
@@ -2869,7 +2881,9 @@ async fn publish_with_mappings(
         "type": "image",
         "actor": "contract-test",
         "capability_schema": contract,
-        "offerings": offerings
+        "offerings": offerings,
+        // 内联发布必须带文档素材：夹具按同版合同生成一份最小素材（Spec 0008 §4）。
+        "documentation": documentation_for(&contract)
     });
     client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
@@ -3078,7 +3092,44 @@ fn publication_body(
     if let Some(markup_bps) = markup_bps {
         body["markup_bps"] = json!(markup_bps);
     }
+    // 内联发布也要带文档素材：没有它发布会被拒（Spec 0008 §4）。夹具按同版合同生成一份最小素材。
+    let contract = body
+        .get("capability_schema")
+        .cloned()
+        .or_else(|| body["offerings"][0].get("capability_schema").cloned());
+    if let Some(contract) = contract {
+        body["documentation"] = documentation_for(&contract);
+    }
     body
+}
+
+/// 按合同生成一份最小文档素材：字段释义逐项覆盖属性与组合约束，正文只放参数表插入点。
+pub(super) fn documentation_for(contract: &Value) -> Value {
+    let mut fields = serde_json::Map::new();
+    collect_documentation_fields(contract, "", &mut fields);
+    if let Some(all_of) = contract.get("allOf").and_then(Value::as_array) {
+        for index in 0..all_of.len() {
+            fields.insert(format!("/allOf/{index}"), json!("组合约束。"));
+        }
+    }
+    json!({
+        "narrative": "# {{platform_name}}\n\n厂商 {{vendor_id}}，类型 {{model_type}}，修订 {{contract_revision}}。\n\n[API Key 鉴权](../../authentication.md)\n\n## 参数\n\n{{parameter_table}}\n",
+        "fields": fields
+    })
+}
+
+fn collect_documentation_fields(
+    schema: &Value,
+    prefix: &str,
+    fields: &mut serde_json::Map<String, Value>,
+) {
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, property) in properties {
+            let pointer = format!("{prefix}/properties/{name}");
+            fields.insert(pointer.clone(), json!("字段释义。"));
+            collect_documentation_fields(property, &pointer, fields);
+        }
+    }
 }
 
 /// 测试构造体：模型 + 提示词（幂等键另走请求头）。

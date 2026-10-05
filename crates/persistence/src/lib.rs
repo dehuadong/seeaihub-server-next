@@ -8,11 +8,12 @@ use seeai_application::{
     ExecutionFinalization, ExecutionLookup, ExecutionReplay, ExecutionRepository,
     FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView, GatewayModelView,
     HubRepository, LateFactKind, LateFacts, LateFactsOutcome, LedgerMismatch, LedgerPage,
-    NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView,
-    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
-    PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance, ReferencedOffering,
-    RefundReconciliationCommand, SelectableOfferingView, SettleExecution, SubmissionStarted,
-    TakenOverExecution, UsageAmounts, customer_usage_status, declared_output_images,
+    MissingModelDocument, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates,
+    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
+    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance,
+    ReferencedOffering, RefundReconciliationCommand, SelectableOfferingView, SettleExecution,
+    SubmissionStarted, TakenOverExecution, UsageAmounts, customer_usage_status,
+    declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
@@ -218,6 +219,8 @@ impl HubRepository for PgHubRepository {
             model_type,
             actor,
             capability_schema,
+            documentation_body,
+            documentation_material,
             markup_bps,
             definitions_from_offerings,
             offerings,
@@ -336,6 +339,16 @@ impl HubRepository for PgHubRepository {
                 VendorModelId(existing.try_get("id").map_err(database_error)?)
             }
         };
+        // 内联发布带来的文档素材随发布落成该厂商模型的素材版本：之后的引用式发布读它，
+        // 运营不需要再导入一次。内容相同复用同一行（唯一键 `(vendor_model_id, content_hash)`）。
+        if let Some(material) = &documentation_material {
+            crate::material_import::upsert_model_document_material(
+                &mut transaction,
+                vendor_model_id,
+                material,
+            )
+            .await?;
+        }
         let mut candidates = Vec::with_capacity(offerings.len());
         let mut snapshot_entries = Vec::with_capacity(offerings.len());
         // 定价列是**按候选键**的映射（同一个网关模型的不同候选价格不同），所以在循环里逐条
@@ -595,6 +608,23 @@ impl HubRepository for PgHubRepository {
         )
         .bind(&gateway_model)
         .bind(&actor)
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
+        // 模型使用文档与合同、候选在同一个事务里原子生效：正文已由 Application 渲染好，这里只落库。
+        // 一个 Runtime Revision 一条文档，正文不可变（Spec 0008 §4）。
+        sqlx::query(
+            r#"
+            INSERT INTO publication.model_documents
+                (id, runtime_revision_id, gateway_model, vendor_model_id, body)
+            VALUES ($1, $2, $3, $4, $5)
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(revision_id.0)
+        .bind(&gateway_model)
+        .bind(vendor_model_id.0)
+        .bind(&documentation_body)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
@@ -1067,12 +1097,13 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT DISTINCT ON (re.gateway_model)
                 re.gateway_model, vm.vendor_id, vm.native_revision, vm.model_type,
-                vm.capability_schema
+                vm.capability_schema, md.id AS documentation_version
             FROM publication.runtime_entries re
             JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
+            JOIN publication.model_documents md ON md.runtime_revision_id = re.runtime_revision_id
             WHERE re.active AND {CANDIDATE_AVAILABLE_SQL}
             ORDER BY re.gateway_model ASC, re.routing_priority ASC, vm.created_at DESC, vm.id ASC
             "#
@@ -1088,9 +1119,146 @@ impl HubRepository for PgHubRepository {
                     native_revision: row.try_get("native_revision").map_err(database_error)?,
                     model_type: row.try_get("model_type").map_err(database_error)?,
                     capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+                    documentation_version: row
+                        .try_get::<Uuid, _>("documentation_version")
+                        .map_err(database_error)?
+                        .to_string(),
                 })
             })
             .collect()
+    }
+
+    async fn model_document_material(
+        &self,
+        vendor_id: &str,
+        native_model_id: &str,
+        native_revision: &str,
+    ) -> Result<Option<Value>, ApplicationError> {
+        sqlx::query_scalar(
+            r#"
+            SELECT m.material
+            FROM catalog.vendor_models vm
+            JOIN publication.model_document_materials m ON m.vendor_model_id = vm.id
+            WHERE vm.vendor_id = $1 AND vm.native_model_id = $2 AND vm.native_revision = $3
+            ORDER BY m.created_at DESC, m.id DESC
+            LIMIT 1
+            "#,
+        )
+        .bind(vendor_id)
+        .bind(native_model_id)
+        .bind(native_revision)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn current_model_document(
+        &self,
+        gateway_model: &str,
+    ) -> Result<Option<String>, ApplicationError> {
+        // 与目录同一条可调用判据：生效条目 + 网关模型开着 + 供给与渠道启用；取当前修订那份正文。
+        sqlx::query_scalar(AssertSqlSafe(format!(
+            r#"
+            SELECT md.body
+            FROM publication.runtime_entries re
+            JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
+            JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+            JOIN supply.offerings o ON o.id = re.offering_id
+            JOIN supply.channels c ON c.id = o.channel_id
+            JOIN publication.model_documents md ON md.runtime_revision_id = re.runtime_revision_id
+            WHERE re.active AND re.gateway_model = $1 AND {CANDIDATE_AVAILABLE_SQL}
+            ORDER BY re.routing_priority ASC, vm.created_at DESC, vm.id ASC
+            LIMIT 1
+            "#
+        )))
+        .bind(gateway_model)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn model_document_by_version(
+        &self,
+        gateway_model: &str,
+        version: Uuid,
+    ) -> Result<Option<String>, ApplicationError> {
+        // 历史正文只按（平台名, 文档标识）定位：不以模型当前是否启用为条件（Spec 0008 §2）。
+        sqlx::query_scalar(
+            "SELECT body FROM publication.model_documents WHERE gateway_model = $1 AND id = $2",
+        )
+        .bind(gateway_model)
+        .bind(version)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)
+    }
+
+    async fn current_models_missing_documents(
+        &self,
+    ) -> Result<Vec<MissingModelDocument>, ApplicationError> {
+        // 生效修订里还没有文档关联的模型——**不看运维开关**：停用的模型之后随时可能被重新启用，
+        // 那时缺文档就会被目录的内连接悄悄藏掉（Spec 0008 §4「不得隐藏模型」）。补齐因此在
+        // 「已发布」这个集合上做，而不是「此刻可调用」那个更小的集合。DISTINCT ON 只取一个型号一条。
+        let rows = sqlx::query(
+            r#"
+            SELECT DISTINCT ON (re.gateway_model)
+                re.gateway_model, re.runtime_revision_id, vm.id AS vendor_model_id,
+                vm.vendor_id, vm.native_model_id, vm.native_revision, vm.model_type,
+                vm.capability_schema
+            FROM publication.runtime_entries re
+            JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
+            LEFT JOIN publication.model_documents md ON md.runtime_revision_id = re.runtime_revision_id
+            WHERE re.active AND md.id IS NULL
+            ORDER BY re.gateway_model ASC, re.routing_priority ASC, vm.created_at DESC, vm.id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await
+        .map_err(database_error)?;
+        rows.iter()
+            .map(|row| {
+                Ok(MissingModelDocument {
+                    runtime_revision_id: RuntimeRevisionId(
+                        row.try_get("runtime_revision_id").map_err(database_error)?,
+                    ),
+                    gateway_model: row.try_get("gateway_model").map_err(database_error)?,
+                    vendor_model_id: VendorModelId(
+                        row.try_get("vendor_model_id").map_err(database_error)?,
+                    ),
+                    vendor_id: row.try_get("vendor_id").map_err(database_error)?,
+                    native_model_id: row.try_get("native_model_id").map_err(database_error)?,
+                    native_revision: row.try_get("native_revision").map_err(database_error)?,
+                    model_type: row.try_get("model_type").map_err(database_error)?,
+                    capability_schema: row.try_get("capability_schema").map_err(database_error)?,
+                })
+            })
+            .collect()
+    }
+
+    async fn insert_model_document(
+        &self,
+        runtime_revision_id: RuntimeRevisionId,
+        gateway_model: &str,
+        vendor_model_id: VendorModelId,
+        body: &str,
+    ) -> Result<(), ApplicationError> {
+        sqlx::query(
+            r#"
+            INSERT INTO publication.model_documents
+                (id, runtime_revision_id, gateway_model, vendor_model_id, body)
+            VALUES ($1, $2, $3, $4, $5)
+            ON CONFLICT (runtime_revision_id) DO NOTHING
+            "#,
+        )
+        .bind(Uuid::new_v4())
+        .bind(runtime_revision_id.0)
+        .bind(gateway_model)
+        .bind(vendor_model_id.0)
+        .bind(body)
+        .execute(&self.pool)
+        .await
+        .map_err(database_error)?;
+        Ok(())
     }
 
     async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError> {

@@ -376,6 +376,20 @@ fn test_timeouts() -> RequestTimeoutPolicy {
     }
 }
 
+/// 这份合同对应的最小文档素材：字段释义逐项覆盖 `surface()` 的属性（Spec 0008 §3）。
+fn documentation() -> Value {
+    json!({
+        "narrative": "# {{platform_name}}\n\n厂商 {{vendor_id}}，类型 {{model_type}}，修订 {{contract_revision}}。\n\n## 参数\n\n{{parameter_table}}\n",
+        "fields": {
+            "/properties/model": "目录返回的模型名。",
+            "/properties/prompt": "提示词。",
+            "/properties/image": "参考图公网 URL。",
+            "/properties/mask": "遮罩图公网 URL。",
+            "/properties/n": "张数。"
+        }
+    })
+}
+
 fn surface() -> Value {
     json!({
         "type": "object",
@@ -401,6 +415,7 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
             native_revision: Some("v1".to_owned()),
             model_type: Some("image".to_owned()),
             capability_schema: Some(surface()),
+            documentation: Some(documentation()),
             offerings: Some(vec![OfferingDraft {
                 offering_id: None,
                 provider_kind: Some("Fake".to_owned()),

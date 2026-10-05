@@ -1710,6 +1710,13 @@ const SELF_SERVICE_ROUTES: [(&str, &str); 3] = [
 /// 把"未认证可达"的全部列出来，白名单里少写它会让这条用例红，写它则要说明为什么它不是缺口。
 const PUBLIC_CATALOGUE_ROUTE: (&str, &str) = ("GET", "/v1/models");
 
+/// 模型使用文档与公共使用文档（Spec 0008 §2）：与模型目录同类——只读、不产生凭据、也不改状态。
+/// 未知模型名或未知文档名回 404，同样不是"未认证"。
+const PUBLIC_DOCUMENT_ROUTES: [(&str, &str); 2] = [
+    ("GET", "/v1/models/{name}/llms.txt"),
+    ("GET", "/v1/docs/{*path}"),
+];
+
 /// 路径参数换成的具体值：占位符原样打过去会落成 404/405，那时验的就不是鉴权了。
 const PROBE_ID: &str = "00000000-0000-4000-8000-000000000000";
 
@@ -1910,6 +1917,15 @@ async fn the_credential_free_customer_surface_is_the_public_catalog_and_the_thre
             ("GET", "/v1/models") => {
                 assert_eq!(status, StatusCode::OK, "公开目录不需要凭据：{body}")
             }
+            ("GET", concrete)
+                if concrete.ends_with("/llms.txt") || concrete.starts_with("/v1/docs/") =>
+            {
+                assert_eq!(
+                    status,
+                    StatusCode::NOT_FOUND,
+                    "公开文档对未知名称回 404、不需要凭据：{body}"
+                )
+            }
             _ => assert_eq!(
                 status,
                 StatusCode::UNAUTHORIZED,
@@ -1925,7 +1941,9 @@ async fn the_credential_free_customer_surface_is_the_public_catalog_and_the_thre
         .iter()
         .copied()
         .chain([PUBLIC_CATALOGUE_ROUTE])
-        .map(|(method, path)| format!("{method} {path}"))
+        .chain(PUBLIC_DOCUMENT_ROUTES)
+        // 新路由带路径参数：比较的是**打过去的具体路径**，与探针口径一致。
+        .map(|(method, path)| format!("{method} {}", concrete_path(path)))
         .collect();
     expected.sort();
     reached.sort();
