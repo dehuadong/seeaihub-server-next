@@ -30,11 +30,11 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     // 结果载荷**不落库**：它只在这条对客响应里，所以上面那条断言就是"原样交回"的全部判据。
     assert_job_succeeded(&harness, &key).await;
 
-    // 2) 参考图走**公网 URL**：这个渠道要字节，所以由 Adapter 自己去取。
+    // 2) 参考图走**公网 URL**：与 APIMart 一样逐字透传，不下载。
     let reference_url = format!("{}/inputs/ref.png", harness.upstream_base_url);
     let key = format!("sync-url-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "edit with a public url");
-    request["image_urls"] = json!([reference_url]);
+    request["image_urls"] = json!([reference_url.clone()]);
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request.clone())
         .await;
@@ -42,20 +42,20 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     assert_sync_success("公网 URL 参考图", &body);
     assert_eq!(
         harness.count("GET", "/inputs/ref.png"),
-        1,
-        "公网 URL 由 Adapter 自己取一次"
+        0,
+        "URL 透传：平台不下载参考图"
     );
     let edits = harness.submit_bytes("/v1/images/edits");
     let rendered = String::from_utf8_lossy(&edits);
     assert!(
         rendered.contains("name=\"image\""),
-        "参考图必须走 image 文件部件"
+        "参考图必须作为 image 部件出现"
     );
     assert!(
-        body_contains_bytes(&edits, PNG_FIXTURE),
-        "公网 URL 取回的字节必须原样进文件部件"
+        rendered.contains(&reference_url),
+        "参考图的公网 URL 必须逐字进表单：{rendered}"
     );
-    // 平台不落盘：这次执行没有调用渠道的上传端点，参考图字节由 Adapter 自己从 URL 取。
+    // 平台不落盘、不代传：既没下载参考图，也没调用渠道的上传端点。
     assert_eq!(harness.count("POST", "/v1/uploads/images"), 0);
 
     // 3) data URL 参考图：生成入口只收公网 URL，受理前拒绝。
@@ -185,8 +185,8 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
         "这次请求没有遮罩，线上就不该有 `mask` 部件：{rendered}"
     );
     assert!(
-        body_contains_bytes(&edits, PNG_FIXTURE),
-        "参考图的字节必须原样进文件部件"
+        rendered.contains(&harness.png_url()) && rendered.contains(&harness.input_url("ref-2.png")),
+        "两张参考图的公网 URL 必须逐字进表单：{rendered}"
     );
 
     // 2) 一张参考图：同一份声明面下仍是单值 `image`——列表形态只属于多张。

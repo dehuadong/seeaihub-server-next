@@ -2,7 +2,7 @@ use super::*;
 use async_trait::async_trait;
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, Deadline, ExternalActionRefused, ImageSite, ImageSites,
-    ImageValueShape,
+    ImageValueShape, InputImage,
 };
 use seeai_domain::{
     ImageParameterKind, MAX_PROVIDER_IDENTIFIER_BYTES, platform_image_parameter,
@@ -40,14 +40,6 @@ struct FakeContext {
 }
 
 impl FakeContext {
-    fn fresh() -> Self {
-        Self {
-            deadline: Deadline::after(Duration::from_secs(30)),
-            client_gone: false,
-            gate_closed: false,
-        }
-    }
-
     fn cancelled() -> Self {
         Self {
             deadline: Deadline::after(Duration::from_secs(30)),
@@ -842,9 +834,9 @@ fn gateway_prompt_only_body_is_byte_identical_to_the_legacy_json_entry() {
     assert_eq!(legacy_body, gateway_body, "JSON 入口逐字不变");
 }
 
-/// URL 态走既有下载：同一个公网地址，新旧入口下载出的字节逐字一致。
+/// 编辑入口把公网 URL **逐字透传**成文本部件：与 APIMart 一样不下载、不上传。
 #[tokio::test]
-async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
+async fn gateway_multipart_form_passes_the_public_url_without_downloading() {
     let payload: &'static [u8] = b"\x89PNG\r\n\x1a\n";
     let receiver = ImageReceiver::start(payload).await;
     let schema = published_schema();
@@ -862,22 +854,22 @@ async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
     };
     let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
         .expect("adapter config should be valid");
-    let legacy_bytes = normalized_form(
+    let form = normalized_form(
         adapter
-            .edit_form(&legacy)
-            .await
-            .expect("the legacy form builds"),
-    )
-    .await;
-    let gateway_bytes = normalized_form(
-        adapter
-            .gateway_edit_form(&input, &FakeContext::fresh())
-            .await
+            .gateway_edit_form(&input)
             .expect("the gateway form builds"),
     )
     .await;
-    assert_eq!(legacy_bytes, gateway_bytes, "URL 态新旧入口下载同一份字节");
-    assert_eq!(receiver.requests(), 2, "两个入口各自下载一次公网参考图");
+    let rendered = &form;
+    assert!(
+        rendered.contains("name=\"image\""),
+        "参考图必须作为 image 部件出现：{rendered}"
+    );
+    assert!(
+        rendered.contains(&receiver.url),
+        "参考图的公网 URL 必须逐字进表单：{rendered}"
+    );
+    assert_eq!(receiver.requests(), 0, "URL 透传：不下载参考图");
 }
 
 /// 取消在生成请求之前生效：闸门拦下，不会真的发出去（基址上没有服务在听）。

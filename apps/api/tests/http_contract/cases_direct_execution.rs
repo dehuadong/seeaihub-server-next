@@ -1025,11 +1025,10 @@ fn peak_rss_kib(pid: u32) -> u64 {
 ///
 /// 预算在这里是进程级上界而不是"每执行预留"：RFC §8 要求最大合法输入与慢发送下 RSS 落在配置的
 /// 预算内。夹具把预算压到**刚好一次执行的预留**（按 Driver 字节上限实测钉出来的那个数），断言
-/// 才有判别力。生成入口收敛为只收公网 URL 后，参考图字节不再随请求体进来，而是由 Adapter 从公网
-/// URL 取回后再编码进 multipart：假上游按 `reference_image_bytes` 交出一张大图，压的仍是
-/// "取图 + 编码"那一段。抖动来源：进程基线与 tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的
-/// 内存留在 arena 里不还给内核、以及 multipart 编码的同尺寸副本。VmHWM 是内核对整段生命周期的
-/// 最高水位，只单调上升，不会漏记峰值。
+/// 才有判别力。生成入口收敛为只收公网 URL、参考图由平台原样透传之后，假上游那 6 MiB 参考图
+/// 不进平台进程：这条用例因此同时钉住"参考图字节不再占平台内存"。抖动来源：进程基线与
+/// tokio/reqwest/sqlx 的运行时缓冲、分配器把释放后的内存留在 arena 里不还给内核。VmHWM 是内核对
+/// 整段生命周期的最高水位，只单调上升，不会漏记峰值。
 #[cfg(target_os = "linux")]
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]

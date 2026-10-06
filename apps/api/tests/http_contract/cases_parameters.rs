@@ -145,11 +145,11 @@ async fn the_edit_path_keeps_declared_parameters_and_drops_undeclared_ones() {
     }
     assert!(
         rendered.contains("name=\"image\""),
-        "平台装载的参考图照旧走文件部件：{rendered}"
+        "平台装载的参考图照旧走 image 部件：{rendered}"
     );
     assert!(
-        body_contains_bytes(&edits, PNG_FIXTURE),
-        "参考图字节必须原样进文件部件"
+        rendered.contains(&harness.png_url()),
+        "参考图的公网 URL 必须逐字进表单：{rendered}"
     );
     assert_job_succeeded(&harness, &key).await;
     harness.cleanup().await;
@@ -182,60 +182,6 @@ async fn both_image_entries_accept_the_same_json_request() {
         assert_eq!(body["error"]["code"].as_str(), Some("invalid_parameter"));
         assert_public_only("文本部件的同义字段冲突", &body);
     }
-    harness.cleanup().await;
-}
-
-/// 参考图取不到 = 生成任务**可证明未受理**：重投到额度用完仍失败时，Job 走失败、预授权释放，
-/// 不进对账。
-///
-/// 这与"提交之后出错进对账"是两条路径，不能混为一谈。AIHubMix 的参考图由 Adapter 自己按公网 URL
-/// 取，取不到时生成请求还没发出去；单次失败可重投（见 `cases_retry.rs`），一直失败就按既有失败
-/// 处置落失败终态。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn reference_image_failure_fails_the_job_before_the_create_request() {
-    // 假上游对参考图的 GET 一律回 500：取图失败发生在生成请求提交之前，可证明未受理。
-    let harness = Harness::start(UpstreamBehaviour {
-        reference_get_failures: usize::MAX,
-        ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
-    })
-    .await;
-    let key = format!("driver-reference-failure-{}", Uuid::new_v4());
-    let mut request = route_request(harness.model, "edit this image");
-    request["image"] = json!(harness.png_url());
-    let (status, body) = harness
-        .sync_json("/v1/images/generations", &key, request.clone())
-        .await;
-    assert_eq!(
-        status,
-        StatusCode::BAD_GATEWAY,
-        "a reference image failure is a platform-side failure: {body}"
-    );
-    assert_eq!(body["error"]["code"].as_str(), Some("platform_unavailable"));
-    assert_public_only("参考图取不到", &body);
-
-    let (job_id, state) = harness.job(&key).await;
-    assert_eq!(
-        state, "failed",
-        "a reference image failure happens before the create request, so the job is simply failed"
-    );
-    // 生成请求根本没发出去。
-    assert_eq!(
-        harness.count("POST", "/v1/images/generations"),
-        0,
-        "the create request must not be sent when the reference image could not be fetched"
-    );
-    // 预授权释放：这台 Job 的 hold 不再是 active。
-    let hold_status: String =
-        sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
-            .bind(job_id)
-            .fetch_one(&harness.pool)
-            .await
-            .expect("the job must have a hold");
-    assert_eq!(
-        hold_status, "released",
-        "a pre-acceptance failure must release the hold"
-    );
     harness.cleanup().await;
 }
 

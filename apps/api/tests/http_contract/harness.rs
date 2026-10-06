@@ -947,13 +947,6 @@ async fn serve_alert(
     socket.write_all(head.as_bytes()).await?;
     socket.flush().await
 }
-fn body_contains_bytes(haystack: &[u8], needle: &[u8]) -> bool {
-    !needle.is_empty()
-        && haystack
-            .windows(needle.len())
-            .any(|window| window == needle)
-}
-
 /// 表单字节里某个**完整部件名**出现的次数。
 ///
 /// 名字连引号一起比：`name="image"` 要求 `image` 后面紧跟着引号，所以列表形态的

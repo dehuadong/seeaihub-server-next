@@ -5,8 +5,8 @@ use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
     AccountingFacts, AdapterDescriptor, AdapterError, DecodedImage, ExecutionContext,
     GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage,
-    ImageAdapter, InputImage, PreparedImageRequest, ProviderCallError, ProviderCost,
-    ProviderCredential, ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTraceId,
+    ImageAdapter, PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential,
+    ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTraceId,
     QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
     decode_data_url, ensure_external_call_allowed, external_call_timeout,
     gateway_passthrough_parameters, is_http_url,
@@ -701,7 +701,7 @@ impl AihubmixImageAdapter {
         credential: &ProviderCredential,
         context: &dyn ExecutionContext,
     ) -> Result<ProviderOutput, AdapterError> {
-        let form = self.gateway_edit_form(input, context).await?;
+        let form = self.gateway_edit_form(input)?;
         ensure_external_call_allowed(context)?;
         // 生成发送的最后资格：与取消线性化。此后到 .send() 之间没有可取消的等待。
         begin_generation_send(context)?;
@@ -718,13 +718,11 @@ impl AihubmixImageAdapter {
     }
 
     /// 组好新入口的编辑表单：部件名取自 [`GatewayInput::image_sites`]，不写死也不读
-    /// `platform_parameters`。一张参考图是单值部件，多张是重复的 `image[]`（与旧入口同一条
-    /// wire 规则）。
-    async fn gateway_edit_form(
-        &self,
-        input: &GatewayInput,
-        context: &dyn ExecutionContext,
-    ) -> Result<multipart::Form, AdapterError> {
+    /// `platform_parameters`。
+    ///
+    /// 参考图与遮罩**直接传公网 URL 文本**：与 APIMart 一样把 URL 逐字透传，不下载、不上传。
+    /// 一张参考图是单值部件，多张是重复的 `image[]`。
+    fn gateway_edit_form(&self, input: &GatewayInput) -> Result<multipart::Form, AdapterError> {
         let reference_site = input.image_sites.reference.as_ref().ok_or_else(|| {
             AdapterError::UnsupportedInput(
                 "the offering declares no reference image parameter, so the edit endpoint has no \
@@ -752,8 +750,7 @@ impl AihubmixImageAdapter {
             reference_site.parameter.clone()
         };
         for image in &input.reference_images {
-            let bytes = self.gateway_image_bytes(image, context).await?;
-            form = form.part(reference_part.clone(), image_part(bytes)?);
+            form = form.text(reference_part.clone(), image.as_str().to_owned());
         }
         if let Some(mask) = &input.mask {
             let mask_site = input.image_sites.mask.as_ref().ok_or_else(|| {
@@ -763,22 +760,9 @@ impl AihubmixImageAdapter {
                         .to_owned(),
                 )
             })?;
-            let bytes = self.gateway_image_bytes(mask, context).await?;
-            form = form.part(mask_site.parameter.clone(), image_part(bytes)?);
+            form = form.text(mask_site.parameter.clone(), mask.as_str().to_owned());
         }
         Ok(form)
-    }
-
-    /// 一份输入图取成字节：公网 URL 在自己下载前先过取消/期限闸，单次超时取 min(自身配置,
-    /// 总期限剩余)。字节不落盘（RFC 0017 §2、§6）。
-    async fn gateway_image_bytes(
-        &self,
-        image: &InputImage,
-        context: &dyn ExecutionContext,
-    ) -> Result<DecodedImage, AdapterError> {
-        ensure_external_call_allowed(context)?;
-        self.download_image_within(image.as_str(), external_call_timeout(self.timeout, context))
-            .await
     }
 }
 

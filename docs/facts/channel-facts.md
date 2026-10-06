@@ -35,7 +35,7 @@
 ### 2.2 参数与取值
 
 - 本平台走 `/v1` 族，**没有 `extra` 这一层**：参数落顶层（出处：`out-reference/aihubmix/schema-gpt-image-2*.endpoints.json` 的 `request.schema`）。
-- 字段面：`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image`、`mask` 只在 edits 端，multipart 里是二进制部件、`format: binary`；generations 端没有这两个字段）。
+- 字段面：`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image`、`mask` 只在 edits 端；generations 端没有这两个字段）。平台按**公网 URL 文本部件**把参考图与遮罩逐字透传，不下载、不上传。机器 Schema 把这两个字段声明成 `format: binary`，与渠道文档通用参数表把 `image` 写成 `string`（"参考图片路径"）冲突；真实上游对 URL 文本部件的接受度待一次计费调用确认。
 - `prompt` 必填、`minLength 1`；2.5 另有 `maxLength 32000`。
 - `n`：`1`–`10`，默认 `1`。
 - `quality`：2.5 两款 `low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）；`gpt-image-2` 只有 `low` / `medium` / `high`（机器 Schema 里没有 `auto`）。
