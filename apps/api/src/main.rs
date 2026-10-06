@@ -2778,9 +2778,9 @@ async fn read_public_document(
     }
     let body = std::fs::read_to_string(public_docs_dir().join(&path))
         .map_err(|error| ApiError::internal(format!("cannot read public-docs/{path}: {error}")))?;
-    // 源码里是相对链接，服务时统一成平台对客基址的绝对地址：与模型说明同一形态（Spec 0008 §3）。
+    // 源码里写 `{{SEE_BASEURL}}/v1/docs/<名>`，服务时代入平台对客基址：与模型说明同一形态（Spec 0008 §3）。
     let body =
-        seeai_application::model_document::rewrite_public_doc_links(&body, &state.see_base_url)?;
+        seeai_application::model_document::render_public_document(&body, &state.see_base_url)?;
     Ok(markdown_response(body))
 }
 

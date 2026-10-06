@@ -12,4 +12,4 @@ Authorization: Bearer YOUR_API_KEY
 
 JSON 图片生成请求还须携带 `Content-Type: application/json`。上传文件时，使用 `multipart/form-data`；使用 `FormData` 或 cURL 的 `-F` 时，由工具自动设置包含 boundary 的请求头。
 
-其他失败参见 [HTTP 状态码和错误处理](http-errors.md)。
+其他失败参见 [HTTP 状态码和错误处理]({{SEE_BASEURL}}/v1/docs/http-errors.md)。

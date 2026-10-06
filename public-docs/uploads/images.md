@@ -54,4 +54,4 @@ curl -X POST "$BASE_URL/v1/uploads/images" \
 | `429` | `rate_limit_exceeded` / `upload_busy` | 按 `Retry-After` 等待后再上传。 |
 | `503` | `upload_storage_unavailable` / `object_store_unavailable` | 上传服务暂不可用；稍后再上传，或使用已有的公网图片 URL。 |
 
-鉴权与其他错误参见 [API Key 鉴权](../authentication.md)和 [HTTP 状态码和错误处理](../http-errors.md)。上传未返回 URL 时，不要把本地文件路径作为图片参数提交。
+鉴权与其他错误参见 [API Key 鉴权]({{SEE_BASEURL}}/v1/docs/authentication.md)和 [HTTP 状态码和错误处理]({{SEE_BASEURL}}/v1/docs/http-errors.md)。上传未返回 URL 时，不要把本地文件路径作为图片参数提交。

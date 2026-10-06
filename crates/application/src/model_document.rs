@@ -69,6 +69,23 @@ pub fn rewrite_public_doc_links(
     Ok(rendered)
 }
 
+/// 把一份公开使用文档的源码变成对客正文：代入 `{{SEE_BASEURL}}`，再把本地链接统一成绝对地址。
+///
+/// 源码里写 `{{SEE_BASEURL}}/v1/docs/<名>`；没有占位符的本地链接也在这里统一成绝对地址。
+pub fn render_public_document(source: &str, base_url: &str) -> Result<String, ApplicationError> {
+    validate_base_url(base_url)?;
+    let substituted = source.replace(BASE_URL_PLACEHOLDER, base_url);
+    if let Some(start) = substituted.find("{{") {
+        let tail = &substituted[start..];
+        let end = tail.find("}}").map(|end| end + 2).unwrap_or(tail.len());
+        return Err(invalid(&format!(
+            "the public usage document leaves an unresolved placeholder {}",
+            &tail[..end]
+        )));
+    }
+    rewrite_public_doc_links(&substituted, base_url)
+}
+
 /// 由同版合同与素材渲染一份模型使用文档。
 pub fn render_model_document(
     contract: &Value,
