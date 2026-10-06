@@ -50,7 +50,7 @@ test('清单只列所选厂商的供给', async ({ request, page }) => {
         offerings: [
           {
             provider_kind: `E2EChannel${vendor}`,
-            adapter_key: 'aihubmix-image-v1',
+            adapter_key: 'apimart-image-v1',
             provider_model_id: `e2e-upstream-${vendor}`,
             base_url: `https://e2e-${vendor}.example.com`,
             credential_env: `E2E_${vendor.toUpperCase()}_KEY`,

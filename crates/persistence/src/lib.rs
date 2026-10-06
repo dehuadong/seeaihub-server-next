@@ -1,3 +1,29 @@
+//! PostgreSQL 持久化实现。本 crate 是全库数据表的唯一写入方；其他 crate 只通过应用层声明的
+//! `HubRepository` / `ExecutionRepository` 端口访问，不直接写 SQL。
+//!
+//! 表与写入方：
+//!
+//! | 表 | 是什么事实 | 写入方 |
+//! | --- | --- | --- |
+//! | `catalog.vendor_models` | 型号的调用方参数合同，随修订不可变 | `RuntimeService::publish` |
+//! | `supply.channels` / `supply.offerings` | 渠道与可售供给，供给上记计价形态与按张 / 按次单价 | `RuntimeService::publish` |
+//! | `pricing.price_plans` | 渠道成本费率（四档 token 单价，币种按该渠道声明） | `RuntimeService::publish` |
+//! | `pricing.fx_rates` | 按币种的折算率与生效时间；外部事实，由管理员录入 | `PricingService::upsert_fx_rate` |
+//! | `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给与档位 / 档内权重、该次发布的定价 | `RuntimeService::publish` |
+//! | `routing.route_policies` | 路由策略；运行期配置，不进不可变修订 | `RoutePolicyService::upsert` |
+//! | `publication.gateway_models` | 网关模型的运维开关；定义只在不可变修订里 | `RuntimeService::publish`、`set_gateway_model_enabled` |
+//! | `generation.jobs` | 受理时的请求摘要与分支、所选供给、冻结的定价快照、产出张数与终态时刻、对客错误码，以及执行所有权与租约 | `ExecutionRepository` 的 `admit` / `begin_submission` / `record_acceptance` / `settle` / `fail_or_reconcile` / `refund_reconciliation` / `renew_execution_ownership` / `takeover_expired_executions` / `reap_unsubmitted_admissions` |
+//! | `generation.routing_decisions` | 受理时为什么选了它：候选、档位、权重、是否合格与分流落点 | 与 Job 同事务写入 |
+//! | `generation.attempts` | 一次执行尝试的阶段、对账标识、计量证据与渠道成本事实 | `ExecutionRepository` 的 `begin_submission` / `record_acceptance` / `settle` / `fail_or_reconcile` / `record_terminal_provider_cost` |
+//! | `generation.execution_capacity` | 渠道全局未决任务槽位；账户执行名额不在此表 | `ExecutionRepository` 的 `admit`、确定终态时释放、`reap_unsubmitted_admissions` 回收孤儿 |
+//! | `generation.late_facts` | 晚到事实收件箱：原提交者在执行 token 失效后交付的有界事实 | `ExecutionRepository` 的 `offer_late_facts` / `claim_unconsumed_late_facts` / `mark_late_fact_consumed` |
+//! | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 已结算余额、占用、预授权与账目；账户分消费者与平台两类 | `ExecutionRepository` 的 `admit` / `settle` / `fail_or_reconcile` / `refund_reconciliation` |
+//! | `ledger.daily_spend` | 每账户每 UTC 自然日一行的已完成实收合计，每日消费限额的判据 | `ExecutionRepository::settle` |
+//! | `identity.api_keys` | API Key 摘要 | `IdentityService` |
+//! | `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载缓存对账发现的覆盖） | `ExecutionRepository::fail_or_reconcile`、`ReconciliationService`、`AccelerationService`、`LedgerAuditor` |
+//!
+//! 各表字段的语义与规则不在这里重复：它们由 Spec 与设计文档拥有。
+
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
@@ -1046,6 +1072,7 @@ impl HubRepository for PgHubRepository {
                     formula: row.try_get("formula").map_err(database_error)?,
                     // 驱动器的事实，仓库读不出来：由应用层按该 `adapter_key` 的声明覆盖。
                     declares_cost: false,
+                    provides_token_usage: false,
                     cost_currency,
                     cost_rates,
                     enabled: row.try_get("enabled").map_err(database_error)?,

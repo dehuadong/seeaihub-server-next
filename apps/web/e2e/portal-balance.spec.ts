@@ -64,8 +64,8 @@ async function publishHoldFixture(
       },
       offerings: [
         {
-          provider_kind: 'AIHubMix',
-          adapter_key: 'aihubmix-image-v1',
+          provider_kind: 'APIMart',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: 'e2e-settled-upstream',
           // 没有 Worker，这个地址一次都不会被访问；受理只用保底表。
           base_url: 'http://127.0.0.1:1',

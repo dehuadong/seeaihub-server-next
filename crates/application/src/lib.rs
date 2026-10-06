@@ -5932,11 +5932,16 @@ impl RuntimeService {
         let mut offerings = self.repository.selectable_offerings().await?;
         for offering in &mut offerings {
             // 渠道能力是**驱动器的事实**，不是仓库能读出来的：能不能声明金额，决定"上游声明金额 ×
-            // 倍率"这条对客形态在这条通路上成不成立。界面据此过滤下拉，发布期据此拒绝。
+            // 倍率"这条对客形态在这条通路上成不成立；给不给四分项用量，决定"按 token 四档"成不成立。
+            // 界面据此过滤下拉，发布期据此拒绝。
             offering.declares_cost = self
                 .adapters
                 .descriptor(&offering.adapter_key)
                 .is_some_and(|descriptor| descriptor.declares_cost);
+            offering.provides_token_usage = self
+                .adapters
+                .descriptor(&offering.adapter_key)
+                .is_some_and(|descriptor| descriptor.provides_token_usage);
         }
         Ok(offerings)
     }
@@ -6412,6 +6417,11 @@ pub struct SelectableOfferingView {
     /// 它决定"上游声明金额 × 倍率"这条对客形态在这条通路上成不成立：界面据此过滤下拉、发布期据此
     /// 拒绝。由应用层按驱动器声明填——仓库不认识驱动器。
     pub declares_cost: bool,
+    /// 这条通路的驱动器**给不给四分项用量**（`AdapterDescriptor::provides_token_usage`）。
+    ///
+    /// 它决定"按 token 四档"这条对客形态在这条通路上成不成立：给不出用量就算不出对客价。同样由
+    /// 应用层按驱动器声明填。
+    pub provides_token_usage: bool,
     /// 渠道成本币种与 `token_rates` 的四档费率（别的形态没有费率）。
     pub cost_currency: Option<String>,
     pub cost_rates: Option<PricePlanRates>,

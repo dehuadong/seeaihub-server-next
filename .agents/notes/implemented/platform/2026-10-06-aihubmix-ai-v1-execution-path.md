@@ -28,7 +28,7 @@ AIHubMix 一族的图片执行全部改走 `POST /ai/v1/images/generations`，**
 
 同一次变更把结算闸门按 ADR 0006 的原文对齐：那条 ADR 早已写明"计量形态跟着渠道的计费方式走——直接声明金额就用那句金额"，而代码此前要求成功件必须有 token 分项。现在**声明了成本的渠道允许成功件没有 token 分项**，计量依据就是那句声明金额；按 token 计价的算式拿到没有 evidence 的成功件时明确失败（`DomainError::MissingMeteringEvidence`），不按 0 结算。
 
-配套的发布期把关落在驱动器能力上（`AdapterDescriptor::provides_token_usage`）：这条通路只声明金额、给不出四分项用量，对客选 `token_rates` 的候选发布期就拒并点名，不等到每一笔请求都落进对账。同一处也守另一条：声明 `upstream_declared` 的候选要求通路真的会把金额交回来。
+配套的发布期把关落在驱动器能力上（`AdapterDescriptor::provides_token_usage`）：这条通路只声明金额、给不出四分项用量，对客选 `token_rates` 的候选发布期就拒并点名，不等到每一笔请求都落进对账。同一处也守另一条：声明 `upstream_declared` 的候选要求通路真的会把金额交回来。这两条能力随运营的可选清单一起回给界面（`SelectableOfferingView` 的 `declares_cost` 与 `provides_token_usage`），发布页的对客形态下拉据此只摆这条通路算得出的那一种。
 
 ## 备选方案
 

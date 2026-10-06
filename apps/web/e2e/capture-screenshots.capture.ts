@@ -120,7 +120,7 @@ async function publishCaptureFixture(request: APIRequestContext): Promise<void> 
       offerings: [
         {
           provider_kind: CAPTURE_CHANNEL,
-          adapter_key: 'aihubmix-image-v1',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: CAPTURE_PROVIDER_MODEL,
           base_url: 'https://shot-placeholder.example.com',
           credential_env: 'SHOT_PLACEHOLDER_KEY',

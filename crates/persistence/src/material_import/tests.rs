@@ -101,22 +101,34 @@ fn the_bootstrap_materials_parse_into_their_offerings() {
     assert_eq!(flare.native_model_id, "gpt-image-2.5-flare");
     assert_eq!(flare.model_type.as_deref(), Some("image"));
     assert_eq!(flare.offerings.len(), 2);
-    // 两种计价形态各一条：AIHubMix 按 token 计量量、APIMart 由上游直接给金额。
-    assert_eq!(flare.offerings[0].formula, PricingFormula::TokenRates);
-    assert!(
-        flare.offerings[0].price_plan.is_some(),
-        "token_rates carries the four-tier rates"
-    );
-    assert_eq!(flare.offerings[1].formula, PricingFormula::UpstreamDeclared);
-    assert!(
-        flare.offerings[1].price_plan.is_none(),
-        "upstream_declared has no price plan"
-    );
+    // 两家渠道都按上游声明的金额计价：AIHubMix 只回金额、不给 token 分项；APIMart 同样由上游给金额。
+    for offering in &flare.offerings {
+        assert_eq!(offering.formula, PricingFormula::UpstreamDeclared);
+        assert!(
+            offering.price_plan.is_none(),
+            "upstream_declared has no price plan"
+        );
+    }
     // 参考图的限制必须与承载面的形态一致，这条是发布期的判据；导入照抄，不做二次推导。
     assert_eq!(flare.offerings[0].restrictions["max_reference_images"], 16);
+    // AIHubMix 走 `/ai/v1`：参考图是字符串数组（`images`）、模型专属字段落 `extra` 容器；
+    // 对客的 `image` 由映射改名成线上名 `images`。
     assert_eq!(
-        flare.offerings[0].carrier_schema["properties"]["image"]["maxItems"],
+        flare.offerings[0].carrier_schema["properties"]["images"]["maxItems"],
         16
+    );
+    assert!(
+        flare.offerings[0].carrier_schema["properties"]["extra"].is_object(),
+        "the model-specific fields live in the extra container"
+    );
+    assert_eq!(
+        flare.offerings[0].parameter_mapping["rename"]["image"],
+        "images"
+    );
+    // APIMart 的承载面用它自己的原生名，同样靠映射接过去。
+    assert_eq!(
+        flare.offerings[1].parameter_mapping["rename"]["image"],
+        "image_urls"
     );
 
     let sunburst = parse("gpt-image-2.5-sunburst.json");

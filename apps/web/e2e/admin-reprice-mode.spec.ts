@@ -48,7 +48,7 @@ test('改价：界面不出现渠道地址与凭证变量名，发布后仍指�
       offerings: [
         {
           provider_kind: 'E2EChannel',
-          adapter_key: 'aihubmix-image-v1',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: 'e2e-reprice-upstream',
           base_url: 'http://127.0.0.1:9/stub',
           credential_env: 'E2E_DUMMY_KEY',

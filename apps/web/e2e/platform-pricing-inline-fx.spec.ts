@@ -45,7 +45,7 @@ test('缺折算率时在定价处当场录，录完立刻出人民币价', async
       offerings: [
         {
           provider_kind: 'E2EInlineFx',
-          adapter_key: 'aihubmix-image-v1',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: 'e2e-inline-fx-upstream',
           base_url: 'https://e2e-inline-fx.example.com',
           credential_env: 'E2E_INLINE_FX_KEY',

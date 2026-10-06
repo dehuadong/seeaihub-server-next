@@ -3084,11 +3084,11 @@ async fn a_token_priced_form_requires_a_channel_that_provides_token_usage() {
     harness.cleanup().await;
 }
 
-/// **清单里带"这条通路会不会声明金额"**（`declares_cost`）：它决定"上游声明金额 × 倍率"这条对客
-/// 形态成不成立——界面据此过滤下拉、发布期据此拒绝。
+/// **清单里带两条渠道能力**（`declares_cost` 与 `provides_token_usage`）：它们分别决定"上游声明金额
+/// × 倍率"与"按 token 四档"这两条对客形态成不成立——界面据此过滤下拉、发布期据此拒绝。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn the_offering_list_reports_whether_the_channel_declares_a_cost() {
+async fn the_offering_list_reports_the_channel_capabilities() {
     let (database_url, database_name) = isolated_database_url().await;
     let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
     let client = Client::new();
@@ -3151,16 +3151,27 @@ async fn the_offering_list_reports_whether_the_channel_declares_a_cost() {
             .unwrap_or_else(|| panic!("{model} 应当在清单里：{body}"))
             .clone()
     };
-    // 两家都声明金额：AIHubMix 的 `/ai/v1` 任务终态给 `usage.cost`，APIMart 的终态给 `cost`。
+    // 两家都声明金额（AIHubMix 的任务终态给 `usage.cost`，APIMart 的终态给 `cost`），
+    // 但只有 APIMart 给得出四分项用量：AIHubMix 的 `/ai/v1` 成功件没有 token 分项。
     assert_eq!(
         find("token-model")["declares_cost"],
         json!(true),
         "APIMart 的终态给实扣金额"
     );
     assert_eq!(
+        find("token-model")["provides_token_usage"],
+        json!(true),
+        "APIMart 回四分项用量"
+    );
+    assert_eq!(
         find("declared-model")["declares_cost"],
         json!(true),
-        "APIMart 的终态带 cost"
+        "AIHubMix 的终态带 usage.cost"
+    );
+    assert_eq!(
+        find("declared-model")["provides_token_usage"],
+        json!(false),
+        "AIHubMix 的成功件没有 token 分项"
     );
 
     drop_isolated_database(&database_name).await;

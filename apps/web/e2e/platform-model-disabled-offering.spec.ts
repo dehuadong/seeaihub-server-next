@@ -49,7 +49,7 @@ test('停用的供给在清单里标明不能选，而不是消失', async ({ re
       offerings: [
         {
           provider_kind: channel,
-          adapter_key: 'aihubmix-image-v1',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: 'e2e-disabled-upstream',
           base_url: 'https://e2e-disabled.example.com',
           credential_env: 'E2E_DISABLED_KEY',

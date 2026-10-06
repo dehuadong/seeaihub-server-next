@@ -74,6 +74,9 @@ export interface SelectableOffering {
   /// 这条通路的驱动器**会不会从上游响应里取到金额**。它决定"上游声明金额 × 倍率"这条对客形态
   /// 在这条通路上成不成立——界面据此过滤下拉（发布期同样据此拒绝）。
   declares_cost: boolean;
+  /// 这条通路的驱动器**给不给四分项用量**。它决定"按 token 四档"这条对客形态在这条通路上
+  /// 成不成立：给不出用量就算不出对客价（界面据此过滤下拉，发布期同样据此拒绝）。
+  provides_token_usage: boolean;
   /// 渠道成本币种与四档费率（`token_rates` 才有费率）。
   cost_currency: string | null;
   cost_rates: {

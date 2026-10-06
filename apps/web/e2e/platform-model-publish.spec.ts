@@ -53,7 +53,7 @@ test('选厂商、勾供给、给价，发布一个平台模型', async ({ reque
       offerings: [
         {
           provider_kind: 'E2EChannel',
-          adapter_key: 'aihubmix-image-v1',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: 'e2e-upstream-model',
           base_url: 'https://e2e-do-not-show.example.com',
           credential_env: 'E2E_DO_NOT_SHOW_KEY',

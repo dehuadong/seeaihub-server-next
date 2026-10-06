@@ -97,7 +97,7 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 
 渠道三要素、驱动器、供应商模型名、承载面、参数映射、限制**不再出现在命令里**：由被引用的 Offering 决定，发布期从库里取，取不到或被停用就拒绝并点名是哪一条。
 
-**发布期还校验渠道能力**：声明"上游给金额"的候选（成本形态或对客形态是 `upstream_declared`）要求这条 Offering 的驱动器 `AdapterDescriptor::declares_cost` 为真，即上游响应里真的会带金额。这条能力随可选清单一起回给界面（`SelectableOfferingView::declares_cost`），对客形态的下拉据此过滤——给不出的形态不摆出来，不让运营选一个发不出去的东西。AIHubMix 只回四分项 `usage`、金额由平台按费率自算；APIMart 的终态另带 `cost`。把形态写反了就在这里点名驱动器拒绝，不等到受理或结算才发现收不到金额。
+**发布期还校验渠道能力**：对客形态选"上游声明金额 × 倍率"的候选（成本形态或对客形态是 `upstream_declared`）要求这条 Offering 的驱动器 `AdapterDescriptor::declares_cost` 为真，即上游响应里真的会带金额；对客形态选"按 token 四档"的候选要求 `provides_token_usage` 为真，即成功件真的给得出四分项用量——给不出就算不出对客价。两条能力随可选清单一起回给界面（`SelectableOfferingView::declares_cost` 与 `provides_token_usage`），对客形态的下拉据此过滤：给不出的形态不摆出来，不让运营选一个发不出去的东西。各条渠道给什么以 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 为准（AIHubMix 走 `/ai/v1` 同步，只回上游声明的 `usage.cost`、没有 token 分项；APIMart 回四分项用量）。把形态写反了就在这里点名驱动器拒绝，不等到受理或结算才发现收不到金额。
 
 命令仍保持"完整、有序的候选集合"这条性质（`ADR-0009`）：运营提交的是他这次要的**那组 Offering 引用**，原子替换的是这组引用与它们的价。
 

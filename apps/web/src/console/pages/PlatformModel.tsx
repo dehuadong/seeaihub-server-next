@@ -31,16 +31,25 @@ function parseConsumerFormula(value: string | null | undefined): ConsumerFormula
   return value === 'token_rates' || value === 'upstream_declared' ? value : null;
 }
 
-/// 这条通路**允许**的对客计价形态。按 token 四档总是可以（两家渠道都回四分项用量）；
-/// "上游声明金额 × 倍率"要求驱动器会从上游响应里取到金额——取不到就不该让运营选出来（发布期也会拒）。
+/// 这条通路**允许**的对客计价形态——只摆这条通路真能算出来的那一种。
+///
+/// - "按 token 四档"要求驱动器给得出四分项用量（`provides_token_usage`），否则算不出对客价；
+/// - "上游声明金额 × 倍率"要求驱动器会从上游响应里取到金额（`declares_cost`）。
 ///
 /// 判据是**显式的 `false`**：字段缺失（前端与后端版本错位时）按"不确定"处理、两项都留着，
 /// 免得把一个本来能选的形态静默藏掉；真选错了发布期那道校验仍会拒。
-function consumerFormulas(declaresCost: boolean | undefined): {
+function consumerFormulas(
+  declaresCost: boolean | undefined,
+  providesTokenUsage: boolean | undefined,
+): {
   value: ConsumerFormula;
   label: string;
 }[] {
-  return CONSUMER_FORMULAS.filter((item) => item.value === 'token_rates' || declaresCost !== false);
+  return CONSUMER_FORMULAS.filter(
+    (item) =>
+      (item.value === 'token_rates' && providesTokenUsage !== false) ||
+      (item.value === 'upstream_declared' && declaresCost !== false),
+  );
 }
 
 /// 微单位 ↔ 原币种金额：库里存的是微单位（`5000000` = $5／每 1M token），给运营看与填的是**原币种
@@ -225,6 +234,7 @@ export function PlatformModelPanel({
             // 这条供给不在可选清单里（已删/停用）时查不到驱动器声明；对**已发布**的候选取宽松值，
             // 免得把已经发出去的"上游声明金额"形态在改价时藏掉。
             declares_cost: true,
+            provides_token_usage: true,
             cost_currency: candidate.cost_currency,
             cost_rates: null,
             enabled: candidate.enabled,
@@ -488,16 +498,18 @@ export function PlatformModelPanel({
                           data-testid={`platform-consumer-form-${offering.provider_kind}-${offering.provider_model_id}`}
                           style={{ minWidth: 200 }}
                           value={picked.consumerFormula}
-                          options={consumerFormulas(offering.declares_cost)}
+                          options={consumerFormulas(offering.declares_cost, offering.provides_token_usage)}
                           onChange={(value: ConsumerFormula) =>
                             patch(offering.offering_id, { consumerFormula: value })
                           }
                         />
                         <Typography.Text type="secondary">
                           与成本形态（{offering.formula}）相互独立：成本怎么算由渠道定，对客怎么收你定。
-                          {offering.declares_cost
-                            ? ''
-                            : '这条通路只回用量、不给金额，所以对客只能按 token 四档。'}
+                          {offering.provides_token_usage === false
+                            ? '这条通路只回金额、不给用量，所以对客只能按上游声明金额 × 倍率。'
+                            : offering.declares_cost === false
+                              ? '这条通路只回用量、不给金额，所以对客只能按 token 四档。'
+                              : ''}
                         </Typography.Text>
                       </Flex>
 

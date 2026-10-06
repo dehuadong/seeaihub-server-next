@@ -46,7 +46,7 @@ test('展开候选显示对客计价形态：按 token 四档与上游声明金�
       offerings: [
         {
           provider_kind: 'E2EToken',
-          adapter_key: 'aihubmix-image-v1',
+          adapter_key: 'apimart-image-v1',
           provider_model_id: 'e2e-candidate-token',
           base_url: 'https://e2e-token.example.com',
           credential_env: 'E2E_TOKEN_KEY',
@@ -72,8 +72,8 @@ test('展开候选显示对客计价形态：按 token 四档与上游声明金�
           cost_currency: 'USD',
         },
         {
-          provider_kind: 'APIMart',
-          adapter_key: 'apimart-image-v1',
+        provider_kind: 'AIHubMix',
+          adapter_key: 'aihubmix-image-v1',
           provider_model_id: 'e2e-candidate-declared',
           base_url: 'https://e2e-declared.example.com',
           credential_env: 'E2E_DECLARED_KEY',
