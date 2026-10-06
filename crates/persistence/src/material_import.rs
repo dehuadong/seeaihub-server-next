@@ -46,6 +46,9 @@ pub const PUBLIC_DOCS_DIR_ENV: &str = "PUBLIC_DOCS_DIR";
 /// 公开文档目录的默认值。仓库、systemd 部署与 Docker 镜像都把 `public-docs` 放在工作目录下。
 pub const DEFAULT_PUBLIC_DOCS_DIR: &str = "public-docs";
 
+/// 导入期校验素材时用的占位基址：导入只验结构，真实对客基址在**发布时**代入正文。
+const IMPORT_VALIDATION_BASE_URL: &str = "http://import.invalid";
+
 /// 素材没写 `actor` 时，价目表那行的来源标注。
 const DEFAULT_ACTOR: &str = "supply-material-import";
 
@@ -156,6 +159,7 @@ async fn import_material(
         &material.vendor_id,
         model_type,
         &material.native_revision,
+        IMPORT_VALIDATION_BASE_URL,
         &documentation,
     )?;
     upsert_model_document_material(&mut tx, vendor_model_id, &documentation).await?;

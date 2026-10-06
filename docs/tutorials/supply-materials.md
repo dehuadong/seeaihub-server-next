@@ -55,4 +55,4 @@ CREATE DATABASE seeai_next;
 启动日志里 `supply materials imported` 带 `materials` / `offerings` / `price_plans` 三个计数（没有素材可导时不出这条），随后 `api listening` 带 `bind`。导入之后确认对客面：
 
 - `GET /v1/models`：当前可调用模型的 `revision` 与 `documentation_url` 都是这次发布的那一份。
-- `GET /v1/models/{name}/llms.txt`：参数表与正文来自同版合同；只改文案时，旧文档地址仍返回旧正文。
+- `GET /v1/models/{name}/llms.txt`：参数表与正文来自同版合同；正文里的链接是 `SEE_BASEURL` 的绝对地址（API 的必填配置，[配置项](../operations/configuration.md#1-进程与连接)）；只改文案时，旧文档地址仍返回旧正文。

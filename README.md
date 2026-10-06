@@ -44,7 +44,7 @@ cargo run -p seeai-api
 cargo run -p seeai-worker            # 另开一个终端
 ```
 
-进程启动时会自己载入 `.env`（`dotenvy`，从当前工作目录往上找，且**不覆盖**已有的环境变量），所以在仓库根 `cp .env.example .env` 之后直接 `cargo run` 就行，不用手动 `set -a`。两个进程都要有 `DATABASE_URL`；API 还要 `ADMIN_TOKEN`（**必填，为空起不来**）与 `ADMIN_EMAIL` / `ADMIN_PASSWORD`（用来建/更新那个管理员账号）。
+进程启动时会自己载入 `.env`（`dotenvy`，从当前工作目录往上找，且**不覆盖**已有的环境变量），所以在仓库根 `cp .env.example .env` 之后直接 `cargo run` 就行，不用手动 `set -a`。两个进程都要有 `DATABASE_URL`；API 还要 `ADMIN_TOKEN`、`SEE_BASEURL`（都是**必填，缺了起不来**）与 `ADMIN_EMAIL` / `ADMIN_PASSWORD`（用来建/更新那个管理员账号）。`SEE_BASEURL` 是平台对客基址，模型说明与公共文档的链接按它写成绝对地址。
 
 前端产物那一步**不能省**：API 只在 `apps/web/dist` 存在时才托管界面（它按编译期路径找），否则 API 与 `/v1/*` 都正常、但浏览器打不开界面。
 

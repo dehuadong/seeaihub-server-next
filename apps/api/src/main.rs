@@ -163,6 +163,8 @@ struct AppState {
     history_cursor_key: [u8; HISTORY_CURSOR_KEY_LEN],
     /// 公开鉴权端点来源维采信的受信头（`AUTH_SOURCE_HEADER`）；不设时退回连接对端地址。
     auth_source_header: Option<header::HeaderName>,
+    /// 平台对客基址（`SEE_BASEURL`）：公共使用文档的链接按它写成绝对地址。
+    see_base_url: String,
 }
 
 impl AppState {
@@ -239,6 +241,10 @@ async fn main() -> Result<()> {
         .parse()
         .context("API_BIND must be a socket address")?;
     let admin_token: Arc<str> = Arc::from(required_env("ADMIN_TOKEN")?);
+    // 平台对客基址：模型说明与公共文档的链接按它写成绝对地址。它是**部署期**事实——发布走管理端
+    // 主机、读取走对客主机，从请求头取会把管理端地址写进不可变版本，所以必须显式配置、启动即校验。
+    let see_base_url = required_env("SEE_BASEURL")?;
+    seeai_application::model_document::validate_base_url(&see_base_url)?;
     let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
     repository.migrate().await?;
     // 供给素材的幂等导入（**工程侧**的动作）：渠道与 Offering 的来源是工程师写的素材。目录由
@@ -506,7 +512,7 @@ async fn main() -> Result<()> {
         identity: IdentityService::new(repository_port.clone())
             .with_rate_limit(acceleration.clone(), generation_rate_limit()?)
             .with_auth_attempt_limits(AuthAttemptLimits::from_env()?),
-        runtime: RuntimeService::new(repository_port.clone(), adapters)
+        runtime: RuntimeService::new(repository_port.clone(), adapters, see_base_url.clone())
             .with_acceleration(acceleration.clone())
             .with_cost_ceiling(cost_ceiling()?),
         reconciliation: ReconciliationService::new(repository_port.clone())
@@ -522,6 +528,7 @@ async fn main() -> Result<()> {
         password_reset_ttl: password_reset_ttl()?,
         history_cursor_key: history_cursor_key()?,
         auth_source_header: auth_source_header()?,
+        see_base_url,
         direct: direct_execution.clone(),
         upload: upload.clone(),
     };
@@ -2763,16 +2770,17 @@ async fn read_model_document(
 /// 清单只有一份属主（
 /// [`seeai_application::model_document::PUBLIC_DOCUMENTS`]）：加第四份文档改那里，改这里会漂移。
 async fn read_public_document(
+    State(state): State<AppState>,
     Path(path): Path<String>,
 ) -> Result<axum::response::Response, ApiError> {
-    if !seeai_application::model_document::PUBLIC_DOCUMENTS
-        .iter()
-        .any(|(name, _)| *name == path)
-    {
+    if !seeai_application::model_document::PUBLIC_DOCUMENTS.contains(&path.as_str()) {
         return Err(ApiError::not_found("no such public document"));
     }
     let body = std::fs::read_to_string(public_docs_dir().join(&path))
         .map_err(|error| ApiError::internal(format!("cannot read public-docs/{path}: {error}")))?;
+    // 源码里是相对链接，服务时统一成平台对客基址的绝对地址：与模型说明同一形态（Spec 0008 §3）。
+    let body =
+        seeai_application::model_document::rewrite_public_doc_links(&body, &state.see_base_url)?;
     Ok(markdown_response(body))
 }
 

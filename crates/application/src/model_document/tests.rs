@@ -1,6 +1,9 @@
 use super::*;
 use serde_json::json;
 
+/// 平台对客基址：正文里的链接与 `{{SEE_BASEURL}}` 都按它写成绝对地址。
+const BASE_URL: &str = "http://api.test";
+
 fn contract() -> Value {
     json!({
         "type": "object",
@@ -37,6 +40,7 @@ fn render(material: &Value) -> Result<String, ApplicationError> {
         "OpenAI",
         "image",
         "r1",
+        BASE_URL,
         material,
     )
 }
@@ -59,9 +63,51 @@ fn renders_the_contract_and_the_public_links() {
     // 组合约束以结构描述 + 素材原义出现。
     assert!(body.contains("组合约束"), "{body}");
     assert!(body.contains("遮罩必须同时给参考图。"), "{body}");
-    // 公共文档链接转成同源地址。
-    assert!(body.contains("/v1/docs/authentication.md"), "{body}");
+    // 公共文档链接统一成平台对客基址的绝对地址。
+    assert!(
+        body.contains("http://api.test/v1/docs/authentication.md"),
+        "{body}"
+    );
     assert!(!body.contains("../../"), "{body}");
+}
+
+#[test]
+fn substitutes_the_platform_base_url_and_rejects_a_bad_one() {
+    let mut with_placeholder = material();
+    with_placeholder["narrative"] = json!(
+        "# {{platform_name}}\n\n调用 {{SEE_BASEURL}}/v1/images/generations。\n\n{{parameter_table}}\n"
+    );
+    let body = render(&with_placeholder).expect("the material renders");
+    assert!(
+        body.contains("调用 http://api.test/v1/images/generations"),
+        "{body}"
+    );
+    assert!(!body.contains(BASE_URL_PLACEHOLDER), "{body}");
+
+    let contract = contract();
+    let error = render_model_document(
+        &contract,
+        "platform-name",
+        "OpenAI",
+        "image",
+        "r1",
+        "api.test",
+        &material(),
+    )
+    .expect_err("a base url without a scheme is rejected");
+    assert!(error.to_string().contains("SEE_BASEURL"), "{error}");
+
+    let error = render_model_document(
+        &contract,
+        "platform-name",
+        "OpenAI",
+        "image",
+        "r1",
+        "http://api.test/",
+        &material(),
+    )
+    .expect_err("a base url with a trailing slash is rejected");
+    assert!(error.to_string().contains("trailing slash"), "{error}");
 }
 
 #[test]
@@ -146,6 +192,7 @@ fn renders_nested_limits_and_combination_values() {
         "OpenAI",
         "image",
         "r1",
+        BASE_URL,
         &material,
     )
     .expect("the material renders");
@@ -168,6 +215,7 @@ fn image_video_and_chat_documents_keep_their_identity() {
             vendor_id,
             model_type,
             "r1",
+            BASE_URL,
             &material(),
         )
         .expect("the material renders")

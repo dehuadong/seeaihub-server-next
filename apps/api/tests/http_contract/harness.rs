@@ -1117,6 +1117,7 @@ fn api_probe_command(database_url: &str, port: u16, admin_token: &str) -> Comman
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", admin_token)
+        .env("SEE_BASEURL", "http://api.contract.test")
         .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
         .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
         .env("PROVIDER_TIMEOUT_SECONDS", "30")
@@ -1207,6 +1208,7 @@ async fn probe_api_startup_with_cursor_key(
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", "cursor-key-probe-token")
+        .env("SEE_BASEURL", "http://api.contract.test")
         .env("ADMIN_EMAIL", "cursor-key-probe@example.com")
         .env("ADMIN_PASSWORD", "a-long-enough-password")
         .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
@@ -1246,6 +1248,7 @@ async fn probe_api_startup_with_execution_capacity(
         .env("DATABASE_URL", database_url)
         .env("API_BIND", format!("127.0.0.1:{port}"))
         .env("ADMIN_TOKEN", "capacity-probe-token")
+        .env("SEE_BASEURL", "http://api.contract.test")
         .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
         // 供给素材的导入与这条判据无关，显式关掉，探针只探容量组合。
         .env("SUPPLY_MATERIAL_DIR", "")
@@ -1499,6 +1502,7 @@ async fn start_api_with(
             .env("DATABASE_URL", database_url)
             .env("API_BIND", format!("127.0.0.1:{port}"))
             .env("ADMIN_TOKEN", &admin_token)
+            .env("SEE_BASEURL", "http://api.contract.test")
             // 客户历史游标密钥是**必须配**的（生产缺了进程起不来），夹具也给一份固定的 32 字节。
             .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
             // **显式不导入供给素材**：每个用例的库是空的、夹具自己造；不设的话默认值

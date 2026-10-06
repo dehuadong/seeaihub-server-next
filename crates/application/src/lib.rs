@@ -5505,17 +5505,25 @@ pub struct RuntimeService {
     acceleration: Arc<AccelerationService>,
     /// 成本护栏：单次请求可能花掉的上游成本上限（运营取值，与受理侧**同一个数**）。
     cost_ceiling: RequestCostCeiling,
+    /// 平台对客基址：模型说明里的链接与示例按它写成绝对地址。它在**发布时**代入，所以取值必须在
+    /// 发布之前定好；正文里存的是代入后的最终地址。
+    public_base_url: String,
 }
 
 impl RuntimeService {
     #[must_use]
-    pub fn new(repository: Arc<dyn HubRepository>, adapters: Arc<dyn AdapterFactory>) -> Self {
+    pub fn new(
+        repository: Arc<dyn HubRepository>,
+        adapters: Arc<dyn AdapterFactory>,
+        public_base_url: String,
+    ) -> Self {
         let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
         Self {
             repository,
             adapters,
             acceleration,
             cost_ceiling: RequestCostCeiling::default_ceiling(),
+            public_base_url,
         }
     }
 
@@ -5628,6 +5636,7 @@ impl RuntimeService {
             vendor_id,
             command.model_type.as_deref().unwrap_or_default(),
             native_revision,
+            &self.public_base_url,
             &material,
         )
     }
@@ -5914,6 +5923,7 @@ impl RuntimeService {
                 &model.vendor_id,
                 &model.model_type,
                 &model.native_revision,
+                &self.public_base_url,
                 &material,
             )?;
             self.repository

@@ -13,16 +13,60 @@ use seeai_domain::replace_contract_model_identity;
 /// 最终正文上限：256 KiB。超限拒绝发布，不截断客户说明。
 pub const MAX_MODEL_DOCUMENT_BYTES: usize = 262_144;
 
-/// 公开使用文档的**名称与公开地址**：渲染器转换链接与 API 提供资源共用这一份清单，
-/// 加第四份只需改这里（Spec 0008 §2）。
-pub const PUBLIC_DOCUMENTS: [(&str, &str); 3] = [
-    ("authentication.md", "/v1/docs/authentication.md"),
-    ("uploads/images.md", "/v1/docs/uploads/images.md"),
-    ("http-errors.md", "/v1/docs/http-errors.md"),
-];
+/// 公开使用文档的**名称**：渲染器转换链接与 API 提供资源共用这一份清单，加第四份只需改这里。
+pub const PUBLIC_DOCUMENTS: [&str; 3] =
+    ["authentication.md", "uploads/images.md", "http-errors.md"];
+
+/// 素材里指代**平台对客基址**的占位符：正文与示例要写绝对地址时用它，发布时由配置代入。
+pub const BASE_URL_PLACEHOLDER: &str = "{{SEE_BASEURL}}";
 
 fn invalid(message: &str) -> ApplicationError {
     ApplicationError::Validation(message.to_owned())
+}
+
+/// 平台对客基址：必须是 http(s) 的源，不带结尾斜杠、查询或片段。
+///
+/// 它在**发布时**代入正文，所以必须是部署期就定好的对客地址；从请求主机取会把管理端主机写进
+/// 不可变版本。
+pub fn validate_base_url(base_url: &str) -> Result<(), ApplicationError> {
+    if !base_url.starts_with("http://") && !base_url.starts_with("https://") {
+        return Err(invalid(&format!(
+            "SEE_BASEURL must be an absolute http(s) origin, got {base_url}"
+        )));
+    }
+    if base_url.ends_with('/') || base_url.contains('?') || base_url.contains('#') {
+        return Err(invalid(&format!(
+            "SEE_BASEURL must not carry a trailing slash, query or fragment, got {base_url}"
+        )));
+    }
+    Ok(())
+}
+
+/// 一份公开使用文档的绝对地址。
+pub fn public_document_url(base_url: &str, name: &str) -> String {
+    format!("{base_url}/v1/docs/{name}")
+}
+
+/// 把正文里的本地链接统一成绝对地址：只允许指向公开使用文档，其余本地/内部路径一律拒绝
+/// （Spec 0008 §1）。素材与公共文档各自按作者写的相对链接书写，这里统一代入平台对客基址；
+/// 已经写死的 http(s) 链接、页内锚点与 `mailto:` 原样保留。
+pub fn rewrite_public_doc_links(
+    markdown: &str,
+    base_url: &str,
+) -> Result<String, ApplicationError> {
+    let mut rendered = String::with_capacity(markdown.len());
+    let mut rest = markdown;
+    while let Some(start) = rest.find("](") {
+        let after = &rest[start + 2..];
+        let Some(end) = after.find(')') else {
+            break;
+        };
+        rendered.push_str(&rest[..start + 2]);
+        rendered.push_str(&public_doc_target(&after[..end], base_url)?);
+        rest = &after[end..];
+    }
+    rendered.push_str(rest);
+    Ok(rendered)
 }
 
 /// 由同版合同与素材渲染一份模型使用文档。
@@ -32,8 +76,10 @@ pub fn render_model_document(
     vendor_id: &str,
     model_type: &str,
     revision: &str,
+    base_url: &str,
     material: &Value,
 ) -> Result<String, ApplicationError> {
+    validate_base_url(base_url)?;
     let narrative = material
         .get("narrative")
         .and_then(Value::as_str)
@@ -109,7 +155,8 @@ pub fn render_model_document(
         .replace("{{platform_name}}", platform_name)
         .replace("{{vendor_id}}", vendor_id)
         .replace("{{model_type}}", model_type)
-        .replace("{{contract_revision}}", revision);
+        .replace("{{contract_revision}}", revision)
+        .replace(BASE_URL_PLACEHOLDER, base_url);
     if let Some(start) = rendered.find("{{") {
         let tail = &rendered[start..];
         let end = tail.find("}}").map(|end| end + 2).unwrap_or(tail.len());
@@ -118,7 +165,7 @@ pub fn render_model_document(
             &tail[..end]
         )));
     }
-    let rendered = public_doc_links(&rendered)?;
+    let rendered = rewrite_public_doc_links(&rendered, base_url)?;
     if rendered.len() > MAX_MODEL_DOCUMENT_BYTES {
         return Err(invalid(&format!(
             "the rendered model document is {} bytes, over the {} byte limit",
@@ -280,25 +327,7 @@ fn requirement(schema: Option<&Value>) -> String {
     parts.join("、")
 }
 
-/// 正文里的本地链接只允许指向三份公共文档；其余本地/内部路径一律拒绝（Spec 0008 §1）。
-fn public_doc_links(narrative: &str) -> Result<String, ApplicationError> {
-    let mut rendered = String::with_capacity(narrative.len());
-    let mut rest = narrative;
-    while let Some(start) = rest.find("](") {
-        let after = &rest[start + 2..];
-        let Some(end) = after.find(')') else {
-            break;
-        };
-        rendered.push_str(&rest[..start + 2]);
-        let target = &after[..end];
-        rendered.push_str(&public_doc_target(target)?);
-        rest = &after[end..];
-    }
-    rendered.push_str(rest);
-    Ok(rendered)
-}
-
-fn public_doc_target(target: &str) -> Result<String, ApplicationError> {
+fn public_doc_target(target: &str, base_url: &str) -> Result<String, ApplicationError> {
     if target.starts_with("http://")
         || target.starts_with("https://")
         || target.starts_with('#')
@@ -307,11 +336,11 @@ fn public_doc_target(target: &str) -> Result<String, ApplicationError> {
         return Ok(target.to_owned());
     }
     let normalized = target.trim_start_matches("./");
-    if let Some((_, url)) = PUBLIC_DOCUMENTS
+    if let Some(name) = PUBLIC_DOCUMENTS
         .iter()
-        .find(|(path, _)| normalized == *path || normalized.ends_with(&format!("/{path}")))
+        .find(|name| normalized == **name || normalized.ends_with(&format!("/{name}")))
     {
-        return Ok((*url).to_owned());
+        return Ok(public_document_url(base_url, name));
     }
     Err(invalid(&format!(
         "the model document links to {target}; only the public usage documents may be linked"

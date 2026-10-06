@@ -145,7 +145,7 @@ sudo cargo build --release -p seeai-api -p seeai-worker
 
 两个进程都用系统用户 `seeai` 跑，工作目录设成构建目录，配置从 `EnvironmentFile` 读。文件是每行 `KEY=VALUE`（systemd 自己解析，不做 shell 展开）。
 
-先建配置目录与两份 env（属服务账号、`600`——里面有口令）。值按[配置项](configuration.md) 换成真实的，`ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。**不必列全**：代码给每个变量都留了缺省，只有**必填**（`DATABASE_URL`、`ADMIN_TOKEN`）和**要覆盖缺省**的项才需要写：
+先建配置目录与两份 env（属服务账号、`600`——里面有口令）。值按[配置项](configuration.md) 换成真实的，`ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。**不必列全**：代码给每个变量都留了缺省，只有**必填**（`DATABASE_URL`、`ADMIN_TOKEN`、`SEE_BASEURL`）和**要覆盖缺省**的项才需要写：
 
 ```sh
 sudo install -d -m 750 -o seeai -g seeai /etc/seeai
@@ -157,6 +157,7 @@ DATABASE_URL=postgres://seeai:<强口令>@127.0.0.1:5432/seeai_next
 ADMIN_TOKEN=<openssl rand -hex 32>
 ADMIN_EMAIL=ops@example.com
 ADMIN_PASSWORD=<强口令>
+SEE_BASEURL=https://app.<域名>
 API_BIND=127.0.0.1:8081
 RUST_LOG=info
 SUPPLY_MATERIAL_DIR=config/bootstrap
@@ -353,6 +354,7 @@ DATABASE_URL=... pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-Reten
 | 端口 | Postgres `5432`、Redis `6379`、API `8081` | 自定；Redis 可选 |
 | 凭证 | 可以留空（不调上游就没用） | 必须是真密钥，按密钥管理 |
 | `ADMIN_TOKEN` | 任意非空 | 强随机、可轮换（§1.4） |
+| `SEE_BASEURL` | 本机 `http://app.localhost:8081` | 对客域名 `https://app.<域名>`，只写源 |
 | 前端产物 | 本机构建后即可 | **必须在构建 API 之前就位**（§1.1） |
 | `CONSOLE_DEV_HOST` | 可用 | **不设**（[进程与连接](configuration.md#1-进程与连接)） |
 | TLS | 不需要 | 反代终止，必须 HTTPS（§1.2） |

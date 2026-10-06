@@ -406,7 +406,11 @@ fn surface() -> Value {
 }
 
 async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFactory>) {
-    let runtime = RuntimeService::new(repository.clone(), factory);
+    let runtime = RuntimeService::new(
+        repository.clone(),
+        factory,
+        "http://api.direct-test".to_owned(),
+    );
     runtime
         .publish(PublishRuntimeCommand {
             vendor_id: Some("fake-vendor".to_owned()),
