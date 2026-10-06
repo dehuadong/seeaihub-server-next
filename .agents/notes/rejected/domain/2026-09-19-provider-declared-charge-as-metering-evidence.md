@@ -2,7 +2,7 @@
 title: 金额型计量证据被否决（原候选决策：Provider 声明的扣费金额作为计量证据）
 status: rejected
 created: 2026-09-19
-updated: 2026-09-23
+updated: 2026-10-06
 approval: 无需批准——该候选决策在其事实前提结清前未获批准，随后被实测否决
 reason: 两家渠道的响应都返回四分项 token，且上游声明的金额无法复现、与按公开费率算出的金额不一致，因此不需要"金额型计量证据"这第二形态
 ---
@@ -43,3 +43,7 @@ reason: 两家渠道的响应都返回四分项 token，且上游声明的金额
 - AIHubMix 的 token 事实来自它 OpenAI 兼容的 `/v1`（同步）。
 
 ⇒ 若将来改用一个拿不到分项 token 的上游面，本条否决**不再自动成立**，需要重新决定证据形态。相关事实见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 端点与响应节；成本口径的决策见 `docs/adr/0016`。
+
+**边界更新（2026-10-06）**：上面那个条件已经出现。AIHubMix 的图片执行改走 `/ai/v1` 之后不再返回任何 token 分项，响应只给上游声明的 `usage.cost`；那条渠道上，金额就是当次唯一的计量依据，处置见[新的记录](../../implemented/platform/2026-10-06-aihubmix-ai-v1-execution-path.md)。
+
+本条**仍然有效**的部分：不把金额当作"第二类 **token** 证据"。声明金额不是另一种用量计数，它有自己的维度——[ADR 0006](../../../../docs/adr/0006-no-settlement-without-metering-evidence.md) 的"计量形态跟着渠道的计费方式走：直接声明金额就用那句金额"就是它的落点。

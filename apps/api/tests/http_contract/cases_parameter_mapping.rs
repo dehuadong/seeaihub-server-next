@@ -209,15 +209,26 @@ async fn a_field_a_carrier_cannot_carry_skips_it_and_fails_platform_side_when_no
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn explicit_defaults_reach_the_upstream_request_body() {
-    // 素材形状照旧（AIHubMix 声明得了 `quality`），只是这条供给挂了一份显式默认值：
-    // 调用方不给 `quality` 时，平台自己发一个 `low`，而不是让上游按它的默认值走。
+    // 模型专属字段在这条渠道上进 `extra` 容器：承载面声明容器，映射把合同的 `quality` 指进去，
+    // 再挂一份显式默认值——调用方不给 `quality` 时，平台自己发一个 `low`，而不是让上游按它的
+    // 默认值走。
     let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
-    draft["capability_schema"]["properties"]["quality"] =
-        json!({"type": "string", "enum": ["low", "high"]});
-    draft["parameter_mapping"] = json!({"defaults": {"quality": "low"}});
+    // 合同（调用方那一侧）仍按顶层字段声明 `quality`；承载面把它收进 `extra`，映射负责落位。
+    // 两条面在这里必须分开给：合同是模型级的，承载面是这条供给的。
+    let mut contract = draft["capability_schema"].clone();
+    contract["properties"]["quality"] = json!({"type": "string", "enum": ["low", "high"]});
+    draft["capability_schema"]["properties"]["extra"] = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {"quality": {"type": "string", "enum": ["low", "high"]}}
+    });
+    draft["parameter_mapping"] = json!({
+        "rename": {"quality": "extra.quality"},
+        "defaults": {"quality": "low"}
+    });
     let harness = Harness::start_with_draft(
         draft,
-        None,
+        Some(contract),
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
     )
@@ -233,7 +244,7 @@ async fn explicit_defaults_reach_the_upstream_request_body() {
     assert_sync_success("显式默认值", &body);
     let submit_body = harness.submit_body("/v1/images/generations");
     assert_eq!(
-        submit_body["quality"], "low",
+        submit_body["extra"]["quality"], "low",
         "默认值必须出现在上游报文里：{submit_body}"
     );
     harness.assert_only_declared_fields(&request);
@@ -248,7 +259,7 @@ async fn explicit_defaults_reach_the_upstream_request_body() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     let submit_body = harness.submit_body("/v1/images/generations");
     assert_eq!(
-        submit_body["quality"], "high",
+        submit_body["extra"]["quality"], "high",
         "调用方给了就用调用方的值：{submit_body}"
     );
     harness.assert_only_declared_fields(&request);
@@ -786,13 +797,22 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
         "prompt": {"type": "string", "minLength": 1},
         "quality": {"type": "string", "enum": ["low", "high"]}
     }));
+    // AIHubMix 把模型专属字段收在 `extra` 容器里：承载面声明容器，映射把合同的 `quality` 指进去。
     let carrier = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1},
+        "extra": {"type": "object", "properties": {"quality": {"type": "string"}}}
+    }));
+    let apimart_carrier = surface_schema(json!({
         "model": {"const": model},
         "prompt": {"type": "string", "minLength": 1},
         "quality": {"type": "string"}
     }));
     // 优先级 0 的候选只把 `high` 映射成线上取值；优先级 1 的候选原样承载取值。
-    let mapped = json!({"enum_map": {"quality": {"high": "xhigh"}}});
+    let mapped = json!({
+        "rename": {"quality": "extra.quality"},
+        "enum_map": {"quality": {"high": "xhigh"}}
+    });
 
     let status = publish_with_mappings(
         &client,
@@ -803,7 +823,7 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
         contract.clone(),
         vec![
             ("aihubmix-image-v1", carrier.clone(), mapped.clone()),
-            ("apimart-image-v1", carrier.clone(), json!({})),
+            ("apimart-image-v1", apimart_carrier.clone(), json!({})),
         ],
     )
     .await;
@@ -1162,38 +1182,37 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
             carriers[0], carriers[1],
             "两条供给各带自己的承载面，不是共用一份"
         );
-        // 承载面按**厂商契约**声明：聚合渠道转售的就是上游模型的能力，因此 AIHubMix 与 APIMart
-        // 一样声明 `background` / `output_compression` / `moderation`，枚举与默认值照厂商契约。
-        // 反过来说，承载面声明了就意味着平台会把字段发出去——渠道不接受是渠道报错，不是平台静默
-        // 把字段吞掉。
+        // 承载面按**厂商契约**声明：模型专属字段在 AIHubMix 上进 `extra` 容器（`/ai/v1` 的顶层
+        // 拒收这些名字），参数映射再把合同字段逐个指进去；APIMart 照旧声明在顶层。承载面声明了
+        // 就意味着平台会把字段发出去——渠道不接受是渠道报错，不是平台静默把字段吞掉。
         for name in ["background", "output_compression", "moderation"] {
             assert!(
-                carriers[0]["properties"].get(name).is_some(),
-                "AIHubMix 的承载面要按厂商契约声明 {name}"
+                carriers[0]["properties"]["extra"]["properties"]
+                    .get(name)
+                    .is_some(),
+                "AIHubMix 的承载面要在 extra 里声明 {name}"
             );
             assert!(
                 carriers[1]["properties"].get(name).is_some(),
                 "APIMart 的承载面声明了 {name}"
             );
         }
+        let extra = &carriers[0]["properties"]["extra"]["properties"];
         assert_eq!(
-            carriers[0]["properties"]["background"]["enum"],
+            extra["background"]["enum"],
             json!(["auto", "opaque", "transparent"]),
             "background 的枚举照厂商契约"
         );
-        assert_eq!(carriers[0]["properties"]["background"]["default"], "auto");
-        assert_eq!(
-            carriers[0]["properties"]["output_compression"]["default"],
-            100
-        );
-        assert_eq!(carriers[0]["properties"]["moderation"]["default"], "auto");
-        // 参考图两边都声明成数组：AIHubMix 按厂商契约的 edit 面（`file[]`，≤16），APIMart 按
+        assert_eq!(extra["background"]["default"], "auto");
+        assert_eq!(extra["output_compression"]["default"], 100);
+        assert_eq!(extra["moderation"]["default"], "auto");
+        // 参考图两边都声明成数组：AIHubMix 按 `/ai/v1` 的媒体引用面（`images`，≤16），APIMart 按
         // 自己的文档（`image_urls`，≤16）——收图上限与这个形态是同一件事，写歪了发布期就拒。
         assert_eq!(
-            carriers[0]["properties"]["image"]["type"], "array",
+            carriers[0]["properties"]["images"]["type"], "array",
             "AIHubMix 的参考图是数组形态"
         );
-        assert_eq!(carriers[0]["properties"]["image"]["maxItems"], 16);
+        assert_eq!(carriers[0]["properties"]["images"]["maxItems"], 16);
         assert_eq!(carriers[1]["properties"]["image_urls"]["maxItems"], 16);
         // 承载面的每个字段名都要能从合同到达：合同直接声明，或被改名接过去（供给不能凭空多出参数）。
         for (index, row) in rows.iter().enumerate() {
@@ -1220,15 +1239,33 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
                 let renamed = wires
                     .iter()
                     .any(|wire| wire.as_str() == Some(name.as_str()));
-                assert!(declared || renamed, "候选 {index} 的 {name} 必须从合同可达");
+                // 容器字段按**成员**判可达：每个成员都要由映射从已声明的合同字段指过来，
+                // 平台侧那条发布校验用的是同一套判据。
+                let container = carrier["properties"][name]
+                    .get("properties")
+                    .and_then(Value::as_object)
+                    .is_some_and(|members| {
+                        !members.is_empty()
+                            && members.keys().all(|member| {
+                                let wire = format!("{name}.{member}");
+                                wires.iter().any(|w| w.as_str() == Some(wire.as_str()))
+                            })
+                    });
+                assert!(
+                    declared || renamed || container,
+                    "候选 {index} 的 {name} 必须从合同可达"
+                );
             }
         }
         // APIMart 的图片字段靠**改名**接到合同字段上（合同叫 image/mask，线上叫 image_urls/mask_url）。
         let aihubmix_mapping: Value = rows[0].try_get("parameter_mapping").expect("mapping");
         assert_eq!(
-            aihubmix_mapping,
-            json!({}),
-            "AIHubMix 与合同同型（size 都是像素型），不需要映射"
+            aihubmix_mapping["rename"]["image"], "images",
+            "AIHubMix 的参考图字段在 `/ai/v1` 上叫 images"
+        );
+        assert_eq!(
+            aihubmix_mapping["rename"]["quality"], "extra.quality",
+            "模型专属字段落进 extra 容器"
         );
         let apimart_mapping: Value = rows[1].try_get("parameter_mapping").expect("mapping");
         assert_eq!(apimart_mapping["rename"]["image"], "image_urls");
@@ -1283,7 +1320,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "两条候选都该合格：{considered:?}"
     );
     assert_eq!(
-        count_calls(&aihubmix_calls, "POST", "/v1/images/generations"),
+        count_calls(&aihubmix_calls, "POST", "/ai/v1/images/generations"),
         1,
         "请求落在 AIHubMix，报文就该发到它的上游"
     );
@@ -1332,16 +1369,17 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
         "两条候选都该合格：{considered:?}"
     );
     let submit = last_submit_body(&aihubmix_calls, "/v1/images/generations");
+    // 模型专属字段在这条渠道上进 `extra` 容器：承载面就这么声明，映射把合同字段指进去。
     assert_eq!(
-        submit["background"], "transparent",
+        submit["extra"]["background"], "transparent",
         "承载得了的字段必须原样上行：{submit}"
     );
     assert_eq!(
         submit["output_format"], "jpeg",
         "合同的组合约束由客户端判，平台不判取值、原样交上游：{submit}"
     );
-    assert_eq!(submit["output_compression"], 80, "{submit}");
-    assert_eq!(submit["moderation"], "low", "{submit}");
+    assert_eq!(submit["extra"]["output_compression"], 80, "{submit}");
+    assert_eq!(submit["extra"]["moderation"], "low", "{submit}");
 
     // ── 收窄素材：把 AIHubMix 这条供给的 `allowed_branches` 收成只允许 `prompt_only` ──
     //

@@ -427,9 +427,9 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
         "apimart-image-v1",
         &["prompt_only", "image_conditioned"],
     );
-    // 映射只覆盖**合同声明过**的字段：顶层合同来自第一条候选（只声明参考图，没有遮罩），
-    // 多映射一个合同里没有的字段会被发布期拒。
-    narrow_second["parameter_mapping"] = json!({"rename": {"image": "image_urls"}});
+    // 映射只覆盖**合同声明过**的字段：顶层合同来自第一条候选（AIHubMix 的线上名：参考图叫
+    // `images`，这条候选只声明参考图、没有遮罩）。APIMart 的承载面用它的原生名，靠改名接过去。
+    narrow_second["parameter_mapping"] = json!({"rename": {"images": "image_urls"}});
     narrow_second["routing_priority"] = json!(1);
     narrow_second["restrictions"] =
         json!({"allowed_branches": ["prompt_only"], "max_reference_images": 0});
@@ -440,7 +440,8 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
         "route-test-1",
         Some(narrow_first["capability_schema"].clone()),
         vec![narrow_first.clone(), narrow_second.clone()],
-        None,
+        // 有候选按上游声明的金额计价，修订级倍率是它的对客价来源。
+        Some(2_000),
     );
     let response = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
@@ -507,7 +508,8 @@ async fn routing_weight_splits_within_a_tier_and_is_replayable() {
         "apimart-image-v1",
         &["prompt_only", "image_conditioned"],
     );
-    heavy_but_ineligible["parameter_mapping"] = json!({"rename": {"image": "image_urls"}});
+    // 顶层合同用 AIHubMix 的线上名（参考图叫 `images`），APIMart 的原生名靠改名接过去。
+    heavy_but_ineligible["parameter_mapping"] = json!({"rename": {"images": "image_urls"}});
     heavy_but_ineligible["routing_priority"] = json!(0);
     heavy_but_ineligible["weight"] = json!(1000);
     heavy_but_ineligible["restrictions"] =

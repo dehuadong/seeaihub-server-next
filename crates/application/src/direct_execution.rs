@@ -18,7 +18,8 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, AdapterError, Deadline, DispatchGate, ExecutionContext,
     ExternalActionRefused, GatewayInput, ImageSite, ImageSites, ImageValueShape, InputImage,
-    ProviderFailureKind, ProviderOutput, ProviderTaskState, ResponsePayload, RetrySafety,
+    ProviderCost, ProviderFailureKind, ProviderOutput, ProviderTaskState, ResponsePayload,
+    RetrySafety,
 };
 use seeai_domain::{
     AccountId, AttemptId, ChargeFacts, ExecutionStage, FencingToken, ImageBranch,
@@ -1080,7 +1081,14 @@ impl DirectExecutionService {
     ) -> Result<DirectExecutionSuccess, DirectExecutionError> {
         let snapshot = &offering.price_snapshot;
         let images = output.response_payload.images.len();
-        let Some(usage) = output.accounting_facts.usage.clone() else {
+        let usage = output.accounting_facts.usage.clone();
+        // 声明了成本的渠道允许成功件没有 token 分项（ADR 0006 的放宽，设计 0022 §5）：计量依据就是
+        // 上游声明的金额。既没有金额、又没有 token 才算证据缺失，转对账。
+        let declared_cost = matches!(
+            output.accounting_facts.provider_cost,
+            ProviderCost::Declared(_)
+        );
+        if usage.is_none() && !declared_cost {
             // 成功但证据缺失：不得按估计收费，转对账（Spec 0005 §5）。
             let provider_cost =
                 failure_provider_cost(snapshot, Some(&output.accounting_facts.provider_cost));
@@ -1134,13 +1142,13 @@ impl DirectExecutionService {
             snapshot,
             &output.accounting_facts.provider_cost,
             CostInputs::Succeeded {
-                usage: &usage,
+                usage: usage.as_ref(),
                 images,
             },
         );
         let charge = snapshot
             .charge_microusd(ChargeFacts {
-                usage: &usage,
+                usage: usage.as_ref(),
                 images,
                 declared_cost_microusd: provider_cost.amount_microusd,
             })

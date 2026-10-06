@@ -562,12 +562,12 @@ impl ExecutionReconciliationService {
             &execution.price_snapshot,
             &facts.provider_cost,
             CostInputs::Succeeded {
-                usage: &usage,
+                usage: Some(&usage),
                 images,
             },
         );
         let charge = execution.price_snapshot.charge_microusd(ChargeFacts {
-            usage: &usage,
+            usage: Some(&usage),
             images,
             declared_cost_microusd: provider_cost.amount_microusd,
         });
@@ -589,7 +589,7 @@ impl ExecutionReconciliationService {
             evidence: MeteringEvidence {
                 attempt_id,
                 provider_response_digest: facts.response_digest.clone(),
-                usage,
+                usage: Some(usage),
             },
             provider_cost,
             charge_microusd,
@@ -816,7 +816,11 @@ impl ExecutionReconciliationService {
                         let images = fact
                             .image_count
                             .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
-                        self_computed_late_cost(&execution.price_snapshot, &evidence.usage, images)
+                        self_computed_late_cost(
+                            &execution.price_snapshot,
+                            evidence.usage.as_ref(),
+                            images,
+                        )
                     }
                     (None, None) => failure_provider_cost(&execution.price_snapshot, None),
                 };
@@ -834,7 +838,11 @@ impl ExecutionReconciliationService {
                         let images = fact
                             .image_count
                             .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
-                        self_computed_late_cost(&execution.price_snapshot, &evidence.usage, images)
+                        self_computed_late_cost(
+                            &execution.price_snapshot,
+                            evidence.usage.as_ref(),
+                            images,
+                        )
                     }
                     (None, None) => failure_provider_cost(&execution.price_snapshot, None),
                 };
@@ -859,11 +867,11 @@ impl ExecutionReconciliationService {
             .map(|count| usize::try_from(count).unwrap_or(usize::MAX));
         let provider_cost = match &fact.provider_cost {
             Some(cost) => cost.clone(),
-            None => self_computed_late_cost(&execution.price_snapshot, &usage, images),
+            None => self_computed_late_cost(&execution.price_snapshot, usage.as_ref(), images),
         };
         // 收件事实带产出张数就用它；不带时按张计价算不出金额，成本落缺口，不拿 0 张顶替。
         let charge = execution.price_snapshot.charge_microusd(ChargeFacts {
-            usage: &usage,
+            usage: usage.as_ref(),
             images: images.unwrap_or(0),
             declared_cost_microusd: provider_cost.amount_microusd,
         });
@@ -1197,7 +1205,7 @@ fn unavailable_provider_cost() -> ProviderCostFact {
 /// 其余形态不依赖张数（token 量、每次单价），按用量或单价算得出。
 fn self_computed_late_cost(
     snapshot: &PriceSnapshot,
-    usage: &TokenUsage,
+    usage: Option<&TokenUsage>,
     images: Option<usize>,
 ) -> ProviderCostFact {
     match snapshot.formula {

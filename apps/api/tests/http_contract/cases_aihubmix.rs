@@ -34,7 +34,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     let reference_url = format!("{}/inputs/ref.png", harness.upstream_base_url);
     let key = format!("sync-url-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "edit with a public url");
-    request["image_urls"] = json!([reference_url.clone()]);
+    request["image"] = json!([reference_url.clone()]);
     let (status, body) = harness
         .sync_json("/v1/images/generations", &key, request.clone())
         .await;
@@ -45,15 +45,11 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
         0,
         "URL 透传：平台不下载参考图"
     );
-    let edits = harness.submit_bytes("/v1/images/edits");
-    let rendered = String::from_utf8_lossy(&edits);
-    assert!(
-        rendered.contains("name=\"image\""),
-        "参考图必须作为 image 部件出现"
-    );
-    assert!(
-        rendered.contains(&reference_url),
-        "参考图的公网 URL 必须逐字进表单：{rendered}"
+    let submitted = harness.submit_body("/ai/v1/images/generations");
+    assert_eq!(
+        submitted["images"],
+        json!([reference_url]),
+        "参考图的公网 URL 必须逐字进请求体：{submitted}"
     );
     // 平台不落盘、不代传：既没下载参考图，也没调用渠道的上传端点。
     assert_eq!(harness.count("POST", "/v1/uploads/images"), 0);
@@ -105,23 +101,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "got {body}");
     assert_eq!(harness.create_calls(), creates_before, "被拒请求不调上游");
 
-    // 5) 同义字段只能给一个；只给遮罩是结构性错误。
-    let key = format!("sync-conflict-{}", Uuid::new_v4());
-    let mut request = route_request(harness.model, "both synonyms");
-    request["image"] = json!(harness.png_url());
-    request["image_urls"] = json!(["https://example.invalid/a.png"]);
-    let (status, body) = post_json(
-        &harness.base_url,
-        &harness.api_key,
-        "/v1/images/generations",
-        &key,
-        &request,
-    )
-    .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
-    assert_eq!(body["error"]["code"].as_str(), Some("invalid_parameter"));
-    assert_public_only("同义字段冲突", &body);
-
+    // 5) 只给遮罩是结构性错误：遮罩脱离参考图没有意义。
     let key = format!("sync-mask-only-{}", Uuid::new_v4());
     let mut request = route_request(harness.model, "mask without an image");
     request["mask"] = json!(harness.png_url());
@@ -150,7 +130,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
 /// 两张都指向假上游的公网 URL：字节由 Adapter 自己取，线上按张数编码。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
+async fn aihubmix_sends_every_reference_image_as_a_public_url() {
     let harness =
         Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 64).await;
 
@@ -163,30 +143,17 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("两张参考图", &body);
-    // 带图的请求走的是编辑端点：这条渠道的参考图只在 /v1/images/edits 上收。
-    assert_eq!(harness.count("POST", "/v1/images/edits"), 1);
-    assert_eq!(harness.count("POST", "/v1/images/generations"), 0);
-
-    let edits = harness.submit_bytes("/v1/images/edits");
-    let rendered = String::from_utf8_lossy(&edits);
+    assert_eq!(harness.count("POST", "/ai/v1/images/generations"), 1);
+    assert_eq!(harness.count("POST", "/v1/images/edits"), 0);
+    let submitted = harness.submit_body("/ai/v1/images/generations");
     assert_eq!(
-        part_name_count(&rendered, "image[]"),
-        2,
-        "两张参考图就是两个 `image[]` 部件：{rendered}"
-    );
-    assert_eq!(
-        part_name_count(&rendered, "image"),
-        0,
-        "多张时不许退回单值 `image`（渠道会 400）：{rendered}"
-    );
-    assert_eq!(
-        part_name_count(&rendered, "mask"),
-        0,
-        "这次请求没有遮罩，线上就不该有 `mask` 部件：{rendered}"
+        submitted["images"],
+        json!([harness.png_url(), harness.input_url("ref-2.png")]),
+        "两张参考图都要逐字进请求体：{submitted}"
     );
     assert!(
-        rendered.contains(&harness.png_url()) && rendered.contains(&harness.input_url("ref-2.png")),
-        "两张参考图的公网 URL 必须逐字进表单：{rendered}"
+        !submitted.as_object().expect("object").contains_key("mask"),
+        "这次请求没有遮罩，线上就不该有 mask 字段：{submitted}"
     );
 
     // 2) 一张参考图：同一份声明面下仍是单值 `image`——列表形态只属于多张。
@@ -198,17 +165,11 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("一张参考图", &body);
-    let edits = harness.submit_bytes("/v1/images/edits");
-    let rendered = String::from_utf8_lossy(&edits);
+    let submitted = harness.submit_body("/ai/v1/images/generations");
     assert_eq!(
-        part_name_count(&rendered, "image"),
-        1,
-        "一张参考图就是单值 `image`：{rendered}"
-    );
-    assert_eq!(
-        part_name_count(&rendered, "image[]"),
-        0,
-        "单张不许用列表形态：{rendered}"
+        submitted["images"],
+        json!([harness.png_url()]),
+        "一张也是一个元素的数组：{submitted}"
     );
 
     assert_job_succeeded(&harness, &key).await;
@@ -218,26 +179,31 @@ async fn aihubmix_encodes_several_reference_images_as_repeated_list_parts() {
 /// 上游给 `url` 时，平台把那个地址**原样**交回，绝不下载、不转存。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn aihubmix_returns_the_url_shape_verbatim() {
-    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
-    let key = format!("sync-url-shape-{}", Uuid::new_v4());
+async fn aihubmix_returns_the_inline_base64_verbatim() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Base64)).await;
+    let key = format!("sync-b64-shape-{}", Uuid::new_v4());
     let (status, body) = harness
         .sync_json(
             "/v1/images/generations",
             &key,
-            route_request(harness.model, "url shape"),
+            route_request(harness.model, "base64 shape"),
         )
         .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("url 形态", &body);
-    let expected = format!("{}/result.png", harness.upstream_base_url);
-    assert_eq!(body["data"][0]["url"].as_str(), Some(expected.as_str()));
-    assert!(
-        body["data"][0].get("b64_json").is_none(),
-        "上游只给了 url，平台不许自己补一个 base64"
+    assert_sync_success("base64 形态", &body);
+    assert_eq!(
+        body["data"][0]["b64_json"].as_str(),
+        Some(STANDARD.encode(PNG_FIXTURE).as_str()),
+        "上游给内联 base64，平台原样交回"
     );
-    // 结果地址是**给调用方**的：平台自己不去取它。
-    assert_eq!(harness.count("GET", "/result.png"), 0);
+    assert!(
+        !body["data"][0]
+            .as_object()
+            .expect("object")
+            .contains_key("url")
+    );
+    // 结果地址（content_url）要平台凭据：平台既不下载它，也不把它交给调用方。
+    assert_eq!(harness.count("GET", "/ai/v1/images"), 0, "平台不取结果");
     assert_job_succeeded(&harness, &key).await;
     harness.cleanup().await;
 }

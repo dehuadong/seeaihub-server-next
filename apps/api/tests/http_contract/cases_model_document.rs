@@ -272,6 +272,7 @@ async fn a_copy_only_republish_creates_a_new_document_version() {
         "native_revision": "doc-1",
         "type": "image",
         "actor": "contract-test",
+        "markup_bps": 2_000,
         "capability_schema": contract.clone(),
         "documentation": documentation,
         "offerings": [{
@@ -284,6 +285,9 @@ async fn a_copy_only_republish_creates_a_new_document_version() {
             "carrier_schema": contract,
             "parameter_mapping": {},
             "formula": "token_rates",
+            // 这条供给按上游声明的金额加价：对客形态与修订级倍率都要给。
+            "consumer_formula": "upstream_declared",
+            "cost_currency": "USD",
             "price_plan": {
                 "currency": "USD",
                 "text_input_microusd_per_million": 5_000_000,

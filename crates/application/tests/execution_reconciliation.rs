@@ -840,7 +840,7 @@ async fn a_late_accounting_fact_settles_and_is_consumed() {
             evidence: Some(MeteringEvidence {
                 attempt_id,
                 provider_response_digest: "resp-late".to_owned(),
-                usage: usage(),
+                usage: Some(usage()),
             }),
             provider_state: Some(ProviderTaskState::Succeeded),
             provider_cost: Some(ProviderCostFact {
@@ -1022,7 +1022,7 @@ async fn a_late_accounting_fact_that_reports_a_failure_releases_the_hold_without
             evidence: Some(MeteringEvidence {
                 attempt_id,
                 provider_response_digest: "resp-late-failed".to_owned(),
-                usage: usage(),
+                usage: Some(usage()),
             }),
             provider_cost: Some(ProviderCostFact {
                 source: ProviderCostSource::Declared,
@@ -1088,7 +1088,7 @@ async fn a_late_accounting_fact_that_reports_a_cancellation_releases_the_hold_wi
             evidence: Some(MeteringEvidence {
                 attempt_id,
                 provider_response_digest: "resp-late-cancelled".to_owned(),
-                usage: usage(),
+                usage: Some(usage()),
             }),
             provider_cost: None,
             provider_state: Some(ProviderTaskState::Cancelled),
@@ -1137,7 +1137,7 @@ async fn a_late_accounting_fact_with_an_unknown_state_keeps_the_hold() {
             evidence: Some(MeteringEvidence {
                 attempt_id,
                 provider_response_digest: "resp-late-unknown".to_owned(),
-                usage: usage(),
+                usage: Some(usage()),
             }),
             provider_cost: None,
             provider_state: Some(ProviderTaskState::Unknown),
@@ -1421,7 +1421,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
             evidence: Some(MeteringEvidence {
                 attempt_id: gap_attempt,
                 provider_response_digest: "resp-gap".to_owned(),
-                usage: usage(),
+                usage: Some(usage()),
             }),
             provider_cost: None,
             provider_state: None,
@@ -1473,7 +1473,7 @@ async fn a_per_image_late_fact_uses_a_known_count_and_gaps_when_it_is_missing() 
             evidence: Some(MeteringEvidence {
                 attempt_id: count_attempt,
                 provider_response_digest: "resp-count".to_owned(),
-                usage: usage(),
+                usage: Some(usage()),
             }),
             provider_cost: None,
             provider_state: None,
@@ -1526,7 +1526,7 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
         evidence: MeteringEvidence {
             attempt_id,
             provider_response_digest: "resp-api".to_owned(),
-            usage: usage(),
+            usage: Some(usage()),
         },
         provider_cost: ProviderCostFact {
             source: ProviderCostSource::Declared,
@@ -1536,7 +1536,7 @@ async fn api_and_worker_finalizations_charge_at_most_once() {
         },
         charge_microusd: snapshot()
             .charge_microusd(ChargeFacts {
-                usage: &usage(),
+                usage: Some(&usage()),
                 images: 1,
                 declared_cost_microusd: Some(2_000),
             })

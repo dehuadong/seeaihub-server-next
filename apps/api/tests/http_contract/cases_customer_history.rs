@@ -16,14 +16,7 @@ async fn history_harness() -> Harness {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );

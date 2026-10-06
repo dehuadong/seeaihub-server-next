@@ -6141,9 +6141,10 @@ impl RuntimeService {
                 ApplicationError::Validation(format!("unknown adapter {}", offering.adapter_key))
             })?;
         validate_adapter_compatibility(&offering, &descriptor)?;
-        // **渠道能力**：声明"上游给金额"的候选，要求这条通路真的会把金额交回来。能力是驱动器的
-        // 事实——AIHubMix 只回四分项 `usage`，金额由平台按费率自算；APIMart 的终态另带 `cost`。
-        // 工程师把成本形态或对客形态写歪就在这里点名拒绝，不等到受理或结算才发现收不到钱。
+        // **渠道能力**：登记的计价形态必须与这条通路真实能给的东西对得上。两条判据都在发布期
+        // 点名拒绝，不等到受理或结算才发现收不到钱：
+        // - 声明"上游给金额"：要求这条通路真的会把金额交回来；
+        // - 对客选按 token 四档：要求这条通路能提供四分项 `usage`（拿不到就算不出对客价）。
         if !descriptor.declares_cost {
             if offering.formula == PricingFormula::UpstreamDeclared {
                 return Err(ApplicationError::Validation(format!(
@@ -6159,6 +6160,15 @@ impl RuntimeService {
                     offering.provider_model_id, offering.adapter_key
                 )));
             }
+        }
+        if offering.consumer_formula == PricingFormula::TokenRates
+            && !descriptor.provides_token_usage
+        {
+            return Err(ApplicationError::Validation(format!(
+                "offering {}: consumer_formula is token_rates but adapter {} provides no token \
+                 usage (the consumer price cannot be computed)",
+                offering.provider_model_id, offering.adapter_key
+            )));
         }
         // 尺寸换算声明也是**发布数据**：源字段必须在合同里（否则客户端提交不了它）、目标字段必须
         // 被这条供给的承载面声明（否则换算出来的值发不出去），档案必须成形状。写歪了在这里拒绝，
@@ -6591,6 +6601,16 @@ fn validate_gateway_model_identity(
 /// - 它是尺寸换算的**目标字段**（换算的源字段在合同里，算出来的值写在这个名字上）。
 ///
 /// 只比名字、不比定义：同一个名字在两边各自描述（例如 `size` 的取值形态）由映射与换算承担。
+/// 承载面里这个名字是不是**容器**（自己声明了 `properties` 的对象）：是就给它的成员名。
+fn container_members(carrier: &Value, field: &str) -> Option<Vec<String>> {
+    carrier
+        .get("properties")?
+        .get(field)?
+        .get("properties")?
+        .as_object()
+        .map(|members| members.keys().cloned().collect())
+}
+
 fn validate_carrier_within_contract(
     contract: &Value,
     carrier: &Value,
@@ -6605,17 +6625,32 @@ fn validate_carrier_within_contract(
             ApplicationError::Validation(format!("parameter_mapping.size: {reason}"))
         })?
         .map(|mapping| mapping.target);
+    let renamed_from_contract = |wire: &str| {
+        renames.as_ref().is_some_and(|renames| {
+            renames.iter().any(|(source, wire_name)| {
+                wire_name.as_str() == wire && declares_parameter(contract, source)
+            })
+        })
+    };
     for field in declared_field_names(carrier) {
         if declares_parameter(contract, field) {
             continue;
         }
-        let renamed_from_contract = renames.as_ref().is_some_and(|renames| {
-            renames.iter().any(|(source, wire)| {
-                wire.as_str() == field && declares_parameter(contract, source)
-            })
-        });
+        // **容器字段**（自己声明了 `properties` 的对象）按它的成员判：只要每个成员都由映射
+        // 从**已声明的合同字段**指过来，这个容器就是合同可达的。它是承载面侧的一套名字，
+        // 合同按顶层字段声明（例如合同的 `quality` 落到承载面的 `extra.quality`）。
+        if let Some(members) = container_members(carrier, field) {
+            let every_member_mapped = !members.is_empty()
+                && members
+                    .iter()
+                    .all(|member| renamed_from_contract(&format!("{field}.{member}")));
+            if every_member_mapped {
+                continue;
+            }
+        }
+        let renamed = renamed_from_contract(field);
         let converted_from_contract = size_target.as_deref() == Some(field);
-        if !renamed_from_contract && !converted_from_contract {
+        if !renamed && !converted_from_contract {
             return Err(ApplicationError::Validation(format!(
                 "carrier schema declares {field}, which the vendor model contract does not"
             )));
@@ -6977,7 +7012,7 @@ fn provider_cost_fact(
 enum CostInputs<'a> {
     /// 成功件：本次实际用量 + 产出的图片张数。
     Succeeded {
-        usage: &'a TokenUsage,
+        usage: Option<&'a TokenUsage>,
         images: usize,
     },
     /// 失败件：只有上游可能报回来的金额，自算一律算不出来。
@@ -6999,9 +7034,11 @@ fn self_computed_cost(snapshot: &PriceSnapshot, inputs: CostInputs<'_>) -> Optio
         return None;
     };
     match snapshot.formula {
-        PricingFormula::TokenRates => snapshot
-            .cost_rates()
-            .and_then(|rates| rates.amount_microusd(usage).ok()),
+        PricingFormula::TokenRates => usage.and_then(|usage| {
+            snapshot
+                .cost_rates()
+                .and_then(|rates| rates.amount_microusd(usage).ok())
+        }),
         PricingFormula::PerImage => {
             let unit = snapshot.cost_unit_price_microusd?;
             let count = u64::try_from(images).ok()?;

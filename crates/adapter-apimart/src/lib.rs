@@ -21,8 +21,9 @@ use seeai_adapter_sdk::{
     GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage, ImageValueShape, InputImage,
     ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput,
     ProviderTaskHandle, ProviderTaskState, ProviderTraceId, QueryAccountingCapability,
-    ResponsePayload, RetrySafety, begin_generation_send, ensure_external_call_allowed,
-    ensure_read_call_allowed, external_call_timeout, gateway_passthrough_parameters,
+    ResponsePayload, RetrySafety, begin_generation_send, declared_microusd,
+    ensure_external_call_allowed, ensure_read_call_allowed, external_call_timeout,
+    gateway_passthrough_parameters,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
 use seeai_domain::{ImageBranch, TokenUsage};
@@ -101,6 +102,7 @@ impl AdapterFactory for ApimartAdapterFactory {
             // APIMart 的终态另带 `cost`（实扣金额，含渠道侧折扣）：声明"上游给金额"的候选
             // 在这条通路上成立。
             declares_cost: true,
+            provides_token_usage: true,
             byte_limits: byte_limits(),
         })
     }
@@ -517,75 +519,6 @@ impl TaskData {
             None => ProviderCost::Unavailable,
         }
     }
-}
-
-/// 上游报出来的金额 → 微单位整数。
-///
-/// **换算**这一步不经过浮点：钱乘 1e6 会在边界上悄悄差 1 微单位，而这种差正是"成本对不上账"
-/// 的来源。（JSON 数字本身由 `serde_json` 按双精度解出，那点误差要到十亿量级的金额才会碰到
-/// 微单位，远超这类金额的实际范围。）
-///
-/// 除数字外还接受**字符串形态与指数写法**：这只是**容忍上游的表示差异**——同一家的响应形状
-/// 会随版本变，把可读的金额读出来总好过凭空记一笔成本缺口。它**不是行为承诺**：上游没有承诺
-/// 过用哪种写法，平台也不因此就"支持"了这些形态，读不出来照样按"没拿到"处理。
-///
-/// 负数是上游在说"这笔倒找钱"，平台没有可记的对应事实，按"没拿到"处理。
-fn declared_microusd(value: &Value) -> Option<u64> {
-    match value {
-        Value::Number(number) => parse_decimal_microusd(&number.to_string()),
-        Value::String(text) => parse_decimal_microusd(text),
-        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
-    }
-}
-
-/// 十进制字面量 → 微单位（小数超过 6 位时四舍五入到第 6 位）。
-///
-/// 判不出确切金额的一律返回 `None`：非数字、负数、指数越界、超出 `u64` 范围。
-/// 只有"上游明说这笔是 0"才得到 `0`——它和"没有金额"是两件事。
-fn parse_decimal_microusd(text: &str) -> Option<u64> {
-    let text = text.trim();
-    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
-        Some((mantissa, exponent)) => (mantissa, exponent.trim().parse::<i32>().ok()?),
-        None => (text, 0),
-    };
-    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
-    if mantissa.starts_with('-') {
-        return None;
-    }
-    let (integer, fraction) = match mantissa.split_once('.') {
-        Some((integer, fraction)) => (integer, fraction),
-        None => (mantissa, ""),
-    };
-    if integer.is_empty() && fraction.is_empty() {
-        return None;
-    }
-    if !integer.bytes().all(|byte| byte.is_ascii_digit())
-        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
-    {
-        return None;
-    }
-    // 数字串去掉小数点，再按 10 的幂移到微单位：金额 × 1e6 = 数字 × 10^(指数 − 小数位数 + 6)。
-    let digits = format!("{integer}{fraction}");
-    let digits = digits.trim_start_matches('0');
-    if digits.is_empty() {
-        return Some(0);
-    }
-    let digits = digits.parse::<u128>().ok()?;
-    let shift = exponent - i32::try_from(fraction.len()).ok()? + 6;
-    let scaled = if shift >= 0 {
-        digits.checked_mul(10_u128.checked_pow(u32::try_from(shift).ok()?)?)?
-    } else {
-        let dropped = usize::try_from(-shift).ok()?;
-        let divisor = 10_u128.checked_pow(u32::try_from(dropped).ok()?)?;
-        let quotient = digits / divisor;
-        // 四舍五入：余数到半个除数就进位。够不到半微单位时结果就是 0，不是"猜了一个数"。
-        if (digits % divisor) * 2 >= divisor {
-            quotient + 1
-        } else {
-            quotient
-        }
-    };
-    u64::try_from(scaled).ok()
 }
 
 /// 一次读上游响应时用的读取预算：上限、超限错误码，以及超限是否仍按瞬时失败重试。

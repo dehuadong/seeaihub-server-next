@@ -14,6 +14,6 @@ status: accepted
 
 **编号存根**：本条合并了 ADR-0010 与 ADR-0016，两个编号保留以便旧链接可解析。
 
-机制（计费形态落在哪、汇率表与快照位、各形态的算式）见 [`../design/0007-pricing-floor-and-settlement.md`](../design/0007-pricing-floor-and-settlement.md)；"上游声明的金额能否作为第二类计量证据"这一候选问题已由实测回答并否决，依据见 [`.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`](../../.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md)。
+机制（计费形态落在哪、汇率表与快照位、各形态的算式）见 [`../design/0007-pricing-floor-and-settlement.md`](../design/0007-pricing-floor-and-settlement.md)。**声明金额是它自己的一种计量形态**：某条上游面拿不到分项 token、只给实扣金额时，那一句金额就是当次的计量依据，"计量形态跟着渠道的计费方式走"正是它的落点，处置见 [`.agents/notes/implemented/platform/2026-10-06-aihubmix-ai-v1-execution-path.md`](../../.agents/notes/implemented/platform/2026-10-06-aihubmix-ai-v1-execution-path.md)；"把金额当作第二类 **token** 证据"这一候选问题仍是否决的，边界见 [`.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md`](../../.agents/notes/rejected/domain/2026-09-19-provider-declared-charge-as-metering-evidence.md)。
 
 **反悔成本**：改它要放开结算路径上的证据校验与库层约束，并把已发布的 Offering、已产生的 `ledger.entries` 与已进对账的案例按新口径重新处置——对账的处置口径（只能退款、不得仅凭运营判断确认扣款）也要一起改。

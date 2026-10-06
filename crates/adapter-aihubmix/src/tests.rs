@@ -8,8 +8,7 @@ use seeai_domain::{
     ImageParameterKind, MAX_PROVIDER_IDENTIFIER_BYTES, platform_image_parameter,
     platform_image_parameters,
 };
-use std::sync::{Arc, Mutex};
-use tokio::io::{AsyncBufReadExt, AsyncWriteExt};
+use std::sync::Arc;
 
 /// 同一传输策略（这里就是单次超时）经创建路径拿到同一个 Client，连接池因此跨请求、跨 Channel 复用。
 #[test]
@@ -152,7 +151,7 @@ fn rejects_schema_with_wrong_prompt_type() {
 #[test]
 fn a_reference_image_declared_as_a_string_array_is_executable() {
     let mut config = published_config();
-    config["offerings"][0]["carrier_schema"]["properties"]["image"] = serde_json::json!({
+    config["offerings"][0]["carrier_schema"]["properties"]["images"] = serde_json::json!({
         "type": "array",
         "items": {"type": "string"},
         "minItems": 1,
@@ -167,7 +166,7 @@ fn a_reference_image_declared_as_a_string_array_is_executable() {
         )
         .expect("a string array reference image is executable");
 
-    config["offerings"][0]["carrier_schema"]["properties"]["image"]["items"]["type"] =
+    config["offerings"][0]["carrier_schema"]["properties"]["images"]["items"]["type"] =
         Value::String("integer".to_owned());
     let offering = published_offering(&config).clone();
     let error = AihubmixAdapterFactory
@@ -178,93 +177,6 @@ fn a_reference_image_declared_as_a_string_array_is_executable() {
         )
         .expect_err("array items that are not strings must be rejected");
     assert!(error.contains("image"), "{error}");
-}
-
-#[test]
-fn maps_branch_to_provider_endpoint() {
-    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
-        .expect("adapter config should be valid");
-    assert_eq!(
-        adapter
-            .endpoint(ImageBranch::PromptOnly)
-            .expect("endpoint should resolve")
-            .as_str(),
-        "https://api.inferera.com/v1/images/generations"
-    );
-    assert_eq!(
-        adapter
-            .endpoint(ImageBranch::Masked)
-            .expect("endpoint should resolve")
-            .as_str(),
-        "https://api.inferera.com/v1/images/edits"
-    );
-}
-#[test]
-fn keeps_the_shape_the_provider_gave() {
-    let url = images_from_response(vec![ImageData {
-        url: Some("https://example.invalid/a.png".to_owned()),
-        b64_json: None,
-    }])
-    .expect("a url is a usable result");
-    assert_eq!(
-        url,
-        vec![GeneratedImage::from_url(
-            "https://example.invalid/a.png".to_owned()
-        )]
-    );
-    let base64 = images_from_response(vec![ImageData {
-        url: None,
-        b64_json: Some("AAAA".to_owned()),
-    }])
-    .expect("base64 is a usable result");
-    assert_eq!(base64, vec![GeneratedImage::from_base64("AAAA".to_owned())]);
-    // 两个都给时保留 url；两个都没有就是不可用的结果。
-    let both = images_from_response(vec![ImageData {
-        url: Some("https://example.invalid/a.png".to_owned()),
-        b64_json: Some("AAAA".to_owned()),
-    }])
-    .expect("both shapes are usable");
-    assert_eq!(
-        both,
-        vec![GeneratedImage::from_url(
-            "https://example.invalid/a.png".to_owned()
-        )],
-        "两个都给时只留 url：结果信封里永远只有一种取图方式"
-    );
-    assert!(
-        images_from_response(vec![ImageData {
-            url: None,
-            b64_json: None
-        }])
-        .is_err()
-    );
-}
-
-/// 响应读成了、却没有可用结果：**失败也要报告这次执行的成本事实**。
-///
-/// 这条渠道不给金额字段，所以成本事实与成功分支同口径报 `computed`（平台按实际用量自算），
-/// 而不是报"没采到"——后者会被读成"这次执行没有成本"，与"渠道不报金额"混成一件事。
-#[test]
-fn a_response_without_images_still_reports_where_the_cost_comes_from() {
-    let body = serde_json::to_vec(&serde_json::json!({
-        "data": [],
-        "usage": {
-            "input_tokens": 9,
-            "input_tokens_details": {"text_tokens": 9, "image_tokens": 0},
-            "output_tokens": 196,
-            "output_tokens_details": {"text_tokens": 0, "image_tokens": 196},
-            "total_tokens": 205
-        }
-    }))
-    .expect("a response body serializes");
-    match success_from_body(&body, None).expect_err("no images must fail") {
-        AdapterError::Provider(provider) => {
-            assert_eq!(provider.code, "provider_result_empty");
-            assert_eq!(provider.provider_cost, Some(ProviderCost::Computed));
-            assert_eq!(provider.retry_safety, RetrySafety::AcceptanceUnknown);
-        }
-        other => panic!("expected a provider error, got {other:?}"),
-    }
 }
 
 #[test]
@@ -360,45 +272,7 @@ fn provider_error_separates_platform_funding_from_platform_credentials() {
     );
 }
 
-#[test]
-fn usage_rejects_missing_token_detail_fields() {
-    let response = br#"{
-            "data": [{"b64_json": "unused"}],
-            "usage": {
-                "input_tokens": 1,
-                "input_tokens_details": {"text_tokens": 1},
-                "output_tokens": 1,
-                "output_tokens_details": {"text_tokens": 0, "image_tokens": 1},
-                "total_tokens": 2
-            }
-        }"#;
-    let error = serde_json::from_slice::<ImageResponse>(response)
-        .expect_err("missing image_tokens must reject metering evidence");
-    assert!(error.to_string().contains("image_tokens"));
-}
 // ── 同步网关协议（RFC 0017 §2/§4）──────────────────────────────────────────────
-
-/// 把 Driver 组好的表单摊成将要发出去的字节，供新旧入口逐字比对。
-async fn render_form(form: multipart::Form) -> Vec<u8> {
-    let chunks = form.into_stream().collect::<Vec<_>>().await;
-    let mut body = Vec::new();
-    for chunk in chunks {
-        body.extend_from_slice(&chunk.expect("the form should stream"));
-    }
-    body
-}
-
-/// 摊平表单并去掉每次随机生成的 boundary：两个入口的内容才可逐字比对。
-async fn normalized_form(form: multipart::Form) -> String {
-    let text = String::from_utf8_lossy(&render_form(form).await).into_owned();
-    let boundary = text
-        .split("\r\n")
-        .next()
-        .and_then(|line| line.strip_prefix("--"))
-        .unwrap_or_default()
-        .to_owned();
-    text.replace(&boundary, "BOUNDARY")
-}
 
 /// 从候选声明面推出新协议的图片参数位；角色判定与线上同一处推导。
 fn gateway_sites(schema: &Value, branch: ImageBranch) -> ImageSites {
@@ -426,104 +300,37 @@ fn gateway_shape(schema: &Value, name: &str) -> ImageValueShape {
     }
 }
 
-/// 一个只回固定图片字节的本地接收器：记下请求次数，用来区分「下载」与「就地解码」。
-struct ImageReceiver {
-    url: String,
-    requests: Arc<Mutex<usize>>,
-    _task: tokio::task::JoinHandle<()>,
-}
-
-impl ImageReceiver {
-    async fn start(body: &'static [u8]) -> Self {
-        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
-            .await
-            .expect("the receiver binds a local port");
-        let port = listener.local_addr().expect("the receiver address").port();
-        let requests = Arc::new(Mutex::new(0_usize));
-        let recorded = requests.clone();
-        let task = tokio::spawn(async move {
-            loop {
-                let Ok((mut socket, _)) = listener.accept().await else {
-                    break;
-                };
-                let recorded = recorded.clone();
-                tokio::spawn(async move {
-                    let _ = serve_image(&mut socket, recorded, body).await;
-                });
-            }
-        });
-        Self {
-            url: format!("http://127.0.0.1:{port}/reference.png"),
-            requests,
-            _task: task,
-        }
-    }
-
-    fn requests(&self) -> usize {
-        *self.requests.lock().expect("requests lock")
-    }
-}
-
-async fn serve_image(
-    socket: &mut tokio::net::TcpStream,
-    requests: Arc<Mutex<usize>>,
-    body: &'static [u8],
-) -> std::io::Result<()> {
-    let mut reader = tokio::io::BufReader::new(&mut *socket);
-    let mut request_line = String::new();
-    reader.read_line(&mut request_line).await?;
-    loop {
-        let mut header = String::new();
-        if reader.read_line(&mut header).await? == 0 {
-            break;
-        }
-        if header.trim_end().is_empty() {
-            break;
-        }
-    }
-    *requests.lock().expect("requests lock") += 1;
-    let head = format!(
-        "HTTP/1.1 200 OK\r\ncontent-type: image/png\r\ncontent-length: {}\r\nconnection: close\r\n\r\n",
-        body.len()
-    );
-    socket.write_all(head.as_bytes()).await?;
-    socket.write_all(body).await?;
-    socket.flush().await
-}
-
-/// 编辑入口把公网 URL **逐字透传**成文本部件：与 APIMart 一样不下载、不上传。
-#[tokio::test]
-async fn gateway_multipart_form_passes_the_public_url_without_downloading() {
-    let payload: &'static [u8] = b"\x89PNG\r\n\x1a\n";
-    let receiver = ImageReceiver::start(payload).await;
+/// 编辑入口把公网 URL 逐字写成**媒体引用**：不下载、不上传，也不去取结果。
+#[test]
+fn the_edit_body_carries_public_urls_as_media_references() {
     let schema = published_schema();
     let input = GatewayInput {
-        provider_model_id: "gpt-image-2.5-flare".to_owned(),
+        provider_model_id: "gpt-image-2.5-sunburst".to_owned(),
         branch: ImageBranch::ImageConditioned,
         native_parameters: serde_json::json!({"prompt": "test"}),
-        reference_images: vec![InputImage::url(receiver.url.clone())],
+        reference_images: vec![
+            InputImage::url("https://example.invalid/one.png"),
+            InputImage::url("https://example.invalid/two.png"),
+        ],
         mask: None,
         image_sites: gateway_sites(&schema, ImageBranch::ImageConditioned),
         cost_currency: "USD".to_owned(),
     };
-    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
-        .expect("adapter config should be valid");
-    let form = normalized_form(
-        adapter
-            .gateway_edit_form(&input)
-            .expect("the gateway form builds"),
-    )
-    .await;
-    let rendered = &form;
-    assert!(
-        rendered.contains("name=\"image\""),
-        "参考图必须作为 image 部件出现：{rendered}"
+    let body = gateway_body(&input).expect("the body builds");
+    let reference = input
+        .image_sites
+        .reference
+        .as_ref()
+        .expect("the offering declares a reference parameter");
+    assert_eq!(
+        body[&reference.parameter],
+        serde_json::json!([
+            "https://example.invalid/one.png",
+            "https://example.invalid/two.png"
+        ]),
+        "参考图按承载面声明的名字写成公网 URL：{body}"
     );
-    assert!(
-        rendered.contains(&receiver.url),
-        "参考图的公网 URL 必须逐字进表单：{rendered}"
-    );
-    assert_eq!(receiver.requests(), 0, "URL 透传：不下载参考图");
+    assert!(body.get("model").is_some() && body.get("prompt").is_some());
 }
 
 /// 取消在生成请求之前生效：闸门拦下，不会真的发出去（基址上没有服务在听）。
@@ -635,4 +442,171 @@ fn gateway_errors_drop_provider_text_and_transport_strings() {
     };
     assert_eq!(call.message, "the provider call failed");
     assert!(!call.message.contains("SECRET"));
+}
+
+#[test]
+fn every_branch_uses_the_single_image_endpoint() {
+    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
+        .expect("adapter config should be valid");
+    // 上游只有一个图片端点：分支由请求里有没有图片字段决定，不由端点分流。
+    assert_eq!(
+        adapter
+            .endpoint()
+            .expect("endpoint should resolve")
+            .as_str(),
+        "https://api.inferera.com/ai/v1/images/generations"
+    );
+}
+
+#[test]
+fn the_result_envelope_takes_the_inline_base64_only() {
+    let inline = images_from_task(
+        vec![TaskOutput {
+            b64_json: Some("AAAA".to_owned()),
+            content_url: Some("https://api.inferera.com/ai/v1/images/t/content/r".to_owned()),
+        }],
+        &ProviderCost::Unavailable,
+    )
+    .expect("an inline image is a usable result");
+    assert_eq!(inline, vec![GeneratedImage::from_base64("AAAA".to_owned())]);
+    // content_url 要平台凭据，平台既不下载也不交给调用方：只有它就没有可用结果。而且失败件要带着
+    // **已经读到的金额**回去，不能在判定失败时把成本事实丢掉。
+    let declared = ProviderCost::Declared(DeclaredCost {
+        amount_microusd: 11_354,
+        currency: "USD".to_owned(),
+    });
+    let error = images_from_task(
+        vec![TaskOutput {
+            b64_json: None,
+            content_url: Some("https://api.inferera.com/ai/v1/images/t/content/r".to_owned()),
+        }],
+        &declared,
+    )
+    .expect_err("only content_url is not a usable result");
+    match error {
+        AdapterError::Provider(failure) => assert_eq!(
+            failure.provider_cost,
+            Some(declared),
+            "结果缺失也要把读到的金额交回平台"
+        ),
+        other => panic!("expected a provider failure, got {other:?}"),
+    }
+    assert!(
+        images_from_task(
+            vec![TaskOutput {
+                b64_json: None,
+                content_url: None
+            }],
+            &ProviderCost::Unavailable,
+        )
+        .is_err()
+    );
+}
+
+#[test]
+fn a_declared_amount_is_taken_verbatim_and_a_missing_one_is_a_cost_gap() {
+    let declared = declared_cost(
+        Some(&TaskUsage {
+            cost: Some(serde_json::json!(0.026436)),
+        }),
+        "USD",
+    );
+    assert_eq!(
+        declared,
+        ProviderCost::Declared(DeclaredCost {
+            amount_microusd: 26_436,
+            currency: "USD".to_owned()
+        })
+    );
+    // 字段在但为空、或读不出来：按成本缺口记，不猜金额。
+    for usage in [
+        TaskUsage {
+            cost: Some(Value::Null),
+        },
+        TaskUsage { cost: None },
+        TaskUsage {
+            cost: Some(serde_json::json!("nonsense")),
+        },
+    ] {
+        assert_eq!(
+            declared_cost(Some(&usage), "USD"),
+            ProviderCost::Unavailable
+        );
+    }
+    assert_eq!(declared_cost(None, "USD"), ProviderCost::Unavailable);
+}
+
+#[test]
+fn a_completed_task_without_a_result_carries_the_declared_cost() {
+    let body = serde_json::json!({
+        "id": "t_1",
+        "status": "completed",
+        "output": [],
+        "usage": {"cost": 0.011354}
+    })
+    .to_string();
+    let error =
+        success_from_body(body.as_bytes(), None, "USD").expect_err("no images is not a result");
+    match error {
+        AdapterError::Provider(call) => {
+            assert_eq!(call.code, "provider_result_empty");
+            assert_eq!(
+                call.provider_cost,
+                Some(ProviderCost::Declared(DeclaredCost {
+                    amount_microusd: 11_354,
+                    currency: "USD".to_owned()
+                }))
+            );
+        }
+        other => panic!("expected a provider error, got {other:?}"),
+    }
+}
+
+#[test]
+fn a_failed_task_is_a_provider_error_with_its_amount() {
+    let body = serde_json::json!({
+        "id": "t_2",
+        "status": "failed",
+        "output": [],
+        "error": {"code": "content_policy", "message": "rejected"},
+        "usage": {"cost": 0.001}
+    })
+    .to_string();
+    let error =
+        success_from_body(body.as_bytes(), None, "USD").expect_err("failed tasks are failures");
+    match error {
+        AdapterError::Provider(call) => {
+            assert_eq!(call.code, "content_policy");
+            assert_eq!(
+                call.provider_cost,
+                Some(ProviderCost::Declared(DeclaredCost {
+                    amount_microusd: 1_000,
+                    currency: "USD".to_owned()
+                }))
+            );
+        }
+        other => panic!("expected a provider error, got {other:?}"),
+    }
+}
+
+/// 完成态任务对象里的 `id` 落到 `provider_trace_id`：它就是这次执行的对账标识，
+/// 平台据此在审计与对账里认这一笔（[设计 0022](../../../docs/design/0022-aihubmix-ai-v1-execution-path.md) §3）。
+#[test]
+fn a_completed_task_keeps_its_id_as_the_provider_trace() {
+    let body = serde_json::json!({
+        "id": "t_2f9c1b7a",
+        "status": "completed",
+        "output": [{"b64_json": "AAAA"}],
+        "usage": {"cost": 0.026436}
+    })
+    .to_string();
+    let success = success_from_body(body.as_bytes(), None, "USD")
+        .expect("a completed task with an inline image is a success");
+    assert_eq!(
+        success
+            .provider_trace_id
+            .as_ref()
+            .map(ProviderTraceId::as_str),
+        Some("t_2f9c1b7a")
+    );
 }

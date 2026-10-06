@@ -33,8 +33,9 @@ async fn declared_parameters_go_upstream_and_undeclared_ones_never_leave_the_pla
     );
     assert_sync_success("声明面过滤", &body);
     let submit_body = harness.submit_body("/v1/images/generations");
+    // 模型专属字段在这条渠道上进 extra 容器（承载面就这么声明，映射把合同字段指进去）。
     assert_eq!(
-        submit_body["quality"], "high",
+        submit_body["extra"]["quality"], "high",
         "声明过的参数原样上行：{submit_body}"
     );
     for dropped in ["image_with_roles", "seed", "foo"] {
@@ -110,11 +111,9 @@ async fn filtering_never_drops_the_images_the_platform_places() {
 /// 编辑路径（`/v1/images/edits`，与 `generations` 同一套 JSON 解码）走同一套参数过滤：
 /// 声明过的参数原样到上游，没声明的到此为止。
 ///
-/// AIHubMix 的编辑端点收的是表单部件：标量参数进文本部件、参考图进文件部件。这里断言两个方向——
-/// 声明过的 `quality` 确实进了发给假上游的表单（文本部件里能读到它的名字），而 `seed` 与
-/// `image_with_roles` 在整份表单字节里都不出现。
-///
-/// 平台这一侧只收公网 URL：参考图走 `image` 字段，字节由 Adapter 自己取回后再进上游的文件部件。
+/// AIHubMix 的编辑请求与文生图走同一个端点、同一个 JSON 请求体：模型专属字段落 `extra` 容器、
+/// 参考图落 `images`。这里断言两个方向——声明过的 `quality` 进了发给假上游的请求体，而 `seed` 与
+/// `image_with_roles` 在整份请求体里都不出现。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_edit_path_keeps_declared_parameters_and_drops_undeclared_ones() {
@@ -131,25 +130,21 @@ async fn the_edit_path_keeps_declared_parameters_and_drops_undeclared_ones() {
     let (status, body) = harness.sync_json("/v1/images/edits", &key, request).await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("编辑路径的声明面过滤", &body);
-    let edits = harness.submit_bytes("/v1/images/edits");
-    let rendered = String::from_utf8_lossy(&edits);
-    assert!(
-        rendered.contains("name=\"quality\""),
-        "声明过的 `quality` 必须进表单部件：{rendered}"
+    let submitted = harness.submit_body("/ai/v1/images/generations");
+    assert_eq!(
+        submitted["extra"]["quality"], "high",
+        "声明过的 `quality` 必须进请求体：{submitted}"
     );
     for dropped in ["seed", "image_with_roles"] {
         assert!(
-            !rendered.contains(&format!("name=\"{dropped}\"")),
-            "候选没声明的 `{dropped}` 绝不能出现在发给上游的表单里：{rendered}"
+            submitted.get(dropped).is_none() && submitted["extra"].get(dropped).is_none(),
+            "候选没声明的 `{dropped}` 绝不能出现在发给上游的请求体里：{submitted}"
         );
     }
-    assert!(
-        rendered.contains("name=\"image\""),
-        "平台装载的参考图照旧走 image 部件：{rendered}"
-    );
-    assert!(
-        rendered.contains(&harness.png_url()),
-        "参考图的公网 URL 必须逐字进表单：{rendered}"
+    assert_eq!(
+        submitted["images"],
+        json!([harness.png_url()]),
+        "平台装载的参考图走 `images`：{submitted}"
     );
     assert_job_succeeded(&harness, &key).await;
     harness.cleanup().await;

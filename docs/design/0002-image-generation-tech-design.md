@@ -15,7 +15,7 @@
 
 ## 1. 实测结论
 
-2026-09-18 用真实付费调用结清：**AIHubMix 的正式执行路径采用它同步的两个端点**——`/v1/images/generations`（文生图）与 `/v1/images/edits`（图生图 / mask）。它们返回完整的分项 token，能形成可核验的 Metering Evidence。
+2026-09-18 用真实付费调用结清：**AIHubMix 的正式执行路径是同步调用**；2026-10-06 起该路径是单一端点 `POST /ai/v1/images/generations`（一个端点覆盖文生图与图生图，参考图与遮罩按公网 URL 媒体引用传递）。它只回上游声明的 `usage.cost`，不给 token 分项。改走 `/ai/v1` 的理由与实测见 [0022](./0022-aihubmix-ai-v1-execution-path.md)。
 
 逐端点的形态、分支、计量事实与实测 token 数，以 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节为唯一出处，本文不复述。没有保存密钥、task ID 或短期 URL。
 
@@ -78,9 +78,7 @@ HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能�
   → CreateImageGenerationRequest
   → DirectExecutionService 直接执行：短事务受理最小 Job + Hold + 渠道槽位，载荷只在内存
   → AIHubMix Adapter
-       ├─ 无 image/images → POST /v1/images/generations
-       └─ 有 image/images → POST /v1/images/edits
-                              └─ mask 可选
+       └─ POST /ai/v1/images/generations（一个端点；有参考图时带上 images 与可选 mask）
   → 上游给的 url / b64_json 原样成为结果信封
   → usage → MeteringEvidence
   → settle 按冻结的 Price Snapshot 结算
@@ -156,19 +154,18 @@ AIHubMix `/v1` 没有公开幂等键，成功调用也不进入可查询任务�
 
 ## 9. Adapter 首期能力
 
-- `submit_generate`：JSON `/v1/images/generations`；
-- `submit_edit`：multipart `/v1/images/edits`，支持单图与 mask；
-- `parse_result`：Base64 图片、输出元数据与 usage；
-- `extract_evidence`：四类 token 与总量；
+- 单一调用：JSON `POST /ai/v1/images/generations`，有参考图时写 `images`（字符串数组）与可选 `mask`；
+- `parse_result`：任务对象里的内联 `b64_json`；
+- `extract_evidence`：上游声明的 `usage.cost`（没有它也没有 token 分项时记成本缺口）；
 - `classify_error`：明确未受理、明确失败、受理状态不确定；
 - 首期不声明 Provider cancel/poll 能力；
-- 多图虽然存在于 `/ai/v1` Schema，但 `/v1/images/edits` 的机器 Schema 只声明单个 `image`（且声明成二进制；平台按公网 URL 文本部件透传，见 `docs/facts/channel-facts.md` §2.2），因此首期正式 Offering 先发布单图 + 可选 mask；多图待真实 `/v1` 合同或可计量 `/ai/v1` 合同成立后再发布。
+- 参考图在 `/ai/v1` 上声明成媒体引用数组（`images`，字符串数组），正式 Offering 按此声明最多 16 张；遮罩是单值 `mask`（见 `docs/facts/channel-facts.md` §2）。
 
 错误分类首期规则：`400` 归为请求永久错误；`401/403` 归为凭证、权限、余额或异步开通问题；`429/503` 只有在明确未受理时才自动退避重试；`task_status_unavailable`、`upstream_bad_response`、`upstream_unreachable`、`result_delivery_failed` 均不能仅凭错误码断言「未生成」。这些规则只决定**平台内部怎么处置**；消费者看到的错误语义由 `docs/adr/0017-provider-errors-are-rewritten-for-consumers.md` 拥有——渠道报的余额、凭证、限流与参数问题都是平台侧故障，不外泄给消费者。
 
 ## 10. Base URL
 
-首期 AIHubMix Channel 默认 Base URL 为 `https://api.inferera.com`，保存时去除尾部 `/`；Adapter 分别拼接 `/v1/images/generations`、`/v1/images/edits` 或 `/ai/v1/...`。Base URL 是 Channel 运行时配置，不写死在 Adapter。
+首期 AIHubMix Channel 默认 Base URL 为 `https://api.inferera.com`，保存时去除尾部 `/`；Adapter 拼接 `/ai/v1/images/generations`。Base URL 是 Channel 运行时配置，不写死在 Adapter。
 
 2026-09-18 已用同一账户完成无费用只读验证：Inferera 域名的 `/ai/v1/images` 和模型 Schema 均返回 HTTP 200，且可读取此前的 `gpt-image-2` 任务与三条预期 endpoint。随后实施期受控集成测试已从该域名完成 generations、单图 edits 与 mask edits 三个分支，均取得可核验 token usage；本轮合同收口不重复执行付费 POST。
 

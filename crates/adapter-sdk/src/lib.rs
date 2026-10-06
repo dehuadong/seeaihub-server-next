@@ -1,5 +1,6 @@
 use seeai_domain::{ImageBranch, ProviderCostSource, TokenUsage};
 use serde::{Deserialize, Serialize};
+use serde_json::Value;
 use std::fmt::{Debug, Formatter};
 use thiserror::Error;
 
@@ -79,7 +80,9 @@ pub fn is_http_url(value: &str) -> bool {
 #[derive(Debug, Clone)]
 pub struct ProviderSuccess {
     pub images: Vec<GeneratedImage>,
-    pub usage: TokenUsage,
+    /// 有效计量证据。声明成本的渠道给不出 token 分项时为 `None`（设计 0022 §4）；
+    /// 有 token 的渠道照旧给 `Some`。
+    pub usage: Option<TokenUsage>,
     pub response_digest: String,
     /// 上游逐请求标识（例如任务式上游的 task id），**只用于对账**：
     /// 不参与计价，也不属于计量证据（见 `CONTEXT.md` 的 `Generation Attempt`）。
@@ -438,9 +441,14 @@ pub struct AdapterDescriptor {
     /// 这条通路的**上游响应会不会带金额**（`cost`）。
     ///
     /// `true`：终态里能读到实扣金额，`upstream_declared` 那两种形态（成本按声明取、对客按声明
-    /// 金额 × 倍率）发得出去。`false`：上游只回四分项 `usage`，金额由平台按费率自算，声明
+    /// 金额 × 倍率）发得出去。`false`：金额由平台按该供给声明的计费形态自算，声明
     /// `upstream_declared` 的候选发布期就拒——否则受理时收不到金额，结算只能记成本缺口。
     pub declares_cost: bool,
+    /// 这条通路的**成功件会不会带四分项 token 用量**。
+    ///
+    /// 对客选按 token 四档卖的候选要有它：拿不到用量就算不出该收多少钱。`false` 时那种候选
+    /// 发布期就拒，不让每一笔请求都落到对账里。
+    pub provides_token_usage: bool,
     /// 这条通路的字节上限：调用方据此计算一次执行的内存预留。
     pub byte_limits: GatewayByteLimits,
 }
@@ -498,3 +506,74 @@ pub enum AdapterError {
 
 #[cfg(test)]
 mod tests;
+
+// ── 上游声明的金额：十进制 → 微单位（两个渠道共用一处换算）────────────────────────
+
+/// 上游报出来的金额 → 微单位整数。
+///
+/// **换算**这一步不经过浮点：钱乘 1e6 会在边界上悄悄差 1 微单位，而这种差正是"成本对不上账"
+/// 的来源。（JSON 数字本身由 `serde_json` 按双精度解出，那点误差要到十亿量级的金额才会碰到
+/// 微单位，远超这类金额的实际范围。）
+///
+/// 除数字外还接受**字符串形态与指数写法**：这只是**容忍上游的表示差异**——同一家的响应形状
+/// 会随版本变，把可读的金额读出来总好过凭空记一笔成本缺口。它**不是行为承诺**：上游没有承诺
+/// 过用哪种写法，平台也不因此就"支持"了这些形态，读不出来照样按"没拿到"处理。
+///
+/// 负数是上游在说"这笔倒找钱"，平台没有可记的对应事实，按"没拿到"处理。
+pub fn declared_microusd(value: &Value) -> Option<u64> {
+    match value {
+        Value::Number(number) => parse_decimal_microusd(&number.to_string()),
+        Value::String(text) => parse_decimal_microusd(text),
+        Value::Null | Value::Bool(_) | Value::Array(_) | Value::Object(_) => None,
+    }
+}
+
+/// 十进制字面量 → 微单位（小数超过 6 位时四舍五入到第 6 位）。
+///
+/// 判不出确切金额的一律返回 `None`：非数字、负数、指数越界、超出 `u64` 范围。
+/// 只有"上游明说这笔是 0"才得到 `0`——它和"没有金额"是两件事。
+pub fn parse_decimal_microusd(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let (mantissa, exponent) = match text.split_once(['e', 'E']) {
+        Some((mantissa, exponent)) => (mantissa, exponent.trim().parse::<i32>().ok()?),
+        None => (text, 0),
+    };
+    let mantissa = mantissa.strip_prefix('+').unwrap_or(mantissa);
+    if mantissa.starts_with('-') {
+        return None;
+    }
+    let (integer, fraction) = match mantissa.split_once('.') {
+        Some((integer, fraction)) => (integer, fraction),
+        None => (mantissa, ""),
+    };
+    if integer.is_empty() && fraction.is_empty() {
+        return None;
+    }
+    if !integer.bytes().all(|byte| byte.is_ascii_digit())
+        || !fraction.bytes().all(|byte| byte.is_ascii_digit())
+    {
+        return None;
+    }
+    // 数字串去掉小数点，再按 10 的幂移到微单位：金额 × 1e6 = 数字 × 10^(指数 − 小数位数 + 6)。
+    let digits = format!("{integer}{fraction}");
+    let digits = digits.trim_start_matches('0');
+    if digits.is_empty() {
+        return Some(0);
+    }
+    let digits = digits.parse::<u128>().ok()?;
+    let shift = exponent - i32::try_from(fraction.len()).ok()? + 6;
+    let scaled = if shift >= 0 {
+        digits.checked_mul(10_u128.checked_pow(u32::try_from(shift).ok()?)?)?
+    } else {
+        let dropped = usize::try_from(-shift).ok()?;
+        let divisor = 10_u128.checked_pow(u32::try_from(dropped).ok()?)?;
+        let quotient = digits / divisor;
+        // 四舍五入：余数到半个除数就进位。够不到半微单位时结果就是 0，不是"猜了一个数"。
+        if (digits % divisor) * 2 >= divisor {
+            quotient + 1
+        } else {
+            quotient
+        }
+    };
+    u64::try_from(scaled).ok()
+}

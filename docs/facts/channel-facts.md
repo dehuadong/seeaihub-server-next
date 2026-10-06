@@ -70,8 +70,8 @@
 ### 2.4 计量与费率
 
 - 按 Tokens 计费，四档单价（每 1M tokens）：文本输入 `$5` / 图像输入 `$8` / 文本输出 `$10` / 图像输出 `$30`（出处：`out-reference/aihubmix/gpt-image-2.md` 与模型页）。
-- 上游**只返回四分项 token、不返回任何金额字段**；`llms.txt` 写 `Pricing: per-generation`，与模型页的 token 单价表冲突——**以模型页的四档 token 单价为准**。
-- 四档与 `config/bootstrap/` 里各 AIHubMix 素材的 `price_plan` 逐项一致（含 `text_output_microusd_per_million = 10000000`）——素材里这条供给登记的**计价形态**是 `token_rates`（按四分项 token 计量量），那份价目表就是它的参数。
+- 官方目录给出四档 token 单价（出处：`out-reference/aihubmix/gpt-image-2.md` 与模型页），`llms.txt` 写 `Pricing: per-generation`，与那份表冲突。这两处都只是**公开价目**。
+- 实际执行面（`/ai/v1`）**不给 token 分项，只给 `usage.cost`**（USD，可为 `null`）。`config/bootstrap/` 里各 AIHubMix 素材登记的**成本与对客计价形态都是 `upstream_declared`**：成本取那句金额，对客按声明金额 × 倍率 × 折算率。公开的四档价目只是定价参考，不是平台的计量依据。
 - 本阶段按 Tokens 计费，**不考虑缓存档**；逐笔成本价与金额留档在 [`paid-provider-calls.md`](../verification/paid-provider-calls.md)。
 
 ## 3. APIMart

@@ -239,6 +239,7 @@ pub(super) fn descriptor() -> AdapterDescriptor {
         ],
         max_reference_images: 1,
         declares_cost: true,
+        provides_token_usage: true,
         byte_limits: GatewayByteLimits {
             request_wire_bytes: GATEWAY_REQUEST_WIRE_BYTES,
             provider_response_bytes: 8 * 1024 * 1024,

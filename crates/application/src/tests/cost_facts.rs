@@ -30,7 +30,7 @@ fn provider_cost_source_follows_where_the_cost_came_from() {
             currency: "CNY".to_owned(),
         }),
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
         },
     );
@@ -50,7 +50,7 @@ fn provider_cost_source_follows_where_the_cost_came_from() {
         &snapshot,
         &ProviderCost::Computed,
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
         },
     );
@@ -63,7 +63,7 @@ fn provider_cost_source_follows_where_the_cost_came_from() {
         &snapshot,
         &ProviderCost::Unavailable,
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
         },
     );
@@ -119,7 +119,7 @@ fn a_supply_priced_per_image_or_per_call_computes_from_its_unit_price() {
         &per_image,
         &ProviderCost::Computed,
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 3,
         },
     );
@@ -140,7 +140,7 @@ fn a_supply_priced_per_image_or_per_call_computes_from_its_unit_price() {
         &per_call,
         &ProviderCost::Computed,
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 7,
         },
     );
@@ -153,7 +153,7 @@ fn a_supply_priced_per_image_or_per_call_computes_from_its_unit_price() {
         &declared_by_upstream,
         &ProviderCost::Computed,
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 3,
         },
     );
@@ -205,7 +205,7 @@ fn the_cost_is_converted_with_the_frozen_rate_of_its_own_currency() {
             currency: "USD".to_owned(),
         }),
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
         },
     );
@@ -220,7 +220,7 @@ fn the_cost_is_converted_with_the_frozen_rate_of_its_own_currency() {
             currency: "CNY".to_owned(),
         }),
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
         },
     );
@@ -257,7 +257,7 @@ fn the_recorded_computed_cost_is_not_the_consumer_charge() {
         .expect("cost rates price the usage");
     let charge = snapshot
         .charge_microusd(ChargeFacts {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
             declared_cost_microusd: None,
         })
@@ -268,7 +268,7 @@ fn the_recorded_computed_cost_is_not_the_consumer_charge() {
         &snapshot,
         &ProviderCost::Computed,
         CostInputs::Succeeded {
-            usage: &usage,
+            usage: Some(&usage),
             images: 1,
         },
     );

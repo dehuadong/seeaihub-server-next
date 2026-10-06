@@ -180,7 +180,8 @@ impl TokenUsage {
 pub struct MeteringEvidence {
     pub attempt_id: AttemptId,
     pub provider_response_digest: String,
-    pub usage: TokenUsage,
+    /// 有效计量证据；声明了成本的渠道可以没有 token 分项（ADR 0006 的放宽）。
+    pub usage: Option<TokenUsage>,
 }
 
 /// 一次执行的**成本来源**：判据是"成本从哪来"，不是"金额对不对"。**三态**：
@@ -353,11 +354,19 @@ pub struct ConsumerRatesCny {
 /// 不是"金额为 0"。
 pub struct ChargeFacts<'a> {
     /// 本次实际用量（按 token 计量量的候选读它）。
-    pub usage: &'a TokenUsage,
+    ///
+    /// 声明了成本的渠道可以没有 token 分项（ADR 0006 的放宽）：那条通路只读
+    /// `declared_cost_microusd`，`None` 不影响它。
+    pub usage: Option<&'a TokenUsage>,
     /// 本次**产出的张数**（按张计价的候选读它）。
     pub images: usize,
     /// 上游这次声明的金额（上游直接给金额的候选读它）；没声明就是 `None`。
     pub declared_cost_microusd: Option<u64>,
+}
+
+/// 按 token 计价的算式要的那些 token：成功件没有分项就明确失败，不当 0。
+fn evidence(usage: Option<&TokenUsage>) -> Result<&TokenUsage, DomainError> {
+    usage.ok_or(DomainError::MissingMeteringEvidence)
 }
 
 /// 一次算钱要用的四档费率，**按名字**取数。
@@ -1053,8 +1062,8 @@ impl PriceSnapshot {
     pub fn charge_microusd(&self, facts: ChargeFacts<'_>) -> Result<u64, DomainError> {
         match self.consumer_formula() {
             PricingFormula::TokenRates => match (&self.consumer_rates_cny, &self.rates) {
-                (Some(rates), _) => rates.amount_microusd(facts.usage),
-                (None, Some(rates)) => rates.amount_microusd(facts.usage),
+                (Some(rates), _) => rates.amount_microusd(evidence(facts.usage)?),
+                (None, Some(rates)) => rates.amount_microusd(evidence(facts.usage)?),
                 (None, None) => Err(DomainError::MissingConsumerRate),
             },
             PricingFormula::UpstreamDeclared => {
@@ -1287,6 +1296,10 @@ pub enum DomainError {
     /// **不按 0 结算**——0 元等于白送。
     #[error("no consumer rate basis to charge this supply with")]
     MissingConsumerRate,
+    /// 按 token 计价的候选拿到一个没有 token 分项的成功件：算不出该收多少钱。
+    /// **不按 0 结算**——不能拿缺证据当免费。
+    #[error("this offering prices by token rates, but the result carries no metering evidence")]
+    MissingMeteringEvidence,
 }
 
 #[cfg(test)]

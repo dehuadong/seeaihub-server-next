@@ -228,7 +228,7 @@ fn evidence(attempt_id: AttemptId, digest: &str) -> MeteringEvidence {
     MeteringEvidence {
         attempt_id,
         provider_response_digest: digest.to_owned(),
-        usage: usage(),
+        usage: Some(usage()),
     }
 }
 

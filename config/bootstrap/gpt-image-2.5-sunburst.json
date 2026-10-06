@@ -1,5 +1,5 @@
 {
-  "_comment": "gpt-image-2.5-sunburst 的运行时发布素材（合同 + 多供给形状）：顶层 capability_schema 是这个 Vendor Model 的**厂商合同**（客户端按它提交），下面两条 offering 各带自己的**承载面**与**参数映射**——AIHubMix 走 OpenAI 兼容面（首选），APIMart 走任务式面（次选）。APIMart 的承载面统一按**像素**声明 size（默认 auto）：渠道文档明确「size 用精确像素格式时 resolution 会被忽略」，因此不需要比例/档位换算，也不需要一次产出两个字段。顶层 gateway_model（平台对客名）可省略：缺省时回退取 native_model_id，所以这份种子素材的对客名就是厂商原生名；对客名由管理员发布时自己填、可以与厂商原生名不同，那个例子见端到端用例。",
+  "_comment": "gpt-image-2.5-sunburst 的运行时发布素材（合同 + 多供给形状）：顶层 capability_schema 是这个 Vendor Model 的**厂商合同**（客户端按它提交），下面两条 offering 各带自己的**承载面**与**参数映射**——AIHubMix 走 `/ai/v1` 的图片面（首选），APIMart 走任务式面（次选）。APIMart 的承载面统一按**像素**声明 size（默认 auto）：渠道文档明确「size 用精确像素格式时 resolution 会被忽略」，因此不需要比例/档位换算，也不需要一次产出两个字段。顶层 gateway_model（平台对客名）可省略：缺省时回退取 native_model_id，所以这份种子素材的对客名就是厂商原生名；对客名由管理员发布时自己填、可以与厂商原生名不同，那个例子见端到端用例。",
   "_status": "已发布到开发库（seeai_next）；生产未批准。",
   "_evidence": {
     "总览": "厂商一手：out-reference/openai/openai-images-generate-2026-09-20.md 与 out-reference/openai/openai-images-edit-2026-09-20.md（2026-09-20 抓取的 OpenAI 官方端点页，model 枚举与各字段说明都明确列出 gpt-image-2.5-flare/-sunburst）；家族面旧快照 out-reference/openai/openai-images-api.md 另存一份（其头注同样载明 2.5 两款）。渠道面：out-reference/aihubmix/schema-gpt-image-2.5-sunburst.endpoints.json 与 out-reference/apimart/gpt-image-2.5-generation.cn.md。",
@@ -22,10 +22,10 @@
     "offering.apimart.rename": "渠道面：参考图字段是 `image_urls`（字符串数组，≤16）、遮罩是 `mask_url`，合同字段叫 `image`/`mask`，因此用 `rename` 落到渠道字段名上（受控实测见 out-reference/apimart/controlled-probe-2026-09-19.json）。2026-09-20 又做了两次真实调用（同一请求带/不带 `mask_url`）：先上传参考图与遮罩换公网 URL，再提交生成——两次都是提交 200 拿到 `task_id`、轮询到 `completed`，且 `usage` 与 `cost` **完全相同**，说明 2.5 接受 `mask_url`（该字段不在 2.5 的生成文档里）；遮罩是否真的**生效**只有弱信号，未严格证明（生成随机、无 seed）。",
     "offering.apimart.moderation": "渠道面：文档写明未传 `moderation` 时 APIMart 自己用 `low`，与厂商默认 `auto` 不同；本版没有注入显式默认值，调用方没给时仍由渠道按自己的默认处理（差异已登记，是否由映射钉死待定）。",
     "restrictions": "可走的分支沿用同一型号旧素材的声明。收图上限按承载面形态定：参考图声明成数组（`maxItems` 16），所以 `max_reference_images` 是 16；两者必须一致，见 offering.aihubmix.image_inputs。",
-    "price_plan": "两家渠道的**计价形态不同**，各按自己的事实登记：AIHubMix 按四分项 token 计量量计价（文本输入 $5 / 图像输入 $8 / 文本输出 $10 / 图像输出 $30，每 1M tokens，来源 URL 见它的 price_plan），APIMart **直接在上游终态给实扣金额**（`cost`，实测样例 0.011354）——它没有自己的计价参数，因此不发费率表，只声明成本币种 USD。",
-    "consumer_rates_cny": "**测试值**：AIHubMix 的四档对客 CNY 费率 = 该渠道成本单价（四档费率）× 倍率 1.2 × 折算率 7.1（USD → CNY）——文本输入 42.6 / 图像输入 68.16 / 文本输出 85.2 / 图像输出 255.6 元每 1M tokens。它只是这条供给的**测试价**：按 token 计量量的候选由运营按同一条乘法推导或直接录入，发布与结算都不读这里的注释。",
+    "price_plan": "两家渠道的**计价形态不同**，各按自己的事实登记：AIHubMix 的图片执行面（`/ai/v1`）在任务终态**直接声明实扣金额**（`usage.cost`，USD，实测样例 0.026436 与 0.01422，可能为 `null`），所以成本与对客计价形态都登记成 `upstream_declared`，不发费率表；公开的四档 token 单价只是定价参考。APIMart **也在上游终态给实扣金额**（`cost`，实测样例 0.011354），同样只声明成本币种 USD。",
+    "consumer_rates_cny": "**这条供给不带对客 token 费率向量**：对客计价形态是 `upstream_declared`，按声明金额 × 倍率 × 折算率算。公开的四档 CNY 费率（42.6 / 68.16 / 85.2 / 255.6 元每 1M tokens）只在按 token 计量量卖时用得上，这里只作定价参考。",
     "markup_bps": "**测试值 2000**（倍率 1.2）：运营按网关模型录入的加价系数，随修订发布、随 Job 快照冻结。代码里没有它的默认值——按张 / 按次 / 上游给金额的候选的对客价全靠它算出来。",
-    "pricing_reference": "**测试值**：两条供给的参考成本都取 APIMart 实测声明过的 11354 微美元（AIHubMix 那条按 `computed`、APIMart 那条按 `declared`）——它只作定价参考，不是售价的被乘数。",
+    "pricing_reference": "**测试值**：两条供给的参考成本都取 APIMart 实测声明过的 11354 微美元（两条供给都按 `declared`）——它只作定价参考，不是售价的被乘数。",
     "floor_amounts": "**测试值**：OpenAI 系按 `size` 给的保底额（CNY）——1K ¥0.16 / 2K ¥0.25 / 4K ¥0.3，`quality` 维留空备用；两条供给的封顶保底值都是 4K 那一档。保底额只用于受理时的预授权，不由售价派生。",
     "offerings_apimart_price": "APIMart 这条供给**没有**对客四档向量：它的对客价 = 上游这次声明的金额 × 倍率 1.2 × 折算率 7.1（受理时把倍率与折算率随快照冻结）。"
   },
@@ -68,7 +68,7 @@
       "mask": { "type": "string" }
     },
     "allOf": [
-      { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
+      { "if": { "required": ["mask"] }, "then": { "required": ["images"] } },
       {
         "if": {
           "properties": { "background": { "const": "transparent" } },
@@ -115,7 +115,7 @@
         "properties": {
           "model": { "const": "gpt-image-2.5-sunburst" },
           "prompt": { "type": "string", "minLength": 1, "maxLength": 32000 },
-          "image": {
+          "images": {
             "type": "array",
             "items": { "type": "string" },
             "minItems": 1,
@@ -129,37 +129,39 @@
             "anyOf": [{ "const": "auto" }, { "pattern": "^[0-9]+x[0-9]+$" }]
           },
           "output_format": { "type": "string", "enum": ["png", "jpeg", "webp"], "default": "png" },
-          "quality": {
-            "type": "string",
-            "enum": ["low", "medium", "high", "xhigh", "max", "auto"],
-            "default": "auto"
-          },
-          "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
-          "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
-          "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" }
+          "extra": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {
+              "quality": {
+                "type": "string",
+                "enum": ["low", "medium", "high", "xhigh", "max", "auto"],
+                "default": "auto"
+              },
+              "output_compression": { "type": "integer", "minimum": 0, "maximum": 100, "default": 100 },
+              "background": { "type": "string", "enum": ["auto", "opaque", "transparent"], "default": "auto" },
+              "moderation": { "type": "string", "enum": ["auto", "low"], "default": "auto" }
+            }
+          }
         },
         "allOf": [
-          { "if": { "required": ["mask"] }, "then": { "required": ["image"] } }
+          { "if": { "required": ["mask"] }, "then": { "required": ["images"] } }
         ]
       },
-      "parameter_mapping": {},
-      "formula": "token_rates",
-      "price_plan": {
-        "currency": "USD",
-        "text_input_microusd_per_million": 5000000,
-        "image_input_microusd_per_million": 8000000,
-        "text_output_microusd_per_million": 10000000,
-        "image_output_microusd_per_million": 30000000,
-        "source_url": "https://aihubmix.com/model/gpt-image-2.5-sunburst"
+      "parameter_mapping": {
+        "rename": {
+          "image": "images",
+          "quality": "extra.quality",
+          "background": "extra.background",
+          "moderation": "extra.moderation",
+          "output_compression": "extra.output_compression"
+        }
       },
-      "consumer_rates_cny": {
-        "text_input_micros_per_million": 42600000,
-        "image_input_micros_per_million": 68160000,
-        "text_output_micros_per_million": 85200000,
-        "image_output_micros_per_million": 255600000
-      },
+      "formula": "upstream_declared",
+      "consumer_formula": "upstream_declared",
+      "cost_currency": "USD",
       "reference_cost_microusd": 11354,
-      "cost_basis": "computed",
+      "cost_basis": "declared",
       "floor_amounts": {
         "amounts": { "1K": 160000, "2K": 250000, "4K": 300000 },
         "cap_microusd": 300000

@@ -17,14 +17,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -52,16 +45,16 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     );
 
     let snapshot = frozen_snapshot(&harness.pool, &key).await;
-    assert_eq!(
-        snapshot["consumer_rates_cny"],
-        priced_consumer_rates(),
-        "对客费率向量必须与后台设定逐位一致"
+    // 这条供给按上游声明的金额加价，不带对客 token 费率向量。
+    assert!(
+        snapshot["consumer_rates_cny"].is_null(),
+        "声明金额形态不带对客 token 费率向量"
     );
     assert_eq!(snapshot["hold_microusd"], json!(250_000), "2K 档的保底额");
     assert_eq!(snapshot["hold_source"], json!("tier"));
     assert_eq!(snapshot["cost_currency"], json!("USD"));
     assert_eq!(snapshot["reference_cost_microusd"], json!(11_354));
-    assert_eq!(snapshot["cost_basis"], json!("computed"));
+    assert_eq!(snapshot["cost_basis"], json!("declared"));
     assert_eq!(snapshot["markup_bps"], json!(2_000));
     assert_eq!(snapshot["fx_rate"]["currency"], json!("USD"));
     assert_eq!(snapshot["fx_rate"]["rate_micros"], json!(7_100_000));
@@ -94,8 +87,8 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
             .await
             .expect("hold");
     assert_eq!(held, 250_000);
-    // 实收 = 对客费率向量 × 实际用量：14 文本输入 × 40 + 196 图像输出 × 220（每 1M）。
-    assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    // 实收 = 上游声明的金额 × 修订级倍率 × 冻结折算率（这条供给按声明金额计价）。
+    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
     // **管理员读调用明细**：逐笔生成、带请求任务 ID、型号、张数与扣费（`#40`）。
     let usage = client
         .get(format!(
@@ -115,7 +108,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     assert_eq!(row["type"], json!("image"), "{usage}");
     assert_eq!(row["usage"]["images"], json!(1), "{usage}");
     // 账本里的 `capture` 是负数（钱从账上出去），明细直接给这个和；界面上按"扣费"显示绝对值。
-    assert_eq!(row["charged_microusd"], json!(-43_680));
+    assert_eq!(row["charged_microusd"], json!(-96_737));
     // **账本读能按类别过滤**：充值记录只看 `credit`；未知类别**拒**而不是静默回空。
     let credits = client
         .get(format!(
@@ -173,30 +166,21 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
         StatusCode::BAD_REQUEST,
         "hold 不再是流水科目，必须拒"
     );
-    // 成本 = 原币种原值 + 折算后 CNY：5950 微美元 × 7.1 = 42245 微元。
+    // 成本 = 上游声明的原值 + 折算后 CNY：11 354 微美元 × 7.1 = 80 614 微元。
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
-    assert_eq!(amount, Some(5_950));
+    assert_eq!(amount, Some(11_354));
     assert_eq!(currency.as_deref(), Some("USD"));
-    assert_eq!(source.as_deref(), Some("computed"));
-    assert_eq!(cny, Some(42_245));
+    assert_eq!(source.as_deref(), Some("declared"));
+    assert_eq!(cny, Some(80_614));
     // 毛利 = 售价（CNY）− 成本折算后 CNY，两条线分开留痕、可逐笔算出。
-    assert_eq!(43_680 - 42_245, 1_435);
+    assert_eq!(96_737 - 80_614, 16_123);
     // 余额 = 初始 − 实收（受理时先按保底额冻，结算按实际结清）。
     let balance_after_first = account_balance(&harness, job_id).await;
-    assert_eq!(balance_after_first, 1_000_000 - 43_680);
+    assert_eq!(balance_after_first, 1_000_000 - 96_737);
 
-    // ── 重发修订（换对客费率向量与加价系数）**不影响已受理的 Job** ──
-    let mut higher = priced_consumer_rates();
-    higher["image_output_micros_per_million"] = json!(440_000_000);
+    // ── 重发修订（换加价系数）**不影响已受理的 Job** ──
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            higher.clone(),
-            3_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 3_000).await,
         StatusCode::OK
     );
     let next_key = format!("pricing-next-{}", Uuid::new_v4());
@@ -210,21 +194,18 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     let next_snapshot = frozen_snapshot(&harness.pool, &next_key).await;
-    assert_eq!(
-        next_snapshot["consumer_rates_cny"], higher,
-        "新受理的 Job 用新价"
-    );
+    // 这条渠道按上游声明金额加价：冻结下来的是倍率，新受理的 Job 用新倍率算价。
     assert_eq!(next_snapshot["markup_bps"], json!(3_000));
     assert_eq!(
         frozen_snapshot(&harness.pool, &key).await,
         snapshot,
         "已受理 Job 的快照逐位不动"
     );
-    assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
     // 第二笔按新价结算：14 文本输入 × 40 + 196 图像输出 × 440（每 1M） = 86800 微元。
     assert_eq!(
         account_balance(&harness, job_id).await,
-        balance_after_first - 86_800,
+        balance_after_first - 104_798,
         "旧 Job 的金额不动，新 Job 按新价扣"
     );
 
@@ -260,19 +241,15 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
         "model": {"const": model},
         "prompt": {"type": "string", "minLength": 1}
     }));
+    // 宽的那份：模型专属字段按线上形态收进 `extra` 容器，映射把合同的 `quality` 指进去。
     let wide = surface_schema(json!({
         "model": {"const": model},
         "prompt": {"type": "string", "minLength": 1},
-        "quality": {"type": "string", "enum": ["low", "high"]}
+        "extra": {
+            "type": "object",
+            "properties": {"quality": {"type": "string", "enum": ["low", "high"]}}
+        }
     }));
-    // 便宜得离谱的那份：这次的用量按它算只有 14 × 1 + 196 × 1 = 210 微元。
-    let cheap = json!({
-        "text_input_micros_per_million": 1_000_000,
-        "image_input_micros_per_million": 1_000_000,
-        "text_output_micros_per_million": 1_000_000,
-        "image_output_micros_per_million": 1_000_000
-    });
-
     let mut first = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     // 承载面走新名字：这一份发布带**模型级合同**，候选自带的旧 `capability_schema` 不该再充当
     // 合同（两份不同的旧字段会让归一期拒掉整份发布）。
@@ -284,21 +261,26 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     first["base_url"] = Value::String(harness.upstream_base_url.clone());
     first["reference_cost_microusd"] = json!(11_354);
     first["cost_basis"] = json!("computed");
-    first["consumer_rates_cny"] = cheap;
+    // 这条候选换了渠道，对客形态也要跟着它的事实走：APIMart 给得出四分项用量，按 token 四档卖。
+    first["consumer_formula"] = json!("token_rates");
+    // 这条候选留在 APIMart：它给得出四分项用量，按 token 四档卖要有那份对客费率向量。
+    first["consumer_rates_cny"] = priced_consumer_rates();
     first["tier_prices"] = json!({});
     first["floor_amounts"] = openai_floor_amounts();
 
     let mut second = first.clone();
     second["carrier_schema"] = wide;
+    second["parameter_mapping"] = json!({"rename": {"quality": "extra.quality"}});
+    second["consumer_formula"] = json!("upstream_declared");
+    second["consumer_rates_cny"] = Value::Null;
     second["reference_cost_microusd"] = json!(999_999);
-    second["consumer_rates_cny"] = priced_consumer_rates();
 
     // 在克隆**之后**把**不被命中**的那条换到另一个渠道：命中那条保持 AIHubMix，
     // 请求才会打到本用例已经起好的假上游。
     first["provider_kind"] = json!("APIMart");
     first["adapter_key"] = json!("apimart-image-v1");
 
-    // 加价系数**不给**：对客费率向量是直接录入的，那一步用不上它（发布期不再强制）。
+    // 两个候选的定价参考差得很远，实收都不该受它影响：这条供给按上游声明的金额加价。
     assert_eq!(
         publish_on_revision(
             &harness,
@@ -306,11 +288,11 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
             "two-candidates-1",
             contract.clone(),
             vec![first.clone(), second.clone()],
-            None,
+            Some(2_000),
         )
         .await,
         StatusCode::OK,
-        "直接录入对客费率向量、不填加价系数也必须发得出去"
+        "两条候选各带自己的定价参考，发布应当成功"
     );
 
     let (_, api_key) =
@@ -331,11 +313,8 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     assert_eq!(state, "succeeded");
 
     let snapshot = frozen_snapshot(&harness.pool, &key).await;
-    assert_eq!(
-        snapshot["consumer_rates_cny"],
-        priced_consumer_rates(),
-        "快照冻的是**命中候选**那一份向量"
-    );
+    // 声明金额形态不带对客 token 费率向量；命中的是哪条候选由下面的 offering_id 钉住。
+    assert!(snapshot["consumer_rates_cny"].is_null());
     let hit: Uuid = snapshot["hit_candidate"]["offering_id"]
         .as_str()
         .expect("the frozen snapshot names the hit candidate")
@@ -356,7 +335,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     // 实收按**命中候选**的向量算：14 文本输入 × 40 + 196 图像输出 × 220（每 1M）。
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -43_680,
+        -96_737,
         "拿优先级 0 那份便宜向量算就是 -210，两者差得很远"
     );
 
@@ -374,7 +353,8 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
             "two-candidates-2",
             contract,
             vec![first, repriced],
-            None,
+            // 命中的那条按上游声明的金额加价，倍率是它的对客价来源。
+            Some(2_000),
         )
         .await,
         StatusCode::OK
@@ -399,12 +379,12 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     );
     assert_eq!(
         harness.captured_microusd(next_job).await,
-        -43_680,
+        -96_737,
         "参考成本只是定价参考：对客实收只随 `consumer_rates_cny` 变"
     );
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -43_680,
+        -96_737,
         "已受理 Job 的金额不动"
     );
 
@@ -428,14 +408,7 @@ async fn the_hold_resolves_the_tier_then_walks_the_supply_floor_chain() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK
     );
     // 充得多一点：`n = 10` 那几笔的保底额按张数放大，1_000_000 会直接撞上准入闸门。
@@ -572,13 +545,13 @@ async fn an_unpriced_revision_and_an_empty_floor_table_fall_back_to_the_platform
     );
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -5_950,
-        "结算也走旧口径：已发布费率 × 实际用量"
+        -96_737,
+        "结算按上游声明的金额 × 倍率 × 折算率"
     );
 
     // 2) 有定价、但保底表里什么都没有：连封顶保底值也没有 ⇒ 平台兜底。
     assert_eq!(
-        republish_priced(&harness, &client, json!({}), priced_consumer_rates(), 2_000).await,
+        republish_priced(&harness, &client, json!({}), 2_000).await,
         StatusCode::OK
     );
     assert_eq!(
@@ -610,7 +583,6 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
             &harness,
             &client,
             json!({"amounts": {"1K": 1_000}, "cap_microusd": 1_000}),
-            priced_consumer_rates(),
             2_000
         )
         .await,
@@ -637,9 +609,9 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
     );
     let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
-    assert_eq!(harness.captured_microusd(job_id).await, -43_680);
+    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
     let balance = account_balance(&harness, job_id).await;
-    assert_eq!(balance, 1_000 - 43_680, "结算按实际扣：差额把余额扣成负数");
+    assert_eq!(balance, 1_000 - 96_737, "结算按实际扣：差额把余额扣成负数");
     assert!(balance < 0);
     let cases: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
@@ -741,14 +713,7 @@ async fn the_admin_view_lists_the_published_pricing() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK
     );
 
@@ -758,10 +723,10 @@ async fn the_admin_view_lists_the_published_pricing() {
     let view = &admin["gateway_models"][0];
     assert_eq!(view["markup_bps"], json!(2_000), "加价系数是修订级的");
     let candidate = &view["candidates"][0];
-    assert_eq!(candidate["consumer_rates_cny"], priced_consumer_rates());
+    assert!(candidate["consumer_rates_cny"].is_null());
     assert_eq!(candidate["reference_cost_microusd"], json!(11_354));
     assert_eq!(candidate["cost_currency"], json!("USD"));
-    assert_eq!(candidate["cost_basis"], json!("computed"));
+    assert_eq!(candidate["cost_basis"], json!("declared"));
     assert_eq!(candidate["tier_prices"]["2K"], json!(250_000));
     assert_eq!(candidate["floor_amounts"]["amounts"]["2K"], json!(250_000));
     assert_eq!(candidate["floor_amounts"]["cap_microusd"], json!(300_000));
@@ -824,7 +789,7 @@ async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouche
     assert_eq!(state, "succeeded");
     let first_snapshot = frozen_snapshot(&harness.pool, &key).await;
     assert_eq!(first_snapshot["consumer_formula"], json!("token_rates"));
-    // 对客按四档向量算：14 文本输入 × 40 + 196 图像输出 × 220（每 1M） = 43_680。
+    // 这条候选按对客 token 四档卖（APIMart 给得出四分项用量）：14 文本输入 × 40 + 196 图像输出 × 220。
     assert_eq!(harness.captured_microusd(first_job).await, -43_680);
     let first_cost = harness.attempt_cost(first_job).await;
     assert_eq!(first_cost.0, Some(11_354), "成本取渠道声明的金额");

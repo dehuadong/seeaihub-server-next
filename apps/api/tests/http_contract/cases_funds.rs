@@ -33,16 +33,6 @@ fn sixty_microusd_floor() -> Value {
     json!({"amounts": {"1K": 60, "2K": 60, "4K": 60}, "cap_microusd": 60})
 }
 
-/// 对客费率全 0：这次成功请求的实收因此是 0。
-fn zero_consumer_rates() -> Value {
-    json!({
-        "text_input_micros_per_million": 0,
-        "image_input_micros_per_million": 0,
-        "text_output_micros_per_million": 0,
-        "image_output_micros_per_million": 0
-    })
-}
-
 /// 等到这个幂等键的 Job 落库、并且占用是 `active`；返回 Job 标识。
 async fn wait_for_active_hold(harness: &Harness, key: &str) -> Uuid {
     for _ in 0..200 {
@@ -113,14 +103,7 @@ async fn account_reads_return_settled_balance_held_and_available_together() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            sixty_microusd_floor(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, sixty_microusd_floor(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -214,14 +197,7 @@ async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() 
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            sixty_microusd_floor(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, sixty_microusd_floor(), 2_000).await,
         StatusCode::OK
     );
     let (account_id, api_key) =
@@ -296,14 +272,7 @@ async fn a_replayed_idempotency_key_does_not_reserve_again() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            sixty_microusd_floor(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, sixty_microusd_floor(), 2_000).await,
         StatusCode::OK
     );
     let (account_id, api_key) =
@@ -358,27 +327,23 @@ async fn a_replayed_idempotency_key_does_not_reserve_again() {
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_settlement_with_zero_charge_writes_no_capture_entry() {
+    // 上游这次声明 0：这条供给按声明金额加价，实收因此是 0，结算不该留下任何流水。
+    let mut behaviour = UpstreamBehaviour::aihubmix(SyncImageShape::Url);
+    behaviour.declared_cost = Some(json!(0));
     let harness = Harness::start_with(
         "AIHubMix",
         "aihubmix-image-v1",
         &["prompt_only"],
         None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        behaviour,
         64,
     )
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            sixty_microusd_floor(),
-            zero_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, sixty_microusd_floor(), 2_000).await,
         StatusCode::OK,
-        "零费率也是合法发布"
+        "声明金额计价也是合法发布"
     );
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000).await;
@@ -396,12 +361,15 @@ async fn a_settlement_with_zero_charge_writes_no_capture_entry() {
     let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "结算要走到成功终态");
 
-    let entries: i64 = sqlx::query_scalar("SELECT count(*) FROM ledger.entries WHERE job_id = $1")
-        .bind(job_id)
-        .fetch_one(&harness.pool)
-        .await
-        .expect("job entries");
-    assert_eq!(entries, 0, "零实收不得留下任何流水");
+    // 零实收不得留下**扣费**流水；受理时的预授权是另一回事，由持仓用例管。
+    let captures: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ledger.entries WHERE job_id = $1 AND kind = 'capture'",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("job captures");
+    assert_eq!(captures, 0, "零实收不得留下任何扣费流水");
     assert_eq!(
         database_balance(&harness, &account_id).await,
         1_000,
@@ -441,14 +409,7 @@ async fn a_charge_below_the_authorized_hold_only_restores_available_without_a_re
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK
     );
     let (account_id, api_key) =

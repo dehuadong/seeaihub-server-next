@@ -17,7 +17,7 @@ fn usage() -> TokenUsage {
 /// 三样一起给，是因为"这条供给按什么计价"只有快照自己知道——调用方不该先替它判一次形态。
 fn facts<'a>(usage: &'a TokenUsage) -> ChargeFacts<'a> {
     ChargeFacts {
-        usage,
+        usage: Some(usage),
         images: 1,
         declared_cost_microusd: None,
     }
@@ -813,4 +813,23 @@ fn provider_identifiers_are_bounded_and_never_urls_or_payloads() {
         !is_bounded_provider_identifier(&"a".repeat(MAX_PROVIDER_IDENTIFIER_BYTES + 1)),
         "an over-long value is not an identifier"
     );
+}
+
+/// 按 token 计价的候选拿到一个**没有 token 分项**的成功件：算不出该收多少钱，明确失败。
+///
+/// 这条判据是结算闸门放宽的另一面：声明了成本的渠道可以用那句金额当计量依据，但按 token 计价的
+/// 候选不能拿"没有 token"当 0 元。
+#[test]
+fn a_token_priced_supply_needs_token_evidence() {
+    let snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
+    assert_eq!(
+        snapshot.charge_microusd(ChargeFacts {
+            usage: None,
+            images: 1,
+            declared_cost_microusd: None,
+        }),
+        Err(DomainError::MissingMeteringEvidence)
+    );
+    // 同一份快照，带用量就算得出来：失败的是"没有证据"，不是"没有费率"。
+    assert!(snapshot.charge_microusd(facts(&usage())).is_ok());
 }

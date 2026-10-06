@@ -518,7 +518,7 @@ async fn a_settled_job_leaves_credit_and_capture_in_the_ledger_view() {
     .await;
     let client = Client::new();
     assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        publish_cache_priced(&harness).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );

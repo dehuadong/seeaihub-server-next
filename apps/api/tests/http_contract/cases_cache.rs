@@ -203,7 +203,7 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
     .await;
     let client = Client::new();
     assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
+        publish_cache_priced(&harness).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -301,7 +301,7 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
     assert_eq!(state, "succeeded");
     let _ = job_id;
     let settled = database_balance(&harness, &account_id).await;
-    assert_eq!(settled, 1_000_000 - 43_680, "实收按对客费率向量算");
+    assert_eq!(settled, 1_000_000 - 96_737, "实收按上游声明的金额加价算");
     let cached = harness.cache().balance(&account_id).expect("结算之后缓存");
     assert_eq!(cached["balance_microusd"], json!(settled));
     assert_eq!(
@@ -355,10 +355,7 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
             }
         };
         let client = Client::new();
-        assert_eq!(
-            publish_cache_priced(&harness, priced_consumer_rates()).await,
-            StatusCode::OK
-        );
+        assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
         let (account_id, api_key) =
             funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
         // 充值把缓存写起来之后再把缓存服务关掉：这时"缓存里有一条值、服务却不可用"。
@@ -393,8 +390,8 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
         with_cache, without_cache,
         "缓存不可用与完全没有缓存必须逐位相同（实收、余额、终态、响应体）"
     );
-    assert_eq!(with_cache.0, -43_680, "实收按对客费率向量算");
-    assert_eq!(with_cache.1, 1_000_000 - 43_680);
+    assert_eq!(with_cache.0, -96_737, "实收按上游声明的金额加价算");
+    assert_eq!(with_cache.1, 1_000_000 - 96_737);
 }
 
 /// **陈旧缓存不得拒绝**：缓存里的余额偏低（来源是对账写回，或写穿但已经很旧）→ 判定交给数据库，
@@ -413,10 +410,7 @@ async fn a_stale_balance_entry_never_rejects() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
     let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
@@ -459,7 +453,7 @@ async fn a_stale_balance_entry_never_rejects() {
     // 两次都真的扣了钱（判定交给了数据库），而且没有留下任何"凭缓存拒绝"的审计。
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        1_000_000 - 2 * 43_680
+        1_000_000 - 2 * 96_737
     );
     assert!(
         audit_events(&harness, "balance.precheck_rejected")
@@ -488,10 +482,7 @@ async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
     let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
@@ -521,7 +512,7 @@ async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
     // 判定交给了数据库：真的建了 Job、真的扣了实收，也没有"凭缓存拒绝"的痕迹。
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        1_000_000 - 43_680,
+        1_000_000 - 96_737,
         "数据库确认够并照常结算"
     );
     assert!(
@@ -550,10 +541,7 @@ async fn a_cache_that_says_there_is_enough_still_lets_the_database_refuse() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     // 余额低于 2K 档的保底额 ¥0.25：数据库这一侧本来就不够。
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 100_000).await;
@@ -617,10 +605,7 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, _api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
     // 缓存里放一条版本远高于数据库的快照：它代表"后提交的那次已经写回来了"。
@@ -686,10 +671,7 @@ async fn a_replayed_request_is_never_refused_by_the_cached_balance() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     // 余额刚好够扣一次保底额（¥0.30 ≥ ¥0.25）：受理之后余额就低于保底额了。
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 300_000).await;
@@ -798,10 +780,7 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
 
@@ -883,10 +862,7 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
 
@@ -1023,10 +999,7 @@ async fn an_unavailable_cache_lets_requests_through_instead_of_rate_limiting_the
     )
     .await;
     let client = Client::new();
-    assert_eq!(
-        publish_cache_priced(&harness, priced_consumer_rates()).await,
-        StatusCode::OK
-    );
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
 

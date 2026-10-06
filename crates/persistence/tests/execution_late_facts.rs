@@ -314,7 +314,7 @@ async fn late_accounting_facts_are_received_but_unrelated_ones_are_ignored() {
     late.evidence = Some(MeteringEvidence {
         attempt_id,
         provider_response_digest: "resp-late".to_owned(),
-        usage: usage(),
+        usage: Some(usage()),
     });
     late.provider_cost = Some(ProviderCostFact {
         source: ProviderCostSource::Declared,
@@ -333,7 +333,7 @@ async fn late_accounting_facts_are_received_but_unrelated_ones_are_ignored() {
     mismatched.evidence = Some(MeteringEvidence {
         attempt_id: AttemptId::new(),
         provider_response_digest: "resp-other".to_owned(),
-        usage: usage(),
+        usage: Some(usage()),
     });
     assert_eq!(
         repository
@@ -490,7 +490,7 @@ async fn claimed_accounting_late_facts_carry_the_evidence_and_cost() {
     late.evidence = Some(MeteringEvidence {
         attempt_id,
         provider_response_digest: "resp-claim".to_owned(),
-        usage: usage(),
+        usage: Some(usage()),
     });
     late.provider_cost = Some(ProviderCostFact {
         source: ProviderCostSource::Declared,

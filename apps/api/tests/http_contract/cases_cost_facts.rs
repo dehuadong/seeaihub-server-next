@@ -135,39 +135,6 @@ async fn a_terminal_without_images_or_amount_lands_in_the_cost_gap_list() {
     harness.cleanup().await;
 }
 
-/// 渠道**不给任何金额字段**（AIHubMix）⇒ 成本按本次实际用量与该渠道四档费率自算，
-/// 币种按该渠道声明。它只进成本口径：对客实收另有出处（账本），两者不是同一个量。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_cost_the_channel_never_reports_is_computed_from_the_actual_usage() {
-    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
-    let key = format!("cost-computed-{}", Uuid::new_v4());
-    let (status, body) = harness
-        .sync_json(
-            "/v1/images/generations",
-            &key,
-            route_request(harness.model, "computed cost"),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("自算成本", &body);
-
-    let (job_id, state) = harness.job(&key).await;
-    assert_eq!(state, "succeeded");
-    let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
-    assert_eq!(source.as_deref(), Some("computed"));
-    assert_eq!(currency.as_deref(), Some("USD"));
-    // 实际用量：14 文本输入 × 5 + 196 图像输出 × 30（每 1M） = 5950 微单位。
-    assert_eq!(amount, Some(5_950));
-    assert_eq!(
-        cny,
-        Some(42_245),
-        "受理时冻结的汇率把自算出来的成本折成人民币（5950 × 7.1 向上取整），毛利要用它"
-    );
-    assert_eq!(harness.captured_microusd(job_id).await, -5_950);
-    harness.cleanup().await;
-}
-
 /// 渠道**直接在上游终态给实扣金额**的供给不需要那份四档费率表：它能发布、能受理，成本取上游
 /// 声明的金额（平台没有可算的参数，也不自己编一个）。
 ///
@@ -366,8 +333,8 @@ async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
 /// 能发布、受理、结算；率 1 那一行把**成本**折成 CNY 时逐位不变——代码里没有"这个币种不用
 /// 折算"的分支。
 ///
-/// 渠道币种不是"全平台统一美元"：按张计价的人民币渠道（例如方舟）就是这一条。这里成本形态是
-/// `per_image`（成本按张）、对客形态另有选择；本用例只看成本侧，对客收多少不影响这条事实。
+/// 渠道币种不是"全平台统一美元"：以人民币声明成本的渠道（例如方舟）就是这一条。成本记上游声明
+/// 的原值，同币种折出来逐位不变；对客收多少不影响这条事实。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
@@ -427,12 +394,13 @@ async fn a_cny_supply_publishes_and_is_charged_without_conversion() {
         json!(1_000_000),
         "同币种的折算率就是 1：{snapshot}"
     );
-    // 同币种不产生折算：证明在**成本**侧——记的是原值（300_000 微元），率 1 折出来逐位不变。
+    // 同币种不产生折算：证明在**成本**侧——记的是上游声明的原值，率 1 折出来逐位不变。
     let (amount, currency, source, cny) = harness.attempt_cost(job_id).await;
-    assert_eq!(amount, Some(300_000), "按张的成本 = 一张 × 单价");
+    assert_eq!(amount, Some(11_354), "成本记上游声明的金额，币种取供给声明");
     assert_eq!(currency.as_deref(), Some("CNY"));
-    assert_eq!(source.as_deref(), Some("computed"));
-    assert_eq!(cny, Some(300_000), "率 1 折出来逐位不变");
+    // 这条渠道的执行面总会声明金额，所以成本来源是 `declared`（成本形态只作定价参考）。
+    assert_eq!(source.as_deref(), Some("declared"));
+    assert_eq!(cny, Some(11_354), "率 1 折出来逐位不变");
 
     // 产出张数落在 `image_count`，用量读的就是它：按张计价的这次执行记下的是**实际**张数
     // （假上游一张），不是请求的 `n`，也不是 0。

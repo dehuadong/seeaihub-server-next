@@ -16,14 +16,7 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -170,14 +163,7 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK
     );
 
@@ -383,14 +369,7 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -598,14 +577,7 @@ async fn a_customer_revoked_key_is_rejected_at_the_generation_entry() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -727,14 +699,7 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );
@@ -1140,14 +1105,7 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
     .await;
     let client = Client::new();
     assert_eq!(
-        republish_priced(
-            &harness,
-            &client,
-            openai_floor_amounts(),
-            priced_consumer_rates(),
-            2_000
-        )
-        .await,
+        republish_priced(&harness, &client, openai_floor_amounts(), 2_000).await,
         StatusCode::OK,
         "带定价的发布必须成功"
     );

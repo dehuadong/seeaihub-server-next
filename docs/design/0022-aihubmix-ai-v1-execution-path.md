@@ -1,8 +1,8 @@
 主题: AIHubMix 执行路径改走 /ai/v1：URL 参考图、任务标识与成本口径
 当前修订: v1
-状态: 待接受
+状态: 已接受
 承接: [同步图片网关 Spec](../specs/0005-synchronous-image-gateway.md) §1–§6；渠道事实见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) §2
-依赖: [同步网关设计](0017-synchronous-image-gateway.md)、[ADR 0006 计量证据](../adr/0006-metering-evidence.md)、[ADR 0007 对账](../adr/0007-reconciliation-instead-of-automatic-retry.md)
+依赖: [同步网关设计](0017-synchronous-image-gateway.md)、[ADR 0006 计量证据](../adr/0006-no-settlement-without-metering-evidence.md)、[ADR 0007 对账](../adr/0007-reconciliation-instead-of-automatic-retry.md)
 
 # AIHubMix 执行路径改走 `/ai/v1`
 
@@ -54,13 +54,13 @@ Invalid type for 'image[]': expected a file, but got a string instead.
 - `cost` 可能为 `null`（历史任务里有）。空值按**成本缺口**记（`ProviderCost::Unavailable`），不猜金额。
 - **没有任何 token 分项**：`usage` 只有 `cost` 一个字段。这条通路的成功件因此没有四分项计量证据。
 
-## 5. 未决的合同决定
+## 5. 合同变化
 
-以下三项超出本稿权限，需在你这一层定：
+三件事与本设计一起落定：
 
-1. **成功件必须有计量证据这条规则要改。** 现行规则是"成功件 `usage` 必须为 `Some`"（[ADR 0006](../adr/0006-metering-evidence.md)）。本通路给不出 token，只能 `None`。改成"声明了成本的渠道，成功件允许没有 token 分项"。
-2. **对客计价形态要对齐。** 现行供给用 `token_rates` 按 token 计价，本通路没有 token。可选项是按上游声明成本加价（`upstream_declared` + `markup_bps`）——与 APIMart 同一形态。
-3. **`prompt_only` 分支是否一起搬。** 搬＝整条渠道一个形状、`declares_cost` 单一取值、成本取上游实际扣费；不搬＝保留 `/v1` 的 token 分项，但同一 adapter 内两种成本形态并存，`declares_cost` 无法用一个布尔表达。
+1. **成功件允许没有 token 分项。** 结算闸门按 [ADR 0006](../adr/0006-no-settlement-without-metering-evidence.md) 的原文对齐：计量形态跟着渠道的计费方式走，声明了成本的渠道就用那句金额；按 token 计价的算式拿到没有证据的成功件时明确失败（`DomainError::MissingMeteringEvidence`），不按 0 结算。
+2. **对客计价形态按上游声明金额加价**：`consumer_formula: upstream_declared`（声明金额 × 冻结倍率 × 冻结折算率），成本同样取声明金额。发布期按驱动器能力把关——对客选 `token_rates` 要求这条通路能提供四分项用量（`AdapterDescriptor::provides_token_usage`），给不出就在发布期拒并点名。
+3. **`prompt_only` 一起搬**：整条渠道一个形状，同一 adapter 内不并存两种成本形态。
 
 ## 6. 失败与对账
 
@@ -72,7 +72,7 @@ Invalid type for 'image[]': expected a file, but got a string instead.
 
 | 面 | 改动 |
 | --- | --- |
-| `crates/adapter-aihubmix` | 端点、请求体（`image`/`images`/`mask` 传 URL 字符串）、结果取响应里的 `b64_json`、成本取 `usage.cost`；`declares_cost` 改成 `true`；按任务 id 查计量 |
+| `crates/adapter-aihubmix` | 端点、请求体（`images` 字符串数组与 `mask` 传公网 URL）、结果取响应里的 `b64_json`、成本取 `usage.cost`；`declares_cost` 与 `provides_token_usage` 各一个取值 |
 | Runtime Revision | 该渠道的供给要重新发布（计价形态与承载面） |
 | `crates/domain` 的参数映射与 `crates/application` 的发布校验 | 允许把合同字段落进承载面的容器字段（`extra.<名>`），请求体嵌套写出 |
 | `docs/facts/channel-facts.md` §2 | 端点表、字段面、成本与计量、结果取回、任务查询 |

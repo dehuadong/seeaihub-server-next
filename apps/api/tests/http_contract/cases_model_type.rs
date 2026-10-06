@@ -95,7 +95,8 @@ async fn an_inline_publication_requires_a_known_model_type() {
         "route-test-1",
         None,
         vec![draft.clone()],
-        None,
+        // 这条构造体按上游声明的金额计价，倍率是对客价来源。
+        Some(2_000),
     );
     missing.as_object_mut().expect("object").remove("type");
     let (status, body) = post_publication(&client, &harness, &missing).await;
@@ -103,7 +104,13 @@ async fn an_inline_publication_requires_a_known_model_type() {
     assert!(body.contains("type is required"), "{body}");
     assert!(body.contains("no-type-model"), "{body}");
 
-    let mut unknown = publication_body("bad-type-model", "route-test-1", None, vec![draft], None);
+    let mut unknown = publication_body(
+        "bad-type-model",
+        "route-test-1",
+        None,
+        vec![draft],
+        Some(2_000),
+    );
     unknown["type"] = json!("audio");
     let (status, body) = post_publication(&client, &harness, &unknown).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
@@ -126,12 +133,18 @@ async fn a_vendor_model_type_is_immutable_within_a_revision() {
         "route-test-1",
         None,
         vec![draft.clone()],
-        None,
+        Some(2_000),
     );
     let (status, body) = post_publication(&client, &harness, &first).await;
     assert_eq!(status, StatusCode::OK, "{body}");
 
-    let mut second = publication_body("typed-model", "route-test-1", None, vec![draft], None);
+    let mut second = publication_body(
+        "typed-model",
+        "route-test-1",
+        None,
+        vec![draft],
+        Some(2_000),
+    );
     second["type"] = json!("video");
     let (status, body) = post_publication(&client, &harness, &second).await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "改类型必须被拒：{body}");
@@ -172,7 +185,7 @@ async fn an_admitted_usage_row_keeps_the_type_it_was_admitted_with() {
         "route-test-1",
         None,
         vec![draft],
-        None,
+        Some(2_000),
     );
     rebind["gateway_model"] = json!(harness.model);
     rebind["type"] = json!("video");
@@ -206,7 +219,13 @@ async fn a_video_record_reports_an_empty_usage_and_the_summary_counts_only_image
 
     let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     draft["base_url"] = json!(harness.upstream_base_url);
-    let mut video = publication_body("video-model", "route-test-1", None, vec![draft], None);
+    let mut video = publication_body(
+        "video-model",
+        "route-test-1",
+        None,
+        vec![draft],
+        Some(2_000),
+    );
     video["type"] = json!("video");
     let (status, body) = post_publication(&client, &harness, &video).await;
     assert_eq!(status, StatusCode::OK, "{body}");

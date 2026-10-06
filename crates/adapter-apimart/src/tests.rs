@@ -1,6 +1,6 @@
 use super::*;
 use async_trait::async_trait;
-use seeai_adapter_sdk::{ExternalActionRefused, ImageSites};
+use seeai_adapter_sdk::{ExternalActionRefused, ImageSites, parse_decimal_microusd};
 use std::sync::{Arc, Mutex};
 use tokio::io::{AsyncBufReadExt, AsyncReadExt, AsyncWriteExt};
 

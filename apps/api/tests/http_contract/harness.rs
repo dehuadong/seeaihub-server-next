@@ -326,6 +326,9 @@ impl UpstreamBehaviour {
         }
     }
 
+    /// AIHubMix 的假上游行为：这条渠道的完成态任务对象**只回内联 base64**（`content_url` 要
+    /// 平台凭据、平台不取），所以 `SyncImageShape::Url` 对它没有意义——结果与结算的判据都按
+    /// base64 走；`sync_image` 参数留着是为了与另一家的构造体同形。
     fn aihubmix(sync_image: SyncImageShape) -> Self {
         Self {
             provider: ProviderShape::Aihubmix,
@@ -468,16 +471,16 @@ async fn serve_fake_upstream(
         tokio::time::sleep(Duration::from_millis(behaviour.delay_ms)).await;
     }
 
-    // 同步渠道（AIHubMix）：`/v1/images/generations` 与 `/v1/images/edits` 都在同一个响应里
-    // 直接给图片与计量。
+    // 同步渠道（AIHubMix）：`/ai/v1/images/generations` 一步给出完成态任务对象——内联 base64 的
+    // 结果与上游声明的金额。平台不再走 `/v1` 的 multipart 编辑端点。
     if behaviour.provider == ProviderShape::Aihubmix
         && method == "POST"
-        && (path.ends_with("/images/generations") || path.ends_with("/images/edits"))
+        && path.ends_with("/images/generations")
     {
-        let payload = serde_json::to_vec(&sync_image_payload(
+        let payload = serde_json::to_vec(&aihubmix_task_payload(
             behaviour.sync_image,
-            port,
             behaviour.sync_image_b64_bytes,
+            behaviour.declared_cost.as_ref(),
         ))
         .expect("sync body");
         return write_response(socket, 200, "OK", "application/json", &payload).await;
@@ -587,26 +590,37 @@ async fn serve_fake_upstream(
     .await
 }
 
-/// 同步渠道的成功响应：`data[0]` 是要么 `url`、要么 `b64_json`，外加计量证据。
+/// AIHubMix（`/ai/v1`）的成功响应：完成态任务对象。`output[]` 给内联 base64，`usage.cost` 是上游
+/// 声明的实际扣费——这条通路没有 token 分项（设计 0022 §4）。
 ///
 /// `b64_bytes` 非 0 时把 base64 载荷顶到该字节数（内存观测用例用），否则用夹具那张小图。
-fn sync_image_payload(shape: SyncImageShape, port: u16, b64_bytes: usize) -> Value {
-    let image = match shape {
-        SyncImageShape::Url => json!({"url": format!("http://127.0.0.1:{port}/result.png")}),
-        SyncImageShape::Base64 if b64_bytes > 0 => json!({"b64_json": "A".repeat(b64_bytes)}),
-        SyncImageShape::Base64 => json!({"b64_json": STANDARD.encode(PNG_FIXTURE)}),
+fn aihubmix_task_payload(
+    shape: SyncImageShape,
+    b64_bytes: usize,
+    declared_cost: Option<&Value>,
+) -> Value {
+    let b64 = match shape {
+        SyncImageShape::Base64 if b64_bytes > 0 => "A".repeat(b64_bytes),
+        _ => STANDARD.encode(PNG_FIXTURE),
     };
-    json!({
-        "created": 1_790_000_000u64,
-        "data": [image],
-        "usage": {
-            "input_tokens": 14,
-            "input_tokens_details": {"cached_tokens": 0, "image_tokens": 0, "text_tokens": 14},
-            "output_tokens": 196,
-            "output_tokens_details": {"image_tokens": 196, "text_tokens": 0},
-            "total_tokens": 210
-        }
-    })
+    let mut payload = json!({
+        "id": "t_contract_task_1",
+        "object": "image",
+        "model": "gpt-image-2.5-flare",
+        "status": "completed",
+        "error": null,
+        "output": [{"index": 0, "type": "file", "b64_json": b64}],
+        "usage": {"cost": 0.011354},
+        "created_at": 1_790_000_000u64,
+        "completed_at": 1_790_000_060u64,
+        "expires_at": 1_790_007_200u64,
+    });
+    // 金额按用例配置给：`None` 就是响应里**没有它**（成本缺口）。
+    match declared_cost {
+        Some(cost) => payload["usage"]["cost"] = cost.clone(),
+        None => payload["usage"] = json!({}),
+    }
+    payload
 }
 
 async fn write_response(
@@ -947,14 +961,6 @@ async fn serve_alert(
     socket.write_all(head.as_bytes()).await?;
     socket.flush().await
 }
-/// 表单字节里某个**完整部件名**出现的次数。
-///
-/// 名字连引号一起比：`name="image"` 要求 `image` 后面紧跟着引号，所以列表形态的
-/// `name="image[]"` 不会被算成单值 `image`——这正是"多张时不许退回单值"要判的事。
-fn part_name_count(rendered: &str, name: &str) -> usize {
-    rendered.matches(&format!("name=\"{name}\"")).count()
-}
-
 /// 为本次测试创建**独立的空库**。
 ///
 /// `HTTP_CONTRACT_DATABASE_URL` 指向一个可连接的空库；多个端到端测试并行时，
@@ -2140,6 +2146,7 @@ impl Harness {
         sync_wait_seconds: u64,
         mut settings: CaseSettings,
     ) -> Self {
+        // 倍率由 `publication_body` 一处按候选的对客形态补（声明金额计价的候选必须有它）。
         let (database_url, database_name) = isolated_database_url().await;
         let calls: UpstreamCalls = Arc::new(Mutex::new(Vec::new()));
         // 闸门句柄要在 behaviour 交给假上游之前取出来：用例侧拿它等到达、放行。
@@ -2396,20 +2403,19 @@ impl Harness {
 
     /// 某个路径上**最近一次**记录到的生成请求体（JSON 形态）。
     fn submit_body(&self, path: &str) -> Value {
-        let raw = self
-            .recorded()
-            .into_iter()
-            .rfind(|call| call.method == "POST" && call.path == path)
-            .map(|call| call.body)
-            .expect("the driver must submit a generation request");
+        let raw = self.submit_bytes(path);
         serde_json::from_slice(&raw).expect("submit body is JSON")
     }
 
     /// 某个路径上**最近一次**记录到的原始请求体（multipart 形态）。
+    /// 假上游收到的**最近一次**该路径的请求体。
+    ///
+    /// 路径按**后缀**比：两家的生成入口前缀不同（AIHubMix 是 `/ai/v1/images/generations`，
+    /// APIMart 是 `/v1/images/generations`），调用点只写自己关心的那一段就够。
     fn submit_bytes(&self, path: &str) -> Vec<u8> {
         self.recorded()
             .into_iter()
-            .rfind(|call| call.method == "POST" && call.path == path)
+            .rfind(|call| call.method == "POST" && call.path.ends_with(path))
             .map(|call| call.body)
             .expect("the driver must submit a generation request")
     }
@@ -2714,12 +2720,13 @@ fn lite_2k_profile() -> Value {
 }
 
 /// 假上游记录里某条路径上**最近一次**提交报文（JSON 形态）。
+/// 假上游记录里**最近一次**该路径的请求体（路径按后缀比，两家的入口前缀不同）。
 fn last_submit_body(calls: &UpstreamCalls, path: &str) -> Value {
     let raw = calls
         .lock()
         .expect("calls lock")
         .iter()
-        .rfind(|call| call.method == "POST" && call.path == path)
+        .rfind(|call| call.method == "POST" && call.path.ends_with(path))
         .map(|call| call.body.clone())
         .expect("the driver must submit a generation request");
     serde_json::from_slice(&raw).expect("submit body is JSON")
@@ -2850,6 +2857,13 @@ async fn publish_with_mappings(
     let offerings = carriers
         .into_iter()
         .map(|(adapter_key, carrier, parameter_mapping)| {
+            // 对客形态按渠道的能力给：AIHubMix 的成功件没有 token 分项，只能按上游声明的金额加价；
+            // APIMart 给得出四分项用量，沿用按 token 四档卖（这批用例只看参数映射，与计价无关）。
+            let consumer_formula = if adapter_key == "apimart-image-v1" {
+                json!("token_rates")
+            } else {
+                json!("upstream_declared")
+            };
             json!({
                 "provider_kind": if adapter_key == "apimart-image-v1" { "APIMart" } else { "AIHubMix" },
                 "adapter_key": adapter_key,
@@ -2860,6 +2874,7 @@ async fn publish_with_mappings(
                 "carrier_schema": carrier,
                 "parameter_mapping": parameter_mapping,
                 "formula": "token_rates",
+                "consumer_formula": consumer_formula,
                 "price_plan": {
                     "currency": "USD",
                     "text_input_microusd_per_million": 5_000_000,
@@ -2879,17 +2894,24 @@ async fn publish_with_mappings(
         "actor": "contract-test",
         "capability_schema": contract,
         "offerings": offerings,
+        // 有候选按上游声明的金额计价，修订级倍率就是它的对客价来源，必须一起发。
+        "markup_bps": 2_000,
         // 内联发布必须带文档素材：夹具按同版合同生成一份最小素材（Spec 0008 §4）。
         "documentation": documentation_for(&contract)
     });
-    client
+    let response = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
         .json(&body)
         .send()
         .await
-        .expect("runtime publication")
-        .status()
+        .expect("runtime publication");
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        eprintln!("publication refused: {status} {text}");
+    }
+    status
 }
 
 /// 某一份合同的落库事实：`(id, 合同内容, created_at)`。
@@ -2915,7 +2937,7 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
     // 声明 `masked` 就要有遮罩字段。发布期会拒绝不自洽的声明（限制只能收窄）。
     //
     // 字段名还必须落在该 Adapter 声明的参数面里，而两家用的原生名不同：
-    // AIHubMix 收 `image` / `mask`，APIMart 收 `image_urls` / `mask_url`。
+    // 两条渠道各自的线上名：AIHubMix 的参考图叫 `images`、遮罩叫 `mask`，APIMart 用 `image_urls` / `mask_url`。
     let mut properties = json!({
         "model": {"const": "placeholder"},
         "prompt": {"type": "string", "minLength": 1}
@@ -2924,19 +2946,17 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
         .iter()
         .any(|branch| matches!(*branch, "image_conditioned" | "masked"));
     let vendor_names = adapter_key == "apimart-image-v1";
-    let image_parameter = if vendor_names { "image_urls" } else { "image" };
+    // AIHubMix 走 `/ai/v1`：参考图是字符串数组（`images`）、遮罩是单值 `mask`；
+    // APIMart 收 `image_urls` / `mask_url`。
+    let image_parameter = if vendor_names { "image_urls" } else { "images" };
     let mask_parameter = if vendor_names { "mask_url" } else { "mask" };
     if declares_image {
-        properties[image_parameter] = if vendor_names {
-            json!({
-                "type": "array",
-                "items": {"type": "string"},
-                "minItems": 1,
-                "maxItems": 1
-            })
-        } else {
-            json!({"type": "string"})
-        };
+        properties[image_parameter] = json!({
+            "type": "array",
+            "items": {"type": "string"},
+            "minItems": 1,
+            "maxItems": 1
+        });
     }
     if branches.contains(&"masked") {
         properties[mask_parameter] = json!({"type": "string"});
@@ -2955,7 +2975,7 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
             "then": {"required": [image_parameter]}
         }]);
     }
-    json!({
+    let mut offering = json!({
         "provider_kind": provider_kind,
         "adapter_key": adapter_key,
         "provider_model_id": "route-model",
@@ -2978,7 +2998,19 @@ fn candidate(provider_kind: &str, adapter_key: &str, branches: &[&str]) -> Value
             "image_output_microusd_per_million": 30_000_000,
             "source_url": "https://example.invalid/price"
         }
-    })
+    });
+    // 计价形态按渠道的事实：AIHubMix 走 `/ai/v1`，只给上游声明的金额、没有 token 分项，所以
+    // 成本与对客价都按声明金额算；APIMart 仍按四分项 token 计量量，带一份可复现的价目表。
+    if !vendor_names {
+        offering["formula"] = json!("upstream_declared");
+        offering["consumer_formula"] = json!("upstream_declared");
+        offering["cost_basis"] = json!("declared");
+        offering["cost_currency"] = json!("USD");
+        if let Some(object) = offering.as_object_mut() {
+            object.remove("price_plan");
+        }
+    }
+    offering
 }
 
 /// 一次发布里的两条候选必须来自**两个渠道**：供给身份是"模型 + 渠道"唯一，同一渠道发两条会
@@ -3017,15 +3049,29 @@ async fn publish_candidates_with_markup(
     offerings: Vec<Value>,
     markup_bps: Option<i32>,
 ) -> StatusCode {
+    // 按上游声明金额计价（`consumer_formula: upstream_declared`）的候选，对客价靠修订级倍率算
+    // 出来，缺了发布期就拒；夹具走这条发布路径时补一个默认值。**故意不给倍率**的用例各自直接
+    // 组发布体，不受这里影响。
+    let markup_bps = markup_bps.or_else(|| {
+        offerings
+            .iter()
+            .any(|offering| offering["consumer_formula"] == json!("upstream_declared"))
+            .then_some(2000)
+    });
     let body = publication_body(model, "route-test-1", contract, offerings, markup_bps);
-    client
+    let response = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
         .json(&body)
         .send()
         .await
-        .expect("runtime publication")
-        .status()
+        .expect("runtime publication");
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        eprintln!("publication refused: {status} {text}");
+    }
+    status
 }
 
 /// 在**指定修订**上发布一组候选（用夹具那台 API 与它的管理员令牌）。
@@ -3041,14 +3087,19 @@ async fn publish_on_revision(
     markup_bps: Option<i32>,
 ) -> StatusCode {
     let body = publication_body(model, revision, Some(contract), offerings, markup_bps);
-    Client::new()
+    let response = Client::new()
         .post(format!("{}/api/v1/runtime-revisions", harness.base_url))
         .bearer_auth(&harness.admin_token)
         .json(&body)
         .send()
         .await
-        .expect("runtime publication")
-        .status()
+        .expect("runtime publication");
+    let status = response.status();
+    let text = response.text().await.unwrap_or_default();
+    if !status.is_success() {
+        eprintln!("publication refused: {status} {text}");
+    }
+    status
 }
 
 /// 拼一份发布命令：线上名以**承载面**为准，`model.const` 与 `provider_model_id` 都跟着本次型号走。
@@ -3679,13 +3730,9 @@ fn unit_candidate(formula: &str, unit_price_microusd: u64, currency: &str) -> Va
     draft["cost_basis"] = json!("computed");
     draft["tier_prices"] = json!({});
     draft["floor_amounts"] = openai_floor_amounts();
-    draft["consumer_formula"] = json!("token_rates");
-    draft["consumer_rates_cny"] = json!({
-        "text_input_micros_per_million": 7_000_000,
-        "image_input_micros_per_million": 9_000_000,
-        "text_output_micros_per_million": 11_000_000,
-        "image_output_micros_per_million": 40_000_000,
-    });
+    // 对客形态只有 `token_rates` 与 `upstream_declared` 两个取值：按张 / 按次只作**成本**形态，
+    // 对客价按上游声明的金额加价。这条供给声明了成本币种，客户价因此按同币种直接加价、不做折算。
+    draft["consumer_formula"] = json!("upstream_declared");
     draft
 }
 
@@ -3698,14 +3745,15 @@ async fn republish_priced(
     harness: &Harness,
     client: &Client,
     floor_amounts: Value,
-    consumer_rates: Value,
     markup_bps: i32,
 ) -> StatusCode {
     let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     draft["base_url"] = Value::String(harness.upstream_base_url.clone());
     draft["reference_cost_microusd"] = json!(11_354);
-    draft["cost_basis"] = json!("computed");
-    draft["consumer_rates_cny"] = consumer_rates;
+    // 这条渠道的响应只有上游声明的金额、没有 token 分项：成本按声明值记，对客也按声明金额加价。
+    // 对客 token 价目在声明金额形态下永远不会被读，发布期带着它反而被拒。
+    draft["cost_basis"] = json!("declared");
+    draft["consumer_formula"] = json!("upstream_declared");
     draft["tier_prices"] = json!({"1K": 160_000, "2K": 250_000, "4K": 300_000});
     draft["floor_amounts"] = floor_amounts;
     publish_candidates_with_markup(
@@ -4268,16 +4316,9 @@ fn bulk_string(value: &str) -> String {
 }
 
 /// 这次用例发布的定价（与 P2b 的用例同一份口径），让"保底额"与"实收"都是确定的数。
-async fn publish_cache_priced(harness: &Harness, consumer_rates: Value) -> StatusCode {
+async fn publish_cache_priced(harness: &Harness) -> StatusCode {
     let client = Client::new();
-    republish_priced(
-        harness,
-        &client,
-        openai_floor_amounts(),
-        consumer_rates,
-        2_000,
-    )
-    .await
+    republish_priced(harness, &client, openai_floor_amounts(), 2_000).await
 }
 
 /// 该账户在**数据库**里的余额（账本是权威）。

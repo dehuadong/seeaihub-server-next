@@ -88,9 +88,9 @@ async fn direct_job_state(harness: &Harness) -> String {
 /// A1 的最小闭环：开关开着、不启 Worker，JSON 入口经假上游同步返回上游给的 url。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn direct_json_generation_returns_url_without_a_worker() {
+async fn direct_json_generation_returns_inline_base64_without_a_worker() {
     let harness =
-        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Url), 4, 30)
+        Harness::start_direct_aihubmix(UpstreamBehaviour::aihubmix(SyncImageShape::Base64), 4, 30)
             .await;
     let key = format!("direct-url-{}", Uuid::new_v4());
     let (status, body) = post_json(
@@ -103,9 +103,10 @@ async fn direct_json_generation_returns_url_without_a_worker() {
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("direct url", &body);
-    assert!(
-        body["data"][0]["url"].as_str().is_some(),
-        "the upstream url must be returned as is, got {body}"
+    assert_eq!(
+        body["data"][0]["b64_json"].as_str(),
+        Some(STANDARD.encode(PNG_FIXTURE).as_str()),
+        "the task result must come back as inline base64, got {body}"
     );
     assert_eq!(harness.create_calls(), 1, "the provider is called once");
     assert_eq!(
@@ -246,7 +247,8 @@ async fn republish_requiring_style(harness: &Harness) {
             "route-test-2",
             contract,
             vec![draft],
-            None,
+            // 有候选按上游声明的金额计价，修订级倍率是它的对客价来源。
+            Some(2_000),
         )
         .await,
         StatusCode::OK,
