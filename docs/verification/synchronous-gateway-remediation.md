@@ -199,7 +199,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 
 三条都不启 Worker：`200` 本身就是"这条路不依赖 Worker 生成队列或结果轮询"的判据。前两条各钉一种上游形态（`url` 原样交回、`b64_json` 与 `STANDARD.encode(PNG_FIXTURE)` 逐字相等）；第三条把两条入口放在同一个进程里跑通，另覆盖公网 URL 参考图、data URL 参考图与 multipart 文件部件三种输入形态。
 
-生成入口收敛为只收公网 URL 后，本节 A1 的 `edits` 用例要改成用公网 URL 提交（文件部件届时被拒），见[设计 0021](../design/0021-object-storage-upload.md) 分片实施顺序的第 5 片（生成入口收敛）；改版前它跑的还是收敛前的输入形态。
+生成入口已收敛：`/v1/images/edits` 与 `/v1/images/generations` 现在接受同一个 JSON 请求，multipart 正文不再被接受（[Spec 0005](../specs/0005-synchronous-image-gateway.md) v4）。上表的 `edits` 行记录的是收敛前那一次运行。
 
 ### A5
 
