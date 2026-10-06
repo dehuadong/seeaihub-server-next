@@ -54,6 +54,8 @@ async fn drop_isolated_database(name: &str) {
 }
 
 /// 四张表的行数，一次读出来：四个数要同时成立（"第二次没多行"是四张表一起判的）。
+///
+/// 素材里没有价目表（两条渠道都按上游声明的金额计价），那一列因此恒为 0。
 async fn table_counts(pool: &PgPool) -> (i64, i64, i64, i64) {
     let row = sqlx::query(
         r#"
@@ -90,8 +92,9 @@ async fn importing_the_same_material_twice_adds_no_rows() {
         .expect("the first import");
     let after_first = table_counts(&pool).await;
     // 先判"第一遍真的导进去了"，否则行数不变这件事可能只是"什么都没导"。
+    // 两条素材各两家渠道、共四条供给；它们都按上游声明的金额计价，素材里没有价目表。
     assert!(
-        first.materials >= 2 && first.offerings >= 4 && first.price_plans >= 2,
+        first.materials >= 2 && first.offerings >= 4,
         "the material should seed every table: {first:?}"
     );
     assert_eq!(
@@ -118,9 +121,10 @@ async fn importing_the_same_material_twice_adds_no_rows() {
         second.offerings, first.offerings,
         "the second pass sees the same candidates"
     );
+    // 两条渠道都按上游声明的金额计价：素材里没有价目表，两遍都不该新建价目表行。
     assert_eq!(
-        second.price_plans, 0,
-        "the second pass reuses the price plan it already wrote"
+        first.price_plans, 0,
+        "upstream_declared materials carry no price plan"
     );
 
     drop(pool);
