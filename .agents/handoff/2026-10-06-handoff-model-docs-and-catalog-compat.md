@@ -14,7 +14,7 @@
 
 CI 未核实：`0d78004` 之后 `gh` 走 GitHub API 持续代理超时；提交本身已推送成功（HEAD == 上游）。
 
-## 唯一未决项：`/v1/models` 的 OpenAI 兼容
+## 唯一未决项：`/v1/models` 的 OpenAI 兼容（工单 #74，Spec 0009 待接受）
 
 用户指出 `/v1/models` 不符合 OpenAI 兼容标准。现状与标准的差别：
 
