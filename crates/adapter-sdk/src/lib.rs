@@ -10,7 +10,7 @@ pub use gateway::{
     ImageValueShape, InputImage, ProviderOutput, ProviderTaskHandle, ProviderTaskState,
     ProviderTraceId, QueryAccountingCapability, ResponsePayload, begin_generation_send,
     ensure_external_call_allowed, ensure_read_call_allowed, external_call_timeout,
-    gateway_passthrough_parameters,
+    gateway_passthrough_parameters, insert_wire_parameter,
 };
 
 #[derive(Clone)]

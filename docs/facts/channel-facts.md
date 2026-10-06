@@ -24,9 +24,11 @@
 
 | 端点 | 形态 | 平台使用 |
 | --- | --- | --- |
-| `POST /v1/images/generations` | 同步，OpenAI 兼容 JSON | `prompt_only` 分支走它 |
-| `POST /v1/images/edits` | 同步，OpenAI 兼容 multipart | `image_conditioned` / `masked` 分支走它 |
-| `POST /ai/v1/images/generations` | 默认同步，`async: true` 转任务式（`GET /ai/v1/images/{id}` 轮询） | 不使用 |
+| `POST /ai/v1/images/generations` | 默认同步；`async: true` 立即回任务对象，配合 `GET /ai/v1/images/{id}` 轮询 | 平台的图片分支走它（[设计 0022](../design/0022-aihubmix-ai-v1-execution-path.md)）|
+| `GET /ai/v1/images/{id}` | 读任务最新状态 | 轮询与按句柄查计量 |
+| `GET /ai/v1/images` | 读本账户图片任务快照（`after` / `limit` ≤100 / `order`） | 创建响应丢失时找回任务 id |
+| `POST /v1/images/generations` | 同步，OpenAI 兼容 JSON | 不使用 |
+| `POST /v1/images/edits` | 同步，OpenAI 兼容 multipart，**只收文件部件** | 不使用 |
 
 - 机器 Schema（免鉴权）：`https://api.inferera.com/call/schema/models/{model}/endpoints`；`aihubmix.com` 在本机不可达，同一 Schema 在 `api.inferera.com` 上取到（出处：`out-reference/aihubmix/schema-gpt-image-2*.endpoints.json`）。
 - 鉴权：`Authorization: Bearer` + `AIHUBMIX_API_KEY`；输出 URL 约 30 分钟过期，下载需带同一凭据（出处：`out-reference/aihubmix/gpt-image-2.md`）。
@@ -34,8 +36,11 @@
 
 ### 2.2 参数与取值
 
-- 本平台走 `/v1` 族，**没有 `extra` 这一层**：参数落顶层（出处：`out-reference/aihubmix/schema-gpt-image-2*.endpoints.json` 的 `request.schema`）。
-- 字段面：`model` / `prompt` / `image` / `mask` / `n` / `size` / `output_format` / `quality`（`image`、`mask` 只在 edits 端；generations 端没有这两个字段）。平台按**公网 URL 文本部件**把参考图与遮罩逐字透传，不下载、不上传。机器 Schema 把这两个字段声明成 `format: binary`，与渠道文档通用参数表把 `image` 写成 `string`（"参考图片路径"）冲突；真实上游对 URL 文本部件的接受度待一次计费调用确认。
+- `/ai/v1` 有 `extra` 这一层（模型专属扩展落它）；`/v1` 族没有，参数落顶层（出处：`out-reference/aihubmix/schema-gpt-image-2*.endpoints.json` 的 `request.schema`）。
+- `/ai/v1` 的字段面：`model` / `prompt` / `image` / `images` / `mask` / `n` / `size` / `output_format` / `extra` / `async` / `webhook_url` / `webhook_events_filter`；`model` 与 `prompt` 必填，`additionalProperties: false`（出处：同 Schema）。
+- 参考图与遮罩是**媒体引用**：公网 URL 字符串或 `{url}` 对象，也接受 data URI 与裸 base64（`image` 是 `images[0]` 的单值别名）。平台只给公网 URL，逐字透传，不下载、不上传。
+- 渠道文档列出的 `response_format`、`aspect_ratio`、`seed`、`negative_prompt` **不在**这两款模型的 `additionalProperties: false` Schema 里：实测 `response_format` 被硬拒绝（`Unknown request parameter`）。字段面以 Schema 为准。
+- `/v1/images/edits` 的 `image` / `mask` 声明成 `format: binary`，且**只收文件部件**：单值 `image` 与数组 `image[]` 传字符串都被拒（实测 `invalid_type`：`expected one of an array of files or file, but got a string instead`）。
 - `prompt` 必填、`minLength 1`；2.5 另有 `maxLength 32000`。
 - `n`：`1`–`10`，默认 `1`。
 - `quality`：2.5 两款 `low` / `medium` / `high` / `xhigh` / `max` / `auto`（默认 `auto`）；`gpt-image-2` 只有 `low` / `medium` / `high`（机器 Schema 里没有 `auto`）。
@@ -55,7 +60,10 @@
 - 2.5 两款在同步 `/v1` 上与 `gpt-image-2` 同构（顶层字段集合相同，编辑端点同字段面），② 的同步解码器不需要按型号分支。
 - 2.5 的 `/v1/*` 实测：`quality` 顶层传入即被接受（无需 `extra`）；接受并落实 `background=transparent`（响应回显 + 产物是带 alpha 的 RGBA PNG）；两张参考图经重复 `image[]` 部件一次提交成功。
 - 绑定失败与恢复：创建请求失联后没有取回手段（同步响应无 id，且同步调用不出现在 `/ai/v1/images` 任务列表里），只能人工对账（[`docs/adr/0007`](../adr/0007-reconciliation-instead-of-automatic-retry.md)）。
-- 异步 `/ai/v1` 任务对象给出任务 id 与轮询状态，**不返回 `usage`、不返回金额**，因此不作为平台的计量与计费执行路径（出处：`out-reference/aihubmix/response-shapes.md` §3；[`paid-provider-calls.md`](../verification/paid-provider-calls.md) §1）。
+- `/ai/v1` 任务对象给任务 id 与状态（`pending` / `in_progress` / `completed` / `failed` / `cancelled`），**另带 `usage.cost`**（USD，可为 `null`；`pending` 与 `in_progress` 时为 `null`）——异步创建的任务同样如此（2026-10-06 实测：创建 `usage:{"cost":null}`、完成 `0.01422`）。渠道文档的任务对象字段表还没有 `usage`，以实测为准。
+- `/ai/v1` **没有任何 token 分项**：全文检索 `token` 0 次。所以这条通路有成本事实、没有四分项计量证据。
+- 结果取回：`output[]` 每项给 `index`、`type:"file"`、可为空的 `b64_json` 与 `content_url`。**同步响应**的 `b64_json` 非空（实测 2,160,484 字符）；**异步轮询**回来的 `b64_json` 为空，只有 `content_url`。`content_url` 形如 `/ai/v1/images/{id}/content/{result_id}`，**要带创建时的 Bearer**（实测无凭据 401、带凭据 200），且上游列为有下载次数上限、过期回 `410 artifact_expired`（实测 `expires_at` 比完成时间晚 2 小时）。
+- `/ai/v1` 的同步与异步调用都出现在 `GET /ai/v1/images` 列表里，可按 id 与列表查回（`/v1` 的同步调用不出现，故那条路创建响应丢失后无从取回）。
 - 错误信封：`{"error":{"code","message","type"}}`（异步文档另带 `tid`）；实测顶层 `quality` 非法时 HTTP 400 + `code: schema_violation`，**未知参数是硬拒绝、不静默降级**（出处：`out-reference/aihubmix/response-shapes.md` §4）。
 - 错误码表：见 `out-reference/aihubmix/error-code.md`（第一方页面，更新于 2026-06-01）。可用信息的边界：**只有部分状态码带机器可读的错误标识符**（如 `insufficient_user_quota`、`prompt_missing`、`prompt_too_long`、`text_too_long`、`size_not_supported`、`n_not_within_range`），其余只能靠状态码 + 消息文本；该页自述大部分 400 是上游透传报错。`403` 的其余分支（账号禁用、IP 白名单、令牌不支持该模型、渠道被禁用）都是我们与渠道之间的配置/资质问题；该页没有「服务器错误」这一档，`503` 只有「没有可用渠道」与「被官方限速」两种含义。⇒ 分类以状态码兜底，并保留原始文本供人工核对。
 

@@ -685,3 +685,30 @@ fn an_injected_default_can_feed_the_conversion() {
         "被消耗的源字段（哪怕是默认值补进来的）不许再上行：{parameters:?}"
     );
 }
+
+/// 容器落位：`extra.quality` 判的是 `extra` 自己的声明，容器没声明时里面的名字一个都不算。
+#[test]
+fn a_container_field_counts_from_the_containers_own_declaration() {
+    let with_extra = schema(serde_json::json!({
+        "extra": {
+            "type": "object",
+            "additionalProperties": false,
+            "properties": {"quality": {"type": "string"}}
+        }
+    }));
+    assert!(declares_parameter(&with_extra, "extra.quality"));
+    // 容器里的名字只在容器里算：顶层没有声明它。
+    assert!(!declares_parameter(&with_extra, "quality"));
+    assert!(carries_parameter(&with_extra, None, "extra.quality"));
+    // 容器本身没声明：里面的名字一个都不算。
+    let without_container = schema(serde_json::json!({"prompt": {"type": "string"}}));
+    assert!(!declares_parameter(&without_container, "extra.quality"));
+    // 改名落到容器里也算承载：合同字段 quality → 线上 extra.quality。
+    let renames = declared_renames(&serde_json::json!({"rename": {"quality": "extra.quality"}}))
+        .expect("the rename table is well formed")
+        .expect("a rename table is declared");
+    assert_eq!(
+        wire_parameter_name(&with_extra, Some(&renames), "quality").as_deref(),
+        Some("extra.quality")
+    );
+}

@@ -71,10 +71,20 @@ pub fn declared_field_names(schema: &Value) -> Vec<&str> {
     names
 }
 
-/// 一份 schema 是否声明了这个**顶层字段名**（判据与 [`declared_field_names`] 是同一份）。
+/// 一份 schema 是否声明了这个字段名。
+///
+/// 名字里带点表示它落在**容器字段**里：`extra.quality` 判的是 `extra` 自己的 `properties` 或
+/// `required` 里的 `quality`。容器本身必须在顶层被声明（不声明就是没有这个容器），判据与
+/// [`declared_field_names`] 对顶层那一层是同一份。
 #[must_use]
 pub fn declares_parameter(schema: &Value, name: &str) -> bool {
-    declared_field_names(schema).contains(&name)
+    match name.split_once('.') {
+        None => declared_field_names(schema).contains(&name),
+        Some((container, field)) => schema
+            .get("properties")
+            .and_then(|properties| properties.get(container))
+            .is_some_and(|inner| declared_field_names(inner).contains(&field)),
+    }
 }
 
 /// 这个取值算不算"调用方**真的用了**这个字段"。

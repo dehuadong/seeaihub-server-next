@@ -6,7 +6,7 @@ use crate::{
 };
 use async_trait::async_trait;
 use seeai_domain::{ImageBranch, TokenUsage};
-use serde_json::Value;
+use serde_json::{Map, Value};
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -134,6 +134,38 @@ pub fn gateway_passthrough_parameters(input: &GatewayInput) -> Vec<(&String, &Va
                 && !input.image_sites.carries(name)
         })
         .collect()
+}
+
+/// 把一对线上字段名与取值写进请求体。
+///
+/// 名字里带点是**容器字段**（`extra.quality`）：写进 `extra` 对象，同名容器多次写入时合并，
+/// 其余名字写顶层。容器位置上已经有一个非对象取值时明确失败——那说明发布数据把同一个名字既当
+/// 容器又当普通字段，是可判定的声明错误，不静默丢掉这次写入。
+///
+/// # Errors
+///
+/// 容器名字与一个非对象取值冲突时报 [`AdapterError::UnsupportedInput`]。
+pub fn insert_wire_parameter(
+    object: &mut Map<String, Value>,
+    name: &str,
+    value: Value,
+) -> Result<(), AdapterError> {
+    let Some((container, field)) = name.split_once('.') else {
+        object.insert(name.to_owned(), value);
+        return Ok(());
+    };
+    let entry = object
+        .entry(container.to_owned())
+        .or_insert_with(|| Value::Object(Map::new()));
+    match entry {
+        Value::Object(inner) => {
+            inner.insert(field.to_owned(), value);
+            Ok(())
+        }
+        _ => Err(AdapterError::UnsupportedInput(format!(
+            "{container} is written as both a container and a plain value"
+        ))),
+    }
 }
 
 /// 绝对总期限：包 tokio::time::Instant，暂停时钟的用例能控制它（RFC 0017 §8）。
