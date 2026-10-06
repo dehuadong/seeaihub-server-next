@@ -6,8 +6,8 @@
 //!   口径进对账。宁可进对账，也不重投。
 //! - 上游明确拒绝受理（参数/凭证类）⇒ 拒绝来自请求本身，重发一次只会得到同一个答复 ⇒ 不重投。
 //!
-//! 参考图只收公网 URL、由平台原样透传给渠道之后，受理前不再有平台侧的取图动作，
-//! "可证明未受理"这一档在当前两条渠道上没有触发点；重投机制保留给任务查询一类可重试的读。
+//! 现成的触发点是**创建请求被上游明确拒收**（APIMart 的 `429` 与幂等子类）：那一次没有开始
+//! 计费，重投不会付两次。
 //!
 //! 预授权跨 Attempt 保留、只结算一次：重投的不是一笔新业务，重新预授权等于把同一笔钱扣两遍。
 
@@ -191,6 +191,164 @@ async fn a_plain_success_still_leaves_exactly_one_attempt() {
             .await
             .expect("the job must have a hold");
     assert_eq!(hold_status, "captured");
+
+    harness.cleanup().await;
+}
+
+/// 可证明未受理的失败重投一次之后成功：Job 终态 `succeeded`，两行 Attempt 各有自己的号。
+///
+/// 这条用例同时钉住"预授权只扣过一次"：受理时扣的那一笔预授权在重投期间原样保留，最后只在
+/// 成功那一次结算（`ledger.holds` 从 `active` 直接变 `captured`，中间没有 `released` 再扣一遍）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_provably_unaccepted_failure_is_retried_and_the_job_settles_once() {
+    // APIMart 的 `429` 是**可证明未受理**：创建请求被上游明确拒收，那一次没有开始计费，重投不会
+    // 付两次。用"拒一次再正常应答"而不是"一直拒"，是为了看到第二次执行真的成功——那正是重投要
+    // 换来的结果。
+    let behaviour = UpstreamBehaviour {
+        create_rejection_status: 429,
+        create_rejection_times: 1,
+        ..UpstreamBehaviour::apimart()
+    };
+    let harness = Harness::start_with_retry(
+        candidate("APIMart", "apimart-image-v1", &["prompt_only"]),
+        behaviour,
+        64,
+        RetrySettings {
+            max_attempts: 3,
+            backoff_base_ms: 20,
+        },
+    )
+    .await;
+    let key = format!("retry-then-succeed-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "retry me"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "第二次成功之后对客是成功：{body}");
+    assert_sync_success("重投之后成功", &body);
+
+    let (job_id, state) = harness.job(&key).await;
+    assert_eq!(state, "succeeded", "重投成功之后 Job 落成功终态");
+
+    assert_eq!(
+        harness.create_calls(),
+        2,
+        "第一次被上游明确拒收（可证明未受理），重投那次才受理"
+    );
+
+    // 两次执行各占一行，号按执行顺序从 1 起。
+    let attempts: Vec<(i32, String)> = sqlx::query_as(
+        "SELECT attempt_no, state FROM generation.attempts WHERE job_id = $1 ORDER BY attempt_no",
+    )
+    .bind(job_id)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("attempt rows");
+    assert_eq!(
+        attempts,
+        vec![(1, "terminal".to_owned()), (2, "terminal".to_owned())],
+        "一次重投留下两行，两行各自收尾（v1 的 Attempt 终态名是 terminal）"
+    );
+
+    // 结算只发生一次：capture 分录只有一条。
+    let captures: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ledger.entries WHERE job_id = $1 AND kind = 'capture'",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("capture entries");
+    assert_eq!(captures, 1, "一次成功只结算一次");
+
+    // 预授权跨 Attempt 保留：两次执行期间它一直是同一个 hold，没有释放再扣一遍。
+    let holds: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT status, amount_microusd FROM ledger.holds WHERE job_id = $1 ORDER BY created_at",
+    )
+    .bind(job_id)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("holds");
+    assert_eq!(
+        holds.len(),
+        1,
+        "重投不重新预授权：这台 Job 自始至终只有一个 hold"
+    );
+    assert_eq!(holds[0].0, "captured", "结算之后这个 hold 是 captured");
+
+    // 资金流水里**没有**释放分录：预授权只留在 `ledger.holds`（上面已断言它是 `captured`），
+    // 结算只留一条实收（`0002` §3）。重投不重复扣、也不重复结清。
+    let releases: i64 = sqlx::query_scalar(
+        "SELECT count(*) FROM ledger.entries WHERE job_id = $1 AND kind = 'release'",
+    )
+    .bind(job_id)
+    .fetch_one(&harness.pool)
+    .await
+    .expect("release entries");
+    assert_eq!(releases, 0, "预授权不进资金流水，只留在 holds");
+
+    harness.cleanup().await;
+}
+
+/// 用尽额度仍失败：上游被调用次数**正好等于上限**，然后按既有失败处置。
+///
+/// 上限是运维配置项，所以"停在几次"必须由配置决定，不能由别的东西（比如上游恰好恢复）决定。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn retries_stop_at_the_configured_limit() {
+    // 创建请求一律被明确拒收（429）：每次执行都走到重投判据上；额度用完时就停在失败终态。
+    let harness = Harness::start_with_retry(
+        candidate("APIMart", "apimart-image-v1", &["prompt_only"]),
+        UpstreamBehaviour {
+            create_rejection_status: 429,
+            create_rejection_times: 0,
+            ..UpstreamBehaviour::apimart()
+        },
+        64,
+        RetrySettings {
+            max_attempts: 2,
+            backoff_base_ms: 20,
+        },
+    )
+    .await;
+    let key = format!("retry-until-limit-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "always rejected"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::BAD_GATEWAY, "got {body}");
+
+    let (job_id, state) = harness.job(&key).await;
+    assert_eq!(
+        state, "failed",
+        "用尽额度之后按既有失败处置：不新增对账态语义"
+    );
+
+    let attempts: Vec<i32> = sqlx::query_scalar(
+        "SELECT attempt_no FROM generation.attempts WHERE job_id = $1 ORDER BY attempt_no",
+    )
+    .bind(job_id)
+    .fetch_all(&harness.pool)
+    .await
+    .expect("attempt rows");
+    assert_eq!(attempts, vec![1, 2], "重投停在上限次数上，不多不少");
+    assert_eq!(harness.create_calls(), 2, "上限是 2：上游正好被调两次");
+    let hold_status: String =
+        sqlx::query_scalar("SELECT status FROM ledger.holds WHERE job_id = $1")
+            .bind(job_id)
+            .fetch_one(&harness.pool)
+            .await
+            .expect("the job must have a hold");
+    assert_eq!(
+        hold_status, "released",
+        "用尽额度这条路径与今天逐位相同：释放预授权"
+    );
 
     harness.cleanup().await;
 }
