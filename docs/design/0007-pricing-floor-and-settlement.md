@@ -33,14 +33,14 @@
 
 **可被路由的供给必须能给出对客计费基准**：对客选按 token 四档的候选是对客费率向量，或 Price Plan 的那份费率（旧口径——历史修订与"迁移后仍生效但没有定价的旧修订"结算时读的就是它）；对客选"上游金额 × 倍率"的要给出 `markup_bps`。给不出就**发布期拒**：这条供给一旦生效，受理与结算都算不出该收多少钱，而按 0 收等于白送。它**与"带不带价目表"是两件事**：`upstream_declared` / `per_image` / `per_call` 不必发 Price Plan，但仍要算得出对客价——因此"不带价目表也能发布"成立，而"连对客价一起没有"不成立；反过来，对客费率向量是 `token_rates` 的价格，别的形态带着它永远不会被读，发布期一并拒。
 
-费率表按渠道各自记、币种按该渠道声明的 `currency` 标注——当前记的四档 `$5 / $10 / $8 / $30`（每 1M tokens：文本输入 / 文本输出 / 图像输入 / 图像输出）是 **AIHubMix** 的表、币种 **USD**，**不是"全平台统一美元"**。
+费率表按渠道各自记、币种按该渠道声明的 `currency` 标注，**不是"全平台统一美元"**。它只是 `token_rates` 这一种计价形态的参数；当前素材里两条渠道都按上游声明的金额计价，都没有价目表——对客选"按 token 四档"时四档金额由运营按报价填，没有渠道价目可作默认值。
 
 **两家渠道各自的计价事实**（依据 [`docs/facts/channel-facts.md`](../facts/channel-facts.md)）：
 
 | 渠道 | 计价形态 | 成本来源 | 口径 |
 | --- | --- | --- | --- |
-| **AIHubMix** | `token_rates`：费率在 `pricing.price_plans`（**按供给挂**） | **`Computed`**：上游只返回四分项 token、**没有任何金额字段** ⇒ 成本 = Σ(**实际** 分项 token × 该渠道的四档费率) | 它的角色**收窄为渠道成本费率**（定价时的参考口径 + 毛利核算），**不再是对客结算基数**（§2/§3） |
-| **APIMart** | `upstream_declared`：**没有** Price Plan | **`Declared`**：上游任务终态**直接返回 `cost`**（**币种以渠道声明为准，不假定 USD**）⇒ **直接取它，不需要我们自己算**——它比自算 | 上游声明的金额只进毛利口径，**不改对客金额**；上游没给就是成本缺口（§7） |
+| **AIHubMix** | `upstream_declared`：**没有** Price Plan | **`Declared`**：`/ai/v1` 的同步任务终态直接给 `usage.cost`（USD，可为 `null`）⇒ **直接取它，不需要我们自己算** | 它**不给 token 分项**，因此对客选不了"按 token 四档"（发布期按驱动器能力拒，见 [`0012`](./0012-platform-model-publishing.md) §4）；上游没给金额就是成本缺口（§7） |
+| **APIMart** | `upstream_declared`：**没有** Price Plan（它也给得出四分项用量，改按 `token_rates` 登记同样成立） | **`Declared`**：上游任务终态**直接返回 `cost`**（**币种以渠道声明为准，不假定 USD**）⇒ **直接取它，不需要我们自己算**——它比自算 | 上游声明的金额只进毛利口径，**不改对客金额**；上游没给就是成本缺口（§7） |
 
 **实测事实**：APIMart 的 `cost` 我们实测过，返回 `cost = 0.011354`（见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 APIMart 计量节）。
 
@@ -62,7 +62,7 @@
 
 **对客计价形态随修订发布、随 Job 快照冻结**：成本形态在 `supply.offerings.formula`（工程登记），两者分处不同字段与生命周期；落点沿用 `consumer_rates_cny` 的同一模式——`runtime_revisions` 上**按候选键的 jsonb**（[`0009`](../../migrations/0009_pricing_floor_and_settlement.sql)），受理时随 Job 快照冻结。
 
-**对客 token 价目由平台维护、初始值取自该 vendor／模型已知的渠道价目**（如 AIHubMix 的四档 `$5 / $8 / $10 / $30` 每 1M tokens，按折算率折 CNY，可由倍率推导；见 [`out-reference/aihubmix/gpt-image-2.md`](../../out-reference/aihubmix/gpt-image-2.md)），运营在发布页改的是**渠道原币种**金额（默认就是这张表），人民币对客价由同一乘法算出。它**不依赖该候选的成本单价**，所以成本为标量（`upstream_declared`，APIMart）的候选同样能按 token 四档卖。这也是 vendor 厂商默认的四档 token 定价方式。
+**对客 token 价目由平台维护、初始值取自该 vendor／模型已知的渠道价目**（该模型名下某条供给按 `token_rates` 登记时，它的四档费率就是这份"已知价目"，按折算率折 CNY、可由倍率推导），运营在发布页改的是**渠道原币种**金额（有已知价目时默认就是它，没有时由运营按报价填），人民币对客价由同一乘法算出。它**不依赖该候选的成本单价**，所以成本为标量（`upstream_declared`，APIMart）的候选同样能按 token 四档卖。这也是 vendor 厂商默认的四档 token 定价方式。
 
 **发布期校验的是能力，不是某一次的值**：对客选 token 四档要求该渠道／驱动器**能提供**四分项 `usage`（两家都提供，见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 与 [`adapter-apimart`](../../crates/adapter-apimart/src/lib.rs)）；选上游金额要求渠道**能声明** `cost`。能力给不出即拒并点名。
 
@@ -197,7 +197,7 @@ PriceSnapshot {
 | `provider_cost_source` | 判据 | 谁是这样 |
 | --- | --- | --- |
 | `declared` | 渠道在终态**直接给了 `cost`**，且解析成功（金额与币种都拿得到）——**直接取它，不需要我们自己算**（比自算更权威） | APIMart（实测 `cost = 0.011354`，`ADR-0006` 的渠道口径） |
-| `computed` | 渠道**不给金额字段**，平台按这条供给登记的**计价形态**自算（§1）：`token_rates` = 实际 `usage` 的分项 token × 该渠道四档费率；`per_image` = 产出的张数 × 单价；`per_call` = 1 次 × 单价（币种按该渠道声明的 `cost_currency`） | AIHubMix（`token_rates`）；按张 / 按次的渠道接进来时同样走这一态 |
+| `computed` | 渠道**不给金额字段**，平台按这条供给登记的**计价形态**自算（§1）：`token_rates` = 实际 `usage` 的分项 token × 该渠道四档费率；`per_image` = 产出的张数 × 单价；`per_call` = 1 次 × 单价（币种按该渠道声明的 `cost_currency`） | 按 `token_rates` 登记的渠道（它给得出四分项用量）；按张 / 按次的渠道接进来时同样走这一态 |
 | `unavailable` | 声明了但**缺字段 / 负数 / 解析失败**，或该次执行根本没拿到终态金额；**也包括算不出来**：形态是 `upstream_declared` 而上游没给、按张计价却拿不到产出张数（失败件没有用量与张数）、快照里没有那份费率或单价 | 任一渠道的异常情形 |
 
 **`unavailable` 的处置（"APIMart 未声明 `cost` 或解析失败"）**：**不得猜测**——不记 0、不用"token × 费率"顶替、不用上一次的值（`ADR-0006`：证据缺字段、负数或解析失败时不得猜测费用，进对账）。具体是：`provider_cost_microusd` / `provider_cost_currency` 留 NULL、`provider_cost_source` 记 `unavailable`，该笔**成本缺口进对账**、毛利标"成本未知"，人工核对上游账单后再补录（补录是人的动作：改 `generation.attempts` 那四列）。**失败件也走这一套**：它手里没有本次用量与产出张数，自算那几态因此一律算不出金额、落到缺口；只有"请求根本没交到渠道"的执行才四列留空（那是"根本没采"）。
@@ -208,7 +208,7 @@ PriceSnapshot {
 
 ## 8. 两个币种平面：对客 CNY，成本按渠道声明的币种
 
-**平台对客只有人民币（CNY）单币种**（用户澄清："用户充值难道还是多币种？"）——用户充值、余额、售价、保底额、扣费**一律人民币**；**成本平面则是"渠道各自的原币种"**：每条供给声明它自己的 **`cost_currency`**（发布数据的一部分，缺省取它 Price Plan 的币种），成本按**该币种**记原值——**可能是 USD、CNY 或别的，不假定 USD**（四档 token 费率表也是**按渠道各自记、按该渠道币种标注**：`$5/$10/$8/$30` 每 1M 是 **AIHubMix** 的 USD 费率表，不是"全平台统一美元"，§1）。两个平面**分开记、分开核**：
+**平台对客只有人民币（CNY）单币种**（用户澄清："用户充值难道还是多币种？"）——用户充值、余额、售价、保底额、扣费**一律人民币**；**成本平面则是"渠道各自的原币种"**：每条供给声明它自己的 **`cost_currency`**（发布数据的一部分，缺省取它 Price Plan 的币种），成本按**该币种**记原值——**可能是 USD、CNY 或别的，不假定 USD**（四档 token 费率表也是**按渠道各自记、按该渠道币种标注**，不是"全平台统一美元"，§1）。两个平面**分开记、分开核**：
 
 | 平面 | 币种 | 包含 | 落在哪 |
 | --- | --- | --- | --- |
@@ -231,7 +231,7 @@ PriceSnapshot {
 | **模型** | `generation.jobs.gateway_model`（迁移 0004 已把列名收口为"平台型号名"） | 无需新列；语义随本设计变成"网关模型名" |
 | **张数** | 请求侧：受理时请求里的 `n`（只在内存里，受理与冻价读它）；结果侧：`generation.jobs.image_count`（结算时按实际产出张数写入，拿不到留 NULL） | 两个口径都要写死：**预授权按供给查保底表并乘请求张数**（`hold = n × 每张额`，§6）；**实收（charge）按对客形态**：token 读实际分项 token、上游金额读声明额 × 冻结倍率 × 冻结折算率（§3/§6），**不封顶在保底额**（超出部分在结算时透支）。**张数另有用途**：渠道按张计价时它是**成本**自算的乘数（§1/§7）。产出张数落 `generation.jobs.image_count`，作为记录与核对信息保留 |
 | **扣费金额** | `ledger.entries`（`kind='capture'`）+ `ledger.holds`（授权额）；**Job 上没有** charge 列。**币种 CNY**（对客平面，§8） | 账本是权威（`ADR-0003`）；**补** `generation.jobs.charge_microusd`（结算时写入）作为投影，便于按 job 查——**缓做**（§5） |
-| **平台成本价** | **没有**：APIMart 的 `cost` 不采纳不留存；AIHubMix 的金额要自算也没存 | **补** `generation.attempts.provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）/ `provider_cost_currency` / `provider_cost_source`（**两态 + 异常态**：`declared` 直接取上游 `cost`、`computed` 按该供给的计价形态自算、`unavailable` 不猜，§5/§7）与 `provider_cost_cny_microusd`（**折算后 CNY**，毛利用，§8） |
+| **平台成本价** | **没有**：APIMart 的 `cost` 与 AIHubMix 的 `usage.cost` 都不采纳不留存 | **补** `generation.attempts.provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）/ `provider_cost_currency` / `provider_cost_source`（**两态 + 异常态**：`declared` 直接取上游 `cost`、`computed` 按该供给的计价形态自算、`unavailable` 不猜，§5/§7）与 `provider_cost_cny_microusd`（**折算后 CNY**，毛利用，§8） |
 | **请求时间戳** | `jobs.created_at`（受理）、`attempts.started_at` / `completed_at` | 够 |
 | **上游 request_id** | `attempts.provider_trace_id`（AIHubMix 的 `x-request-id`；APIMart 的 task id） | 够 |
 
