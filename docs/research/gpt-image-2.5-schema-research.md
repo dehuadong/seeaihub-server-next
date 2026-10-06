@@ -2,7 +2,7 @@
 
 > 上游协议研究与只读取证记录，**不是平台对外接口合同**。所有证据来自无需鉴权的机器可读端点，**未发起任何计费调用**，未使用任何 API Key。
 > 抓取时间：2026-09-19（三个模型的三类端点均返回 HTTP 200）。
-> **范围**：只写 AIHubMix。跨渠道的归纳与另一渠道的事实见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 与 `out-reference/apimart/`（依据 `docs/design/0004` R1：渠道差异不得互相推导）。
+> **范围**：只写 AIHubMix。跨渠道的归纳与另一渠道的事实见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 与 `out-reference/apimart/`（依据 `docs/architecture.md` R1：渠道差异不得互相推导）。
 
 ## 更正记录（2026-09-19，本次整改）
 
@@ -96,7 +96,7 @@ Schema 中每个端点带 `lifecycle`，但它描述的是**运行时语义**，
 
 本渠道已有的实测（第一阶段的付费样本，记录在 [`gpt-image-2-inferera-research.md`](./gpt-image-2-inferera-research.md) §13）：OpenAI 兼容端点返回**分项 token**（`input_tokens_details.{text_tokens,image_tokens}` 等），`/ai/v1` 异步任务对象**没有 `usage`**。归纳后的渠道事实见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节。
 
-**成本价怎么来**（**本渠道自己的口径**）：本渠道**只返回四分项 token、不返回任何金额字段**，因此成本价 = Σ(分项 token × 官方四档费率)。四档费率与实测见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节——渠道之间不互相推导（`docs/design/0004` R1），另一渠道怎么取成本价看那份文档的 APIMart 节。
+**成本价怎么来**（**本渠道自己的口径**）：本渠道**只返回四分项 token、不返回任何金额字段**，因此成本价 = Σ(分项 token × 官方四档费率)。四档费率与实测见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 节——渠道之间不互相推导（`docs/architecture.md` R1），另一渠道怎么取成本价看那份文档的 APIMart 节。
 
 ## 8. 本轮落盘的资料（只留会被用到的）
 

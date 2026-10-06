@@ -4,7 +4,7 @@
 
 # Vendor Model Contract 与 Offering Parameter Mapping 落地设计
 
-本文是工作项 [`dehuadong/seeaihub-server-next#10`](https://github.com/dehuadong/seeaihub-server-next/issues/10)（调用方合同收口）的技术设计。持久决定归 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，分层职责归 [`docs/design/0004`](./0004-layered-architecture.md)（§3.3 的结构性差距 G5），本文只承载"怎么落地"。
+本文是工作项 [`dehuadong/seeaihub-server-next#10`](https://github.com/dehuadong/seeaihub-server-next/issues/10)（调用方合同收口）的技术设计。持久决定归 [`docs/adr/0015`](../adr/0015-vendor-model-contract-and-offering-parameter-mapping.md)，分层职责归[架构治理](../architecture.md)，结构性差距 G5 的依据见 [`docs/design/0004`](./0004-layered-architecture.md) §3.3，本文只承载"怎么落地"。
 
 ## 1. 问题（一句话）
 
@@ -62,7 +62,7 @@
 ## 5. `size` 的语义（三义分型 + 换算）
 
 - 领域新增 `SizeSpec`：`Pixels { width, height }` / `Ratio { ratio }` / `Tier { tier }`，合同声明该模型接受哪一种（或哪几种）。
-- **尺寸档案随发布走，不编进领域**：`SizeProfile`（比例 × 档位 → 像素）作为**发布数据**（合同或映射的一部分）携带，取自厂商官方映射表（`out-reference/doubao/图片生成模型API调用指南.md` 里 lite/pro/4.x 各一张表；Google、OpenAI 各自一份）。领域只留 `SizeSpec` 类型与换算算法——否则接新厂商就要改代码，违背 `docs/design/0004` §2 R3。
+- **尺寸档案随发布走，不编进领域**：`SizeProfile`（比例 × 档位 → 像素）作为**发布数据**（合同或映射的一部分）携带，取自厂商官方映射表（`out-reference/doubao/图片生成模型API调用指南.md` 里 lite/pro/4.x 各一张表；Google、OpenAI 各自一份）。领域只留 `SizeSpec` 类型与换算算法——否则接新厂商就要改代码，违背[架构治理](../architecture.md) R3。
 - 映射声明该供给要哪种形态；换算在映射层做（`2:3`+`2K` → `1664x2496`；`1024x1024` → `1:1`+`1K`）。换算不出（档案缺该组合）→ 该候选不合格。
 - **当前状态（2026-09-20 记录）：这套换算没有调用点。** 已发布的素材里唯一声明的映射是 APIMart 的 `rename`（参考图改名），**没有任何素材声明 `size` 映射**——因为 gpt-image 系的合同是像素型，而 AIHubMix 与 APIMart 都收精确像素（APIMart 在 `size` 为像素时忽略 `resolution`，用户 2026-09-20 据此把该渠道定为统一收像素）。**保留而不删**的理由：它是"合同形态 ≠ 该供给形态"这一情形唯一的承载——接入 **Google**（原生 `aspect_ratio` + `image_size`，比例 + 档位）或 **Doubao**（`size` 为档位或像素）时若目标渠道只收另一种形态，就靠它。等那两家素材落地后若确认不需要，再连同单测一次删净。
 

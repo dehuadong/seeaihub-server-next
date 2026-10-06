@@ -76,7 +76,6 @@ Invalid type for 'image[]': expected a file, but got a string instead.
 | Runtime Revision | 该渠道的供给要重新发布（计价形态与承载面） |
 | `crates/domain` 的参数映射与 `crates/application` 的发布校验 | 允许把合同字段落进承载面的容器字段（`extra.<名>`），请求体嵌套写出 |
 | `docs/facts/channel-facts.md` §2 | 端点表、字段面、成本与计量、结果取回、任务查询 |
-| `docs/architecture.md` | AIHubMix 一族的端点与结果描述 |
 | 用例 | 断言上游收到的是 `/ai/v1` 与 URL 字符串；断言结果取响应里的 `b64_json` 且平台不发结果下载请求；断言成本取 `usage.cost`、空值进缺口 |
 
 ## 8. 验证

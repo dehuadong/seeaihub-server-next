@@ -146,7 +146,7 @@ PriceSnapshot {
 - **售价**：`ledger.entries`（`kind = 'capture'`，金额为负）+ `ledger.holds`（授权额）——账本是权威（`ADR-0003`）；另在 `generation.jobs` 加 `charge_microusd` 列（结算时写入）作为**投影**，便于按 job 直接查，权威仍是账本。**这一列缓做**：账本已经查得到，它只是查询便利，不阻塞任何切片（P2b 工单）。
 - **成本**：`generation.attempts` 新增 `provider_cost_microusd`（**原币种**微单位，币种见 `provider_cost_currency`）、`provider_cost_currency`、`provider_cost_source`（**两态 + 异常态**：`computed` / `declared` / `unavailable`，判据见 §7；`declared` = 直接取上游 `cost`，`computed` = 按该供给登记的**计价形态**自算：分项 token × 四档费率 / 张数 × 单价 / 1 次 × 单价）与 `provider_cost_cny_microusd`（**折算后 CNY**，用快照的 `fx_rate`——该币种 → CNY——折出，毛利用）。**异步写入**（结算时才拿得到）。
 - **毛利** = 售价（快照，**CNY**）− 成本**折算后 CNY**（`attempts.provider_cost_cny_microusd`，由**原币种**原值 × 快照的 `fx_rate` 折出），按 job 可查；**两条线分开留痕**（售价/扣费记 CNY、成本记**原币种**原值 + 币种 + 折算汇率 + 折算后 CNY，§8）；成本缺失（`unavailable`）时标"成本未知"，不猜（§7）。
-- **边界**：把平台自担的成本**写进账本**（`ledger.entries` 的 `cost` 科目，挂平台账户）与账实核对**不在本份**：落点与写入方见 [`docs/architecture.md`](../architecture.md) §5，毛利口径仍是 `attempts` 的四列（上文），同一件事不做两遍。
+- **边界**：把平台自担的成本**写进账本**（`ledger.entries` 的 `cost` 科目，挂平台账户）与账实核对**不在本份**：落点与写入方见 `crates/persistence`，毛利口径仍是 `attempts` 的四列（上文），同一件事不做两遍。
 
 ## 6. 预授权只是保底：按供给查保底表冻结，结算按实际、可透支
 
@@ -200,7 +200,7 @@ PriceSnapshot {
 | `computed` | 渠道**不给金额字段**，平台按这条供给登记的**计价形态**自算（§1）：`token_rates` = 实际 `usage` 的分项 token × 该渠道四档费率；`per_image` = 产出的张数 × 单价；`per_call` = 1 次 × 单价（币种按该渠道声明的 `cost_currency`） | AIHubMix（`token_rates`）；按张 / 按次的渠道接进来时同样走这一态 |
 | `unavailable` | 声明了但**缺字段 / 负数 / 解析失败**，或该次执行根本没拿到终态金额；**也包括算不出来**：形态是 `upstream_declared` 而上游没给、按张计价却拿不到产出张数（失败件没有用量与张数）、快照里没有那份费率或单价 | 任一渠道的异常情形 |
 
-**`unavailable` 的处置（"APIMart 未声明 `cost` 或解析失败"）**：**不得猜测**——不记 0、不用"token × 费率"顶替、不用上一次的值（`ADR-0006`：证据缺字段、负数或解析失败时不得猜测费用，进对账）。具体是：`provider_cost_microusd` / `provider_cost_currency` 留 NULL、`provider_cost_source` 记 `unavailable`，该笔**成本缺口进对账**、毛利标"成本未知"，人工核对上游账单后再补录（补录是人的动作：改 `generation.attempts` 那四列）。**失败件也走这一套**：它手里没有本次用量与产出张数，自算那几态因此一律算不出金额、落到缺口；只有"请求根本没交到渠道"的执行才四列留空（那是"根本没采"，见 [`docs/architecture.md`](../architecture.md)）。
+**`unavailable` 的处置（"APIMart 未声明 `cost` 或解析失败"）**：**不得猜测**——不记 0、不用"token × 费率"顶替、不用上一次的值（`ADR-0006`：证据缺字段、负数或解析失败时不得猜测费用，进对账）。具体是：`provider_cost_microusd` / `provider_cost_currency` 留 NULL、`provider_cost_source` 记 `unavailable`，该笔**成本缺口进对账**、毛利标"成本未知"，人工核对上游账单后再补录（补录是人的动作：改 `generation.attempts` 那四列）。**失败件也走这一套**：它手里没有本次用量与产出张数，自算那几态因此一律算不出金额、落到缺口；只有"请求根本没交到渠道"的执行才四列留空（那是"根本没采"）。
 
 **"进对账"的确切落法是一张只读的「成本缺口清单」**（`GET /api/v1/provider-cost-gaps`，管理员面，带上游对账标识）：**不开对账案例、也不把 Job 推进 `reconciliation_required`**——对账案例的处置路径是退款，而成本缺口没有任何东西可退（对客结算已经按费率快照正常完成）；把两件事混成一个待办，只会让运营既不知道该退什么、也看不到缺口。运营拿清单里的对账标识去核上游账单，补录完成后该笔不再出现在清单里（清单的判据就是"来源是 `unavailable`"）。
 
@@ -269,7 +269,7 @@ PriceSnapshot {
 
 - **对外价策略与具体数值**（含是否分档、加价系数与汇率的具体取值）归 [`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)；
 - **成本护栏**（服务端成本上限一类的运营护栏）不在本份（见 [运维底线与运行面](./0009-operational-baseline.md) §7）——本份只把**客户余额**当受理上限（§6）；
-- **成本进账本与账实核对**不在本份——本份只落**成本事实**，供算毛利（§5/§7）；账本那一侧（`cost` 科目、平台账户、核对任务）见 [`docs/architecture.md`](../architecture.md) §5。
+- **成本进账本与账实核对**不在本份——本份只落**成本事实**，供算毛利（§5/§7）；账本那一侧（`cost` 科目、平台账户、核对任务）见 `crates/persistence`。
 
 ### 需要 ADR 的决定
 

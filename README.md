@@ -24,8 +24,8 @@
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
 | **容器部署**（Dockerfile、compose、镜像与升级） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **素材与模型升级教程**（改素材后怎么生效、合同变更为什么要升修订、本地库怎么处理） | [`docs/tutorials/supply-materials.md`](docs/tutorials/supply-materials.md) |
-| **代码结构**：哪个 crate / 文件 / 表负责什么 | [`docs/architecture.md`](docs/architecture.md) |
-| 分层的**职责与规则**（①–⑤、R1–R4、接入清单） | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
+| **架构治理**：分层职责、依赖方向、边界规则（R1–R5）与扩展纪律 | [`docs/architecture.md`](docs/architecture.md) |
+| 分层规则的**依据、边界细则与例外理由** | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
 | 持久决定 | [`docs/adr/`](docs/adr/) |
 | 领域词汇表 | [`CONTEXT.md`](CONTEXT.md) |
 | 各渠道的事实（端点、参数、计量与成本口径、实测记录） | [`docs/facts/channel-facts.md`](docs/facts/channel-facts.md) |

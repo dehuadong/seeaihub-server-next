@@ -39,7 +39,7 @@
 
 两条读共用这一份视图里的用量值，但**各自保留自己的行投影**：客户侧的 `read_customer_usage` 不回 Job 标识、响应带翻页游标，管理端的 `list_account_usage` 回 `job_id`、响应不带游标。只有用量的装配下沉到视图，两个行 DTO 与两个外层响应各自保留，API 层不再各装配一份用量。
 
-这两个端点只服务本仓库控制台（对客那条认客户会话，管理端那条认管理员），`image_count` 换成 `usage` 是它们自己的字段替换，没有外部调用方；对外公开的 `/v1/models` 只增字段。这次替换是[模型类型 Spec](../../docs/specs/0006-model-type-and-usage-records.md) 的合同决定，同一变更里同步描述该字段的属主：[客户控制台导航与历史](0014-customer-console-navigation-and-history.md) §2、[身份与控制台](0010-identity-and-consoles.md) §4.2 的端点表、[代码结构索引](../architecture.md) 的端点表、[管理后台信息架构](0011-console-information-architecture.md) 的扣费记录说明、[账户资金设计](0013-account-funds-and-reservations.md) §5 的汇总口径与[人工验收清单](../verification/consoles-manual-acceptance.md)。
+这两个端点只服务本仓库控制台（对客那条认客户会话，管理端那条认管理员），`image_count` 换成 `usage` 是它们自己的字段替换，没有外部调用方；对外公开的 `/v1/models` 只增字段。这次替换是[模型类型 Spec](../../docs/specs/0006-model-type-and-usage-records.md) 的合同决定，同一变更里同步描述该字段的属主：[客户控制台导航与历史](0014-customer-console-navigation-and-history.md) §2、[身份与控制台](0010-identity-and-consoles.md) §4.2 的端点表、`apps/api` 的路由定义、[管理后台信息架构](0011-console-information-architecture.md) 的扣费记录说明、[账户资金设计](0013-account-funds-and-reservations.md) §5 的汇总口径与[人工验收清单](../verification/consoles-manual-acceptance.md)。
 
 ## 5. 账单汇总
 

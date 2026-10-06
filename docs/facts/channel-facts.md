@@ -3,7 +3,7 @@
 本仓库自己的**渠道事实汇总登记**——把散在各 `out-reference/<provider>/` 的上游材料归纳成结论，逐条给出处。不是平台接口合同，运行中的服务不读取本文。
 
 - **只放结论**，引用不复述：原始形状、逐字样本与错误码表在 `out-reference/<provider>/`，见 §1 的总账。
-- **不合并渠道**：一个渠道一族，各自独立；渠道差异属该渠道 ② Driver 的内部实现，不互相推导（依据 [`docs/design/0004`](../design/0004-layered-architecture.md) R1）。
+- **不合并渠道**：一个渠道一族，各自独立；渠道差异属该渠道 ② Driver 的内部实现，不互相推导（依据 [`架构治理`](../architecture.md) R1）。
 - **不记凭证值**，只记变量名：`AIHUBMIX_API_KEY`（AIHubMix）、`APIMART_API_KEY`（APIMart）、`DOUBAO_API_KEY`（火山方舟）。三个变量在 **User 与 Machine 级都存在**，Agent 进程默认环境里读不到——用 `[Environment]::GetEnvironmentVariable(name,'User'|'Machine')` 取（2026-09-23 复核）。
 - **本文不记计费调用流水**：授权依据、次数、花费与样本位置统一留档在 [`docs/verification/paid-provider-calls.md`](../verification/paid-provider-calls.md)。
 - **不记平台口径**：平台怎么取成本、怎么结算、怎么对客呈现归 [`docs/design/0007`](../design/0007-pricing-floor-and-settlement.md)、[`docs/adr/0006`](../adr/0006-no-settlement-without-metering-evidence.md) 与 [`docs/adr/0017`](../adr/0017-provider-errors-are-rewritten-for-consumers.md)；实施清单归相应工单。

@@ -2,7 +2,7 @@
 当前修订: v1
 状态: 已接受
 承接: [同步图片网关 Spec v1](../specs/0005-synchronous-image-gateway.md) §1–§8
-依赖: [分层架构](0004-layered-architecture.md)、[合同与映射](0005-vendor-model-contract-and-offering-mapping.md)、[定价结算](0007-pricing-floor-and-settlement.md)、[账户资金](0013-account-funds-and-reservations.md)
+依赖: [架构治理](../architecture.md)、[合同与映射](0005-vendor-model-contract-and-offering-mapping.md)、[定价结算](0007-pricing-floor-and-settlement.md)、[账户资金](0013-account-funds-and-reservations.md)
 
 # 同步图片网关执行与异常对账
 

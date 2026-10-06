@@ -13,7 +13,7 @@
 | --- | --- | --- | --- |
 | 1 | §9.1 / §10：公开价**只有三项**（文本输入 / 图片输入 / 图片输出），仓库旧资料里的「文本输出 `$10 / 1M`」**不予采用** | **四档都要用**：文本输入 `$5`、**文本输出 `$10`**、图像输入 `$8`、图像输出 `$30`（每 1M tokens）。当初按"只有三项"发布，导致生效配置里**文本输出费率写成 0**，即少收费——该缺陷记录在 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节 | 用户 2026-09-19 确认四档；[`docs/facts/channel-facts.md`](../facts/channel-facts.md) 的 AIHubMix 费率节 |
 | 2 | §6.1（据文档）：**即使同步执行，AIHubMix 也会保存任务记录**，创建响应丢失时可通过 `GET /ai/v1/images` 查找 | **对本渠道的 `/v1` 同步分支不成立**：§13.2 实测两次同步调用**未出现在** `/ai/v1/images` 列表里。因此 `/v1` 的创建请求失联后**没有**可查询的上游任务 ⇒ 只能进对账（见 `docs/adr/0005`/`0007`） | 本文件 §13.2 实测 |
-| 3 | §7.1b 末：以「与火山方舟的行为相反」作对比 | 已删除。渠道差异不互相推导（`docs/design/0004` R1）；火山方舟的事实只在 `out-reference/doubao/doubao-ark-image-research.md` | `docs/design/0004` R1 |
+| 3 | §7.1b 末：以「与火山方舟的行为相反」作对比 | 已删除。渠道差异不互相推导（`docs/architecture.md` R1）；火山方舟的事实只在 `out-reference/doubao/doubao-ark-image-research.md` | `docs/architecture.md` R1 |
 
 **另外**：§12 的验证清单已在 §13 完成（§13 取代相冲突的"待确认"），§12 保留为历史过程记录。
 
