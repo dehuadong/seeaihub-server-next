@@ -56,3 +56,4 @@ CREATE DATABASE seeai_next;
 
 - `GET /v1/models`：当前可调用模型的 `revision` 与 `documentation_url` 都是这次发布的那一份。
 - `GET /v1/models/{name}/llms.txt`：参数表与正文来自同版合同；正文里的链接是 `SEE_BASEURL` 的绝对地址（API 的必填配置，[配置项](../operations/configuration.md#1-进程与连接)）；只改文案时，旧文档地址仍返回旧正文。
+- `GET /v1/docs/README.md`：对客文档入口，讲怎么查模型、目录各字段的含义与 JSON Schema 读法，并索引 `authentication.md`、`uploads/images.md`、`http-errors.md` 三份。这四份随 API 版本提供，与发布哪一份素材无关。
