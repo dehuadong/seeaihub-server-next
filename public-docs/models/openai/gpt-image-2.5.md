@@ -1,6 +1,6 @@
 # {{platform_name}} 图片生成与编辑
 
-模型厂商为 {{vendor_id}}，模型类型为 `{{model_type}}`，合同修订为 `{{contract_revision}}`。支持文字生成图片、使用参考图编辑，以及带遮罩的局部编辑。调用时使用 `GET /v1/models` 返回的模型 `name`；参数可用值以对应条目的 `contract` 为准。
+模型厂商为 {{vendor_id}}，模型类型为 `{{model_type}}`，合同修订为 `{{contract_revision}}`。支持文字生成图片、使用参考图编辑，以及带遮罩的局部编辑。调用时使用 `GET /v1/models` 返回的模型 `name`；参数可用值以对应条目的 `contract` 为准。目录字段含义与 JSON Schema 读法见 [API 使用说明]({{SEE_BASEURL}}/v1/docs/README.md)。
 
 ## 请求方式
 

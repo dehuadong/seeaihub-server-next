@@ -14,8 +14,12 @@ use seeai_domain::replace_contract_model_identity;
 pub const MAX_MODEL_DOCUMENT_BYTES: usize = 262_144;
 
 /// 公开使用文档的**名称**：渲染器转换链接与 API 提供资源共用这一份清单，加第四份只需改这里。
-pub const PUBLIC_DOCUMENTS: [&str; 3] =
-    ["authentication.md", "uploads/images.md", "http-errors.md"];
+pub const PUBLIC_DOCUMENTS: [&str; 4] = [
+    "README.md",
+    "authentication.md",
+    "uploads/images.md",
+    "http-errors.md",
+];
 
 /// 素材里指代**平台对客基址**的占位符：正文与示例要写绝对地址时用它，发布时由配置代入。
 pub const BASE_URL_PLACEHOLDER: &str = "{{SEE_BASEURL}}";

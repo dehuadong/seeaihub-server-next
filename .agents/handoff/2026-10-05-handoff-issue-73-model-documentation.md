@@ -12,7 +12,7 @@
 
 | 内容 | 位置 |
 | --- | --- |
-| 行为合同与验收 | [模型使用文档 Spec](../../docs/specs/0008-model-usage-documentation.md)，当前与生效修订均为 v1，状态“已接受” |
+| 行为合同与验收 | [模型使用文档 Spec](../../docs/specs/0008-model-usage-documentation.md)，当前与生效修订均为 v2，状态“已接受” |
 | 文档素材、渲染、存储、发布、迁移与验证设计 | [模型使用文档 Agent Note](../notes/implemented/platform/2026-10-05-model-usage-documentation.md)，已交付 |
 | 客户端使用说明入口 | [public-docs/README.md](../../public-docs/README.md)；公共鉴权、上传、错误说明及 OpenAI GPT-Image-2.5 模型族说明均在该目录 |
 | 仓库文档入口 | [README.md](../../README.md)，增加 API 使用文档链接 |

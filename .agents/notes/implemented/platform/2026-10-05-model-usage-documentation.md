@@ -17,7 +17,7 @@ verification: cargo test -p seeai-application --lib model_document（6 条）、
 
 ## 决定
 
-[模型使用文档 Spec v1](../../../../docs/specs/0008-model-usage-documentation.md) §1–§5 已按本记录交付。没有新建独立 ADR：文档的内容边界属于该 Spec，存储和渲染沿用既有不可变发布机制。
+[模型使用文档 Spec](../../../../docs/specs/0008-model-usage-documentation.md)（现 v2）§1–§5 已按本记录交付。没有新建独立 ADR：文档的内容边界属于该 Spec，存储和渲染沿用既有不可变发布机制。
 
 ### 文档素材与导入
 

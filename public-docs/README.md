@@ -45,6 +45,6 @@ curl "$BASE_URL/v1/models"
 
 模型的使用说明随发布提供：读取 `GET /v1/models` 返回的 `documentation_url`，拿到你选中那个模型的参数说明与调用示例。它和目录来自同一次发布，参数规则不会串版。
 
-- [API Key 鉴权](authentication.md)
-- [上传参考图片](uploads/images.md)
-- [HTTP 状态码和错误处理](http-errors.md)
+- [API Key 鉴权]({{SEE_BASEURL}}/v1/docs/authentication.md)
+- [上传参考图片]({{SEE_BASEURL}}/v1/docs/uploads/images.md)
+- [HTTP 状态码和错误处理]({{SEE_BASEURL}}/v1/docs/http-errors.md)

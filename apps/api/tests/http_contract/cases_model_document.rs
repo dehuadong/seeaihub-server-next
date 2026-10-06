@@ -157,7 +157,7 @@ fn version_of(url: &str) -> &str {
     url.split("version=").nth(1).expect("version parameter")
 }
 
-/// A7：三份公共文档按固定名称提供；未列出的名称与路径穿越都回 404，不提供任意文件读取。
+/// A7：四份公共文档（含对客入口）按固定名称提供；未列出的名称与路径穿越都回 404，不提供任意文件读取。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_public_usage_documents_are_served_by_their_fixed_names() {
@@ -166,7 +166,12 @@ async fn the_public_usage_documents_are_served_by_their_fixed_names() {
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
-    for name in ["authentication.md", "uploads/images.md", "http-errors.md"] {
+    for name in [
+        "README.md",
+        "authentication.md",
+        "uploads/images.md",
+        "http-errors.md",
+    ] {
         let response = client
             .get(format!("{base_url}/v1/docs/{name}"))
             .send()
@@ -176,11 +181,25 @@ async fn the_public_usage_documents_are_served_by_their_fixed_names() {
         let body = response.text().await.expect("public document body");
         assert!(!body.trim().is_empty(), "{name} 的正文不该为空");
     }
-    for name in [
-        "README.md",
-        "models/openai/gpt-image-2.5.md",
-        "%2e%2e%2fCargo.toml",
-    ] {
+    // 入口讲清目录字段的含义，并把三份说明写成绝对地址。
+    let entry = client
+        .get(format!("{base_url}/v1/docs/README.md"))
+        .send()
+        .await
+        .expect("entry document")
+        .text()
+        .await
+        .expect("entry body");
+    assert!(entry.contains("documentation_url"), "{entry}");
+    assert!(
+        entry.contains("http://api.contract.test/v1/docs/authentication.md"),
+        "{entry}"
+    );
+    assert!(
+        !entry.contains(seeai_application::model_document::BASE_URL_PLACEHOLDER),
+        "{entry}"
+    );
+    for name in ["models/openai/gpt-image-2.5.md", "%2e%2e%2fCargo.toml"] {
         let response = client
             .get(format!("{base_url}/v1/docs/{name}"))
             .send()
