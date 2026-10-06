@@ -2,8 +2,8 @@ use super::*;
 
 /// AIHubMix：两条同步路径都能跑通，且**渠道给什么就返回什么**。
 ///
-/// 覆盖公网 URL 输入、`url` / `b64_json` 两种上游形态，以及 data URL 与 multipart 文件部件
-/// 在受理前被拒（Spec 0005 A12）。
+/// 覆盖公网 URL 输入、`url` / `b64_json` 两种上游形态、data URL 在受理前被拒（Spec 0005 A12），
+/// 以及 multipart 正文不再被接受（Spec 0005 §1）。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() {
@@ -89,7 +89,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     .expect("job count");
     assert_eq!(jobs, 0, "被拒的 data URL 不建执行记录");
 
-    // 4) edits 入口（multipart 文件部件）：同一份公网 URL 合同，文件部件在受理前被拒。
+    // 4) 两个图片入口共用一套 JSON 解码：multipart 正文不再被接受（Spec 0005 §1）。
     let key = format!("sync-edit-{}", Uuid::new_v4());
     let form = reqwest::multipart::Form::new()
         .part(
@@ -99,23 +99,10 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
                 .mime_str("image/png")
                 .expect("mime"),
         )
-        .part(
-            "mask",
-            reqwest::multipart::Part::bytes(PNG_FIXTURE.to_vec())
-                .file_name("mask.png")
-                .mime_str("image/png")
-                .expect("mime"),
-        )
         .text("model", harness.model.to_owned())
         .text("prompt", "edit through the multipart entry");
     let (status, body) = harness.sync_multipart(&key, form).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
-    assert_eq!(
-        body["error"]["code"].as_str(),
-        Some("public_image_url_required"),
-        "{body}"
-    );
-    assert_public_only("文件部件参考图", &body);
+    assert_eq!(status, StatusCode::UNSUPPORTED_MEDIA_TYPE, "got {body}");
     assert_eq!(harness.create_calls(), creates_before, "被拒请求不调上游");
 
     // 5) 同义字段只能给一个；只给遮罩是结构性错误。

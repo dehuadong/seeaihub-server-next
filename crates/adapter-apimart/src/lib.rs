@@ -1264,12 +1264,7 @@ fn gateway_generation_body(
 impl ApimartImageAdapter {
     /// 公网 URL 原样透传：生成入口只收公网 URL，平台不下载、不上传、不改写。
     fn gateway_resolve_url(&self, image: &InputImage) -> Result<String, AdapterError> {
-        match image {
-            InputImage::Url(url) => Ok(url.clone()),
-            InputImage::Bytes(_) => Err(AdapterError::UnsupportedInput(
-                "the generation entry only accepts public image urls".to_owned(),
-            )),
-        }
+        Ok(image.as_str().to_owned())
     }
 
     /// 按 [`GatewayInput::image_sites`] 换算图片：参考图与遮罩各自的参数名与 wire 形状来自参数位，

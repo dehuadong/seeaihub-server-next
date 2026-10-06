@@ -107,31 +107,28 @@ async fn filtering_never_drops_the_images_the_platform_places() {
     harness.cleanup().await;
 }
 
-/// 编辑路径（multipart 入口）走同一套：声明过的参数原样到上游，没声明的到此为止。
+/// 编辑路径（`/v1/images/edits`，与 `generations` 同一套 JSON 解码）走同一套参数过滤：
+/// 声明过的参数原样到上游，没声明的到此为止。
 ///
 /// AIHubMix 的编辑端点收的是表单部件：标量参数进文本部件、参考图进文件部件。这里断言两个方向——
 /// 声明过的 `quality` 确实进了发给假上游的表单（文本部件里能读到它的名字），而 `seed` 与
 /// `image_with_roles` 在整份表单字节里都不出现。
 ///
-/// 平台这一侧只收公网 URL：参考图走 `image` 文本部件，字节由 Adapter 自己取回后再进上游的文件部件。
+/// 平台这一侧只收公网 URL：参考图走 `image` 字段，字节由 Adapter 自己取回后再进上游的文件部件。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn the_multipart_edit_path_keeps_declared_parameters_and_drops_undeclared_ones() {
+async fn the_edit_path_keeps_declared_parameters_and_drops_undeclared_ones() {
     let harness =
         Harness::start_with_bootstrap(UpstreamBehaviour::aihubmix(SyncImageShape::Base64), 64)
             .await;
     let key = format!("edits-declared-{}", Uuid::new_v4());
-    let form = reqwest::multipart::Form::new()
-        .text("model", harness.model.to_owned())
-        .text("prompt", "an edit with a declared parameter")
-        .text("quality", "high")
-        .text("seed", "7")
-        .text(
-            "image_with_roles",
-            json!([{"role": "reference", "url": "https://example.invalid/a.png"}]).to_string(),
-        )
-        .text("image", harness.png_url());
-    let (status, body) = harness.sync_multipart(&key, form).await;
+    let mut request = route_request(harness.model, "an edit with a declared parameter");
+    request["quality"] = json!("high");
+    request["seed"] = json!(7);
+    request["image_with_roles"] =
+        json!([{"role": "reference", "url": "https://example.invalid/a.png"}]);
+    request["image"] = json!(harness.png_url());
+    let (status, body) = harness.sync_json("/v1/images/edits", &key, request).await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("编辑路径的声明面过滤", &body);
     let edits = harness.submit_bytes("/v1/images/edits");
@@ -158,39 +155,33 @@ async fn the_multipart_edit_path_keeps_declared_parameters_and_drops_undeclared_
     harness.cleanup().await;
 }
 
-/// multipart 入口的图片也可以走**文本部件**（不带文件名）：与 JSON 入口同一套语义，
-/// 值就是公网 URL，平台认的字段名照样只有 `image` / `image_urls` / `mask`。
+/// 两个图片入口共用一套解码：同一个 JSON 请求发给哪个路径，行为都一致（Spec 0005 §1）。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn multipart_text_image_fields_follow_the_same_contract() {
+async fn both_image_entries_accept_the_same_json_request() {
     let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Base64)).await;
 
-    // 1) 不带文件名的 `image_urls` 文本件：正常出图。
-    let key = format!("edits-text-{}", Uuid::new_v4());
-    let form = reqwest::multipart::Form::new()
-        .text("model", harness.model.to_owned())
-        .text("prompt", "edit through a text field")
-        .text("image_urls", harness.png_url());
-    let (status, body) = harness.sync_multipart(&key, form).await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("文本部件参考图", &body);
-    let edits = harness.submit_bytes("/v1/images/edits");
-    assert!(
-        body_contains_bytes(&edits, PNG_FIXTURE),
-        "文本部件里的公网 URL 取回的字节必须进文件部件"
-    );
+    // 1) 参考图走 `image_urls`：两个路径都出图。
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        let key = format!("edits-text-{}", Uuid::new_v4());
+        let mut request = route_request(harness.model, "edit through a text field");
+        request["image_urls"] = json!([harness.png_url()]);
+        let (status, body) = harness.sync_json(path, &key, request).await;
+        assert_eq!(status, StatusCode::OK, "{path}: got {body}");
+        assert_sync_success("文本部件参考图", &body);
+    }
 
-    // 2) `image` 与 `image_urls` 同时给非空值：同义字段含糊，受理前 400。
-    let key = format!("edits-text-conflict-{}", Uuid::new_v4());
-    let form = reqwest::multipart::Form::new()
-        .text("model", harness.model.to_owned())
-        .text("prompt", "both synonyms as text fields")
-        .text("image", "https://example.invalid/a.png")
-        .text("image_urls", "https://example.invalid/b.png");
-    let (status, body) = harness.sync_multipart(&key, form).await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "got {body}");
-    assert_eq!(body["error"]["code"].as_str(), Some("invalid_parameter"));
-    assert_public_only("文本部件的同义字段冲突", &body);
+    // 2) `image` 与 `image_urls` 同时给非空值：同义字段含糊，受理前 400，两个路径同判。
+    for path in ["/v1/images/generations", "/v1/images/edits"] {
+        let key = format!("edits-text-conflict-{}", Uuid::new_v4());
+        let mut request = route_request(harness.model, "both synonyms as text fields");
+        request["image"] = json!("https://example.invalid/a.png");
+        request["image_urls"] = json!(["https://example.invalid/b.png"]);
+        let (status, body) = harness.sync_json(path, &key, request).await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "{path}: got {body}");
+        assert_eq!(body["error"]["code"].as_str(), Some("invalid_parameter"));
+        assert_public_only("文本部件的同义字段冲突", &body);
+    }
     harness.cleanup().await;
 }
 

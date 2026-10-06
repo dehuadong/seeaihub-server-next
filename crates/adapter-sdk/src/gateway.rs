@@ -1,14 +1,12 @@
 //! 同步网关执行协议（RFC 0017 §2、§4）：内存输入、执行上下文与生命周期接口。
 
 use crate::{
-    AdapterError, DecodedImage, GeneratedImage, ProviderCallError, ProviderCost,
-    ProviderCredential, ProviderFailureKind, RetrySafety,
+    AdapterError, GeneratedImage, ProviderCallError, ProviderCost, ProviderCredential,
+    ProviderFailureKind, RetrySafety,
 };
 use async_trait::async_trait;
-use base64::{Engine, engine::general_purpose::STANDARD};
 use seeai_domain::{ImageBranch, TokenUsage};
 use serde_json::Value;
-use std::borrow::Cow;
 use std::fmt::{Debug, Formatter};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicU8, Ordering};
@@ -30,54 +28,27 @@ pub enum ExternalActionRefused {
 /// Provider 有界标识与 trace：权威定义在 [`seeai_domain`]，SDK 只重导出，不另立一套校验。
 pub use seeai_domain::{ProviderTaskHandle, ProviderTraceId};
 
-/// 一处输入图片的形态：公网 URL，或 multipart 文件部件的字节。
-///
-/// 生成入口只收公网 URL；`Bytes` 只为 **multipart 重放比对**保留（受理时按记录冻结的规则
-/// 重算指纹），不参与执行（RFC 0017 §2）。
+/// 一处输入图片：公网 http(s) 地址。平台不下载，原样交给上游（RFC 0017 §2）。
 #[derive(Clone)]
-pub enum InputImage {
-    /// 公网 http(s) 地址：平台不下载，原样交给上游。
-    Url(String),
-    /// multipart 文件部件的已解码字节与声明的媒体类型。
-    Bytes(DecodedImage),
-}
+pub struct InputImage(String);
 
 impl InputImage {
-    /// 需要 data URL 的渠道用它取 wire 值：URL 借用原值，字节只编码一次。
-    pub fn to_data_url(&self) -> Result<Cow<'_, str>, AdapterError> {
-        match self {
-            Self::Url(url) => Ok(Cow::Borrowed(url)),
-            Self::Bytes(image) => Ok(Cow::Owned(format!(
-                "data:{};base64,{}",
-                image.media_type,
-                STANDARD.encode(&image.bytes)
-            ))),
-        }
+    /// 由公网 http(s) 地址构造。
+    pub fn url(value: impl Into<String>) -> Self {
+        Self(value.into())
     }
 
-    /// 需要字节的渠道用它取解码结果：公网 URL 没有字节。
-    pub fn decoded(&self) -> Result<Cow<'_, DecodedImage>, AdapterError> {
-        match self {
-            Self::Bytes(image) => Ok(Cow::Borrowed(image)),
-            Self::Url(_) => Err(AdapterError::UnsupportedInput(
-                "a public url carries no bytes; the adapter must fetch it".to_owned(),
-            )),
-        }
+    /// 取值：公网 http(s) 地址。
+    #[must_use]
+    pub fn as_str(&self) -> &str {
+        &self.0
     }
 }
 
 impl Debug for InputImage {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
-        // 图片值不进日志或 Debug（RFC 0017 §4）：只打印形态与长度。
-        match self {
-            Self::Url(value) => write!(formatter, "InputImage::Url({} chars)", value.len()),
-            Self::Bytes(image) => write!(
-                formatter,
-                "InputImage::Bytes({} bytes, {})",
-                image.bytes.len(),
-                image.media_type
-            ),
-        }
+        // 图片值不进日志或 Debug（RFC 0017 §4）：只打印长度。
+        write!(formatter, "InputImage({} chars)", self.0.len())
     }
 }
 

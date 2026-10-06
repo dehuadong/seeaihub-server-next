@@ -73,7 +73,7 @@
 | GET | `/v1/models` | `list_models` | 任何人（公开目录，无需鉴权；只列当前可调的**网关模型**：`name` 是平台对客名、`vendor_id` 是厂商标识、`type` 是模型类型，另给合同修订 `revision` 与调用方合同 `contract`；厂商原生名不进对客面，`contract` 里的型号身份已换成对客名） |
 | GET | `/v1/account` | `read_own_account` | 持 Key 的账户（**只有自己的**三个金额字段：已结算余额、持有中与可用额，**分开给、不合成一个数**——合成"总资产"会让"这笔钱到底扣没扣"说不清。三个数都以**数据库**为准、不读缓存：缓存可能滞后、也可能刚被对账覆盖写回，而这条读的用途正是查看与核对） |
 | POST | `/v1/images/generations` | `generate_image` | 持 Key 的账户（JSON；`model` + 平铺的模型参数 + 参考图/遮罩；幂等键走 `Idempotency-Key` 头） |
-| POST | `/v1/images/edits` | `edit_image` | 同上（`multipart/form-data`；`image`/`mask` 只收公网 URL 文本部件，文件部件在受理前被拒；与上一条**同一个能力**） |
+| POST | `/v1/images/edits` | `generate_image` | 与上一条**同一套 JSON 解码**：两个路径是同一个能力，只做请求解码；参考图与遮罩只收公网 URL |
 | POST | `/v1/uploads/images` | `upload_image` | 持 Key 的账户（单文件 `multipart/form-data`，字段名 `file`；写入上传存储换公网 URL；路由自带正文上限，不计费、不建执行记录） |
 | POST | `/api/v1/admin/sessions` | `login_admin` | 公开（邮箱 + 口令 → 会话；邮箱不存在与口令不对回同一个答复，两条路都走一次口令哈希） |
 | GET / DELETE | `/api/v1/admin/session`、`/api/v1/admin/sessions` | `read_admin_session`、`logout_admin` | **仅会话**（共享 `ADMIN_TOKEN` 不指向任何管理员，在这些端点上被拒） |
@@ -101,7 +101,7 @@
 
 ```text
 消费侧
-  │ POST /v1/images/generations 或 /v1/images/edits   apps/api/src/main.rs  generate_image / edit_image
+  │ POST /v1/images/generations 或 /v1/images/edits   apps/api/src/main.rs  generate_image
   ▼
 入口中间件：认证、速率与读取准入都发生在消费正文之前，
   取不到读取许可直接拒绝，不排队                        apps/api/src/main.rs  require_generation_access
@@ -184,7 +184,7 @@ DirectExecutionService::execute                        crates/application  direc
 | `crates/*/src/tests.rs`、`crates/*/src/<模块>/tests.rs`、`crates/application/src/tests/` | 各 crate 的单元测试（`crates/application` 的按主题分在 `src/tests/` 下）。落点约定见根 [`AGENTS.md`](../AGENTS.md) 的「通用约定」 | 端到端合同测试（在 `apps/api/tests/http_contract/`） |
 | `crates/domain/src/execution_protocol.rs` | 同步网关执行的最小事实：`ExecutionStage`（admitted/executing/succeeded/failed/reconciliation_required）、`AttemptStage`（prepared/submitting/accepted/terminal/unknown）、`FencingToken`、`ProviderTaskState` 与有界 Provider 标识校验（`MAX_PROVIDER_IDENTIFIER_BYTES` / `is_bounded_provider_identifier`） | 持久化、HTTP 与 Provider 细节 |
 | `crates/application/src/request_fingerprint.rs` | 幂等键不可逆标识（无密钥 SHA-256）与请求指纹（带密钥 HMAC-SHA256、按版本轮换的指纹密钥）及规范化（端点/型号/已识别参数/参考图与 mask/n） | 具体请求解析与选路 |
-| `crates/adapter-sdk/src/gateway.rs` | 新协议 Adapter 生命周期接口：`InputImage`（公网 URL，或 multipart 文件部件的字节——后者只供重放比对）、`GatewayInput`、`ExecutionContext`/`AcceptedHandle`、`GatewayAdapter`、`ProviderOutput`/`AccountingFacts` | 具体渠道协议与平台财务规则 |
+| `crates/adapter-sdk/src/gateway.rs` | 新协议 Adapter 生命周期接口：`InputImage`（公网 URL）、`GatewayInput`、`ExecutionContext`/`AcceptedHandle`、`GatewayAdapter`、`ProviderOutput`/`AccountingFacts` | 具体渠道协议与平台财务规则 |
 | `crates/domain/src/lib.rs` | `JobState` 状态机、`ImageBranch`、`OfferingCandidate`（档位 `routing_priority` 与**档内权重** `weight`）、`PricingFormula`（计价形态：按 token 计量量 / 按张 / 按次 / 上游直接给金额）、`PriceSnapshot`（成本计价形态与其成本单价、对客计价形态与对客费率向量 / 成本费率 / 保底额 / 折算率 / 成本来源）、`resolve_size_tier` 与 `FloorTable`（像素型 `size` 归位 + 保底表查表与回落链）、`FxRate` 定点折算、`TokenUsage` / `MeteringEvidence` | IO、持久化 |
 | `crates/domain/src/image_parameters.rs` | 图片参数的**唯一**一份规则：调用方契约字段（`image`/`image_urls`/`mask`）、候选声明参数名的判定（名字以 `image` 开头＝参考图、含 `mask`＝遮罩）、`null`/空串＝这一处没有图、把调用方的图落到候选声明的参数名上 | IO；也不认识任何**具体渠道**（参数名本身按 [`docs/adr/0015`](adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 应来自 Vendor Model Contract；当前实现里它是渠道原生名，属 [`#6`](https://github.com/dehuadong/seeaihub-server-next/issues/6) 差距 G1） |
 | `crates/domain/src/upload_media.rs` | 上传素材的领域规则：允许的媒体类型（按内容魔数判定 JPEG/PNG/WebP）、规范 MIME 到对象键扩展名的映射、单文件上限（20 MiB，严格小于）、对象键构造（`reference-media/{调用者账户 id}/{uuid}.{ext}`）与写入失败分类 | IO、对象存储、HTTP 与环境变量 |
@@ -195,7 +195,7 @@ DirectExecutionService::execute                        crates/application  direc
 | `crates/persistence/src/lib.rs` | `PgHubRepository`：SQL、事务边界、迁移、行↔领域类型映射；余额变更一律用 `RETURNING` 把**提交后**的余额带回给用例（供写穿缓存） | 业务判定（只执行用例给出的结论） |
 | `crates/cache-redis/src/lib.rs` | 加速层的 Redis 实现：`GET` / `SET … PX` / `DEL` 三条命令、惰性连接与单次操作超时；连不上或命令报错一律返回错误，由用例层当"未命中"处理。`REDIS_URL` 为空时不构造（`from_env` 返回 `None`） | 键名、值形状与版本判定（都在 `crates/application`） |
 | `crates/alert-webhook/src/lib.rs` | 平台故障告警出口的 HTTP 实现：把一条 `PlatformAlert` 以 POST JSON 发出、有界超时与重试。`PROVIDER_ALERT_WEBHOOK` 为空时不构造（`from_env` 返回 `None`），地址不可用时构造即失败 | 何时告警、告警内容、发送失败如何收口（都在 `crates/application` 的 `PlatformAlerter`） |
-| `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 编解码（multipart 文件部件的重放比对）、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`（**失败件同样带成本事实报告**：终态之后判定失败时把已经读到的成本随错误交回平台）、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
+| `crates/adapter-sdk/src/lib.rs` | ② 的接口与共享类型：`ImageAdapter`、`AdapterDescriptor`、`PreparedImageRequest`、结果信封（`url` 或 `b64_json` 恰好其一）、data URL 编解码（渠道请求里的内联图片）、`ProviderSuccess`、**成本事实报告**（`ProviderCost` 三态 `declared` / `computed` / `unavailable`，成员名与领域取值逐字同名，转换只此一处）、`ProviderCallError`（**失败件同样带成本事实报告**：终态之后判定失败时把已经读到的成本随错误交回平台）、`RetrySafety` 三态、`ProviderFailureKind` 平台侧失败类别 | 任何具体渠道的协议细节 |
 | `crates/adapter-aihubmix/src/lib.rs` | AIHubMix 一族：端点分流（`/v1/images/generations` 与 `/v1/images/edits`）、multipart 封装（参考图需字节：公网 URL 由它自己取）、结果原样交回、响应头 `x-request-id`（有则采集为对账标识）、错误分类、**成本报告"这条渠道不给金额字段"**（成本由平台按实际用量自算） | 平台侧的生命周期与计费规则 |
 | `crates/adapter-apimart/src/lib.rs` | APIMart 一族：任务式（提交 → 轮询，**只在 Adapter 内部**）、公网参考图逐字透传、四分项计量证据的读取、错误分类与 `SafeBeforeAcceptance`；终态里的 `cost` **采纳为成本事实**（精确换成微单位、币种用渠道声明；缺字段 / 负数 / 解析失败一律按"拿不到"报告，不猜）。`credits_cost` 仍不采纳 | 同上；金额只进成本口径，不替代计量事实、不参与对客金额 |
 | `crates/adapter-object-storage/src/lib.rs` | 阿里云 OSS 对象存储适配器：V4 header 模式自实现签名、PUT（禁覆盖头）/HEAD 请求构造、有界传输（单请求超时、无隐式重试、不跟随重定向）与 HTTP 状态到失败分类的映射；只发 PUT 与 HEAD，不签发预签名 URL | 重试编排、配置读取与对客错误码（在应用层） |

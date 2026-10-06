@@ -842,51 +842,6 @@ fn gateway_prompt_only_body_is_byte_identical_to_the_legacy_json_entry() {
     assert_eq!(legacy_body, gateway_body, "JSON 入口逐字不变");
 }
 
-/// 新 multipart 入口与旧入口必须给出同一份部件字节：图片从强类型字段取，不经 data URL 往返。
-#[tokio::test]
-async fn gateway_edit_form_is_byte_identical_to_the_legacy_multipart_entry() {
-    let schema = published_schema();
-    let image = "data:image/png;base64,AAAA";
-    let mask = "data:image/png;base64,BBBB";
-    let mut legacy = request_for(&schema, ImageBranch::Masked);
-    legacy.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "n": 1,
-        "image": image,
-        "mask": mask,
-    });
-    let input = GatewayInput {
-        provider_model_id: legacy.provider_model_id.clone(),
-        branch: ImageBranch::Masked,
-        native_parameters: serde_json::json!({"prompt": "test", "n": 1}),
-        reference_images: vec![InputImage::Bytes(
-            decode_inline_image(image).expect("the inline reference image decodes"),
-        )],
-        mask: Some(InputImage::Bytes(
-            decode_inline_image(mask).expect("the inline mask decodes"),
-        )),
-        image_sites: gateway_sites(&schema, ImageBranch::Masked),
-        cost_currency: "USD".to_owned(),
-    };
-    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
-        .expect("adapter config should be valid");
-    let legacy_bytes = normalized_form(
-        adapter
-            .edit_form(&legacy)
-            .await
-            .expect("the legacy form builds"),
-    )
-    .await;
-    let gateway_bytes = normalized_form(
-        adapter
-            .gateway_edit_form(&input, &FakeContext::fresh())
-            .await
-            .expect("the gateway form builds"),
-    )
-    .await;
-    assert_eq!(legacy_bytes, gateway_bytes, "multipart 入口逐字不变");
-}
-
 /// URL 态走既有下载：同一个公网地址，新旧入口下载出的字节逐字一致。
 #[tokio::test]
 async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
@@ -900,7 +855,7 @@ async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
         provider_model_id: legacy.provider_model_id.clone(),
         branch: ImageBranch::ImageConditioned,
         native_parameters: serde_json::json!({"prompt": "test"}),
-        reference_images: vec![InputImage::Url(receiver.url.clone())],
+        reference_images: vec![InputImage::url(receiver.url.clone())],
         mask: None,
         image_sites: gateway_sites(&schema, ImageBranch::ImageConditioned),
         cost_currency: "USD".to_owned(),
@@ -925,35 +880,6 @@ async fn gateway_multipart_form_downloads_a_public_url_like_the_legacy_entry() {
     assert_eq!(receiver.requests(), 2, "两个入口各自下载一次公网参考图");
 }
 
-/// 内存态不发生网络往返：multipart 文件部件的 `Bytes` 直接借用，只有 URL 才走下载。
-#[tokio::test]
-async fn gateway_input_images_borrow_bytes_without_network() {
-    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
-        .expect("adapter config should be valid");
-    let borrowed = adapter
-        .gateway_image_bytes(
-            &InputImage::Bytes(DecodedImage {
-                media_type: "image/jpeg".to_owned(),
-                bytes: Bytes::from_static(&[1, 2, 3]),
-            }),
-            &FakeContext::fresh(),
-        )
-        .await
-        .expect("declared bytes are borrowed");
-    assert_eq!(borrowed.bytes.as_ref(), &[1, 2, 3]);
-    assert_eq!(borrowed.media_type, "image/jpeg");
-    // 公网地址没有现成字节：模拟没有服务监听，证明它确实走下载而不是当字节用。
-    assert!(
-        adapter
-            .gateway_image_bytes(
-                &InputImage::Url("http://127.0.0.1:1/none.png".to_owned()),
-                &FakeContext::fresh(),
-            )
-            .await
-            .is_err(),
-        "URL 态必须走下载"
-    );
-}
 /// 取消在生成请求之前生效：闸门拦下，不会真的发出去（基址上没有服务在听）。
 #[tokio::test]
 async fn a_cancelled_gateway_execution_never_sends() {

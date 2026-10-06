@@ -6,7 +6,7 @@
 
 - 一个 `CreateImageGenerationRequest` 接收入口与一条直接执行路径；内部只持久化最小执行与账务记录（Job/Attempt，对客不可见）；
 - 两个渠道族的 Adapter：AIHubMix（`https://api.inferera.com`，同步）与 APIMart（`https://api.apib.ai`，任务式，只在 Adapter 内部）；
-- 对客只有两条同步路径：`POST /v1/images/generations`（JSON）与 `POST /v1/images/edits`（multipart）；参考图/遮罩只收 `http(s)` 公网 URL，本地文件先经上传端点 `POST /v1/uploads/images` 换成公网 URL；
+- 对客只有两条同步路径：`POST /v1/images/generations` 与 `POST /v1/images/edits`，两者接受同一个 JSON 请求；参考图/遮罩只收 `http(s)` 公网 URL，本地文件先经上传端点 `POST /v1/uploads/images` 换成公网 URL；
 - 无图片走上游的文生图接口；有图片、可选遮罩则按渠道自己的参数走图生图/编辑；
 - 结果按渠道原形返回：渠道给 `url` 就给 `url`、给 `b64_json` 就给 `b64_json`，平台不落盘静态素材；
 - PostgreSQL 固化 Runtime Revision、Job、Attempt、Price Snapshot 和账本；

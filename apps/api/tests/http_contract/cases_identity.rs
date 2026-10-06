@@ -1821,7 +1821,8 @@ fn probe_body(method: &str, path: &str) -> ProbeBody {
     }
     match path {
         "/v1/images/generations" => ProbeBody::Json(json!({})),
-        "/v1/images/edits" => ProbeBody::Multipart,
+        // 两个图片入口共用一套 JSON 解码：探针体也是 JSON。
+        "/v1/images/edits" => ProbeBody::Json(json!({})),
         // 上传端点要 multipart 正文；合法 multipart 的探针体仍要走到鉴权那一步。
         "/v1/uploads/images" => ProbeBody::Multipart,
         "/v1/customers" => ProbeBody::Json(json!({

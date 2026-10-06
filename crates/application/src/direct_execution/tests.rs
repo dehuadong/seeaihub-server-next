@@ -101,8 +101,8 @@ fn gateway_input_hoists_images_out_of_native_parameters() {
         }
     }));
     let request = request(
-        vec![InputImage::Url("https://img.example/a.png".to_owned())],
-        Some(InputImage::Url("https://img.example/mask.png".to_owned())),
+        vec![InputImage::url("https://img.example/a.png")],
+        Some(InputImage::url("https://img.example/mask.png")),
     );
     // 这一份是承载准备后的参数面：图片位上的取值已经由 place_image_inputs 装载。
     let prepared = json!({
@@ -170,22 +170,4 @@ fn a_replay_projects_to_the_four_spec_four_outcomes() {
         ),
         DirectExecutionError::OutcomeUnknown
     ));
-}
-
-#[test]
-fn bytes_are_fingerprinted_as_their_wire_data_url() {
-    let request = request(
-        vec![
-            InputImage::Url("https://img.example/a.png".to_owned()),
-            InputImage::Bytes(seeai_adapter_sdk::DecodedImage {
-                media_type: "image/png".to_owned(),
-                bytes: bytes::Bytes::from_static(b"\x89PNG"),
-            }),
-        ],
-        None,
-    );
-    let routing = routing_request(&request).expect("a routing request");
-    assert_eq!(routing.reference_images.len(), 2);
-    assert_eq!(routing.reference_images[0], "https://img.example/a.png");
-    assert!(routing.reference_images[1].starts_with("data:image/png;base64,"));
 }

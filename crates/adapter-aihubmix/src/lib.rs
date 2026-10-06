@@ -694,8 +694,7 @@ impl AihubmixImageAdapter {
         parse_response(response).await.map(gateway_output)
     }
 
-    /// 新协议的 multipart 入口：图片直接来自 `input.reference_images` / `input.mask`，字节由
-    /// [`InputImage::decoded`] 给出、公网 URL 走既有下载，不经 data URL 往返。
+    /// 新协议的编辑入口：图片直接来自 `input.reference_images` / `input.mask`，公网 URL 走既有下载。
     async fn gateway_edit(
         &self,
         input: &GatewayInput,
@@ -770,25 +769,16 @@ impl AihubmixImageAdapter {
         Ok(form)
     }
 
-    /// 一份输入图取成字节：multipart 文件部件的 `Bytes` 借用，公网 URL 在自己下载前先过取消/
-    /// 期限闸，单次超时取 min(自身配置, 总期限剩余)。内存形态不发生网络往返（RFC 0017 §2、§6）。
+    /// 一份输入图取成字节：公网 URL 在自己下载前先过取消/期限闸，单次超时取 min(自身配置,
+    /// 总期限剩余)。字节不落盘（RFC 0017 §2、§6）。
     async fn gateway_image_bytes(
         &self,
         image: &InputImage,
         context: &dyn ExecutionContext,
     ) -> Result<DecodedImage, AdapterError> {
-        match image {
-            InputImage::Url(url) => {
-                ensure_external_call_allowed(context)?;
-                self.download_image_within(url, external_call_timeout(self.timeout, context))
-                    .await
-            }
-            InputImage::Bytes(_) => {
-                let decoded = image.decoded()?;
-                ensure_input_size(decoded.bytes.len())?;
-                Ok(decoded.into_owned())
-            }
-        }
+        ensure_external_call_allowed(context)?;
+        self.download_image_within(image.as_str(), external_call_timeout(self.timeout, context))
+            .await
     }
 }
 

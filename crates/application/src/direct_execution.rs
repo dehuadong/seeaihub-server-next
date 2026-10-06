@@ -78,9 +78,8 @@ pub fn settle_reserve_from_env() -> Result<Duration, ApplicationError> {
 
 /// 已经解析好的一次同步图片请求。
 ///
-/// 图片是**两态**（公网 URL，或 multipart 文件部件的字节——后者只供同键重放比对），由接口层
-/// 解析 multipart 与 JSON 后给出；本用例只把它们交给适配器，不落盘、不写日志。`endpoint`
-/// 进请求指纹：JSON 与 multipart 两个端点不承诺共享指纹。
+/// 图片是公网 URL，由接口层解析 JSON 后给出；本用例只把它们交给适配器，不落盘、不写日志。
+/// `endpoint` 进请求指纹：两个路径各自是一个端点，不共享指纹。
 pub struct DirectExecutionRequest {
     pub account_id: AccountId,
     /// 对外的平台型号名（网关模型）。
@@ -99,18 +98,13 @@ pub struct DirectExecutionRequest {
 
 /// 命中同键记录后比对用的**原始输入**：有界解析之后、按任何合同解释之前的那一份请求面。
 ///
-/// 它比 [`DirectExecutionRequest`] 早一步：图片还在参数面的契约字段名下（JSON 入口），或还是
-/// multipart 文件部件（edits 入口）。记录比对用它按**记录冻结的合同**重算指纹，因此图片字段
-/// 抽取、型号与分支判定都发生在查找之后（RFC 0018 §9.1）。
+/// 它比 [`DirectExecutionRequest`] 早一步：图片还在参数面的契约字段名下。记录比对用它按**记录
+/// 冻结的合同**重算指纹，因此图片字段抽取、型号与分支判定都发生在查找之后（RFC 0018 §9.1）。
 pub struct RecordedRequestInput<'a> {
     /// 幂等键：进记录比对用的请求面（[`CreateImageGenerationRequest`] 的一份形状）。
     pub idempotency_key: &'a str,
     /// 已经计过数的参数面；契约字段名下的图片还在里面。
     pub parameters: RequestParameters,
-    /// multipart 文件部件：参考图。
-    pub file_references: &'a [InputImage],
-    /// multipart 文件部件：遮罩。
-    pub file_mask: Option<&'a InputImage>,
 }
 
 /// 执行所有权的登记出口：直接执行用例在**首次提交声明落库后**把 `(job_id, fencing_token)` 交给调用方。
@@ -1538,9 +1532,9 @@ fn routing_request(
     let reference_images = request
         .reference_images
         .iter()
-        .map(image_text)
-        .collect::<Result<Vec<_>, _>>()?;
-    let mask = request.mask.as_ref().map(image_text).transpose()?;
+        .map(|image| image.as_str().to_owned())
+        .collect::<Vec<_>>();
+    let mask = request.mask.as_ref().map(|image| image.as_str().to_owned());
     Ok(CreateImageGenerationRequest {
         account_id: request.account_id,
         model: request.model.clone(),
@@ -1551,19 +1545,10 @@ fn routing_request(
     })
 }
 
-/// 图片进指纹与选路的字符串形态：公网 URL 借用原值，multipart 文件部件的字节编码一次。
-fn image_text(image: &InputImage) -> Result<String, ApplicationError> {
-    image
-        .to_data_url()
-        .map(|value| value.into_owned())
-        .map_err(|error| ApplicationError::Validation(error.to_string()))
-}
-
 /// **原始输入** → 记录比对用的请求面：命中同键记录后按记录冻结的合同解释这次请求的那一半。
 ///
-/// 图片按契约字段名从参数面里摘出（与受理侧同一组固定名字），multipart 文件部件编码成 data URL；
-/// `model` 与受理侧一样从普通参数面移走。形状取不出来——图片值类型不对、两个同义字段都给、
-/// 没有 `model`——时返回 `None`：这次请求无法用记录冻结的合同解释，调用方必须按冲突拒绝，
+/// 图片按契约字段名从参数面里摘出（与受理侧同一组固定名字）；`model` 与受理侧一样从普通参数面移走。
+/// 形状取不出来——图片值类型不对、两个同义字段都给、没有 `model`——时返回 `None`：这次请求无法用记录冻结的合同解释，调用方必须按冲突拒绝，
 /// 不能当作未命中去执行新请求。
 ///
 /// 它不做任何版本化判定：合同面（有没有声明图片位、必填项、`n` 的取值面）由调用方拿记录冻结的
@@ -1575,24 +1560,8 @@ fn recorded_request_face(
     let RecordedRequestInput {
         idempotency_key,
         mut parameters,
-        file_references,
-        file_mask,
     } = input;
     let text = take_contract_image_inputs(&mut parameters).ok()?;
-    // 文件部件在场时以它为准：受理侧两者同时给出会被拒，因此不存在"两边都有"的记录。
-    let reference_images = if file_references.is_empty() {
-        text.reference_images
-    } else {
-        file_references
-            .iter()
-            .map(image_text)
-            .collect::<Result<Vec<_>, _>>()
-            .ok()?
-    };
-    let mask = match file_mask {
-        Some(image) => Some(image_text(image).ok()?),
-        None => text.mask,
-    };
     let model = parameters
         .remove("model")
         .and_then(|value| value.as_str().map(str::to_owned))?;
@@ -1600,8 +1569,8 @@ fn recorded_request_face(
         account_id,
         model,
         native_parameters: parameters.as_value().clone(),
-        reference_images,
-        mask,
+        reference_images: text.reference_images,
+        mask: text.mask,
         idempotency_key: idempotency_key.to_owned(),
     })
 }

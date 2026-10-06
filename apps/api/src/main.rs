@@ -2,8 +2,8 @@ use anyhow::{Context, Result, bail};
 use async_trait::async_trait;
 use axum::{
     Json, Router,
-    extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State, multipart::Field},
-    http::{HeaderMap, HeaderValue, StatusCode, header},
+    extract::{DefaultBodyLimit, Extension, Multipart, Path, Query, State},
+    http::{HeaderMap, HeaderValue, StatusCode, Uri, header},
     response::{IntoResponse, Response},
     routing::{delete, get, patch, post, put},
 };
@@ -12,7 +12,7 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_aihubmix::AihubmixAdapterFactory;
 use seeai_adapter_apimart::ApimartAdapterFactory;
 use seeai_adapter_object_storage::OssObjectStorage;
-use seeai_adapter_sdk::{DecodedImage, InputImage};
+use seeai_adapter_sdk::InputImage;
 use seeai_alert_webhook::WebhookAlertSink;
 use seeai_application::{
     AccelerationService, AccountSummary, AccountsService, AdapterRegistry, ApplicationError,
@@ -37,10 +37,9 @@ use seeai_application::{
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
-    AccountId, ChannelId, ImageInputs, ImageParameterKind, JobId, LedgerEntryKind, OfferingId,
-    PublishedModel, RequestJsonError, RequestJsonLimits, RequestParameters, RoutePolicy,
-    RouteStrategy, UploadWriteFailure, contract_image_parameter_kind,
-    replace_contract_model_identity,
+    AccountId, ChannelId, ImageInputs, JobId, LedgerEntryKind, OfferingId, PublishedModel,
+    RequestJsonError, RequestJsonLimits, RequestParameters, RoutePolicy, RouteStrategy,
+    UploadWriteFailure, replace_contract_model_identity,
 };
 use seeai_persistence::{
     PgHubRepository, material_import::import_supply_materials_from_env,
@@ -619,7 +618,8 @@ async fn main() -> Result<()> {
     // extension，handler 不再自己认证。
     let image_routes = Router::new()
         .route("/v1/images/generations", post(generate_image))
-        .route("/v1/images/edits", post(edit_image))
+        // 两个路径是同一个能力、同一套解码：`edits` 与 `generations` 接受同一个 JSON 请求（Spec 0005 §1）。
+        .route("/v1/images/edits", post(generate_image))
         .route_layer(axum::middleware::from_fn_with_state(
             state.clone(),
             require_generation_access,
@@ -3048,16 +3048,17 @@ struct SyncImageResponse {
     data: Vec<GeneratedImage>,
 }
 
-/// generations 入口（JSON）：与 edits 入口**是同一个能力**，只是请求编码不同。
+/// 两个图片入口（`/v1/images/generations` 与 `/v1/images/edits`）的**同一套** JSON 解码。
 ///
-/// 分支只看请求里有没有参考图 / 遮罩，不由端点断言——带图的 generations、不带图的 edits
-/// 都是合法请求。
+/// 两个路径是同一个能力，都走同一条受理路径（Spec 0005 §1）；分支只看请求里有没有参考图 /
+/// 遮罩，不由端点断言。端点本身进请求指纹与记录比对面，所以按请求的真实路径传下去。
 async fn generate_image(
     State(state): State<AppState>,
     account: Option<Extension<AuthenticatedAccount>>,
     slow: Option<Extension<SlowRead>>,
     scope: Option<Extension<Arc<ConnectionScope>>>,
     headers: HeaderMap,
+    uri: Uri,
     body: Result<BoundedRequestParameters, GenerationBodyRejection>,
 ) -> Result<Response, ApiError> {
     let direct = state.direct.clone();
@@ -3078,74 +3079,10 @@ async fn generate_image(
         account.0.received_at,
         scope.map(|scope| scope.0),
         &headers,
+        uri.path(),
         parameters,
     )
     .await
-}
-
-/// edits 入口（`multipart/form-data`）：`image` 与 `mask` 的文本部件按公网 URL 读，文件部件在受理前被拒。
-///
-/// 文件部件的字节仍被解析出来（`InputImage::Bytes`）供同键重放比对，**不落盘**；命中幂等记录时
-/// 按记录冻结的规则比对，未命中才按当前合同解释——那时文件部件一律 `400 public_image_url_required`。
-/// 没有 `image` 的 edits 同样合法（那就是文生图）。
-async fn edit_image(
-    State(state): State<AppState>,
-    account: Option<Extension<AuthenticatedAccount>>,
-    slow: Option<Extension<SlowRead>>,
-    scope: Option<Extension<Arc<ConnectionScope>>>,
-    headers: HeaderMap,
-    mut multipart: Multipart,
-) -> Result<Response, ApiError> {
-    let direct = state.direct.clone();
-    let account = account.ok_or_else(generation_account_missing)?;
-    let parsed = parse_multipart_direct(&mut multipart).await;
-    // 慢读超时不建记录：它发生在受理前，按 408 回应，而不是当成 multipart 格式错误。
-    if slow.as_ref().is_some_and(|slow| slow.0.timed_out()) {
-        return Err(slow_read_timeout());
-    }
-    let (parameters, file_references, file_mask) = parsed?;
-    let endpoint = "/v1/images/edits";
-    let idempotency_key = idempotency_key(&headers);
-    // 有界读取已完成，查找只用到账户与幂等键：这时还没摘图片字段、没判型号，也没占执行许可。
-    if let Some(lookup) = lookup_recorded(&direct, account.0.account_id, &idempotency_key).await? {
-        return Err(replay_recorded(
-            &direct,
-            account.0.account_id,
-            endpoint,
-            lookup,
-            RecordedRequestInput {
-                idempotency_key: &idempotency_key,
-                parameters,
-                file_references: &file_references,
-                file_mask: file_mask.as_ref(),
-            },
-        )?);
-    }
-    let (parameters, reference_images, mask) =
-        interpret_current_inputs(parameters, file_references, file_mask)?;
-    run_direct_generation(
-        direct,
-        account.0.account_id,
-        account.0.received_at,
-        scope.map(|scope| scope.0),
-        idempotency_key,
-        endpoint,
-        parameters,
-        reference_images,
-        mask,
-    )
-    .await
-}
-
-/// 表单里除文件外的部件都是字符串；只有整数型参数还原成数字（`n`），其余保持字符串
-/// （`prompt` 写成 "1" 也不能变成数字）。
-fn form_scalar(name: &str, text: &str) -> Value {
-    if name == "n"
-        && let Ok(value) = text.trim().parse::<i64>()
-    {
-        return Value::from(value);
-    }
-    Value::String(text.to_owned())
 }
 
 /// 直接执行入口的认证明细放进 request extension；handler 从它取账户，不再自己认证。
@@ -3408,9 +3345,9 @@ async fn run_direct_json(
     received_at: tokio::time::Instant,
     scope: Option<Arc<ConnectionScope>>,
     headers: &HeaderMap,
+    endpoint: &str,
     parameters: RequestParameters,
 ) -> Result<Response, ApiError> {
-    let endpoint = "/v1/images/generations";
     let idempotency_key = idempotency_key(headers);
     if let Some(lookup) = lookup_recorded(&direct, account_id, &idempotency_key).await? {
         return Err(replay_recorded(
@@ -3421,13 +3358,10 @@ async fn run_direct_json(
             RecordedRequestInput {
                 idempotency_key: &idempotency_key,
                 parameters,
-                file_references: &[],
-                file_mask: None,
             },
         )?);
     }
-    let (parameters, reference_images, mask) =
-        interpret_current_inputs(parameters, Vec::new(), None)?;
+    let (parameters, reference_images, mask) = interpret_current_inputs(parameters)?;
     run_direct_generation(
         direct,
         account_id,
@@ -3478,17 +3412,11 @@ fn replay_recorded(
 /// 按**当前合同**解释有界解析后的入口输入：图片值只收公网 URL。
 ///
 /// 只在幂等键未命中记录之后调用。命中时按记录冻结的合同比对，不用这里的新规则重新解释原请求
-/// （Spec 0005 §4）。参考图或遮罩的取值不是 `http(s)` 公网 URL（含 `data:` URL、multipart
-/// 文件部件与任何其他非法文本）时一律 `400 public_image_url_required`：不建记录、不取占用、不调上游。
-/// multipart 文件部件的字节仍被解析出来，但只供重放比对用，不参与执行。
+/// （Spec 0005 §4）。参考图或遮罩的取值不是 `http(s)` 公网 URL（含 `data:` URL 与任何其他非法
+/// 文本）时一律 `400 public_image_url_required`：不建记录、不取占用、不调上游。
 fn interpret_current_inputs(
     mut parameters: RequestParameters,
-    file_references: Vec<InputImage>,
-    file_mask: Option<InputImage>,
 ) -> Result<(RequestParameters, Vec<InputImage>, Option<InputImage>), ApiError> {
-    if !file_references.is_empty() || file_mask.is_some() {
-        return Err(public_image_url_required());
-    }
     let text_inputs = take_contract_image_inputs(&mut parameters)?;
     let reference_images = text_inputs
         .reference_images
@@ -3502,7 +3430,7 @@ fn interpret_current_inputs(
 /// 一个文本图片值必须是 `http(s)` 公网 URL；其余一律 `400 public_image_url_required`。
 fn public_image_url(value: String) -> Result<InputImage, ApiError> {
     if seeai_adapter_sdk::is_http_url(&value) {
-        return Ok(InputImage::Url(value));
+        return Ok(InputImage::url(value));
     }
     Err(public_image_url_required())
 }
@@ -3513,58 +3441,6 @@ fn public_image_url_required() -> ApiError {
         "public_image_url_required",
         "an input image must be a public http(s) url".to_owned(),
     )
-}
-
-/// multipart 图片部件：**直接保留字节**与声明的媒体类型；字节只供同键重放比对，不参与执行。
-async fn form_image_bytes(field: Field<'_>) -> Result<InputImage, ApiError> {
-    let media_type = field
-        .content_type()
-        .map(str::to_owned)
-        .unwrap_or_else(|| "image/png".to_owned());
-    let bytes = field
-        .bytes()
-        .await
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?;
-    Ok(InputImage::Bytes(DecodedImage { media_type, bytes }))
-}
-
-/// 解析 multipart 的**有界读取**：文件部件保留字节，文本部件逐项计数，契约字段名下的文本图片
-/// 原样留在参数面里（是否摘图、按什么规则解释由调用方在查过幂等键之后决定）。
-///
-/// 文本部件走 [`RequestParameters::builder`] **逐项计数**：非 JSON 编码的入口同样受容器层数、
-/// 字段数、累计字符串字节与节点数的约束（RFC 0018 §2.2），不能因为"不是 JSON"就绕开这一层。
-async fn parse_multipart_direct(
-    multipart: &mut Multipart,
-) -> Result<(RequestParameters, Vec<InputImage>, Option<InputImage>), ApiError> {
-    let mut parameters = RequestParameters::builder();
-    let mut file_references: Vec<InputImage> = Vec::new();
-    let mut file_mask: Option<InputImage> = None;
-    while let Some(field) = multipart
-        .next_field()
-        .await
-        .map_err(|error| ApiError::bad_request("invalid_multipart", error.to_string()))?
-    {
-        let name = field.name().unwrap_or_default().to_owned();
-        match contract_image_parameter_kind(&name) {
-            Some(ImageParameterKind::Reference) if field.file_name().is_some() => {
-                file_references.push(form_image_bytes(field).await?);
-            }
-            Some(ImageParameterKind::Mask) if field.file_name().is_some() => {
-                file_mask = Some(form_image_bytes(field).await?);
-            }
-            _ => {
-                let text = field.text().await.map_err(|error| {
-                    ApiError::bad_request("invalid_multipart", error.to_string())
-                })?;
-                parameters
-                    .insert(name.clone(), form_scalar(&name, &text))
-                    .map_err(|violation| {
-                        ApiError::bad_request("invalid_parameter", violation.to_string())
-                    })?;
-            }
-        }
-    }
-    Ok((parameters.finish(), file_references, file_mask))
 }
 
 /// 直接执行入口：预留本机许可，起受监督的执行，等一次性结果，按内存载荷构造响应。

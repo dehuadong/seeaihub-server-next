@@ -35,7 +35,7 @@ curl -X POST "$BASE_URL/v1/images/generations" \
 
 局部编辑时，单独上传遮罩图，并加入 `"mask":"<遮罩上传响应中的 url>"`。遮罩应与参考图配合，表示希望编辑的区域。
 
-也可使用 `POST /v1/images/edits` 的 multipart 表单入口，参考图和遮罩填写 URL 文本。多张参考图建议使用上述 JSON 入口；不要在编辑表单中直接附图片文件。
+`POST /v1/images/edits` 与上面的 `POST /v1/images/generations` 接受同一个 JSON 请求，两个地址等价，用哪个都行。
 
 ## 成功响应
 
