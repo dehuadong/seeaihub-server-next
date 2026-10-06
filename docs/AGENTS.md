@@ -16,6 +16,8 @@
 | 渠道事实 | `docs/facts/` | 已核实的渠道结论 | 平台规则、设计理由与调用流水 |
 | 调研 | `docs/research/` | 结论、事实、推论、待确认与来源 | 运行时合同 |
 | 验证清单 | `docs/verification/` | 执行步骤与证据 | 来源 Spec 或工作项拥有的验收合同 |
+| 部署与配置参考 | `docs/operations/` | 怎么跑起来、上生产与全部配置项：开发环境、生产部署、容器、每个变量的缺省与生产取值 | 使用教程（归 `docs/tutorials/`）；产品、技术或架构决定 |
+| 使用教程 | `docs/tutorials/` | 管理、运营与运维**按场景怎么使用**这套系统：操作步骤、失败处置与验证 | 部署与配置参考（归 `docs/operations/`）；产品、技术或架构决定（归 Spec / RFC / ADR） |
 | Agent Note | `.agents/notes/` | 一次变更独有的理由、备选、后果与验证 | Spec、RFC、ADR、工作状态或当前规则 |
 | 外部原始材料 | `out-reference/` | 上游快照、样本与其他背景证据 | 工程合同、运行时输入与项目决定 |
 | Agent 指令与技能 | 各级 `AGENTS.md`、`.agents/skills/` | Agent 行为护栏与工作方法 | 产品与运行时合同 |
