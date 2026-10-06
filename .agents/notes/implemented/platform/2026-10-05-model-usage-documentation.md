@@ -35,7 +35,7 @@ verification: cargo test -p seeai-application --lib model_document（6 条）、
 
 ### 读取与切换
 
-目录每条加 `documentation_url`：`/v1/models/{按路径段编码的 name}/llms.txt?version={文档 UUID}`，由目录取数时一次取到合同与文档标识后投射成根相对地址。`GET /v1/models/{name}/llms.txt` 无版本时按与目录**同一条**可调用判据取当前正文，带 `version` 时只按（平台名, 文档标识）读历史正文、不看当前是否启用；未知或错配的版本一律 404，不回退到当前版本。`GET /v1/docs/{名称}` 只提供 Spec §2 的 `authentication.md`、`uploads/images.md`、`http-errors.md` 三份，资源只从 `public-docs/` 选，名称清单只有一处属主；服务时把源码里的相对链接按同一基址写成绝对地址，与模型说明同一形态。
+目录每条加 `documentation_url`：`/v1/models/{按路径段编码的 name}/llms.txt?version={文档 UUID}`，由目录取数时一次取到合同与文档标识后投射成根相对地址。`GET /v1/models/{name}/llms.txt` 无版本时按与目录**同一条**可调用判据取当前正文，带 `version` 时只按（平台名, 文档标识）读历史正文、不看当前是否启用；未知或错配的版本一律 404，不回退到当前版本。`GET /v1/docs/{名称}` 只提供 Spec §2 的 `README.md`（对客入口）、`authentication.md`、`uploads/images.md`、`http-errors.md` 四份，资源只从 `public-docs/` 选，名称清单只有一处属主；服务时把源码里的相对链接按同一基址写成绝对地址，与模型说明同一形态。
 
 首次开放目录字段之前，启动时 `ensure_current_model_documents` 在**已发布**（`re.active`）集合上为每个还没有文档的模型生成快照，**不看运维开关**：停用的模型之后随时可能被重新启用，那时缺文档就会被目录的取数悄悄藏掉。缺素材即启动失败并点名模型，不隐藏模型、也不返回伪造正文；补齐只新增文档记录，不改既有 Runtime Revision、价格或路由。
 
