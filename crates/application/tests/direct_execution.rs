@@ -19,9 +19,9 @@ use chrono::Duration as ChronoDuration;
 use seeai_adapter_sdk::{
     AcceptedHandle, AccountingFacts, AdapterDescriptor, AdapterError, DeclaredCost, DispatchGate,
     ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput,
-    GeneratedImage, ImageAdapter, ProviderCallError, ProviderCost, ProviderCredential,
-    ProviderTaskHandle, QueryAccountingCapability, ResponsePayload, RetrySafety,
-    begin_generation_send, ensure_external_call_allowed,
+    GeneratedImage, ProviderCallError, ProviderCost, ProviderCredential, ProviderTaskHandle,
+    QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
+    ensure_external_call_allowed,
 };
 use seeai_application::{
     AdapterFactory, AdmitExecution, AdmitOutcome, ApplicationError, BeginSubmission,
@@ -251,21 +251,6 @@ impl AdapterFactory for FakeFactory {
         Ok(())
     }
 
-    fn create(
-        &self,
-        adapter_key: &str,
-        _base_url: &str,
-        _timeout: Duration,
-    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
-        if adapter_key != ADAPTER_KEY {
-            return Err(ApplicationError::Configuration(format!(
-                "the fake has no legacy adapter for {adapter_key}"
-            )));
-        }
-        // 发布期会装配一次旧接口的 Driver 以确认能构造；直接执行路径不用它。
-        Ok(Arc::new(FakeLegacyAdapter))
-    }
-
     fn create_gateway(
         &self,
         adapter_key: &str,
@@ -282,25 +267,6 @@ impl AdapterFactory for FakeFactory {
             behavior: self.behavior.clone(),
             calls: self.calls.clone(),
         }))
-    }
-}
-
-struct FakeLegacyAdapter;
-
-#[async_trait]
-impl ImageAdapter for FakeLegacyAdapter {
-    fn key(&self) -> &'static str {
-        ADAPTER_KEY
-    }
-
-    async fn execute(
-        &self,
-        _request: seeai_adapter_sdk::PreparedImageRequest,
-        _credential: &ProviderCredential,
-    ) -> Result<seeai_adapter_sdk::ProviderSuccess, AdapterError> {
-        Err(AdapterError::Configuration(
-            "the fake legacy adapter is unused".to_owned(),
-        ))
     }
 }
 

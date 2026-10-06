@@ -1,7 +1,7 @@
 use super::*;
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
-use seeai_adapter_sdk::{AdapterDescriptor, ImageAdapter};
+use seeai_adapter_sdk::AdapterDescriptor;
 use seeai_application::*;
 use seeai_domain::*;
 use serde_json::Value;
@@ -695,17 +695,6 @@ impl AdapterFactory for NoAdapterFactory {
         _restrictions: &Value,
     ) -> Result<(), String> {
         unimplemented!()
-    }
-
-    fn create(
-        &self,
-        adapter_key: &str,
-        _base_url: &str,
-        _timeout: Duration,
-    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
-        Err(ApplicationError::Configuration(format!(
-            "the drain fixture has no driver for {adapter_key}"
-        )))
     }
 }
 

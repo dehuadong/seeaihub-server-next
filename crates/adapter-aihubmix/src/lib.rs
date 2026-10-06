@@ -1,21 +1,17 @@
 use async_trait::async_trait;
-use bytes::{Bytes, BytesMut};
+use bytes::BytesMut;
 use futures_util::StreamExt;
 use reqwest::{Client, StatusCode, multipart};
 use seeai_adapter_sdk::{
-    AccountingFacts, AdapterDescriptor, AdapterError, DecodedImage, ExecutionContext,
-    GATEWAY_REQUEST_WIRE_BYTES, GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage,
-    ImageAdapter, PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential,
-    ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTraceId,
-    QueryAccountingCapability, ResponsePayload, RetrySafety, begin_generation_send,
-    decode_data_url, ensure_external_call_allowed, external_call_timeout,
-    gateway_passthrough_parameters, is_http_url,
+    AccountingFacts, AdapterDescriptor, AdapterError, ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES,
+    GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage, ProviderCallError,
+    ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput, ProviderSuccess,
+    ProviderTraceId, QueryAccountingCapability, ResponsePayload, RetrySafety,
+    begin_generation_send, ensure_external_call_allowed, external_call_timeout,
+    gateway_passthrough_parameters,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
-use seeai_domain::{
-    ImageBranch, ImageInputs, ImageParameterKind, TokenUsage, image_inputs,
-    platform_image_parameter,
-};
+use seeai_domain::{ImageBranch, TokenUsage};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -27,10 +23,6 @@ use url::Url;
 pub const ADAPTER_KEY: &str = "aihubmix-image-v1";
 /// 上游响应正文上限：调用方据此计算一次执行的内存预留。
 pub const MAX_PROVIDER_RESPONSE_BYTES: usize = 128 * 1024 * 1024;
-/// 单张输入图（参考图或遮罩）在内存里的上限：data URL 就地解码、公网 URL 自己下载，
-/// 两种形态都不落盘，因此必须有上限兜住内存。
-const MAX_INPUT_IMAGE_BYTES: usize = 16 * 1024 * 1024;
-
 /// 本 Driver 声明的字节上限。
 ///
 /// 生成响应上限与只读对账读取上限都从这里派生（RFC 0018 §2.1）。这条通路不声明按句柄查询
@@ -89,22 +81,6 @@ impl AdapterFactory for AihubmixAdapterFactory {
             return Err(format!("unknown adapter {adapter_key}"));
         }
         validate_aihubmix_publication(carrier_schema, restrictions)
-    }
-
-    fn create(
-        &self,
-        adapter_key: &str,
-        base_url: &str,
-        timeout: Duration,
-    ) -> Result<std::sync::Arc<dyn ImageAdapter>, ApplicationError> {
-        if adapter_key != ADAPTER_KEY {
-            return Err(ApplicationError::Configuration(format!(
-                "unsupported adapter {adapter_key}"
-            )));
-        }
-        AihubmixImageAdapter::new(base_url, timeout)
-            .map(|adapter| std::sync::Arc::new(adapter) as std::sync::Arc<dyn ImageAdapter>)
-            .map_err(|error| ApplicationError::Configuration(error.to_string()))
     }
 
     /// 同步网关协议：同一条供给换成 [`GatewayAdapter`] 交出同一个 Driver。
@@ -394,243 +370,6 @@ impl AihubmixImageAdapter {
             .join(path)
             .map_err(|error| AdapterError::Configuration(error.to_string()))
     }
-
-    async fn generate(
-        &self,
-        request: &PreparedImageRequest,
-        credential: &ProviderCredential,
-    ) -> Result<ProviderSuccess, AdapterError> {
-        let body = generation_body(request)?;
-        let response = self
-            .client
-            .post(self.endpoint(ImageBranch::PromptOnly)?)
-            .bearer_auth(credential.expose())
-            .json(&body)
-            .send()
-            .await
-            .map_err(ambiguous_transport_error)?;
-        parse_response(response).await
-    }
-
-    async fn edit(
-        &self,
-        request: &PreparedImageRequest,
-        credential: &ProviderCredential,
-    ) -> Result<ProviderSuccess, AdapterError> {
-        let form = self.edit_form(request).await?;
-        let response = self
-            .client
-            .post(self.endpoint(request.branch)?)
-            .bearer_auth(credential.expose())
-            .multipart(form)
-            .send()
-            .await
-            .map_err(ambiguous_transport_error)?;
-        parse_response(response).await
-    }
-
-    /// 组好编辑请求的 multipart 表单。
-    ///
-    /// 单独拆出来，是为了让"部件名从哪来"能被直接验证：测试把这份表单摊成将要发出去的字节，
-    /// 看 `name="…"` 到底是谁（见测试里的 `multipart_body`）。
-    async fn edit_form(
-        &self,
-        request: &PreparedImageRequest,
-    ) -> Result<multipart::Form, AdapterError> {
-        let inputs = reference_inputs(request)?;
-        let reference_part = image_part_name(request, ImageParameterKind::Reference)?;
-        let mut form = multipart::Form::new()
-            .text("model", request.provider_model_id.clone())
-            .text(
-                "prompt",
-                required_string(&request.native_parameters, "/prompt")?,
-            );
-        for (name, value) in passthrough_parameters(request) {
-            // 标量转成文本部件；数组与对象**没有**可用的表示法，于是明确失败——
-            // 见 [`multipart_text`] 里为什么不做"序列化成 JSON 文本"这种替代形态。
-            form = form.text(name.clone(), multipart_text(name, value)?);
-        }
-        // 参考图逐张发，**部件名随张数变**：一张就是名单里那个名字（`image`），多张时用重复的
-        // `image[]`——multipart 的重复字段才是这条渠道认的列表形态（实测：重复 `image` 会 400）。
-        // 这是**传输细节**：合同与承载面只声明"这条供给能承载最多 16 张参考图"，怎么编码由这里
-        // 承担，也不进 descriptor 的能力名单。收几张由发布物与选路定，这里不另设自己的上限。
-        let reference_part = if inputs.reference_images.len() > 1 {
-            format!("{reference_part}[]")
-        } else {
-            reference_part.to_owned()
-        };
-        for value in &inputs.reference_images {
-            let image = self.image_bytes(value).await?;
-            form = form.part(reference_part.clone(), image_part(image)?);
-        }
-        if let Some(mask) = &inputs.mask {
-            let mask_part = image_part_name(request, ImageParameterKind::Mask)?;
-            let mask = self.image_bytes(mask).await?;
-            form = form.part(mask_part.to_owned(), image_part(mask)?);
-        }
-        Ok(form)
-    }
-
-    /// 把一种图片形态取成字节：`data:` URL 就地解码，公网 URL 自己下载（只在内存里）。
-    ///
-    /// 这一步发生在生成请求之前，所以失败时**上游什么都没收到**：按可证明未受理处理
-    /// （Job 失败并释放预授权），不进对账。
-    async fn image_bytes(&self, value: &str) -> Result<DecodedImage, AdapterError> {
-        match classify_image_value(value)? {
-            ImageValue::Inline(value) => decode_inline_image(value),
-            ImageValue::Remote(url) => self.download_image(url).await,
-        }
-    }
-
-    /// 公网 URL 自己下载：带超时（用本 Driver 的 HTTP 客户端）与体积上限，只在内存里。
-    async fn download_image(&self, url: &str) -> Result<DecodedImage, AdapterError> {
-        self.download_image_within(url, self.timeout).await
-    }
-
-    /// 带显式单次超时的下载；新协议用总期限剩余夹住它（RFC 0017 §6）。
-    async fn download_image_within(
-        &self,
-        url: &str,
-        timeout: Duration,
-    ) -> Result<DecodedImage, AdapterError> {
-        let response = self
-            .client
-            .get(url)
-            .timeout(timeout)
-            .send()
-            .await
-            .map_err(reference_image_unavailable)?;
-        let status = response.status();
-        if !status.is_success() {
-            return Err(reference_image_unavailable(format!(
-                "reference image returned HTTP {}",
-                status.as_u16()
-            )));
-        }
-        let media_type = response
-            .headers()
-            .get(reqwest::header::CONTENT_TYPE)
-            .and_then(|value| value.to_str().ok())
-            .map(|value| value.split(';').next().unwrap_or(value).trim().to_owned())
-            .unwrap_or_else(|| "image/png".to_owned());
-        let bytes = read_limited(response, MAX_INPUT_IMAGE_BYTES)
-            .await
-            .map_err(|error| reference_image_unavailable(error.to_string()))?;
-        Ok(DecodedImage { media_type, bytes })
-    }
-}
-
-/// 参考图/遮罩的两种允许形态。
-#[derive(Debug)]
-enum ImageValue<'a> {
-    /// `data:image/…;base64,…`：就地解码。
-    Inline(&'a str),
-    /// 公网 http(s) 地址：自己下载。
-    Remote(&'a str),
-}
-
-fn classify_image_value(value: &str) -> Result<ImageValue<'_>, AdapterError> {
-    if value.starts_with("data:") {
-        return Ok(ImageValue::Inline(value));
-    }
-    if is_http_url(value) {
-        return Ok(ImageValue::Remote(value));
-    }
-    Err(AdapterError::UnsupportedInput(format!(
-        "a reference image must be an http(s) url or a data url, got {value}"
-    )))
-}
-
-fn decode_inline_image(value: &str) -> Result<DecodedImage, AdapterError> {
-    let decoded = decode_data_url(value).map_err(AdapterError::UnsupportedInput)?;
-    ensure_input_size(decoded.bytes.len())?;
-    Ok(decoded)
-}
-
-/// 这个 Driver 的编辑端点要**至少**一张参考图（外加至多一张遮罩）：一张都不给就直接拒绝，不静默
-/// 发一个没有图的编辑请求。
-///
-/// 多张**不在这里拦**：这条面按"最多 16 张参考图"发布（`restrictions.max_reference_images`），
-/// 收几张是发布物与选路的事；这里再拦一道，等于让声明的能力与实现互相矛盾——而且被拦下的请求是
-/// 平台侧故障，调用方完全无从判断。
-fn reference_inputs(request: &PreparedImageRequest) -> Result<ImageInputs, AdapterError> {
-    let inputs = image_inputs(&request.native_parameters, &request.platform_parameters)
-        .map_err(AdapterError::UnsupportedInput)?;
-    if inputs.reference_images.is_empty() {
-        return Err(AdapterError::UnsupportedInput(
-            "the edit endpoint needs one reference image".to_owned(),
-        ));
-    }
-    Ok(inputs)
-}
-
-/// 编辑路径上图片部件的名字：**取自平台名单**，不写死。
-///
-/// 名单里的名字就是被选中候选自己声明的参数名（受理时按候选声明面与分支算好、随请求冻结），
-/// 所以 Profile 把参考图声明成 `image_urls` 时，线上部件名跟着变成 `image_urls`——平台不改写
-/// 渠道参数名。哪个名字是遮罩仍按候选面的判定函数分（`image_parameter_kind` 看名字的形状，
-/// 与取值无关）。
-///
-/// 名单里找不到这个角色：这份候选表达不了这次请求，按"装不下/表达不了"明确失败。绝不退回一个
-/// 写死的名字——那会把图塞进上游根本没声明过的字段，而且错得无声无息。
-fn image_part_name(
-    request: &PreparedImageRequest,
-    kind: ImageParameterKind,
-) -> Result<&str, AdapterError> {
-    platform_image_parameter(&request.platform_parameters, kind).ok_or_else(|| {
-        let role = match kind {
-            ImageParameterKind::Reference => "reference image",
-            ImageParameterKind::Mask => "mask",
-        };
-        AdapterError::UnsupportedInput(format!(
-            "the offering declares no {role} parameter, so the edit endpoint has no part to carry it"
-        ))
-    })
-}
-
-fn ensure_input_size(bytes: usize) -> Result<(), AdapterError> {
-    if bytes > MAX_INPUT_IMAGE_BYTES {
-        return Err(AdapterError::UnsupportedInput(format!(
-            "the reference image exceeds the {MAX_INPUT_IMAGE_BYTES}-byte limit"
-        )));
-    }
-    Ok(())
-}
-
-/// 按上限读满一个响应体（下载参考图时用，避免把内存读穿）。
-async fn read_limited(response: reqwest::Response, limit: usize) -> Result<Bytes, AdapterError> {
-    let mut body = BytesMut::new();
-    let mut stream = response.bytes_stream();
-    while let Some(chunk) = stream.next().await {
-        let chunk = chunk.map_err(ambiguous_transport_error)?;
-        if body.len().saturating_add(chunk.len()) > limit {
-            return Err(AdapterError::UnsupportedInput(format!(
-                "the reference image exceeds the {limit}-byte limit"
-            )));
-        }
-        body.extend_from_slice(&chunk);
-    }
-    Ok(body.freeze())
-}
-
-#[async_trait]
-impl ImageAdapter for AihubmixImageAdapter {
-    fn key(&self) -> &'static str {
-        ADAPTER_KEY
-    }
-
-    async fn execute(
-        &self,
-        request: PreparedImageRequest,
-        credential: &ProviderCredential,
-    ) -> Result<ProviderSuccess, AdapterError> {
-        match request.branch {
-            ImageBranch::PromptOnly => self.generate(&request, credential).await,
-            ImageBranch::ImageConditioned | ImageBranch::Masked => {
-                self.edit(&request, credential).await
-            }
-        }
-    }
 }
 
 /// 新协议的 JSON 入口：普通参数逐字进顶层字段，平台装载的图片参数名不参与（它们只是
@@ -808,50 +547,6 @@ fn gateway_error(error: AdapterError) -> AdapterError {
     }
 }
 
-fn generation_body(request: &PreparedImageRequest) -> Result<Value, AdapterError> {
-    let mut object = Map::new();
-    object.insert(
-        "model".to_owned(),
-        Value::String(request.provider_model_id.clone()),
-    );
-    object.insert(
-        "prompt".to_owned(),
-        Value::String(required_string(&request.native_parameters, "/prompt")?),
-    );
-    for (name, value) in passthrough_parameters(request) {
-        object.insert(name.clone(), value.clone());
-    }
-    Ok(Value::Object(object))
-}
-
-/// 平台自己装好的参数名与图片参数之外的参数，**原样**交给上游。
-///
-/// 到手的参数面本身就是候选声明面里的子集（未声明的名字在受理期就按声明面丢掉了，见
-/// `seeai_domain`），所以这里不做"认不认识"的判别，只跳过两类：平台自己落的 `model`/`prompt`，
-/// 以及**平台装载进去的那些图片参数名**（名单由受理时算好，见
-/// [`PreparedImageRequest::platform_parameters`]）——图片在这条链路上走文件部件，走了 JSON 体
-/// 就会既重复又形态不对。其余名字逐字过去，取值一个都不改：归属不看取值的形状，
-/// 所以名字像图也不会让它消失。
-///
-/// 唯一的例外是空值：`null` 表示"这一处没有给"，与平台的图片参数无关，也不是一个参数值，
-/// 因此不进请求体（全平台共用的空值约定，见 `seeai_domain`）。
-fn passthrough_parameters(request: &PreparedImageRequest) -> Vec<(&String, &Value)> {
-    let Value::Object(parameters) = &request.native_parameters else {
-        return Vec::new();
-    };
-    parameters
-        .iter()
-        .filter(|(name, value)| {
-            !matches!(name.as_str(), "model" | "prompt")
-                && !value.is_null()
-                && !request
-                    .platform_parameters
-                    .iter()
-                    .any(|declared| declared == *name)
-        })
-        .collect()
-}
-
 fn required_string(parameters: &Value, pointer: &str) -> Result<String, AdapterError> {
     parameters
         .pointer(pointer)
@@ -887,39 +582,6 @@ fn scalar_text(value: &Value) -> Option<String> {
         Value::Bool(value) => Some(value.to_string()),
         Value::Null | Value::Array(_) | Value::Object(_) => None,
     }
-}
-
-/// 一张输入图变成 multipart 文件部件：文件名与 MIME 按解码出的媒体类型给。
-fn image_part(image: DecodedImage) -> Result<multipart::Part, AdapterError> {
-    let name = format!("image.{}", extension_for(&image.media_type));
-    multipart::Part::bytes(image.bytes.to_vec())
-        .file_name(name)
-        .mime_str(&image.media_type)
-        .map_err(|error| AdapterError::UnsupportedInput(error.to_string()))
-}
-
-fn extension_for(media_type: &str) -> &'static str {
-    match media_type {
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        _ => "png",
-    }
-}
-
-/// 参考图取不到字节（公网 URL 下载失败、或它不是 http(s) 地址）。
-///
-/// 生成请求还没发出去，所以是**可证明未受理**：Job 直接失败并释放预授权，不进对账。
-fn reference_image_unavailable(message: impl std::fmt::Display) -> AdapterError {
-    ProviderCallError {
-        code: "reference_image_unavailable".to_owned(),
-        message: message.to_string(),
-        trace_id: None,
-        retry_safety: RetrySafety::SafeBeforeAcceptance,
-        kind: ProviderFailureKind::Unknown,
-        // 请求还没发出去：这次执行没有成本事实可带。
-        provider_cost: None,
-    }
-    .into()
 }
 
 fn ambiguous_transport_error(error: reqwest::Error) -> AdapterError {

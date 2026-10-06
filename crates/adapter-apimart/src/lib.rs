@@ -18,18 +18,14 @@ use reqwest::{Client, StatusCode};
 use seeai_adapter_sdk::{
     AcceptanceError, AcceptedHandle, AccountingFacts, AccountingQuery, AdapterDescriptor,
     AdapterError, Deadline, DeclaredCost, ExecutionContext, GATEWAY_REQUEST_WIRE_BYTES,
-    GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage, ImageAdapter, ImageValueShape,
-    InputImage, PreparedImageRequest, ProviderCallError, ProviderCost, ProviderCredential,
-    ProviderFailureKind, ProviderOutput, ProviderSuccess, ProviderTaskHandle, ProviderTaskState,
-    ProviderTraceId, QueryAccountingCapability, ResponsePayload, RetrySafety,
-    begin_generation_send, ensure_external_call_allowed, ensure_read_call_allowed,
-    external_call_timeout, gateway_passthrough_parameters, is_http_url,
+    GatewayAdapter, GatewayByteLimits, GatewayInput, GeneratedImage, ImageValueShape, InputImage,
+    ProviderCallError, ProviderCost, ProviderCredential, ProviderFailureKind, ProviderOutput,
+    ProviderTaskHandle, ProviderTaskState, ProviderTraceId, QueryAccountingCapability,
+    ResponsePayload, RetrySafety, begin_generation_send, ensure_external_call_allowed,
+    ensure_read_call_allowed, external_call_timeout, gateway_passthrough_parameters,
 };
 use seeai_application::{AdapterFactory, ApplicationError};
-use seeai_domain::{
-    ImageBranch, ImageParameterKind, TokenUsage, image_parameter_kind, image_parameter_values,
-    mask_value,
-};
+use seeai_domain::{ImageBranch, TokenUsage};
 use serde::Deserialize;
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -119,22 +115,6 @@ impl AdapterFactory for ApimartAdapterFactory {
             return Err(format!("unknown adapter {adapter_key}"));
         }
         validate_apimart_publication(carrier_schema, restrictions)
-    }
-
-    fn create(
-        &self,
-        adapter_key: &str,
-        base_url: &str,
-        timeout: Duration,
-    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
-        if adapter_key != ADAPTER_KEY {
-            return Err(ApplicationError::Configuration(format!(
-                "unsupported adapter {adapter_key}"
-            )));
-        }
-        ApimartImageAdapter::new(base_url, timeout)
-            .map(|adapter| Arc::new(adapter) as Arc<dyn ImageAdapter>)
-            .map_err(|error| ApplicationError::Configuration(error.to_string()))
     }
 
     /// 同步网关协议：同一条供给换成 [`GatewayAdapter`] 交出同一个 Driver。
@@ -237,14 +217,13 @@ fn shared_client(timeout: Duration) -> Result<Arc<Client>, AdapterError> {
 pub struct ApimartImageAdapter {
     client: Arc<Client>,
     base_url: Url,
-    /// 整轮（提交 + 轮询到终态）的墙钟上限。
-    deadline: Duration,
     /// 只读对账查询的响应上限：独立于生成响应上限，超限只留证据缺口（RFC 0018 §2.1）。
     reconciliation_read_bytes: usize,
 }
 
 impl ApimartImageAdapter {
-    pub fn new(base_url: &str, timeout: Duration) -> Result<Self, AdapterError> {
+    /// 单次调用由执行期限与 [`REQUEST_TIMEOUT`] 夹住，装配期传入的 `_timeout` 不再单独持有。
+    pub fn new(base_url: &str, _timeout: Duration) -> Result<Self, AdapterError> {
         let normalized = format!("{}/", base_url.trim_end_matches('/'));
         let base_url = Url::parse(&normalized)
             .map_err(|error| AdapterError::Configuration(error.to_string()))?;
@@ -252,7 +231,6 @@ impl ApimartImageAdapter {
         Ok(Self {
             client,
             base_url,
-            deadline: timeout,
             reconciliation_read_bytes: byte_limits().reconciliation_read_bytes(),
         })
     }
@@ -261,130 +239,6 @@ impl ApimartImageAdapter {
         self.base_url
             .join(path)
             .map_err(|error| AdapterError::Configuration(error.to_string()))
-    }
-
-    /// 上游只接受**公网可访问的 URL**：原样透传，平台不下载、不搬运、也不改写它。
-    ///
-    /// 生成入口只收公网 URL，其余取值在受理前就被拒了；这里只兜住被绕过的输入。
-    fn resolve_url(&self, value: &str) -> Result<String, AdapterError> {
-        if is_http_url(value) {
-            return Ok(value.to_owned());
-        }
-        Err(AdapterError::UnsupportedInput(format!(
-            "a reference image must be an http(s) url, got {value}"
-        )))
-    }
-
-    /// 把一次请求里的所有图片输入换算成公网 URL，保持它们各自的参数名与形状。
-    ///
-    /// 只走**平台自己的名单**（受理时按候选声明面与分支算好，见
-    /// [`PreparedImageRequest::platform_parameters`]）：名单里的参数名是 Profile 声明、平台受理时
-    /// 写进去的，这里只替换取值；名单外的名字一个都不碰——它们只是到手的普通参数，既不上传也不
-    /// 改写，逐字交给上游（没声明的名字在受理期就已经按声明面丢掉了，根本到不了这里）。
-    /// 形状（标量 / 数组）保持不变，数组顺序即调用方给的顺序。
-    async fn resolve_images(
-        &self,
-        request: &PreparedImageRequest,
-    ) -> Result<Map<String, Value>, AdapterError> {
-        let parameters = request.native_parameters.as_object().ok_or_else(|| {
-            AdapterError::UnsupportedInput("parameters must be an object".to_owned())
-        })?;
-        let mut resolved = Map::new();
-        for name in &request.platform_parameters {
-            let Some(value) = parameters.get(name) else {
-                continue;
-            };
-            // 名单里的名字按候选声明面分清角色；取值、名字与空值约定都来自 `seeai_domain`：
-            // `null` 与空串是"这一处没有图"，不上行；非字符串条目在那里已经被拒，这里不再自己判一遍。
-            match image_parameter_kind(name) {
-                None => {}
-                Some(ImageParameterKind::Reference) => {
-                    let values = image_parameter_values(name, value)
-                        .map_err(AdapterError::UnsupportedInput)?;
-                    let mut urls = Vec::with_capacity(values.len());
-                    for text in values {
-                        urls.push(Value::String(self.resolve_url(text)?));
-                    }
-                    if urls.is_empty() {
-                        continue;
-                    }
-                    // 形状（标量 / 数组）保持调用方给的样子；数组里空出来的格子不占位。
-                    let replaced = if matches!(value, Value::Array(_)) {
-                        Value::Array(urls)
-                    } else {
-                        urls.into_iter().next().expect("just checked non-empty")
-                    };
-                    resolved.insert(name.clone(), replaced);
-                }
-                Some(ImageParameterKind::Mask) => {
-                    let Some(text) =
-                        mask_value(name, value).map_err(AdapterError::UnsupportedInput)?
-                    else {
-                        continue;
-                    };
-                    let url = self.resolve_url(text)?;
-                    resolved.insert(name.clone(), Value::String(url));
-                }
-            }
-        }
-        Ok(resolved)
-    }
-
-    /// 提交生成请求，返回 `task_id`。
-    async fn submit(
-        &self,
-        request: &PreparedImageRequest,
-        resolved: &Map<String, Value>,
-        credential: &ProviderCredential,
-    ) -> Result<String, AdapterError> {
-        let body = generation_body(request, resolved)?;
-        let response = self
-            .client
-            .post(self.endpoint("v1/images/generations")?)
-            .bearer_auth(credential.expose())
-            .json(&body)
-            .send()
-            .await
-            .map_err(ambiguous_transport_error)?;
-        let status = response.status();
-        let body = read_body(response)
-            .await
-            .map_err(|error| narrow_submit_rejection(status, error))?;
-        let parsed: SubmitEnvelope = serde_json::from_slice(&body).map_err(|error| {
-            provider_error(
-                "provider_response_invalid",
-                error.to_string(),
-                RetrySafety::AcceptanceUnknown,
-                ProviderFailureKind::Unknown,
-            )
-        })?;
-        // 文档明确：`data` 是数组，读 `data[0].task_id`。
-        parsed
-            .data
-            .into_iter()
-            .next()
-            .map(|item| item.task_id)
-            .ok_or_else(|| {
-                provider_error(
-                    "provider_task_missing",
-                    "submit response carried no task id".to_owned(),
-                    // 已被受理但没有 task id：无法对账，且绝不能重发。
-                    RetrySafety::AcceptanceUnknown,
-                    ProviderFailureKind::Unknown,
-                )
-            })
-    }
-
-    /// 单次任务查询，对瞬时失败做有界退避重试。
-    ///
-    /// 只重试**读**：创建请求已经在别的路径上发过且绝不重发。
-    async fn query_task(
-        &self,
-        task_id: &str,
-        credential: &ProviderCredential,
-    ) -> Result<Bytes, AdapterError> {
-        self.query_task_with(task_id, credential, None, ReadBudget::GENERATION)
-            .await
     }
 
     /// 单次任务查询（含幂等读的有界退避重试）。`context` 给出取消与总期限时，每次尝试前
@@ -441,167 +295,6 @@ impl ApimartImageAdapter {
             }
         }
     }
-
-    /// 轮询任务直到终态。
-    async fn poll(
-        &self,
-        task_id: &str,
-        credential: &ProviderCredential,
-    ) -> Result<TaskData, AdapterError> {
-        let start = tokio::time::Instant::now();
-        loop {
-            if start.elapsed() >= self.deadline {
-                return Err(provider_error(
-                    "provider_task_timeout",
-                    format!("task {task_id} did not reach a terminal state in time"),
-                    // 已受理且仍在跑：既不能当失败，也不能重发。
-                    RetrySafety::AcceptanceUnknown,
-                    ProviderFailureKind::Unknown,
-                ));
-            }
-            // 任务查询是**幂等读**，因此可以安全重试：同一次执行内对瞬时失败退避重试
-            // 若干次。这与"创建请求绝不重发"不冲突——重试的是读。
-            // 用完次数后仍失败，则按"已受理但没取到结果"进对账（见 `after_acceptance`）。
-            let body = match self.query_task(task_id, credential).await {
-                Ok(body) => body,
-                Err(error) => return Err(after_acceptance(error)),
-            };
-            let parsed: TaskEnvelope = serde_json::from_slice(&body).map_err(|error| {
-                provider_error(
-                    "provider_response_invalid",
-                    error.to_string(),
-                    RetrySafety::AcceptanceUnknown,
-                    ProviderFailureKind::Unknown,
-                )
-            })?;
-            match parsed.data.status.as_str() {
-                "completed" => return Ok(parsed.data),
-                "failed" | "cancelled" => {
-                    let (code, message) = parsed
-                        .data
-                        .error
-                        .as_ref()
-                        .map(|error| {
-                            (
-                                error.code.map_or_else(
-                                    || "provider_task_failed".to_owned(),
-                                    |c| c.to_string(),
-                                ),
-                                error.message.clone(),
-                            )
-                        })
-                        .unwrap_or_else(|| {
-                            (
-                                "provider_task_failed".to_owned(),
-                                parsed.data.status.clone(),
-                            )
-                        });
-                    return Err(provider_error(
-                        &code,
-                        message,
-                        RetrySafety::NotRetryable,
-                        ProviderFailureKind::Unknown,
-                    ));
-                }
-                // 渠道事实里的任务状态是 pending/processing/completed/failed/cancelled；
-                // 出现集合外的取值时不能当失败、更不能当成功，继续按未完成轮询。
-                _ => {
-                    tokio::time::sleep(POLL_INTERVAL).await;
-                }
-            }
-        }
-    }
-}
-
-#[async_trait]
-impl ImageAdapter for ApimartImageAdapter {
-    fn key(&self) -> &'static str {
-        ADAPTER_KEY
-    }
-
-    async fn execute(
-        &self,
-        request: PreparedImageRequest,
-        credential: &ProviderCredential,
-    ) -> Result<ProviderSuccess, AdapterError> {
-        // 0) 参考图与遮罩：上游只接受**公网可访问的 URL**，平台原样透传。
-        let resolved = self.resolve_images(&request).await?;
-        // 1) 提交。**这一步之后绝不能重发**（创建请求绝不重发）；
-        //    任何后续失败都返回 AcceptanceUnknown，交由平台进对账。
-        let task_id = self.submit(&request, &resolved, credential).await?;
-        // 2) 提交之后的每一步，都把这个 task id 附在错误上：对账的人至少能拿它去上游查。
-        self.finish(&task_id, &request.cost_currency, credential)
-            .await
-            .map_err(|error| with_task_id(error, &task_id))
-    }
-}
-
-impl ApimartImageAdapter {
-    /// 提交**已经成功**之后的部分：轮询到终态 → 抽计量 → 收集结果信封。
-    ///
-    /// 单独拆出来，是为了让"给失败附上 task id"这件事只有一处
-    /// （见 [`with_task_id`]）——这一段的任何失败都会进对账，没有 task id 就查不了。
-    async fn finish(
-        &self,
-        task_id: &str,
-        cost_currency: &str,
-        credential: &ProviderCredential,
-    ) -> Result<ProviderSuccess, AdapterError> {
-        // 轮询到终态。任务查询是幂等读，其瞬时失败在传输层已归类为
-        // AcceptanceUnknown（不重试），由平台按"已确认生成但未取到"处理。
-        let task = self.poll(task_id, credential).await?;
-        // 终态一到手，金额就已经读得出来：这一段里的**任何**失败都把它带上——没有结果图不代表
-        // 这笔钱没花，带上它，失败件才能落 declared 或进成本缺口清单。
-        let provider_cost = task.provider_cost(cost_currency);
-        let usage = task
-            .usage()
-            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?;
-        let digest = task.response_digest(task_id);
-        // 结果地址原样交给调用方：平台不下载、不转存，也不替上游承诺链接的有效期。
-        let images = task
-            .image_urls()
-            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?
-            .into_iter()
-            .map(GeneratedImage::from_url)
-            .collect::<Vec<_>>();
-        if images.is_empty() {
-            return Err(with_provider_cost(
-                provider_error(
-                    "provider_result_empty",
-                    "provider returned no images".to_owned(),
-                    RetrySafety::AcceptanceUnknown,
-                    ProviderFailureKind::Unknown,
-                ),
-                provider_cost,
-            ));
-        }
-        Ok(ProviderSuccess {
-            images,
-            usage,
-            // 对账标识：任务式上游的 task id。只写入 attempts.provider_trace_id 供人工对账，
-            // **不用于跨调用自动恢复**——拿它自动补齐结果需要另一套模型。
-            provider_trace_id: ProviderTraceId::parse(task_id),
-            response_digest: digest,
-            provider_cost,
-        })
-    }
-}
-
-/// 给终态之后的失败附上"这一笔已经花了多少"：**只加** `provider_cost`，`code` / `message` /
-/// `retry_safety` / `kind` / `trace_id` 原样。
-///
-/// 终态里的金额与结果无关：读到它之后才失败，那笔成本是既成事实，而失败件是它唯一的落点。
-/// `AdapterError` 的其余变体没有位置承载成本，原样返回。
-fn with_provider_cost(error: AdapterError, provider_cost: ProviderCost) -> AdapterError {
-    match error {
-        AdapterError::Provider(mut provider) => {
-            if provider.provider_cost.is_none() {
-                provider.provider_cost = Some(provider_cost);
-            }
-            AdapterError::Provider(provider)
-        }
-        other => other,
-    }
 }
 
 /// 给"提交之后"的失败补上 task id，**不改** `code` / `message` / `retry_safety` / `provider_cost`。
@@ -622,45 +315,21 @@ fn with_task_id(error: AdapterError, task_id: &str) -> AdapterError {
     }
 }
 
-fn generation_body(
-    request: &PreparedImageRequest,
-    resolved: &Map<String, Value>,
-) -> Result<Value, AdapterError> {
-    let mut object = Map::new();
-    object.insert(
-        "model".to_owned(),
-        Value::String(request.provider_model_id.clone()),
-    );
-    object.insert(
-        "prompt".to_owned(),
-        required_string(&request.native_parameters, "/prompt")?,
-    );
-    // 其余参数**原样**交给上游：到手的参数面已经是候选声明面里的子集（未声明的名字在受理期
-    // 就按声明面丢掉了），所以这里不做"认不认识"的判别，只跳过多出来的 `model`/`prompt` 与
-    // **平台装载过的那些图片参数名**（名单由受理时算好，见
-    // [`PreparedImageRequest::platform_parameters`]）——图片在下面回填成换算后的公网 URL，
-    // 原值再进一次会把图片取值当普通参数重复发上去。其余名字逐字过去，取值一个都不改：归属不看取值
-    // 的形状，所以名字像图也不会被认领或改写。`null` 表示"这一处没有给"，不是参数值，照旧不进请求体。
-    if let Value::Object(parameters) = &request.native_parameters {
-        for (name, value) in parameters {
-            if matches!(name.as_str(), "model" | "prompt")
-                || value.is_null()
-                || request
-                    .platform_parameters
-                    .iter()
-                    .any(|declared| declared == name)
-            {
-                continue;
+/// 给终态之后的失败附上"这一笔已经花了多少"：**只加** `provider_cost`，`code` / `message` /
+/// `retry_safety` / `kind` / `trace_id` 原样。
+///
+/// 终态里的金额与结果无关：读到它之后才失败，那笔成本是既成事实，而失败件是它唯一的落点。
+/// `AdapterError` 的其余变体没有位置承载成本，原样返回。
+fn with_provider_cost(error: AdapterError, provider_cost: ProviderCost) -> AdapterError {
+    match error {
+        AdapterError::Provider(mut provider) => {
+            if provider.provider_cost.is_none() {
+                provider.provider_cost = Some(provider_cost);
             }
-            object.insert(name.clone(), value.clone());
+            AdapterError::Provider(provider)
         }
+        other => other,
     }
-    // 参考图与遮罩回填到**它们各自的参数名**上（`image_urls`、`mask_url` 由 Profile 声明，
-    // 平台受理时写到那里，Driver 不自己决定名字），取值已经全部是公网 URL。
-    for (name, value) in resolved {
-        object.insert(name.clone(), value.clone());
-    }
-    Ok(Value::Object(object))
 }
 
 fn required_string(parameters: &Value, pointer: &str) -> Result<Value, AdapterError> {

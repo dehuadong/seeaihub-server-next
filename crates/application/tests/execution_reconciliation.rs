@@ -18,7 +18,7 @@ use async_trait::async_trait;
 use chrono::{Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
     AccountingFacts, AccountingQuery, AdapterDescriptor, AdapterError, Deadline, DeclaredCost,
-    ExecutionContext, GatewayAdapter, GatewayInput, ImageAdapter, ProviderCost, ProviderCredential,
+    ExecutionContext, GatewayAdapter, GatewayInput, ProviderCost, ProviderCredential,
     ProviderOutput, ProviderTaskState, QueryAccountingCapability,
 };
 use seeai_application::{
@@ -180,25 +180,6 @@ impl GatewayAdapter for FakeGateway {
     }
 }
 
-struct FakeLegacyAdapter;
-
-#[async_trait]
-impl ImageAdapter for FakeLegacyAdapter {
-    fn key(&self) -> &'static str {
-        ADAPTER_KEY
-    }
-
-    async fn execute(
-        &self,
-        _request: seeai_adapter_sdk::PreparedImageRequest,
-        _credential: &ProviderCredential,
-    ) -> Result<seeai_adapter_sdk::ProviderSuccess, AdapterError> {
-        Err(AdapterError::Configuration(
-            "the reconciliation never runs the legacy adapter".to_owned(),
-        ))
-    }
-}
-
 impl AdapterFactory for FakeFactory {
     fn descriptor(&self, _adapter_key: &str) -> Option<AdapterDescriptor> {
         None
@@ -211,15 +192,6 @@ impl AdapterFactory for FakeFactory {
         _restrictions: &serde_json::Value,
     ) -> Result<(), String> {
         Ok(())
-    }
-
-    fn create(
-        &self,
-        _adapter_key: &str,
-        _base_url: &str,
-        _timeout: Duration,
-    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
-        Ok(Arc::new(FakeLegacyAdapter))
     }
 
     fn create_gateway(

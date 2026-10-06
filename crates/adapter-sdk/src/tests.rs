@@ -1,24 +1,17 @@
 use super::*;
 
+/// 生成入口的参考图与遮罩只认公网 `http(s)` 地址：`data:` URL 与裸 base64 都不是。
 #[test]
-fn decodes_inline_data_urls_into_bytes() {
-    let encoded = STANDARD.encode([0x89_u8, b'P', b'N', b'G']);
-    let decoded =
-        decode_data_url(&format!("data:image/png;base64,{encoded}")).expect("data url decodes");
-    assert_eq!(decoded.media_type, "image/png");
-    assert_eq!(&decoded.bytes[..], &[0x89, b'P', b'N', b'G']);
-    // 不带媒体类型时保持中性，不假装知道格式。
-    let decoded = decode_data_url("data:;base64,AAAA").expect("decodes");
-    assert_eq!(decoded.media_type, "application/octet-stream");
-    for bad in [
-        "https://example.invalid/a.png",
-        "data:image/png,notbase64",
-        "data:image/png;base64",
-    ] {
-        assert!(decode_data_url(bad).is_err(), "`{bad}` is not a data url");
-    }
+fn only_public_http_urls_are_image_values() {
     assert!(is_http_url("https://example.invalid/a.png"));
-    assert!(!is_http_url("data:image/png;base64,AAAA"));
+    assert!(is_http_url("http://example.invalid/a.png"));
+    for rejected in [
+        "data:image/png;base64,AAAA",
+        "/var/tmp/a.png",
+        "ftp://example.invalid/a.png",
+    ] {
+        assert!(!is_http_url(rejected), "`{rejected}` is not a public url");
+    }
 }
 
 #[test]

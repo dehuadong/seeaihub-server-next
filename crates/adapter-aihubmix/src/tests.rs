@@ -92,47 +92,9 @@ impl ExecutionContext for FakeContext {
     }
 }
 
-fn request(branch: ImageBranch) -> PreparedImageRequest {
-    request_for(&published_schema(), branch)
-}
-
-/// 按某个候选声明面造一份受理产物：名单与线上**同一处推导**（候选声明的参数名 + 分支），
-/// 测试里不另抄一份名字。
-fn request_for(schema: &Value, branch: ImageBranch) -> PreparedImageRequest {
-    PreparedImageRequest {
-        provider_model_id: "gpt-image-2.5-flare".to_owned(),
-        branch,
-        native_parameters: serde_json::json!({
-            "prompt": "test",
-            "n": 1,
-            "size": "1024x1024",
-            "output_format": "png",
-            "quality": "low"
-        }),
-        platform_parameters: platform_image_parameters(schema, branch),
-        cost_currency: "USD".to_owned(),
-    }
-}
-
 /// 发布素材里那条 AIHubMix 供给的**承载面**（声明的是 `image` / `mask`）。
 fn published_schema() -> Value {
     published_offering(&published_config())["carrier_schema"].clone()
-}
-
-/// 把 Driver 组好的编辑表单摊成**将要发出去的字节**：`name="…"` 就是上游收到的东西。
-///
-/// 不起上游也不走网络：测试里的图都是内联 data URL，取字节这一步没有任何 IO。
-/// （表单的字节流由 reqwest 自己拼装，这里只是把它读出来。）
-async fn multipart_body(request: &PreparedImageRequest) -> Result<String, AdapterError> {
-    let adapter = AihubmixImageAdapter::new("https://api.inferera.com/", Duration::from_secs(10))
-        .expect("adapter config should be valid");
-    let form = adapter.edit_form(request).await?;
-    let chunks = form.into_stream().collect::<Vec<_>>().await;
-    let mut body = Vec::new();
-    for chunk in chunks {
-        body.extend_from_slice(&chunk.expect("the form should stream"));
-    }
-    Ok(String::from_utf8_lossy(&body).into_owned())
 }
 
 /// 在售素材是"一份合同 + 两条供给"：AIHubMix 这条在下标 0，声明面在 `carrier_schema` 里。
@@ -237,264 +199,6 @@ fn maps_branch_to_provider_endpoint() {
         "https://api.inferera.com/v1/images/edits"
     );
 }
-
-#[test]
-fn sends_quality_on_the_wire_field() {
-    let body =
-        generation_body(&request(ImageBranch::PromptOnly)).expect("request should be supported");
-    assert_eq!(
-        body.pointer("/quality"),
-        Some(&Value::String("low".to_owned()))
-    );
-    // 调用方与线上都是顶层：不再有 `extra` 这一层包装。
-    assert!(body.get("extra").is_none());
-}
-
-#[test]
-fn passes_the_documented_optional_parameters_through() {
-    let mut prepared = request(ImageBranch::PromptOnly);
-    let Value::Object(parameters) = &mut prepared.native_parameters else {
-        panic!("fixture parameters must be an object");
-    };
-    parameters.insert("background".to_owned(), Value::String("opaque".to_owned()));
-    parameters.insert("output_compression".to_owned(), Value::from(80));
-    parameters.insert("moderation".to_owned(), Value::String("low".to_owned()));
-    parameters.insert("user".to_owned(), Value::String("end-user-1".to_owned()));
-    let body = generation_body(&prepared).expect("request should be supported");
-    assert_eq!(
-        body.pointer("/background"),
-        Some(&Value::String("opaque".to_owned()))
-    );
-    assert_eq!(body.pointer("/output_compression"), Some(&Value::from(80)));
-    assert_eq!(
-        body.pointer("/moderation"),
-        Some(&Value::String("low".to_owned()))
-    );
-    assert_eq!(
-        body.pointer("/user"),
-        Some(&Value::String("end-user-1".to_owned()))
-    );
-}
-
-/// 到手的每一个参数都原样进请求体：名字不改，取值也不改。
-///
-/// 这是个**防御性**用例：按现行规则，本用例塞进来的名字在受理期就按候选声明面丢掉了，
-/// 到不了 Driver（到手的参数面本来就是声明面里的子集）。之所以还要这么写，是为了钉住
-/// Driver **自己**的判断依据：它不按名字、也不按取值的形状重新解释任何参数——名字以 `image`
-/// 开头、取值是对象数组的一手参数（渠道文档里写明的形状）在它眼里同样只是一个普通参数。
-/// 将来上游过滤一旦放松，这里会立刻看得见。
-#[test]
-fn every_parameter_it_receives_goes_upstream_verbatim() {
-    let mut prepared = request(ImageBranch::PromptOnly);
-    let Value::Object(parameters) = &mut prepared.native_parameters else {
-        panic!("fixture parameters must be an object");
-    };
-    parameters.insert("channel_specific_knob".to_owned(), Value::from(7));
-    parameters.insert(
-        "image_with_roles".to_owned(),
-        serde_json::json!([{"role": "reference", "url": "https://example.invalid/a.png"}]),
-    );
-    let body = generation_body(&prepared).expect("request should be supported");
-    assert_eq!(
-        body.pointer("/channel_specific_knob"),
-        Some(&Value::from(7))
-    );
-    assert_eq!(
-        body.pointer("/image_with_roles/0/role"),
-        Some(&Value::String("reference".to_owned()))
-    );
-    // 声明过的可选参数一并原样过去（`request()` 的声明面里有 `quality`）。
-    assert_eq!(
-        body.pointer("/quality"),
-        Some(&Value::String("low".to_owned()))
-    );
-}
-
-/// Driver 不按名字或取值的形状重新解释参数：`images` 留在原地，不会被当成参考图。
-///
-/// 归属只看平台名单（名单里是候选声明、平台装载过的那些名字）：名字不在名单里的参数，
-/// Driver 既不拿它当图、也不把它的值改写成上游 URL。这也是个**防御性**用例：`images` 没被
-/// 这份候选声明，正常链路上在受理期就丢了，到不了这里；把它直接塞进请求，是为了钉住
-/// Driver 的判断依据始终是名单，而不是"这个名字看起来像图"。
-#[test]
-fn a_received_parameter_is_never_reinterpreted_by_its_shape() {
-    let mut prepared = request(ImageBranch::PromptOnly);
-    let Value::Object(parameters) = &mut prepared.native_parameters else {
-        panic!("fixture parameters must be an object");
-    };
-    parameters.insert(
-        "images".to_owned(),
-        serde_json::json!(["https://example.invalid/u.png"]),
-    );
-    let body = generation_body(&prepared).expect("request should be supported");
-    assert_eq!(
-        body.pointer("/images"),
-        Some(&serde_json::json!(["https://example.invalid/u.png"])),
-        "到手的参数逐字上行：{body}"
-    );
-    assert!(
-        body.pointer("/image").is_none(),
-        "名单里没有 `images`：Driver 不按形状把它认领成参考图，也不改写名字：{body}"
-    );
-}
-
-/// multipart 的编辑路径：到手的一手参数**要么进文本部件、要么明确失败**，不许被默默跳过。
-///
-/// 标量照旧进文本部件；数组在 multipart 里没有平台承认的表示法，于是报错并点名是哪个参数
-/// （`multipart_text` 里写了为什么不做"序列化成 JSON 文本"这种替代形态）。用例里塞进来的
-/// 两个名字同样越过了受理期的声明面过滤（正常链路上到不了这里），钉的是这条路径的处置
-/// 不依赖"这个名字认不认识"：标量有文本部件形态、数组明确失败，两条都在。
-#[test]
-fn received_parameters_on_the_multipart_path_are_never_dropped_silently() {
-    let mut prepared = request(ImageBranch::ImageConditioned);
-    prepared.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": "data:image/png;base64,AAAA",
-        "channel_specific_knob": "scalar",
-        // 名字像图、取值是字符串数组，但不在名单里：Driver 只当它是普通参数，
-        // 而 multipart 没有能承载数组的文本部件形态。
-        "images": ["https://example.invalid/u.png"]
-    });
-    let scalar = multipart_text("channel_specific_knob", &Value::from("scalar"))
-        .expect("标量有文本部件形态");
-    assert_eq!(scalar, "scalar");
-    let error = multipart_text(
-        "images",
-        &serde_json::json!(["https://example.invalid/u.png"]),
-    )
-    .expect_err("数组在这条路径上没有表示法");
-    let message = error.to_string();
-    assert!(message.contains("images"), "报错必须点名参数：{message}");
-    // 名单里的图片参数不在这条透传链路上：它们走文件部件。
-    assert!(
-        !passthrough_parameters(&prepared)
-            .iter()
-            .any(|(name, _)| name.as_str() == "image")
-    );
-}
-
-/// 编辑端点收几张参考图由发布物与选路定，Driver 只保证"至少一张"：一张都不给就直接拒绝，
-/// 多张照收——声明的能力与实现必须是同一件事。
-#[test]
-fn the_edit_endpoint_takes_every_reference_image_it_is_given() {
-    let mut value = request(ImageBranch::ImageConditioned);
-    value.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
-    });
-    let inputs = reference_inputs(&value).expect("this surface is published for several images");
-    assert_eq!(inputs.reference_images.len(), 2);
-    // 一张参考图可以被接受；遮罩一并带出来。
-    let mut masked = request(ImageBranch::Masked);
-    masked.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": "data:image/png;base64,AAAA",
-        "mask": "data:image/png;base64,BBBB"
-    });
-    let inputs = reference_inputs(&masked).expect("one reference image plus a mask");
-    assert_eq!(inputs.reference_images.len(), 1);
-    assert!(inputs.mask.is_some());
-    // 没有参考图：编辑端点没有可编辑的图，直接拒绝。
-    assert!(reference_inputs(&request(ImageBranch::ImageConditioned)).is_err());
-}
-
-/// 多张参考图在线上是**重复的 `image[]` 部件**：不是只发第一张，也不是重复单值 `image`
-/// （实测后者会 400）。一张时仍是单值 `image`。
-#[tokio::test]
-async fn several_reference_images_become_repeated_list_parts() {
-    let mut two = request(ImageBranch::ImageConditioned);
-    two.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": ["data:image/png;base64,AAAA", "data:image/png;base64,BBBB"]
-    });
-    let rendered = multipart_body(&two)
-        .await
-        .expect("two reference images are expressible");
-    assert_eq!(
-        rendered.matches("name=\"image[]\"").count(),
-        2,
-        "两张参考图就是两个 `image[]` 部件：{rendered}"
-    );
-    assert!(
-        !rendered.contains("name=\"image\""),
-        "多张时不许退回单值 `image`（渠道会 400）：{rendered}"
-    );
-
-    // 一张时仍是单值 `image`：列表形态只属于多张。
-    let mut one = request(ImageBranch::ImageConditioned);
-    one.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": ["data:image/png;base64,AAAA"]
-    });
-    let rendered = multipart_body(&one)
-        .await
-        .expect("one reference image is expressible");
-    assert!(rendered.contains("name=\"image\""), "{rendered}");
-    assert!(!rendered.contains("image[]"), "{rendered}");
-}
-
-#[test]
-fn images_are_not_sent_as_text_parameters() {
-    // 图片走文件部件：JSON 体里不许再出现 `image` / `mask` 的字符串值。
-    let mut prepared = request(ImageBranch::Masked);
-    prepared.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": "data:image/png;base64,AAAA",
-        "mask": "data:image/png;base64,BBBB"
-    });
-    let names = passthrough_parameters(&prepared)
-        .into_iter()
-        .map(|(name, _)| name.clone())
-        .collect::<Vec<_>>();
-    assert!(!names.iter().any(|name| name == "image" || name == "mask"));
-}
-
-/// 部件名与候选声明面同源：Profile 把参考图参数声明成 `image_urls`（**不是** `image`）时，
-/// 线上 multipart 的部件名就是 `image_urls`。
-///
-/// 断言看的是表单摊成的字节里那些 `name="…"`——写死名字的实现会在这里发出 `name="image"`，
-/// 于是把图塞进上游根本没声明过的字段：静默改名。名字由名单给出，所以这里换个声明面就换名字。
-#[tokio::test]
-async fn edit_part_names_are_the_names_the_profile_declared() {
-    let schema = serde_json::json!({
-        "type": "object",
-        "additionalProperties": false,
-        "required": ["model", "prompt"],
-        "properties": {
-            "model": {"const": "gpt-image-2"},
-            "prompt": {"type": "string"},
-            "image_urls": {"type": "array", "items": {"type": "string"}, "maxItems": 1},
-            "mask_url": {"type": "string"}
-        }
-    });
-    let mut prepared = request_for(&schema, ImageBranch::Masked);
-    prepared.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image_urls": ["data:image/png;base64,AAAA"],
-        "mask_url": "data:image/png;base64,BBBB"
-    });
-    let rendered = multipart_body(&prepared)
-        .await
-        .expect("the candidate can express both inputs");
-    assert!(rendered.contains("name=\"image_urls\""), "{rendered}");
-    assert!(rendered.contains("name=\"mask_url\""), "{rendered}");
-    assert!(
-        !rendered.contains("name=\"image\"") && !rendered.contains("name=\"mask\""),
-        "部件名不许退回写死的 image / mask：{rendered}"
-    );
-    // 名单为空（候选一张图都没声明）：这次请求表达不了——明确失败，同样不退回写死的名字。
-    let mut unclaimed = request(ImageBranch::ImageConditioned);
-    unclaimed.native_parameters = serde_json::json!({
-        "prompt": "test",
-        "image": "data:image/png;base64,AAAA"
-    });
-    unclaimed.platform_parameters = Vec::new();
-    assert!(matches!(
-        multipart_body(&unclaimed).await,
-        Err(AdapterError::UnsupportedInput(_))
-    ));
-}
-
 #[test]
 fn keeps_the_shape_the_provider_gave() {
     let url = images_from_response(vec![ImageData {
@@ -561,30 +265,6 @@ fn a_response_without_images_still_reports_where_the_cost_comes_from() {
         }
         other => panic!("expected a provider error, got {other:?}"),
     }
-}
-
-#[test]
-fn inline_data_urls_are_decoded_in_memory() {
-    let decoded =
-        decode_inline_image("data:image/png;base64,iVBORw0KGgo=").expect("decodes in memory");
-    assert_eq!(decoded.media_type, "image/png");
-    assert_eq!(
-        &decoded.bytes[..],
-        &[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]
-    );
-    // 不是 http(s) 也不是 data URL 的值一律拒绝，不猜。
-    let error =
-        classify_image_value("asset://not-a-thing").expect_err("an unknown shape must be rejected");
-    assert!(error.to_string().contains("http(s) url"));
-    // 公网地址走下载那一支，data URL 走解码那一支——两条路只有一处判定。
-    assert!(matches!(
-        classify_image_value("https://example.invalid/a.png"),
-        Ok(ImageValue::Remote(_))
-    ));
-    assert!(matches!(
-        classify_image_value("data:image/png;base64,AAAA"),
-        Ok(ImageValue::Inline(_))
-    ));
 }
 
 #[test]
@@ -811,40 +491,14 @@ async fn serve_image(
     socket.flush().await
 }
 
-/// 新 JSON 入口与旧入口必须给出同一份上游字节：内部表达换了，wire 不能变。
-#[test]
-fn gateway_prompt_only_body_is_byte_identical_to_the_legacy_json_entry() {
-    let legacy = request(ImageBranch::PromptOnly);
-    let input = GatewayInput {
-        provider_model_id: legacy.provider_model_id.clone(),
-        branch: ImageBranch::PromptOnly,
-        native_parameters: legacy.native_parameters.clone(),
-        reference_images: Vec::new(),
-        mask: None,
-        image_sites: ImageSites::default(),
-        cost_currency: "USD".to_owned(),
-    };
-    let legacy_body =
-        serde_json::to_vec(&generation_body(&legacy).expect("the legacy request is supported"))
-            .expect("a body serializes");
-    let gateway_body = serde_json::to_vec(
-        &gateway_generation_body(&input).expect("the gateway request is supported"),
-    )
-    .expect("a body serializes");
-    assert_eq!(legacy_body, gateway_body, "JSON 入口逐字不变");
-}
-
 /// 编辑入口把公网 URL **逐字透传**成文本部件：与 APIMart 一样不下载、不上传。
 #[tokio::test]
 async fn gateway_multipart_form_passes_the_public_url_without_downloading() {
     let payload: &'static [u8] = b"\x89PNG\r\n\x1a\n";
     let receiver = ImageReceiver::start(payload).await;
     let schema = published_schema();
-    let url = receiver.url.clone();
-    let mut legacy = request_for(&schema, ImageBranch::ImageConditioned);
-    legacy.native_parameters = serde_json::json!({"prompt": "test", "image": url});
     let input = GatewayInput {
-        provider_model_id: legacy.provider_model_id.clone(),
+        provider_model_id: "gpt-image-2.5-flare".to_owned(),
         branch: ImageBranch::ImageConditioned,
         native_parameters: serde_json::json!({"prompt": "test"}),
         reference_images: vec![InputImage::url(receiver.url.clone())],

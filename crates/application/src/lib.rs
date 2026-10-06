@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_adapter_sdk::{
-    AdapterDescriptor, GatewayAdapter, ImageAdapter, ProviderCost, ProviderCredential, RetrySafety,
+    AdapterDescriptor, GatewayAdapter, ProviderCost, ProviderCredential, RetrySafety,
 };
 pub use seeai_adapter_sdk::{GeneratedImage, ProviderFailureKind};
 use seeai_domain::{
@@ -5400,16 +5400,7 @@ pub trait AdapterFactory: Send + Sync {
         restrictions: &Value,
     ) -> Result<(), String>;
 
-    fn create(
-        &self,
-        adapter_key: &str,
-        base_url: &str,
-        timeout: Duration,
-    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError>;
-
-    /// 新协议（同步网关）的 Driver 装配：与 [`AdapterFactory::create`] 同一族 Driver，接口换成
-    /// [`GatewayAdapter`]。默认明确不支持——只有实现了同步网关协议的 adapter 才覆盖它，旧 Worker
-    /// 路径继续只用 [`AdapterFactory::create`]。
+    /// 同步网关协议的 Driver 装配。默认明确不支持——只有实现了同步网关协议的 adapter 才覆盖它。
     fn create_gateway(
         &self,
         adapter_key: &str,
@@ -5462,20 +5453,6 @@ impl AdapterFactory for AdapterRegistry {
                 factory.validate_publication(adapter_key, carrier_schema, restrictions)
             }
             None => Err(format!("unknown adapter {adapter_key}")),
-        }
-    }
-
-    fn create(
-        &self,
-        adapter_key: &str,
-        base_url: &str,
-        timeout: Duration,
-    ) -> Result<Arc<dyn ImageAdapter>, ApplicationError> {
-        match self.find(adapter_key) {
-            Some(factory) => factory.create(adapter_key, base_url, timeout),
-            None => Err(ApplicationError::Configuration(format!(
-                "unknown adapter {adapter_key}"
-            ))),
         }
     }
 
@@ -6200,7 +6177,8 @@ impl RuntimeService {
                 &offering.restrictions,
             )
             .map_err(ApplicationError::Validation)?;
-        self.adapters.create(
+        // 这条供给必须装得出同步网关 Driver：装配失败在发布期拒绝，不到受理才发现。
+        self.adapters.create_gateway(
             &offering.adapter_key,
             &offering.base_url,
             Duration::from_secs(1),
