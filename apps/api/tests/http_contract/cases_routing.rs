@@ -958,7 +958,7 @@ async fn disabling_an_offering_stops_later_acceptances_and_the_catalog() {
     let (_, catalog) = get_catalog(&client, &harness.base_url, None).await;
     assert_eq!(
         catalog,
-        json!({"data": []}),
+        json!({"object": "list", "data": []}),
         "停用的供给不进目录：{catalog}"
     );
     let jobs_after: i64 = sqlx::query_scalar("SELECT count(*) FROM generation.jobs")

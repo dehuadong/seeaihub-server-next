@@ -10,7 +10,7 @@
 curl "$BASE_URL/v1/models"
 ```
 
-成功返回 `200`，模型列表位于 `data`；没有可用模型时为 `{"data":[]}`。
+成功返回 `200`，模型列表位于 `data`；没有可用模型时为 `{"object":"list","data":[]}`。
 
 | 字段 | 含义 |
 | --- | --- |
@@ -20,6 +20,7 @@ curl "$BASE_URL/v1/models"
 | `revision` | 这份模型参数说明的合同修订号，用于识别参数规则的变化。 |
 | `contract` | JSON Schema，描述该模型允许的参数及其结构和限制。 |
 | `documentation_url` | 该模型使用说明的地址（同源根相对地址）。模型参数说明与调用示例都以它为准。 |
+| `id` / `object` / `created` / `owned_by` | OpenAI 模型列表的标准字段：`id` 与 `name` 同值，`object` 固定 `model`，`created` 是该条当前发布的生效时间（Unix 秒），`owned_by` 与 `vendor_id` 同值。 |
 
 厂商、模型类型和调用方式是不同的信息。请按对应模型的使用说明选择端点和请求编码。
 

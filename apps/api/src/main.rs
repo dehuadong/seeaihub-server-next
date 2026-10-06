@@ -2637,6 +2637,8 @@ async fn list_provider_cost_gaps(
 /// 对客目录的响应：与生成入口一样用 `data` 承载列表。
 #[derive(Debug, Serialize)]
 struct ModelCatalogResponse {
+    /// 标准列表信封：`GET /v1/models` 是 OpenAI-compatible 的模型列表（Spec 0009 §2）。
+    object: &'static str,
     data: Vec<ModelCatalogEntry>,
 }
 
@@ -2645,6 +2647,14 @@ struct ModelCatalogResponse {
 /// 字段名是对客协议的取值，与内部的 [`PublishedModel`] 分开：内部字段改名不该动对客协议。
 #[derive(Debug, Serialize)]
 struct ModelCatalogEntry {
+    /// 标准模型标识：与 `name` 同值；OpenAI 兼容客户端读它，把它填进请求的 `model`（Spec 0009 §2）。
+    id: String,
+    /// 标准对象类型：固定 `model`（Spec 0009 §2）。
+    object: &'static str,
+    /// 标准创建时间：Unix 秒，该条当前发布的生效时间（Spec 0009 §2）。
+    created: i64,
+    /// 标准归属：与 `vendor_id` 同值（Spec 0009 §2）。
+    owned_by: String,
     /// 客户端提交 `model` 时用的名字——**平台对客名**（网关模型名）。
     name: String,
     /// 厂商标识：目录属性，同一个厂商模型可以由多条渠道供给。
@@ -2672,12 +2682,17 @@ impl From<PublishedModel> for ModelCatalogEntry {
             model_type,
             capability_schema,
             documentation_version,
+            published_at,
         } = model;
         let documentation_url = format!(
             "/v1/models/{}/llms.txt?version={documentation_version}",
             encode_path_segment(&gateway_model)
         );
         Self {
+            id: gateway_model.clone(),
+            object: "model",
+            created: published_at.timestamp(),
+            owned_by: vendor_id.clone(),
             name: gateway_model.clone(),
             vendor_id,
             revision: native_revision,
@@ -2732,7 +2747,10 @@ async fn list_models(
         .into_iter()
         .map(ModelCatalogEntry::from)
         .collect();
-    Ok(Json(ModelCatalogResponse { data }))
+    Ok(Json(ModelCatalogResponse {
+        object: "list",
+        data,
+    }))
 }
 
 /// 模型使用文档的查询参数：`version` 是目录返回的不透明文档版本标识。

@@ -1,8 +1,12 @@
 主题: OpenAI 兼容的模型列表
 当前修订: v1
-生效修订: 无
-状态: 待接受
+生效修订: v1
+状态: 已接受
 依赖: [控制台 Spec](0001-admin-and-customer-consoles.md) v19（`GET /v1/models` 既有字段的冻结）、[模型类型 Spec](0006-model-type-and-usage-records.md) v1（只增字段的先例）、[模型使用文档 Spec](0008-model-usage-documentation.md) v2（同一条目的 `documentation_url`）
+
+# OpenAI 兼容的模型列表
+
+本 Spec 拥有 `GET /v1/models` 的 OpenAI 兼容响应形状：列表信封与每条模型的标准字段。目录的可见性判据与既有字段的来源归[控制台 Spec](0001-admin-and-customer-consoles.md)、[模型类型 Spec](0006-model-type-and-usage-records.md) 与[模型使用文档 Spec](0008-model-usage-documentation.md)；标准字段是既有字段的投射，不引入第二份事实。术语沿用 [CONTEXT.md](../../CONTEXT.md)。
 
 ## 1. 目的
 
@@ -18,7 +22,7 @@
   - `object`：固定 `"model"`。
   - `created`：Unix 秒，取该条**当前 Runtime Revision 的发布时间**。
   - `owned_by`：与同条 `vendor_id` 同值。
-- 既有字段的名字、取值与顺序不变；可见模型集合与顺序不变；不新增端点，错误响应形状不变。
+- 既有字段的名字与取值不变；新增字段排在既有字段之前，既有字段之间的相对顺序不变；可见模型集合与顺序不变；不新增端点，错误响应形状不变。
 
 ## 3. 兼容边界
 
@@ -32,11 +36,11 @@
 | --- | --- |
 | A1 | 顶层含 `object: "list"`；每条含 `id`、`object: "model"`、`created`（整数 Unix 秒）、`owned_by`。 |
 | A2 | `id` 与 `name`、`owned_by` 与 `vendor_id` 同值；`created` 等于该条当前 Runtime Revision 的发布时间。 |
-| A3 | 既有六个字段的名字与取值不变，可见模型集合与顺序不变。 |
+| A3 | 既有六个字段的名字与取值不变，它们之间的相对顺序不变；可见模型集合与顺序不变。 |
 | A4 | 只读标准字段的客户端（按 `data[].id` 取模型标识）能解析出全部可见模型。 |
 
 ## 5. 修订记录
 
 | 修订 | 章节 | 合同变化摘要 | 生效 |
 | --- | --- | --- | --- |
-| v1 | 全文 | 目录响应只增 OpenAI 模型列表的标准字段：顶层 `object`，每条 `id` / `object` / `created` / `owned_by`；既有字段不变。 | 待接受／无 |
+| v1 | 全文 | 目录响应只增 OpenAI 模型列表的标准字段：顶层 `object`，每条 `id` / `object` / `created` / `owned_by`；既有字段不变。 | 已接受／v1 |

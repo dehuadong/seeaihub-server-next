@@ -1097,9 +1097,10 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT DISTINCT ON (re.gateway_model)
                 re.gateway_model, vm.vendor_id, vm.native_revision, vm.model_type,
-                vm.capability_schema, md.id AS documentation_version
+                vm.capability_schema, md.id AS documentation_version, rr.created_at AS published_at
             FROM publication.runtime_entries re
             JOIN publication.gateway_models gm ON gm.gateway_model = re.gateway_model AND gm.enabled
+            JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
             JOIN catalog.vendor_models vm ON vm.id = re.vendor_model_id
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
@@ -1123,6 +1124,7 @@ impl HubRepository for PgHubRepository {
                         .try_get::<Uuid, _>("documentation_version")
                         .map_err(database_error)?
                         .to_string(),
+                    published_at: row.try_get("published_at").map_err(database_error)?,
                 })
             })
             .collect()

@@ -1240,6 +1240,8 @@ pub struct PublishedModel {
     pub capability_schema: Value,
     /// 该模型当前文档的**不透明版本标识**：目录用它拼 `documentation_url`（Spec 0008 §2）。
     pub documentation_version: String,
+    /// 该条目当前发布的生效时间：目录用它给标准字段 `created`（Spec 0009 §2）。
+    pub published_at: DateTime<Utc>,
 }
 
 /// 合同里声明**型号身份**的那个字段的位置（`properties.model.const`）。

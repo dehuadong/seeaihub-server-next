@@ -1130,7 +1130,7 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
     assert_public_only("无鉴权头的目录请求", &catalog);
     assert_eq!(
         catalog,
-        json!({"data": []}),
+        json!({"object": "list", "data": []}),
         "还没发布任何型号时，目录是空列表而不是错误：{catalog}"
     );
     let (status, catalog) = get_catalog(&client, &base_url, Some("sk_seeai_not_a_real_key")).await;
@@ -1170,14 +1170,19 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
         assert_eq!(status, StatusCode::OK, "{name} 必须发布成功");
     }
 
-    // ── 两个型号都在，形状是 `{name, vendor_id, revision, contract}`；照旧不带鉴权头 ──
+    // ── 两个型号都在，形状是平台字段 + OpenAI 列表标准字段（Spec 0009 §2）；照旧不带鉴权头 ──
     let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK, "got {catalog}");
     assert_public_only("目录", &catalog);
     assert_eq!(
+        catalog["object"].as_str(),
+        Some("list"),
+        "顶层带标准列表信封：{catalog}"
+    );
+    assert_eq!(
         catalog.as_object().map(serde_json::Map::len),
-        Some(1),
-        "目录顶层只有 data：{catalog}"
+        Some(2),
+        "目录顶层只有 object 与 data：{catalog}"
     );
     let entries = catalog["data"].as_array().expect("data is an array");
     assert_eq!(entries.len(), 2, "两个在售型号都要在目录里：{catalog}");
@@ -1197,13 +1202,37 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
             keys,
             vec![
                 "contract",
+                "created",
                 "documentation_url",
+                "id",
                 "name",
+                "object",
+                "owned_by",
                 "revision",
                 "type",
                 "vendor_id"
             ],
-            "目录条目是 name / vendor_id / revision / type / contract / documentation_url 六个字段：{entry}"
+            "目录条目是平台六个字段加标准的 id / object / created / owned_by：{entry}"
+        );
+        // 标准字段是平台字段的投射，不是另一份事实（Spec 0009 §2 A2）。
+        assert_eq!(entry["object"].as_str(), Some("model"), "{entry}");
+        assert_eq!(entry["id"].as_str(), Some(name), "{entry}");
+        assert_eq!(entry["owned_by"].as_str(), Some("OpenAI"), "{entry}");
+        // A2：`created` 等于该条当前 Runtime Revision 的发布时间（两边都取整到秒）。
+        let published_at: i64 = sqlx::query_scalar(
+            "SELECT EXTRACT(EPOCH FROM date_trunc('second', rr.created_at))::bigint
+             FROM publication.runtime_entries re
+             JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+             WHERE re.gateway_model = $1 AND re.active",
+        )
+        .bind(name)
+        .fetch_one(&pool)
+        .await
+        .expect("该型号当前生效的 Runtime Revision");
+        assert_eq!(
+            entry["created"].as_i64(),
+            Some(published_at),
+            "created 必须是当前发布的生效时间：{entry}"
         );
         assert_eq!(entry["type"].as_str(), Some("image"), "{entry}");
         assert_eq!(entry["vendor_id"].as_str(), Some("OpenAI"));
@@ -1218,6 +1247,15 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
             &entry["contract"], schema,
             "目录里的合同必须与发布的那一份逐字一致（对客名与原生名同值时逐字相同）"
         );
+    }
+    // A4：标准客户端只读 `id` 也能取到全部可见模型。
+    let ids: Vec<&str> = entries
+        .iter()
+        .filter_map(|entry| entry["id"].as_str())
+        .collect();
+    assert_eq!(ids.len(), published.len(), "id 覆盖全部可见模型：{catalog}");
+    for (name, ..) in published {
+        assert!(ids.contains(&name), "id 必须覆盖 {name}：{catalog}");
     }
 
     // ── 停用供给：该型号从目录里消失，提交也确实取不到候选 ──
@@ -1267,7 +1305,7 @@ async fn the_model_catalog_lists_only_callable_models_with_their_published_contr
     assert_eq!(status, StatusCode::OK);
     assert_eq!(
         catalog,
-        json!({"data": []}),
+        json!({"object": "list", "data": []}),
         "供给与渠道全停用后，目录是空列表而不是错误：{catalog}"
     );
 
@@ -1540,7 +1578,7 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     let (_, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(
         catalog,
-        json!({"data": []}),
+        json!({"object": "list", "data": []}),
         "关掉的模型从目录里消失：{catalog}"
     );
     let off_key = format!("naming-off-{}", Uuid::new_v4());
@@ -1710,7 +1748,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         "不带对客名的命令必须照常可发布：{body}"
     );
 
-    // ── 目录逐位一致：name 是厂商原生名，形状就是新的五字段形状 ──
+    // ── 目录逐位一致：name 是厂商原生名，平台字段照旧 ──
     let (status, catalog) = get_catalog(&client, &base_url, None).await;
     assert_eq!(status, StatusCode::OK, "{catalog}");
     // 文档地址随发布生成（版本标识是随机 UUID），先校验它指对模型，再剥掉它逐位比其余字段。
@@ -1723,10 +1761,11 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         documentation_url.starts_with("/v1/models/gpt-image-2/llms.txt?version="),
         "文档地址指向该模型的公开说明：{documentation_url}"
     );
-    entry
-        .as_object_mut()
-        .expect("entry is an object")
-        .remove("documentation_url");
+    // 标准字段由平台字段派生，逐位比较前与文档地址一起剥掉。
+    let fields = entry.as_object_mut().expect("entry is an object");
+    for key in ["documentation_url", "id", "object", "created", "owned_by"] {
+        fields.remove(key);
+    }
     assert_eq!(
         entry,
         json!({

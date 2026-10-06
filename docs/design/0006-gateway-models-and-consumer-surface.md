@@ -83,23 +83,27 @@
 
 ```json
 {
+  "object": "list",
   "data": [
     {
+      "id": "gpt-image-2.5-plus",
+      "object": "model",
+      "created": 1789000000,
+      "owned_by": "OpenAI",
       "name": "gpt-image-2.5-plus",
       "vendor_id": "OpenAI",
       "revision": "2026-09-20-contract-1.0",
       "type": "image",
-      "contract": { "...": "发布的那份合同，其中 properties.model.const 已替换为 gpt-image-2.5-plus" }
+      "contract": { "...": "发布的那份合同，其中 properties.model.const 已替换为 gpt-image-2.5-plus" },
+      "documentation_url": "/v1/models/gpt-image-2.5-plus/llms.txt?version=…"
     }
   ]
 }
 ```
 
-- `name`：**网关模型名**，客户端提交 `model` 时用的唯一身份；
 - `vendor_id`：厂商标识（目录属性；现有响应把同一个值叫 `vendor`，按用户口径改名 `vendor_id`——这**修订**了 `docs/design/0005` §8.1 已定的响应形状 `{name, vendor, revision, contract}`，评审时按该节的处理方式确认）；
-- `revision`：合同修订号；
-- `type`：模型类型，取值 `image` / `video` / `chat`，来自本次发布引用的 Vendor Model；客户端据此判断用量单位；
 - `contract`：发布的那份合同（`model.const` 已替换，见 §1.4）。
+- 目录字段的当前清单与取值归 [模型类型 Spec](../specs/0006-model-type-and-usage-records.md)、[模型使用文档 Spec](../specs/0008-model-usage-documentation.md) §2 与 [OpenAI 兼容的模型列表 Spec](../specs/0009-openai-compatible-model-list.md)（顶层 `object`；每条 `id` / `object` / `created` / `owned_by`）。
 - **不出现**：`native_model_id`、`provider_model_id`、渠道、供给、驱动、优先级、权重、价格、任何执行记录。
 - **仍公开、不校验 Key**：沿用 `docs/design/0005` §8.1 的裁定（建表单之前先要凭证等于逼调用方为了看一眼目录去开户；目录只有型号身份与合同）。
 - **只列当前真的能调的**：判据与受理期同一条（生效条目 + 启用的供给 + 启用的渠道 + **网关模型 `enabled`**），取数与判据都在仓库层。
