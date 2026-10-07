@@ -116,6 +116,9 @@ fn the_bootstrap_materials_parse_into_their_offerings() {
             offering.price_plan.is_none(),
             "upstream_declared has no price plan"
         );
+        // 成本币种是渠道事实：没有 Price Plan 的供给也要说得清上游给的钱是哪个币种，
+        // 否则引用式发布填不出成本币种（工作项 #81）。
+        assert_eq!(offering.cost_currency.as_deref(), Some("USD"));
     }
     // 参考图的限制必须与承载面的形态一致，这条是发布期的判据；导入照抄，不做二次推导。
     assert_eq!(flare.offerings[0].restrictions["max_reference_images"], 16);
@@ -203,6 +206,7 @@ fn material_offering(
             source_url: "https://example.invalid/rates".to_owned(),
         }),
         consumer_reference_rates: reference,
+        cost_currency: Some("USD".to_owned()),
     }
 }
 

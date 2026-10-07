@@ -18,8 +18,8 @@
 //! 声明的渠道价目（不是运营的定价），因此与供给技术定义同层导入、写进 `supply.offerings`
 //! （设计 0007 §2）。
 //!
-//! 素材里的 `cost_currency` 同样不落这四张表：`supply.offerings` 没有这一列，成本币种是发布期
-//! 按候选声明的东西（今天由 Price Plan 的币种或发布命令的 `cost_currency` 承接）。
+//! 素材里的 `cost_currency` 落 `supply.offerings.cost_currency`：它是**渠道事实**（这条通路收的钱是
+//! 哪个币种），与供给的技术定义同层；发布期按候选取它，缺了才要求发布命令显式给出（设计 0012 §3）。
 
 use crate::{database_error, to_i64};
 use seeai_application::{ApplicationError, ConsumerReferenceRates};
@@ -341,8 +341,8 @@ async fn upsert_offering(
         INSERT INTO supply.offerings
             (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
              restrictions, carrier_schema, parameter_mapping, enabled,
-             formula, cost_unit_price_microusd, consumer_reference_rates)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
+             formula, cost_unit_price_microusd, consumer_reference_rates, cost_currency)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12)
         ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
             adapter_key = EXCLUDED.adapter_key,
             provider_model_id = EXCLUDED.provider_model_id,
@@ -351,8 +351,9 @@ async fn upsert_offering(
             parameter_mapping = EXCLUDED.parameter_mapping,
             formula = EXCLUDED.formula,
             cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
-            -- 素材是供给定义的属主：它没写参考价目就是没有，导入照实写回去（含清空）。
-            consumer_reference_rates = EXCLUDED.consumer_reference_rates
+            -- 素材是供给定义的属主：它没写参考价目或成本币种就是没有，导入照实写回去（含清空）。
+            consumer_reference_rates = EXCLUDED.consumer_reference_rates,
+            cost_currency = EXCLUDED.cost_currency
         RETURNING id
         "#,
     )
@@ -374,6 +375,7 @@ async fn upsert_offering(
             .transpose()
             .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
     )
+    .bind(offering.cost_currency.as_deref())
     .fetch_one(&mut *conn)
     .await
     .map_err(database_error)?;
@@ -493,6 +495,16 @@ fn check_offering_shape(label: &str, offering: &MaterialOffering) -> Result<(), 
             "{label}: consumer_reference_rates needs the currency its four rates are in"
         )));
     }
+    // 成本币种是可选的（旧素材没有它，靠 Price Plan 的币种），写了就必须说得清是哪个币种。
+    if offering
+        .cost_currency
+        .as_ref()
+        .is_some_and(|currency| currency.trim().is_empty())
+    {
+        return Err(ApplicationError::Validation(format!(
+            "{label}: cost_currency must not be blank"
+        )));
+    }
     Ok(())
 }
 
@@ -537,6 +549,9 @@ struct MaterialOffering {
     /// 因此**任何成本形态都可以写**（见 [`ConsumerReferenceRates`]）。
     #[serde(default)]
     consumer_reference_rates: Option<ConsumerReferenceRates>,
+    /// 该供给声明的**成本币种**（渠道事实）：上游声明金额或单价是哪个币种的钱。
+    #[serde(default)]
+    cost_currency: Option<String>,
 }
 
 #[derive(Debug, Deserialize)]

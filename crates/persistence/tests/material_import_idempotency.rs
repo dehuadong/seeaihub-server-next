@@ -5,6 +5,7 @@
 //! 用例从 `HTTP_CONTRACT_DATABASE_URL` 派生一个一次性库（仓库里真实数据库用例的统一入口），
 //! 跑完整迁移后导入两遍，比对四张表的行数；跑完把这个库删掉，不动那个基库本身。
 
+use seeai_application::HubRepository;
 use seeai_persistence::PgHubRepository;
 use seeai_persistence::material_import::import_supply_materials;
 use serde_json::{Value, json};
@@ -158,6 +159,33 @@ async fn importing_the_same_material_twice_adds_no_rows() {
     .await
     .expect("the APIMart offering row");
     assert!(absent.is_none(), "a supply that declares none stays NULL");
+    // 成本币种同样落库：素材写着 `cost_currency: "USD"`，引用式发布与运营界面据此填成本币种
+    // （没有 Price Plan、又还没发布过的供给，此前没有任何来源，见工作项 #81）。
+    let currencies: Vec<String> = sqlx::query_scalar(
+        "SELECT COALESCE(o.cost_currency, '') FROM supply.offerings o ORDER BY o.cost_currency",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the offering cost currencies");
+    assert_eq!(
+        currencies,
+        vec!["USD".to_owned(); 4],
+        "every imported offering declares its cost currency"
+    );
+    // 可选供给清单带着它回来——界面据此显示币种、发出成本币种。
+    let selectable = repository
+        .selectable_offerings()
+        .await
+        .expect("the selectable offerings");
+    assert_eq!(selectable.len(), 4, "four supplies are listed");
+    for offering in &selectable {
+        assert_eq!(
+            offering.cost_currency.as_deref(),
+            Some("USD"),
+            "{} keeps the declared cost currency in the list",
+            offering.provider_kind
+        );
+    }
 
     drop(pool);
     drop(repository);

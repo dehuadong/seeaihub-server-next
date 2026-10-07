@@ -93,13 +93,25 @@ const NO_ATTEMPT: AttemptId = AttemptId(Uuid::nil());
 /// 所以那个断言是"审过了"，不是把检查绕过去——别的动态 SQL 不要走这条路。
 const CANDIDATE_AVAILABLE_SQL: &str = "o.enabled AND c.enabled";
 
-/// 读候选定价必须**一起**选出来的列。
+/// 读候选定价必须**一起**选出来的列，按 `alias` 限定到 `publication.runtime_revisions` 的别名。
 ///
 /// [`row_candidate_pricing`] 按名字逐列读它们，少一列就是运行期的 `no column found for name: …`
 /// ——曾经漏掉 `consumer_formula`，让"省略渠道的增量发布"整条 500。三处读候选定价的查询共用这一份，
-/// 新增列只改这里。列名不带表别名：这几列只有 `publication.runtime_revisions` 有，不会歧义。
-const CANDIDATE_PRICING_COLUMNS: &str = "consumer_rates_cny, consumer_formula, cost_basis, \
-     reference_cost_microusd, cost_currency, tier_prices, floor_amounts";
+/// 新增列只改这里。**必须带表别名**：`supply.offerings` 也有 `cost_currency`（工作项 #81），
+/// 不加限定就是 `column reference "cost_currency" is ambiguous`。
+fn candidate_pricing_columns(alias: &str) -> String {
+    [
+        "consumer_rates_cny",
+        "consumer_formula",
+        "cost_basis",
+        "reference_cost_microusd",
+        "cost_currency",
+        "tier_prices",
+        "floor_amounts",
+    ]
+    .map(|column| format!("{alias}.{column}"))
+    .join(", ")
+}
 
 /// 读**所有在效合同**里声明的输出张数上限，取最大的那份。
 ///
@@ -691,6 +703,7 @@ impl HubRepository for PgHubRepository {
         // 排序的第二项是 `o.id`（定序，不是业务顺序）：同一档允许多条候选，档内按权重分摊要
         // 划分区间，而区间划分必须只有一个答案——行序不保证稳定，落点因此必须配一个稳定序。
         // 分摊本身在用例层做（那里才知道账户与幂等键），这里只保证取回来的顺序是确定的。
+        let pricing = candidate_pricing_columns("rr");
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT
@@ -707,7 +720,7 @@ impl HubRepository for PgHubRepository {
                 p.image_output_microusd_per_million,
                 rr.created_at AS captured_at,
                 rr.markup_bps,
-                {CANDIDATE_PRICING_COLUMNS},
+                {pricing},
                 re.routing_priority,
                 re.weight
             FROM publication.runtime_entries re
@@ -757,6 +770,7 @@ impl HubRepository for PgHubRepository {
         &self,
         gateway_model: &str,
     ) -> Result<Vec<ActiveOfferingChannel>, ApplicationError> {
+        let pricing = candidate_pricing_columns("r");
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT o.provider_model_id, o.adapter_key, c.provider_kind, c.base_url, c.credential_env,
@@ -768,7 +782,7 @@ impl HubRepository for PgHubRepository {
                    p.text_output_microusd_per_million,
                    p.image_output_microusd_per_million,
                    p.source_url AS plan_source_url,
-                   {CANDIDATE_PRICING_COLUMNS}
+                   {pricing}
             FROM publication.runtime_entries re
             JOIN supply.offerings o ON o.id = re.offering_id
             JOIN supply.channels c ON c.id = o.channel_id
@@ -875,7 +889,7 @@ impl HubRepository for PgHubRepository {
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 o.carrier_schema, o.parameter_mapping, o.formula, o.cost_unit_price_microusd,
-                o.consumer_reference_rates,
+                o.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
                 vm.vendor_id, vm.native_model_id, vm.native_revision, vm.model_type,
                 vm.capability_schema,
                 c.provider_kind, c.base_url, c.credential_env,
@@ -945,9 +959,17 @@ impl HubRepository for PgHubRepository {
                     }),
                     None => None,
                 };
-                let cost_currency = plan.as_ref().map(|plan| plan.currency.clone()).or(row
-                    .try_get::<Option<String>, _>("declared_currency")
-                    .map_err(database_error)?);
+                // 成本币种按"渠道怎么结算"取：Price Plan 的币种（那份费率就是它的钱）→ 供给声明的
+                // 成本币种（素材里的渠道事实）→ 已发布修订冻结的那个（旧形状唯一的来源）。
+                let cost_currency = plan
+                    .as_ref()
+                    .map(|plan| plan.currency.clone())
+                    .or(row
+                        .try_get::<Option<String>, _>("offering_cost_currency")
+                        .map_err(database_error)?)
+                    .or(row
+                        .try_get::<Option<String>, _>("declared_currency")
+                        .map_err(database_error)?);
                 let reference: Option<Value> = row
                     .try_get("consumer_reference_rates")
                     .map_err(database_error)?;
@@ -996,7 +1018,7 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.formula,
-                o.consumer_reference_rates,
+                o.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
                 vm.vendor_id, vm.native_model_id, vm.native_revision,
                 c.provider_kind,
                 ({CANDIDATE_AVAILABLE_SQL}) AS enabled,
@@ -1065,9 +1087,14 @@ impl HubRepository for PgHubRepository {
                     }),
                     None => None,
                 };
+                // 成本币种按"渠道怎么结算"取：Price Plan 的币种（那份费率就是它的钱）→ 供给声明的
+                // 成本币种（素材里的渠道事实）→ 已发布修订冻结的那个（旧形状唯一的来源）。
                 let cost_currency = cost_rates
                     .as_ref()
                     .map(|rates| rates.currency.clone())
+                    .or(row
+                        .try_get::<Option<String>, _>("offering_cost_currency")
+                        .map_err(database_error)?)
                     .or(row
                         .try_get::<Option<String>, _>("declared_currency")
                         .map_err(database_error)?);
@@ -1317,6 +1344,7 @@ impl HubRepository for PgHubRepository {
         //
         // 候选能不能走由 `CANDIDATE_AVAILABLE_SQL` 判一次、当列读回来——不在这里用 Rust 重算
         // 那几个开关的与：重算就是第三份判据，将来加一条闸门必然漏掉一处。
+        let pricing = candidate_pricing_columns("rr");
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT
@@ -1328,7 +1356,7 @@ impl HubRepository for PgHubRepository {
                 re.provider_kind,
                 ({CANDIDATE_AVAILABLE_SQL}) AS candidate_available,
                 rr.markup_bps,
-                {CANDIDATE_PRICING_COLUMNS},
+                {pricing},
                 re.routing_priority,
                 re.weight
             FROM publication.runtime_entries re
@@ -5789,8 +5817,8 @@ async fn inline_definition(
             INSERT INTO supply.offerings
                 (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
                  restrictions, carrier_schema, parameter_mapping, enabled,
-                 formula, cost_unit_price_microusd, consumer_reference_rates)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
+                 formula, cost_unit_price_microusd, consumer_reference_rates, cost_currency)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12)
             ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
                 adapter_key = EXCLUDED.adapter_key,
                 provider_model_id = EXCLUDED.provider_model_id,
@@ -5799,10 +5827,11 @@ async fn inline_definition(
                 parameter_mapping = EXCLUDED.parameter_mapping,
                 formula = EXCLUDED.formula,
                 cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
-                -- 参考价目只在内联形状声明了它时覆盖：内联那条路是改价的兼容形状，省略一个供给
-                -- 属性不该把它抹掉；要清掉它由素材导入（供给定义的属主）声明。
+                -- 参考价目与成本币种只在内联形状声明了它们时覆盖：内联那条路是改价的兼容形状，省略
+                -- 一个供给属性不该把它抹掉；要清掉它们由素材导入（供给定义的属主）声明。
                 consumer_reference_rates = COALESCE(
-                    EXCLUDED.consumer_reference_rates, supply.offerings.consumer_reference_rates)
+                    EXCLUDED.consumer_reference_rates, supply.offerings.consumer_reference_rates),
+                cost_currency = COALESCE(EXCLUDED.cost_currency, supply.offerings.cost_currency)
             RETURNING id
             "#,
         )
@@ -5824,6 +5853,7 @@ async fn inline_definition(
                 .transpose()
                 .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
         )
+        .bind(offering.cost_currency.as_deref())
         .fetch_one(&mut **transaction)
         .await
         .map_err(database_error)?,
