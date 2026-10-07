@@ -380,6 +380,7 @@ fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
         schema("gpt-image-2.5-flare"),
         String::new(),
         None,
+        None,
         Vec::new(),
         false,
     );
@@ -394,6 +395,7 @@ fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
     let request = command.into_request(
         schema("gpt-image-2.5-flare"),
         String::new(),
+        None,
         None,
         Vec::new(),
         false,
@@ -410,6 +412,7 @@ fn the_gateway_name_falls_back_to_the_vendor_name_when_absent() {
         schema("gpt-image-2.5-flare"),
         String::new(),
         None,
+        None,
         Vec::new(),
         false,
     );
@@ -422,6 +425,7 @@ fn a_publish_must_declare_a_gateway_name() {
     let mut request = base_command().into_request(
         schema("gpt-image-2.5-flare"),
         String::new(),
+        None,
         None,
         Vec::new(),
         false,

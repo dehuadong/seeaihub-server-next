@@ -128,37 +128,27 @@ async fn importing_the_same_material_twice_adds_no_rows() {
         first.price_plans, 0,
         "upstream_declared materials carry no price plan"
     );
-    // 对客参考价目落 `supply.offerings`：AIHubMix 那条声明了它，导入照实写回（两遍之后仍是它）；
-    // APIMart 那条没声明，就是 NULL——素材是这一列的属主，`0012` §3。
-    let reference: Option<Value> = sqlx::query_scalar(
+    // 对客参考价目落 `catalog.vendor_models`：一个模型一行，导入照实写回（两遍之后仍是它）。
+    let references: Vec<(String, Option<Value>)> = sqlx::query_as(
         r#"
-        SELECT o.consumer_reference_rates
-        FROM supply.offerings o
-        JOIN supply.channels c ON c.id = o.channel_id
-        WHERE c.provider_kind = 'AIHubMix' AND o.provider_model_id = 'gpt-image-2.5-flare'
+        SELECT native_model_id, consumer_reference_rates
+        FROM catalog.vendor_models
+        ORDER BY native_model_id
         "#,
     )
-    .fetch_one(&pool)
+    .fetch_all(&pool)
     .await
-    .expect("the AIHubMix offering row");
-    let reference = reference.expect("AIHubMix declares the reference price list");
-    assert_eq!(reference["currency"], json!("USD"));
-    assert_eq!(
-        reference["text_input_microusd_per_million"],
-        json!(5_000_000)
-    );
-    let absent: Option<Value> = sqlx::query_scalar(
-        r#"
-        SELECT o.consumer_reference_rates
-        FROM supply.offerings o
-        JOIN supply.channels c ON c.id = o.channel_id
-        WHERE c.provider_kind = 'APIMart' AND o.provider_model_id = 'gpt-image-2.5-flare'
-        "#,
-    )
-    .fetch_one(&pool)
-    .await
-    .expect("the APIMart offering row");
-    assert!(absent.is_none(), "a supply that declares none stays NULL");
+    .expect("the vendor model rows");
+    assert_eq!(references.len(), 2, "two models import");
+    for (model, reference) in references {
+        let reference = reference.unwrap_or_else(|| panic!("{model} declares the price list"));
+        assert_eq!(reference["currency"], json!("USD"), "{model}");
+        assert_eq!(
+            reference["text_input_microusd_per_million"],
+            json!(5_000_000),
+            "{model}"
+        );
+    }
     // 成本币种同样落库：素材写着 `cost_currency: "USD"`，引用式发布与运营界面据此填成本币种
     // （没有 Price Plan、又还没发布过的供给，此前没有任何来源，见工作项 #81）。
     let currencies: Vec<String> = sqlx::query_scalar(
@@ -218,16 +208,15 @@ async fn a_reference_price_list_change_updates_the_row_in_place() {
 
     let reference: Option<Value> = sqlx::query_scalar(
         r#"
-        SELECT o.consumer_reference_rates
-        FROM supply.offerings o
-        JOIN supply.channels c ON c.id = o.channel_id
-        WHERE c.provider_kind = 'AIHubMix' AND o.provider_model_id = 'gpt-image-2.5-flare'
+        SELECT consumer_reference_rates
+        FROM catalog.vendor_models
+        WHERE native_model_id = 'gpt-image-2.5-flare'
         "#,
     )
     .fetch_one(&pool)
     .await
-    .expect("the AIHubMix offering row");
-    let reference = reference.expect("AIHubMix declares the reference price list");
+    .expect("the vendor model row");
+    let reference = reference.expect("the model declares the reference price list");
     assert_eq!(
         reference["text_input_microusd_per_million"],
         json!(6_000_000),
@@ -248,12 +237,8 @@ fn edited_material_dir() -> PathBuf {
         let text = std::fs::read_to_string(material_dir().join(name)).expect("a material file");
         let mut material: Value = serde_json::from_str(&text).expect("the material is json");
         if name == "gpt-image-2.5-flare.json" {
-            let offerings = material["offerings"].as_array_mut().expect("offerings");
-            let hub = offerings
-                .iter_mut()
-                .find(|offering| offering["provider_kind"] == json!("AIHubMix"))
-                .expect("the AIHubMix offering");
-            hub["consumer_reference_rates"]["text_input_microusd_per_million"] = json!(6_000_000);
+            material["consumer_reference_rates"]["text_input_microusd_per_million"] =
+                json!(6_000_000);
         }
         let edited = serde_json::to_string_pretty(&material).expect("the edited material is json");
         std::fs::write(dir.join(name), edited).expect("the temporary material is written");

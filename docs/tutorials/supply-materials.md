@@ -24,7 +24,7 @@
 | 供给技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`） | 不换 | **就地更新** `supply.offerings` 那一行（不动 `enabled`） | 重新发布后才进受理 |
 | 渠道身份（`provider_kind`、`base_url`、`credential_env`） | 不换 | 新增一行 `supply.channels`，旧行留着；供给落到新渠道行 | 重新发布后生效 |
 | 费率（`price_plan` 的四档） | 不换 | 同 `(offering_id, currency, source_url)` 且四档全同则复用，变了追加一行 | 重新发布后生效 |
-| 对客参考价目（`consumer_reference_rates` 的四档） | 不换 | **就地更新** `supply.offerings` 那一列（与成本形态无关，任何形态都可声明；没写就是没有） | 重新发布后生效（运营发布页的初始价取它） |
+| 对客参考价目（顶层 `consumer_reference_rates` 的四档） | 不换 | **就地更新** `catalog.vendor_models` 那一列（模型级一份，与成本形态无关；没写就是没有） | 重新发布后生效（运营发布页的初始价取它） |
 
 「重新发布」是运营在管理接口做的引用式发布（选供给 + 给价），它生成一份新的 Runtime Revision；已发布修订的技术定义与说明是冻结快照，导入不回头改它们。
 

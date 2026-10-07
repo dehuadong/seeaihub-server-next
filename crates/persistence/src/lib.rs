@@ -259,6 +259,7 @@ impl HubRepository for PgHubRepository {
             capability_schema,
             documentation_body,
             documentation_material,
+            consumer_reference_rates,
             markup_bps,
             definitions_from_offerings,
             offerings,
@@ -377,6 +378,26 @@ impl HubRepository for PgHubRepository {
                 VendorModelId(existing.try_get("id").map_err(database_error)?)
             }
         };
+        // 对客参考价目**不随合同冻结**：同一修订重发时合同行按不可变规则复用，这一列仍按本次命令更新
+        // ——它是模型级的供给事实，不是合同的一部分；省略即保留已有的值（引用式发布不重报它）。
+        sqlx::query(
+            r#"
+            UPDATE catalog.vendor_models
+            SET consumer_reference_rates = COALESCE($2, consumer_reference_rates)
+            WHERE id = $1
+            "#,
+        )
+        .bind(vendor_model_id.0)
+        .bind(
+            consumer_reference_rates
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+        )
+        .execute(&mut *transaction)
+        .await
+        .map_err(database_error)?;
         // 内联发布带来的文档素材随发布落成该厂商模型的素材版本：之后的引用式发布读它，
         // 运营不需要再导入一次。内容相同复用同一行（唯一键 `(vendor_model_id, content_hash)`）。
         if let Some(material) = &documentation_material {
@@ -889,7 +910,7 @@ impl HubRepository for PgHubRepository {
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 o.carrier_schema, o.parameter_mapping, o.formula, o.cost_unit_price_microusd,
-                o.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
+                vm.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
                 vm.vendor_id, vm.native_model_id, vm.native_revision, vm.model_type,
                 vm.capability_schema,
                 c.provider_kind, c.base_url, c.credential_env,
@@ -1018,7 +1039,7 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.formula,
-                o.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
+                vm.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
                 vm.vendor_id, vm.native_model_id, vm.native_revision,
                 c.provider_kind,
                 ({CANDIDATE_AVAILABLE_SQL}) AS enabled,
@@ -5817,8 +5838,8 @@ async fn inline_definition(
             INSERT INTO supply.offerings
                 (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
                  restrictions, carrier_schema, parameter_mapping, enabled,
-                 formula, cost_unit_price_microusd, consumer_reference_rates, cost_currency)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12)
+                 formula, cost_unit_price_microusd, cost_currency)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
             ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
                 adapter_key = EXCLUDED.adapter_key,
                 provider_model_id = EXCLUDED.provider_model_id,
@@ -5827,10 +5848,8 @@ async fn inline_definition(
                 parameter_mapping = EXCLUDED.parameter_mapping,
                 formula = EXCLUDED.formula,
                 cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
-                -- 参考价目与成本币种只在内联形状声明了它们时覆盖：内联那条路是改价的兼容形状，省略
-                -- 一个供给属性不该把它抹掉；要清掉它们由素材导入（供给定义的属主）声明。
-                consumer_reference_rates = COALESCE(
-                    EXCLUDED.consumer_reference_rates, supply.offerings.consumer_reference_rates),
+                -- 成本币种只在内联形状声明了它时覆盖：内联那条路是改价的兼容形状，省略一个供给属性
+                -- 不该把它抹掉；要清掉它由素材导入（供给定义的属主）声明。
                 cost_currency = COALESCE(EXCLUDED.cost_currency, supply.offerings.cost_currency)
             RETURNING id
             "#,
@@ -5845,14 +5864,6 @@ async fn inline_definition(
         .bind(&offering.parameter_mapping)
         .bind(offering.formula.as_str())
         .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
-        .bind(
-            offering
-                .consumer_reference_rates
-                .as_ref()
-                .map(serde_json::to_value)
-                .transpose()
-                .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
-        )
         .bind(offering.cost_currency.as_deref())
         .fetch_one(&mut **transaction)
         .await

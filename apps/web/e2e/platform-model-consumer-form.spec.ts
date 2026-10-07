@@ -37,7 +37,7 @@ async function seed(request: APIRequestContext, body: Record<string, unknown>) {
 /// 而**这条通路真能算出来的那一种才摆出来**——驱动器给不出四分项用量的通路不能按 token 四档卖，
 /// 取不到金额的通路不能按上游声明金额卖（发布期同样会拒）；新候选的默认形态也落在**可选的那一种**
 /// 上，不落在一个算不出来、发不出去的形态上。
-/// token 四档的初始值取**该 vendor／模型已知的价目**（供给声明的对客参考价目，旧形状回退到它的
+/// token 四档的初始值取**该 vendor／模型已知的价目**（模型声明的对客参考价目，旧形状回退到某条供给的
 /// Price Plan）× 倍率 × 折算率，与选哪条候选无关。
 /// 整页不出现渠道地址、凭证变量名、驱动器。
 ///
@@ -242,7 +242,7 @@ test('对客计价形态只摆这条通路算得出的那一种：默认形态�
 ///
 /// 夹具：一个 vendor 模型两条供给——一条按 token 四档卖、成本按上游声明金额（给得出四分项用量），
 /// 一条声明对客参考价目；另有一个模型只放前者，用来验"没有参考价目"的说法。
-test('按 token 四档的初始价取供给声明的对客参考价目，没有它就说清要按报价填', async ({
+test('按 token 四档的初始价取模型声明的对客参考价目，没有它就说清要按报价填', async ({
   page,
   request,
 }) => {
@@ -286,7 +286,7 @@ test('按 token 四档的初始价取供给声明的对客参考价目，没有�
       tokenOffering(tokenUpstream),
       {
         provider_kind: 'AIHubMix',
-        // 参考价目的属主：它自己只回金额、不按 token 卖，但声明了这份价目。
+        // 它自己只回金额、不按 token 卖；模型级的参考价目与它无关。
         adapter_key: 'aihubmix-image-v1',
         provider_model_id: listUpstream,
         base_url: 'https://e2e-do-not-show.example.com',
@@ -296,16 +296,16 @@ test('按 token 四档的初始价取供给声明的对客参考价目，没有�
         parameter_mapping: {},
         formula: 'upstream_declared',
         cost_currency: 'USD',
-        consumer_reference_rates: {
-          currency: 'USD',
-          text_input_microusd_per_million: 5_000_000,
-          image_input_microusd_per_million: 8_000_000,
-          text_output_microusd_per_million: 10_000_000,
-          image_output_microusd_per_million: 30_000_000,
-          source_url: 'https://e2e-list.example.com',
-        },
       },
     ],
+    // 参考价目是**模型级**的一份（与合同同级）：该模型下按 token 四档卖的候选取它当初始价。
+    consumer_reference_rates: {
+      currency: 'USD',
+      text_input_microusd_per_million: 5_000_000,
+      image_input_microusd_per_million: 8_000_000,
+      text_output_microusd_per_million: 10_000_000,
+      image_output_microusd_per_million: 30_000_000,
+    },
   });
   // 另一个模型：只有按 token 四档卖的那条，全模型没有任何参考价目可作默认值。
   await seed(request, {
@@ -339,9 +339,7 @@ test('按 token 四档的初始价取供给声明的对客参考价目，没有�
   );
   await expect(page.getByTestId('platform-amount-0')).toHaveValue('5');
   await expect(page.getByTestId('platform-amount-3')).toHaveValue('30');
-  await expect(
-    page.getByText('默认取该 vendor／模型已知的对客参考价目（取自 AIHubMix）'),
-  ).toBeVisible();
+  await expect(page.getByText('默认取该 vendor／模型已知的对客参考价目')).toBeVisible();
   // 人民币对客价照旧由"金额 × 折算率 7.2 × 倍率 1.2"算出。
   await expect(
     page.getByText(

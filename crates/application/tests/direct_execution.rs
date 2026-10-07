@@ -387,6 +387,7 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
             model_type: Some("image".to_owned()),
             capability_schema: Some(surface()),
             documentation: Some(documentation()),
+            consumer_reference_rates: None,
             offerings: Some(vec![OfferingDraft {
                 offering_id: None,
                 provider_kind: Some("Fake".to_owned()),
@@ -412,7 +413,6 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
                     image_output_microusd_per_million: 30_000_000,
                     source_url: "https://example.invalid/price".to_owned(),
                 }),
-                consumer_reference_rates: None,
                 cost_unit_price_microusd: None,
                 cost_currency: None,
                 reference_cost_microusd: None,

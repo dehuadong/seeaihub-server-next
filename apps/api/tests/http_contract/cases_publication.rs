@@ -3194,20 +3194,20 @@ async fn the_offering_list_reports_the_channel_capabilities() {
     // 用量（按 token 四档卖，倍率不参与计算）。
     let mut declared = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     declared["base_url"] = json!("https://declared.example.com");
-    // 对客参考价目与成本形态无关：这条只回金额的供给照样声明它，清单原样带出来（设计 0007 §2）。
-    declared["consumer_reference_rates"] = json!({
+    let mut token = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
+    token["base_url"] = json!("https://token.example.com");
+    // 对客参考价目是**模型级**的一份（顶层，与合同同级）：与成本形态无关，这条只回金额的模型照样
+    // 声明它，清单把它带在每条供给上（设计 0007 §2）。
+    let reference = json!({
         "currency": "USD",
         "text_input_microusd_per_million": 5_000_000,
         "image_input_microusd_per_million": 8_000_000,
         "text_output_microusd_per_million": 10_000_000,
-        "image_output_microusd_per_million": 30_000_000,
-        "source_url": "https://example.invalid/list"
+        "image_output_microusd_per_million": 30_000_000
     });
-    let mut token = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
-    token["base_url"] = json!("https://token.example.com");
-    for (model, offering, markup_bps) in [
-        ("token-model", token, None),
-        ("declared-model", declared, Some(2_000)),
+    for (model, offering, markup_bps, reference) in [
+        ("token-model", token, None, None),
+        ("declared-model", declared, Some(2_000), Some(reference)),
     ] {
         let contract = surface_schema(json!({
             "model": {"const": model},
@@ -3228,6 +3228,9 @@ async fn the_offering_list_reports_the_channel_capabilities() {
         });
         if let Some(markup_bps) = markup_bps {
             body["markup_bps"] = json!(markup_bps);
+        }
+        if let Some(reference) = reference {
+            body["consumer_reference_rates"] = reference;
         }
         let response = client
             .post(format!("{base_url}/api/v1/runtime-revisions"))
@@ -3278,11 +3281,11 @@ async fn the_offering_list_reports_the_channel_capabilities() {
         json!(false),
         "AIHubMix 的成功件没有 token 分项"
     );
-    // 参考价目随清单带出来：对客 token 四档的初始价取它；没声明的供给是 null，不造一份空价目。
+    // 参考价目随清单带出来：它是**模型级**的一份，该模型下每条供给都带同一个值；没声明的模型是 null。
     assert_eq!(
         find("declared-model")["consumer_reference_rates"]["currency"],
         json!("USD"),
-        "声明了参考价目的供给原样带出来"
+        "模型声明的参考价目原样带出来"
     );
     assert_eq!(
         find("declared-model")["consumer_reference_rates"]["text_input_microusd_per_million"],
@@ -3290,7 +3293,7 @@ async fn the_offering_list_reports_the_channel_capabilities() {
     );
     assert!(
         find("token-model")["consumer_reference_rates"].is_null(),
-        "没声明参考价目的供给是 null"
+        "没声明参考价目的模型是 null"
     );
 
     drop_isolated_database(&database_name).await;

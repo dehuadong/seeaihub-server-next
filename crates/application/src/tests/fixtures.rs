@@ -124,6 +124,7 @@ pub(super) fn base_command() -> PublishRuntimeCommand {
         model_type: Some("image".to_owned()),
         capability_schema: None,
         documentation: None,
+        consumer_reference_rates: None,
         offerings: None,
         references: None,
         markup_bps: None,
@@ -159,7 +160,6 @@ pub(super) fn draft(provider_model_id: &str) -> OfferingDraft {
         capability_schema: Some(schema("gpt-image-2.5-flare")),
         formula: Some("token_rates".to_owned()),
         price_plan: Some(price_plan()),
-        consumer_reference_rates: None,
         cost_unit_price_microusd: None,
         cost_currency: None,
         reference_cost_microusd: None,
@@ -198,7 +198,6 @@ pub(super) fn offering_with(schema_properties: Value, restrictions: Value) -> No
         provider_model_id: "m".to_owned(),
         base_url: "https://api.inferera.com".to_owned(),
         credential_env: "AIHUBMIX_API_KEY".to_owned(),
-        consumer_reference_rates: None,
         rates: Some(PriceRates {
             currency: "USD".to_owned(),
             text_input_microusd_per_million: 5_000_000,

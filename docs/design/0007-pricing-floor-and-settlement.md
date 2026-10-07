@@ -33,7 +33,7 @@
 
 **可被路由的供给必须能给出对客计费基准**：对客选按 token 四档的候选是对客费率向量，或 Price Plan 的那份费率（旧口径——历史修订与"迁移后仍生效但没有定价的旧修订"结算时读的就是它）；对客选"上游金额 × 倍率"的要给出 `markup_bps`。给不出就**发布期拒**：这条供给一旦生效，受理与结算都算不出该收多少钱，而按 0 收等于白送。它**与"带不带价目表"是两件事**：`upstream_declared` / `per_image` / `per_call` 不必发 Price Plan，但仍要算得出对客价——因此"不带价目表也能发布"成立，而"连对客价一起没有"不成立；反过来，对客费率向量是 `token_rates` 的价格，别的形态带着它永远不会被读，发布期一并拒。
 
-费率表按渠道各自记、币种按该渠道声明的 `currency` 标注，**不是"全平台统一美元"**。它只是 `token_rates` 这一种计价形态的参数，**不是初始价的来源**：对客 token 四档的初始价取该供给声明的**对客参考价目**（`consumer_reference_rates`，与成本形态无关），只有旧形状的供给才回退到它的 Price Plan。当前素材里两条渠道都按上游声明的金额计价、都没有 Price Plan；对客参考价目由 AIHubMix 那条供给声明，同模型下按 token 四档卖的候选（APIMart）初始价就取它。
+费率表按渠道各自记、币种按该渠道声明的 `currency` 标注，**不是"全平台统一美元"**。它只是 `token_rates` 这一种计价形态的参数，**不是初始价的来源**：对客 token 四档的初始价取该 vendor／模型声明的**对客参考价目**（`consumer_reference_rates`，模型级一份，与成本形态无关），只有旧形状的模型才回退到某条供给的 Price Plan。当前素材里两条渠道都按上游声明的金额计价、都没有 Price Plan；对客参考价目是模型级的一份，该模型下按 token 四档卖的候选（APIMart）初始价就取它。
 
 **两家渠道各自的计价事实**（依据 [`docs/facts/channel-facts.md`](../facts/channel-facts.md)）：
 
@@ -62,7 +62,7 @@
 
 **对客计价形态随修订发布、随 Job 快照冻结**：成本形态在 `supply.offerings.formula`（工程登记），两者分处不同字段与生命周期；落点沿用 `consumer_rates_cny` 的同一模式——`runtime_revisions` 上**按候选键的 jsonb**（[`0009`](../../migrations/0009_pricing_floor_and_settlement.sql)），受理时随 Job 快照冻结。
 
-**对客 token 价目由平台维护、初始值取自该 vendor／模型已知的价目**（该模型名下某条供给声明了**对客参考价目** `consumer_reference_rates` 时，那份渠道原币种四档就是这份"已知价目"，按折算率折 CNY、可由倍率推导；旧形状的供给没有这个字段，回退到按 `token_rates` 登记的那份 Price Plan），运营在发布页改的是**渠道原币种**金额（有已知价目时默认就是它，没有时由运营按报价填），人民币对客价由同一乘法算出。它**不依赖该候选的成本单价**，所以成本为标量（`upstream_declared`，APIMart）的候选同样能按 token 四档卖。这也是 vendor 厂商默认的四档 token 定价方式。
+**对客 token 价目由平台维护、初始值取自该 vendor／模型已知的价目**（该模型声明了**对客参考价目** `consumer_reference_rates` 时，那份渠道原币种四档就是这份"已知价目"，按折算率折 CNY、可由倍率推导；旧形状的供给没有这个字段，回退到按 `token_rates` 登记的那份 Price Plan），运营在发布页改的是**渠道原币种**金额（有已知价目时默认就是它，没有时由运营按报价填），人民币对客价由同一乘法算出。它**不依赖该候选的成本单价**，所以成本为标量（`upstream_declared`，APIMart）的候选同样能按 token 四档卖。这也是 vendor 厂商默认的四档 token 定价方式。
 
 **发布期校验的是能力，不是某一次的值**：对客选 token 四档要求该渠道／驱动器**能提供**四分项 `usage`（两家都提供，见 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 与 [`adapter-apimart`](../../crates/adapter-apimart/src/lib.rs)）；选上游金额要求渠道**能声明** `cost`。能力给不出即拒并点名。
 

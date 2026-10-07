@@ -67,6 +67,13 @@ fn imported_projection(material: &Material) -> Value {
         "native_model_id": material.native_model_id,
         "native_revision": material.native_revision,
         "capability_schema": material.capability_schema,
+        "consumer_reference_rates": material.consumer_reference_rates.as_ref().map(|rates| json!({
+            "currency": rates.currency,
+            "text_input_microusd_per_million": rates.text_input_microusd_per_million,
+            "image_input_microusd_per_million": rates.image_input_microusd_per_million,
+            "text_output_microusd_per_million": rates.text_output_microusd_per_million,
+            "image_output_microusd_per_million": rates.image_output_microusd_per_million,
+        })),
         "offerings": material
             .offerings
             .iter()
@@ -88,14 +95,6 @@ fn imported_projection(material: &Material) -> Value {
                     "text_output_microusd_per_million": plan.text_output_microusd_per_million,
                     "image_output_microusd_per_million": plan.image_output_microusd_per_million,
                     "source_url": plan.source_url,
-                })),
-                "consumer_reference_rates": offering.consumer_reference_rates.as_ref().map(|rates| json!({
-                    "currency": rates.currency,
-                    "text_input_microusd_per_million": rates.text_input_microusd_per_million,
-                    "image_input_microusd_per_million": rates.image_input_microusd_per_million,
-                    "text_output_microusd_per_million": rates.text_output_microusd_per_million,
-                    "image_output_microusd_per_million": rates.image_output_microusd_per_million,
-                    "source_url": rates.source_url,
                 })),
             }))
             .collect::<Vec<_>>(),
@@ -141,16 +140,21 @@ fn the_bootstrap_materials_parse_into_their_offerings() {
         flare.offerings[1].parameter_mapping["rename"]["image"],
         "image_urls"
     );
-    // 对客参考价目与成本形态无关：AIHubMix 那条（`upstream_declared`）声明了它，APIMart 那条没声明
-    // ——同模型下按 token 四档卖的候选，初始价取前者（设计 0007 §2）。
-    let reference = flare.offerings[0]
+    // 对客参考价目是**模型级**的一份（顶层）：与成本形态无关，一个模型一份，同模型的每条候选共用
+    // 它当初始价来源（设计 0007 §2）。
+    let reference = flare
         .consumer_reference_rates
         .as_ref()
-        .expect("AIHubMix declares the reference price list");
+        .expect("the model declares the reference price list");
     assert_eq!(reference.currency, "USD");
     assert_eq!(reference.text_input_microusd_per_million, 5_000_000);
     assert_eq!(reference.image_output_microusd_per_million, 30_000_000);
-    assert!(flare.offerings[1].consumer_reference_rates.is_none());
+    assert!(
+        parse("gpt-image-2.5-sunburst.json")
+            .consumer_reference_rates
+            .is_some(),
+        "the second model declares its own list"
+    );
 
     let sunburst = parse("gpt-image-2.5-sunburst.json");
     assert_eq!(sunburst.native_model_id, "gpt-image-2.5-sunburst");
@@ -180,12 +184,7 @@ fn the_operators_pricing_is_invisible_to_the_import() {
 }
 
 /// 一条素材供给：只给参与形状校验的那几个字段，其余取最小可用值。
-fn material_offering(
-    formula: PricingFormula,
-    unit: Option<u64>,
-    plan: bool,
-    reference: Option<ConsumerReferenceRates>,
-) -> MaterialOffering {
+fn material_offering(formula: PricingFormula, unit: Option<u64>, plan: bool) -> MaterialOffering {
     MaterialOffering {
         provider_kind: "AIHubMix".to_owned(),
         adapter_key: "aihubmix-image-v1".to_owned(),
@@ -205,7 +204,6 @@ fn material_offering(
             image_output_microusd_per_million: 1,
             source_url: "https://example.invalid/rates".to_owned(),
         }),
-        consumer_reference_rates: reference,
         cost_currency: Some("USD".to_owned()),
     }
 }
@@ -214,7 +212,7 @@ fn material_offering(
 /// 导入期先拦一道，为的是错误里点得出是哪条候选。
 #[test]
 fn an_offering_whose_formula_contradicts_its_parameters_is_rejected() {
-    let offering = |formula, unit, plan| material_offering(formula, unit, plan, None);
+    let offering = |formula, unit, plan| material_offering(formula, unit, plan);
     let token_rates = || offering(PricingFormula::TokenRates, None, true);
     let per_image = || offering(PricingFormula::PerImage, Some(7), false);
 
@@ -240,38 +238,32 @@ fn an_offering_whose_formula_contradicts_its_parameters_is_rejected() {
     }
 }
 
-/// 对客参考价目**不是成本参数**：任何成本形态的供给都可以声明它，缺了也不影响；但币种必须说得清
-/// ——运营界面按它展示那份初始价（设计 0007 §2）。
+/// 对客参考价目是**模型级**的一份：任何成本形态的模型都可以声明它（它不挂在供给上），缺了也不影响；
+/// 但币种必须说得清——运营界面按它展示那份初始价（设计 0007 §2）。
 #[test]
-fn the_consumer_reference_rates_are_independent_of_the_cost_form() {
+fn the_consumer_reference_rates_are_checked_once_per_model() {
     let rates = |currency: &str| ConsumerReferenceRates {
         currency: currency.to_owned(),
         text_input_microusd_per_million: 5_000_000,
         image_input_microusd_per_million: 8_000_000,
         text_output_microusd_per_million: 10_000_000,
         image_output_microusd_per_million: 30_000_000,
-        source_url: "https://example.invalid/list".to_owned(),
     };
-    let offering = |formula, reference| material_offering(formula, None, false, reference);
+    let mut material = parse("gpt-image-2.5-flare.json");
+    let path = Path::new("material.json");
 
-    check_offering_shape(
-        "material.json: offerings[0]",
-        &offering(PricingFormula::UpstreamDeclared, Some(rates("USD"))),
-    )
-    .expect("a declared-cost supply may still declare the reference price list");
-    check_offering_shape(
-        "material.json: offerings[0]",
-        &offering(PricingFormula::UpstreamDeclared, None),
-    )
-    .expect("the reference price list is optional");
+    material.consumer_reference_rates = Some(rates("USD"));
+    check_consumer_reference_rates(path, &material).expect("a currency is enough");
 
-    let error = check_offering_shape(
-        "material.json: offerings[0]",
-        &offering(PricingFormula::UpstreamDeclared, Some(rates("  "))),
-    )
-    .expect_err("a reference price list without a currency is rejected");
-    assert!(error.to_string().contains("offerings[0]"), "{error}");
-    assert!(error.to_string().contains("currency"), "{error}");
+    material.consumer_reference_rates = None;
+    check_consumer_reference_rates(path, &material).expect("the list is optional");
+
+    material.consumer_reference_rates = Some(rates("  "));
+    let error = check_consumer_reference_rates(path, &material)
+        .expect_err("a price list without a currency is rejected");
+    let message = error.to_string();
+    assert!(message.contains("material.json"), "{message}");
+    assert!(message.contains("currency"), "{message}");
 }
 
 /// 类型必须声明、且落在三种之内；报错要点名素材文件与型号（Spec 0006 §4.4、设计 0020 §2）。
@@ -386,7 +378,7 @@ fn the_materials_only_constrain_fields_they_declare() {
 /// 承载面的组合约束点到没声明的线上名时，导入期就拒并点名文件／候选与那处指针。
 #[test]
 fn a_carrier_clause_naming_an_undeclared_field_is_rejected_at_import() {
-    let mut offering = material_offering(PricingFormula::UpstreamDeclared, None, false, None);
+    let mut offering = material_offering(PricingFormula::UpstreamDeclared, None, false);
     offering.carrier_schema = json!({
         "type": "object",
         "additionalProperties": false,

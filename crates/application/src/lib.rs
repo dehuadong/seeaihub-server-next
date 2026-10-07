@@ -166,6 +166,11 @@ pub struct PublishRuntimeCommand {
     /// `narrative_path` 在 API 层解析成正文。
     #[serde(default)]
     pub documentation: Option<Value>,
+    /// 该 vendor／模型声明的**对客参考价目**（顶层，与 `capability_schema` 同级）：一个模型一份，
+    /// 只作对客 token 四档初始价的来源（见 [`ConsumerReferenceRates`]）。内联发布给；引用式发布不给
+    /// （它读同一厂商模型已导入的那一份）。
+    #[serde(default)]
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 本次发布的**完整、有序**候选集合：必填且非空。
     ///
     /// 每条候选自带渠道、承载面与计价；候选的档位缺省取它在数组里的下标，也可以自己声明
@@ -250,6 +255,9 @@ pub struct PublishRuntimeRequest {
     /// 内联发布带来的**已解析文档素材**：随发布落成该厂商模型的素材版本，之后的引用式发布读它。
     /// 引用式发布为 `None`（素材早已导入）。
     pub documentation_material: Option<Value>,
+    /// 这次发布要不要更新该 vendor／模型声明的**对客参考价目**：给了就写（内联形状的顶层字段），
+    /// `None` 就保留已有的值（引用式发布不重报供给事实）。它不随合同冻结。
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 加价系数（基点）：随修订发布、随 Job 快照冻结；没有候选带定价时为 `None`。
     pub markup_bps: Option<i32>,
     /// 候选的**技术定义**从哪里取：`true` = 由被引用的 Offering 行决定（引用式发布），`false` = 用
@@ -318,12 +326,6 @@ pub struct OfferingDraft {
     /// 渠道不按 token 计量量计价时**不必发它**——那时这条供给没有 Price Plan。
     #[serde(default)]
     pub price_plan: Option<PricePlanDraft>,
-    /// 该供给声明的**对客参考价目**（渠道原币种四档，只作对客 token 四档的初始价来源）。
-    ///
-    /// 它**不是成本参数**（成本费率是 [`Self::price_plan`]）：任何成本形态都可以声明它，缺了也不影响
-    /// 发布——那时初始价由运营按报价填。完整口径见 [`ConsumerReferenceRates`]。
-    #[serde(default)]
-    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// `per_image` / `per_call` 的**单价**（成本平面微单位，币种见 [`Self::cost_currency`]）。
     ///
     /// 按张 / 按次计价时它是成本自算唯一的参数；另外两种形态不给（给了会被拒：那个数永远不会
@@ -435,9 +437,6 @@ pub struct NormalizedOffering {
     pub rates: Option<PriceRates>,
     /// Price Plan 的来源 URL（渠道价目的出处）；没有 Price Plan 时为 `None`。
     pub price_source_url: Option<String>,
-    /// 这条供给声明的**对客参考价目**（渠道原币种四档）：只作对客 token 四档的初始价来源。
-    /// `None` = 没声明（初始价由运营按报价填），见 [`ConsumerReferenceRates`]。
-    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// `per_image` / `per_call` 的单价；另外两种形态为 `None`。
     pub cost_unit_price_microusd: Option<u64>,
     /// 这条供给声明的成本币种；`None` = 没显式声明（取 Price Plan 的币种，旧形状的素材）。
@@ -472,6 +471,9 @@ impl NormalizedOffering {
 #[derive(Debug, Clone)]
 pub struct NormalizedPublication {
     pub contract: Value,
+    /// 该 vendor／模型声明的**对客参考价目**：一个模型一份，只作对客 token 四档初始价的来源
+    /// （见 [`ConsumerReferenceRates`]）。它不进修订、不进 Job 快照，因此**不随合同冻结**。
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     pub offerings: Vec<NormalizedOffering>,
 }
 
@@ -483,6 +485,7 @@ impl PublishRuntimeCommand {
         capability_schema: Value,
         documentation_body: String,
         documentation_material: Option<Value>,
+        consumer_reference_rates: Option<ConsumerReferenceRates>,
         offerings: Vec<NormalizedOffering>,
         definitions_from_offerings: bool,
     ) -> PublishRuntimeRequest {
@@ -512,6 +515,7 @@ impl PublishRuntimeCommand {
             capability_schema,
             documentation_body,
             documentation_material: documentation_material.or(self.documentation),
+            consumer_reference_rates,
             markup_bps: self.markup_bps,
             // 引用式发布的技术定义由仓储从被引用的 Offering 行取：草稿里根本没有它们（那是这次改动的
             // 要点——运营不给技术字段）。内联那条老路自带定义，仓储用请求里的值。
@@ -567,6 +571,7 @@ impl PublishRuntimeCommand {
         self.validate_markup(&offerings)?;
         Ok(NormalizedPublication {
             contract: self.resolve_contract(drafts)?,
+            consumer_reference_rates: self.consumer_reference_rates.clone(),
             offerings,
         })
     }
@@ -678,7 +683,6 @@ impl PublishRuntimeCommand {
                     formula: billing.formula,
                     rates: billing.rates,
                     price_source_url: billing.price_source_url,
-                    consumer_reference_rates: billing.consumer_reference_rates,
                     cost_unit_price_microusd: billing.cost_unit_price_microusd,
                     cost_currency: billing.cost_currency,
                     consumer_rates_cny: billing.consumer_rates_cny,
@@ -764,9 +768,6 @@ struct Billing {
     formula: PricingFormula,
     rates: Option<PriceRates>,
     price_source_url: Option<String>,
-    /// 这条供给声明的**对客参考价目**（渠道原币种四档）：只作对客 token 四档的初始价来源，
-    /// 见 [`ConsumerReferenceRates`]。
-    consumer_reference_rates: Option<ConsumerReferenceRates>,
     cost_unit_price_microusd: Option<u64>,
     cost_currency: Option<String>,
     consumer_rates_cny: Option<ConsumerRatesCny>,
@@ -910,7 +911,6 @@ fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, App
         formula: declared,
         rates,
         price_source_url,
-        consumer_reference_rates: draft.consumer_reference_rates.clone(),
         cost_unit_price_microusd: draft.cost_unit_price_microusd,
         cost_currency,
         consumer_rates_cny: draft.consumer_rates_cny.clone(),
@@ -5560,6 +5560,7 @@ impl RuntimeService {
         let (publication, native_model_id) = self.resolve_inheritance(&mut command).await?;
         let NormalizedPublication {
             contract,
+            consumer_reference_rates,
             offerings,
         } = publication;
         validate_contract(&native_model_id, &contract)?;
@@ -5578,6 +5579,7 @@ impl RuntimeService {
             contract,
             documentation_body,
             documentation_material,
+            consumer_reference_rates,
             normalized,
             definitions_from_offerings,
         );
@@ -5731,8 +5733,6 @@ impl RuntimeService {
                 parameter_mapping: found.parameter_mapping.clone(),
                 capability_schema: None,
                 formula: Some(found.formula.clone()),
-                // 参考价目也是被引用行上的事实：原样填回，发布只改价、不动供给定义。
-                consumer_reference_rates: found.consumer_reference_rates.clone(),
                 // 渠道费率也取自那一行：它是**渠道怎么结算**的事实，不是运营这次要改的东西。
                 price_plan: found.plan.as_ref().map(|plan| PricePlanDraft {
                     currency: plan.currency.clone(),
@@ -5793,6 +5793,8 @@ impl RuntimeService {
             capability_schema: Some(first.capability_schema.clone()),
             // 引用式发布的文档读同一厂商模型已导入的素材，命令里不带。
             documentation: None,
+            // 对客参考价目同理：它已经在那个厂商模型行上了，这次发布不重报（省略即保留）。
+            consumer_reference_rates: None,
             offerings: Some(offerings),
             references: None,
             markup_bps: command.markup_bps,
@@ -6487,9 +6489,6 @@ pub struct ConsumerReferenceRates {
     pub image_input_microusd_per_million: u64,
     pub text_output_microusd_per_million: u64,
     pub image_output_microusd_per_million: u64,
-    /// 这份价目的出处（渠道价目页）；没写就是空串。
-    #[serde(default)]
-    pub source_url: String,
 }
 
 /// 这条候选是否**省略**了渠道字段。

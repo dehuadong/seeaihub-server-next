@@ -14,8 +14,8 @@
 //! 运营的价。`_comment` / `_status` / `_evidence` 是说明字段；顶层 `gateway_model` 也不在这里落地
 //! ——对客名由运营发布时自己填，导入不建立 Gateway Model。
 //!
-//! 例外是 offering 的 `consumer_reference_rates`：它是**对客 token 四档初始价的参考价目**，属工程师
-//! 声明的渠道价目（不是运营的定价），因此与供给技术定义同层导入、写进 `supply.offerings`
+//! 例外是顶层的 `consumer_reference_rates`：它是**对客 token 四档初始价的参考价目**，属工程师声明的
+//! 模型价目（不是运营的定价），因此与合同同层导入、写进 `catalog.vendor_models`，一个模型一份
 //! （设计 0007 §2）。
 //!
 //! 素材里的 `cost_currency` 落 `supply.offerings.cost_currency`：它是**渠道事实**（这条通路收的钱是
@@ -197,11 +197,13 @@ async fn upsert_vendor_model(
     material: &Material,
 ) -> Result<VendorModelId, ApplicationError> {
     let model_type = material_model_type(path, material)?;
+    check_consumer_reference_rates(path, material)?;
     let inserted: Option<Uuid> = sqlx::query_scalar(
         r#"
         INSERT INTO catalog.vendor_models
-            (id, vendor_id, native_model_id, native_revision, model_type, capability_schema)
-        VALUES ($1, $2, $3, $4, $5, $6)
+            (id, vendor_id, native_model_id, native_revision, model_type, capability_schema,
+             consumer_reference_rates)
+        VALUES ($1, $2, $3, $4, $5, $6, $7)
         ON CONFLICT (vendor_id, native_model_id, native_revision) DO NOTHING
         RETURNING id
         "#,
@@ -212,6 +214,14 @@ async fn upsert_vendor_model(
     .bind(&material.native_revision)
     .bind(model_type)
     .bind(&material.capability_schema)
+    .bind(
+        material
+            .consumer_reference_rates
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+    )
     .fetch_optional(&mut *conn)
     .await
     .map_err(database_error)?;
@@ -253,9 +263,38 @@ async fn upsert_vendor_model(
             stored_type
         )));
     }
-    Ok(VendorModelId(
-        existing.try_get("id").map_err(database_error)?,
-    ))
+    let id: Uuid = existing.try_get("id").map_err(database_error)?;
+    // 对客参考价目**不属合同**，所以按素材照实写回（含清空）：素材是它的属主。
+    sqlx::query("UPDATE catalog.vendor_models SET consumer_reference_rates = $2 WHERE id = $1")
+        .bind(id)
+        .bind(
+            material
+                .consumer_reference_rates
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+        )
+        .execute(&mut *conn)
+        .await
+        .map_err(database_error)?;
+    Ok(VendorModelId(id))
+}
+
+/// 校验素材顶层声明的**对客参考价目**说得清币种（它只作初始价来源，只校验这一件事）。
+fn check_consumer_reference_rates(
+    path: &Path,
+    material: &Material,
+) -> Result<(), ApplicationError> {
+    if let Some(reference) = &material.consumer_reference_rates
+        && reference.currency.trim().is_empty()
+    {
+        return Err(ApplicationError::Validation(format!(
+            "{}: consumer_reference_rates needs the currency its four rates are in",
+            path.display()
+        )));
+    }
+    Ok(())
 }
 
 /// 读出并校验素材声明的模型类型。
@@ -341,8 +380,8 @@ async fn upsert_offering(
         INSERT INTO supply.offerings
             (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
              restrictions, carrier_schema, parameter_mapping, enabled,
-             formula, cost_unit_price_microusd, consumer_reference_rates, cost_currency)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12)
+             formula, cost_unit_price_microusd, cost_currency)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
         ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
             adapter_key = EXCLUDED.adapter_key,
             provider_model_id = EXCLUDED.provider_model_id,
@@ -351,8 +390,7 @@ async fn upsert_offering(
             parameter_mapping = EXCLUDED.parameter_mapping,
             formula = EXCLUDED.formula,
             cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
-            -- 素材是供给定义的属主：它没写参考价目或成本币种就是没有，导入照实写回去（含清空）。
-            consumer_reference_rates = EXCLUDED.consumer_reference_rates,
+            -- 素材是供给定义的属主：它没写成本币种就是没有，导入照实写回去（含清空）。
             cost_currency = EXCLUDED.cost_currency
         RETURNING id
         "#,
@@ -367,14 +405,6 @@ async fn upsert_offering(
     .bind(&offering.parameter_mapping)
     .bind(offering.formula.as_str())
     .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
-    .bind(
-        offering
-            .consumer_reference_rates
-            .as_ref()
-            .map(serde_json::to_value)
-            .transpose()
-            .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
-    )
     .bind(offering.cost_currency.as_deref())
     .fetch_one(&mut *conn)
     .await
@@ -487,14 +517,6 @@ fn check_offering_shape(label: &str, offering: &MaterialOffering) -> Result<(), 
         ))),
         _ => Ok(()),
     }?;
-    // 参考价目只作初始价的来源（不是成本参数），所以只校验它自己说得清不清楚。
-    if let Some(reference) = &offering.consumer_reference_rates
-        && reference.currency.trim().is_empty()
-    {
-        return Err(ApplicationError::Validation(format!(
-            "{label}: consumer_reference_rates needs the currency its four rates are in"
-        )));
-    }
     // 成本币种是可选的（旧素材没有它，靠 Price Plan 的币种），写了就必须说得清是哪个币种。
     if offering
         .cost_currency
@@ -523,6 +545,11 @@ struct Material {
     /// Pointer 绑定的字段释义。厂商模型的身份与参数值由渲染器注入，素材里不写死。
     #[serde(default)]
     documentation: Option<Value>,
+    /// 该 vendor／模型声明的**对客参考价目**（顶层，与 `capability_schema` 同级）：一个模型一份，
+    /// 只作对客 token 四档初始价的来源（见 [`ConsumerReferenceRates`]）。它不是成本参数，缺了不影响
+    /// 导入与发布。
+    #[serde(default)]
+    consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 谁写的这份素材；落进价目表那行的来源标注。
     actor: Option<String>,
     offerings: Vec<MaterialOffering>,
@@ -545,10 +572,6 @@ struct MaterialOffering {
     cost_unit_price_microusd: Option<u64>,
     /// 按 token 计量量计价时的那份四档费率；另外三种形态必须不写。
     price_plan: Option<MaterialPricePlan>,
-    /// 该供给声明的**对客参考价目**（渠道原币种四档）：只作对客 token 四档的初始价来源，
-    /// 因此**任何成本形态都可以写**（见 [`ConsumerReferenceRates`]）。
-    #[serde(default)]
-    consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 该供给声明的**成本币种**（渠道事实）：上游声明金额或单价是哪个币种的钱。
     #[serde(default)]
     cost_currency: Option<String>,

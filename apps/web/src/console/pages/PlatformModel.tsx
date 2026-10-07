@@ -14,7 +14,7 @@ import {
   Typography,
 } from 'antd';
 import type { AdminClient } from '../client';
-import type { ConsumerFormula, SelectableOffering } from '../../shared/types';
+import type { ConsumerFormula, ConsumerReferenceRates, SelectableOffering } from '../../shared/types';
 import { Panel } from '../ui';
 import { useLoadable } from '../../shared/ui';
 
@@ -123,36 +123,18 @@ export function PlatformModelPanel({
 
   /// 该 vendor／模型**已知的价目**：对客 token 四档的初始值取它，与勾哪条候选无关（`0007` §2）。
   ///
-  /// 来源按优先次序取一条：**供给声明的对客参考价目**（`consumer_reference_rates`，与成本形态无关）
-  /// 优先，其次是按 token 计量的那条供给的成本费率（旧口径的 Price Plan）。同源多条时**按渠道名与
-  /// 模型名定序**（不依赖清单顺序）；取到的来源标在界面上，让运营知道这份初始价是从哪条供给抄的。
+  /// 来源按优先次序取一条：**模型声明的对客参考价目**（`consumer_reference_rates`，与成本形态无关）
+  /// 优先，其次是按 token 计量的那条供给的成本费率（旧口径的 Price Plan）。参考价目是模型级的一份，
+  /// 该模型下每条供给带回来的是同一个值；成本费率仍按候选自己的那条取。
   function knownRates(offering: SelectableOffering): {
-    rates: NonNullable<SelectableOffering['cost_rates']>;
-    providerKind: string;
+    rates: ConsumerReferenceRates;
     fromReference: boolean;
   } | null {
-    const inModel = all
-      .filter(
-        (item) =>
-          item.vendor_id === offering.vendor_id &&
-          item.native_model_id === offering.native_model_id,
-      )
-      .sort((left, right) =>
-        (left.provider_kind + '/' + left.provider_model_id).localeCompare(
-          right.provider_kind + '/' + right.provider_model_id,
-        ),
-      );
-    const reference = inModel.find((item) => item.consumer_reference_rates);
-    if (reference?.consumer_reference_rates) {
-      return {
-        rates: reference.consumer_reference_rates,
-        providerKind: reference.provider_kind,
-        fromReference: true,
-      };
+    if (offering.consumer_reference_rates) {
+      return { rates: offering.consumer_reference_rates, fromReference: true };
     }
-    const plan = inModel.find((item) => item.cost_rates);
-    if (plan?.cost_rates) {
-      return { rates: plan.cost_rates, providerKind: plan.provider_kind, fromReference: false };
+    if (offering.cost_rates) {
+      return { rates: offering.cost_rates, fromReference: false };
     }
     return null;
   }
@@ -563,7 +545,7 @@ export function PlatformModelPanel({
                         <>
                           <Typography.Text type="secondary">
                             {known && rateSource
-                              ? `四档金额按渠道原币种（${known.currency}／每 1M token）填，默认取该 vendor／模型已知的${rateSource.fromReference ? '对客参考价目' : '渠道成本费率'}（取自 ${rateSource.providerKind}），可以改。`
+                              ? `四档金额按渠道原币种（${known.currency}／每 1M token）填，默认取该 vendor／模型已知的${rateSource.fromReference ? '对客参考价目' : '渠道成本费率'}，可以改。`
                               : '这个 vendor／模型还没有已知的价目可作默认值——请按报价填四档金额（原币种），空着不许发。'}
                             对客人民币价 = 金额 × 折算率 × 倍率（当前 ×{multiplier.toFixed(4)}）。
                           </Typography.Text>
