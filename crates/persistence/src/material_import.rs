@@ -165,7 +165,8 @@ async fn import_material(
         &material.native_revision,
         IMPORT_VALIDATION_BASE_URL,
         &documentation,
-    )?;
+    )
+    .map_err(|error| ApplicationError::Validation(format!("{}: {error}", path.display())))?;
     upsert_model_document_material(&mut tx, vendor_model_id, &documentation).await?;
     let mut summary = MaterialImportSummary::default();
     for (index, offering) in material.offerings.iter().enumerate() {
@@ -441,12 +442,19 @@ async fn upsert_price_plan(
     Ok(true)
 }
 
-/// 素材内部的配套校验：计价形态、它的参数、以及这条供给要不要一份价目表。
+/// 素材内部的配套校验：计价形态、它的参数、这条供给要不要一份价目表，以及承载面的组合约束。
 ///
 /// 库层只钉得住"单价只属于按张 / 按次"（`offerings_cost_unit_price_shape`）；"`token_rates` 必须有
 /// 四档费率、另外三种形态没有价目表"是发布期的判据。导入期在这里拦一道，是为了让错误说到**哪个
-/// 文件的哪条候选**，而不是等发布时才在别处炸开。
+/// 文件的哪条候选**，而不是等发布时才在别处炸开。承载面的组合约束同理（合同那一侧的同一判据由
+/// `render_model_document` 在导入期判）。
 fn check_offering_shape(label: &str, offering: &MaterialOffering) -> Result<(), ApplicationError> {
+    if let Some(message) = seeai_application::model_document::undeclared_clause_message(
+        label,
+        &offering.carrier_schema,
+    ) {
+        return Err(ApplicationError::Validation(message));
+    }
     let formula = offering.formula.as_str();
     match (
         offering.formula.takes_unit_price(),

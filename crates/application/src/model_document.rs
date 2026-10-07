@@ -8,7 +8,7 @@
 use serde_json::Value;
 
 use crate::ApplicationError;
-use seeai_domain::replace_contract_model_identity;
+use seeai_domain::{declares_parameter, replace_contract_model_identity};
 
 /// 最终正文上限：256 KiB。超限拒绝发布，不截断客户说明。
 pub const MAX_MODEL_DOCUMENT_BYTES: usize = 262_144;
@@ -26,6 +26,89 @@ pub const BASE_URL_PLACEHOLDER: &str = "{{SEE_BASEURL}}";
 
 fn invalid(message: &str) -> ApplicationError {
     ApplicationError::Validation(message.to_owned())
+}
+
+/// 组合约束点错名字时的整句报错：判据与文案一处。
+///
+/// `subject` 是出问题的那份对象（"the contract for model X" / "offering A/B" / 素材的位置），由调用方
+/// 按自己的语境给——同一条规则在三处使用，错误口径不能各写一份。
+#[must_use]
+pub fn undeclared_clause_message(subject: &str, schema: &Value) -> Option<String> {
+    undeclared_clause_name(schema).map(|(pointer, name)| {
+        format!(
+            "{subject}: the schema names {name} at {pointer}, but it does not declare that field"
+        )
+    })
+}
+
+/// 组合约束里点到、但**同一层**没声明的字段名，附它在约束里的位置（JSON Pointer）。
+///
+/// 只判**封闭对象**（`additionalProperties: false`）：只有那一层里，"点到没声明的名字"才等于那条约束
+/// 落不到任何值上——分支要么永远无法满足（`allOf`、`oneOf` 的死分支），要么永远是死条文（`not` 那种
+/// 恒真的约束甚至放行了本想禁止的取值）；模型使用文档里那句结构描述还会教调用方填一个会被丢弃的字段。
+/// 不封闭的那一层可以带额外属性，点到没声明的名字是合法的（由上游按自己的 schema 处置），不判。
+///
+/// 判据用 [`declares_parameter`]：`properties` 的键、`required` 里单列的名字与 `容器.成员` 都算声明
+/// ——与参数过滤同一份判据，两边不一致就会出现"判它没声明、却把它的值留下"。
+///
+/// 每一层各判一次：顶层、每个 `properties` 子 schema、`items`。约束的落点覆盖 `allOf` / `oneOf` /
+/// `anyOf` 的子句本身与它的 `if` / `then` / `else`，以及 `not`。
+#[must_use]
+pub fn undeclared_clause_name(schema: &Value) -> Option<(String, String)> {
+    if let Some(found) = own_undeclared_clause_name(schema) {
+        return Some(found);
+    }
+    if let Some(properties) = schema.get("properties").and_then(Value::as_object) {
+        for (name, sub) in properties {
+            if let Some((pointer, field)) = undeclared_clause_name(sub) {
+                return Some((format!("/properties/{name}{pointer}"), field));
+            }
+        }
+    }
+    if let Some((pointer, field)) = schema.get("items").and_then(undeclared_clause_name) {
+        return Some((format!("/items{pointer}"), field));
+    }
+    None
+}
+
+/// 只看这一层（且必须是封闭对象）的组合约束，不含子 schema。
+fn own_undeclared_clause_name(schema: &Value) -> Option<(String, String)> {
+    if schema.get("additionalProperties").and_then(Value::as_bool) != Some(false) {
+        return None;
+    }
+    fn names(side: &Value, pointer: &str, out: &mut Vec<(String, String)>) {
+        if let Some(required) = side.get("required").and_then(Value::as_array) {
+            for (index, name) in required.iter().filter_map(Value::as_str).enumerate() {
+                out.push((format!("{pointer}/required/{index}"), name.to_owned()));
+            }
+        }
+        if let Some(properties) = side.get("properties").and_then(Value::as_object) {
+            for name in properties.keys() {
+                out.push((format!("{pointer}/properties/{name}"), name.clone()));
+            }
+        }
+    }
+    let mut candidates = Vec::new();
+    for key in ["allOf", "oneOf", "anyOf"] {
+        let Some(clauses) = schema.get(key).and_then(Value::as_array) else {
+            continue;
+        };
+        for (index, clause) in clauses.iter().enumerate() {
+            let pointer = format!("/{key}/{index}");
+            names(clause, &pointer, &mut candidates);
+            for keyword in ["if", "then", "else"] {
+                if let Some(side) = clause.get(keyword) {
+                    names(side, &format!("{pointer}/{keyword}"), &mut candidates);
+                }
+            }
+        }
+    }
+    if let Some(negated) = schema.get("not") {
+        names(negated, "/not", &mut candidates);
+    }
+    candidates
+        .into_iter()
+        .find(|(_, name)| !declares_parameter(schema, name))
 }
 
 /// 平台对客基址：必须是 http(s) 的源，不带结尾斜杠、查询或片段。
@@ -129,6 +212,12 @@ pub fn render_model_document(
                 row.pointer
             )));
         }
+    }
+    // 组合约束只能点合同自己声明的字段：点到别的名字时那条分支永远无法满足，渲染出来的结构描述
+    // 还会教调用方填一个会被丢弃的字段（AIHubMix 改名那次就在顶层合同上留下过这种名字）。
+    let subject = format!("the contract for model {platform_name}");
+    if let Some(message) = undeclared_clause_message(&subject, contract) {
+        return Err(invalid(&message));
     }
     let constraint_pointers: Vec<String> = contract
         .get("allOf")

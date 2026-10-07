@@ -6098,6 +6098,16 @@ impl RuntimeService {
             &offering.carrier_schema,
             &offering.parameter_mapping,
         )?;
+        // 承载面的组合约束同样只能点它自己声明的字段：点到没声明的名字时那条分支永远无法满足。
+        let subject = format!(
+            "offering {}/{}",
+            offering.provider_kind, offering.provider_model_id
+        );
+        if let Some(message) =
+            model_document::undeclared_clause_message(&subject, &offering.carrier_schema)
+        {
+            return Err(ApplicationError::Validation(message));
+        }
         let mut base_url = offering.base_url.trim().trim_end_matches('/').to_owned();
         if base_url.is_empty() {
             return Err(ApplicationError::Validation(

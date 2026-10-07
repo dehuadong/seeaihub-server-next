@@ -884,6 +884,102 @@ async fn carrier_field_outside_the_contract_is_rejected() {
     drop_isolated_database(&database_name).await;
 }
 
+/// 组合约束只能点自己声明的字段（R1a）：合同侧与承载面侧各拒一次。
+///
+/// 来源：AIHubMix 改名那次把承载面的 `image` 改成 `images`，同一遍扫描改到了顶层合同的 `allOf`
+/// ——合同声明 `image` 却要求 `images`，对客模型文档里那句结构描述于是教调用方填一个会被丢弃的
+/// 字段（工作项 #79）。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn combination_constraints_naming_undeclared_fields_are_rejected() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+
+    let model = "constraint-name-model";
+    let carrier = |clause: &str| {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": model},
+                "prompt": {"type": "string", "minLength": 1},
+                "images": {"type": "array", "items": {"type": "string"}},
+                "mask": {"type": "string"}
+            },
+            "allOf": [{"if": {"required": ["mask"]}, "then": {"required": [clause]}}]
+        })
+    };
+    let contract = |clause: &str| {
+        json!({
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["model", "prompt"],
+            "properties": {
+                "model": {"const": model},
+                "prompt": {"type": "string", "minLength": 1},
+                "image": {"type": "array", "items": {"type": "string"}},
+                "mask": {"type": "string"}
+            },
+            "allOf": [{"if": {"required": ["mask"]}, "then": {"required": [clause]}}]
+        })
+    };
+
+    // 承载力那条改名按线上形态给（`image` → `images`）：R1 因此通过，拒的原因只剩约束里那个名字。
+    let mapping = json!({"rename": {"image": "images"}});
+
+    // 合同点到承载面的线上名 `images`：合同没声明它，拒。
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "constraint-1",
+        contract("images"),
+        vec![("aihubmix-image-v1", carrier("images"), mapping.clone())],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a contract clause naming a field the contract does not declare must be rejected"
+    );
+
+    // 合同点自己声明的 `image`；承载面点到合同的对客名 `image`：承载面没声明它，拒。
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "constraint-2",
+        contract("image"),
+        vec![("aihubmix-image-v1", carrier("image"), mapping.clone())],
+    )
+    .await;
+    assert_eq!(
+        status,
+        StatusCode::BAD_REQUEST,
+        "a carrier clause naming a field the carrier does not declare must be rejected"
+    );
+
+    // 两边各点自己声明的名字：通过。
+    let status = publish_with_mappings(
+        &client,
+        &base_url,
+        &admin_token,
+        model,
+        "constraint-3",
+        contract("image"),
+        vec![("aihubmix-image-v1", carrier("images"), mapping)],
+    )
+    .await;
+    assert_eq!(status, StatusCode::OK);
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 承载面 ⊆ Driver 能写上线文的字段名（R2）：声明了发不出去的字段就拒绝。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]

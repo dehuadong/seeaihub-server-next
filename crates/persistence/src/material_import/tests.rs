@@ -331,6 +331,83 @@ fn an_explicit_material_dir_is_used_as_given() {
     );
 }
 
+/// 组合约束点到的字段名必须是**同一层**自己声明的：点到别的名字时那条约束落不到任何值上（合同是
+/// 封闭对象，承载面的线上字段也只由声明面产生），模型使用文档还会教调用方填一个会被丢弃的字段
+/// （AIHubMix 改名那次在顶层合同上留下过 `images`，见工作项 #79）。判据只有一份
+/// （`undeclared_clause_name`），这里按真素材跑一遍，承载面那一条同时走导入期的 `check_offering_shape`。
+#[test]
+fn the_materials_only_constrain_fields_they_declare() {
+    for name in ["gpt-image-2.5-flare.json", "gpt-image-2.5-sunburst.json"] {
+        let material = parse(name);
+        let mut schemas = vec![("合同", &material.capability_schema)];
+        for offering in &material.offerings {
+            schemas.push((offering.provider_kind.as_str(), &offering.carrier_schema));
+        }
+        for (label, schema) in schemas {
+            assert_eq!(
+                seeai_application::model_document::undeclared_clause_name(schema),
+                None,
+                "{name}: {label} 的组合约束点到没声明的字段"
+            );
+        }
+        for (index, offering) in material.offerings.iter().enumerate() {
+            check_offering_shape(&format!("{name}: offerings[{index}]"), offering)
+                .expect("the two materials' carriers are well-formed");
+        }
+        // 遮罩那条约束点的必须是合同声明的 `image`（对客字段名），不是承载面的线上名 `images`。
+        assert_eq!(
+            material.capability_schema["allOf"][0]["then"]["required"],
+            json!(["image"]),
+            "{name}"
+        );
+        // 对客文档里那句结构描述由合同渲染：说的是 `image`，不再教调用方填 `images`。
+        let documentation =
+            resolve_documentation(&public_docs(), &material_dir().join(name), &material)
+                .expect("the documentation resolves");
+        let body = seeai_application::model_document::render_model_document(
+            &material.capability_schema,
+            &material.native_model_id,
+            &material.vendor_id,
+            "image",
+            &material.native_revision,
+            "http://api.test",
+            &documentation,
+        )
+        .expect("the contract renders");
+        assert!(body.contains("提供 `image`"), "{name}: {body}");
+        assert!(!body.contains("提供 `images`"), "{name}: {body}");
+    }
+}
+
+/// 承载面的组合约束点到没声明的线上名时，导入期就拒并点名文件／候选与那处指针。
+#[test]
+fn a_carrier_clause_naming_an_undeclared_field_is_rejected_at_import() {
+    let mut offering = material_offering(PricingFormula::UpstreamDeclared, None, false, None);
+    offering.carrier_schema = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["model", "prompt"],
+        "properties": {
+            "model": {"const": "gpt-image-2.5-flare"},
+            "prompt": {"type": "string"},
+            "images": {"type": "array", "items": {"type": "string"}},
+            "mask": {"type": "string"}
+        },
+        "allOf": [{"if": {"required": ["mask"]}, "then": {"required": ["image"]}}]
+    });
+    let error = check_offering_shape("material.json: offerings[0]", &offering)
+        .expect_err("a carrier clause naming an undeclared field is rejected");
+    let message = error.to_string();
+    assert!(message.contains("material.json: offerings[0]"), "{message}");
+    assert!(message.contains("image"), "{message}");
+    assert!(message.contains("/allOf/0/then/required/0"), "{message}");
+
+    // 换成承载面自己声明的线上名 `images` 就通过。
+    offering.carrier_schema["allOf"][0]["then"]["required"] = json!(["images"]);
+    check_offering_shape("material.json: offerings[0]", &offering)
+        .expect("the wire name the carrier declares is accepted");
+}
+
 /// 顶层合同必须声明 `background=transparent` 与 `output_format` 的组合约束：取值由上游判，
 /// 但客户端要能从合同知道这两个参数怎么一起用（用户 2026-10-05 的决定）。
 #[test]

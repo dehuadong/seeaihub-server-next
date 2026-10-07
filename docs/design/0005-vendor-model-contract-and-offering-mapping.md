@@ -41,6 +41,7 @@
 
 发布期：
 
+- **R1a 组合约束只能点自己声明的字段**：只判**封闭对象**（`additionalProperties: false`）——只有那一层里"点到没声明的名字"才等于那条约束落不到任何值上（`allOf` / `oneOf` 的死分支，或 `not` 那种恒真、等于放行本想禁止取值的死条文），模型使用文档里那句结构描述也才会教调用方填一个会被丢弃的字段；不封闭的层可以带额外属性，由上游按自己的 schema 处置，不判。判据用`declares_parameter`（`properties` 的键、`required` 里单列的名字与 `容器.成员` 都算声明，与参数过滤同一份）。每一层各判一次：顶层、每个 `properties` 子 schema、`items`；约束的落点覆盖 `allOf` / `oneOf` / `anyOf` 的子句本身与 `if` / `then` / `else`、以及 `not`。合同在渲染模型文档时判（合同必须封闭，由 `validate_contract` 强制），承载面在导入期与发布期各判一次；错误点名模型／候选、那处指针与字段名。
 - **R1** `carrier_schema` 的每个顶层字段必须**从合同可达**：合同直接声明它、被 `rename` 从某个合同字段接过来、或是尺寸换算的目标字段（供给不能凭空多出参数）。
 - **R2** `carrier_schema` 的每个字段必须能通过映射落到 Driver 的 `wire_parameters` 上（否则"声明了发不出去"）。
 - **R3** 分支与参考图张数上限仍对 Driver 的 `supported_branches` / `max_reference_images`。

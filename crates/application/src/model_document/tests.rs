@@ -12,7 +12,9 @@ fn contract() -> Value {
         "properties": {
             "model": {"const": "vendor-name"},
             "prompt": {"type": "string", "minLength": 1, "maxLength": 32000},
-            "n": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1}
+            "n": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1},
+            "image": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+            "mask": {"type": "string"}
         },
         "allOf": [
             {"if": {"required": ["mask"]}, "then": {"required": ["image"]}}
@@ -27,6 +29,8 @@ fn material() -> Value {
             "/properties/model": "平台目录返回的对客名。",
             "/properties/prompt": "提示词。",
             "/properties/n": "张数。",
+            "/properties/image": "参考图。",
+            "/properties/mask": "遮罩。",
             "/allOf/0": "遮罩必须同时给参考图。"
         }
     })
@@ -124,6 +128,99 @@ fn rejects_materials_that_do_not_match_the_contract() {
     extra["fields"]["/properties/seed"] = json!("合同没有的字段。");
     let error = render(&extra).expect_err("an extra definition is rejected");
     assert!(error.to_string().contains("/properties/seed"), "{error}");
+}
+
+/// 组合约束只能点合同自己声明的字段：点到别的名字时那条分支永远无法满足，渲染出来的结构描述还会
+/// 教调用方填一个会被丢弃的字段（AIHubMix 改名那次在顶层合同上留下过 `images`）。
+#[test]
+fn rejects_combination_constraints_that_name_undeclared_fields() {
+    let mut bad_then = contract();
+    bad_then["allOf"][0]["then"]["required"] = json!(["images"]);
+    let error = render_model_document(
+        &bad_then,
+        "platform-name",
+        "OpenAI",
+        "image",
+        "r1",
+        BASE_URL,
+        &material(),
+    )
+    .expect_err("a clause naming an undeclared field is rejected");
+    let message = error.to_string();
+    assert!(message.contains("platform-name"), "{message}");
+    assert!(message.contains("images"), "{message}");
+    assert!(message.contains("/allOf/0/then/required/0"), "{message}");
+
+    // `if` 那一侧同样判：条件点到一个没人能提供的名字时，那条约束永远是死条文。
+    let mut bad_if = contract();
+    bad_if["allOf"][0]["if"]["required"] = json!(["mask_url"]);
+    bad_if["allOf"][0]["then"]["required"] = json!(["image"]);
+    let error = render_model_document(
+        &bad_if,
+        "platform-name",
+        "OpenAI",
+        "image",
+        "r1",
+        BASE_URL,
+        &material(),
+    )
+    .expect_err("an if-clause naming an undeclared field is rejected");
+    assert!(error.to_string().contains("mask_url"), "{error}");
+    assert!(
+        error.to_string().contains("/allOf/0/if/required/0"),
+        "{error}"
+    );
+
+    // 子 schema 各判各层：`size` 自己是个**封闭对象**，它的 `allOf` 点到它自己没声明的 `width`
+    // （文档里那一行会把这条约束渲染出来，所以同样要拦）。
+    let mut nested = contract();
+    nested["properties"]["size"] = json!({
+        "type": "object",
+        "additionalProperties": false,
+        "properties": {"auto": {"type": "boolean"}},
+        "allOf": [{"if": {"required": ["auto"]}, "then": {"required": ["width"]}}]
+    });
+    let mut material_with_size = material();
+    material_with_size["fields"]["/properties/size"] = json!("尺寸。");
+    material_with_size["fields"]["/properties/size/properties/auto"] = json!("自动尺寸。");
+    let error = render_model_document(
+        &nested,
+        "platform-name",
+        "OpenAI",
+        "image",
+        "r1",
+        BASE_URL,
+        &material_with_size,
+    )
+    .expect_err("a nested clause naming an undeclared field is rejected");
+    assert!(
+        error
+            .to_string()
+            .contains("/properties/size/allOf/0/then/required/0"),
+        "{error}"
+    );
+
+    // 不封闭的那一层不判：它可以带额外属性，`required` 点一个没声明的名字是合法的（由上游按自己的
+    // schema 处置），`0005` §5 的尺寸形态就长这样。
+    let mut open_nested = contract();
+    open_nested["properties"]["size"] = json!({
+        "anyOf": [
+            {"const": "auto"},
+            {"required": ["width"]}
+        ]
+    });
+    let mut material_with_size = material();
+    material_with_size["fields"]["/properties/size"] = json!("尺寸。");
+    render_model_document(
+        &open_nested,
+        "platform-name",
+        "OpenAI",
+        "image",
+        "r1",
+        BASE_URL,
+        &material_with_size,
+    )
+    .expect("a clause inside an open object is left to the upstream");
 }
 
 #[test]

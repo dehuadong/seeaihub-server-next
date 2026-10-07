@@ -31,7 +31,7 @@
   },
   "vendor_id": "OpenAI",
   "native_model_id": "gpt-image-2.5-sunburst",
-  "native_revision": "2026-09-20-contract-1.0",
+  "native_revision": "2026-09-20-contract-1.1",
   "type": "image",
   "actor": "bootstrap",
   "markup_bps": 2000,
@@ -68,7 +68,7 @@
       "mask": { "type": "string" }
     },
     "allOf": [
-      { "if": { "required": ["mask"] }, "then": { "required": ["images"] } },
+      { "if": { "required": ["mask"] }, "then": { "required": ["image"] } },
       {
         "if": {
           "properties": { "background": { "const": "transparent" } },
