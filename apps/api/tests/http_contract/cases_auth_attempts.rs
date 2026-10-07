@@ -6,6 +6,14 @@
 use super::*;
 use serde_json::json;
 
+/// 公开鉴权尝试的计数窗口与"整段序列要跑完"的余量。
+///
+/// 窗口是运维取值（60 秒就是缺省值）；用例压小的是失败上限，几步就能触限。余量要盖住整条序列：
+/// CI 运行 37553143246 的日志里，用这个窗口的几条用例最长约 3.5 秒（含起进程），余量取 10 秒；
+/// 不够时 [`wait_for_window_margin`] 先等到下一个窗口开头。
+const WINDOW_MS: u64 = 60_000;
+const WINDOW_MARGIN_MS: u64 = 10_000;
+
 /// 起一个带假 Redis、失败上限压小的 API：来源维采信 `x-real-ip`。
 async fn bounded_api(
     database_url: &str,
@@ -58,9 +66,10 @@ async fn login(
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn public_auth_attempts_are_bounded_by_identity() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 3, 60_000).await;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 3, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let email = "bounded-identity@example.com";
     let password = "a-long-enough-password";
@@ -91,9 +100,10 @@ async fn public_auth_attempts_are_bounded_by_identity() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn public_auth_attempts_are_bounded_by_source() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 3, 60_000).await;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 3, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     for index in 0..3 {
         let email = format!("bounded-source-{index}@example.com");
@@ -120,9 +130,10 @@ async fn public_auth_attempts_are_bounded_by_source() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_successful_attempt_does_not_count_toward_the_limit() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, 60_000).await;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let email = "bounded-success@example.com";
     let password = "a-long-enough-password";
@@ -162,11 +173,14 @@ async fn a_successful_attempt_does_not_count_toward_the_limit() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_auth_waiting_period_rejects_correct_credentials_then_recovers() {
     let (database_url, database_name) = isolated_database_url().await;
-    // 窗口要盖住 register + 一次失败登录 + 一次被拒登录的耗时（含 argon2），否则会在窗口边界上翻面。
-    let window_ms = 5_000;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, window_ms).await;
+    // 这条用例自取窗口与余量（遮蔽文件头那对同名常量）：窗口要盖住 register + 一次失败登录 +
+    // 一次被拒登录的耗时（含 argon2），这几步约 2.5 秒（CI 运行 37553143246 的日志），余量取 3.5 秒。
+    const WINDOW_MS: u64 = 5_000;
+    const WINDOW_MARGIN_MS: u64 = 3_500;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let email = "bounded-window@example.com";
     let password = "a-long-enough-password";
@@ -193,7 +207,7 @@ async fn the_auth_waiting_period_rejects_correct_credentials_then_recovers() {
         .expect("Retry-After is whole seconds");
     assert!(retry_after >= 1);
 
-    tokio::time::sleep(Duration::from_millis(window_ms + 500)).await;
+    tokio::time::sleep(Duration::from_millis(WINDOW_MS + 500)).await;
     assert_eq!(
         login(&client, &base_url, email, password, "10.3.0.1")
             .await
@@ -244,9 +258,10 @@ async fn without_a_cache_the_auth_attempt_limit_does_not_apply() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn register_and_reset_redemption_are_bounded_too() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, 60_000).await;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let email = "bounded-register@example.com";
     let password = "a-long-enough-password";
@@ -314,9 +329,10 @@ async fn register_and_reset_redemption_are_bounded_too() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_attempt_limit_does_not_reveal_whether_the_identity_exists() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, 60_000).await;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let known = "bounded-known@example.com";
     let password = "a-long-enough-password";
@@ -450,9 +466,10 @@ async fn the_attempt_limit_does_not_reveal_whether_the_identity_exists() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_three_endpoints_count_failures_separately() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, 60_000).await;
+    let (base_url, admin_token, _process) = bounded_api(&database_url, 1, WINDOW_MS).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let email = "endpoint-separation@example.com";
     let password = "a-long-enough-password";

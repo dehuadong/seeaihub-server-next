@@ -557,15 +557,22 @@ async fn an_exhausted_upload_slot_returns_429_upload_busy() {
 }
 
 /// A6：上传速率用独立命名空间，不挤占生成的每 API Key 配额。
+///
+/// 两次上传之间夹着一次生成，这段要在同一个窗口里跑完：CI 运行 37553143246 的日志里约 1 秒，
+/// 余量取 5 秒（见 [`wait_for_window_margin`]）。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_upload_rate_limit_does_not_spend_the_generation_quota() {
+    const WINDOW_MS: u64 = 60_000;
+    const WINDOW_MARGIN_MS: u64 = 5_000;
+
     let cache = CacheFixture::start(CacheSettings::default()).await;
     let mut upload = upload_storage();
-    upload.rate_limit = Some((1, 60_000));
+    upload.rate_limit = Some((1, WINDOW_MS));
     let harness =
         Harness::start_with_upload_storage_and_cache(upload, UpstreamBehaviour::apimart(), cache)
             .await;
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let (status, body) = harness
         .upload(file_part(PNG_FIXTURE, "one.png", Some("image/png")))

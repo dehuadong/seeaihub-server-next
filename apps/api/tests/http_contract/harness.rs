@@ -26,7 +26,7 @@ use std::{
         Arc, Mutex,
         atomic::{AtomicBool, AtomicUsize, Ordering},
     },
-    time::Duration,
+    time::{Duration, SystemTime, UNIX_EPOCH},
 };
 use uuid::Uuid;
 
@@ -3314,6 +3314,25 @@ async fn await_api_ready(
 async fn wait_until_ready(client: &Client, base_url: &str, admin_token: &str) {
     if let Err(reason) = await_api_ready(client, base_url, admin_token).await {
         panic!("API at {base_url} did not become ready: {reason}");
+    }
+}
+
+/// 等计数窗口的剩余时间够放下 `margin_ms`；不够就先等到下一个窗口开头之后 100 毫秒（正好停在
+/// 边界上会又变成"贴着边界"）。
+///
+/// 计数键里带着窗口号、TTL 只给本窗口剩余时间，窗口按钟点等分（与实现的 `rate_limit_window`
+/// 用同一套钟和窗口长度）。序列跨过边界时，边界之后的判定读到的是归零的计数，断言就会时好时坏。
+/// 余量够时不等，所以正常跑法不引入等待；对齐之后同一窗口内的判定是确定的，不必为此改窗口取值
+/// 或放松断言。
+async fn wait_for_window_margin(window_ms: u64, margin_ms: u64) {
+    let now_ms = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("the wall clock is after the epoch")
+        .as_millis() as u64;
+    let remaining = window_ms - now_ms % window_ms;
+    if remaining < margin_ms {
+        eprintln!("窗口余量不足，对齐到下一个计数窗口：等 {remaining} 毫秒（需要 {margin_ms}）");
+        tokio::time::sleep(Duration::from_millis(remaining + 100)).await;
     }
 }
 

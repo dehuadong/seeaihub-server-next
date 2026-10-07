@@ -832,9 +832,8 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
 ///
 /// 上限调到 1 次，第二次请求就能看到越限那条路，不必发满默认的 60 次。
 ///
-/// 窗口边界按钟点等分，所以这条用例先**对齐到窗口开头**再发请求：贴着边界跑的话，第二次请求
-/// 可能落到下一个窗口里，断言就会时好时坏（实测约 15 次里坏 1 次）。对齐之后，同一窗口内的判定
-/// 是确定的——不需要为此把窗口调大或者改判据。对齐用的钟与窗口长度都与实现同一套。
+/// 两次请求要在同一个窗口里，所以先等出足够的窗口余量（见 [`wait_for_window_margin`]）：贴着
+/// 边界跑的话，第二次请求可能落到下一个窗口，断言就会时好时坏。
 ///
 /// "别的窗口"用**删掉这条计数**来构造，而不是等窗口过去：键里带着窗口序号，计数消失就等于到了
 /// 别的窗口；删掉之后从 1 重新数起，它同时验了各窗口各算各的。
@@ -847,9 +846,9 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
-    const WINDOW_MS: i64 = 60_000;
-    // 离边界太近就先过去：给"两次请求 + 清理"留出足够余量，不至于刚对齐就撞上下一条边界。
-    const MARGIN_MS: i64 = 30_000;
+    const WINDOW_MS: u64 = 60_000;
+    // 两次请求加清理要在窗口里跑完：第一次请求在窗口里要等同步窗口到期，余量按 30 秒取。
+    const WINDOW_MARGIN_MS: u64 = 30_000;
 
     let harness = Harness::start_with_cache_and_rate_limit(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
@@ -858,7 +857,7 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
         64,
         1,
         CacheFixture::start(CacheSettings::default()).await,
-        ApiRateLimit::once_per(WINDOW_MS as u64),
+        ApiRateLimit::once_per(WINDOW_MS),
     )
     .await;
     let client = Client::new();
@@ -866,12 +865,7 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
 
-    let now_ms = chrono::Utc::now().timestamp_millis();
-    let until_boundary = WINDOW_MS - now_ms.rem_euclid(WINDOW_MS);
-    if until_boundary < MARGIN_MS {
-        eprintln!("对齐到下一个限流窗口：还要等 {until_boundary} 毫秒");
-        tokio::time::sleep(Duration::from_millis(until_boundary as u64)).await;
-    }
+    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
 
     let first = post_json(
         &harness.base_url,
@@ -925,7 +919,7 @@ async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
     let retry_after = retry_after.expect("越限必须给出 Retry-After");
     let seconds: u64 = retry_after.parse().expect("Retry-After 是秒数");
     assert!(
-        (1..=u64::try_from(WINDOW_MS / 1_000).expect("window in seconds")).contains(&seconds),
+        (1..=WINDOW_MS / 1_000).contains(&seconds),
         "Retry-After 是到下一个窗口的秒数，落在 1..=窗口长度 里，实得 {seconds}"
     );
 
