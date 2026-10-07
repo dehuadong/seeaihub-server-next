@@ -20,7 +20,7 @@
 | --- | --- |
 | **API 使用文档**（模型查询、各模型说明、素材上传与错误处理） | 对客读 `GET /v1/docs/README.md`（入口，索引下面三份）、`GET /v1/docs/authentication.md`、`GET /v1/docs/uploads/images.md`、`GET /v1/docs/http-errors.md`；源码在 [`public-docs/`](public-docs/README.md) |
 | **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
-| **怎么上生产**（打包、部署、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
+| **怎么上生产**（构建、部署、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
 | **容器部署**（Dockerfile、compose、镜像与升级） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **素材与模型升级教程**（改素材后怎么生效、合同变更为什么要升修订、本地库怎么处理） | [`docs/tutorials/supply-materials.md`](docs/tutorials/supply-materials.md) |

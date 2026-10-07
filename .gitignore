@@ -13,9 +13,6 @@ apps/web/dist/
 apps/web/test-results/
 apps/web/playwright-report/
 apps/web/.playwright/
-# 打包脚本的产物与编译缓存：本机生成，不入版本库。
-/build/dist/
-/build/.cache/
 # 第三方可运行示例代码：随外部参考资源保留在本地，不入版本库。
 # 其余 out-reference/ 内容（调研笔记、Schema 快照、错误码、计量证据样本）正常入库。
 /out-reference/doubao/touch_edit_demo/

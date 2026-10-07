@@ -42,7 +42,7 @@
 
 既有 `consume_request_slot` 是“每请求占一个名额、键为密钥标识”的调用点，本设计在它旁边新增按失败记数的判定与写入调用点，不改它；与既有每密钥速率不同的是它**计失败次数而不是请求数**，判定与写入分处一次请求的两端。三个端点的身份口径：注册与登录用提交的邮箱，兑换用重置码所属客户；重置码不存在或已用时没有身份维，该次失败只计来源维。拒绝结果与计数都不区分邮箱是否存在、重置码是否存在或已用，因此计数不能按“这个身份是否存在”分流。等待时长按当前窗口剩余时间给，沿用既有 `Retry-After` 头与 `rate_limit_exceeded` 错误码；`CacheStore` 没有 `INCR`，读改写仍不是严格原子，沿用既有取舍——要挡的是数量级异常，不是精确的第 N 次。三个端点各自的上限与窗口是运维取值，读法沿用既有速率上限的整数环境变量与缺省值模式：`AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` 与 `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS`，`<ENDPOINT>` 取 `REGISTER`、`LOGIN` 或 `REDEEM`。降级沿用既有规则：缓存不可用或读到不可读的值时不拒绝请求，按“这一窗口还没数过”继续；`REDIS_URL` 为空时这层不生效，这是部署期可见的事实，不写成“无缓存也强制”。
 
-来源维需要一个权威的客户端地址：连接层把**连接对端地址**挂进请求扩展，这是唯一不能由调用方自带的来源；生产在 nginx 之后时对端是代理本身，因此在 API 进程配 `AUTH_SOURCE_HEADER`（例如 `x-real-ip`，[反向代理配置](../operations/production.md#25-反向代理与-tls)已用 `$remote_addr` 覆盖写它）后采信该头，未配置时退回对端地址。`X-Forwarded-For` 的最左值可以由客户端自带，不采信。采信头的前提是 API 不能被绕过代理直连（否则同一个头同样可伪造），这是部署期边界。该信任边界的取舍与备选由[本次记录](../../.agents/notes/implemented/platform/2026-10-05-public-auth-attempt-limits.md)保留。
+来源维需要一个权威的客户端地址：连接层把**连接对端地址**挂进请求扩展，这是唯一不能由调用方自带的来源；生产在 nginx 之后时对端是代理本身，因此在 API 进程配 `AUTH_SOURCE_HEADER`（例如 `x-real-ip`，[反向代理配置](../operations/production.md#24-反向代理与-tls)已用 `$remote_addr` 覆盖写它）后采信该头，未配置时退回对端地址。`X-Forwarded-For` 的最左值可以由客户端自带，不采信。采信头的前提是 API 不能被绕过代理直连（否则同一个头同样可伪造），这是部署期边界。该信任边界的取舍与备选由[本次记录](../../.agents/notes/implemented/platform/2026-10-05-public-auth-attempt-limits.md)保留。
 
 ## 4. 静态托管与兼容边界
 
