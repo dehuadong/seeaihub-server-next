@@ -29,16 +29,16 @@ use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
     AccountSummary, ActiveOfferingChannel, AdmitExecution, AdmitOutcome, AdmittedJob, ApiKeyView,
     ApplicationError, BalanceChange, BeginSubmission, CancelUnsubmitted, ClaimedLateFact,
-    CustomerAccountTarget, CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery,
-    CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope, CustomerUsageView, CustomerView,
-    ExecutionFinalization, ExecutionLookup, ExecutionReplay, ExecutionRepository,
-    FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView, GatewayModelView,
-    HubRepository, LateFactKind, LateFacts, LateFactsOutcome, LedgerMismatch, LedgerPage,
-    MissingModelDocument, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates,
-    ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery, ProviderFailureView,
-    PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance,
-    ReferencedOffering, RefundReconciliationCommand, SelectableOfferingView, SettleExecution,
-    SubmissionStarted, TakenOverExecution, UsageAmounts, customer_usage_status,
+    ConsumerReferenceRates, CustomerAccountTarget, CustomerBillingQuery, CustomerBillingSummary,
+    CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope,
+    CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionLookup, ExecutionReplay,
+    ExecutionRepository, FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView,
+    GatewayModelView, HubRepository, LateFactKind, LateFacts, LateFactsOutcome, LedgerMismatch,
+    LedgerPage, MissingModelDocument, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
+    PricePlanRates, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
+    RecordAcceptance, ReferencedOffering, RefundReconciliationCommand, SelectableOfferingView,
+    SettleExecution, SubmissionStarted, TakenOverExecution, UsageAmounts, customer_usage_status,
     declared_output_images,
 };
 use seeai_domain::{
@@ -875,6 +875,7 @@ impl HubRepository for PgHubRepository {
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 o.carrier_schema, o.parameter_mapping, o.formula, o.cost_unit_price_microusd,
+                o.consumer_reference_rates,
                 vm.vendor_id, vm.native_model_id, vm.native_revision, vm.model_type,
                 vm.capability_schema,
                 c.provider_kind, c.base_url, c.credential_env,
@@ -947,6 +948,13 @@ impl HubRepository for PgHubRepository {
                 let cost_currency = plan.as_ref().map(|plan| plan.currency.clone()).or(row
                     .try_get::<Option<String>, _>("declared_currency")
                     .map_err(database_error)?);
+                let reference: Option<Value> = row
+                    .try_get("consumer_reference_rates")
+                    .map_err(database_error)?;
+                let consumer_reference_rates = reference
+                    .map(serde_json::from_value::<ConsumerReferenceRates>)
+                    .transpose()
+                    .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
                 Ok(ReferencedOffering {
                     offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
                     vendor_id: row.try_get("vendor_id").map_err(database_error)?,
@@ -964,6 +972,7 @@ impl HubRepository for PgHubRepository {
                     restrictions: row.try_get("restrictions").map_err(database_error)?,
                     formula: row.try_get("formula").map_err(database_error)?,
                     plan,
+                    consumer_reference_rates,
                     cost_currency,
                     cost_unit_price_microusd: row
                         .try_get::<Option<i64>, _>("cost_unit_price_microusd")
@@ -987,6 +996,7 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.formula,
+                o.consumer_reference_rates,
                 vm.vendor_id, vm.native_model_id, vm.native_revision,
                 c.provider_kind,
                 ({CANDIDATE_AVAILABLE_SQL}) AS enabled,
@@ -1061,6 +1071,13 @@ impl HubRepository for PgHubRepository {
                     .or(row
                         .try_get::<Option<String>, _>("declared_currency")
                         .map_err(database_error)?);
+                let reference: Option<Value> = row
+                    .try_get("consumer_reference_rates")
+                    .map_err(database_error)?;
+                let consumer_reference_rates = reference
+                    .map(serde_json::from_value::<ConsumerReferenceRates>)
+                    .transpose()
+                    .map_err(|error| ApplicationError::Persistence(error.to_string()))?;
                 Ok(SelectableOfferingView {
                     offering_id: OfferingId(row.try_get("offering_id").map_err(database_error)?),
                     vendor_id: row.try_get("vendor_id").map_err(database_error)?,
@@ -1075,6 +1092,7 @@ impl HubRepository for PgHubRepository {
                     provides_token_usage: false,
                     cost_currency,
                     cost_rates,
+                    consumer_reference_rates,
                     enabled: row.try_get("enabled").map_err(database_error)?,
                 })
             })
@@ -5771,8 +5789,8 @@ async fn inline_definition(
             INSERT INTO supply.offerings
                 (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
                  restrictions, carrier_schema, parameter_mapping, enabled,
-                 formula, cost_unit_price_microusd)
-            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
+                 formula, cost_unit_price_microusd, consumer_reference_rates)
+            VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
             ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
                 adapter_key = EXCLUDED.adapter_key,
                 provider_model_id = EXCLUDED.provider_model_id,
@@ -5780,7 +5798,11 @@ async fn inline_definition(
                 carrier_schema = EXCLUDED.carrier_schema,
                 parameter_mapping = EXCLUDED.parameter_mapping,
                 formula = EXCLUDED.formula,
-                cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd
+                cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
+                -- 参考价目只在内联形状声明了它时覆盖：内联那条路是改价的兼容形状，省略一个供给
+                -- 属性不该把它抹掉；要清掉它由素材导入（供给定义的属主）声明。
+                consumer_reference_rates = COALESCE(
+                    EXCLUDED.consumer_reference_rates, supply.offerings.consumer_reference_rates)
             RETURNING id
             "#,
         )
@@ -5794,6 +5816,14 @@ async fn inline_definition(
         .bind(&offering.parameter_mapping)
         .bind(offering.formula.as_str())
         .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
+        .bind(
+            offering
+                .consumer_reference_rates
+                .as_ref()
+                .map(serde_json::to_value)
+                .transpose()
+                .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+        )
         .fetch_one(&mut **transaction)
         .await
         .map_err(database_error)?,

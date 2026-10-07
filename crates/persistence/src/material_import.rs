@@ -14,11 +14,15 @@
 //! 运营的价。`_comment` / `_status` / `_evidence` 是说明字段；顶层 `gateway_model` 也不在这里落地
 //! ——对客名由运营发布时自己填，导入不建立 Gateway Model。
 //!
+//! 例外是 offering 的 `consumer_reference_rates`：它是**对客 token 四档初始价的参考价目**，属工程师
+//! 声明的渠道价目（不是运营的定价），因此与供给技术定义同层导入、写进 `supply.offerings`
+//! （设计 0007 §2）。
+//!
 //! 素材里的 `cost_currency` 同样不落这四张表：`supply.offerings` 没有这一列，成本币种是发布期
 //! 按候选声明的东西（今天由 Price Plan 的币种或发布命令的 `cost_currency` 承接）。
 
 use crate::{database_error, to_i64};
-use seeai_application::ApplicationError;
+use seeai_application::{ApplicationError, ConsumerReferenceRates};
 use seeai_domain::{ChannelId, OfferingId, PricingFormula, VendorModelId};
 use serde::Deserialize;
 use serde_json::{Value, json};
@@ -336,8 +340,8 @@ async fn upsert_offering(
         INSERT INTO supply.offerings
             (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
              restrictions, carrier_schema, parameter_mapping, enabled,
-             formula, cost_unit_price_microusd)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10)
+             formula, cost_unit_price_microusd, consumer_reference_rates)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
         ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
             adapter_key = EXCLUDED.adapter_key,
             provider_model_id = EXCLUDED.provider_model_id,
@@ -345,7 +349,9 @@ async fn upsert_offering(
             carrier_schema = EXCLUDED.carrier_schema,
             parameter_mapping = EXCLUDED.parameter_mapping,
             formula = EXCLUDED.formula,
-            cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd
+            cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
+            -- 素材是供给定义的属主：它没写参考价目就是没有，导入照实写回去（含清空）。
+            consumer_reference_rates = EXCLUDED.consumer_reference_rates
         RETURNING id
         "#,
     )
@@ -359,6 +365,14 @@ async fn upsert_offering(
     .bind(&offering.parameter_mapping)
     .bind(offering.formula.as_str())
     .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
+    .bind(
+        offering
+            .consumer_reference_rates
+            .as_ref()
+            .map(serde_json::to_value)
+            .transpose()
+            .map_err(|error| ApplicationError::Persistence(error.to_string()))?,
+    )
     .fetch_one(&mut *conn)
     .await
     .map_err(database_error)?;
@@ -462,7 +476,16 @@ fn check_offering_shape(label: &str, offering: &MaterialOffering) -> Result<(), 
              token_rates only"
         ))),
         _ => Ok(()),
+    }?;
+    // 参考价目只作初始价的来源（不是成本参数），所以只校验它自己说得清不清楚。
+    if let Some(reference) = &offering.consumer_reference_rates
+        && reference.currency.trim().is_empty()
+    {
+        return Err(ApplicationError::Validation(format!(
+            "{label}: consumer_reference_rates needs the currency its four rates are in"
+        )));
     }
+    Ok(())
 }
 
 /// 一份素材。顶层那些说明字段与运营的定价字段不在结构里，serde 默认忽略未知字段，这正好是我们要的：
@@ -502,6 +525,10 @@ struct MaterialOffering {
     cost_unit_price_microusd: Option<u64>,
     /// 按 token 计量量计价时的那份四档费率；另外三种形态必须不写。
     price_plan: Option<MaterialPricePlan>,
+    /// 该供给声明的**对客参考价目**（渠道原币种四档）：只作对客 token 四档的初始价来源，
+    /// 因此**任何成本形态都可以写**（见 [`ConsumerReferenceRates`]）。
+    #[serde(default)]
+    consumer_reference_rates: Option<ConsumerReferenceRates>,
 }
 
 #[derive(Debug, Deserialize)]

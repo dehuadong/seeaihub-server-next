@@ -121,40 +121,63 @@ export function PlatformModelPanel({
     return found ? found.rate_micros / 1_000_000 : null;
   }
 
-  /// 该 vendor／模型**已知的渠道价目**来自哪条供给：对客 token 四档的初始值取它，与选哪条候选无关
-  /// （`0007` §2）。
+  /// 该 vendor／模型**已知的价目**：对客 token 四档的初始值取它，与勾哪条候选无关（`0007` §2）。
   ///
-  /// 平台维护的是"这个 vendor／模型"的一张价目表，所以这里在该 vendor／模型下带 `cost_rates` 的供给
-  /// 里取一条，**按渠道名与模型名定序**（不依赖清单顺序）；取到的来源标在界面上，让运营知道这份
-  /// 初始价是从哪条供给抄的。
-  function knownRateSource(offering: SelectableOffering): SelectableOffering | null {
-    const withRates = all
+  /// 来源按优先次序取一条：**供给声明的对客参考价目**（`consumer_reference_rates`，与成本形态无关）
+  /// 优先，其次是按 token 计量的那条供给的成本费率（旧口径的 Price Plan）。同源多条时**按渠道名与
+  /// 模型名定序**（不依赖清单顺序）；取到的来源标在界面上，让运营知道这份初始价是从哪条供给抄的。
+  function knownRates(offering: SelectableOffering): {
+    rates: NonNullable<SelectableOffering['cost_rates']>;
+    providerKind: string;
+    fromReference: boolean;
+  } | null {
+    const inModel = all
       .filter(
         (item) =>
           item.vendor_id === offering.vendor_id &&
-          item.native_model_id === offering.native_model_id &&
-          item.cost_rates,
+          item.native_model_id === offering.native_model_id,
       )
       .sort((left, right) =>
         (left.provider_kind + '/' + left.provider_model_id).localeCompare(
           right.provider_kind + '/' + right.provider_model_id,
         ),
       );
-    return withRates[0] ?? null;
+    const reference = inModel.find((item) => item.consumer_reference_rates);
+    if (reference?.consumer_reference_rates) {
+      return {
+        rates: reference.consumer_reference_rates,
+        providerKind: reference.provider_kind,
+        fromReference: true,
+      };
+    }
+    const plan = inModel.find((item) => item.cost_rates);
+    if (plan?.cost_rates) {
+      return { rates: plan.cost_rates, providerKind: plan.provider_kind, fromReference: false };
+    }
+    return null;
   }
 
-  /// 这条候选定价用的**渠道币种**：供给自己声明的优先，否则取那条已知价目的币种。
-  function pricingCurrency(offering: SelectableOffering): string | null {
-    return offering.cost_currency ?? knownRateSource(offering)?.cost_rates?.currency ?? null;
+  /// 这条候选的**成本币种**：供给自己声明的优先，否则取它那份成本费率的币种。
+  ///
+  /// 它随候选发布（`cost_currency`），与四档金额用的币种是两件事：金额可能取自**另一条供给声明的
+  /// 参考价目**，那份价目的币种才是金额的币种（见 [`amountsCurrency`]）。
+  function costCurrency(offering: SelectableOffering): string | null {
+    return offering.cost_currency ?? offering.cost_rates?.currency ?? null;
   }
 
-  /// 四档金额的**默认值**：该 vendor／模型已知的渠道价目（原币种，每百万 token 微单位）。
+  /// 四档金额用的**币种**：取那份已知价目的币种——金额就是从它抄来的，换算也必须用它，不能拿候选
+  /// 自己的成本币种去折（两者可以不同：参考价目按渠道记，候选的成本币种按供给声明）。
+  function amountsCurrency(offering: SelectableOffering): string | null {
+    return knownRates(offering)?.rates.currency ?? offering.cost_currency ?? null;
+  }
+
+  /// 四档金额的**默认值**：该 vendor／模型已知的价目（原币种，每百万 token 微单位）。
   ///
   /// 这是**默认值**、不是平台替运营定价：值只是预填给运营，改了就按他填的发布、随 Job 快照冻结。
   /// 该 vendor／模型没有已知价目时返回 `null`——**不拿 0 顶替**：0 是一个真实的价（等于白送），
   /// 而"没有默认值"不是 0；界面让运营自己填，空着不许发。
   function defaultAmounts(offering: SelectableOffering): [number, number, number, number] | null {
-    const known = knownRateSource(offering)?.cost_rates;
+    const known = knownRates(offering)?.rates;
     if (!known) return null;
     return [
       known.text_input_microusd_per_million,
@@ -162,6 +185,21 @@ export function PlatformModelPanel({
       known.text_output_microusd_per_million,
       known.image_output_microusd_per_million,
     ];
+  }
+
+  /// 勾选或载入一条供给时的**对客形态**：取这条通路可选的那一种。
+  ///
+  /// 带回来的那个（改价载入的是**历史修订**里的形态）只要还在可选集合里就用它，否则落到集合里的
+  /// 第一种（`CONSUMER_FORMULAS` 的顺序就是优先次序——按 token 四档优先，Spec 0001 v9）。渠道能力
+  /// 可能已经变了（AIHubMix 改走 `/ai/v1` 之后不再给四分项用量），那时历史值落在不可选的形态上，
+  /// 界面会显示一个发不出去的形态；一种都给不出时保留带回来的那个，由发布期拒。
+  function resolveConsumerFormula(
+    preferred: ConsumerFormula | null,
+    offering: SelectableOffering,
+  ): ConsumerFormula {
+    const allowed = consumerFormulas(offering.declares_cost, offering.provides_token_usage);
+    if (preferred && allowed.some((item) => item.value === preferred)) return preferred;
+    return allowed[0]?.value ?? preferred ?? 'token_rates';
   }
 
   /// 这条候选实际用的四档金额：运营填过就用他填的，否则用默认值。
@@ -174,7 +212,7 @@ export function PlatformModelPanel({
   function effectiveCny(item: Selected): [number, number, number, number] | null {
     const amounts = effectiveAmounts(item);
     if (!amounts) return null;
-    const fx = fxRate(pricingCurrency(item.offering));
+    const fx = fxRate(amountsCurrency(item.offering));
     if (fx === null) return null;
     const scale = fx * multiplier;
     return amounts.map((value) => Math.round(value * scale)) as [number, number, number, number];
@@ -237,12 +275,13 @@ export function PlatformModelPanel({
             provides_token_usage: true,
             cost_currency: candidate.cost_currency,
             cost_rates: null,
+            consumer_reference_rates: null,
             enabled: candidate.enabled,
           } satisfies SelectableOffering);
         // 已发布的是**人民币**价，反推回渠道原币种金额：界面给运营看与改的是原币种金额，人民币价由它
         // 算出来。缺折算率或没带价时交给默认值。
         const published = candidate.consumer_rates_cny;
-        const fx = fxRate(pricingCurrency(resolved));
+        const fx = fxRate(amountsCurrency(resolved));
         const amounts =
           published && fx !== null
             ? ([ 
@@ -261,10 +300,11 @@ export function PlatformModelPanel({
           offering: resolved,
           priority: index,
           weight: candidate.weight,
-          consumerFormula:
+          consumerFormula: resolveConsumerFormula(
             parseConsumerFormula(candidate.consumer_formula) ??
-            parseConsumerFormula(resolved.formula) ??
-            'token_rates',
+              parseConsumerFormula(resolved.formula),
+            resolved,
+          ),
           amounts,
         };
       }),
@@ -281,8 +321,9 @@ export function PlatformModelPanel({
               offering,
               priority: list.length,
               weight: 1,
-              // 对客形态的默认是**按 token 四档**（平台主流收法），运营可以立刻在下拉里改。
-              consumerFormula: 'token_rates',
+              // 对客形态的默认是这条通路**可选的第一种**：按 token 四档优先（平台主流收法），
+              // 它不成立时落到唯一可选的那种——AIHubMix 只回金额、不给用量，默认就是它。
+              consumerFormula: resolveConsumerFormula(null, offering),
               amounts: null,
             },
           ]
@@ -346,7 +387,7 @@ export function PlatformModelPanel({
           }
         }
         // 渠道币种是**成本侧的管道**，不是运营填的字段：服务端按它取折算率、把成本折成人民币做毛利。
-        const currency = pricingCurrency(item.offering);
+        const currency = costCurrency(item.offering);
         if (currency) reference.cost_currency = currency;
         return reference;
       }),
@@ -465,9 +506,14 @@ export function PlatformModelPanel({
               const picked = selected.find(
                 (item) => item.offering.offering_id === offering.offering_id,
               );
-              const rateSource = knownRateSource(offering);
-              const known = rateSource?.cost_rates ?? null;
-              const currency = pricingCurrency(offering);
+              const rateSource = knownRates(offering);
+              const known = rateSource?.rates ?? null;
+              // 折算率那一行要录的是**这次定价真正用到的币种**：按 token 四档卖时是四档金额的币种
+              // （可能来自另一条供给声明的参考价目），其余形态是候选的成本币种（上游声明的金额）。
+              const currency =
+                picked?.consumerFormula === 'token_rates'
+                  ? amountsCurrency(offering)
+                  : costCurrency(offering);
               const shownAmounts = picked ? effectiveAmounts(picked) : null;
               const shownCny = picked ? effectiveCny(picked) : null;
               return (
@@ -516,9 +562,9 @@ export function PlatformModelPanel({
                       {picked.consumerFormula === 'token_rates' ? (
                         <>
                           <Typography.Text type="secondary">
-                            {known
-                              ? `四档金额按渠道原币种（${known.currency}／每 1M token）填，默认取该 vendor／模型已知的渠道价目（取自 ${rateSource?.provider_kind}），可以改。`
-                              : '这个 vendor／模型还没有已知的渠道价目可作默认值——请按报价填四档金额（原币种），空着不许发。'}
+                            {known && rateSource
+                              ? `四档金额按渠道原币种（${known.currency}／每 1M token）填，默认取该 vendor／模型已知的${rateSource.fromReference ? '对客参考价目' : '渠道成本费率'}（取自 ${rateSource.providerKind}），可以改。`
+                              : '这个 vendor／模型还没有已知的价目可作默认值——请按报价填四档金额（原币种），空着不许发。'}
                             对客人民币价 = 金额 × 折算率 × 倍率（当前 ×{multiplier.toFixed(4)}）。
                           </Typography.Text>
                           <Flex gap={8} wrap>
@@ -548,11 +594,13 @@ export function PlatformModelPanel({
                               {yuanPerMillion(shownCny[1])}／文出 ¥{yuanPerMillion(shownCny[2])}／图出 ¥
                               {yuanPerMillion(shownCny[3])}
                             </Typography.Text>
-                          ) : (
+                          ) : shownAmounts !== null ? (
+                            // 金额缺了不说"缺折算率"：那句上面已经说清要按报价填，这里再报一次会把
+                            // 两种缺法混成一句话。
                             <Typography.Text type="warning">
                               还缺折算率，人民币对客价算不出来。
                             </Typography.Text>
-                          )}
+                          ) : null}
                         </>
                       ) : null}
 

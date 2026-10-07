@@ -3098,6 +3098,15 @@ async fn the_offering_list_reports_the_channel_capabilities() {
     // 用量（按 token 四档卖，倍率不参与计算）。
     let mut declared = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     declared["base_url"] = json!("https://declared.example.com");
+    // 对客参考价目与成本形态无关：这条只回金额的供给照样声明它，清单原样带出来（设计 0007 §2）。
+    declared["consumer_reference_rates"] = json!({
+        "currency": "USD",
+        "text_input_microusd_per_million": 5_000_000,
+        "image_input_microusd_per_million": 8_000_000,
+        "text_output_microusd_per_million": 10_000_000,
+        "image_output_microusd_per_million": 30_000_000,
+        "source_url": "https://example.invalid/list"
+    });
     let mut token = candidate("APIMart", "apimart-image-v1", &["prompt_only"]);
     token["base_url"] = json!("https://token.example.com");
     for (model, offering, markup_bps) in [
@@ -3172,6 +3181,20 @@ async fn the_offering_list_reports_the_channel_capabilities() {
         find("declared-model")["provides_token_usage"],
         json!(false),
         "AIHubMix 的成功件没有 token 分项"
+    );
+    // 参考价目随清单带出来：对客 token 四档的初始价取它；没声明的供给是 null，不造一份空价目。
+    assert_eq!(
+        find("declared-model")["consumer_reference_rates"]["currency"],
+        json!("USD"),
+        "声明了参考价目的供给原样带出来"
+    );
+    assert_eq!(
+        find("declared-model")["consumer_reference_rates"]["text_input_microusd_per_million"],
+        json!(5_000_000)
+    );
+    assert!(
+        find("token-model")["consumer_reference_rates"].is_null(),
+        "没声明参考价目的供给是 null"
     );
 
     drop_isolated_database(&database_name).await;

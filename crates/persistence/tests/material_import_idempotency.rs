@@ -7,6 +7,7 @@
 
 use seeai_persistence::PgHubRepository;
 use seeai_persistence::material_import::import_supply_materials;
+use serde_json::{Value, json};
 use sqlx::{AssertSqlSafe, PgPool, Row};
 use std::path::{Path, PathBuf};
 use uuid::Uuid;
@@ -126,10 +127,110 @@ async fn importing_the_same_material_twice_adds_no_rows() {
         first.price_plans, 0,
         "upstream_declared materials carry no price plan"
     );
+    // 对客参考价目落 `supply.offerings`：AIHubMix 那条声明了它，导入照实写回（两遍之后仍是它）；
+    // APIMart 那条没声明，就是 NULL——素材是这一列的属主，`0012` §3。
+    let reference: Option<Value> = sqlx::query_scalar(
+        r#"
+        SELECT o.consumer_reference_rates
+        FROM supply.offerings o
+        JOIN supply.channels c ON c.id = o.channel_id
+        WHERE c.provider_kind = 'AIHubMix' AND o.provider_model_id = 'gpt-image-2.5-flare'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the AIHubMix offering row");
+    let reference = reference.expect("AIHubMix declares the reference price list");
+    assert_eq!(reference["currency"], json!("USD"));
+    assert_eq!(
+        reference["text_input_microusd_per_million"],
+        json!(5_000_000)
+    );
+    let absent: Option<Value> = sqlx::query_scalar(
+        r#"
+        SELECT o.consumer_reference_rates
+        FROM supply.offerings o
+        JOIN supply.channels c ON c.id = o.channel_id
+        WHERE c.provider_kind = 'APIMart' AND o.provider_model_id = 'gpt-image-2.5-flare'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the APIMart offering row");
+    assert!(absent.is_none(), "a supply that declares none stays NULL");
 
     drop(pool);
     drop(repository);
     drop_isolated_database(&database_name).await;
+}
+
+/// 参考价目**就地更新**：换一份把 AIHubMix 那条的四档金额改过的素材，`supply.offerings` 那一列跟着
+/// 变，且不新增任何一行——素材是这一列的属主（`0012` §3）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL; derives a throwaway database"]
+async fn a_reference_price_list_change_updates_the_row_in_place() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    let pool = repository.pool().clone();
+
+    import_supply_materials(&pool, &material_dir(), &repo_public_docs())
+        .await
+        .expect("the first import");
+    let before = table_counts(&pool).await;
+
+    let edited = edited_material_dir();
+    import_supply_materials(&pool, &edited, &repo_public_docs())
+        .await
+        .expect("the edited import");
+    let after = table_counts(&pool).await;
+    assert_eq!(before, after, "改参考价目不该新增任何一行");
+
+    let reference: Option<Value> = sqlx::query_scalar(
+        r#"
+        SELECT o.consumer_reference_rates
+        FROM supply.offerings o
+        JOIN supply.channels c ON c.id = o.channel_id
+        WHERE c.provider_kind = 'AIHubMix' AND o.provider_model_id = 'gpt-image-2.5-flare'
+        "#,
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the AIHubMix offering row");
+    let reference = reference.expect("AIHubMix declares the reference price list");
+    assert_eq!(
+        reference["text_input_microusd_per_million"],
+        json!(6_000_000),
+        "素材改了参考价目，那一列就地更新：{reference}"
+    );
+
+    std::fs::remove_dir_all(&edited).expect("the temporary material directory is removed");
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}
+
+/// 仓库素材的临时副本：把 flare 那份 AIHubMix 供给的参考价目改一个数，其余原样。
+fn edited_material_dir() -> PathBuf {
+    let dir = std::env::temp_dir().join(format!("seeai-material-{}", Uuid::new_v4().simple()));
+    std::fs::create_dir_all(&dir).expect("a temporary material directory");
+    for name in ["gpt-image-2.5-flare.json", "gpt-image-2.5-sunburst.json"] {
+        let text = std::fs::read_to_string(material_dir().join(name)).expect("a material file");
+        let mut material: Value = serde_json::from_str(&text).expect("the material is json");
+        if name == "gpt-image-2.5-flare.json" {
+            let offerings = material["offerings"].as_array_mut().expect("offerings");
+            let hub = offerings
+                .iter_mut()
+                .find(|offering| offering["provider_kind"] == json!("AIHubMix"))
+                .expect("the AIHubMix offering");
+            hub["consumer_reference_rates"]["text_input_microusd_per_million"] = json!(6_000_000);
+        }
+        let edited = serde_json::to_string_pretty(&material).expect("the edited material is json");
+        std::fs::write(dir.join(name), edited).expect("the temporary material is written");
+    }
+    dir
 }
 
 /// 文档素材版本：同一内容重复导入复用一行，内容变化追加一行；发布取最近导入的那一行

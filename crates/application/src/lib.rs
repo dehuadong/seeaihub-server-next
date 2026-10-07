@@ -318,6 +318,12 @@ pub struct OfferingDraft {
     /// 渠道不按 token 计量量计价时**不必发它**——那时这条供给没有 Price Plan。
     #[serde(default)]
     pub price_plan: Option<PricePlanDraft>,
+    /// 该供给声明的**对客参考价目**（渠道原币种四档，只作对客 token 四档的初始价来源）。
+    ///
+    /// 它**不是成本参数**（成本费率是 [`Self::price_plan`]）：任何成本形态都可以声明它，缺了也不影响
+    /// 发布——那时初始价由运营按报价填。完整口径见 [`ConsumerReferenceRates`]。
+    #[serde(default)]
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// `per_image` / `per_call` 的**单价**（成本平面微单位，币种见 [`Self::cost_currency`]）。
     ///
     /// 按张 / 按次计价时它是成本自算唯一的参数；另外两种形态不给（给了会被拒：那个数永远不会
@@ -429,6 +435,9 @@ pub struct NormalizedOffering {
     pub rates: Option<PriceRates>,
     /// Price Plan 的来源 URL（渠道价目的出处）；没有 Price Plan 时为 `None`。
     pub price_source_url: Option<String>,
+    /// 这条供给声明的**对客参考价目**（渠道原币种四档）：只作对客 token 四档的初始价来源。
+    /// `None` = 没声明（初始价由运营按报价填），见 [`ConsumerReferenceRates`]。
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// `per_image` / `per_call` 的单价；另外两种形态为 `None`。
     pub cost_unit_price_microusd: Option<u64>,
     /// 这条供给声明的成本币种；`None` = 没显式声明（取 Price Plan 的币种，旧形状的素材）。
@@ -669,6 +678,7 @@ impl PublishRuntimeCommand {
                     formula: billing.formula,
                     rates: billing.rates,
                     price_source_url: billing.price_source_url,
+                    consumer_reference_rates: billing.consumer_reference_rates,
                     cost_unit_price_microusd: billing.cost_unit_price_microusd,
                     cost_currency: billing.cost_currency,
                     consumer_rates_cny: billing.consumer_rates_cny,
@@ -754,6 +764,9 @@ struct Billing {
     formula: PricingFormula,
     rates: Option<PriceRates>,
     price_source_url: Option<String>,
+    /// 这条供给声明的**对客参考价目**（渠道原币种四档）：只作对客 token 四档的初始价来源，
+    /// 见 [`ConsumerReferenceRates`]。
+    consumer_reference_rates: Option<ConsumerReferenceRates>,
     cost_unit_price_microusd: Option<u64>,
     cost_currency: Option<String>,
     consumer_rates_cny: Option<ConsumerRatesCny>,
@@ -897,6 +910,7 @@ fn normalize_billing(index: usize, draft: &OfferingDraft) -> Result<Billing, App
         formula: declared,
         rates,
         price_source_url,
+        consumer_reference_rates: draft.consumer_reference_rates.clone(),
         cost_unit_price_microusd: draft.cost_unit_price_microusd,
         cost_currency,
         consumer_rates_cny: draft.consumer_rates_cny.clone(),
@@ -5717,6 +5731,8 @@ impl RuntimeService {
                 parameter_mapping: found.parameter_mapping.clone(),
                 capability_schema: None,
                 formula: Some(found.formula.clone()),
+                // 参考价目也是被引用行上的事实：原样填回，发布只改价、不动供给定义。
+                consumer_reference_rates: found.consumer_reference_rates.clone(),
                 // 渠道费率也取自那一行：它是**渠道怎么结算**的事实，不是运营这次要改的东西。
                 price_plan: found.plan.as_ref().map(|plan| PricePlanDraft {
                     currency: plan.currency.clone(),
@@ -6382,6 +6398,9 @@ pub struct ReferencedOffering {
     /// 该 Offering 当前那行渠道费率（`token_rates` 才有）；别的形态是 `None`。
     /// 存平铺的数字而不是 [`PricePlanDraft`]：它是**读回来**的事实，不是一次发布的输入。
     pub plan: Option<PricePlanRates>,
+    /// 该 Offering 声明的**对客参考价目**（渠道原币种四档）：对客 token 四档的初始价取它，
+    /// 见 [`ConsumerReferenceRates`]。
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 该 Offering **实际生效的**成本币种（有 Price Plan 时是它的币种，否则是这条供给最近一次发布
     /// 声明的那个）：运营不给币种时由它兜底。按张 / 按次计价的供给没有 Price Plan，缺了它就会被
     /// "必须显式声明成本币种"拒掉——而币种是渠道事实，不该要运营每条候选重报一遍。
@@ -6425,6 +6444,9 @@ pub struct SelectableOfferingView {
     /// 渠道成本币种与 `token_rates` 的四档费率（别的形态没有费率）。
     pub cost_currency: Option<String>,
     pub cost_rates: Option<PricePlanRates>,
+    /// 这条供给声明的**对客参考价目**（渠道原币种四档）：对客 token 四档的初始价取它，
+    /// 见 [`ConsumerReferenceRates`]。
+    pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 能不能选：供给自己启用、且它所属渠道启用。停用的仍列出来并标明，运营要能看出"为什么它选不了"。
     pub enabled: bool,
 }
@@ -6437,6 +6459,26 @@ pub struct PricePlanRates {
     pub image_input_microusd_per_million: u64,
     pub text_output_microusd_per_million: u64,
     pub image_output_microusd_per_million: u64,
+    pub source_url: String,
+}
+
+/// 一条供给声明的**对客参考价目**：渠道原币种的四档 token 价 + 出处。
+///
+/// 它只作对客 token 四档的**初始价**来源——运营在发布页看到的那份预填值就是它，改了按改后的发。
+/// 它**不是成本费率**（那是 [`PricePlanRates`]），因此任何成本形态的供给都可以声明它，缺了也不影响
+/// 发布（设计 0007 §2、Spec 0001 V-D12）。
+///
+/// 它**不进修订、也不进 Job 快照**：冻结下来的是由它推导出的那份对客 CNY 费率向量
+/// （`consumer_rates_cny`），参考价目本身只在发布页当默认值用。
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct ConsumerReferenceRates {
+    pub currency: String,
+    pub text_input_microusd_per_million: u64,
+    pub image_input_microusd_per_million: u64,
+    pub text_output_microusd_per_million: u64,
+    pub image_output_microusd_per_million: u64,
+    /// 这份价目的出处（渠道价目页）；没写就是空串。
+    #[serde(default)]
     pub source_url: String,
 }
 

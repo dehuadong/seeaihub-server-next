@@ -72,10 +72,12 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 | --- | --- | --- |
 | `catalog.vendor_models` | `(vendor_id, native_model_id, native_revision)` | 复用该行。**合同行不可变**，所以同一三元组下的内容必须一致；不一致则报错要求**换 `native_revision`**——"内容不同就新写一行"这条做不到，因为 `schema_hash` 已被迁移 `0006` 删除，唯一键就是这三元组 |
 | `supply.channels` | `(provider_kind, base_url, credential_env)` | 复用该行，**只更新 `enabled` 里的"新建时默认 true"**：启停是运营状态，导入不该把它顶回启用，所以实际是 `ON CONFLICT DO NOTHING` |
-| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`）。**不动 `enabled`** |
+| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`、`consumer_reference_rates`）。**不动 `enabled`** |
 | `pricing.price_plans` | `(offering_id, currency, source_url)` 且四档费率全同 | 复用；**费率变了才追加一行**（不是"每个时刻一行"——表上只有 `created_at`，没有生效时刻这一列） |
 
 **成本币种在这四张表里没有落点**：`supply.offerings` 没有 `cost_currency` 列（`0013` 只加了 `formula` 与 `cost_unit_price_microusd`），所以素材里"直接由上游给金额"那条（APIMart）声明的币种今天**不入库**，它只能由 Price Plan 的币种、或该供给最近一次发布在修订上声明的币种承接。引用式发布因此按"Price Plan 币种 → 最近一次发布声明的币种"兜底（见 §4）。
+
+**对客参考价目（`consumer_reference_rates`）与成本无关，因此落 `supply.offerings` 那一列**：它是"该 vendor／模型已知价目"的来源，对客 token 四档的初始价取它（[`0007`](./0007-pricing-floor-and-settlement.md) §2），不是成本参数——所以它不随 Price Plan 走，任何成本形态的供给都可以声明它，缺了也不影响导入与发布。写它的两条路规则不同：**素材是它的属主**，素材没写就是没有，导入照实写回（含清空）；**内联发布的兼容形状省略它时不抹掉已有的值**——那条路是改价的兼容形状，省略一个供给属性不该把它清掉。
 
 **`base_url` 或 `credential_env` 变了就是换了一个渠道身份**——按上表会落到**新的** `supply.channels` 行，旧行留着（它可能还被别的 Offering 或已发布修订引用）。导入**绝不修改**渠道身份三要素中的任何一个来"就地改名"。
 

@@ -59,6 +59,19 @@ export interface GatewayModelsResponse {
 /// 一条**可被运营选中**的供给：发布平台模型时那个 `offering_id` 指向的东西。
 ///
 /// 它**不含**渠道地址与凭证变量名——那是渠道部署事实，选择用不到它们（`docs/design/0012` §2.1）。
+/// 一份**四档费率**：币种 + 四档金额（每百万 token 的微单位）+ 出处。
+///
+/// 成本费率（`cost_rates`）与对客参考价目（`consumer_reference_rates`）同形，但含义不同：前者是
+/// 渠道的成本费率、后者只作对客 token 四档的初始价来源。
+export interface FourTierRates {
+  currency: string;
+  text_input_microusd_per_million: number;
+  image_input_microusd_per_million: number;
+  text_output_microusd_per_million: number;
+  image_output_microusd_per_million: number;
+  source_url: string;
+}
+
 export interface SelectableOffering {
   offering_id: string;
   /// 厂商（先选它，再在它的分组里选供给）。
@@ -79,14 +92,10 @@ export interface SelectableOffering {
   provides_token_usage: boolean;
   /// 渠道成本币种与四档费率（`token_rates` 才有费率）。
   cost_currency: string | null;
-  cost_rates: {
-    currency: string;
-    text_input_microusd_per_million: number;
-    image_input_microusd_per_million: number;
-    text_output_microusd_per_million: number;
-    image_output_microusd_per_million: number;
-    source_url: string;
-  } | null;
+  cost_rates: FourTierRates | null;
+  /// 这条供给声明的**对客参考价目**（渠道原币种四档）：对客 token 四档的初始价取它。
+  /// 它**不是成本参数**——成本按上游声明金额的供给同样可以声明它。
+  consumer_reference_rates: FourTierRates | null;
   /// 能不能选：供给自己启用、且它所属渠道启用。停用的仍列出来并标明。
   enabled: boolean;
 }

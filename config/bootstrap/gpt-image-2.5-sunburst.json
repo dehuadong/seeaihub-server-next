@@ -23,7 +23,7 @@
     "offering.apimart.moderation": "渠道面：文档写明未传 `moderation` 时 APIMart 自己用 `low`，与厂商默认 `auto` 不同；本版没有注入显式默认值，调用方没给时仍由渠道按自己的默认处理（差异已登记，是否由映射钉死待定）。",
     "restrictions": "可走的分支沿用同一型号旧素材的声明。收图上限按承载面形态定：参考图声明成数组（`maxItems` 16），所以 `max_reference_images` 是 16；两者必须一致，见 offering.aihubmix.image_inputs。",
     "price_plan": "两家渠道的**计价形态不同**，各按自己的事实登记：AIHubMix 的图片执行面（`/ai/v1`）在任务终态**直接声明实扣金额**（`usage.cost`，USD，实测样例 0.026436 与 0.01422，可能为 `null`），所以成本与对客计价形态都登记成 `upstream_declared`，不发费率表；公开的四档 token 单价只是定价参考。APIMart **也在上游终态给实扣金额**（`cost`，实测样例 0.011354），同样只声明成本币种 USD。",
-    "consumer_rates_cny": "**这条供给不带对客 token 费率向量**：对客计价形态是 `upstream_declared`，按声明金额 × 倍率 × 折算率算。公开的四档 CNY 费率（42.6 / 68.16 / 85.2 / 255.6 元每 1M tokens）只在按 token 计量量卖时用得上，这里只作定价参考。",
+    "consumer_reference_rates": "**这份价目只作对客 token 四档的初始价来源**（设计 0007 §2）：这条供给的对客计价形态是 `upstream_declared`，按声明金额 × 倍率 × 折算率算，结算不读这份价。它是渠道公开的四档 token 单价（USD 5 / 8 / 10 / 30 每 1M tokens，出处见 `source_url`），**与成本形态无关**——成本按上游声明的金额算，这条供给没有 Price Plan。同模型下按 token 四档卖的候选（APIMart 那条）的初始价就取它；按该价目推导的对客 CNY 费率是 42.6 / 68.16 / 85.2 / 255.6 元每 1M tokens（× 倍率 1.2 × 折算率 7.1）。",
     "markup_bps": "**测试值 2000**（倍率 1.2）：运营按网关模型录入的加价系数，随修订发布、随 Job 快照冻结。代码里没有它的默认值——按张 / 按次 / 上游给金额的候选的对客价全靠它算出来。",
     "pricing_reference": "**测试值**：两条供给的参考成本都取 APIMart 实测声明过的 11354 微美元（两条供给都按 `declared`）——它只作定价参考，不是售价的被乘数。",
     "floor_amounts": "**测试值**：OpenAI 系按 `size` 给的保底额（CNY）——1K ¥0.16 / 2K ¥0.25 / 4K ¥0.3，`quality` 维留空备用；两条供给的封顶保底值都是 4K 那一档。保底额只用于受理时的预授权，不由售价派生。",
@@ -160,6 +160,14 @@
       "formula": "upstream_declared",
       "consumer_formula": "upstream_declared",
       "cost_currency": "USD",
+      "consumer_reference_rates": {
+        "currency": "USD",
+        "text_input_microusd_per_million": 5000000,
+        "image_input_microusd_per_million": 8000000,
+        "text_output_microusd_per_million": 10000000,
+        "image_output_microusd_per_million": 30000000,
+        "source_url": "https://aihubmix.com/model/gpt-image-2.5-sunburst"
+      },
       "reference_cost_microusd": 11354,
       "cost_basis": "declared",
       "floor_amounts": {
