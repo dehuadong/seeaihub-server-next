@@ -1,6 +1,7 @@
 # OpenAI 图片生成 API 要点
 
 > 外部参考摘要，不是本平台接口合同。内容取自 OpenAI 官方文档在 2026-09-20 的页面快照；模型、价格和限制可能变化，接入前应重新核对官方文档。
+> 价格详情：参见 成本与延迟
 
 - 原文：[Image generation](https://developers.openai.com/api/docs/guides/image-generation)
 - 快照日期：2026-09-20

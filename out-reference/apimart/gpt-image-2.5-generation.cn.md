@@ -9,6 +9,7 @@
 > ## Documentation Index
 > Fetch the complete documentation index at: https://docs.apimart.ai/llms.txt
 > Use this file to discover all available pages before exploring further.
+> 价格详情（实际以结果cost字段值为准）：按 Tokens 计费：文本输入 $5 / 1M tokens ｜ 文本输出 $10 / 1M tokens ｜ 图像输入 $8 / 1M tokens ｜ 图像输出 $30 / 1M tokens
 
 # GPT-Image-2.5 图像生成
 

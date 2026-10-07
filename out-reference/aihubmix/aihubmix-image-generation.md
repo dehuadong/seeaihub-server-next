@@ -5,6 +5,7 @@
 > 优选baseurl
 > 如果当地网络连接失败时，建议切换至优选baseurl。https://api.inferera.com
 
+> 价格详情（实际以结果cost字段值为准）：按 Tokens 计费：文本输入 $5 / 1M tokens ｜ 文本输出 $10 / 1M tokens ｜ 图像输入 $8 / 1M tokens ｜ 图像输出 $30 / 1M tokens
 
 # 图片生成
 
