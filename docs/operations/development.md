@@ -51,6 +51,7 @@ cp .env.example .env
 | `SEE_BASEURL` | `http://app.localhost:8081` | **必填**，平台对客基址；模型说明与公共文档的链接按它写成绝对地址，只写源 |
 | `ADMIN_TOKEN` | 任意非空 | **必填**，空值会让进程起不来 |
 | `CUSTOMER_HISTORY_CURSOR_KEY` | `openssl rand -base64 32` | **必填**，客户历史翻页游标的加密密钥；缺了或不是 32 字节的 base64 时 API 起不来 |
+| `REQUEST_FINGERPRINT_KEY_V1` | `openssl rand -base64 32` | **必填**，请求指纹的 HMAC 密钥；缺了或不是 32 字节的 base64 时 API 起不来 |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 自定 | 用来建/更新那个管理员账号，运营后台的登录页用它 |
 | `REDIS_URL` | `redis://127.0.0.1:6379` | 留空则不启用加速层，功能不变 |
 | `SUPPLY_MATERIAL_DIR` | `config/bootstrap` | 设了才会导入供给素材；不设则可选供给清单是空的 |

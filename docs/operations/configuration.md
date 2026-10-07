@@ -4,7 +4,7 @@
 
 每个变量按"不设会怎样"分三类：
 
-- **必填**：不设进程起不来，报错点名。`DATABASE_URL`（两个进程）、`ADMIN_TOKEN`（API）、`CUSTOMER_HISTORY_CURSOR_KEY`（API）与 `SEE_BASEURL`（API）。
+- **必填**：不设进程起不来，报错点名。`DATABASE_URL`（两个进程）、`ADMIN_TOKEN`（API）、`SEE_BASEURL`（API）、`CUSTOMER_HISTORY_CURSOR_KEY`（API）与 `REQUEST_FINGERPRINT_KEY_V1`（API）。
 - **不设＝关掉该能力**：进程照常启动，但某个功能静默失效，日志里只有一条容易漏掉的提示。这类最容易踩——供给导入、管理员登录、渠道密钥、上传存储配置、加速层、告警出口，以及多 worker 的 `WORKER_ID`；下面各表会点出来。
 - **有缺省**：不设就走代码缺省，按需覆盖。
 
@@ -157,6 +157,7 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
 | `SUPPLY_MATERIAL_DIR` | `config/bootstrap` | **API 每次启动**都会在迁移之后把该目录里的 `*.json` 幂等写成渠道与 Offering（匹配键见 `docs/design/0012-platform-model-publishing.md` §3）。默认值就是仓库与镜像里那份工程师素材；设成**空串＝显式不导入**（测试库、开发库要一份干净的供给清单时用它）；目录不存在或里面没有素材时什么都不做 |
+| `PUBLIC_DOCS_DIR` | `public-docs` | 对客公开文档与素材 `documentation.narrative_path` 的解析根，相对进程工作目录。`GET /v1/docs/*` 与素材导入都读它 |
 
 这是**工程侧**的开关：渠道与供给由工程师随素材配一次，运营在后台**选**它们、给价。运营那条路本身不建供给，管理接口也只能启停（`PATCH /api/v1/channels/{id}`、`PATCH /api/v1/offerings/{id}`）；要凭空造供给只剩**旧的内联发布形状**（`POST /api/v1/runtime-revisions` 直接带 `offerings`，`docs/design/0012-platform-model-publishing.md` §7 的过渡路径，不是运营的路）。**不设也能上架**：默认目录就是那份素材；换自己的素材就用只读卷把变量指过去。
 

@@ -30,7 +30,7 @@ Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("web").join("dist")
 - 构建时目录不存在 → 编译照过；运行时只会记一条 `no web build found; the API serves no front end` 警告，**两个界面都打不开**（API 与 `/v1/*` 仍然正常，所以很容易查错方向）；
 - 构建后把二进制搬到别处 → 它仍然去找**编译时那个绝对路径**下的 `apps/api/../web/dist`，**跟着二进制走的是编译时路径**，不是运行目录。
 
-所以顺序是：**先 `npm run build` 出产物，再 `cargo build --release`**；运行时必须能在编译时那个**绝对路径**下找到 `apps/web/dist`。在目标机同一路径构建最省事（§2.2、§2.3），把二进制或整个目录搬到别的绝对路径都不行。
+所以顺序是：**先 `npm run build` 出产物，再 `cargo build --release`**；运行时必须能在编译时那个**绝对路径**下找到 `apps/web/dist`。打包脚本（§2.2）与就地构建（§2.3）都把仓库放在这个路径上编译；把二进制或整个目录搬到别的绝对路径都不行。
 
 ### 1.2 前端分发靠主机名，反代要透传 `Host`
 
@@ -55,6 +55,7 @@ TLS 在反代终止（本服务只监听明文 HTTP）。**用 HTTPS 是必须�
 
 **两个进程各自在启动时跑迁移**（`hub_repository.migrate()`，迁移幂等、由 PG advisory lock 串行化）。所以：
 
+- 迁移由 `sqlx::migrate!` 在编译期嵌进二进制，运行不需要 `migrations/`；
 - 连接用的数据库用户需要建表/改表权限，不能是只读账号；
 - 升级时**先部署、后观察**即可，不需要单独的迁移步骤；但**多个实例同时冷启动**时它们会争那把锁，表现为其中一个稍慢启动，属正常；
 - 回滚要谨慎：迁移是**只进不退**的（没有 down 脚本）。真要回退，得从备份恢复。
@@ -100,33 +101,59 @@ sudo -u postgres psql -p 5432 -c "CREATE DATABASE seeai_next OWNER seeai;"
 
 **Redis 7（可选）**：装上并让 `REDIS_URL` 指过去，例如 `sudo apt-get install -y redis-server` 加 `REDIS_URL=redis://127.0.0.1:6379`。它是加速层，故障只算降级（缓存读不到按 miss 处理），不必为它做高可用来保可用性。
 
-### 2.2 部署到生产机
+### 2.2 打包与部署
 
-生产机上把仓库放在一个固定的绝对路径，本文用 `/opt/seeai`。这个路径就是**编译时的路径根**（§1.1）：进程的运行目录换了它也不会变，所以后面的构建与启动都围绕它。在别的机器构建再拷二进制也行，但编译时那个绝对路径必须在服务器上仍然存在（把 `apps/web/dist` 放到原处）。
+主路径是**在构建机出包，生产机只解包**。二进制把编译期路径写死（§1.1），所以构建时仓库要在 `/opt/seeai`、包也只能解到这个路径。
 
-服务账号只用来**跑**进程，不参与构建，所以它不需要 Node/Rust，也不需要 home：
+**构建机前置**：Node 24、Rust 1.94+、C 工具链，以及 `cmake`、`perl`、`pkg-config`（aws-lc-rs 要从源码构建）、`bubblewrap`：
 
 ```sh
-sudo useradd --system --user-group --shell /usr/sbin/nologin seeai
-sudo git clone <仓库地址> /opt/seeai      # /opt/seeai 必须为空；建过用户目录就先清掉
+sudo apt-get install -y build-essential cmake perl pkg-config bubblewrap binutils
 ```
 
-部署后的布局（`seeai` 只读这棵树，目录 755、文件 644 就够；要让 `seeai` 拥有它就 `chown -R seeai:seeai /opt/seeai`）：
+```sh
+build/package.sh
+```
+
+`--version` 可指定包名里的版本，缺省用 `git describe`。
+
+脚本做四件事：构建两份前端产物；用 bubblewrap 把仓库挂到 `/opt/seeai` 再编译两个二进制，把 `/opt/seeai` 编进路径；组装 `build/dist/seeai-<版本>.tar.gz`；量出二进制要求的最高 GLIBC 版本。脚本会核对二进制里确实留下了 `/opt/seeai/apps/api`，对不上直接失败。`--skip-web`、`--skip-build` 复用已有的前端产物与二进制，`--out` 换输出目录。
+
+**服务器前置**：与构建机同 CPU 架构，且 glibc 不低于包内 `PACKAGE.txt` 记的 `required-glibc`。任一条不满足就别用这个包，改用 §2.3 在服务器上构建。
+
+把包传到服务器，再建服务账号并解包。服务账号只用来**跑**进程，不参与构建，所以它不需要 Node/Rust，也不需要 home：
+
+```sh
+scp build/dist/seeai-<版本>.tar.gz <服务器>:/tmp/
+
+sudo useradd --system --user-group --shell /usr/sbin/nologin seeai
+sudo install -d -m 755 /opt/seeai
+sudo tar -xzf seeai-<版本>.tar.gz -C /opt/seeai --strip-components=1
+```
+
+包由 `build/package.sh` 组装；进程运行时读下面这些路径（目录 755、文件 644 就够；要让 `seeai` 拥有它就 `chown -R seeai:seeai /opt/seeai`）：
 
 | 路径 | 是什么 |
 | --- | --- |
-| `/opt/seeai/` | 检出目录，也是编译时路径的根 |
-| `/opt/seeai/apps/web/dist/` | 前端产物（构建后出现） |
-| `/opt/seeai/target/release/seeai-api` | API 二进制（构建后出现） |
-| `/opt/seeai/target/release/seeai-worker` | Worker 二进制（构建后出现） |
+| `/opt/seeai/target/release/seeai-api` | API 二进制 |
+| `/opt/seeai/target/release/seeai-worker` | Worker 二进制 |
+| `/opt/seeai/apps/web/dist/` | 前端产物 |
+| `/opt/seeai/apps/api/` | 空目录：路径里的 `..` 要先能进它（§1.1） |
+| `/opt/seeai/public-docs/` | 对客公开文档，也是素材 `narrative_path` 的解析根 |
+| `/opt/seeai/config/bootstrap/` | 供给素材（`SUPPLY_MATERIAL_DIR` 的缺省值） |
+
+迁移已编进二进制，运行不需要 `migrations/`（§1.3）。包里另有 `deploy/systemd/` 两个单元与 `PACKAGE.txt`（版本、提交、架构与 glibc 记录）。
 
 `/etc/seeai/api.env`、`/etc/seeai/worker.env` 见 §2.4。
 
-### 2.3 构建
+### 2.3 就地构建（备选）
 
-用有 Node/Rust 工具链的账号在检出目录里构建（下例是 root；也可以用你的部署账号）。顺序不能反：**先出前端产物，再编译二进制**（原因见 §1.1）。
+没有构建机、或服务器 glibc 比包要求的旧时，在生产机上直接构建。工具链同 §2.2（不需要 `bubblewrap`）。顺序不能反：**先出前端产物，再编译二进制**（§1.1）。
+
+把仓库放在 `/opt/seeai`，这个路径就是编译时的路径根：
 
 ```sh
+sudo git clone <仓库地址> /opt/seeai      # /opt/seeai 必须为空
 cd /opt/seeai
 sudo npm --prefix apps/web ci
 sudo npm --prefix apps/web run build
@@ -140,12 +167,22 @@ sudo cargo build --release -p seeai-api -p seeai-worker
 | `target/release/seeai-api` | API 二进制 |
 | `target/release/seeai-worker` | Worker 二进制 |
 | `apps/web/dist/` | `console.html`、`portal.html` 与它们引用的 `assets/*` |
+| `public-docs/`、`config/bootstrap/` | 运行时读的公开文档与供给素材 |
+
+用有 Node/Rust 工具链的账号构建；跑进程的 `seeai` 账号只读这棵树。
 
 ### 2.4 systemd 单元
 
-两个进程都用系统用户 `seeai` 跑，工作目录设成构建目录，配置从 `EnvironmentFile` 读。文件是每行 `KEY=VALUE`（systemd 自己解析，不做 shell 展开）。
+两个进程都用系统用户 `seeai` 跑，工作目录 `/opt/seeai`，配置从 `EnvironmentFile` 读。文件是每行 `KEY=VALUE`（systemd 自己解析，不做 shell 展开）。单元文件随包带，源码在 [`deploy/systemd/`](../../deploy/systemd/)：
 
-先建配置目录与两份 env（属服务账号、`600`——里面有口令）。值按[配置项](configuration.md) 换成真实的，`ADMIN_TOKEN` 用 `openssl rand -hex 32` 生成。**不必列全**：代码给每个变量都留了缺省，只有**必填**（`DATABASE_URL`、`ADMIN_TOKEN`、`SEE_BASEURL`）和**要覆盖缺省**的项才需要写：
+```sh
+sudo install -m 644 /opt/seeai/deploy/systemd/seeai-api.service /etc/systemd/system/seeai-api.service
+sudo install -m 644 /opt/seeai/deploy/systemd/seeai-worker.service /etc/systemd/system/seeai-worker.service
+```
+
+单元的停机宽限（`TimeoutStopSec`）与理由写在单元文件里。
+
+先建配置目录与两份 env（属服务账号、`600`——里面有口令）。**必填**项与取值见[配置项](configuration.md)（§1、§8、§9）；其余变量代码都留了缺省，只有要覆盖缺省才写。下面示例把必填项都写上：
 
 ```sh
 sudo install -d -m 750 -o seeai -g seeai /etc/seeai
@@ -158,6 +195,8 @@ ADMIN_TOKEN=<openssl rand -hex 32>
 ADMIN_EMAIL=ops@example.com
 ADMIN_PASSWORD=<强口令>
 SEE_BASEURL=https://app.<域名>
+CUSTOMER_HISTORY_CURSOR_KEY=<openssl rand -base64 32>
+REQUEST_FINGERPRINT_KEY_V1=<openssl rand -base64 32>
 API_BIND=127.0.0.1:8081
 RUST_LOG=info
 SUPPLY_MATERIAL_DIR=config/bootstrap
@@ -170,63 +209,14 @@ AIHUBMIX_API_KEY=<渠道密钥>
 APIMART_API_KEY=<渠道密钥>
 RUST_LOG=info
 EOF
+
+sudo systemctl daemon-reload
+sudo systemctl enable --now seeai-api seeai-worker
 ```
 
 `SUPPLY_MATERIAL_DIR`（相对 `WorkingDirectory=/opt/seeai`）让 API 每次启动都把仓库里的供给素材幂等导成渠道与 Offering；**不设时默认就是 `config/bootstrap`**，上面显式写出来只是为了部署文件可读——要换成自己的素材，把它指到挂载卷（[配置项 §6](configuration.md#6-供给素材导入)）。它只被 API 读，worker 不需要。
 
 `worker.env` 比 `api.env` 多两样：每个实例唯一的 `WORKER_ID`，以及渠道密钥（[渠道凭证](configuration.md#5-渠道凭证)）。
-
-再写两个 unit（root 所有、`644`），然后启用：
-
-```sh
-sudo tee /etc/systemd/system/seeai-api.service >/dev/null <<'EOF'
-[Unit]
-Description=SeeAI Hub API
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=seeai
-Group=seeai
-WorkingDirectory=/opt/seeai
-EnvironmentFile=/etc/seeai/api.env
-ExecStart=/opt/seeai/target/release/seeai-api
-Restart=on-failure
-RestartSec=3
-# 给在飞请求收尾；应不小于 GENERATION_SYNC_WAIT_SECONDS。进程处理 SIGINT 与 SIGTERM。
-TimeoutStopSec=720
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo tee /etc/systemd/system/seeai-worker.service >/dev/null <<'EOF'
-[Unit]
-Description=SeeAI Hub Worker
-After=network-online.target
-Wants=network-online.target
-
-[Service]
-Type=simple
-User=seeai
-Group=seeai
-WorkingDirectory=/opt/seeai
-EnvironmentFile=/etc/seeai/worker.env
-ExecStart=/opt/seeai/target/release/seeai-worker
-Restart=on-failure
-RestartSec=3
-# 给手上那一轮跑完；至少给到一次上游调用的最坏耗时 PROVIDER_TIMEOUT_SECONDS。
-# 给不够也不丢事实：强杀后由过期租约回收（§1.3）。
-TimeoutStopSec=720
-
-[Install]
-WantedBy=multi-user.target
-EOF
-
-sudo systemctl daemon-reload
-sudo systemctl enable --now seeai-api seeai-worker
-```
 
 改过 env 文件后要让新值生效，得 `sudo systemctl restart seeai-api seeai-worker`——进程只在启动时读一次环境变量。
 
@@ -294,7 +284,7 @@ sudo nginx -t && sudo systemctl reload nginx
 配置全部从环境变量读，文件与 systemd 单元见 §2.4。进程启动时的 `dotenvy::dotenv()` 只是兜底：它从**当前工作目录**往上找 `.env` 并载入，但**不覆盖**已有环境变量——生产不要放 `.env` 进部署目录。前台直接跑也可以（值由 shell 或密钥系统给）：
 
 ```sh
-DATABASE_URL=... ADMIN_TOKEN=... ADMIN_EMAIL=... ADMIN_PASSWORD=... API_BIND=0.0.0.0:8081 seeai-api
+DATABASE_URL=... ADMIN_TOKEN=... SEE_BASEURL=... CUSTOMER_HISTORY_CURSOR_KEY=... REQUEST_FINGERPRINT_KEY_V1=... ADMIN_EMAIL=... ADMIN_PASSWORD=... API_BIND=0.0.0.0:8081 seeai-api
 DATABASE_URL=... WORKER_ID=worker-1 seeai-worker
 ```
 
@@ -319,14 +309,17 @@ DATABASE_URL=... WORKER_ID=worker-1 seeai-worker
 
 ## 6. 备份
 
+在装了 `pg_dump` 的机器上导（服务器随 PostgreSQL 一起有）：
+
 ```sh
-DATABASE_URL=... pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-RetentionDays <天数>]
+pg_dump --format=custom --file <文件> "$DATABASE_URL"
 ```
 
-- 连接串**只从 `DATABASE_URL` 读**，不从参数读、不打印：转储里含业务数据，凭据不进命令行历史；
-- 导出方式用 PATH 上的 `pg_dump`；找不到或导出失败时**明确报错**，不静默产出空文件；
-- 按保留天数清掉更旧的转储。
-- 脚本是 PowerShell：服务器上要有 `pwsh`；不装也能直接导一份，命令是 `pg_dump --format=custom --file <文件> "$DATABASE_URL"`。
+- 用与服务器 PostgreSQL 同大版本的 `pg_dump`；
+- `DATABASE_URL` 带口令，`pg_dump` 会把整串放进命令行（`ps` 可见）；要避免就用 `.pgpass`，或用 `PGPASSWORD` 配合 `-h`/`-U`/`-d` 分开给；
+- 导出失败时**明确报错**，不静默产出空文件。
+
+仓库里另有 `scripts/backup/pg-backup.ps1`（PowerShell，按保留天数清旧转储）：它随检出走，不在部署包里；要用得先有 `pwsh`。
 
 **要恢复时注意**：迁移只进不退（§1.3），所以恢复的目标版本必须与备份时的 schema 一致，或者先把代码退到那个版本再恢复。
 
@@ -336,7 +329,7 @@ DATABASE_URL=... pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-Reten
 
 | # | 做什么 | 判据 |
 | --- | --- | --- |
-| 1 | 按 §2 构建并部署，起 API | `GET /health` 回 `200 {"status":"ok"}` |
+| 1 | 按 §2.2 部署（构建机出包，或 §2.3 就地构建），起 API | `GET /health` 回 `200 {"status":"ok"}` |
 | 2 | 浏览器打开 `https://admin.<域名>/` | 出现**运营后台**登录页（不是客户控制台——那说明 `Host` 没透传，§1.2） |
 | 3 | 同一浏览器打开 `https://app.<域名>/` | 出现**客户控制台** |
 | 4 | 起 worker，看日志 | `worker started`，且没有反复刷新的错误 |
@@ -366,6 +359,7 @@ DATABASE_URL=... pwsh scripts/backup/pg-backup.ps1 [-TargetDir <目录>] [-Reten
 
 ## 9. 升级与重启
 
-- 迁移在两个进程启动时自动跑（§1.3），升级就是换二进制再重启；
+- 迁移在两个进程启动时自动跑（§1.3），升级就是解新包覆盖 `/opt/seeai` 再重启（§2.2）；
 - `systemctl restart seeai-api` 发 `SIGINT`、走排空（§2.4、§3），不需要单独的停机脚本；多实例逐台重启，避免全部同时冷启动去争迁移锁（争锁只表现为启动稍慢）；
-- 迁移只进不退：回滚只能从备份恢复（§1.3），所以升级前先做一次备份（§6）。
+- 应用回退用上一版包覆盖；数据库迁移只进不退，回退数据库只能从备份恢复（§1.3）。升级前先做一次备份（§6）；
+- 单元文件有改动时重新装到 `/etc/systemd/system/` 再 `systemctl daemon-reload`（§2.4）——解包只覆盖 `/opt/seeai`，不动 `/etc`。

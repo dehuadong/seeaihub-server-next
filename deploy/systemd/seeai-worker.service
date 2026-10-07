@@ -1,0 +1,20 @@
+[Unit]
+Description=SeeAI Hub Worker
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seeai
+Group=seeai
+WorkingDirectory=/opt/seeai
+EnvironmentFile=/etc/seeai/worker.env
+ExecStart=/opt/seeai/target/release/seeai-worker
+Restart=on-failure
+RestartSec=3
+# 给手上那一轮跑完；至少给到一次上游调用的最坏耗时 PROVIDER_TIMEOUT_SECONDS。
+# 给不够也不丢事实：强杀后由过期租约回收。
+TimeoutStopSec=720
+
+[Install]
+WantedBy=multi-user.target

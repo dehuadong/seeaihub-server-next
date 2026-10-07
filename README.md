@@ -20,7 +20,7 @@
 | --- | --- |
 | **API 使用文档**（模型查询、各模型说明、素材上传与错误处理） | 对客读 `GET /v1/docs/README.md`（入口，索引下面三份）、`GET /v1/docs/authentication.md`、`GET /v1/docs/uploads/images.md`、`GET /v1/docs/http-errors.md`；源码在 [`public-docs/`](public-docs/README.md) |
 | **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
-| **怎么上生产**（构建顺序、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
+| **怎么上生产**（打包、部署、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
 | **容器部署**（Dockerfile、compose、镜像与升级） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **素材与模型升级教程**（改素材后怎么生效、合同变更为什么要升修订、本地库怎么处理） | [`docs/tutorials/supply-materials.md`](docs/tutorials/supply-materials.md) |
@@ -44,7 +44,7 @@ cargo run -p seeai-api
 cargo run -p seeai-worker            # 另开一个终端
 ```
 
-进程启动时会自己载入 `.env`（`dotenvy`，从当前工作目录往上找，且**不覆盖**已有的环境变量），所以在仓库根 `cp .env.example .env` 之后直接 `cargo run` 就行，不用手动 `set -a`。两个进程都要有 `DATABASE_URL`；API 还要 `ADMIN_TOKEN`、`SEE_BASEURL`（都是**必填，缺了起不来**）与 `ADMIN_EMAIL` / `ADMIN_PASSWORD`（用来建/更新那个管理员账号）。`SEE_BASEURL` 是平台对客基址，模型说明与公共文档的链接按它写成绝对地址。
+进程启动时会自己载入 `.env`（`dotenvy`，从当前工作目录往上找，且**不覆盖**已有的环境变量），所以在仓库根 `cp .env.example .env` 之后直接 `cargo run` 就行，不用手动 `set -a`。两个进程都要有 `DATABASE_URL`；API 还要 `ADMIN_TOKEN`、`SEE_BASEURL`、`CUSTOMER_HISTORY_CURSOR_KEY`、`REQUEST_FINGERPRINT_KEY_V1`（都是**必填，缺了起不来**）与 `ADMIN_EMAIL` / `ADMIN_PASSWORD`（用来建/更新那个管理员账号）。`SEE_BASEURL` 是平台对客基址，模型说明与公共文档的链接按它写成绝对地址。
 
 前端产物那一步**不能省**：API 只在 `apps/web/dist` 存在时才托管界面（它按编译期路径找），否则 API 与 `/v1/*` 都正常、但浏览器打不开界面。
 

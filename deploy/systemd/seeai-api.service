@@ -1,0 +1,19 @@
+[Unit]
+Description=SeeAI Hub API
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=seeai
+Group=seeai
+WorkingDirectory=/opt/seeai
+EnvironmentFile=/etc/seeai/api.env
+ExecStart=/opt/seeai/target/release/seeai-api
+Restart=on-failure
+RestartSec=3
+# 给在飞请求收尾；应不小于 GENERATION_SYNC_WAIT_SECONDS。进程处理 SIGINT 与 SIGTERM。
+TimeoutStopSec=720
+
+[Install]
+WantedBy=multi-user.target
