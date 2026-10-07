@@ -92,8 +92,8 @@
       "/properties/moderation": "内容审核强度，可填 `auto`（默认审核）或 `low`（较宽松审核），默认声明为 `auto`。",
       "/properties/image": "可选。参考图的公网 `http(s)` URL 数组，1–16 张；本地图片先用上传接口换成公网 URL 再填入。",
       "/properties/mask": "可选。遮罩图的公网 `http(s)` URL，用于指定希望编辑的区域；填 `mask` 时必须同时填写 `image`。",
-      "/allOf/0": "组合约束：填写 `mask` 时必须同时填写 `image`，遮罩单独填写不成立。",
-      "/allOf/1": "组合约束：`background` 为 `transparent` 时，`output_format` 只能填 `png` 或 `webp`。"
+      "/allOf/0": "填写 `mask` 时必须同时填写 `image`，遮罩单独填写不成立。",
+      "/allOf/1": "`background` 为 `transparent` 时，`output_format` 只能填 `png` 或 `webp`。"
     }
   },
   "consumer_reference_rates": {
