@@ -23,9 +23,13 @@
 - Provider 创建请求状态不确定时进入 `reconciliation_required`，不得自动重提。
 - 模型 Schema、Offering、Channel、Price Plan 经不可变 Runtime Revision 发布；请求与 Job 固定受理时版本。
 
+建议改成下面这段，先说明执行范围，再列完整命令：
+
 ## 验证
 
-在仓库根执行：
+本地按改动范围运行能发现本次回归的最小必要检查。检查范围、运行时机与推送前核对要求见 [`docs/agents/git.md`](docs/agents/git.md)。
+
+Rust 全量检查默认由 CI 执行。以下命令在仓库根运行，不要求每次在本地执行：
 
 ```sh
 cargo fmt --check
@@ -33,9 +37,12 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
+本地全量检查仅用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
+
 真实 Provider 测试必须显式启用并限制调用次数；普通测试不得产生外部费用。
 
-按改动面选能挡住这次回归的**最小**证据；要提交或推送不构成把已经通过的检查再跑一遍的理由。Rust 全量门禁由 CI 承担，文档、Agent Note 与技能按改动面在本地检查。只报告实际跑过的命令。提交、推送与历史改写见 `docs/agents/git.md`。
+文档、Agent Note 与技能按改动范围在本地检查。已通过且仍适用的检查，不因提交或推送重复运行。只报告实际跑过的命令。
+
 
 ### 浏览器行为：跑 `npx playwright test`
 
