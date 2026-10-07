@@ -88,7 +88,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
             .expect("hold");
     assert_eq!(held, 250_000);
     // 实收 = 上游声明的金额 × 修订级倍率 × 冻结折算率（这条供给按声明金额计价）。
-    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
+    assert_eq!(harness.captured_microusd(job_id).await, -97_000);
     // **管理员读调用明细**：逐笔生成、带请求任务 ID、型号、张数与扣费（`#40`）。
     let usage = client
         .get(format!(
@@ -108,7 +108,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     assert_eq!(row["type"], json!("image"), "{usage}");
     assert_eq!(row["usage"]["images"], json!(1), "{usage}");
     // 账本里的 `capture` 是负数（钱从账上出去），明细直接给这个和；界面上按"扣费"显示绝对值。
-    assert_eq!(row["charged_microusd"], json!(-96_737));
+    assert_eq!(row["charged_microusd"], json!(-97_000));
     // **账本读能按类别过滤**：充值记录只看 `credit`；未知类别**拒**而不是静默回空。
     let credits = client
         .get(format!(
@@ -173,10 +173,10 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
     assert_eq!(source.as_deref(), Some("declared"));
     assert_eq!(cny, Some(80_614));
     // 毛利 = 售价（CNY）− 成本折算后 CNY，两条线分开留痕、可逐笔算出。
-    assert_eq!(96_737 - 80_614, 16_123);
+    assert_eq!(97_000 - 80_614, 16_386);
     // 余额 = 初始 − 实收（受理时先按保底额冻，结算按实际结清）。
     let balance_after_first = account_balance(&harness, job_id).await;
-    assert_eq!(balance_after_first, 1_000_000 - 96_737);
+    assert_eq!(balance_after_first, 1_000_000 - 97_000);
 
     // ── 重发修订（换加价系数）**不影响已受理的 Job** ──
     assert_eq!(
@@ -201,11 +201,11 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
         snapshot,
         "已受理 Job 的快照逐位不动"
     );
-    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
-    // 第二笔按新价结算：14 文本输入 × 40 + 196 图像输出 × 440（每 1M） = 86800 微元。
+    assert_eq!(harness.captured_microusd(job_id).await, -97_000);
+    // 第二笔按新价结算，落账取整到整积分 105 000。
     assert_eq!(
         account_balance(&harness, job_id).await,
-        balance_after_first - 104_798,
+        balance_after_first - 105_000,
         "旧 Job 的金额不动，新 Job 按新价扣"
     );
 
@@ -215,7 +215,7 @@ async fn pricing_is_frozen_into_the_job_and_settlement_only_reads_that_snapshot(
 /// **售价按命中的那条候选算**：同一个网关模型的两个候选各带一份对客费率向量，实收按**命中**的
 /// 那一份算，而且只随它变。
 ///
-/// 两份向量故意差得很远（便宜那份算出来是 210 微元、正常那份是 43680 微元），拿错一份立刻露出来；
+/// 两份向量故意差得很远（便宜那份算出来是 210 微元、正常那份取整后是 44000 微元），拿错一份立刻露出来；
 /// 用**承载面差异**把请求逼到优先级 1 的那条（优先级 0 的候选承载不了 `quality`）。随后只改
 /// `reference_cost_microusd` 重发：参考成本只是定价参考，对客实收逐位不变。
 #[tokio::test]
@@ -335,7 +335,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     // 实收按**命中候选**的向量算：14 文本输入 × 40 + 196 图像输出 × 220（每 1M）。
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -96_737,
+        -97_000,
         "拿优先级 0 那份便宜向量算就是 -210，两者差得很远"
     );
 
@@ -379,12 +379,12 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
     );
     assert_eq!(
         harness.captured_microusd(next_job).await,
-        -96_737,
+        -97_000,
         "参考成本只是定价参考：对客实收只随 `consumer_rates_cny` 变"
     );
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -96_737,
+        -97_000,
         "已受理 Job 的金额不动"
     );
 
@@ -545,8 +545,8 @@ async fn an_unpriced_revision_and_an_empty_floor_table_fall_back_to_the_platform
     );
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -96_737,
-        "结算按上游声明的金额 × 倍率 × 折算率"
+        -97_000,
+        "结算按上游声明的金额 × 倍率 × 折算率，落账取整到整积分"
     );
 
     // 2) 有定价、但保底表里什么都没有：连封顶保底值也没有 ⇒ 平台兜底。
@@ -577,7 +577,7 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
     )
     .await;
     let client = Client::new();
-    // 保底额 ¥0.001（1000 微元），而这次生成实际要 ¥0.043680：估小了。
+    // 保底额 ¥0.001（1000 微元），而这次生成实际要 ¥0.044000（取整到整积分）：估小了。
     assert_eq!(
         republish_priced(
             &harness,
@@ -609,9 +609,9 @@ async fn an_overdraft_settles_into_a_negative_balance_and_the_next_request_is_re
     );
     let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded");
-    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
+    assert_eq!(harness.captured_microusd(job_id).await, -97_000);
     let balance = account_balance(&harness, job_id).await;
-    assert_eq!(balance, 1_000 - 96_737, "结算按实际扣：差额把余额扣成负数");
+    assert_eq!(balance, 1_000 - 97_000, "结算按实际扣：差额把余额扣成负数");
     assert!(balance < 0);
     let cases: i64 = sqlx::query_scalar(
         "SELECT count(*) FROM operations.reconciliation_cases WHERE job_id = $1",
@@ -790,7 +790,7 @@ async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouche
     let first_snapshot = frozen_snapshot(&harness.pool, &key).await;
     assert_eq!(first_snapshot["consumer_formula"], json!("token_rates"));
     // 这条候选按对客 token 四档卖（APIMart 给得出四分项用量）：14 文本输入 × 40 + 196 图像输出 × 220。
-    assert_eq!(harness.captured_microusd(first_job).await, -43_680);
+    assert_eq!(harness.captured_microusd(first_job).await, -44_000);
     let first_cost = harness.attempt_cost(first_job).await;
     assert_eq!(first_cost.0, Some(11_354), "成本取渠道声明的金额");
 
@@ -830,8 +830,8 @@ async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouche
         json!("upstream_declared")
     );
     assert!(next_snapshot["consumer_rates_cny"].is_null());
-    // 新形态：声明额 11_354 × 倍率 1.2 × 折算率 7.1 = 96_736.08 ⇒ 向上取整 96_737。
-    assert_eq!(harness.captured_microusd(next_job).await, -96_737);
+    // 新形态：声明额 11_354 × 倍率 1.2 × 折算率 7.1 = 96_736.08 ⇒ 向上取整 96_737，再取整到整积分 97_000。
+    assert_eq!(harness.captured_microusd(next_job).await, -97_000);
 
     // P2：换形态重发不许动已受理 Job 的快照与实收。
     assert_eq!(
@@ -839,7 +839,7 @@ async fn changing_the_consumer_form_leaves_an_accepted_job_and_its_cost_untouche
         first_snapshot,
         "已受理 Job 的快照逐位不动"
     );
-    assert_eq!(harness.captured_microusd(first_job).await, -43_680);
+    assert_eq!(harness.captured_microusd(first_job).await, -44_000);
     // P5：两笔的平台成本逐位相同——成本按渠道的成本形态取，与对客形态无关。
     assert_eq!(
         harness.attempt_cost(next_job).await,

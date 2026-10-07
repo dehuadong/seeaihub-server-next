@@ -192,10 +192,36 @@ fn decimal_amounts_convert_to_micro_units_exactly() {
     }
 }
 
+/// 终态的一张图给多个地址、并声明过期时刻：地址数组不摊平，过期时刻原样带上。
+#[test]
+fn a_task_image_keeps_all_its_urls_and_the_channel_expiry() {
+    let body = serde_json::json!({
+        "data": {
+            "id": "task-x",
+            "status": "completed",
+            "usage": full_usage(),
+            "result": { "images": [
+                { "url": ["https://a.example/1.png", "https://a.example/2.png"], "expires_at": 1789000000 }
+            ] }
+        }
+    });
+    let parsed: TaskEnvelope = serde_json::from_value(body).expect("task envelope parses");
+    assert_eq!(
+        parsed.data.images().expect("one image entry"),
+        vec![GeneratedImage::Url {
+            urls: vec![
+                "https://a.example/1.png".to_owned(),
+                "https://a.example/2.png".to_owned(),
+            ],
+            expires_at: Some(1_789_000_000),
+        }]
+    );
+}
+
 #[test]
 fn completed_task_without_urls_is_rejected() {
     let data = task("completed", full_usage(), Vec::new());
-    let error = data.image_urls().expect_err("no urls must fail");
+    let error = data.images().expect_err("no urls must fail");
     assert!(error.to_string().contains("no image url"), "{error}");
 }
 
@@ -215,7 +241,7 @@ fn a_terminal_without_images_still_carries_the_cost_it_declared() {
         })
     );
 
-    let error = data.image_urls().expect_err("no urls must fail");
+    let error = data.images().expect_err("no urls must fail");
     let error = with_task_id(with_provider_cost(error, provider_cost.clone()), "task-x");
     match error {
         AdapterError::Provider(provider) => {

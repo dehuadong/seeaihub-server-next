@@ -37,9 +37,9 @@ use seeai_application::{
 };
 use seeai_cache_redis::RedisCache;
 use seeai_domain::{
-    AccountId, ChannelId, ImageInputs, JobId, LedgerEntryKind, OfferingId, PublishedModel,
-    RequestJsonError, RequestJsonLimits, RequestParameters, RoutePolicy, RouteStrategy,
-    UploadWriteFailure, replace_contract_model_identity,
+    AccountId, ChannelId, ImageInputs, JobId, LedgerEntryKind, MICRO_PER_POINT, OfferingId,
+    PublishedModel, RequestJsonError, RequestJsonLimits, RequestParameters, RoutePolicy,
+    RouteStrategy, UploadWriteFailure, replace_contract_model_identity,
 };
 use seeai_persistence::{
     PgHubRepository, material_import::import_supply_materials_from_env,
@@ -1350,28 +1350,51 @@ async fn list_account_usage(
 /// 三个数**分开给、不合成一个数**：已结算余额是已经真的扣掉的钱，持有中是已预授权但还没结算的
 /// 部分——预授权不是扣款，它只是先把钱占住；可用额是前两者相减，受理只用它判能不能再占
 /// （账户资金 Spec `0002` §4）。合成一个"总资产"会让"这笔钱到底扣没扣"说不清，而这三个数的
-/// 用途正是让人看清这件事。客户控制台只把这个数字显示成一个「余额」——取 `available_microusd`。
+/// 用途正是让人看清这件事。客户控制台只把这个数字显示成一个「余额」——取 `available_points`。
 ///
 /// 三个数都从**数据库**同一行读出、不读缓存：缓存里的值可能滞后、也可能刚被对账覆盖写回，而这条
 /// 读的用途正是查看与核对，拿被怀疑的一方作证没有意义。认证沿用对客那条路径（消费者自己的 API
 /// Key），所以看到的只可能是自己的账户。
 #[derive(Debug, Serialize)]
 struct OwnAccountResponse {
-    balance_microusd: i64,
-    held_microusd: i64,
-    available_microusd: i64,
+    balance_points: i64,
+    held_points: i64,
+    available_points: i64,
     updated_at: DateTime<Utc>,
+}
+
+/// CNY 微单位 → 整积分：向上取整到 1000 微单位的整数倍（Spec 0002 §1）。
+///
+/// 账上的对客金额本来恒为整积分（写入口已经取整），这里是读侧的兜底：万一有非整积分的历史或
+/// 异常行，向上取整并记一条错误——既不静默向下截断（少算客户的钱），也不在请求路径里 panic
+/// （那会让请求永不返回）。
+fn points_from_microusd(microusd: u64) -> u64 {
+    let remainder = microusd % MICRO_PER_POINT;
+    if remainder != 0 {
+        tracing::error!(
+            microusd,
+            "a consumer amount is not a whole number of points; rounding it up"
+        );
+    }
+    microusd.div_ceil(MICRO_PER_POINT)
+}
+
+/// CNY 微单位（可正可负）→ 整积分；规则同 `points_from_microusd`。
+fn to_points(microusd: i64) -> i64 {
+    let points = points_from_microusd(microusd.unsigned_abs());
+    let points = i64::try_from(points).unwrap_or(i64::MAX);
+    if microusd < 0 { -points } else { points }
 }
 
 /// 客户会话面的账户读：比 API Key 面多一个**自己的账户名称**。
 ///
-/// 两个面分开成两个类型是刻意的：`/v1/account` 的形状是既有合同，加字段会连带改掉它。
+/// 两个面各自一个响应类型：金额单位一起换成积分，字段增减互不牵连。
 #[derive(Debug, Serialize)]
 struct CustomerAccountResponse {
     name: String,
-    balance_microusd: i64,
-    held_microusd: i64,
-    available_microusd: i64,
+    balance_points: i64,
+    held_points: i64,
+    available_points: i64,
     updated_at: DateTime<Utc>,
 }
 
@@ -1382,9 +1405,9 @@ async fn read_own_account(
     let account_id = authenticate(&state, &headers).await?;
     let change = state.accounts.read_balance(account_id).await?;
     Ok(Json(OwnAccountResponse {
-        balance_microusd: change.balance_microusd,
-        held_microusd: change.held_microusd,
-        available_microusd: change.available_microusd,
+        balance_points: to_points(change.balance_microusd),
+        held_points: to_points(change.held_microusd),
+        available_points: to_points(change.available_microusd),
         updated_at: change.updated_at,
     }))
 }
@@ -1943,6 +1966,8 @@ async fn redeem_customer_password_reset(
 
 #[derive(Debug, Serialize)]
 struct CustomerUsageRow {
+    /// 这次调用的平台标识（该笔 Generation Job 的标识）：与生成响应的 `data.id` 同一条。
+    id: JobId,
     gateway_model: String,
     status: CustomerUsageStatus,
     kind: CustomerUsageKind,
@@ -1955,7 +1980,7 @@ struct CustomerUsageRow {
     model_type: String,
     /// 本次执行按类型给出的量；该类型还没有量落点时为全空。
     usage: UsageAmounts,
-    charged_microusd: i64,
+    charged_points: i64,
 }
 
 #[derive(Debug, Serialize)]
@@ -1967,13 +1992,38 @@ struct CustomerUsageResponse {
     next_cursor: Option<String>,
 }
 
+/// 对客的一条账目：与管理员那条同形，但金额是**积分**（对客金额单位）。
+///
+/// 单开一个类型而不是复用管理员的 `LedgerEntryView`：金额单位不同（管理员 CNY 微单位、客户积分），
+/// 复用会把两套单位混在一个类型里。
+#[derive(Debug, Serialize)]
+struct CustomerLedgerEntryView {
+    account_id: AccountId,
+    kind: String,
+    amount_points: i64,
+    job_id: Option<JobId>,
+    created_at: DateTime<Utc>,
+}
+
+impl From<LedgerEntryView> for CustomerLedgerEntryView {
+    fn from(entry: LedgerEntryView) -> Self {
+        Self {
+            account_id: entry.account_id,
+            kind: entry.kind,
+            amount_points: to_points(entry.amount_microusd),
+            job_id: entry.job_id,
+            created_at: entry.created_at,
+        }
+    }
+}
+
 /// 对客资金流水的响应：与管理员那条同形，外加翻页定位。
 ///
 /// 单开一个类型而不是给管理员的 `AccountEntriesResponse` 加字段：管理员那条的响应形状是既有合同，
 /// 不因为对客要翻页而改变。
 #[derive(Debug, Serialize)]
 struct CustomerLedgerResponse {
-    entries: Vec<LedgerEntryView>,
+    entries: Vec<CustomerLedgerEntryView>,
     count: usize,
     /// 同一套区间与类别条件下的总条数（与 `count` 不同：本页条数）。
     total: u64,
@@ -2093,7 +2143,7 @@ fn next_cursor(
 ///
 /// 认的是**客户会话**（与 `/v1/account` 的 API Key 不是一回事）：客户控制台要能登录之后直接看账。
 /// 三个数分开给、不合成"总资产"——预授权不是扣款；客户控制台只把这个数字显示成一个「余额」——取
-/// `available_microusd`（客户现在能用的钱），不分别展示这三项。
+/// `available_points`（客户现在能用的钱），不分别展示这三项。
 async fn read_customer_account(
     State(state): State<AppState>,
     headers: HeaderMap,
@@ -2104,9 +2154,9 @@ async fn read_customer_account(
     let summary = state.accounts.account_summary(account_id).await?;
     Ok(Json(CustomerAccountResponse {
         name: summary.name,
-        balance_microusd: change.balance_microusd,
-        held_microusd: change.held_microusd,
-        available_microusd: change.available_microusd,
+        balance_points: to_points(change.balance_microusd),
+        held_points: to_points(change.held_microusd),
+        available_points: to_points(change.available_microusd),
         updated_at: change.updated_at,
     }))
 }
@@ -2204,6 +2254,7 @@ async fn read_customer_ledger(
     let views = entries
         .into_iter()
         .map(LedgerEntryView::from)
+        .map(CustomerLedgerEntryView::from)
         .collect::<Vec<_>>();
     Ok(Json(CustomerLedgerResponse {
         count: views.len(),
@@ -2283,6 +2334,7 @@ async fn read_customer_usage(
     let usage = rows
         .into_iter()
         .map(|row| CustomerUsageRow {
+            id: row.job_id,
             gateway_model: row.gateway_model,
             status: row.status,
             kind: row.kind,
@@ -2290,7 +2342,7 @@ async fn read_customer_usage(
             terminal_at: row.terminal_at,
             model_type: row.model_type,
             usage: row.usage,
-            charged_microusd: row.charged_microusd,
+            charged_points: to_points(row.charged_microusd),
         })
         .collect::<Vec<_>>();
     Ok(Json(CustomerUsageResponse {
@@ -2318,7 +2370,7 @@ async fn read_customer_billing(
         "until": billing.until,
         "requests": summary.requests,
         "usage": summary.usage,
-        "charged_microusd": summary.charged_microusd,
+        "charged_points": to_points(summary.charged_microusd),
     })))
 }
 
@@ -3038,14 +3090,53 @@ fn take_contract_image_inputs(parameters: &mut RequestParameters) -> Result<Imag
         .map_err(|message| ApiError::bad_request("invalid_parameter", message))
 }
 
-/// 对客的成功响应：只有 `created` 与 `data`。
+/// 对客的成功响应信封：`{code, data:{id, status, cost, result:{images[]}}}`。
 ///
-/// 这里**结构上**就没有 job、没有任务的字段——内部的执行记录不投射成对客协议；
-/// `data` 每项只有渠道给的 `url` 或 `b64_json`。
+/// 形状与渠道无关：字段集由平台定义，取图值与过期时刻按渠道事实填入。`id` 是这次调用的
+/// Generation Job 标识，对客不透明；`cost` 是本次落账实收（整积分）。
 #[derive(Debug, Serialize)]
 struct SyncImageResponse {
-    created: i64,
-    data: Vec<GeneratedImage>,
+    code: u16,
+    data: SyncImageData,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncImageData {
+    id: JobId,
+    status: CustomerUsageStatus,
+    cost: u64,
+    result: SyncImageResult,
+}
+
+#[derive(Debug, Serialize)]
+struct SyncImageResult {
+    images: Vec<SyncImageItem>,
+}
+
+/// 对客的一张图：一项 = 渠道的一张图，要么一组地址（可带渠道给的过期时刻），要么内联 base64。
+#[derive(Debug, Serialize)]
+#[serde(untagged)]
+enum SyncImageItem {
+    Url {
+        url: Vec<String>,
+        #[serde(skip_serializing_if = "Option::is_none")]
+        expires_at: Option<i64>,
+    },
+    B64Json {
+        b64_json: String,
+    },
+}
+
+impl From<GeneratedImage> for SyncImageItem {
+    fn from(image: GeneratedImage) -> Self {
+        match image {
+            GeneratedImage::Url { urls, expires_at } => Self::Url {
+                url: urls,
+                expires_at,
+            },
+            GeneratedImage::B64Json(b64_json) => Self::B64Json { b64_json },
+        }
+    }
 }
 
 /// 两个图片入口（`/v1/images/generations` 与 `/v1/images/edits`）的**同一套** JSON 解码。
@@ -3515,7 +3606,7 @@ async fn run_direct_generation(
     }
 }
 
-/// 成功响应：created 与内存里的 data 直接构造，不读 Job、不重放结果。
+/// 成功响应：调用标识、状态、实收与内存里的图片直接构造，不读库、不重放结果。
 ///
 /// 发送期限在**交接时**定为绝对时刻，交给连接层执行：body 是否继续被读取不影响它（RFC 0018 §8.1）。
 fn direct_success_response(
@@ -3525,11 +3616,20 @@ fn direct_success_response(
     window: Duration,
 ) -> Result<Response, ApiError> {
     let body = SyncImageResponse {
-        created: success
-            .payload
-            .created
-            .unwrap_or_else(|| Utc::now().timestamp()),
-        data: success.payload.images,
+        code: 200,
+        data: SyncImageData {
+            id: success.job_id,
+            status: CustomerUsageStatus::Completed,
+            cost: points_from_microusd(success.charge_microusd),
+            result: SyncImageResult {
+                images: success
+                    .payload
+                    .images
+                    .into_iter()
+                    .map(SyncImageItem::from)
+                    .collect(),
+            },
+        },
     };
     let payload = serde_json::to_vec(&body).map_err(|error| ApiError {
         status: StatusCode::INTERNAL_SERVER_ERROR,

@@ -39,25 +39,38 @@ impl Debug for ProviderCredential {
     }
 }
 
-/// 一次生成的一张图：**渠道给什么就是什么**——给 `url` 就留 `url`、给 base64 就留 `b64_json`。
+/// 一次生成的一张图：**渠道给什么就是什么**——给地址就留地址、给 base64 就留 `b64_json`。
 ///
-/// 形状本身保证"恰好其一"：只有两种取图方式，没有"两项都在"或"一项都没有"的表示法。
-/// 平台不下载、不解码、不归档，因此也不需要第三种形态。
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+/// 形状本身保证"恰好其一"：要么一组地址、要么一个内联串，没有"两项都在"或"一项都没有"的表示法。
+/// 一个 `Url` 项就是渠道的一张图，`urls` 是渠道为这张图给出的全部地址；`expires_at` 是渠道
+/// 声明的过期时刻（Unix 秒），渠道不给就是 `None`，平台不推算。平台不下载、不解码、不归档。
+///
+/// 对客的 wire 形状不在这里：它是客户合同，由 `apps/api` 拥有；这个类型只承载渠道事实。
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum GeneratedImage {
-    /// 上游给的是公网地址（或它自己的临时链接）。
-    #[serde(rename = "url")]
-    Url(String),
+    /// 上游给的是公网地址（或它自己的临时链接）；`expires_at` 是渠道给的过期时刻（Unix 秒）。
+    Url {
+        urls: Vec<String>,
+        expires_at: Option<i64>,
+    },
     /// 上游给的是内联 base64。
-    #[serde(rename = "b64_json")]
     B64Json(String),
 }
 
 impl GeneratedImage {
-    /// 上游给的是公网地址。
+    /// 上游给一个地址、没给过期时刻。
     #[must_use]
     pub fn from_url(url: String) -> Self {
-        Self::Url(url)
+        Self::Url {
+            urls: vec![url],
+            expires_at: None,
+        }
+    }
+
+    /// 上游给一组地址与（可选的）过期时刻。
+    #[must_use]
+    pub fn from_urls(urls: Vec<String>, expires_at: Option<i64>) -> Self {
+        Self::Url { urls, expires_at }
     }
 
     /// 上游给的是内联 base64。

@@ -23,10 +23,22 @@ fn facts<'a>(usage: &'a TokenUsage) -> ChargeFacts<'a> {
     }
 }
 
+/// 对客金额落账前向上取整到整积分：1积分 = 1000 微单位，不足 1 积分的部分向上进一。
+#[test]
+fn consumer_amounts_round_up_to_whole_points() {
+    assert_eq!(whole_points_microusd(0), 0);
+    assert_eq!(whole_points_microusd(1), 1_000);
+    assert_eq!(whole_points_microusd(999), 1_000);
+    assert_eq!(whole_points_microusd(1_000), 1_000);
+    assert_eq!(whole_points_microusd(1_001), 2_000);
+    assert_eq!(whole_points_microusd(14_207), 15_000);
+    assert_eq!(whole_points_microusd(96_737), 97_000);
+}
+
 #[test]
 fn calculates_edit_charge_from_verified_usage() {
     let snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
-    assert_eq!(snapshot.charge_microusd(facts(&usage())), Ok(14_207));
+    assert_eq!(snapshot.charge_microusd(facts(&usage())), Ok(15_000));
 }
 
 /// 成本自算与对客扣费是**两个口径**：算式同一个，读的费率各自一份。
@@ -48,7 +60,7 @@ fn computed_cost_reads_the_channel_cost_rates_not_the_consumer_charge() {
     // 成本：27 文本输入 × 5 + 1024 图像输入 × 8 + 196 图像输出 × 30（每 1M）。
     assert_eq!(cost, Ok(14_207));
     // 对客：同一份用量，换成对客那份费率，金额就不一样了。
-    assert_eq!(charge, Ok(17_245));
+    assert_eq!(charge, Ok(18_000));
     assert_ne!(
         cost, charge,
         "两份费率不同时，成本与对客扣费必须各自算各自的，不能互相顶替"
@@ -414,7 +426,7 @@ fn the_charge_reads_the_consumer_vector_when_the_snapshot_carries_pricing() {
     let mut snapshot = snapshot_with_rates("USD", 5_000_000, 8_000_000, 10_000_000, 30_000_000);
     assert_eq!(
         snapshot.charge_microusd(facts(&usage())),
-        Ok(14_207),
+        Ok(15_000),
         "旧口径"
     );
     assert_eq!(snapshot.hold_microusd, None);
@@ -437,7 +449,7 @@ fn the_charge_reads_the_consumer_vector_when_the_snapshot_carries_pricing() {
     });
     assert_eq!(
         snapshot.charge_microusd(facts(&usage())),
-        Ok(17_245),
+        Ok(18_000),
         "对客费率向量"
     );
     // 成本侧不受影响：它仍读该渠道的成本费率。
@@ -483,7 +495,7 @@ fn a_snapshot_without_the_pricing_keys_still_parses() {
         PricingFormula::TokenRates,
         "历史快照缺这个键时按当时唯一存在的计价形态读"
     );
-    assert_eq!(snapshot.charge_microusd(facts(&usage())), Ok(14_207));
+    assert_eq!(snapshot.charge_microusd(facts(&usage())), Ok(15_000));
 }
 
 /// 对客实收**算不出来时不按 0 收**：返回错误，由调用方按平台侧故障处置。
@@ -525,7 +537,7 @@ fn a_supply_without_a_consumer_basis_cannot_be_charged() {
         declared_cost_microusd: Some(11_354),
         ..facts(&executed)
     };
-    assert_eq!(snapshot.charge_microusd(declared), Ok(96_737));
+    assert_eq!(snapshot.charge_microusd(declared), Ok(97_000));
 }
 
 /// 造一份**上游声明金额**计价的快照（成本与对客都是 `upstream_declared`）。
@@ -555,10 +567,10 @@ fn unit_snapshot(
     snapshot
 }
 
-/// 上游直接给金额：对客价 = **这次声明的金额 × 倍率 × 折算率**。
+/// 上游直接给金额：对客价 = **这次声明的金额 × 倍率 × 折算率**，再向上取整到整积分。
 ///
-/// 11354 微美元 × 1.2 × 7.1 = 96736.08 ⇒ 向上取整 96737：一次除、一次取整，
-/// 不是"先折人民币再乘倍率"那样取整两遍。
+/// 11354 微美元 × 1.2 × 7.1 = 96736.08 ⇒ 向上取整 96737，再取整到整积分 97000：
+/// 一次除、一次取整，不是"先折人民币再乘倍率"那样取整两遍。
 #[test]
 fn an_upstream_declared_supply_sells_at_the_declared_amount_times_the_markup() {
     let snapshot = unit_snapshot(PricingFormula::UpstreamDeclared, 0, "USD", 2_000, 7_100_000);
@@ -567,7 +579,7 @@ fn an_upstream_declared_supply_sells_at_the_declared_amount_times_the_markup() {
             declared_cost_microusd: Some(11_354),
             ..facts(&usage())
         }),
-        Ok(96_737)
+        Ok(97_000)
     );
 }
 
@@ -643,7 +655,7 @@ fn a_derived_consumer_price_needs_all_of_its_inputs() {
             declared_cost_microusd: Some(11_354),
             ..facts(&usage())
         }),
-        Ok(96_737)
+        Ok(97_000)
     );
 
     let mut without_markup = complete.clone();
@@ -776,7 +788,7 @@ fn the_charge_follows_the_consumer_form_not_the_cost_form() {
     });
     assert_eq!(
         snapshot.charge_microusd(facts(&usage())),
-        Ok(17_245),
+        Ok(18_000),
         "成本是 upstream_declared，对客仍按四档 CNY 向量收"
     );
 }

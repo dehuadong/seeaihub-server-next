@@ -295,7 +295,11 @@ async fn a_video_record_reports_an_empty_usage_and_the_summary_counts_only_image
     .fetch_one(&harness.pool)
     .await
     .expect("ledger capture sum");
-    assert_eq!(billing["charged_microusd"], json!(captured), "{billing}");
+    assert_eq!(
+        billing["charged_points"],
+        json!(captured / 1_000),
+        "{billing}"
+    );
 
     harness.cleanup().await;
 }

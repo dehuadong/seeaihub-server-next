@@ -202,26 +202,29 @@ test('用量与账单按模型类型显示：缺量的类型显示占位而不�
       body: JSON.stringify({
         usage: [
           {
+            id: 'e2e-call-video',
             gateway_model: 'video-model',
-            status: 'succeeded',
+            status: 'completed',
             kind: 'generation',
             created_at: '2026-01-15T12:00:00.000Z',
             terminal_at: '2026-01-15T12:00:05.000Z',
             type: 'video',
             usage: {},
-            charged_microusd: 0,
+            charged_points: 0,
           },
           {
+            id: 'e2e-call-image',
             gateway_model: 'image-model',
-            status: 'succeeded',
+            status: 'completed',
             kind: 'generation',
             created_at: '2026-01-15T12:01:00.000Z',
             terminal_at: '2026-01-15T12:01:05.000Z',
             type: 'image',
             usage: { images: 1 },
-            charged_microusd: 0,
+            charged_points: 0,
           },
           {
+            id: 'e2e-call-pending',
             gateway_model: 'image-model',
             status: 'pending',
             kind: 'generation',
@@ -229,7 +232,7 @@ test('用量与账单按模型类型显示：缺量的类型显示占位而不�
             terminal_at: null,
             type: 'image',
             usage: { images: 0 },
-            charged_microusd: 0,
+            charged_points: 0,
           },
         ],
         count: 3,
@@ -248,7 +251,7 @@ test('用量与账单按模型类型显示：缺量的类型显示占位而不�
         until: null,
         requests: 2,
         usage: { images: 1 },
-        charged_microusd: 0,
+        charged_points: 0,
       }),
     });
   });
@@ -259,6 +262,8 @@ test('用量与账单按模型类型显示：缺量的类型显示占位而不�
   await expect(history).toContainText('—');
   // 图片未产出沿用现有口径显示 0，而不是占位（Spec A7）。
   await expect(history).toContainText('0 张');
+  // 新增的调用标识作为一列展示（与生成响应的 `data.id` 同一条）。
+  await expect(history).toContainText('e2e-call-image');
 
   await nav(page, '账单与资金记录');
   await expect(page.getByTestId('portal-billing-usage-image')).toContainText('1 张');

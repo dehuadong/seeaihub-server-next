@@ -43,12 +43,21 @@ curl -X POST "$BASE_URL/v1/images/generations" \
 
 ```json
 {
-  "created": 1791158400,
-  "data": [{"url": "https://example.com/result.png"}]
+  "code": 200,
+  "data": {
+    "id": "3f2a9c1e-...",
+    "status": "completed",
+    "cost": 14,
+    "result": {
+      "images": [
+        { "url": ["https://example.com/result.png"], "expires_at": 1789000000 }
+      ]
+    }
+  }
 }
 ```
 
-`created` 是 Unix 秒时间戳。`data` 中每项包含 `url` 或 `b64_json` 之一：有 `url` 时读取该地址，有 `b64_json` 时按 base64 解码为图片。请兼容两种结果形式，并及时保存结果。服务不提供生成结果的保存与重放。
+`code` 成功时固定 `200`。`data.id` 是这次调用的平台标识，对客不透明，可与调用记录里的同一条对上。`data.status` 同步成功时为 `completed`。`data.cost` 是本次实际扣费，单位是积分（1元 = 1000积分）。`data.result.images` 中每项是一张图，包含 `url` 或 `b64_json` 之一：有 `url` 时读取这些地址，有 `b64_json` 时按 base64 解码为图片。渠道给出地址过期时刻时该项带 `expires_at`（Unix 秒）；没有这个键表示渠道没有给。请兼容两种结果形式，并及时保存结果。服务不提供生成结果的保存与重放。错误响应仍是 `{"error":{"code","message"}}`。
 
 ## 错误与重复请求
 

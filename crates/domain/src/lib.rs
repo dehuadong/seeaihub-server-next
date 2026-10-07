@@ -444,6 +444,24 @@ impl PriceRates {
     }
 }
 
+/// 1 积分 = 1000 CNY 微单位（1元 = 1000积分）。
+///
+/// 对客金额单位是积分；平台内部以 CNY 微单位记账，对客金额因此恒为 1000 的整数倍。
+pub const MICRO_PER_POINT: u64 = 1_000;
+
+/// 把 CNY 微单位金额向上取整到整积分（[`MICRO_PER_POINT`] 的整数倍）。
+///
+/// 对客金额（保底额、实收、充值、初始充值与正式调整）落账前都过这里，账上的对客金额因此恒为整积分。
+/// 取整只在**落账前**做一次；已经取整的金额再取整不变。
+#[must_use]
+pub fn whole_points_microusd(microusd: u64) -> u64 {
+    let points = microusd.div_ceil(MICRO_PER_POINT);
+    // 溢出时取 u64 内最大的整积分："结果恒为整积分"这条不变量不能被边界破掉。
+    points
+        .checked_mul(MICRO_PER_POINT)
+        .unwrap_or(u64::MAX - u64::MAX % MICRO_PER_POINT)
+}
+
 /// 折算率的**定点分母**：折算率以百万分之一为单位表达。
 ///
 /// 钱与汇率都不走浮点：`0.011354 × 1e6` 在浮点下会落在 11354.000000000002 这类值上，
@@ -1059,8 +1077,9 @@ impl PriceSnapshot {
     /// 没有倍率、没有折算率、上游没声明金额。
     ///
     /// 成本自算走 [`Self::cost_rates`] 与 [`Self::formula`]，与这里分成两个入口。
+    /// 返回值是**整积分**（[`whole_points_microusd`]）：对客实收落账前向上取整到 1000 微单位的整数倍。
     pub fn charge_microusd(&self, facts: ChargeFacts<'_>) -> Result<u64, DomainError> {
-        match self.consumer_formula() {
+        let raw = match self.consumer_formula() {
             PricingFormula::TokenRates => match (&self.consumer_rates_cny, &self.rates) {
                 (Some(rates), _) => rates.amount_microusd(evidence(facts.usage)?),
                 (None, Some(rates)) => rates.amount_microusd(evidence(facts.usage)?),
@@ -1078,7 +1097,8 @@ impl PriceSnapshot {
             PricingFormula::PerImage | PricingFormula::PerCall => {
                 Err(DomainError::MissingConsumerRate)
             }
-        }
+        }?;
+        Ok(whole_points_microusd(raw))
     }
 
     /// 成本金额 × 倍率 × 折算率 → **对客金额**（CNY 微单位），向上取整。

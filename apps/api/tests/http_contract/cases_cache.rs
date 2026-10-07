@@ -162,12 +162,12 @@ async fn the_ledger_view_and_the_consumer_account_read_the_database_not_the_cach
         .await
         .expect("consumer account JSON");
     assert_eq!(
-        own["balance_microusd"].as_i64(),
-        Some(db_balance),
-        "对客面读的是库里的 {db_balance}，不是缓存里那个错的 7：{own}"
+        own["balance_points"].as_i64(),
+        Some(db_balance / 1_000),
+        "对客面读的是库里的 {db_balance} 微单位（积分 = 微单位 / 1000），不是缓存里那个错的 7：{own}"
     );
     assert_eq!(
-        own["held_microusd"].as_i64(),
+        own["held_points"].as_i64(),
         Some(0),
         "没有任何持有中的预授权：{own}"
     );
@@ -301,7 +301,11 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
     assert_eq!(state, "succeeded");
     let _ = job_id;
     let settled = database_balance(&harness, &account_id).await;
-    assert_eq!(settled, 1_000_000 - 96_737, "实收按上游声明的金额加价算");
+    assert_eq!(
+        settled,
+        1_000_000 - 97_000,
+        "实收按上游声明的金额加价算，落账取整到整积分"
+    );
     let cached = harness.cache().balance(&account_id).expect("结算之后缓存");
     assert_eq!(cached["balance_microusd"], json!(settled));
     assert_eq!(
@@ -390,8 +394,11 @@ async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
         with_cache, without_cache,
         "缓存不可用与完全没有缓存必须逐位相同（实收、余额、终态、响应体）"
     );
-    assert_eq!(with_cache.0, -96_737, "实收按上游声明的金额加价算");
-    assert_eq!(with_cache.1, 1_000_000 - 96_737);
+    assert_eq!(
+        with_cache.0, -97_000,
+        "实收按上游声明的金额加价算，落账取整到整积分"
+    );
+    assert_eq!(with_cache.1, 1_000_000 - 97_000);
 }
 
 /// **陈旧缓存不得拒绝**：缓存里的余额偏低（来源是对账写回，或写穿但已经很旧）→ 判定交给数据库，
@@ -453,7 +460,7 @@ async fn a_stale_balance_entry_never_rejects() {
     // 两次都真的扣了钱（判定交给了数据库），而且没有留下任何"凭缓存拒绝"的审计。
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        1_000_000 - 2 * 96_737
+        1_000_000 - 2 * 97_000
     );
     assert!(
         audit_events(&harness, "balance.precheck_rejected")
@@ -512,7 +519,7 @@ async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
     // 判定交给了数据库：真的建了 Job、真的扣了实收，也没有"凭缓存拒绝"的痕迹。
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        1_000_000 - 96_737,
+        1_000_000 - 97_000,
         "数据库确认够并照常结算"
     );
     assert!(

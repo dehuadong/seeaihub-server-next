@@ -17,9 +17,12 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     let (job_id, state) = harness.job(&key).await;
     assert_eq!(state, "succeeded", "the driver flow must settle the job");
     assert_eq!(
-        body["data"],
-        json!([{"url": format!("{}/result.png", harness.upstream_base_url)}]),
-        "结果信封里只有上游给的那个地址"
+        body["data"]["result"]["images"],
+        json!([{
+            "url": [format!("{}/result.png", harness.upstream_base_url)],
+            "expires_at": 4_000_000_000u64
+        }]),
+        "结果信封里只有上游给的那个地址与渠道给的过期时刻"
     );
     assert_eq!(harness.count("GET", "/result.png"), 0, "平台不许下载结果图");
 
@@ -62,10 +65,10 @@ async fn apimart_driver_executes_the_task_flow_against_a_local_upstream() {
     );
 
     // 采集成本**不改对客金额**：实收仍是该渠道费率 × 实际分项 token
-    // （14 文本输入 × 5 + 196 图像输出 × 30 = 5950 微单位），与上游声明的 11354 是两个量。
+    // （14 文本输入 × 5 + 196 图像输出 × 30 = 5950 微单位，落账取整到 6000），与上游声明的 11354 是两个量。
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -5_950,
+        -6_000,
         "上游声明的金额只进成本口径，不许动对客实收"
     );
 

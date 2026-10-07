@@ -283,8 +283,9 @@ impl CredentialProvider for FakeCredentials {
 fn success_output() -> seeai_adapter_sdk::ProviderOutput {
     seeai_adapter_sdk::ProviderOutput {
         response_payload: ResponsePayload {
-            created: Some(1),
-            images: vec![GeneratedImage::Url("https://img.example/x.png".to_owned())],
+            images: vec![GeneratedImage::from_url(
+                "https://img.example/x.png".to_owned(),
+            )],
         },
         accounting_facts: AccountingFacts {
             usage: Some(usage()),

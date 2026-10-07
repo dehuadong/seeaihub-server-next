@@ -975,18 +975,18 @@ async fn the_consumer_account_view_shows_only_its_own_balance_and_hold() {
         .await
         .expect("own account JSON");
     assert_eq!(
-        own["balance_microusd"].as_i64(),
-        Some(database_balance(&harness, &own_id).await),
-        "余额与库一致：{own}"
+        own["balance_points"].as_i64(),
+        Some(database_balance(&harness, &own_id).await / 1_000),
+        "余额与库一致（积分 = 微单位 / 1000）：{own}"
     );
     assert_eq!(
-        own["held_microusd"].as_i64(),
-        Some(held),
+        own["held_points"].as_i64(),
+        Some(held / 1_000),
         "持有中是已预授权未结算的那一笔：{own}"
     );
     assert!(
-        own["balance_microusd"].as_i64().unwrap_or_default()
-            < database_balance(&harness, &own_id).await + held,
+        own["balance_points"].as_i64().unwrap_or_default()
+            < (database_balance(&harness, &own_id).await + held) / 1_000,
         "持有中没有被算进余额：{own}"
     );
     assert!(
@@ -1006,17 +1006,17 @@ async fn the_consumer_account_view_shows_only_its_own_balance_and_hold() {
         .await
         .expect("stranger account JSON");
     assert_eq!(
-        stranger["balance_microusd"].as_i64(),
-        Some(database_balance(&harness, &other_id).await),
+        stranger["balance_points"].as_i64(),
+        Some(database_balance(&harness, &other_id).await / 1_000),
         "看到的是自己的余额：{stranger}"
     );
     assert_eq!(
-        stranger["held_microusd"].as_i64(),
+        stranger["held_points"].as_i64(),
         Some(0),
         "别人的持有中不该露出来，自己也没有持有：{stranger}"
     );
     assert_ne!(
-        own["balance_microusd"], stranger["balance_microusd"],
+        own["balance_points"], stranger["balance_points"],
         "两个账户的余额不同，才说明这条读真的按调用者分账户"
     );
 

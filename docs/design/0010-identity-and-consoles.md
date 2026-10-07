@@ -143,7 +143,7 @@
 | `GET` | `/v1/customer/api-keys` | 客户会话 | — | `200 {keys:[{key_id, label, created_at, revoked_at}]}`（**无明文**） |
 | `POST` | `/v1/customer/api-keys` | 客户会话 | `{label}` | `201 {key_id, api_key}`（明文只此一次） |
 | `DELETE` | `/v1/customer/api-keys/{key_id}` | 客户会话 | — | `204`；不属于自己 ⇒ `404` |
-| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {name, balance_microusd, held_microusd, available_microusd, updated_at}`；客户页面只显示一个「余额」数字（取 `available_microusd`），`name` 是客户可改的账户名称 |
+| `GET` | `/v1/customer/account` | 客户会话 | — | `200 {name, balance_points, held_points, available_points, updated_at}`；客户页面只显示一个「余额」数字（取 `available_points`），`name` 是客户可改的账户名称 |
 | `PUT` | `/v1/customer/account/name` | 客户会话 | `{name}` | 客户改自己账户的名称：账户由会话确定，不能清空，非法名称 400；改的是资料，不动余额、标签与凭据（规则见 [账户名称 Spec](../specs/0003-account-names-and-login-identities.md)） |
 | `GET` | `/v1/customer/ledger` | 客户会话 | 资金记录查询 | 按账户和时间区间读真实收支；筛选、翻页和响应见[客户控制台设计](0014-customer-console-navigation-and-history.md) §3 |
 | `GET` | `/v1/customer/usage` | 客户会话 | 调用记录查询 | 对客状态、终态时刻、分组和翻页见[客户控制台设计](0014-customer-console-navigation-and-history.md) §2 |
@@ -153,19 +153,19 @@
 
 **为什么把账务拆成四条而不是一个聚合响应**：汇总与明细的"口径"不同——汇总必须按区间全量算，明细按上限截断；塞进一个响应里，改一次页大小就会让"明细求和等于汇总"这条验收条件失效（Spec V-C8）。拆开之后，每条端点的语义各自稳定，页面按需组合。
 
-**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`status`、`created_at`、`terminal_at`、`type`（模型类型）与按类型的用量 `usage`、`charged_microusd`——**不含 Generation Job 的标识与内部状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为"对客不可见、不投射成对客协议"，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。模型类型与用量取值归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)，落地见[模型类型设计](0020-model-type.md) §4。
+**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`id`（这次调用的平台标识）、`status`、`created_at`、`terminal_at`、`type`（模型类型）与按类型的用量 `usage`、`charged_points`——**不含内部 Job 状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为内部执行与审计记录、对客只暴露它的标识，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。模型类型与用量取值归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)，落地见[模型类型设计](0020-model-type.md) §4。
 
-`status` 是收敛后的四值（`succeeded` / `failed` / `pending` / `canceled`），由内部 Job 状态与结算结果映射而来；未结案的 `reconciliation_required` 对客仍是 `pending`，不提前宣告失败。映射写在拥有它的读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。`failed` 只说这次未产出，不改写渠道侧的错误细节。
+`status` 是收敛后的四值（`completed` / `failed` / `pending` / `canceled`），由内部 Job 状态与结算结果映射而来；未结案的 `reconciliation_required` 对客仍是 `pending`，不提前宣告失败。映射写在拥有它的读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。`failed` 只说这次未产出，不改写渠道侧的错误细节。
 
-**汇总怎么算**：`requests` 按区间内到达终态的执行记录计；用量按 `model_type` 分组、各类型各自的量合计放在同一个 `usage` 对象里，不跨类型相加；`charged_microusd` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
+**汇总怎么算**：`requests` 按区间内到达终态的执行记录计；用量按 `model_type` 分组、各类型各自的量合计放在同一个 `usage` 对象里，不跨类型相加；`charged_points` 按区间内入账的实际扣费与正式调整（`capture`、`adjustment`）有符号金额求和（单位是积分）。预授权与释放不产生资金流水；跨天归属及逐笔核对见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §5。`[since, until)` 是半开区间、按 UTC 解释。
 
 **为什么重置令牌也走摘要入库**：它等同于一次登录凭据（能改口令），因此与会话令牌同一条纪律——明文只在响应里，库里只有 SHA-256，且有独立更短的过期（`PASSWORD_RESET_TTL_SECONDS`，默认 30 分钟），用完即删。
 
-**对客账务读的路径与既有对客面分开**：充值记录、用量与账单走 `/v1/customer/*`。`/v1/account` 的余额字段改为已结算余额并增加可用额字段；金额语义以[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §4 为准。
+**对客账务读的路径与既有对客面分开**：充值记录、用量与账单走 `/v1/customer/*`。`/v1/account` 的余额字段是 `balance_points` / `held_points` / `available_points`（积分）；金额语义以[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §4 为准。
 
 ### 4.3 账户读与流水端点
 
-`GET /api/v1/accounts/{id}/entries`（管理员流水）保留分页与区间查询，条目只含实际收支；对客流水在 §4.2 的 `ledger` 里按 `WHERE account_id = <会话账户>` 收窄，不展示预授权或释放。`/v1/account` 返回三个金额字段，客户控制台只渲染 `available_microusd` 为一个「余额」数字；内部占用与已结算余额仍用于受理判定与对账。
+`GET /api/v1/accounts/{id}/entries`（管理员流水）保留分页与区间查询，条目只含实际收支；对客流水在 §4.2 的 `ledger` 里按 `WHERE account_id = <会话账户>` 收窄，不展示预授权或释放。`/v1/account` 返回三个金额字段（积分），客户控制台只渲染 `available_points` 为一个「余额」数字；内部占用与已结算余额仍用于受理判定与对账。
 
 ### 4.4 页面 → 端点（逐页承接 Spec M1–M6、C5–C12）
 

@@ -6,7 +6,7 @@
 
 # AIHubMix 执行路径改走 `/ai/v1`
 
-本稿拥有 AIHubMix 一族的执行端点选择、请求与响应形状、任务标识与对账取回方式、成本与计量的口径。对客行为合同仍由[同步图片网关 Spec](../specs/0005-synchronous-image-gateway.md)拥有：请求只收公网 URL，成功回 `{created, data:[{url|b64_json}]}`，每项只保留一种形式。
+本稿拥有 AIHubMix 一族的执行端点选择、请求与响应形状、任务标识与对账取回方式、成本与计量的口径。对客行为合同仍由[同步图片网关 Spec](../specs/0005-synchronous-image-gateway.md)拥有：请求只收公网 URL，成功回 `{code, data:{id, status, cost, result:{images[]}}}`，每项只保留一种形式。
 
 ## 1. 现状与问题
 

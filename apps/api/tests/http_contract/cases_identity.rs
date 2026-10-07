@@ -1268,7 +1268,7 @@ async fn a_customer_registers_manages_its_own_keys() {
         .json::<Value>()
         .await
         .expect("account body");
-    assert_eq!(fresh["balance_microusd"], json!(0), "新账户余额必须是 0");
+    assert_eq!(fresh["balance_points"], json!(0), "新账户余额必须是 0");
 
     // 同一邮箱再注册一次是冲突。
     let duplicate = client
@@ -1466,7 +1466,7 @@ async fn operations_open_customer_accounts_including_for_existing_ones() {
         .expect("own account request");
     assert_eq!(account.status(), StatusCode::OK);
     let account = account.json::<Value>().await.expect("own account body");
-    assert_eq!(account["balance_microusd"], json!(5_000_000));
+    assert_eq!(account["balance_points"], json!(5_000));
 
     // 同一个账户再绑一个邮箱是冲突。
     let twice = client
@@ -1629,7 +1629,7 @@ async fn accounting_reads_are_scoped_to_the_caller() {
         .json::<Value>()
         .await
         .expect("account body");
-    assert_eq!(a_account["balance_microusd"], json!(25_000_000));
+    assert_eq!(a_account["balance_points"], json!(25_000));
     let a_ledger = client
         .get(format!("{base_url}/v1/customer/ledger"))
         .bearer_auth(&sessions[0].0)
@@ -1656,7 +1656,7 @@ async fn accounting_reads_are_scoped_to_the_caller() {
         .await
         .expect("account body");
     assert_eq!(
-        b_account["balance_microusd"],
+        b_account["balance_points"],
         json!(0),
         "B 不该看到 A 的余额：{b_account}"
     );
@@ -1690,7 +1690,7 @@ async fn accounting_reads_are_scoped_to_the_caller() {
         .await
         .expect("billing body");
     assert_eq!(
-        b_billing["charged_microusd"],
+        b_billing["charged_points"],
         json!(0),
         "B 的账单不该带上 A 的钱：{b_billing}"
     );
@@ -2110,7 +2110,7 @@ async fn an_account_opened_without_a_password_is_entered_via_a_reset_token() {
         .await
         .expect("account body");
     assert_eq!(
-        account["balance_microusd"],
+        account["balance_points"],
         json!(0),
         "这是个新开的空账户：{account}"
     );

@@ -104,7 +104,7 @@ async fn direct_json_generation_returns_inline_base64_without_a_worker() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("direct url", &body);
     assert_eq!(
-        body["data"][0]["b64_json"].as_str(),
+        body["data"]["result"]["images"][0]["b64_json"].as_str(),
         Some(STANDARD.encode(PNG_FIXTURE).as_str()),
         "the task result must come back as inline base64, got {body}"
     );
@@ -136,7 +136,7 @@ async fn direct_json_generation_returns_base64_without_a_worker() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("direct base64", &body);
     assert_eq!(
-        body["data"][0]["b64_json"].as_str(),
+        body["data"]["result"]["images"][0]["b64_json"].as_str(),
         Some(STANDARD.encode(PNG_FIXTURE).as_str()),
         "the upstream base64 must be returned as is"
     );
@@ -1114,7 +1114,7 @@ async fn direct_max_provider_response_peak_rss_stays_within_the_memory_budget() 
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert!(
-        body["data"][0]["b64_json"].is_string(),
+        body["data"]["result"]["images"][0]["b64_json"].is_string(),
         "渠道给什么就原样回什么，got {body}"
     );
     let peak_kib = peak_rss_kib(harness.api_pid());

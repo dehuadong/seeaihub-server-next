@@ -7,12 +7,12 @@ import {
 } from '@ant-design/icons';
 import type { CustomerClient } from '../client';
 import { portalPath } from '../routes';
-import { whenText, yuanText } from '../../shared/format';
+import { pointsText, whenText } from '../../shared/format';
 import { useLoadable } from '../../shared/ui';
 
 /// 概览：**首屏只有一个数**——「余额」，外加通往其余四页的入口。
 ///
-/// 这个数是客户**现在能用的钱**（`available_microusd` = 已结算余额 − 持有中）。内部那套"已结算余额／
+/// 这个数是客户**现在能用的钱**（`available_points` = 已结算余额 − 持有中）。内部那套"已结算余额／
 /// 持有中／可用额"的分法、以及"什么时候会动"的机制都只在合同与管理员面出现：客户页面只有一个数、
 /// 一个名字，也不写解释占用与结算的文案（[控制台 Spec](../../../../../docs/specs/0001-admin-and-customer-consoles.md)
 /// C7、§4.3、V-D5；[账户资金 Spec](../../../../../docs/specs/0002-account-funds-and-reservations.md) §4、A7）。
@@ -44,7 +44,7 @@ export function OverviewPage({
           <Statistic
             data-testid="portal-balance"
             title="余额"
-            value={account.data ? yuanText(account.data.available_microusd) : '—'}
+            value={account.data ? pointsText(account.data.available_points) : '—'}
             loading={account.loading}
           />
           {/* 受理与结算都会动这个数：给客户一个自己取准数的地方。 */}

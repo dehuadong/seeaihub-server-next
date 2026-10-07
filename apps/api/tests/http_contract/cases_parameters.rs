@@ -416,6 +416,15 @@ async fn an_image_count_above_the_carriers_maximum_is_capped_at_that_maximum() {
     // 假上游一次只回一张图（它不按请求的 `n` 出图）：这里验的是"请求照常跑完、结果照原形回"，
     // 出图张数与受理时那个数没有保证关系——结算按实际产出算，正是这条裁决的前提。
     assert_sync_success("按承载面的上界发出", &body);
+    // 产出张数按**实际产出**给，不按请求的 `n`（Spec 0005 §8 A13）：假上游只回一张。
+    let images = body["data"]["result"]["images"]
+        .as_array()
+        .expect("result.images is an array");
+    assert_eq!(
+        images.len(),
+        1,
+        "产出张数按实际产出给，不按请求的 6：{body}"
+    );
 
     let submit = harness.submit_body("/v1/images/generations");
     assert_eq!(

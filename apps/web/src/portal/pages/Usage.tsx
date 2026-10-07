@@ -2,16 +2,16 @@ import { Alert, Button, Card, DatePicker, Divider, Flex, Table, Tag, Typography 
 import dayjs from 'dayjs';
 import type { CustomerClient } from '../client';
 import type { CustomerUsageResponse, CustomerUsageRow } from '../../shared/types';
-import { whenText, yuanText } from '../../shared/format';
+import { pointsText, whenText } from '../../shared/format';
 import { usageText } from '../../shared/model-usage';
 import { useLoadable } from '../../shared/ui';
 import { useCursorPage } from '../history';
 import { rangeFromLocalDates, rangeLabel, useHistoryRange } from '../dates';
 
 /// 对客状态的展示文案。取值由服务端收敛，界面只翻译，不自己判断含义。
-function statusLabel(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
+function statusLabel(status: 'completed' | 'failed' | 'pending' | 'canceled'): string {
   switch (status) {
-    case 'succeeded':
+    case 'completed':
       return '成功';
     case 'failed':
       return '未产出';
@@ -22,9 +22,9 @@ function statusLabel(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): s
   }
 }
 
-function statusColor(status: 'succeeded' | 'failed' | 'pending' | 'canceled'): string {
+function statusColor(status: 'completed' | 'failed' | 'pending' | 'canceled'): string {
   switch (status) {
-    case 'succeeded':
+    case 'completed':
       return 'green';
     case 'failed':
       return 'red';
@@ -91,7 +91,7 @@ export function UsagePage({ client }: { client: CustomerClient }) {
       <div data-testid="portal-usage-active-table">
         <Table<CustomerUsageRow>
           size="small"
-          rowKey={(row, index) => `${row.created_at}-${index ?? 0}`}
+          rowKey="id"
           loading={active.loading}
           pagination={false}
           scroll={{ x: 'max-content' }}
@@ -100,6 +100,7 @@ export function UsagePage({ client }: { client: CustomerClient }) {
             emptyText: <Alert type="info" showIcon message="没有正在处理的请求。" />,
           }}
           columns={[
+            { title: '调用标识', dataIndex: 'id' },
             {
               title: '请求时刻',
               dataIndex: 'created_at',
@@ -121,10 +122,10 @@ export function UsagePage({ client }: { client: CustomerClient }) {
               render: (_: unknown, row: CustomerUsageRow) => usageText(row.type, row.usage),
             },
             {
-              title: '扣费（元）',
-              dataIndex: 'charged_microusd',
+              title: '扣费（积分）',
+              dataIndex: 'charged_points',
               align: 'right',
-              render: (value: number) => yuanText(value),
+              render: (value: number) => pointsText(value),
             },
           ]}
         />
@@ -171,7 +172,7 @@ export function UsagePage({ client }: { client: CustomerClient }) {
       <div data-testid="portal-usage-history-table">
         <Table<CustomerUsageRow>
           size="small"
-          rowKey={(row, index) => `${row.terminal_at ?? row.created_at}-${index ?? 0}`}
+          rowKey="id"
           loading={history.loading}
           pagination={false}
           scroll={{ x: 'max-content' }}
@@ -180,6 +181,7 @@ export function UsagePage({ client }: { client: CustomerClient }) {
             emptyText: <Alert type="info" showIcon message="这个区间里没有已结束的请求。" />,
           }}
           columns={[
+            { title: '调用标识', dataIndex: 'id' },
             {
               title: '请求时刻',
               dataIndex: 'created_at',
@@ -205,10 +207,10 @@ export function UsagePage({ client }: { client: CustomerClient }) {
               render: (_: unknown, row: CustomerUsageRow) => usageText(row.type, row.usage),
             },
             {
-              title: '扣费（元）',
-              dataIndex: 'charged_microusd',
+              title: '扣费（积分）',
+              dataIndex: 'charged_points',
               align: 'right',
-              render: (value: number) => yuanText(value),
+              render: (value: number) => pointsText(value),
             },
           ]}
         />

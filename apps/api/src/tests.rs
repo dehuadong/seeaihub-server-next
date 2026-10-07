@@ -9,6 +9,41 @@ use std::{
 };
 use tracing_subscriber::fmt::MakeWriter;
 
+/// 图片项的对客 wire 形状：url 项是地址数组（渠道给过期时刻时带 `expires_at`、不给就没有这个键），
+/// b64_json 项只有内联串。这是 Spec 0005 §8 A13 的那条判据，钉在序列化这一层。
+#[test]
+fn a_sync_image_item_serializes_as_a_url_array_or_inline_base64() {
+    use super::SyncImageItem;
+    use seeai_application::GeneratedImage;
+
+    let with_expiry = SyncImageItem::from(GeneratedImage::from_urls(
+        vec![
+            "https://a.example/1.png".to_owned(),
+            "https://a.example/2.png".to_owned(),
+        ],
+        Some(1_789_000_000),
+    ));
+    assert_eq!(
+        serde_json::to_value(&with_expiry).expect("serializes"),
+        serde_json::json!({
+            "url": ["https://a.example/1.png", "https://a.example/2.png"],
+            "expires_at": 1_789_000_000
+        })
+    );
+    let without_expiry = SyncImageItem::from(GeneratedImage::from_url(
+        "https://a.example/1.png".to_owned(),
+    ));
+    assert_eq!(
+        serde_json::to_value(&without_expiry).expect("serializes"),
+        serde_json::json!({"url": ["https://a.example/1.png"]})
+    );
+    let base64 = SyncImageItem::from(GeneratedImage::from_base64("AAAA".to_owned()));
+    assert_eq!(
+        serde_json::to_value(&base64).expect("serializes"),
+        serde_json::json!({"b64_json": "AAAA"})
+    );
+}
+
 /// 把 tracing 的输出收进内存，好断言"这条错误到底有没有留下痕迹"。
 ///
 /// 用内存而不是子进程的 stderr：这里要验的是**这个转换有没有记日志、记的是不是带来源的那条**，
@@ -282,15 +317,18 @@ fn an_unclosed_fragment_drops_the_rest_of_the_message() {
 // 只有 Linux 有 `VmHWM`：这些用例因此是 Linux 专属（直接执行本身也只在 Linux 上启动）。
 #[cfg(target_os = "linux")]
 mod memory_measurement {
-    use crate::{SyncImageResponse, take_contract_image_inputs};
+    use crate::{
+        SyncImageData, SyncImageItem, SyncImageResponse, SyncImageResult,
+        take_contract_image_inputs,
+    };
     use seeai_adapter_aihubmix::{ADAPTER_KEY as AIHUBMIX_ADAPTER_KEY, AihubmixAdapterFactory};
     use seeai_adapter_sdk::{
         AcceptanceError, AcceptedHandle, Deadline, ExecutionContext, ExternalActionRefused,
         GATEWAY_REQUEST_WIRE_BYTES, GatewayInput, ImageSites, ProviderCredential,
     };
-    use seeai_application::{AdapterFactory, GeneratedImage};
+    use seeai_application::{AdapterFactory, CustomerUsageStatus, GeneratedImage};
     use seeai_domain::{
-        ImageBranch, RequestJsonError, RequestParameters, RequestStructureViolation,
+        ImageBranch, JobId, RequestJsonError, RequestParameters, RequestStructureViolation,
     };
     use serde_json::json;
     use std::sync::Arc;
@@ -502,7 +540,8 @@ mod memory_measurement {
             .images
             .iter()
             .map(|image| match image {
-                GeneratedImage::B64Json(value) | GeneratedImage::Url(value) => value.len(),
+                GeneratedImage::B64Json(value) => value.len(),
+                GeneratedImage::Url { urls, .. } => urls.iter().map(String::len).sum(),
             })
             .sum();
         println!(
@@ -527,8 +566,17 @@ mod memory_measurement {
     fn memory_encoded_client_body_peak() {
         let image_bytes = seeai_adapter_aihubmix::MAX_PROVIDER_RESPONSE_BYTES - 4096;
         let body = SyncImageResponse {
-            created: 1_790_000_000,
-            data: vec![GeneratedImage::from_base64("A".repeat(image_bytes))],
+            code: 200,
+            data: SyncImageData {
+                id: JobId::new(),
+                status: CustomerUsageStatus::Completed,
+                cost: 0,
+                result: SyncImageResult {
+                    images: vec![SyncImageItem::from(GeneratedImage::from_base64(
+                        "A".repeat(image_bytes),
+                    ))],
+                },
+            },
         };
         let before = process_peak_rss_kib();
         let payload = serde_json::to_vec(&body).expect("the client body serializes");
@@ -536,10 +584,17 @@ mod memory_measurement {
         // 信封：合同允许的产出张数上限（`NO_CONTRACT_MAX_OUTPUT_IMAGES = 10`）下、图片字符串之外的
         // 固定开销。空字符串把这一项单独量出来，不带任何图片字节。
         let envelope = SyncImageResponse {
-            created: 1_790_000_000,
-            data: (0..10)
-                .map(|_| GeneratedImage::from_base64(String::new()))
-                .collect(),
+            code: 200,
+            data: SyncImageData {
+                id: JobId::new(),
+                status: CustomerUsageStatus::Completed,
+                cost: 0,
+                result: SyncImageResult {
+                    images: (0..10)
+                        .map(|_| SyncImageItem::from(GeneratedImage::from_base64(String::new())))
+                        .collect(),
+                },
+            },
         };
         let envelope_bytes = serde_json::to_vec(&envelope)
             .expect("the envelope serializes")

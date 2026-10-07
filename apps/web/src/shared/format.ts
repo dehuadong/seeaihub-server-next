@@ -16,6 +16,11 @@ export function yuanText(micros: number): string {
   return `${yuan(micros)} 元`;
 }
 
+/// 对客金额 → 展示用的积分。对客金额本来就是整数积分，**不换算、不带小数**；负数照实显示。
+export function pointsText(points: number): string {
+  return `${points} 积分`;
+}
+
 /// 时间戳按本地时区展示；空值原样显示为 `—`，不猜。
 export function when(value: string | null | undefined): string {
   if (!value) return '—';

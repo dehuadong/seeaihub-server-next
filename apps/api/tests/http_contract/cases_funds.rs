@@ -7,16 +7,28 @@ const SLOW_UPSTREAM_MS: u64 = 3_000;
 const SLOW_SYNC_WAIT_SECONDS: u64 = 30;
 
 /// 账户读必须同时给出三项，且 `available = balance − held`（账户资金 Spec `0002` §4、A7）。
-fn assert_account_triplet(what: &str, body: &Value, balance: i64, held: i64) {
+///
+/// 期望值按 **CNY 微单位**给：管理端响应就是微单位；对客响应是积分（1积分 = 1000 微单位），
+/// 这里按响应自带的字段名判定单位、换算后再比，调用方不必为两种单位各写一遍期望。
+fn assert_account_triplet(what: &str, body: &Value, balance_microusd: i64, held_microusd: i64) {
+    let points = body.get("balance_points").is_some();
+    let (balance_field, held_field, available_field) = if points {
+        ("balance_points", "held_points", "available_points")
+    } else {
+        ("balance_microusd", "held_microusd", "available_microusd")
+    };
+    let unit = |microusd: i64| if points { microusd / 1_000 } else { microusd };
+    let balance = unit(balance_microusd);
+    let held = unit(held_microusd);
     assert_eq!(
-        body["balance_microusd"].as_i64(),
+        body[balance_field].as_i64(),
         Some(balance),
         "{what}：{body}"
     );
-    assert_eq!(body["held_microusd"].as_i64(), Some(held), "{what}：{body}");
-    let available = body["available_microusd"]
+    assert_eq!(body[held_field].as_i64(), Some(held), "{what}：{body}");
+    let available = body[available_field]
         .as_i64()
-        .unwrap_or_else(|| panic!("{what} 必须给 available_microusd：{body}"));
+        .unwrap_or_else(|| panic!("{what} 必须给 {available_field}：{body}"));
     assert_eq!(
         available,
         balance - held,
@@ -123,7 +135,7 @@ async fn account_reads_return_settled_balance_held_and_available_together() {
         .json()
         .await
         .expect("admin account body");
-    assert_account_triplet("管理员账户读", &admin, 1_000, 60);
+    assert_account_triplet("管理员账户读", &admin, 1_000, 1_000);
 
     let own: Value = client
         .get(format!("{}/v1/account", harness.base_url))
@@ -134,7 +146,7 @@ async fn account_reads_return_settled_balance_held_and_available_together() {
         .json()
         .await
         .expect("own account body");
-    assert_account_triplet("对客 Key 账户读", &own, 1_000, 60);
+    assert_account_triplet("对客 Key 账户读", &own, 1_000, 1_000);
 
     // 客户会话读：先给这个账户配上登录身份，再登录拿会话。
     let email = format!("funds-{}@example.com", Uuid::new_v4());
@@ -171,16 +183,16 @@ async fn account_reads_return_settled_balance_held_and_available_together() {
         .json()
         .await
         .expect("customer account body");
-    assert_account_triplet("客户会话账户读", &customer, 1_000, 60);
+    assert_account_triplet("客户会话账户读", &customer, 1_000, 1_000);
 
     request.abort();
     harness.cleanup().await;
 }
 
-/// 同一账户的并发受理共同遵守同一可用额：余额 100、两笔各 60，最多一笔占用成立（A2）。
+/// 同一账户的并发受理共同遵守同一可用额：余额 1000（1积分）、两笔各占 1000，最多一笔成立（A2）。
 ///
-/// 第二笔必须由数据库的条件更新拒绝——若受理只比余额、不看已有占用，两笔会同时成立，
-/// 库里就会留下 120 的占用而余额只有 100。
+/// 保底额 60 落账前向上取整到 1000（1积分），所以两笔各占 1000。第二笔必须由数据库的条件更新
+/// 拒绝——若受理只比余额、不看已有占用，两笔会同时成立，库里就会留下 2000 的占用而余额只有 1000。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() {
@@ -201,7 +213,7 @@ async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() 
         StatusCode::OK
     );
     let (account_id, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 100).await;
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000).await;
 
     let first_key = format!("funds-concurrent-a-{}", Uuid::new_v4());
     let first = accept_without_worker(&harness, &api_key, &first_key, "first reservation").await;
@@ -230,13 +242,13 @@ async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() 
     // 库里只有一笔占用；已结算余额没有被预授权动过。
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        100,
+        1_000,
         "预授权不改已结算余额"
     );
     assert_eq!(
         held_in_db(&harness, &account_id).await,
-        60,
-        "只有一笔 60 的占用成立"
+        1_000,
+        "只有一笔 1000（整积分）的占用成立"
     );
     let jobs: i64 =
         sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
@@ -254,8 +266,8 @@ async fn concurrent_reservations_cannot_both_occupy_the_same_available_amount() 
 
 /// 同一幂等键的重发返回原请求，不再次占用（A2）。
 ///
-/// 余额故意给足（1000）：若重发被当成新请求，它会**成功**再占 60，库里因此留下两条 Job 与
-/// 120 的占用；只有真正去重成原来那条 Job，才会仍然是一条、60。
+/// 余额故意给足（2000）：若重发被当成新请求，它会**成功**再占 1000，库里因此留下两条 Job 与
+/// 2000 的占用；只有真正去重成原来那条 Job，才会仍然是一条、1000。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_replayed_idempotency_key_does_not_reserve_again() {
@@ -276,7 +288,7 @@ async fn a_replayed_idempotency_key_does_not_reserve_again() {
         StatusCode::OK
     );
     let (account_id, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000).await;
+        funded_account(&client, &harness.base_url, &harness.admin_token, 2_000).await;
 
     let key = format!("funds-replay-{}", Uuid::new_v4());
     let first = accept_without_worker(&harness, &api_key, &key, "replay reservation").await;
@@ -297,7 +309,7 @@ async fn a_replayed_idempotency_key_does_not_reserve_again() {
     );
     assert_eq!(
         held_in_db(&harness, &account_id).await,
-        60,
+        1_000,
         "重发不重复占用"
     );
     let jobs: i64 =
@@ -393,8 +405,8 @@ async fn a_settlement_with_zero_charge_writes_no_capture_entry() {
 
 /// 实收低于预授权额时，未花的部分只恢复可用额、不产生退款流水（`0002` §2.3、A1）。
 ///
-/// 2K 的预授权额是 250000，实收 43680：结算后占用清零、已结算余额只减实收；账上只有充值与
-/// 实收两条，没有把差额退回来的调整分录。可用额从 `余额 − 250000` 回到 `余额 − 43680`。
+/// 2K 的预授权额是 250000，实收 43680 取整到 44000：结算后占用清零、已结算余额只减实收；
+/// 账上只有充值与实收两条，没有把差额退回来的调整分录。可用额从 `余额 − 250000` 回到 `余额 − 44000`。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_charge_below_the_authorized_hold_only_restores_available_without_a_refund() {
@@ -471,8 +483,8 @@ async fn a_charge_below_the_authorized_hold_only_restores_available_without_a_re
         .await
         .expect("own account body");
     assert_eq!(
-        own["available_microusd"].as_i64(),
-        Some(1_000_000 - charge),
+        own["available_points"].as_i64(),
+        Some((1_000_000 - charge) / 1_000),
         "{own}"
     );
     harness.cleanup().await;

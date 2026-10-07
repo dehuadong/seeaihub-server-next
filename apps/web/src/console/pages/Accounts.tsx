@@ -356,7 +356,7 @@ export function AccountsPage({
 
 /// 调用明细里的状态：与对客那条读同一套收敛取值，运营看中文。
 const USAGE_STATUS: Record<string, string> = {
-  succeeded: '成功',
+  completed: '成功',
   failed: '失败',
   pending: '进行中',
   canceled: '已取消',
@@ -707,7 +707,7 @@ function UsageModule({ client, accountId }: { client: AdminClient; accountId: st
             title: '状态',
             dataIndex: 'status',
             render: (value: string) => (
-              <Tag color={value === 'succeeded' ? 'green' : 'default'}>
+              <Tag color={value === 'completed' ? 'green' : 'default'}>
                 {USAGE_STATUS[value] ?? value}
               </Tag>
             ),

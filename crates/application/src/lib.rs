@@ -18,7 +18,7 @@ use seeai_domain::{
     declares_mask_parameter, declares_parameter, declares_reference_image_parameter,
     image_parameter_kind, is_used_parameter_value, literal_parameter_text, place_image_inputs,
     platform_image_parameters, resolve_size_tier, unit_amount_microusd, validate_image_inputs,
-    wire_parameter_name,
+    whole_points_microusd, wire_parameter_name,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
@@ -2302,7 +2302,7 @@ pub struct CustomerUsageView {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum CustomerUsageStatus {
-    Succeeded,
+    Completed,
     Failed,
     Pending,
     Canceled,
@@ -2323,7 +2323,7 @@ pub enum CustomerUsageKind {
 #[must_use]
 pub fn customer_usage_status(state: seeai_domain::JobState) -> CustomerUsageStatus {
     match state {
-        seeai_domain::JobState::Succeeded => CustomerUsageStatus::Succeeded,
+        seeai_domain::JobState::Succeeded => CustomerUsageStatus::Completed,
         seeai_domain::JobState::Failed => CustomerUsageStatus::Failed,
         // 对账中不是终态：结果未定，对客显示"处理中"。
         seeai_domain::JobState::ReconciliationRequired => CustomerUsageStatus::Pending,
@@ -4464,6 +4464,8 @@ impl AccountsService {
         tag: Option<&str>,
         actor: &str,
     ) -> Result<AccountId, ApplicationError> {
+        // 初始充值也是对客金额：落账前取整到整积分（Spec 0002 §1）。
+        let initial_credit_microusd = whole_points_microusd(initial_credit_microusd);
         let account_id = AccountId::new();
         let change = match name {
             // 调用方给了名称：只有这一个候选，撞名就是冲突。
@@ -4518,6 +4520,8 @@ impl AccountsService {
         business_key: &str,
         actor: &str,
     ) -> Result<(), ApplicationError> {
+        // 充值也是对客金额：落账前取整到整积分（Spec 0002 §1）。
+        let amount_microusd = whole_points_microusd(amount_microusd);
         let change = self
             .repository
             .credit_account(account_id, amount_microusd, business_key, actor)
@@ -6974,7 +6978,7 @@ pub(crate) async fn freeze_offering_pricing(
         })
     };
     if offering.price_snapshot.floor_amounts.is_none() {
-        return scale(max_cost_microusd);
+        return Ok(whole_points_microusd(scale(max_cost_microusd)?));
     }
     let table = offering
         .price_snapshot
@@ -7004,7 +7008,7 @@ pub(crate) async fn freeze_offering_pricing(
             literal_parameter_text(native_parameters, "quality"),
         )
         .unwrap_or((max_cost_microusd, HoldSource::PlatformDefault));
-    let hold_microusd = scale(per_image_microusd)?;
+    let hold_microusd = whole_points_microusd(scale(per_image_microusd)?);
     offering.price_snapshot.hold_microusd = Some(hold_microusd);
     offering.price_snapshot.hold_source = Some(hold_source);
     Ok(hold_microusd)

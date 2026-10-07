@@ -15,8 +15,8 @@ import {
 import dayjs from 'dayjs';
 import { useState } from 'react';
 import type { CustomerClient } from '../client';
-import type { CustomerLedgerResponse, LedgerEntry } from '../../shared/types';
-import { whenText, yuanText } from '../../shared/format';
+import type { CustomerLedgerEntry, CustomerLedgerResponse } from '../../shared/types';
+import { pointsText, whenText } from '../../shared/format';
 import { MODEL_TYPES, modelTypeLabel, usageText } from '../../shared/model-usage';
 import { useLoadable } from '../../shared/ui';
 import { useCursorPage } from '../history';
@@ -57,9 +57,9 @@ const LEDGER_PAGE = 20;
 /// 有符号净额的展示：负值以正数金额标"净支出"，正值标"净返还"，零标"收支相抵"。
 ///
 /// 不把净额除以请求数并称作平均扣费——那是 Spec §4.3 明确禁止的口径。
-function netText(microusd: number): string {
-  if (microusd === 0) return '收支相抵';
-  return microusd < 0 ? `净支出 ${yuanText(-microusd)}` : `净返还 ${yuanText(microusd)}`;
+function netText(points: number): string {
+  if (points === 0) return '收支相抵';
+  return points < 0 ? `净支出 ${pointsText(-points)}` : `净返还 ${pointsText(points)}`;
 }
 
 /// 账单与资金记录：**同一个日期区间**驱动区间汇总与真实收支流水。
@@ -84,7 +84,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
     [client, range.since, range.until, kind],
   );
   /// 续页挂在当前这一份流水第一页上：重取、换区间或换类别都会换第一页，续页随之作废。
-  const more = useCursorPage<LedgerEntry, CustomerLedgerResponse>(ledger.data, async (cursor) => {
+  const more = useCursorPage<CustomerLedgerEntry, CustomerLedgerResponse>(ledger.data, async (cursor) => {
     const page = await client.ledger({
       since: range.since,
       until: range.until,
@@ -168,7 +168,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
             <span data-testid="portal-billing-net">
               <Statistic
                 title="扣费净额"
-                value={billing.data ? netText(billing.data.charged_microusd) : '—'}
+                value={billing.data ? netText(billing.data.charged_points) : '—'}
                 loading={billing.loading}
               />
             </span>
@@ -195,7 +195,7 @@ export function BillingPage({ client }: { client: CustomerClient }) {
         {ledger.error ? <Alert type="error" showIcon message={ledger.error} /> : null}
         {more.error ? <Alert type="error" showIcon message={more.error} /> : null}
         <div data-testid="portal-ledger-table">
-          <Table<LedgerEntry>
+          <Table<CustomerLedgerEntry>
             size="small"
             rowKey={(entry, index) => `${entry.created_at}-${index ?? 0}`}
             loading={ledger.loading}
@@ -229,12 +229,12 @@ export function BillingPage({ client }: { client: CustomerClient }) {
                 ),
               },
               {
-                title: '金额（元）',
-                dataIndex: 'amount_microusd',
+                title: '金额（积分）',
+                dataIndex: 'amount_points',
                 align: 'right',
                 render: (value: number) => (
                   <Typography.Text type={value < 0 ? 'danger' : undefined}>
-                    {yuanText(value)}
+                    {pointsText(value)}
                   </Typography.Text>
                 ),
               },

@@ -135,10 +135,14 @@ pub struct DirectExecutionCall {
 }
 
 /// 一次直接执行的成功结果：`payload` 只在本进程内存里，不落库。
+///
+/// `charge_microusd` 是这次落账的实收（整积分，见 [`seeai_domain::whole_points_microusd`]）：
+/// 对客响应要用它报本次实付，不能再去读库或重算。
 pub struct DirectExecutionSuccess {
     pub job_id: JobId,
     pub attempt_id: AttemptId,
     pub payload: ResponsePayload,
+    pub charge_microusd: u64,
 }
 
 /// 一次收尾里**已经取得、可能来不及在当前所有权下正式结算**的账务事实。
@@ -1218,14 +1222,12 @@ impl DirectExecutionService {
         if tokio::time::Instant::now() >= total_deadline {
             return Err(DirectExecutionError::ResultDeliveryTimeout);
         }
-        let mut payload = output.response_payload;
-        if payload.created.is_none() {
-            payload.created = Some(Utc::now().timestamp());
-        }
+        let payload = output.response_payload;
         Ok(DirectExecutionSuccess {
             job_id,
             attempt_id,
             payload,
+            charge_microusd: charge,
         })
     }
 

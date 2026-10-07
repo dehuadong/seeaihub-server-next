@@ -1,7 +1,8 @@
 /// 管理端视图的类型。字段按**真实响应**写（`crates/application` 的视图结构与
 /// `apps/api/src/main.rs` 的响应结构体逐字核对过），不按想象写。
 ///
-/// 金额一律是**微单位**（microusd）：展示层负责换算，传输与判断都用整数。
+/// 金额分两个平面：**管理端**是 CNY 微单位（`_microusd`），展示层换算成元；**对客**是**积分**
+/// （`_points`，整数，1元 = 1000积分），展示层直接显示，不换算。
 
 export interface ConsumerRatesCny {
   text_input_micros_per_million: number;
@@ -219,7 +220,7 @@ export interface LedgerEntry {
 export interface AdminUsageRow {
   job_id: string;
   gateway_model: string;
-  status: 'succeeded' | 'failed' | 'pending' | 'canceled';
+  status: 'completed' | 'failed' | 'pending' | 'canceled';
   kind: 'generation' | 'edit';
   created_at: string;
   /// 模型类型：受理时引用的 Vendor Model 的类型。
@@ -277,17 +278,17 @@ export interface PublicModelsResponse {
 }
 
 /// 对客账户面：已结算余额、持有中与可用额分开给，三者在同一时点满足
-/// `available = balance − held`。客户控制台只把这个数字显示成一个「余额」——取
-/// `available_microusd`（客户现在能用的钱），不分别展示已结算余额、持有中或可用额，也不显示单笔
-/// 预授权额（账户资金 Spec `0002` §4；控制台 Spec `0001` C7、V-D5）。
+/// `available = balance − held`。三个数都是**积分**（整数）。客户控制台只把这个数字显示成一个
+/// 「余额」——取 `available_points`（客户现在能用的钱），不分别展示已结算余额、持有中或可用额，
+/// 也不显示单笔预授权额（账户资金 Spec `0002` §4；控制台 Spec `0001` C7、V-D5）。
 export interface OwnAccount {
   /// 自己的账户名称：客户可在账户设置里改（规则见账户名称 Spec）。
   name: string;
-  balance_microusd: number;
+  balance_points: number;
   /// 已受理未结清的占用合计。接口返回，但客户页面不作为单独的数展示。
-  held_microusd: number;
+  held_points: number;
   /// 可用额 = 已结算余额 − 持有中。客户页面那个「余额」取的就是它。
-  available_microusd: number;
+  available_points: number;
   updated_at: string;
 }
 
@@ -311,11 +312,13 @@ export interface CustomerKeysResponse {
   keys: CustomerKey[];
 }
 
-/// 用量里的一次生成请求：执行记录的**对客投影**，不含 Job 标识与内部状态。
+/// 用量里的一次生成请求：执行记录的**对客投影**，不含内部状态。
 export interface CustomerUsageRow {
+  /// 这次调用的标识；与生成响应里的 `data.id` 是同一条。
+  id: string;
   gateway_model: string;
-  /// 对客状态：`succeeded` / `failed` / `pending` / `canceled`（内部 Job 状态收敛过的取值）。
-  status: 'succeeded' | 'failed' | 'pending' | 'canceled';
+  /// 对客状态：`completed` / `failed` / `pending` / `canceled`（内部 Job 状态收敛过的取值）。
+  status: 'completed' | 'failed' | 'pending' | 'canceled';
   /// `generation` / `edit`。
   kind: 'generation' | 'edit';
   created_at: string;
@@ -325,7 +328,8 @@ export interface CustomerUsageRow {
   type: ModelType;
   /// 本次执行按类型给出的量。
   usage: UsageAmounts;
-  charged_microusd: number;
+  /// 本次对客实收，积分整数。
+  charged_points: number;
 }
 
 export interface CustomerUsageResponse {
@@ -336,9 +340,20 @@ export interface CustomerUsageResponse {
   next_cursor: string | null;
 }
 
+/// 对客资金流水的一条：与管理员那条同形，但金额是**积分**（对客平面）。
+export interface CustomerLedgerEntry {
+  account_id: string;
+  /// `credit` / `capture` / `adjustment`，与落库取值同名。预授权与平台成本不作为对客流水。
+  kind: string;
+  /// 积分；入账为正，实收为负，正式调整按资金增减带符号。
+  amount_points: number;
+  job_id: string | null;
+  created_at: string;
+}
+
 /// 对客资金流水响应：与管理员那条同形，外加翻页定位与同一条件下的总数。
 export interface CustomerLedgerResponse {
-  entries: LedgerEntry[];
+  entries: CustomerLedgerEntry[];
   count: number;
   /// 同一套区间与类别条件下的总条数（与 `count` 不同：本页条数）。
   total: number;
@@ -365,5 +380,6 @@ export interface CustomerBilling {
   requests: number;
   /// 区间内按类型分别合计的量；某类型没有值时对应的键缺省。
   usage: UsageAmounts;
-  charged_microusd: number;
+  /// 实际扣费与正式调整的有符号净额，积分整数；负数表示净支出。
+  charged_points: number;
 }

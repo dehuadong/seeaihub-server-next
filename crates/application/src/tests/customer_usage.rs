@@ -16,7 +16,7 @@ fn every_job_state_maps_to_the_contracted_consumer_status() {
             JobState::ReconciliationRequired,
             CustomerUsageStatus::Pending,
         ),
-        (JobState::Succeeded, CustomerUsageStatus::Succeeded),
+        (JobState::Succeeded, CustomerUsageStatus::Completed),
         (JobState::Failed, CustomerUsageStatus::Failed),
         (JobState::Canceled, CustomerUsageStatus::Canceled),
     ];

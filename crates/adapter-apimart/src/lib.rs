@@ -411,6 +411,9 @@ struct TaskResult {
 struct TaskImage {
     #[serde(default)]
     url: Vec<String>,
+    /// 渠道声明的结果地址过期时刻（Unix 秒）；不给就是 `None`，平台不推算。
+    #[serde(default)]
+    expires_at: Option<i64>,
 }
 
 #[derive(Debug, Deserialize)]
@@ -471,19 +474,24 @@ impl TaskData {
         })
     }
 
-    fn image_urls(&self) -> Result<Vec<String>, AdapterError> {
-        let urls: Vec<String> = self
+    /// 终态里的图片项：**一项 = 渠道的一张图**，`urls` 是渠道为这张图给出的全部地址。
+    ///
+    /// 地址数组不摊平：摊平会让"一张图给了多个地址"被算成多张，产出张数与按张计费随之漂移。
+    /// 地址为空的项不是一张图，丢掉；一项都没有时按结果缺失失败。
+    fn images(&self) -> Result<Vec<GeneratedImage>, AdapterError> {
+        let images: Vec<GeneratedImage> = self
             .result
             .as_ref()
             .map(|result| {
                 result
                     .images
                     .iter()
-                    .flat_map(|image| image.url.iter().cloned())
+                    .filter(|image| !image.url.is_empty())
+                    .map(|image| GeneratedImage::from_urls(image.url.clone(), image.expires_at))
                     .collect()
             })
             .unwrap_or_default();
-        if urls.is_empty() {
+        if images.is_empty() {
             return Err(provider_error(
                 "provider_result_missing",
                 "completed task carried no image url".to_owned(),
@@ -491,7 +499,7 @@ impl TaskData {
                 ProviderFailureKind::Unknown,
             ));
         }
-        Ok(urls)
+        Ok(images)
     }
 
     fn response_digest(&self, task_id: &str) -> String {
@@ -1048,11 +1056,8 @@ impl ApimartImageAdapter {
             .map_err(|error| with_provider_cost(error, provider_cost.clone()))?;
         let digest = task.response_digest(task_id);
         let images = task
-            .image_urls()
-            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?
-            .into_iter()
-            .map(GeneratedImage::from_url)
-            .collect::<Vec<_>>();
+            .images()
+            .map_err(|error| with_provider_cost(error, provider_cost.clone()))?;
         if images.is_empty() {
             return Err(with_provider_cost(
                 provider_error(
@@ -1066,11 +1071,7 @@ impl ApimartImageAdapter {
         }
         let image_count = u32::try_from(images.len()).unwrap_or(u32::MAX);
         Ok(ProviderOutput {
-            response_payload: ResponsePayload {
-                // 应用层按自己的时钟兜底 `created`；任务面不提供它。
-                created: None,
-                images,
-            },
+            response_payload: ResponsePayload { images },
             accounting_facts: AccountingFacts {
                 usage: Some(usage),
                 provider_cost,
@@ -1218,7 +1219,7 @@ impl GatewayAdapter for ApimartImageAdapter {
                 accounting_facts: None,
             });
         }
-        let image_count = u32::try_from(task.image_urls().map(|urls| urls.len()).unwrap_or(0))
+        let image_count = u32::try_from(task.images().map(|images| images.len()).unwrap_or(0))
             .unwrap_or(u32::MAX);
         Ok(AccountingQuery {
             state,

@@ -67,7 +67,7 @@ admitted → executing → succeeded
 
 没有领取阶段：执行由发起这次请求的 API 进程直接持有并完成。Job 固化：Vendor Model Revision、派生分支、Offering、Adapter、Channel、Published Revision、请求指纹与幂等摘要、Price Snapshot。发布或改价后，已受理 Job 不重新解释输入。事实权威见 `docs/adr/0003-postgresql-is-source-of-truth.md`。
 
-HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations` 与 `/v1/images/edits`，两个路径接受同一个 JSON 请求。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{created, data:[{url|b64_json}]}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，不投射成对客协议。图片取值只收 `http(s)` 公网 URL，不是公网 URL 的取值在受理前被拒；合同见 [Spec 0005](../specs/0005-synchronous-image-gateway.md) §1、§3。
+HTTP 只是应用命令的适配层，对客**只有两条路径、同一个能力**：`/v1/images/generations` 与 `/v1/images/edits`，两个路径接受同一个 JSON 请求。**分支只看请求里有没有参考图/遮罩**，**不按端点断言**——带图的 generations 与不带图的 edits 都合法。两条都走同一个受理路径（`CreateImageGenerationRequest`），只做请求解码，不能自己选路、计费或调用 Provider。**形态是同步的**（2026-09-20 定）：受理后等 Job 到终态，成功回 `{code, data:{id, status, cost, result:{images[]}}}`——渠道给哪种形态就回哪种；失败回错误信封。没有 202 受理、没有 job_id 轮询：Job 是**内部执行/审计记录**，对客只暴露它的标识。图片取值只收 `http(s)` 公网 URL，不是公网 URL 的取值在受理前被拒；合同见 [Spec 0005](../specs/0005-synchronous-image-gateway.md) §1、§3。
 
 ## 4. 执行路径与接口职责
 

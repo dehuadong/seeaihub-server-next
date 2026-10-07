@@ -82,7 +82,7 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
     let rows = usage["usage"].as_array().expect("usage array");
     assert_eq!(rows.len(), 1, "这一笔请求必须出现在用量里：{usage}");
     let row = &rows[0];
-    assert_eq!(row["status"], json!("succeeded"));
+    assert_eq!(row["status"], json!("completed"));
     assert_eq!(row["kind"], json!("generation"));
     // 产出张数落在 `image_count`：这一笔实际产出一张，用量读的就是那个落点。
     assert_eq!(row["type"], json!("image"), "{usage}");
@@ -105,9 +105,21 @@ async fn a_customer_sees_its_own_usage_with_the_amount_the_ledger_charged() {
     .await
     .expect("ledger capture sum");
     assert_eq!(
-        row["charged_microusd"],
-        json!(charged),
-        "用量里的扣费必须来自账本"
+        row["charged_points"],
+        json!(charged / 1_000),
+        "用量里的扣费必须来自账本（积分 = 微单位 / 1000）"
+    );
+    // 生成响应与用量记录是同一条事实（Spec 0005 §8 A13）：`id` 是同一个调用标识，
+    // `cost` 是同一条扣费。
+    assert_eq!(
+        body["data"]["id"], row["id"],
+        "生成响应的 id 必须与用量记录的调用标识一致：{body}"
+    );
+    // 响应的 `cost` 是正数金额，用量记录的扣费按既有约定带符号（扣费为负）：比金额。
+    assert_eq!(
+        body["data"]["cost"].as_i64(),
+        row["charged_points"].as_i64().map(i64::abs),
+        "生成响应的 cost 必须等于用量记录里那一笔扣费的金额：{body}"
     );
 
     // 管理端读同一条记录：类型与用量与客户侧一致（Spec A2）。
@@ -252,10 +264,10 @@ async fn the_billing_summary_does_not_shrink_with_the_detail_page_size() {
         .as_array()
         .expect("usage array")
         .iter()
-        .map(|row| row["charged_microusd"].as_i64().expect("charged"))
+        .map(|row| row["charged_points"].as_i64().expect("charged"))
         .sum();
     assert_eq!(
-        billing["charged_microusd"],
+        billing["charged_points"],
         json!(summed),
         "汇总的扣费总额必须等于全量明细的求和"
     );
@@ -325,8 +337,8 @@ async fn a_customer_reads_balance_and_held_separately() {
         .json::<Value>()
         .await
         .expect("account body");
-    assert_eq!(account["balance_microusd"], json!(3_000_000));
-    assert_eq!(account["held_microusd"], json!(0), "没有在飞请求时持有为 0");
+    assert_eq!(account["balance_points"], json!(3_000));
+    assert_eq!(account["held_points"], json!(0), "没有在飞请求时持有为 0");
 
     // 流水里能看到那笔充值（Spec C8）。
     let ledger = client
@@ -459,7 +471,7 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
         json!(0),
         "until 在请求之前时不该算进来"
     );
-    assert_eq!(excluded["charged_microusd"], json!(0));
+    assert_eq!(excluded["charged_points"], json!(0));
 
     // 库里按类型分别求和：扣费总额等于 `capture`，**不是** `capture + hold + release`。
     let sums: Vec<(String, i64)> = sqlx::query_as(
@@ -484,8 +496,8 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
     assert!(capture < 0, "夹具应当真的扣了一笔：{sums:?}");
     assert_eq!(holds, 0, "hold 与 release 应当正好抵消：{sums:?}");
     assert_eq!(
-        included["charged_microusd"],
-        json!(capture),
+        included["charged_points"],
+        json!(capture / 1_000),
         "扣费总额必须等于 capture 的求和，不能把 hold/release 算进来"
     );
 
@@ -512,11 +524,11 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
         .expect("entries")
         .iter()
         .filter(|entry| matches!(entry["kind"].as_str(), Some("capture") | Some("adjustment")))
-        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .map(|entry| entry["amount_points"].as_i64().expect("amount"))
         .sum();
     assert_eq!(
         json!(ledger_charges),
-        included["charged_microusd"],
+        included["charged_points"],
         "同一区间下明细里扣费条目之和必须等于汇总报的扣费总额：ledger={ledger} billing={included}"
     );
 
@@ -540,14 +552,14 @@ async fn the_billing_window_is_half_open_and_ignores_holds() {
         .expect("entries")
         .iter()
         .filter(|entry| matches!(entry["kind"].as_str(), Some("capture") | Some("adjustment")))
-        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .map(|entry| entry["amount_points"].as_i64().expect("amount"))
         .sum();
     assert_eq!(
         charges_before, 0,
         "界外的扣费不该出现在明细里：{ledger_before}"
     );
     assert_eq!(
-        excluded["charged_microusd"],
+        excluded["charged_points"],
         json!(0),
         "汇总同一条口径：{excluded}"
     );
@@ -814,7 +826,7 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         json!(0),
         "跨天结算的那一笔不该落在受理日：{request_day_billing}"
     );
-    assert_eq!(request_day_billing["charged_microusd"], json!(0));
+    assert_eq!(request_day_billing["charged_points"], json!(0));
     assert!(
         request_day_billing["usage"].get("images").is_none(),
         "受理日没有已完成的图片请求，用量键缺省：{request_day_billing}"
@@ -832,8 +844,8 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         "结算日的那笔产出一张，随终态时刻入桶"
     );
     assert_eq!(
-        settled_day_billing["charged_microusd"],
-        json!(capture),
+        settled_day_billing["charged_points"],
+        json!(capture / 1_000),
         "结算日的扣费就是那笔 capture"
     );
 
@@ -901,8 +913,8 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         .expect("usage body");
     assert_eq!(settled_day_usage["count"], json!(1));
     let row = &settled_day_usage["usage"][0];
-    assert_eq!(row["status"], json!("succeeded"));
-    assert_eq!(row["charged_microusd"], json!(capture));
+    assert_eq!(row["status"], json!("completed"));
+    assert_eq!(row["charged_points"], json!(capture / 1_000));
     let row_terminal_at = row["terminal_at"].as_str().expect("用量行要给出终态时刻");
     assert_eq!(
         chrono::DateTime::parse_from_rfc3339(row_terminal_at)
@@ -914,7 +926,7 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
 
     let combined = read_billing(&request_day, &next_day).await;
     assert_eq!(combined["requests"], json!(1));
-    assert_eq!(combined["charged_microusd"], json!(capture));
+    assert_eq!(combined["charged_points"], json!(capture / 1_000));
 
     harness.cleanup().await;
 }
@@ -1034,11 +1046,7 @@ async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
         json!("pending"),
         "对账中的请求对客显示处理中：{usage}"
     );
-    assert_eq!(
-        row["charged_microusd"],
-        json!(0),
-        "没结算就没有扣费：{usage}"
-    );
+    assert_eq!(row["charged_points"], json!(0), "没结算就没有扣费：{usage}");
     assert_eq!(row["type"], json!("image"), "{usage}");
     assert_eq!(row["usage"]["images"], json!(0), "没有交付结果图：{usage}");
 
@@ -1084,7 +1092,7 @@ async fn an_unfinished_job_shows_up_in_usage_but_not_in_billing() {
         "没有已完成的图片请求，用量键缺省：{billing}"
     );
     assert_eq!(
-        billing["charged_microusd"],
+        billing["charged_points"],
         json!(0),
         "没结算就没有已扣费额：{billing}"
     );
@@ -1174,7 +1182,7 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
     .await
     .expect("shift the capture away from the terminal time");
 
-    let adjustment = -12_345_i64;
+    let adjustment = -12_000_i64;
     sqlx::query(
         "INSERT INTO ledger.entries (id, account_id, job_id, kind, amount_microusd, business_key)
          VALUES ($1,$2,NULL,'adjustment',$3,$4)",
@@ -1223,11 +1231,12 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
         .as_array()
         .expect("usage array")
         .iter()
-        .map(|row| row["charged_microusd"].as_i64().expect("charged"))
+        .map(|row| row["charged_points"].as_i64().expect("charged"))
         .sum();
     assert_eq!(
-        usage_sum, captures,
-        "已完成用量逐笔扣费合计必须等于实际扣费流水：usage={usage}"
+        usage_sum,
+        captures / 1_000,
+        "已完成用量逐笔扣费合计必须等于实际扣费流水（积分 = 微单位 / 1000）：usage={usage}"
     );
 
     // 按**结算日**窗口读那一笔错开时刻的用量：它按终态时刻出现，逐笔扣费必须是这个 Job 的完整
@@ -1258,8 +1267,8 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
         "错开时刻的那一笔仍按终态时刻归属到结算日：{shifted_usage}"
     );
     assert_eq!(
-        shifted_usage["usage"][0]["charged_microusd"],
-        json!(shifted_capture),
+        shifted_usage["usage"][0]["charged_points"],
+        json!(shifted_capture / 1_000),
         "用量行必须返回该 Job 的完整 capture，不能按流水入账时刻过滤：{shifted_usage}"
     );
 
@@ -1273,8 +1282,8 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
         .await
         .expect("billing body");
     assert_eq!(
-        billing["charged_microusd"],
-        json!(captures + adjustment),
+        billing["charged_points"],
+        json!((captures + adjustment) / 1_000),
         "账单净额 = 实际扣费 + 正式调整：billing={billing}"
     );
 
@@ -1291,21 +1300,21 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
     let adjustments: Vec<i64> = entries
         .iter()
         .filter(|entry| entry["kind"].as_str() == Some("adjustment"))
-        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .map(|entry| entry["amount_points"].as_i64().expect("amount"))
         .collect();
     assert_eq!(
         adjustments,
-        vec![adjustment],
+        vec![adjustment / 1_000],
         "正式调整必须单独列示：{ledger}"
     );
     let ledger_net: i64 = entries
         .iter()
         .filter(|entry| matches!(entry["kind"].as_str(), Some("capture") | Some("adjustment")))
-        .map(|entry| entry["amount_microusd"].as_i64().expect("amount"))
+        .map(|entry| entry["amount_points"].as_i64().expect("amount"))
         .sum();
     assert_eq!(
         json!(ledger_net),
-        billing["charged_microusd"],
+        billing["charged_points"],
         "同一区间下扣费与调整之和等于账单净额：ledger={ledger} billing={billing}"
     );
 

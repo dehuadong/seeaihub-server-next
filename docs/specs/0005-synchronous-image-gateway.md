@@ -1,8 +1,8 @@
 主题: 同步图片网关与最小执行记录
-当前修订: v4
-生效修订: v4
+当前修订: v5
+生效修订: v5
 状态: 已接受
-依赖: [账户资金 Spec v4](0002-account-funds-and-reservations.md)、[图片上传与对象存储 Spec](0007-image-upload-and-object-storage.md) v2、[结算证据门槛](../adr/0006-no-settlement-without-metering-evidence.md)
+依赖: [账户资金 Spec v5](0002-account-funds-and-reservations.md)、[控制台 Spec](0001-admin-and-customer-consoles.md) C9、[图片上传与对象存储 Spec](0007-image-upload-and-object-storage.md) v2、[结算证据门槛](../adr/0006-no-settlement-without-metering-evidence.md)
 
 # 同步图片网关与最小执行记录
 
@@ -10,7 +10,16 @@
 
 ## 1. 产品边界
 
-消费者使用 `POST /v1/images/generations` 或 `POST /v1/images/edits`，两者接受同一个 JSON 请求，走同一条受理路径，在同一 HTTP 响应取得图片。成功响应为 `{created, data:[{url|b64_json}]}`，每项只保留一种渠道给出的图片形式。平台不下载响应图片、不解码响应 base64、不提供结果托管或公开异步任务接口。
+消费者使用 `POST /v1/images/generations` 或 `POST /v1/images/edits`，两者接受同一个 JSON 请求，走同一条受理路径，在同一 HTTP 响应取得图片。成功响应为 `{code: 200, data: {id, status, cost, result: {images: [...]}}}`：
+
+| 字段 | 含义 |
+| --- | --- |
+| `data.id` | 平台给这次调用的标识，对调用方不透明；同一条标识也出现在对客用量记录里（见[控制台 Spec](0001-admin-and-customer-consoles.md) C9） |
+| `data.status` | 同步成功时为 `completed` |
+| `data.cost` | 本次对客实收的**正数金额**（积分），单位与口径归[账户资金 Spec](0002-account-funds-and-reservations.md)；用量与账单记录里的同一笔按既有约定带符号（扣费为负） |
+| `data.result.images[]` | 每项是渠道的一张图：`url`（字符串数组，保留该图全部地址）或 `b64_json`；产出张数按项计 |
+
+产出张数少于请求的 `n` 时仍按实际产出成功返回。`url` 项保留渠道为这张图给出的全部地址。渠道为结果地址给出过期时刻时，该项带 `expires_at`（Unix 秒）；渠道不给就没有这个键，平台不自行推算过期时长。平台不下载响应图片、不解码响应 base64、不提供结果托管或公开异步任务接口。错误响应不变，仍为 `{"error":{"code","message"}}`。
 
 参考图与遮罩只接受 `http(s)` 公网 URL。`data:` URL 与任何其他非法文本都不是合法的图片输入，按 §3 在受理前拒绝。调用方手上的本地文件先经[上传端点](0007-image-upload-and-object-storage.md)换成公网 URL 再提交；命中同一幂等记录的重发按 §4 回原请求事实，不用本规则重新解释原请求。
 
@@ -38,7 +47,7 @@
 
 完成合同处理并冻结修订、路由、价格后，受理须按账户资金 Spec 原子创建最小记录和预授权。必须先持久化当前 Attempt 的提交状态，再发出可能产生生成费用的外部请求。上游任务句柄一旦收到，必须在后续轮询之前保存；保存失败不能发第二次生成请求。
 
-正常 `200` 必须满足：结果结构可返回、存在有效计量证据、账务结算已确认提交。账务事务包含状态、证据、成本事实、占用结清与实际扣费；重复收尾或自动对账不得重复扣费。数据库提交结果未知时必须先按执行标识确认，不能直接认定未扣款，也不能重复发出外部请求。
+正常 `200` 必须满足：结果结构可返回、存在有效计量证据、账务结算已确认提交。产出张数少于请求的 `n` 不改变成功判定：按实际产出结算。账务事务包含状态、证据、成本事实、占用结清与实际扣费；重复收尾或自动对账不得重复扣费。数据库提交结果未知时必须先按执行标识确认，不能直接认定未扣款，也不能重复发出外部请求。
 
 Provider 成功且有有效证据时，按冻结价格结算；客户端断开、接收超时或未保存图片不证明 Provider 未产生费用。此类请求仍按实际用量收费，平台交付故障需要补偿时通过已有正式资金调整处理，不自动免单或重新生成。收费边界见 §7。
 
@@ -112,10 +121,11 @@ Provider 成功并且证据有效时照常结算，即使客户端没有收到�
 | A10 | 管理端与客户调用记录只展示最小用量、状态和金额；不依赖结果或原始参数；金额、跨日账单、成本缺口和人工解除规则继续满足资金 Spec。 |
 | A11 | 客户端断开与发送期限在连接层生效：HTTP/1 已有流水线缓冲时仍能观察到 FIN；HTTP/2 阻塞流的最早发送期限终止同连接全部流；transport 任务与缓冲销毁后才释放发送许可，账务事实不被期限改写；不具备等效关闭检测的平台拒绝启用直接执行。 |
 | A12 | 参考图或遮罩的取值不是 `http(s)` 公网 URL（含 `data:` URL 与任何其他非法文本）时，受理前返回 `400 public_image_url_required`：不建执行记录、不取执行许可与资金占用、不调用 Provider，被拒绝的取值不落持久层；同键重发已受理的旧记录仍按原记录与冻结的指纹规则回应。 |
+| A13 | 两个入口的成功响应都是 `{code:200, data:{id,status,cost,result:{images[]}}}`：`id` 与同账户用量记录里的标识一致；`status` 为 `completed`；`cost` 的金额等于该笔实收（积分，正数）；`result.images[]` 每项只有 `url` 或 `b64_json` 之一，`url` 项保留渠道给的全部地址，渠道给过期时刻时带 `expires_at`、不给时无此键；假上游产出少于请求 `n`（请求 6 张、候选承载面最多 4 张、产出 4 张）时仍返回 `200`，`result.images[]` 的项数等于实际产出张数，`cost` 按实际产出算；错误响应仍是 `{"error":{"code","message"}}`。 |
 
 ## 9. 技术设计与修订
 
-[同步网关技术设计](../design/0017-synchronous-image-gateway.md)承接 §1–§8；[整改技术设计](../design/0018-synchronous-gateway-remediation.md)承接本次复审整改；[对象存储上传设计](../design/0021-object-storage-upload.md)承接 §1、§3 的输入图片形态收敛与[上传端点](0007-image-upload-and-object-storage.md)；[本次设计记录](../../.agents/notes/proposed/platform/2026-10-03-synchronous-image-gateway.md)拥有选择理由与后果。
+[同步网关技术设计](../design/0017-synchronous-image-gateway.md)承接 §1–§8；[整改技术设计](../design/0018-synchronous-gateway-remediation.md)承接本次复审整改；[对象存储上传设计](../design/0021-object-storage-upload.md)承接 §1、§3 的输入图片形态收敛与[上传端点](0007-image-upload-and-object-storage.md)；[本次设计记录](../../.agents/notes/proposed/platform/2026-10-03-synchronous-image-gateway.md)拥有选择理由与后果；[对客响应信封与积分单位](../../.agents/notes/implemented/platform/2026-10-07-consumer-response-envelope-and-points.md)承接 §1、§3 的对客响应形状与金额单位换算。
 
 | 修订 | 章节 | 合同变化摘要 | 状态／生效版本 |
 | --- | --- | --- | --- |
@@ -123,3 +133,4 @@ Provider 成功并且证据有效时照常结算，即使客户端没有收到�
 | v2 | §6、§8 | 增加客户端发送期限的连接层语义、HTTP/2 连接级关闭影响与直接执行的 Linux 关闭检测部署限制；新增 A11。 | 已接受／v2 |
 | v4 | §1–§4、§5 | 两个对客图片入口都保留，但 `POST /v1/images/edits` 不再有自己的解码：它与 `POST /v1/images/generations` 接受同一个 JSON 请求、走同一条代码路径。删去 multipart 解码、文件部件与“两个端点不共享指纹”的条款。 | 已接受／v4 |
 | v3 | §1–§4、§8 | 输入参考图与遮罩收敛为只收公网 URL：取值不是公网 URL 的输入（含 `data:` URL 与文件部件）在受理前拒绝（`400 public_image_url_required`，原为 `400 invalid_parameter`；不建记录、不取占用、不调上游）；载荷边界限定为生成请求，上传素材归图片上传与对象存储 Spec；新增 A12。 | 已接受／v3 |
+| v5 | §1、§3、§8 | 对客成功响应改为 `{code, data:{id, status, cost, result:{images[]}}}`：新增平台调用标识、对客状态与对客实收（积分）；图片收进 `result.images[]`，一项 = 渠道的一张图、`url` 为字符串数组并保留该图全部地址、产出张数按项计，可带渠道给出的 `expires_at`；删去 `created`；错误响应不变；新增 A13。 | 已接受／v5 |

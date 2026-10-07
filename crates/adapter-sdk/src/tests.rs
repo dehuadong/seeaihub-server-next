@@ -14,34 +14,36 @@ fn only_public_http_urls_are_image_values() {
     }
 }
 
+/// 一个 `Url` 项就是渠道的一张图：地址数组原样保留、不摊平，渠道给的过期时刻原样带上。
 #[test]
 fn generated_images_keep_only_the_shape_the_provider_gave() {
-    let url = GeneratedImage::from_url("https://example.invalid/a.png".to_owned());
     assert_eq!(
-        serde_json::to_value(&url).expect("serializes"),
-        serde_json::json!({"url": "https://example.invalid/a.png"})
+        GeneratedImage::from_url("https://example.invalid/a.png".to_owned()),
+        GeneratedImage::Url {
+            urls: vec!["https://example.invalid/a.png".to_owned()],
+            expires_at: None,
+        }
     );
-    let base64 = GeneratedImage::from_base64("AAAA".to_owned());
     assert_eq!(
-        serde_json::to_value(&base64).expect("serializes"),
-        serde_json::json!({"b64_json": "AAAA"})
+        GeneratedImage::from_urls(
+            vec![
+                "https://a.example/1.png".to_owned(),
+                "https://a.example/2.png".to_owned(),
+            ],
+            Some(1_789_000_000),
+        ),
+        GeneratedImage::Url {
+            urls: vec![
+                "https://a.example/1.png".to_owned(),
+                "https://a.example/2.png".to_owned(),
+            ],
+            expires_at: Some(1_789_000_000),
+        }
     );
-    // 读回来还是同一种形态（结果信封落库、再读出来）。
     assert_eq!(
-        serde_json::from_value::<GeneratedImage>(serde_json::json!({"url": "u"}))
-            .expect("a url reads back"),
-        GeneratedImage::from_url("u".to_owned())
+        GeneratedImage::from_base64("AAAA".to_owned()),
+        GeneratedImage::B64Json("AAAA".to_owned())
     );
-    // 形状本身就是"恰好其一"：两项都在、一项都没有都不是合法的图。
-    for impossible in [
-        serde_json::json!({}),
-        serde_json::json!({"url": "u", "b64_json": "b"}),
-    ] {
-        assert!(
-            serde_json::from_value::<GeneratedImage>(impossible.clone()).is_err(),
-            "{impossible} 不是恰好一项"
-        );
-    }
 }
 
 #[test]

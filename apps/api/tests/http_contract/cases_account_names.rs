@@ -1022,7 +1022,7 @@ async fn the_api_key_face_does_not_gain_a_name() {
         own.get("name").is_none(),
         "API Key 面的形状是既有合同，不跟着客户侧加字段：{own}"
     );
-    assert!(own.get("balance_microusd").is_some());
+    assert!(own.get("balance_points").is_some());
 
     // 同时确认运营侧摘要确实带了名称（两处读分开成两个响应类型的理由就在这）。
     assert!(

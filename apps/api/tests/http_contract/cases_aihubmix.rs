@@ -23,7 +23,7 @@ async fn aihubmix_sync_entries_accept_images_and_return_the_provider_envelope() 
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("文生图", &body);
     assert_eq!(
-        body["data"][0]["b64_json"].as_str(),
+        body["data"]["result"]["images"][0]["b64_json"].as_str(),
         Some(STANDARD.encode(PNG_FIXTURE).as_str()),
         "上游给 base64，平台必须原样交回"
     );
@@ -192,12 +192,12 @@ async fn aihubmix_returns_the_inline_base64_verbatim() {
     assert_eq!(status, StatusCode::OK, "got {body}");
     assert_sync_success("base64 形态", &body);
     assert_eq!(
-        body["data"][0]["b64_json"].as_str(),
+        body["data"]["result"]["images"][0]["b64_json"].as_str(),
         Some(STANDARD.encode(PNG_FIXTURE).as_str()),
         "上游给内联 base64，平台原样交回"
     );
     assert!(
-        !body["data"][0]
+        !body["data"]["result"]["images"][0]
             .as_object()
             .expect("object")
             .contains_key("url")

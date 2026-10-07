@@ -59,7 +59,7 @@ API 解码必须区分**省略**与**显式 `null`**：省略走生成，显式 
 
 账户查询增加独立名称条件，保留现有邮箱大小写不敏感精确匹配、标签精确匹配和多条件 AND 语义。对规范化后的名称查询做 PostgreSQL 大小写不敏感子串匹配；SQL pattern 中先转义反斜线、`%` 和 `_`，明确 ESCAPE 字符，再绑定参数。不能直接拼 SQL，不能把用户输入当模式。顺序继续为 `created_at DESC, id DESC`，limit 上限继续沿用现有实现。
 
-对客账户读**新开一个响应类型**（例如 `CustomerAccountResponse { name, balance_microusd, held_microusd, available_microusd, updated_at }`），从同一个 `BalanceChange` 映射，只挂在 `GET /v1/customer/account` 上；API Key 面的 `GET /v1/account` 继续用现有 `OwnAccountResponse`，形状一个字段都不变——两者现在共用同一个响应类型，直接加字段会把 API Key 面也改掉（违反 Spec `0003` §5 与 Spec `0001` §6）。
+对客账户读**新开一个响应类型**（例如 `CustomerAccountResponse { name, balance_points, held_points, available_points, updated_at }`），从同一个 `BalanceChange` 映射，只挂在 `GET /v1/customer/account` 上；API Key 面的 `GET /v1/account` 与它同批把金额换成积分字段（`balance_points` / `held_points` / `available_points`），两个面读同一份金额事实（单位与取整见[账户资金 Spec](../specs/0002-account-funds-and-reservations.md) §1）。两个面各自一个响应类型，改动互不牵连。
 
 名称筛选与唯一性是两件事：筛选是子串匹配且**大小写不敏感**（运营输入小写也能找到），唯一性约束只挡逐字符完全相同的名称。HTTP 增量和状态码以 Spec §5 为准，创建账户保留现有响应与成功状态，不顺便调整为另一种协议；撞名统一用既有的 `409 Conflict`（与邮箱冲突同一形状），不新造错误码。新增写接口（管理员改名、客户改名）加入各自的认证端点集合与认证验证矩阵。名称创建／修改审计记录 account id、actor（管理员或客户）、规范化值、旧新值，不增加密码或令牌资料。操作者归因继续沿用现有审计机制，本变更不扩展管理员角色或改造整套审计。
 

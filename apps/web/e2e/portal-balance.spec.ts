@@ -2,7 +2,7 @@ import { expect, test, type APIRequestContext, type Page } from '@playwright/tes
 import { adminApiUrl, portalUrl, settings } from './settings';
 import { captureActiveHold, releaseActiveHold } from './account-state';
 
-/// 客户概览只显示**一个「余额」**——客户现在能用的钱（`available_microusd`）：请求受理时按占住的
+/// 客户概览只显示**一个「余额」**——客户现在能用的钱（`available_points`）：请求受理时按占住的
 /// 额度减少，结算后按实际扣费多退少补；页面不出现已结算余额、持有中、可用额三个分项，也不出现单笔
 /// 预授权金额（账户资金 Spec A7 的客户那半、控制台 Spec C7、V-D5）。
 ///
@@ -171,13 +171,13 @@ async function expectHold(request: APIRequestContext, apiKey: string): Promise<v
     headers: { Authorization: `Bearer ${apiKey}` },
   });
   const body = (await own.json()) as {
-    balance_microusd: number;
-    held_microusd: number;
-    available_microusd: number;
+    balance_points: number;
+    held_points: number;
+    available_points: number;
   };
-  expect(body.balance_microusd).toBe(100_000_000);
-  expect(body.held_microusd).toBe(30_000_000);
-  expect(body.available_microusd).toBe(70_000_000);
+  expect(body.balance_points).toBe(100_000);
+  expect(body.held_points).toBe(30_000);
+  expect(body.available_points).toBe(70_000);
 }
 
 /// 页面只显示一个「余额」：读数正确，且不出现内部三分解的名字或预授权金额。
@@ -195,14 +195,14 @@ test('充值 100 后受理占住 30：概览显示余额 70', async ({ page, req
   const { email, password, apiKey } = await fundedCustomer(request);
 
   await signIn(page, email, password);
-  await expectBalance(page, '100 元');
+  await expectBalance(page, '100000 积分');
 
   await createHold(request, gatewayModel, apiKey);
   await expectHold(request, apiKey);
 
   // 页面读的就是客户现在能用的钱：占住 30 之后显示 70，不是 100。
   await page.reload();
-  await expectBalance(page, '70 元');
+  await expectBalance(page, '70000 积分');
 });
 
 test('仅释放预授权：余额回到 100', async ({ page, request }) => {
@@ -215,12 +215,12 @@ test('仅释放预授权：余额回到 100', async ({ page, request }) => {
   await expectHold(request, apiKey);
   // 页面不轮询：受理之后要用概览上的刷新入口自己取一次，读数才是 70。
   await page.getByTestId('portal-balance-reload').click();
-  await expectBalance(page, '70 元');
+  await expectBalance(page, '70000 积分');
 
   // 释放占用（结果由合同用例的真事务覆盖）：占住的钱退回可用，读数回到 100。
   await releaseActiveHold(accountId);
   await page.reload();
-  await expectBalance(page, '100 元');
+  await expectBalance(page, '100000 积分');
 });
 
 test('实收 20 结算后：概览显示余额 80', async ({ page, request }) => {
@@ -232,10 +232,10 @@ test('实收 20 结算后：概览显示余额 80', async ({ page, request }) =>
   await createHold(request, gatewayModel, apiKey);
   await expectHold(request, apiKey);
   await page.getByTestId('portal-balance-reload').click();
-  await expectBalance(page, '70 元');
+  await expectBalance(page, '70000 积分');
 
   // 成功结算扣 20 元（结果由合同用例的真事务覆盖）：占住的钱按实收结清，读数变成 80，仍不出现预授权金额。
   await captureActiveHold(accountId, 20_000_000);
   await page.reload();
-  await expectBalance(page, '80 元');
+  await expectBalance(page, '80000 积分');
 });

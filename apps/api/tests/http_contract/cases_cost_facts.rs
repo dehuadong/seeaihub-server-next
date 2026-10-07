@@ -39,7 +39,7 @@ async fn a_declared_cost_that_never_arrives_is_recorded_as_a_gap_not_guessed() {
     .expect("gap query");
     assert_eq!(gaps, 1);
     // 对客实收不受成本缺口影响。
-    assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+    assert_eq!(harness.captured_microusd(job_id).await, -6_000);
     harness.cleanup().await;
 }
 
@@ -217,10 +217,10 @@ async fn an_upstream_declared_supply_needs_no_rate_card_and_takes_the_upstream_a
             .await
             .expect("authorization");
     assert_eq!(authorized, 250_000, "保底额是 2K 档的 ¥0.25");
-    // 对客实收 = **上游声明的金额 × 倍率 × 折算率**（11354 × 1.2 × 7.1 = 96736.08 ⇒ 96737），
-    // 与成本折算（11354 × 7.1 = 80613.4 ⇒ 80614）是两个量：后者只进毛利口径。
-    assert_eq!(harness.captured_microusd(job_id).await, -96_737);
-    assert_eq!(96_737 - 80_614, 16_123, "毛利 = 售价 − 成本折算后 CNY");
+    // 对客实收 = **上游声明的金额 × 倍率 × 折算率**（11354 × 1.2 × 7.1 = 96736.08 ⇒ 96737，
+    // 落账再取整到整积分 97000），与成本折算（11354 × 7.1 = 80613.4 ⇒ 80614）是两个量：后者只进毛利口径。
+    assert_eq!(harness.captured_microusd(job_id).await, -97_000);
+    assert_eq!(97_000 - 80_614, 16_386, "毛利 = 售价 − 成本折算后 CNY");
     harness.cleanup().await;
 }
 
@@ -319,12 +319,12 @@ async fn a_declared_cost_is_taken_as_is_and_converted_with_the_frozen_rate() {
     assert_eq!(cny, Some(80_614), "11354 微美元 × 7.1 = 80613.4 ⇒ 向上取整");
     assert_eq!(
         harness.captured_microusd(job_id).await,
-        -43_680,
-        "实际成本不改对客金额：对客金额只由冻结的对客费率向量决定"
+        -44_000,
+        "实际成本不改对客金额：对客金额只由冻结的对客费率向量决定，落账取整到整积分"
     );
     // 毛利 = 售价（CNY）− 成本折算后 CNY：这一笔是负的（参考成本只是发布时的定价参考，
     // 上游实际声明的金额比它高），照样能逐笔算出——不猜、不掩盖。
-    assert_eq!(43_680 - 80_614, -36_934);
+    assert_eq!(44_000 - 80_614, -36_614);
 
     harness.cleanup().await;
 }
@@ -466,7 +466,7 @@ async fn a_cost_gap_is_listed_for_operations_without_pushing_the_job_into_reconc
     .await
     .expect("cases");
     assert_eq!(cases, 0);
-    assert_eq!(harness.captured_microusd(job_id).await, -5_950);
+    assert_eq!(harness.captured_microusd(job_id).await, -6_000);
 
     // 运营从缺口清单里看到它，带着去上游核账单要用的对账标识。
     let client = Client::new();

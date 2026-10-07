@@ -23,7 +23,7 @@ test('注册后进概览：首屏只有一个「余额」 + 五页固定导航',
 
   // **首屏**（不滚动、不切页）就该看到余额，标题就是「余额」。
   await expect(page.getByTestId('portal-balance')).toContainText('余额');
-  await expect(page.getByTestId('portal-balance')).toContainText('0 元');
+  await expect(page.getByTestId('portal-balance')).toContainText('0 积分');
   // 概览只有一个数：没有"扣费总额（全部）"，也没有无区间说明的平均扣费（V-D14）。
   expect(await page.locator('.ant-statistic').count()).toBe(1);
   for (const forbidden of ['扣费总额', '平均每次扣费']) {

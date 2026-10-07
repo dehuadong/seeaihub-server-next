@@ -411,9 +411,7 @@ pub enum QueryAccountingCapability {
 /// 一次执行要交回对客响应的内存载荷；它不落库、不写日志。
 #[derive(Clone)]
 pub struct ResponsePayload {
-    /// 上游给的 created（若有）；没有时由应用层兜底，不由 Adapter 造假值。
-    pub created: Option<i64>,
-    /// 每张图只保留上游给的 url 或 b64_json。
+    /// 每张图只保留上游给的地址（含渠道给的过期时刻）或内联 base64；一项 = 渠道的一张图。
     pub images: Vec<GeneratedImage>,
 }
 
@@ -421,8 +419,7 @@ impl Debug for ResponsePayload {
     fn fmt(&self, formatter: &mut Formatter<'_>) -> std::fmt::Result {
         write!(
             formatter,
-            "ResponsePayload {{ created: {:?}, images: {} }}",
-            self.created,
+            "ResponsePayload {{ images: {} }}",
             self.images.len()
         )
     }

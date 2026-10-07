@@ -2501,7 +2501,8 @@ impl Harness {
 
 /// 对客响应里**不许**出现内部的执行记录，也不许指路任何查询接口。
 ///
-/// 内部它就是一个执行与审计记录：没有 job id、没有任务号、没有"去查任务"的指引。
+/// 内部它就是一个执行与审计记录：对客只暴露它的标识（调用标识），没有内部状态、没有任务号、
+/// 没有"去查任务"的指引。
 /// 这里同时钉住"渠道/供给侧的词汇不进对客响应"：供给、渠道、驱动与厂商原生型号都是平台内部
 /// 的组织方式，调用方拿到的只有型号身份与它公开的能力面（目录里的合同就是后者）。
 fn assert_public_only(what: &str, body: &Value) {
@@ -2559,29 +2560,66 @@ async fn post_json(
     )
 }
 
-/// OpenAI 形状的成功响应：`{created, data:[…]}`，且没有内部字样。
+/// 对客成功响应：`{code, data:{id, status, cost, result:{images[]}}}`，且没有内部字样。
 fn assert_sync_success(what: &str, body: &Value) {
     assert_public_only(what, body);
-    assert!(
-        body["created"].as_i64().is_some(),
-        "{what}: created is required, got {body}"
+    assert_eq!(
+        body["code"].as_u64(),
+        Some(200),
+        "{what}: code must be 200, got {body}"
     );
     let data = body["data"]
+        .as_object()
+        .unwrap_or_else(|| panic!("{what}: data must be an object, got {body}"));
+    assert!(
+        data["id"].as_str().is_some(),
+        "{what}: id is required, got {body}"
+    );
+    assert_eq!(
+        data["status"].as_str(),
+        Some("completed"),
+        "{what}: status must be completed, got {body}"
+    );
+    assert!(
+        data["cost"].as_u64().is_some(),
+        "{what}: cost must be an integer number of points, got {body}"
+    );
+    let images = data["result"]["images"]
         .as_array()
-        .unwrap_or_else(|| panic!("{what}: data must be an array, got {body}"));
-    assert!(!data.is_empty(), "{what}: data must not be empty");
-    for item in data {
-        let has_url = item["url"].as_str().is_some();
+        .unwrap_or_else(|| panic!("{what}: result.images must be an array, got {body}"));
+    assert!(
+        !images.is_empty(),
+        "{what}: result.images must not be empty"
+    );
+    for item in images {
+        let has_url = item["url"].as_array().is_some();
         let has_base64 = item["b64_json"].as_str().is_some();
         assert!(
             has_url ^ has_base64,
             "{what}: every item keeps exactly one of url / b64_json, got {item}"
         );
-        assert_eq!(
-            item.as_object().map(serde_json::Map::len),
-            Some(1),
-            "{what}: no other fields may appear on an image item, got {item}"
-        );
+        if has_url {
+            let urls = item["url"].as_array().expect("url array");
+            assert!(
+                !urls.is_empty(),
+                "{what}: a url item carries at least one address, got {item}"
+            );
+            assert!(
+                urls.iter().all(|url| url.as_str().is_some()),
+                "{what}: every address is a string, got {item}"
+            );
+        }
+        for key in item
+            .as_object()
+            .map(|object| object.keys())
+            .into_iter()
+            .flatten()
+        {
+            assert!(
+                matches!(key.as_str(), "url" | "b64_json" | "expires_at"),
+                "{what}: unexpected image field `{key}` in {item}"
+            );
+        }
     }
 }
 
@@ -4495,10 +4533,10 @@ async fn audit_events(harness: &Harness, action: &str) -> Vec<Value> {
 
 /// 对客响应里**可比对**的那部分：图片项各有哪些字段、是不是本机假上游给的 `url`。
 ///
-/// `created` 是时间戳，`url` 里带着假上游每次随机的端口——两者逐位比不了。比的是响应结构：
-/// 缓存开着与关掉，对客拿到的形状必须逐位相同。
+/// `url` 里带着假上游每次随机的端口，逐位比不了。比的是响应结构：缓存开着与关掉，
+/// 对客拿到的形状必须逐位相同。
 fn comparable_response(body: &Value) -> Vec<(Vec<String>, bool)> {
-    body["data"]
+    body["data"]["result"]["images"]
         .as_array()
         .map(|items| {
             items
@@ -4510,7 +4548,9 @@ fn comparable_response(body: &Value) -> Vec<(Vec<String>, bool)> {
                         .unwrap_or_default();
                     keys.sort();
                     let is_url = item["url"]
-                        .as_str()
+                        .as_array()
+                        .and_then(|urls| urls.first())
+                        .and_then(|url| url.as_str())
                         .is_some_and(|url| url.starts_with("http://127.0.0.1:"));
                     (keys, is_url)
                 })

@@ -485,8 +485,6 @@ fn gateway_output(success: ProviderSuccess) -> ProviderOutput {
     let image_count = u32::try_from(success.images.len()).unwrap_or(u32::MAX);
     ProviderOutput {
         response_payload: ResponsePayload {
-            // 应用层按自己的时钟兜底 `created`；这条渠道的响应信封没读它。
-            created: None,
             images: success.images,
         },
         accounting_facts: AccountingFacts {

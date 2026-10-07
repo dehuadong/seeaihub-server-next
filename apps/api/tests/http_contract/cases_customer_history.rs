@@ -256,7 +256,7 @@ async fn ledger_pages_by_cursor_and_filters_by_kind() {
             seen.push(format!(
                 "{}|{}",
                 entry["created_at"].as_str().expect("created_at"),
-                entry["amount_microusd"]
+                entry["amount_points"]
             ));
         }
         pages += 1;
@@ -456,7 +456,7 @@ async fn the_window_lower_bound_counts_in_both_detail_and_summary() {
         1,
         "下界那一笔必须算进逐笔（半开区间含下界）：{detail}"
     );
-    assert_eq!(entries[0]["amount_microusd"], json!(charged));
+    assert_eq!(entries[0]["amount_points"], json!(charged / 1_000));
     assert_eq!(detail["total"], json!(1));
 
     // 汇总：同一区间把同一笔算进净额。
@@ -471,8 +471,8 @@ async fn the_window_lower_bound_counts_in_both_detail_and_summary() {
     .await;
     assert_eq!(status, StatusCode::OK, "{summary}");
     assert_eq!(
-        summary["charged_microusd"],
-        json!(charged),
+        summary["charged_points"],
+        json!(charged / 1_000),
         "同一区间下逐笔与汇总必须对得上：{summary} vs {detail}"
     );
     assert_eq!(summary["requests"], json!(1));
@@ -748,7 +748,7 @@ async fn the_customer_ledger_hides_the_platform_cost_line() {
     let entries = adjustments["entries"].as_array().expect("entries");
     assert_eq!(entries.len(), 1, "只该有那一条正式调整：{adjustments}");
     assert_eq!(entries[0]["kind"], json!("adjustment"));
-    assert_eq!(entries[0]["amount_microusd"], json!(5_000));
+    assert_eq!(entries[0]["amount_points"], json!(5));
 
     // `cost` 连"可筛的类别"都不是：问它就该被拒，而不是回一批空数据让它以为"这个类别没有记录"。
     let (status, body) = get_json(
