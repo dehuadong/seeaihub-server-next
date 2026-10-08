@@ -1366,7 +1366,7 @@ struct OwnAccountResponse {
 /// CNY 微单位 → 整积分：向上取整到 1000 微单位的整数倍（Spec 0002 §1）。
 ///
 /// 「账上的对客金额恒为整积分」由写入口保证：Spec 0002 §1 要求预授权额、实收、充值、初始充值与正式调整的
-/// 入账金额在落账前向上取整，域层的取整函数是 [`seeai_domain::whole_points_microusd`]。
+/// 入账金额在落账前按绝对值向上取整到整积分，域层的取整函数是 [`seeai_domain::whole_points_microusd`]。
 ///
 /// 这里是读侧的兜底，不是第二条保证：遇到非整积分的历史或异常行时向上取整并记一条错误，账上那个数并不因此
 /// 变整（管理端读得到的仍是它）。读侧不断言、也不让请求失败——非整积分说明有写入方漏了取整，但客户请求不该
@@ -1384,9 +1384,7 @@ fn points_from_microusd(microusd: u64) -> u64 {
 
 /// CNY 微单位（可正可负）→ 整积分；规则同 `points_from_microusd`。
 ///
-/// 负数按**绝对值**向上取整：`-1500` 微元是 `-2` 积分，不是 `-1`。Spec 0002 §1 字面的「向上取整」是向
-/// +∞，两者对负数不一致；写侧只收非负金额，没有可照抄的负数取向，而账上金额恒为整积分时这条分支不可达。
-/// 要按字面执行负数取向，先把它写进 Spec 0002 §1。
+/// 负数按**绝对值**向上取整：`-1500` 微元是 `-2` 积分，不是 `-1`（Spec 0002 §1、A10）。
 fn to_points(microusd: i64) -> i64 {
     let points = points_from_microusd(microusd.unsigned_abs());
     let points = i64::try_from(points).unwrap_or(i64::MAX);

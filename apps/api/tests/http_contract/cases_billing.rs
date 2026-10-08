@@ -1323,9 +1323,9 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
 
 /// 读侧遇到非整积分时按**绝对值**向上取整（Spec 0002 §1、A10）。
 ///
-/// 绕过写入口直接改库，造出对客读可能遇到的两种非整积分：已结算余额差 1 微元（写入方漏取整留下的行），以及
-/// 一条没有写入口、也不改余额的正式调整行（账实核对会发现它与余额不一致；读侧对它只取整，不改账）。把读侧
-/// 的取整改成截断，两处断言都会失败。
+/// 绕过写入口直接改库，造出对客金额取值面（1000 微元的整数倍）之外的两种行：已结算余额差 1 微元（写入方漏
+/// 取整留下的行），以及一条没有写入口、也不改余额的正式调整行（账实核对会发现它与余额不一致；读侧对它只
+/// 取整，不改账）。把读侧的取整改成截断，两处断言都会失败。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_non_whole_point_amount_rounds_up_on_the_customer_read() {
