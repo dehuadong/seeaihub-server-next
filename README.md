@@ -22,7 +22,7 @@
 | **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
 | **怎么上生产**（构建、部署、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
-| **容器部署**（Dockerfile、compose、镜像与升级） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
+| **容器部署**（Dockerfile、compose、镜像准备与升级、宝塔面板） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **素材与模型升级教程**（改素材后怎么生效、合同变更为什么要升修订、本地库怎么处理） | [`docs/tutorials/supply-materials.md`](docs/tutorials/supply-materials.md) |
 | **架构治理**：分层职责、依赖方向、边界规则（R1–R5）与扩展纪律 | [`docs/architecture.md`](docs/architecture.md) |
 | 分层规则的**依据、边界细则与例外理由** | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
