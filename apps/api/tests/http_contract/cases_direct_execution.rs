@@ -1137,9 +1137,9 @@ async fn held_channel_slots(harness: &Harness) -> i64 {
 
 /// A8：两个 API 副本连同一数据库时，账户与渠道上限由数据库事实共同遵守。
 ///
-/// 主进程与副本各配 1 个账户名额、1 个渠道名额。第一个请求在主进程上停在上游等待里，此时：
-/// - 同一账户在副本上再发一次 ⇒ 429 `too_many_in_flight`（账户名额已被占）；
-/// - 另一个账户在副本上发一次 ⇒ 503 `platform_unavailable`（它自己的账户名额是空的，但唯一的
+/// 主进程与副本各配 1 个并发名额缺省、1 个渠道名额。第一个请求在主进程上停在上游等待里，此时：
+/// - 同一账户在副本上再发一次 ⇒ 429 `too_many_in_flight`（该模型的名额已被占）；
+/// - 另一个账户在副本上发一次 ⇒ 503 `platform_unavailable`（它自己的名额是空的，但唯一的
 ///   渠道名额被占）。
 ///
 /// 两次拒绝都不建执行记录，`execution_capacity` 始终只有第一个请求那一行 held；第一个请求结束
@@ -1153,7 +1153,7 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
             delay_ms: 3_000,
             ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
         },
-        1,  // 账户在飞上限
+        1,  // 并发名额缺省
         30, // 总期限：要盖过 3s 的上游等待
         ApiProcessSettings {
             channel_max_in_flight: Some(1),
@@ -1173,7 +1173,7 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
         )
         .await;
 
-    // 另一个账户：它自己的账户名额是空的，所以它只能被渠道名额挡住。
+    // 另一个账户：它自己的名额是空的，所以它只能被渠道名额挡住。
     let client = Client::new();
     let (_, other_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
@@ -1194,7 +1194,7 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
         "第一个请求必须已经占住唯一的渠道名额"
     );
 
-    // ① 同一账户在**副本**上再发：账户名额已满。
+    // ① 同一账户在**副本**上再发：该模型的名额已满。
     let same_account_key = format!("replica-cap-same-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &peer_base,
@@ -1206,9 +1206,9 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
     .await;
     assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "got {body}");
     assert_eq!(body["error"]["code"], json!("too_many_in_flight"));
-    assert_public_only("跨副本账户名额", &body);
+    assert_public_only("跨副本模型名额", &body);
 
-    // ② 另一个账户在副本上发：账户名额是空的，但唯一的渠道名额被占。
+    // ② 另一个账户在副本上发：它自己的名额是空的，但唯一的渠道名额被占。
     let other_account_key = format!("replica-cap-other-{}", Uuid::new_v4());
     let (status, body) = post_json(
         &peer_base,

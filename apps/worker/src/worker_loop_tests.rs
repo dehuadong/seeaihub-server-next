@@ -307,7 +307,7 @@ impl HubRepository for EmptyQueueRepository {
     async fn active_offering(
         &self,
         _gateway_model: &str,
-    ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+    ) -> Result<ActiveOfferings, ApplicationError> {
         unimplemented!()
     }
     async fn active_offering_channels(
@@ -337,10 +337,11 @@ impl HubRepository for EmptyQueueRepository {
     async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError> {
         unimplemented!()
     }
-    async fn set_gateway_model_enabled(
+    async fn set_gateway_model_settings(
         &self,
         _gateway_model: &str,
-        _enabled: bool,
+        _enabled: Option<bool>,
+        _max_concurrent_jobs: Option<Option<u32>>,
         _actor: &str,
     ) -> Result<(), ApplicationError> {
         unimplemented!()

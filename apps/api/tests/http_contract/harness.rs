@@ -62,6 +62,8 @@ mod cases_kill_matrix;
 mod cases_lifecycle;
 #[path = "cases_migrations.rs"]
 mod cases_migrations;
+#[path = "cases_model_concurrency.rs"]
+mod cases_model_concurrency;
 #[path = "cases_model_document.rs"]
 mod cases_model_document;
 #[path = "cases_model_type.rs"]

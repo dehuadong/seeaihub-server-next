@@ -157,7 +157,7 @@ fn command(
         request_digest: request_digest.to_owned(),
         request_digest_key_version: 1,
         max_cost_microusd: 1000,
-        max_account_in_flight: 8,
+        max_in_flight: 8,
         max_channel_in_flight: 4,
     }
 }
@@ -336,7 +336,7 @@ async fn admit_is_atomic_idempotent_and_owns_a_channel_slot() {
     drop_isolated_database(&database_name).await;
 }
 
-/// 并发受理共同遵守同一份账户名额：四个不同键同时进来，名额只允许一个通过。
+/// 并发受理共同遵守同一个（账户 × 网关模型）名额：四个不同键同时进来，名额只允许一个通过。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL and a role allowed to CREATE DATABASE; derives a throwaway database"]
 async fn concurrent_admits_respect_the_account_slot() {
@@ -358,8 +358,8 @@ async fn concurrent_admits_respect_the_account_slot() {
             &format!("concurrent-key-{index}"),
             &format!("concurrent-digest-{index}"),
         );
-        // 名额只放一个；渠道与资金都够，唯一能挡住并发的必须是这份账户名额。
-        command.max_account_in_flight = 1;
+        // 名额只放一个；渠道与资金都够，唯一能挡住并发的必须是这份模型名额（同一个模型）。
+        command.max_in_flight = 1;
         handles.push(tokio::spawn(async move { repository.admit(command).await }));
     }
     let mut admitted = 0;
@@ -377,7 +377,7 @@ async fn concurrent_admits_respect_the_account_slot() {
     );
     assert_eq!(
         rejected, 3,
-        "the other three must be rejected by the account slot"
+        "the other three must be rejected by the model's slot"
     );
     let jobs = scalar(
         &pool,

@@ -755,7 +755,7 @@ fn build_service(
         keys,
         test_timeouts(),
         DirectExecutionLimits {
-            max_account_in_flight: 8,
+            default_max_concurrent_jobs: 8,
             max_channel_in_flight: 8,
             default_hold_microusd: 1_000,
         },
@@ -1797,6 +1797,7 @@ async fn a_replay_survives_a_disabled_candidate() {
             .active_offering("gw")
             .await
             .expect("the active candidates")
+            .candidates
             .is_empty(),
         "a disabled candidate disappears from routing"
     );

@@ -66,11 +66,16 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
   `provider_model_id`。迁移 `migrations/0004_gateway_model.sql` 把
   `generation.jobs` 与 `publication.runtime_entries` 的 `native_model_id` 改成 `gateway_model`
   （两者当时同值，改名只写清角色，不改取值）。
-- **同一账户的在飞任务数上限**：`GENERATION_MAX_CONCURRENT_JOBS`（默认 1）。受理前数一次
-  `count_in_flight_jobs`（`accepted`/`leased`/`submitting`），到顶回 `429 too_many_in_flight`
-  （新的对客码 `ApplicationError::TooManyInFlight`）。额度按**账户**算，不是按端点——用户
-  2026-09-20 的裁定是"针对端点先设计成 1 个并发数"。**同一个幂等键的那个不算占名额**：那种
-  请求会去重成原来那个 Job，重发不该被上限拒掉（用户同日："超时当然可以重发"）。
+- **同一账户在**同一个网关模型**上的在飞任务数上限**：名额由运营按模型设置
+  （`publication.gateway_models.max_concurrent_jobs`），模型没设时用部署缺省
+  `GENERATION_MAX_CONCURRENT_JOBS`（默认 1）。受理时在同一事务里数一次该账户在该模型上
+  `admitted`/`executing` 的 Job，到名额回 `429 too_many_in_flight`
+  （`ApplicationError::TooManyInFlight`）。额度按**账户 × 模型**算，不是按端点——用户 2026-09-20
+  的裁定是"针对端点先设计成 1 个并发数"；2026-10-08 用户指出"一个图片任务挡住同一账户的视频
+  请求"不合理，维度由**账户**改成**账户 × 模型**，见
+  [网关模型的并发名额](./2026-10-08-gateway-model-concurrency-quota.md)。
+  **同一个幂等键的那个不算占名额**：那种请求会去重成原来那个 Job，重发不该被上限拒掉
+  （用户同日："超时当然可以重发"）。
 - **两个 OpenAI 兼容入口改成同步返回**：受理后等任务跑到终态（上限
   `GENERATION_SYNC_WAIT_SECONDS`，默认 120s），成功回 `{created, data:[{b64_json}]}`，失败回
   OpenAI 错误信封（平台侧语义，渠道原文不外泄）。内部流水线一字未改，同步只是门面的等待。

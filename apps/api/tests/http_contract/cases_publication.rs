@@ -1669,11 +1669,16 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     );
     let (status, admin) = get_gateway_models(&client, &base_url, Some(&admin_token)).await;
     assert_eq!(status, StatusCode::OK, "{admin}");
+    let top = admin
+        .as_object()
+        .expect("the admin model list is an object");
     assert_eq!(
-        admin.as_object().map(serde_json::Map::len),
-        Some(1),
-        "管理端清单只有 gateway_models 一个顶层字段：{admin}"
+        top.len(),
+        2,
+        "管理端清单的顶层字段只有模型数组与并发名额的部署缺省：{admin}"
     );
+    assert!(top.contains_key("gateway_models"), "{admin}");
+    assert!(top.contains_key("max_concurrent_jobs_default"), "{admin}");
     let listed = admin["gateway_models"]
         .as_array()
         .expect("gateway_models is an array");
@@ -1681,6 +1686,12 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     let view = &listed[0];
     assert_eq!(view["gateway_model"], GATEWAY);
     assert_eq!(view["enabled"], true);
+    // 存量模型没有单独设名额：回 `null`，生效值由顶层那个部署缺省给。
+    assert_eq!(
+        view["max_concurrent_jobs"],
+        Value::Null,
+        "没设名额的模型回 null：{admin}"
+    );
     assert_eq!(view["vendor_id"], "OpenAI");
     assert_eq!(view["native_model_id"], NATIVE, "厂商原生名只在管理端出现");
     assert_eq!(view["native_revision"], material["native_revision"]);

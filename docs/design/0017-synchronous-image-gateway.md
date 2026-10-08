@@ -1,5 +1,5 @@
 主题: 同步图片网关执行与异常对账
-当前修订: v1
+当前修订: v2
 状态: 已接受
 承接: [同步图片网关 Spec v1](../specs/0005-synchronous-image-gateway.md) §1–§8
 依赖: [架构治理](../architecture.md)、[合同与映射](0005-vendor-model-contract-and-offering-mapping.md)、[定价结算](0007-pricing-floor-and-settlement.md)、[账户资金](0013-account-funds-and-reservations.md)
@@ -129,7 +129,7 @@ API Supervisor 拥有每个新执行任务、token、内存输入、permit 与 o
 | 每 API Key 请求速率 | Redis 原子计数脚本与 TTL；失败按现有规则放行 | 固定窗口；本机准入兜住降级负载 |
 | 本机正文读取与解析 | 在 Body extractor 前 `try_acquire` permit，按字节限额读取；拒绝不排无界等待 | 从接收正文到输入移入执行；Body 慢读有超时 |
 | 本机执行与峰值内存 | 固定执行槽位与字节预算；配置允许最大请求+最大响应+解析/编码副本时预留足够额度 | 覆盖执行、断开后收尾及响应发送；不能执行一结束就释放全部内存许可 |
-| 账户全局执行 | PostgreSQL 容量事实，与受理同事务更新，原子检查既有账户上限 | 正常执行与中间安全重试；终态或转对账释放，沿用既有账户在飞计数，不代替 Hold |
+| 账户在某模型上的并发 | PostgreSQL（按 `generation.jobs` 计数），与受理同事务、账户行锁下判定；名额取自该模型行（运营设置，模型没设时用部署缺省） | 正常执行与中间安全重试；终态或转对账释放，不代替 Hold |
 | Channel 全局未决任务 | PostgreSQL 容量事实，与受理同事务更新；配置更新不抹掉已有许可 | 执行及未知接受占用；确定终态或可信人工处置才释放 |
 | 本机客户端响应发送 | `try_acquire` 发送 permit，响应 body 持有预算和 permit，有界写超时 | 响应销毁或发送完成；慢客户端占用也计入预算 |
 

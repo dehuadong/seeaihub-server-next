@@ -1940,3 +1940,69 @@ async fn the_model_type_migration_backfills_existing_vendor_models() {
     let _ = std::fs::remove_dir_all(&staged);
     drop_isolated_database(&database_name).await;
 }
+
+/// **升级不改变各模型的生效名额**（工作项 #94）。
+///
+/// 名额列可空、没有回填：已经上架过的模型升上来是"未设"，生效值仍是部署缺省——与升级前那个
+/// 部署级上限是同一个数，所以升级不会静默改容。下限是库层的最后一道：0 与负数落不进去。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn the_model_quota_migration_leaves_existing_models_unset() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+    let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
+
+    // 1) 只应用这次改动之前的迁移。
+    let staged = stage_migrations(&migrations, "0048", "model-quota");
+    sqlx::migrate::Migrator::new(staged)
+        .await
+        .expect("early migrator")
+        .run(&pool)
+        .await
+        .expect("early migrations apply");
+
+    // 2) 旧数据：一个已经上架过的网关模型（这张表没有别的外键，一行就够）。
+    sqlx::query("INSERT INTO publication.gateway_models (gateway_model) VALUES ('legacy-model')")
+        .execute(&pool)
+        .await
+        .expect("legacy gateway model");
+
+    // 3) 补上整批迁移（含 0048）。
+    sqlx::migrate::Migrator::new(migrations)
+        .await
+        .expect("full migrator")
+        .run(&pool)
+        .await
+        .expect("the full set applies on a database that already has rows");
+
+    // 4) 存量行还在、开关没变、名额是"未设"。
+    let row: (bool, Option<i32>) = sqlx::query_as(
+        "SELECT enabled, max_concurrent_jobs FROM publication.gateway_models
+         WHERE gateway_model = 'legacy-model'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the legacy row survives");
+    assert!(row.0, "迁移不该改掉运维开关");
+    assert_eq!(
+        row.1, None,
+        "存量模型是未设名额（生效值仍是部署缺省），不是被回填成 1"
+    );
+
+    // 5) 库层是最后一道：0 与负数落不进这一列。
+    for value in [0, -1] {
+        let rejected = sqlx::query(
+            "UPDATE publication.gateway_models SET max_concurrent_jobs = $1
+             WHERE gateway_model = 'legacy-model'",
+        )
+        .bind(value)
+        .execute(&pool)
+        .await;
+        assert!(rejected.is_err(), "名额至少 1，{value} 必须被拒");
+    }
+
+    drop(pool);
+    drop_isolated_database(&database_name).await;
+}

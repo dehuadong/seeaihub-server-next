@@ -72,8 +72,8 @@ async fn measure_baseline(
 ) -> BaselineObservation {
     // 取同一组窗口与上游超时。30s 足够 8 并发的 48 个请求跑完。
     const SYNC_WAIT_SECONDS: u64 = 30;
-    // 夹具的账户在飞上限必须大于并发，否则测量被容量闸门排队，测到的是闸门而不是执行路径。
-    const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
+    // 夹具的并发名额缺省必须大于并发，否则测量被容量闸门排队，测到的是闸门而不是执行路径。
+    const MAX_CONCURRENT_JOBS_DEFAULT: u64 = 64;
     // 渠道全局名额同理：直接执行在整个上游调用期间占着它。
     const CHANNEL_IN_FLIGHT: u64 = 128;
     // 测量用一份单独的大余额账户，不依赖夹具发布账户的余额是否够 48 次扣费。
@@ -93,7 +93,7 @@ async fn measure_baseline(
     let harness = Harness::start_direct_with(
         draft,
         behaviour,
-        MAX_ACCOUNT_IN_FLIGHT,
+        MAX_CONCURRENT_JOBS_DEFAULT,
         SYNC_WAIT_SECONDS,
         ApiProcessSettings {
             channel_max_in_flight: Some(CHANNEL_IN_FLIGHT),
@@ -236,9 +236,9 @@ async fn direct_execution_gateway_overhead_split() {
     // 样本数按 p99 留出余量：n=120 时 p99 取第 119 个样本，不再是最大值。
     const REQUESTS: usize = 120;
     const UPSTREAM_DELAY_MS: u64 = 200;
-    // 与基线同一组窗口、上游超时与账户在飞上限，只有"顺序发"这一点不同。
+    // 与基线同一组窗口、上游超时与并发名额缺省，只有"顺序发"这一点不同。
     const SYNC_WAIT_SECONDS: u64 = 30;
-    const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
+    const MAX_CONCURRENT_JOBS_DEFAULT: u64 = 64;
     const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;
 
     let draft = candidate(
@@ -251,7 +251,7 @@ async fn direct_execution_gateway_overhead_split() {
         ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
     };
     let harness =
-        Harness::start_direct(draft, behaviour, MAX_ACCOUNT_IN_FLIGHT, SYNC_WAIT_SECONDS).await;
+        Harness::start_direct(draft, behaviour, MAX_CONCURRENT_JOBS_DEFAULT, SYNC_WAIT_SECONDS).await;
     let (_, api_key) = funded_account(
         &Client::new(),
         &harness.base_url,
@@ -357,9 +357,9 @@ async fn wal_bytes_of_one_request(harness: &Harness, api_key: &str, label: &str)
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn direct_execution_wal_bytes_per_request() {
     const BATCH: usize = 5;
-    // 与顺序耗时拆分同一组窗口与账户在飞上限，只有测量对象换成 WAL 字节。
+    // 与顺序耗时拆分同一组窗口与并发名额缺省，只有测量对象换成 WAL 字节。
     const SYNC_WAIT_SECONDS: u64 = 30;
-    const MAX_ACCOUNT_IN_FLIGHT: u64 = 64;
+    const MAX_CONCURRENT_JOBS_DEFAULT: u64 = 64;
     const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;
 
     let draft = candidate(
@@ -370,7 +370,7 @@ async fn direct_execution_wal_bytes_per_request() {
     let harness = Harness::start_direct(
         draft,
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
-        MAX_ACCOUNT_IN_FLIGHT,
+        MAX_CONCURRENT_JOBS_DEFAULT,
         SYNC_WAIT_SECONDS,
     )
     .await;

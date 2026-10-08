@@ -11,11 +11,11 @@
 //! | `pricing.fx_rates` | 按币种的折算率与生效时间；外部事实，由管理员录入 | `PricingService::upsert_fx_rate` |
 //! | `publication.runtime_revisions` / `runtime_entries` | 哪次发布生效、各型号的活动供给与档位 / 档内权重、该次发布的定价 | `RuntimeService::publish` |
 //! | `routing.route_policies` | 路由策略；运行期配置，不进不可变修订 | `RoutePolicyService::upsert` |
-//! | `publication.gateway_models` | 网关模型的运维开关；定义只在不可变修订里 | `RuntimeService::publish`、`set_gateway_model_enabled` |
+//! | `publication.gateway_models` | 网关模型的运维开关与并发名额；定义只在不可变修订里 | `RuntimeService::publish`、`set_gateway_model_settings` |
 //! | `generation.jobs` | 受理时的请求摘要与分支、所选供给、冻结的定价快照、产出张数与终态时刻、对客错误码，以及执行所有权与租约 | `ExecutionRepository` 的 `admit` / `begin_submission` / `record_acceptance` / `settle` / `fail_or_reconcile` / `refund_reconciliation` / `renew_execution_ownership` / `takeover_expired_executions` / `reap_unsubmitted_admissions` |
 //! | `generation.routing_decisions` | 受理时为什么选了它：候选、档位、权重、是否合格与分流落点 | 与 Job 同事务写入 |
 //! | `generation.attempts` | 一次执行尝试的阶段、对账标识、计量证据与渠道成本事实 | `ExecutionRepository` 的 `begin_submission` / `record_acceptance` / `settle` / `fail_or_reconcile` / `record_terminal_provider_cost` |
-//! | `generation.execution_capacity` | 渠道全局未决任务槽位；账户执行名额不在此表 | `ExecutionRepository` 的 `admit`、确定终态时释放、`reap_unsubmitted_admissions` 回收孤儿 |
+//! | `generation.execution_capacity` | 渠道全局未决任务槽位；账户在某模型上的并发名额不在此表（名额取自 `publication.gateway_models`，计数数 `generation.jobs`） | `ExecutionRepository` 的 `admit`、确定终态时释放、`reap_unsubmitted_admissions` 回收孤儿 |
 //! | `generation.late_facts` | 晚到事实收件箱：原提交者在执行 token 失效后交付的有界事实 | `ExecutionRepository` 的 `offer_late_facts` / `claim_unconsumed_late_facts` / `mark_late_fact_consumed` |
 //! | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 已结算余额、占用、预授权与账目；账户分消费者与平台两类 | `ExecutionRepository` 的 `admit` / `settle` / `fail_or_reconcile` / `refund_reconciliation` |
 //! | `identity.api_keys` | API Key 摘要 | `IdentityService` |
@@ -26,19 +26,19 @@
 use async_trait::async_trait;
 use chrono::{DateTime, Duration as ChronoDuration, Utc};
 use seeai_application::{
-    AccountSummary, ActiveOfferingChannel, AdmitExecution, AdmitOutcome, AdmittedJob, ApiKeyView,
-    ApplicationError, BalanceChange, BeginSubmission, CancelUnsubmitted, ClaimedLateFact,
-    ConsumerReferenceRates, CustomerAccountTarget, CustomerBillingQuery, CustomerBillingSummary,
-    CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope,
-    CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionLookup, ExecutionReplay,
-    ExecutionRepository, FailOrReconcileExecution, FailureDisposition, GatewayModelCandidateView,
-    GatewayModelView, HubRepository, LateFactKind, LateFacts, LateFactsOutcome, LedgerMismatch,
-    LedgerPage, MissingModelDocument, NewFxRate, NormalizedOffering, OpenLedgerCaseCommand,
-    PricePlanRates, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublicErrorCode, PublishRuntimeRequest, ReconciliationCaseView,
-    RecordAcceptance, ReferencedOffering, RefundReconciliationCommand, SelectableOfferingView,
-    SettleExecution, SubmissionStarted, TakenOverExecution, UsageAmounts, customer_usage_status,
-    declared_output_images,
+    AccountSummary, ActiveOfferingChannel, ActiveOfferings, AdmitExecution, AdmitOutcome,
+    AdmittedJob, ApiKeyView, ApplicationError, BalanceChange, BeginSubmission, CancelUnsubmitted,
+    ClaimedLateFact, ConsumerReferenceRates, CustomerAccountTarget, CustomerBillingQuery,
+    CustomerBillingSummary, CustomerLedgerQuery, CustomerUsageKind, CustomerUsageQuery,
+    CustomerUsageScope, CustomerUsageView, CustomerView, ExecutionFinalization, ExecutionLookup,
+    ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
+    GatewayModelCandidateView, GatewayModelView, HubRepository, LateFactKind, LateFacts,
+    LateFactsOutcome, LedgerMismatch, LedgerPage, MissingModelDocument, NewFxRate,
+    NormalizedOffering, OpenLedgerCaseCommand, PricePlanRates, ProviderCostGapView,
+    ProviderFailureKind, ProviderFailureQuery, ProviderFailureView, PublicErrorCode,
+    PublishRuntimeRequest, ReconciliationCaseView, RecordAcceptance, ReferencedOffering,
+    RefundReconciliationCommand, SelectableOfferingView, SettleExecution, SubmissionStarted,
+    TakenOverExecution, UsageAmounts, customer_usage_status, declared_output_images,
 };
 use seeai_domain::{
     AccountId, AttemptId, AttemptStage, ChannelId, ConsumerRatesCny, CostBasis, ExecutionStage,
@@ -706,7 +706,7 @@ impl HubRepository for PgHubRepository {
     async fn active_offering(
         &self,
         gateway_model: &str,
-    ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+    ) -> Result<ActiveOfferings, ApplicationError> {
         // 按 routing_priority 升序取全部 active 候选。每个候选 JOIN 到它所属的那一行
         // vendor_models 取**合同**（模型级唯一一份），技术定义（承载面、参数映射、限制、驱动器、
         // 供应商模型名与渠道三要素）读**条目自己那八列**——它是这次发布冻结下来的那一份，供给与
@@ -728,7 +728,7 @@ impl HubRepository for PgHubRepository {
             r#"
             SELECT
                 rr.id AS runtime_revision_id,
-                vm.id AS vendor_model_id, re.gateway_model, vm.native_revision,
+                vm.id AS vendor_model_id, re.gateway_model, gm.max_concurrent_jobs, vm.native_revision,
                 vm.capability_schema, re.carrier_schema, re.parameter_mapping,
                 o.id AS offering_id, re.adapter_key, re.provider_model_id, re.restrictions,
                 o.formula, o.cost_unit_price_microusd,
@@ -761,7 +761,13 @@ impl HubRepository for PgHubRepository {
         .map_err(database_error)?;
         // 无 active 候选不是错误：由调用方判定「无合格候选」。返回空集合。
         let mut candidates = Vec::with_capacity(rows.len());
+        let mut max_concurrent_jobs: Option<u32> = None;
         for row in &rows {
+            // 名额是**模型级**的：同一模型的所有候选读出来都是同一个值，取第一行即可。
+            if max_concurrent_jobs.is_none() {
+                max_concurrent_jobs =
+                    quota_from_column(row.try_get("max_concurrent_jobs").map_err(database_error)?)?;
+            }
             candidates.push(row_to_candidate(row)?);
         }
         // 防御：同一模型的 active 候选集必须**永远来自同一个 Revision**（发布即原子替换）。
@@ -778,7 +784,10 @@ impl HubRepository for PgHubRepository {
                 )));
             }
         }
-        Ok(candidates)
+        Ok(ActiveOfferings {
+            candidates,
+            max_concurrent_jobs,
+        })
     }
 
     /// 该型号当前生效修订里可被沿用的候选：供应商、渠道模型名与渠道三要素。
@@ -1374,7 +1383,7 @@ impl HubRepository for PgHubRepository {
         let rows = sqlx::query(AssertSqlSafe(format!(
             r#"
             SELECT
-                re.gateway_model, gm.enabled,
+                re.gateway_model, gm.enabled, gm.max_concurrent_jobs,
                 vm.vendor_id, vm.native_model_id, vm.native_revision, vm.capability_schema,
                 rr.id AS runtime_revision_id, rr.created_at AS published_at,
                 o.id AS offering_id, re.adapter_key, re.provider_model_id,
@@ -1411,45 +1420,89 @@ impl HubRepository for PgHubRepository {
         Ok(views)
     }
 
-    async fn set_gateway_model_enabled(
+    async fn set_gateway_model_settings(
         &self,
         gateway_model: &str,
-        enabled: bool,
+        enabled: Option<bool>,
+        max_concurrent_jobs: Option<Option<u32>>,
         actor: &str,
     ) -> Result<(), ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
-        // 只改开关这一列。定义（合同、候选集）不在这里，改了它等于绕过发布——那会让
-        // "Job 固定受理时版本"失去依据。
-        let updated = sqlx::query(
+        // 先锁住这一行再读旧值：审计要写清改前改后，而 `UPDATE ... RETURNING` 只给新值。
+        // 没发布过的名字不是"待创建的资源"：定义只能由发布产生，因此这里是"不存在"，
+        // 而不是先建一行再让人以为它已经在售。
+        let current = sqlx::query(
+            r#"
+            SELECT enabled, max_concurrent_jobs
+            FROM publication.gateway_models
+            WHERE gateway_model = $1
+            FOR UPDATE
+            "#,
+        )
+        .bind(gateway_model)
+        .fetch_optional(&mut *transaction)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("gateway model {gateway_model}")))?;
+        let (current_enabled, current_max): (bool, Option<i32>) = {
+            use sqlx::Row as _;
+            (
+                current.try_get("enabled").map_err(database_error)?,
+                current
+                    .try_get("max_concurrent_jobs")
+                    .map_err(database_error)?,
+            )
+        };
+        // 只改这两列：运维开关与并发名额。定义（合同、候选集）不在这里，改了它等于绕过发布——
+        // 那会让"Job 固定受理时版本"失去依据。名额与开关同类：运行状态，不是定义。
+        let next_enabled = enabled.unwrap_or(current_enabled);
+        let next_max = match max_concurrent_jobs {
+            None => current_max,
+            Some(None) => None,
+            Some(Some(value)) => Some(quota_column_value(value)?),
+        };
+        sqlx::query(
             r#"
             UPDATE publication.gateway_models
-            SET enabled = $2, updated_at = now(), updated_by = $3
+            SET enabled = $2, max_concurrent_jobs = $3, updated_at = now(), updated_by = $4
             WHERE gateway_model = $1
             "#,
         )
         .bind(gateway_model)
-        .bind(enabled)
+        .bind(next_enabled)
+        .bind(next_max)
         .bind(actor)
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        // 没发布过的名字不是"待创建的资源"：定义只能由发布产生，因此这里是"不存在"，
-        // 而不是先建一行再让人以为它已经在售。
-        if updated.rows_affected() == 0 {
-            transaction.rollback().await.map_err(database_error)?;
-            return Err(ApplicationError::NotFound(format!(
-                "gateway model {gateway_model}"
-            )));
+        // 请求里给了哪一项就写哪一项的审计（空改动也记一笔：运营点过一次保存这件事本身要看得到，
+        // 与 `set_offering_enabled` / `set_channel_enabled` 的写法一致）。动作名各说清做了什么，
+        // 历史里既有的 `gateway_model.set_enabled` 不被改名。
+        if let Some(value) = enabled {
+            insert_audit(
+                &mut transaction,
+                actor,
+                "gateway_model.set_enabled",
+                "gateway_model",
+                gateway_model,
+                &serde_json::json!({"enabled": value}),
+            )
+            .await?;
         }
-        insert_audit(
-            &mut transaction,
-            actor,
-            "gateway_model.set_enabled",
-            "gateway_model",
-            gateway_model,
-            &serde_json::json!({"enabled": enabled}),
-        )
-        .await?;
+        if max_concurrent_jobs.is_some() {
+            insert_audit(
+                &mut transaction,
+                actor,
+                "gateway_model.set_max_concurrent_jobs",
+                "gateway_model",
+                gateway_model,
+                &serde_json::json!({
+                    "before": current_max,
+                    "after": next_max,
+                }),
+            )
+            .await?;
+        }
         transaction.commit().await.map_err(database_error)
     }
 
@@ -3703,7 +3756,7 @@ impl ExecutionRepository for PgHubRepository {
             request_digest,
             request_digest_key_version,
             max_cost_microusd,
-            max_account_in_flight,
+            max_in_flight,
             max_channel_in_flight,
         } = command;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
@@ -3783,20 +3836,23 @@ impl ExecutionRepository for PgHubRepository {
         .await
         .map_err(database_error)?
         .ok_or(ApplicationError::InsufficientBalance)?;
-        // 账户在飞名额：admitted/executing 计入；对账态不是占用名额的在飞执行，不计（沿用既有排除）。
-        // 账户行已被上面那条 UPDATE 锁住，同账户的并发受理在这里排队，计数因此不会漏掉在飞的。
+        // 并发名额按「账户 × 这个网关模型」数：admitted/executing 计入，对账态不是占用名额的在飞执行，
+        // 不计。不同模型互不占名额。账户行已被上面那条 UPDATE 锁住，同账户的并发受理在这里排队，
+        // 计数因此不会漏掉在飞的。名额由调用方解析后传入（模型的值或部署缺省），这里不兜缺省。
         let in_flight: i64 = sqlx::query_scalar(
             r#"
             SELECT count(*) FROM generation.jobs
             WHERE account_id = $1
+              AND gateway_model = $2
               AND state IN ('admitted', 'executing')
             "#,
         )
         .bind(account_id.0)
+        .bind(&offering.gateway_model)
         .fetch_one(&mut *transaction)
         .await
         .map_err(database_error)?;
-        if u64::try_from(in_flight).unwrap_or(u64::MAX) >= max_account_in_flight {
+        if u64::try_from(in_flight).unwrap_or(u64::MAX) >= max_in_flight {
             return Err(ApplicationError::TooManyInFlight);
         }
         // 渠道全局容量：持有的槽位各计一个未决任务；租约过期不证明上游结束，所以只认 released。
@@ -4170,7 +4226,7 @@ impl ExecutionRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        // 释放占用：锁 Hold 再动账户，与结算同一锁序；账户执行名额与渠道容量同事务归还。
+        // 释放占用：锁 Hold 再动账户，与结算同一锁序；该账户在该模型上的并发名额与渠道容量同事务归还。
         let (hold_id, hold_amount) = lock_active_hold(&mut transaction, job_id).await?;
         sqlx::query(
             "UPDATE ledger.holds SET status = 'released', updated_at = now() WHERE id = $1 AND status = 'active'",
@@ -6165,6 +6221,29 @@ async fn insert_platform_cost(
     .await
 }
 
+/// 读列里的并发名额：`NULL`＝未设（用部署缺省）。列的 `CHECK` 与接口层校验保证它落在范围内；
+/// 真读到范围外的值就报错，**不静默放大**成一个巨大的名额。
+fn quota_from_column(value: Option<i32>) -> Result<Option<u32>, ApplicationError> {
+    value
+        .map(|value| {
+            u32::try_from(value).map_err(|_| {
+                ApplicationError::Persistence(format!(
+                    "max_concurrent_jobs {value} in the database does not fit a u32"
+                ))
+            })
+        })
+        .transpose()
+}
+
+/// 名额落列（`integer`）：范围校验在接口层（对客 400），这里只做最后一道不静默的转换。
+fn quota_column_value(value: u32) -> Result<i32, ApplicationError> {
+    i32::try_from(value).map_err(|_| {
+        ApplicationError::Persistence(format!(
+            "max_concurrent_jobs {value} does not fit the integer column"
+        ))
+    })
+}
+
 fn row_to_candidate(row: &sqlx::postgres::PgRow) -> Result<OfferingCandidate, ApplicationError> {
     let offering_id = OfferingId(row.try_get("offering_id").map_err(database_error)?);
     let channel_id = ChannelId(row.try_get("channel_id").map_err(database_error)?);
@@ -6410,6 +6489,9 @@ fn row_to_gateway_model(
     Ok(GatewayModelView {
         gateway_model: row.try_get("gateway_model").map_err(database_error)?,
         enabled: row.try_get("enabled").map_err(database_error)?,
+        max_concurrent_jobs: quota_from_column(
+            row.try_get("max_concurrent_jobs").map_err(database_error)?,
+        )?,
         vendor_id: row.try_get("vendor_id").map_err(database_error)?,
         native_model_id: row.try_get("native_model_id").map_err(database_error)?,
         native_revision: row.try_get("native_revision").map_err(database_error)?,

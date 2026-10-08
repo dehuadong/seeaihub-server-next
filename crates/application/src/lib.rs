@@ -92,12 +92,14 @@ pub use image_upload::{
     UPLOAD_STORAGE_ACCESS_KEY_SECRET_ENV, UploadCancellation, UploadStorageConfig, UploadedImage,
 };
 
-/// 直接执行的两个容量名额与平台兜底保底额：运营取值，随调用传入，本用例只在同一个事务里
-/// 按它判定，不在库层另存一份会与调用方漂移的限额（RFC 0017 §6）。
+/// 直接执行的并发缺省与平台兜底保底额：运营取值，随调用传入。
+///
+/// **并发名额本身不在进程配置里**：它挂在网关模型那一行上（`publication.gateway_models`），由运营
+/// 设置、随受理读出来；这里给的只是"模型没有设值时"的缺省。
 #[derive(Debug, Clone, Copy)]
 pub struct DirectExecutionLimits {
-    /// 该账户同时允许的在飞执行数。
-    pub max_account_in_flight: u64,
+    /// 网关模型没设并发名额时用的缺省（每账户、每网关模型）。
+    pub default_max_concurrent_jobs: u64,
     /// 该渠道全局允许的未决任务数。
     pub max_channel_in_flight: u64,
     /// 候选没有发布保底表时的平台兜底保底额（CNY 微单位）。
@@ -1666,11 +1668,23 @@ pub struct AdmitOffering {
     pub credential_env: String,
 }
 
+/// 一次受理要用的**模型级**读：该网关模型当前生效修订的候选，加上挂在模型行上的并发名额。
+///
+/// 名额放在这里、**不放进 [`OfferingCandidate`]**：候选是发布物的一部分（发布接口原样回显它），
+/// 运营的运行期设置不该出现在发布面；发布事务也是先写条目再写模型行，发布路径填不出它。
+#[derive(Debug, Clone)]
+pub struct ActiveOfferings {
+    /// 该模型的 active 候选，按 `routing_priority` 升序。
+    pub candidates: Vec<OfferingCandidate>,
+    /// 该模型的并发名额；`None`＝用部署缺省（[`DirectExecutionLimits::default_max_concurrent_jobs`]）。
+    pub max_concurrent_jobs: Option<u32>,
+}
+
 /// 新协议原子受理的命令：账户、冻结身份与摘要，**不含任何业务载荷**。
 ///
 /// 请求正文、参考图、mask、结果信封不在这里，也不在同事务写入的 Job 上（Spec 0005 §2）。
-/// 两个容量名额是运营取值、随调用传入：本端口只负责在同一个事务里按它判定，不在库层另存一份
-/// 会与调用方漂移的限额（限额本身的归属见 RFC 0017 §6，尚未由切片定义）。
+/// 两个容量名额都由调用方**解析后**传入：并发名额按「账户 × 网关模型」判（模型的值得自模型行，
+/// 没设时由应用层用进程缺省合成），渠道名额是全局的一个数。持久化只按传入的数计数、不兜缺省。
 #[derive(Debug, Clone)]
 pub struct AdmitExecution {
     pub account_id: AccountId,
@@ -1686,8 +1700,8 @@ pub struct AdmitExecution {
     pub request_digest_key_version: i16,
     /// 本次预授权额（保底额，CNY 微单位），由定价侧算定并随快照冻结。
     pub max_cost_microusd: u64,
-    /// 该账户同时允许的在飞执行数。
-    pub max_account_in_flight: u64,
+    /// 该账户**在这个网关模型上**同时允许的在飞执行数（已解析：模型的值或部署缺省）。
+    pub max_in_flight: u64,
     /// 该渠道全局允许的未决任务数。
     pub max_channel_in_flight: u64,
 }
@@ -1826,7 +1840,7 @@ pub struct SubmissionStarted {
 
 /// `cancel_unsubmitted` 的命令：受理已提交、生成请求确实没有发出的执行身份。
 ///
-/// 这类执行能按"确定未提交"收尾：原子释放 Hold、账户执行名额与渠道容量，落一个确定未提交的
+/// 这类执行能按"确定未提交"收尾：原子释放 Hold、该账户在该模型上的并发名额与渠道容量，落一个确定未提交的
 /// 结论。它**不新建 Attempt**——为释放先写一条 submitting 记录，会把确定未提交的执行伪装成
 /// 可能已提交（RFC 0018 §4.1）。调用方声称这次生成确实没发出，端口据此把已有的提交声明（若
 /// 有）收成 `terminal`；已经 `accepted`/`unknown` 的 Attempt 说明提交可能已在飞，一律冲突。
@@ -2417,6 +2431,8 @@ pub struct GatewayModelView {
     pub gateway_model: String,
     /// 运维开关：关掉之后它从对客目录消失、受理得到"模型不存在"；已受理的 Job 不受影响。
     pub enabled: bool,
+    /// 每个账户在该模型上同时在跑的上限；`None`＝用部署缺省。由运营设置，改完即时生效。
+    pub max_concurrent_jobs: Option<u32>,
     pub vendor_id: String,
     /// 厂商原生名：**只在管理端出现**，对客面看不到它。
     pub native_model_id: String,
@@ -2566,14 +2582,14 @@ pub trait HubRepository: Send + Sync {
     /// 等于"关掉之后再也找不到怎么打开"。库里一条供给都没有时返回空 `Vec`，不是错误。
     async fn selectable_offerings(&self) -> Result<Vec<SelectableOfferingView>, ApplicationError>;
 
-    /// 取该型号当前的 **active 候选集合**，按 `routing_priority` 升序。
+    /// 取该型号当前的 **active 候选集合**（按 `routing_priority` 升序）与该模型行上的并发名额。
     ///
     /// 同一模型的 active 候选集**永远来自同一个 Revision**（发布即原子替换）。
-    /// 无任何 active 候选时返回空 `Vec`，不是错误——由调用方判定"无合格候选"。
+    /// 无任何 active 候选时 `candidates` 为空，不是错误——由调用方判定"无合格候选"。
     async fn active_offering(
         &self,
         gateway_model: &str,
-    ) -> Result<Vec<OfferingCandidate>, ApplicationError>;
+    ) -> Result<ActiveOfferings, ApplicationError>;
 
     /// **按主键点读的供给可用性复核**：这些供给里，此刻仍然启用的有哪些（它的渠道也启用）。
     ///
@@ -2639,14 +2655,17 @@ pub trait HubRepository: Send + Sync {
     /// 是重新启用还是重发；把它藏起来等于"关掉之后再也找不到怎么打开"。
     async fn gateway_models(&self) -> Result<Vec<GatewayModelView>, ApplicationError>;
 
-    /// 管理员写：只改运维开关，写一条审计事件。
+    /// 管理员写：只改运维开关与并发名额，按改了什么各写一条审计事件。
     ///
-    /// 没发布过的名字返回 [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**
-    /// 任何东西（不做分步 CRUD）。
-    async fn set_gateway_model_enabled(
+    /// `enabled`：`None`＝这次不改，`Some(v)`＝设成 v。
+    /// `max_concurrent_jobs`：`None`＝这次不改，`Some(None)`＝清成"用部署缺省"，`Some(Some(n))`＝设成 n。
+    /// 两个都是 `None` 由调用方拒掉（没有要改的东西）。没发布过的名字返回
+    /// [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**任何东西。
+    async fn set_gateway_model_settings(
         &self,
         gateway_model: &str,
-        enabled: bool,
+        enabled: Option<bool>,
+        max_concurrent_jobs: Option<Option<u32>>,
         actor: &str,
     ) -> Result<(), ApplicationError>;
 
@@ -3162,7 +3181,7 @@ pub trait HubRepository: Send + Sync {
 /// 实现不得在事务里跨 Provider 等待，也不得把业务载荷带进端口参数。
 #[async_trait]
 pub trait ExecutionRepository: Send + Sync {
-    /// 原子受理：账户与键唯一性、资金最终检查、账户在飞名额与 Channel 全局容量检查、最小 Job、
+    /// 原子受理：账户与键唯一性、资金最终检查、该账户在该模型上的并发名额与 Channel 全局容量检查、最小 Job、
     /// Hold 与容量事实**同事务**提交。
     ///
     /// 同账户同 idempotency_key_digest 已存在时走幂等重放：只按原记录做只读投影，不新建、
@@ -3171,7 +3190,7 @@ pub trait ExecutionRepository: Send + Sync {
     ///
     /// 保底额可以为零（账户资金 Spec v4 §2.1）：零元预授权在可用额非负时放行，可用额为负时
     /// 仍按资金闸门拒绝。失败：余额不足返回 ApplicationError::InsufficientBalance；
-    /// 账户名额已满返回 ApplicationError::TooManyInFlight；
+    /// 该账户在该模型上的名额已满返回 ApplicationError::TooManyInFlight；
     /// 渠道全局容量已满返回 ApplicationError::PlatformCapacityExhausted。
     async fn admit(&self, command: AdmitExecution) -> Result<AdmitOutcome, ApplicationError>;
 
@@ -3220,7 +3239,7 @@ pub trait ExecutionRepository: Send + Sync {
 
     /// 带 fencing 的"确定未提交"取消：受理已提交但生成请求确实没发出的执行按确定未提交收尾。
     ///
-    /// 同一事务里原子释放该 Job 的 active Hold（并按预授权额去掉账户占用）、账户执行名额与渠道
+    /// 同一事务里原子释放该 Job 的 active Hold（并按预授权额去掉账户占用）、该账户在该模型上的并发名额与渠道
     /// 容量槽位，把 Job 写成 failed 并盖 `terminal_at`；不写对客错误码（没有对客结论，也不需要
     /// 重开路径）。它**不建 Attempt**：没有提交声明的执行本来就没有 Attempt，已有已收尾 Attempt
     /// 的重投也无法再证明"没发过"。调用方凭带 fencing 的 token 声称这次生成确实没发出，端口据此
@@ -5854,18 +5873,19 @@ impl RuntimeService {
         Ok(offerings)
     }
 
-    /// 管理员写：只改运维开关。没发布过的名字由仓库判成"不存在"。
+    /// 管理员写：只改运维开关与并发名额。没发布过的名字由仓库判成"不存在"。
     ///
-    /// 改完失效该型号的 route 缓存（清理历史条目）：直接执行每次受理都直读数据库的候选与开关，
+    /// 改完失效该型号的 route 缓存（清理历史条目）：直接执行每次受理都直读数据库的候选、开关与名额，
     /// 关掉的模型在受理期就是"模型不存在"，不依赖任何缓存是否过期。
-    pub async fn set_gateway_model_enabled(
+    pub async fn set_gateway_model_settings(
         &self,
         gateway_model: &str,
-        enabled: bool,
+        enabled: Option<bool>,
+        max_concurrent_jobs: Option<Option<u32>>,
         actor: &str,
     ) -> Result<(), ApplicationError> {
         self.repository
-            .set_gateway_model_enabled(gateway_model, enabled, actor)
+            .set_gateway_model_settings(gateway_model, enabled, max_concurrent_jobs, actor)
             .await?;
         self.acceleration.invalidate_route(gateway_model).await;
         Ok(())

@@ -24,7 +24,7 @@ HTTP/2 设置小 flow-control window，使流被真实阻塞；覆盖一个图�
 
 请求断开覆盖 HTTP/1 pending service 时已有 pipeline bytes 缓存在 Hyper read buffer 的场景，防止仅靠 handler Drop 漏掉 FIN；HTTP/2 覆盖 header 后 RST_STREAM、请求正文未读完时 reset 和整连接终止。客户端断开与 `DispatchGate` 开始动作并发，用屏障而非定时猜测控制竞态。monitor 覆盖注册确认前不启动连接、注册/控制队列满、cleanup 保留容量、fd 重用、重复关闭事件、duplicate fd 注销确认和线程故障；不消费 HTTP 字节、不热轮询，故障时零新增生成。H2 task group 覆盖流反复创建/结束、容量满及关闭期间拒绝新 spawn，验证完成 handle 持续回收。
 
-Supervisor 超时、停机及 transport 关闭不能直接强杀已可能提交的 Application 收尾。独立 finalization deadline 到期后任务及图片释放；未知 Hold/渠道容量按合同保留，账户执行名额按既有规则释放。
+Supervisor 超时、停机及 transport 关闭不能直接强杀已可能提交的 Application 收尾。独立 finalization deadline 到期后任务及图片释放；未知 Hold/渠道容量按合同保留，该账户在该模型上的并发名额按既有规则释放。
 
 ## 3. 收尾与晚到事实
 
@@ -66,7 +66,7 @@ A6 同时覆盖先持久化句柄再 poll、持久化失败及只读异常对账
 
 A7 使用本清单 transport、断开和收尾竞争用例，验证 timeout 不重写已确认账务，成功已收费但交付失败符合调用方错误说明。
 
-A8 在多 API 副本下观察账户/渠道全局计数与本机资源上限；转对账只释放账户执行名额，未知渠道名额/Hold 保留；缓存通知丢失时不能选旧修订/停用候选。分别测 Provider 耗时、准备/数据库/编码/发送耗时和不同响应大小的峰值内存；SQL 数量不随等待时长周期增长。
+A8 在多 API 副本下观察模型/渠道全局计数与本机资源上限；转对账只释放该账户在该模型上的并发名额，未知渠道名额/Hold 保留；缓存通知丢失时不能选旧修订/停用候选。分别测 Provider 耗时、准备/数据库/编码/发送耗时和不同响应大小的峰值内存；SQL 数量不随等待时长周期增长。
 
 A9 使用本清单第 4.2 节旧库升级用例，另覆盖旧在飞任务排空/转对账与容量登记及历史载荷清理证据。
 

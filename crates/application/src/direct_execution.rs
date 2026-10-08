@@ -433,7 +433,10 @@ impl DirectExecutionService {
         }
         // 合同是模型级唯一一份：先读候选取合同，按它过滤出"已识别的参数"，指纹在选路与候选
         // 截断之前形成，且不依赖当前价格、候选或修订（Spec 0005 §4）。
-        let candidates = self.repository.active_offering(&request.model).await?;
+        // 候选与并发名额来自**同一次**读：名额挂在模型行上，由运营设置；模型没设时用进程缺省。
+        let active = self.repository.active_offering(&request.model).await?;
+        let max_concurrent_jobs = active.max_concurrent_jobs;
+        let candidates = active.candidates;
         if candidates.is_empty() {
             return Err(ApplicationError::NotFound(format!(
                 "no active offering for model {}",
@@ -512,7 +515,9 @@ impl DirectExecutionService {
                 request_digest,
                 request_digest_key_version: self.keys.current_request_key_version(),
                 max_cost_microusd: hold_microusd,
-                max_account_in_flight: self.limits.max_account_in_flight,
+                max_in_flight: max_concurrent_jobs
+                    .map(u64::from)
+                    .unwrap_or(self.limits.default_max_concurrent_jobs),
                 max_channel_in_flight: self.limits.max_channel_in_flight,
             })
             .await?;

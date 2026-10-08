@@ -361,7 +361,7 @@ async fn admit_with_snapshot(
             request_digest: format!("request-{key}"),
             request_digest_key_version: 1,
             max_cost_microusd: 1000,
-            max_account_in_flight: 8,
+            max_in_flight: 8,
             max_channel_in_flight: 8,
         })
         .await

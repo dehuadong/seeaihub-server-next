@@ -6,7 +6,7 @@
 
 use super::*;
 use crate::{
-    AccountSummary, ActiveOfferingChannel, AlertSink, ApiKeyView, BalanceChange,
+    AccountSummary, ActiveOfferingChannel, ActiveOfferings, AlertSink, ApiKeyView, BalanceChange,
     CustomerAccountTarget, CustomerBillingQuery, CustomerBillingSummary, CustomerLedgerQuery,
     CustomerUsageQuery, CustomerUsageView, CustomerView, GatewayModelView, LedgerEntry, LedgerPage,
     NewFxRate, ProviderCostGapView, ProviderFailureQuery, ProviderFailureView,
@@ -16,8 +16,7 @@ use crate::{
 use async_trait::async_trait;
 use chrono::{DateTime, Utc};
 use seeai_domain::{
-    AccountId, ChannelId, FxRate, OfferingCandidate, OfferingId, PublishedModel, PublishedRevision,
-    RoutePolicy,
+    AccountId, ChannelId, FxRate, OfferingId, PublishedModel, PublishedRevision, RoutePolicy,
 };
 use serde_json::Value;
 use std::{
@@ -353,7 +352,7 @@ impl HubRepository for AuditRepository {
     async fn active_offering(
         &self,
         _native_model_id: &str,
-    ) -> Result<Vec<OfferingCandidate>, ApplicationError> {
+    ) -> Result<ActiveOfferings, ApplicationError> {
         unused_repository()
     }
 
@@ -390,10 +389,11 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn set_gateway_model_enabled(
+    async fn set_gateway_model_settings(
         &self,
         _gateway_model: &str,
-        _enabled: bool,
+        _enabled: Option<bool>,
+        _max_concurrent_jobs: Option<Option<u32>>,
         _actor: &str,
     ) -> Result<(), ApplicationError> {
         unused_repository()

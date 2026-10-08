@@ -43,8 +43,12 @@ Provider 的一个调用入口及凭证身份。
 _Avoid_: Provider、Offering、上传存储
 
 **Gateway Model**（对外的模型字段 `model`）:
-平台自己的模型身份：运营给它起名、指定它指向的 Vendor Model Revision、配它由哪些 Offering 供应、定它的价，并启用或停用它。它是对客面唯一存在的模型身份，与 Vendor Model、供应商模型名是三个分开的角色。
+平台自己的模型身份：运营给它起名、指定它指向的 Vendor Model Revision、配它由哪些 Offering 供应、定它的价，启用或停用它，并设它的并发名额。它是对客面唯一存在的模型身份，与 Vendor Model、供应商模型名是三个分开的角色。
 _Avoid_: 平台模型、网关模型、把 `model` 当成厂商原生模型名
+
+**Model Concurrency Quota**（模型并发名额）:
+每个账户在一个 Gateway Model 上**同时在跑**的生成任务上限。它挂在 Gateway Model 上、由运营设置，不随 Runtime Revision 冻结——改了即刻影响之后受理的请求；模型没设时用部署缺省。按「账户 × 该模型」计数，不同模型互不占名额；转对账的 Job 不占名额。
+_Avoid_: 把它当发布内容、当账户总量上限、当请求速率（速率与并发是两个量）
 
 **Runtime Revision**:
 一次经过校验并发布的不可变运行时目录，固定模型、供给、渠道限制与价格关系。请求与 Job 固定受理时的版本。

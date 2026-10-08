@@ -5,6 +5,8 @@ import {
   Descriptions,
   Drawer,
   Flex,
+  Form,
+  InputNumber,
   Popconfirm,
   Switch,
   Table,
@@ -45,6 +47,8 @@ export function ModelsPage({
   const { message } = AntApp.useApp();
   const models = useLoadable(() => client.gatewayModels(), [client]);
   const [busy, setBusy] = useState<string | null>(null);
+  /// 正在提交并发名额的模型名（只影响那一张卡的保存按钮）。
+  const [quotaBusy, setQuotaBusy] = useState<string | null>(null);
   const [failure, setFailure] = useState<string | null>(null);
   const [open, setOpen] = useState<string | null>(null);
   /// 抽屉里的表单：`null` 表示抽屉关着；`{ editing: null }` 表示新增；`{ editing: '名' }` 表示改价。
@@ -71,7 +75,34 @@ export function ModelsPage({
     }
   }
 
+  /// 保存并发名额：留空＝清成"用部署缺省"（发 `null`，不是 0）。
+  async function saveQuota(model: GatewayModel, value: number | null | undefined) {
+    setQuotaBusy(model.gateway_model);
+    setFailure(null);
+    try {
+      await client.setGatewayModelConcurrency(model.gateway_model, value ?? null);
+      message.success(
+        value === null || value === undefined
+          ? '已改回"用部署缺省"'
+          : `并发名额已设为 ${value}`,
+      );
+      models.reload();
+    } catch (error) {
+      setFailure(error instanceof Error ? error.message : String(error));
+    } finally {
+      setQuotaBusy(null);
+    }
+  }
+
   const list = models.data?.gateway_models ?? [];
+  /// 部署缺省由 API 顶层给（缺省值只有服务端知道）；数据没到时只说"用部署缺省"，不编一个数。
+  const defaultQuota = models.data?.max_concurrent_jobs_default;
+  const quotaText = (value: number | null) =>
+    value !== null
+      ? `${value}（每账户）`
+      : defaultQuota === undefined
+        ? '用部署缺省'
+        : `用部署缺省（${defaultQuota}）`;
 
   return (
     <ConsolePage
@@ -173,7 +204,51 @@ export function ModelsPage({
               <Descriptions.Item label="发布时间">
                 {whenText(model.published_at)}
               </Descriptions.Item>
+              <Descriptions.Item label="并发名额">
+                {quotaText(model.max_concurrent_jobs)}
+              </Descriptions.Item>
             </Descriptions>
+
+            <Form
+              layout="inline"
+              style={{ marginTop: 12 }}
+              key={`${model.gateway_model}:${model.max_concurrent_jobs ?? 'default'}`}
+              initialValues={{ max_concurrent_jobs: model.max_concurrent_jobs ?? undefined }}
+              onFinish={(values: { max_concurrent_jobs?: number | null }) =>
+                saveQuota(model, values.max_concurrent_jobs)
+              }
+            >
+              <Form.Item
+                name="max_concurrent_jobs"
+                label="并发名额"
+                tooltip="每个账户在这个模型上同时在跑的上限；留空＝用部署缺省"
+                rules={[
+                  {
+                    // 不在控件层夹住非法值（`min` 会把 0 悄悄压成 1）：点保存时点名拒掉。
+                    validator: (_rule, value: number | null | undefined) =>
+                      value === undefined || value === null || value >= 1
+                        ? Promise.resolve()
+                        : Promise.reject(new Error('并发名额至少 1')),
+                  },
+                ]}
+              >
+                <InputNumber
+                  data-testid={`models-quota-input-${model.gateway_model}`}
+                  precision={0}
+                  style={{ width: 120 }}
+                  placeholder={quotaText(null)}
+                />
+              </Form.Item>
+              <Form.Item>
+                <Button
+                  data-testid={`models-quota-submit-${model.gateway_model}`}
+                  htmlType="submit"
+                  loading={quotaBusy === model.gateway_model}
+                >
+                  保存名额
+                </Button>
+              </Form.Item>
+            </Form>
 
             {expanded ? (
               <Table
