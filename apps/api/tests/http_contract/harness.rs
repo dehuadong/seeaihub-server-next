@@ -1479,6 +1479,10 @@ async fn start_api_with(
         let mut command = Command::new(env!("CARGO_BIN_EXE_seeai-api"));
         remove_proxy_env(&mut command);
         command
+            // 工作目录落在临时目录：进程启动会读一次 `.env`（`dotenvy` 从工作目录向上找），默认落在
+            // 仓库内就会读到**开发者本机**那份配置——用例的结论于是随各人环境变（本机 `.env` 里配了
+            // 上传存储时，"没配存储回 503"那条用例必红）。下面按绝对路径给的变量不依赖工作目录。
+            .current_dir(std::env::temp_dir())
             .env("DATABASE_URL", database_url)
             .env("API_BIND", format!("127.0.0.1:{port}"))
             .env("ADMIN_TOKEN", &admin_token)
