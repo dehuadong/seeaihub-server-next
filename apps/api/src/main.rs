@@ -4092,8 +4092,11 @@ fn history_cursor_key() -> Result<[u8; HISTORY_CURSOR_KEY_LEN]> {
     })
 }
 
-/// 预授权额（microusd）。**服务端定，不由调用方自报**——现状是一个固定数（默认 $0.02），
-/// 够跑通也有上限；按 Price Snapshot 算该请求的最坏成本是后续优化。
+/// 兜底保底额（CNY 微单位，默认 `20000` = 0.02 元；名字里的 `usd` 是历史命名，
+/// `docs/design/0007-pricing-floor-and-settlement.md` §8）。**服务端定，不由调用方自报**。
+///
+/// 它只在**查不到该供给的保底表**时用：正常路径是「供给的档位保底额 → 该供给的封顶保底值 → 这里」
+/// （`docs/design/0007-pricing-floor-and-settlement.md` §6）。
 fn generation_max_cost_microusd() -> Result<u64> {
     match env::var("GENERATION_MAX_COST_MICROUSD") {
         Ok(value) if !value.trim().is_empty() => value
@@ -4334,17 +4337,18 @@ fn auth_source_header() -> Result<Option<header::HeaderName>> {
     Ok(Some(name))
 }
 
-/// 每账户每日扣费上限（默认每天 50 美元等值）。读法与上面两项相同，一个环境变量：
-/// `GENERATION_MAX_DAILY_SPEND_MICROUSD`，单位 microusd。
+/// 每账户每日扣费上限（**不设就是不限**）。读法与上面两项相同，一个环境变量：
+/// `GENERATION_MAX_DAILY_SPEND_MICROUSD`，单位 CNY 微单位（名字里的 `usd` 是历史命名，
+/// `docs/design/0007-pricing-floor-and-settlement.md` §8）。
 ///
-/// 它是**运营取值**，不是产品档位：它挡的是"没人看管的脚本在一天里把余额烧光"，不是一个
-/// 精算过的客户额度，所以留成部署期可调。它与限流的读法相同、**判据不同**——限流读缓存里的
-/// 计数，这一项每次都从账本聚合，因为"今天已经花掉多少"是事实。
+/// 它与限流的读法相同、**判据不同**：限流读缓存里的计数，这一项每次都从账本聚合，因为"今天已经
+/// 花掉多少"是事实；不设时连那次聚合都不做。
 fn generation_daily_spend_limit() -> Result<GenerationDailySpendLimit> {
     Ok(GenerationDailySpendLimit::from_env()?)
 }
 
-/// 单次请求的上游**成本上限**：`GENERATION_MAX_REQUEST_COST_MICROUSD`（microusd，默认 10 元等值）。
+/// 单次请求的上游**成本上限**：`GENERATION_MAX_REQUEST_COST_MICROUSD`（CNY 微单位，默认
+/// `10000000` = 10 元；名字里的 `usd` 是历史命名，`docs/design/0007-pricing-floor-and-settlement.md` §8）。
 ///
 /// 判据、两处判定与它的边界见 [`RequestCostCeiling`]。它与 `GENERATION_MAX_COST_MICROUSD` **不是
 /// 同一个量**：那个是查不到供给封顶保底值时的兜底**保底额**。

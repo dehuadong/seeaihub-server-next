@@ -840,7 +840,7 @@ fn the_daily_spend_cap_rejects_at_the_limit_and_points_at_the_next_day() {
 
     assert!(
         daily_spend_limit_error(1_000, 999, now).is_none(),
-        "还差 1 microusd 就没到顶：受理照常"
+        "还差 1 CNY 微单位就没到顶：受理照常"
     );
     let rejected = daily_spend_limit_error(1_000, 1_000, now)
         .expect("花到正好等于额度时今天已经没有余量，必须拒");
@@ -868,14 +868,20 @@ fn the_daily_spend_cap_rejects_at_the_limit_and_points_at_the_next_day() {
 }
 
 /// 额度配成 0 是配置错误，不是"这个账户不许花"：关停该走账户与密钥那条路，让每个请求都撞在
-/// 一个说不清的错误上只会让人以为平台坏了。
+/// 一个说不清的错误上只会让人以为平台坏了。**不配就是不限**（`None`）。
 #[test]
 fn a_daily_spend_limit_must_be_positive() {
-    assert!(GenerationDailySpendLimit::new(0).is_err());
+    assert!(GenerationDailySpendLimit::new(Some(0)).is_err());
     assert_eq!(
-        GenerationDailySpendLimit::new(1)
-            .expect("1 microusd 是一个（很小的）合法额度")
+        GenerationDailySpendLimit::new(Some(1))
+            .expect("1 CNY 微单位是一个（很小的）合法额度")
             .max_daily_spend_microusd,
-        1
+        Some(1)
+    );
+    assert_eq!(
+        GenerationDailySpendLimit::new(None)
+            .expect("不配就是不限")
+            .max_daily_spend_microusd,
+        None
     );
 }

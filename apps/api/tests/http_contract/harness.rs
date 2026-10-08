@@ -1287,6 +1287,22 @@ async fn probe_api_startup_with_upload_env(
     probe_running_and_stderr(command).await
 }
 
+/// 起一个 API 进程，只额外给**每日扣费上限**那一个变量，回报"还在跑吗"与 stderr。
+///
+/// 基础必填项由 [`api_probe_command`] 配齐（它的工作目录在临时目录，不读仓库根的 `.env`），
+/// 所以这里给的那一个就是探针要探的那一个。
+async fn probe_api_startup_with_daily_spend_limit(
+    database_url: &str,
+    value: &str,
+) -> (bool, String) {
+    let mut command = api_probe_command(database_url, probe_port(), "daily-spend-probe-token");
+    command
+        .env("GENERATION_MAX_DAILY_SPEND_MICROUSD", value)
+        .stdout(Stdio::null())
+        .stderr(Stdio::piped());
+    probe_running_and_stderr(command).await
+}
+
 /// 起一个已经装配好的命令，等它要么退出一场配置错误、要么真的开始服务，并回报 stderr。
 ///
 /// 只用于"启动该失败/该成功"这一类判据：不查 `/health`、不写夹具，也不会把一个还在跑的探针
@@ -1562,12 +1578,16 @@ async fn start_api_with(
         if let Some(name) = &settings.auth_source_header {
             command.env("AUTH_SOURCE_HEADER", name);
         }
-        if let Some(limit_microusd) = settings.daily_spend_limit_microusd {
-            command.env(
-                "GENERATION_MAX_DAILY_SPEND_MICROUSD",
-                limit_microusd.to_string(),
-            );
-        }
+        // 每日扣费上限**总是显式传给子进程**：没给就传空。它现在的语义是"不设即不限"，而"不设"
+        // 只有显式传空才盖得住仓库根的 `.env`——`dotenvy` 不覆盖已存在的变量，空值也算已存在。
+        // 不这么做，用例的行为会随开发者本机 `.env` 里那一行变（默认路径的 cwd 在仓库内）。
+        command.env(
+            "GENERATION_MAX_DAILY_SPEND_MICROUSD",
+            settings
+                .daily_spend_limit_microusd
+                .map(|limit| limit.to_string())
+                .unwrap_or_default(),
+        );
         if let Some(ceiling_microusd) = settings.cost_ceiling_microusd {
             command.env(
                 "GENERATION_MAX_REQUEST_COST_MICROUSD",

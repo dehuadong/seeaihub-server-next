@@ -831,3 +831,59 @@ async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
 
     harness.cleanup().await;
 }
+
+/// 不设每日上限就是不限（Spec `0002` §5）。
+///
+/// 夹具把这一项**显式传空**（`harness` 总是传，见它那里的注释）。这里把当日已花那一行顶到远超
+/// 旧默认值（`50000000` 微元 = 50 元）的数，请求仍必须受理——不是 `429 daily_spend_limit_exceeded`。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn without_a_daily_spend_limit_the_day_total_does_not_reject() {
+    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
+    let account_id = Uuid::parse_str(&harness.account_id).expect("account id");
+    // 判据是**每日合计那一行**，不是历史流水的求和：直接把它顶到 1000 元。
+    sqlx::query(
+        "INSERT INTO ledger.daily_spend (account_id, day, settled_microusd)
+         VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 1_000_000_000)
+         ON CONFLICT (account_id, day) DO UPDATE SET settled_microusd = EXCLUDED.settled_microusd",
+    )
+    .bind(account_id)
+    .execute(&harness.pool)
+    .await
+    .expect("seed the day total");
+
+    let key = format!("no-daily-limit-{}", Uuid::new_v4());
+    let (status, body) = harness
+        .sync_json(
+            "/v1/images/generations",
+            &key,
+            route_request(harness.model, "no daily limit contract"),
+        )
+        .await;
+    assert_eq!(status, StatusCode::OK, "不设上限就不该按当日合计拒：{body}");
+    assert_sync_success("不设每日上限时的那一笔", &body);
+
+    harness.cleanup().await;
+}
+
+/// 额度配成 `0` 是配置错误，不是"这个账户不许花"：进程必须拒绝启动并点名那个变量。
+///
+/// 同一个探针换成空串必须起得来——否则上面那条断言可能只是"别的必填项没配"。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_zero_daily_spend_limit_refuses_to_start_by_name() {
+    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
+        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
+    let (running, stderr) = probe_api_startup_with_daily_spend_limit(&database_url, "0").await;
+    assert!(
+        !running,
+        "0 不是额度、是配置错误，进程必须拒绝启动；stderr: {stderr}"
+    );
+    assert!(
+        stderr.contains("GENERATION_MAX_DAILY_SPEND_MICROUSD"),
+        "报错要点名那个变量；stderr: {stderr}"
+    );
+
+    let (running, stderr) = probe_api_startup_with_daily_spend_limit(&database_url, "").await;
+    assert!(running, "空串是不限，进程必须起得来；stderr: {stderr}");
+}

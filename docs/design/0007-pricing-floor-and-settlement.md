@@ -221,7 +221,7 @@ PriceSnapshot {
 - **售价 = 按候选发布的四档对客费率向量 `consumer_rates_cny`**（初始值按"该 vendor/模型已知的渠道价目 × 倍率 × 折算率"设定/推导、运营可改，**以 CNY 表达**），**按命中候选取、随修订发布并随 Job 快照冻结**；`reference_cost_microusd` **只作定价参考，不是售价的被乘数**（§2/§4）；
 - **保底额是 CNY**：OpenAI 系 **1K = ¥0.16 / 2K = ¥0.25 / 4K = ¥0.3**（**币种＝CNY，已确认**，[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6 与本文 §6）；
 - **快照写清两条线**：**售价 / 保底 / 扣费记 CNY**；**成本记原币种金额 + 币种 + 当时汇率 + 折算后 CNY**（毛利用）——两条线分开，便于核对；
-- **既有列名的币种语义**：`ledger.accounts.balance_microusd` 与 `GENERATION_MAX_COST_MICROUSD` 的**币种语义为 CNY**（列名里的 `usd` 是历史命名；实施时可按需改名，语义以本节为准）；`reference_cost_microusd` / `provider_cost_microusd` 的 `_microusd` 同样是**历史命名**，其币种是**该候选 / 该次执行的 `cost_currency`**（§5/§7），**不假定 USD**。
+- **既有列名与运维取值的币种语义**：`ledger.accounts.balance_microusd`、`GENERATION_MAX_COST_MICROUSD`、`GENERATION_MAX_REQUEST_COST_MICROUSD` 与 `GENERATION_MAX_DAILY_SPEND_MICROUSD` 的**币种语义为 CNY**（名字里的 `usd` 是历史命名；实施时可按需改名，语义以本节为准）；`reference_cost_microusd` / `provider_cost_microusd` 的 `_microusd` 同样是**历史命名**，其币种是**该候选 / 该次执行的 `cost_currency`**（§5/§7），**不假定 USD**。
 
 ## 9. 记录与日志：六项信息现在落在哪
 

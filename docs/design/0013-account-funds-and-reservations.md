@@ -1,7 +1,7 @@
 主题: 账户资金与预授权的当前值模型
 当前修订: v5
 状态: 待接受
-承接: [`账户余额、预授权与实际收支` v4](../specs/0002-account-funds-and-reservations.md) §1–§7
+承接: [`账户余额、预授权与实际收支` v7](../specs/0002-account-funds-and-reservations.md) §1–§7
 依赖: [`0007` 定价、保底与结算](0007-pricing-floor-and-settlement.md)、[`0008` 路由与缓存](0008-routing-strategy-and-caching.md)、[`0009` 运行基线](0009-operational-baseline.md)；[`ADR-0003`](../adr/0003-postgresql-is-source-of-truth.md)、[`ADR-0006`](../adr/0006-no-settlement-without-metering-evidence.md)
 
 # 账户资金与预授权的当前值模型
@@ -69,7 +69,9 @@ Redis 的 `user_balance` 值改为 `{balance_microusd, held_microusd, available_
 
 ## 4. 每日消费限额
 
-现有受理路径每次按账户和当天时间汇总 `capture`。改为 PostgreSQL 中每账户每 UTC 自然日一行的已结算消费合计，合计以正数记录实收；成功结算写负数 `capture` 的同一事务增加对应日期合计，零实收不增加。受理读取当天一行，不扫历史流水。结算日期由数据库时钟决定，与 `capture.created_at` 取同一事务时刻；缺行视为 0。该限额继续只看已经完成的消费，不预占未来消费，单笔与在飞请求仍可能使当日合计越过阈值。
+现有受理路径每次按账户和当天时间汇总 `capture`。改为 PostgreSQL 中每账户每 UTC 自然日一行的已结算消费合计，合计以正数记录实收；成功结算写负数 `capture` 的同一事务增加对应日期合计，零实收不增加。**配了限额时**受理读取当天一行，不扫历史流水；**不设限额时连这一行都不读**。结算日期由数据库时钟决定，与 `capture.created_at` 取同一事务时刻；缺行视为 0。该限额继续只看已经完成的消费，不预占未来消费，单笔与在飞请求仍可能使当日合计越过阈值。
+
+**它是运营可配置的平台侧护栏，不是产品档位**（[`0002`](../specs/0002-account-funds-and-reservations.md) §5）：余额本身已经是客户能花的钱的上限，这道门挡的是"实收可以超过保底额、余额可以为负"留下的平台敞口，不是替客户管他怎么花自己已充值的钱——所以**不设就是不限**，要限才限。
 
 每日合计是查询投影，不替代账户余额或资金流水。业务键及 Job 终态保证重放不重复累加。需要核查时可按日期汇总该日 `capture` 与每日合计比对，核查不在受理路径运行。
 

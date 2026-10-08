@@ -1567,33 +1567,30 @@ fn counts_as_auth_failure(error: &ApplicationError) -> bool {
     )
 }
 
-/// 每账户**当天已经花掉**多少（microusd）的**上限配置**：默认值与它算不算产品档位。
+/// 每账户**当天已经花掉**多少（CNY 微单位）的**上限配置**：**不设就是不限**（`None`）。
 ///
 /// 判据本身——每天一行的已完成实收合计、成功结算在写 `capture` 的同一事务累加、受理只读
-/// 当天一行而不扫历史流水、且不读缓存——归 [`HubRepository::daily_spend_microusd`]。
-///
-/// 默认是每账户每天 50 美元等值（`50_000_000` microusd）。这是**运营取值**而不是产品档位：
-/// 它挡的是"没人看管的脚本把账户余额在一天里烧光"这种形态，不是一个精算过的额度；要按客户
-/// 分级，改的是部署期的环境变量，不是这里。
+/// 当天一行而不扫历史流水、且不读缓存——归 [`HubRepository::daily_spend_microusd`]；
+/// 它为什么是"运营取值而不是产品档位"归 `docs/design/0013-account-funds-and-reservations.md` §4。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct GenerationDailySpendLimit {
-    /// 一个自然日（UTC）内允许扣掉的总额度，单位 microusd。
-    pub max_daily_spend_microusd: u64,
+    /// 一个自然日（UTC）内允许扣掉的总额度，单位 CNY 微单位；`None` = 不限。
+    pub max_daily_spend_microusd: Option<u64>,
 }
 
 impl GenerationDailySpendLimit {
-    /// 运维默认值：每天 50 美元等值。
+    /// 运维默认值：**不限**。
     #[must_use]
     pub fn default_limit() -> Self {
         Self {
-            max_daily_spend_microusd: 50_000_000,
+            max_daily_spend_microusd: None,
         }
     }
 
-    /// 上限必须是正数：0 等于"这个账户一次都不许花"，那不是额度、是关停；真要关停应当走
+    /// 给了上限就必须是正数：0 等于"这个账户一次都不许花"，那不是额度、是关停；真要关停应当走
     /// 账户与密钥那条路，而不是把额度设成 0 让每个请求都撞在一个说不清的错误上。
-    pub fn new(max_daily_spend_microusd: u64) -> Result<Self, ApplicationError> {
-        if max_daily_spend_microusd == 0 {
+    pub fn new(max_daily_spend_microusd: Option<u64>) -> Result<Self, ApplicationError> {
+        if max_daily_spend_microusd == Some(0) {
             return Err(ApplicationError::Configuration(
                 "the daily spend limit must be positive".to_owned(),
             ));
@@ -1603,12 +1600,30 @@ impl GenerationDailySpendLimit {
         })
     }
 
-    /// 从环境变量读运维取值：`GENERATION_MAX_DAILY_SPEND_MICROUSD`；没给或给空用默认值。
+    /// 从环境变量读运维取值：`GENERATION_MAX_DAILY_SPEND_MICROUSD`；**没给或给空就是不限**。
+    ///
+    /// 读不出来（不是整数、或不是合法 UTF-8）是**配置错误**，不是"不限"：护栏静默失效比配错更糟。
     pub fn from_env() -> Result<Self, ApplicationError> {
-        Self::new(rate_limit_env(
-            "GENERATION_MAX_DAILY_SPEND_MICROUSD",
-            50_000_000,
-        )?)
+        let limit = match std::env::var("GENERATION_MAX_DAILY_SPEND_MICROUSD") {
+            Err(std::env::VarError::NotPresent) => None,
+            Err(std::env::VarError::NotUnicode(_)) => {
+                return Err(ApplicationError::Configuration(
+                    "GENERATION_MAX_DAILY_SPEND_MICROUSD must be valid UTF-8".to_owned(),
+                ));
+            }
+            Ok(value) if value.trim().is_empty() => None,
+            Ok(value) => Some(value.trim().parse::<u64>().map_err(|_| {
+                ApplicationError::Configuration(
+                    "GENERATION_MAX_DAILY_SPEND_MICROUSD must be an integer".to_owned(),
+                )
+            })?),
+        };
+        // 报错点名那个变量：运维看的是部署面，`new` 自己的措辞不带变量名。
+        Self::new(limit).map_err(|_| {
+            ApplicationError::Configuration(
+                "GENERATION_MAX_DAILY_SPEND_MICROUSD must be positive when it is set".to_owned(),
+            )
+        })
     }
 }
 

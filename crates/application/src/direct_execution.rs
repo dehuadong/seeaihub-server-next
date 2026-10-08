@@ -335,12 +335,13 @@ pub struct DirectExecutionService {
     cost_ceiling: RequestCostCeiling,
     /// 可证明上游未受理时的请求内重投策略（次数与退避），与旧路径共用同一组配置。
     retry_policy: RetryPolicy,
-    /// 该账户**当天**最多能花掉多少（microusd，运营取值，见 [`GenerationDailySpendLimit`]）。
+    /// 该账户**当天**最多能花掉多少（CNY 微单位，运营取值，见 [`GenerationDailySpendLimit`]）；
+    /// `None` = **不限**（没配这个环境变量时的默认）。
     ///
-    /// 它与两个容量名额守的不是同一件事：名额守的是"同时在跑几个"，钱烧光的形态却是**串行**的
-    /// ——一个接一个地跑、每一个都合规，照样能在一天里把余额花完。判据见
+    /// 它与两个容量名额守的不是同一件事：名额守的是"同时在跑几个"，这道守的是"今天已经花掉多少钱"
+    /// （花钱可以是完全串行的，两个名额计数都看不见它）。判据见
     /// [`HubRepository::daily_spend_microusd`]：问的是当日已完成实收的合计，不是任何计数器。
-    max_daily_spend_microusd: u64,
+    max_daily_spend_microusd: Option<u64>,
     /// 加速层：受理、结算与失败收尾都改余额，提交后要把新余额写穿缓存。
     acceleration: Arc<AccelerationService>,
 }
@@ -381,7 +382,8 @@ impl DirectExecutionService {
 
     /// 装上运维给的**每日扣费上限**。
     ///
-    /// 上限是配置项：它随部署形态与客户分级变，所以由调用方给，而不是写死在这里。
+    /// 上限是配置项：它随部署形态与客户分级变，所以由调用方给，而不是写死在这里；**没配就是不限**
+    /// （[`GenerationDailySpendLimit::default_limit`]）。
     #[must_use]
     pub fn with_daily_spend_limit(mut self, limit: GenerationDailySpendLimit) -> Self {
         self.max_daily_spend_microusd = limit.max_daily_spend_microusd;
@@ -546,20 +548,23 @@ impl DirectExecutionService {
         // 每日扣费上限：与两个容量名额是**三道不同的门**——账户名额守"同时在跑几个"、渠道名额守
         // "上游未决任务有几个"，这道守的是"今天已经花掉多少钱"（花钱可以是完全串行的，两个计数
         // 都看不见它）。判据见 [`HubRepository::daily_spend_microusd`]，超限按既有的 429 语义回。
+        // **没配就是不限**：不设时连那次当日合计都不读。
         //
         // 它**放在 admit 事务之外**，理由是这道门与那笔扣减本来就不可能原子：当日合计只在**结算**
         // 那一笔里累加，而结算发生在受理之后很久，任何事务边界都圈不住"受理到结算"这段窗口；
         // 事务内再读一次不会让判定更准，只会把"到次日零点还有多久"这条对客事实（由
         // [`daily_spend_limit_error`] 按唯一一处规则算出）搬进 SQL 再写一遍。读的仍是已提交的
         // 权威事实，位置取在**受理之前**：不建 Job、不占 Hold、不占渠道名额。
-        let spent_microusd = self
-            .repository
-            .daily_spend_microusd(request.account_id)
-            .await?;
-        if let Some(rejected) =
-            daily_spend_limit_error(self.max_daily_spend_microusd, spent_microusd, Utc::now())
-        {
-            return Err(rejected.into());
+        if let Some(limit_microusd) = self.max_daily_spend_microusd {
+            let spent_microusd = self
+                .repository
+                .daily_spend_microusd(request.account_id)
+                .await?;
+            if let Some(rejected) =
+                daily_spend_limit_error(limit_microusd, spent_microusd, Utc::now())
+            {
+                return Err(rejected.into());
+            }
         }
 
         let outcome = self
