@@ -16,6 +16,8 @@ curl -X POST "$BASE_URL/v1/images/generations" \
   -d '{"model":"{{platform_name}}","prompt":"画一张暖色调的阅读角","size":"1024x1024","quality":"medium","n":1}'
 ```
 
+`Idempotency-Key` 是可选请求头：填了，平台按账户与该键识别同一次调用，同键重发返回原请求的事实，不重新生成、不重复收费；不填，每次请求都是独立调用。每次新的生成请求用一个新键；核对原请求时保留原键、原端点和相同正文。键取 8–128 个 ASCII 字母、数字、`.`、`_`、`-`，不符合返回 `400 validation_error`。
+
 ## 参数
 
 {{parameter_table}}
@@ -63,4 +65,4 @@ curl -X POST "$BASE_URL/v1/images/generations" \
 
 参数错误、图片 URL 不合法、余额不足、限流和超时的处理参见 [HTTP 状态码和错误处理]({{SEE_BASEURL}}/v1/docs/http-errors.md)。
 
-建议为每次生成提供一个新的 `Idempotency-Key`。连接断开或结果未确认后，核对原请求时保留原键、端点和相同请求内容。`409 result_not_retained` 表示原请求已完成，图片无法重放；`502/504 outcome_unknown` 表示结果或费用尚未确认。不要自动换新键重试，换新键会成为另一笔可能收费的生成请求。
+`409 result_not_retained` 表示原请求已完成，图片无法重放；`502/504 outcome_unknown` 表示结果或费用尚未确认。不要自动换新键重试，换新键会成为另一笔可能收费的生成请求。
