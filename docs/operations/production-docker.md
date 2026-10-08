@@ -11,7 +11,7 @@ systemd 方式见[生产环境（systemd）](production.md)。
 | | systemd（[生产环境（systemd）](production.md)） | 容器（本文） |
 | --- | --- | --- |
 | 进程管理 | 两个 systemd 单元 | 两个容器（`restart: unless-stopped`） |
-| 二进制与前端产物 | 在 `/opt/seeai` 构建（[生产环境（systemd）§1](production.md#1-构建)） | 多阶段构建进镜像 |
+| 二进制与前端产物 | 在服务器构建或安装开发构建机的发布包（[生产环境（systemd）§1](production.md#1-构建)） | 在开发构建机或服务器多阶段构建进镜像 |
 | 配置注入 | `EnvironmentFile` | `env_file`（密钥系统在启动前渲染进去） |
 | 停机 | 默认 SIGTERM + `TimeoutStopSec` | 默认 SIGTERM + `stop_grace_period` |
 | 日志 | journald | `docker logs` 或采集器 |
@@ -32,14 +32,35 @@ systemd 方式见[生产环境（systemd）](production.md)。
 
 ### 2.1 装 Docker
 
+生产服务器使用 Linux，安装 Docker Engine 与 Compose V2。镜像架构必须与服务器 CPU 一致。运行镜像内使用 Debian Bookworm，不要求宿主也使用 Debian；容器共享宿主内核，不能消除架构与内核能力要求，见 [Docker 多平台说明](https://docs.docker.com/build/building/multi-platform/)。
+
+下面的安装命令适用于提供这些包、使用 systemd 的 Debian/Ubuntu 环境；其他发行版使用对应的 Docker 安装步骤。
+
 ```sh
 sudo apt-get install -y docker.io docker-compose-v2
 sudo systemctl enable --now docker
 ```
 
-下面服务器侧的命令按 `sudo docker` 写；把账号加进 `docker` 组并重新登录后可省掉 `sudo`。
+安装后用 `sudo docker version` 与 `sudo docker compose version` 确认服务可连接、Compose 可用。下面服务器侧的命令按 `sudo docker` 写；把账号加进 `docker` 组并重新登录后可省掉 `sudo`。
+
+服务器只运行预构建镜像时，无需安装 Rust、Node 或编译工具。PostgreSQL、可选 Redis、环境变量与 HTTPS 反代仍需准备（§3、§4）。本文不规定最低 CPU、内存或磁盘容量；按[生成预算](configuration.md#2-生成护栏)、[上传预算](configuration.md#10-上传端点与上传存储)、其他进程占用和实际并发配置资源，生成内存预算不等于整机内存需求。
 
 ### 2.2 在本机构建
+
+构建可以在 Windows Docker Desktop、Linux/WSL 的 Docker 环境或生产服务器执行。下面的 `docker` 命令均在仓库根执行；先检出要发布的提交或标签，记录 `git rev-parse HEAD`。
+
+Windows 构建机使用 Docker Desktop 的 Linux 容器模式，可使用 WSL 2 后端；安装要求见 [Docker Desktop Windows 文档](https://docs.docker.com/desktop/setup/install/windows-install/)。从 PowerShell 构建 Windows 目录中的仓库即可，不需要在 Windows 另装 Rust、Node；从 WSL 执行时需要 Docker Desktop 启用该发行版的 WSL 集成，或使用该 Linux 环境自己的 Docker Engine。
+
+先检查 Docker 服务与构建器：
+
+```sh
+docker version
+docker info --format '{{.OSType}}'
+docker buildx version
+docker buildx inspect --bootstrap
+```
+
+`OSType` 必须为 `linux`。跨架构构建时，构建器的 `Platforms` 应包含目标架构，并具备模拟或对应架构的构建节点。Docker Desktop 默认提供模拟支持；独立 Docker Engine 的构建器需按 [Docker 多平台构建文档](https://docs.docker.com/build/building/multi-platform/) 准备。模拟编译通常比同架构构建慢。
 
 `Dockerfile` 三个阶段：`web` 用 Node 构建两份前端产物，`build` 用 Rust 构建两个二进制，`runtime` 用 Debian slim 只带运行所需的东西，以非 root 用户跑。
 
@@ -63,26 +84,54 @@ docker build -f <仓库根>/Dockerfile -t seeai:<tag> <仓库根>
 
 **在服务器上构建镜像要用完整包，不加 `--no-web-src`。** 镜像的 `web` 阶段在容器里跑 `npm ci && npm run build`，要的是 `apps/web/` 那组构建输入（清单见[部署总览 §2.5](deployment.md#25-代码到服务器上)）；少了它们的包 `docker build` 会在 `COPY` 那步失败。只有走 §2.3 那条路时服务器才不需要这些输入。
 
-镜像架构与构建机一致；服务器架构不同时用 `--platform` 指定，或在服务器上构建。
+按生产服务器架构选择一条命令。下面示例生成单架构镜像，并用 `--load` 载入本地 Docker，供 §2.3 导出；命令可直接在 PowerShell 或 Bash 执行。
+
+```sh
+# x86_64 服务器
+docker buildx build --platform linux/amd64 -t seeai:release-amd64 --load .
+
+# ARM64 服务器
+docker buildx build --platform linux/arm64 -t seeai:release-arm64 --load .
+```
+
+当前 Dockerfile 在目标平台执行 Node 与 Rust 构建；x86_64 上构建 ARM64 时通常模拟 ARM64 环境，未配置在 x86_64 上直接调用 Rust 交叉编译器。构建机的仓库路径不会成为 API 的前端查找路径，镜像中的构建与运行目录均为 `/app`。
+
+构建需要下载基础镜像、系统包、npm 与 Cargo 依赖，不需要生产数据库或渠道凭证。完成后检查镜像平台，例如 ARM64：
+
+```sh
+docker image inspect seeai:release-arm64 --format '{{.Os}}/{{.Architecture}}'
+```
+
+结果应为 `linux/arm64`；x86_64 镜像应为 `linux/amd64`。平台检查与构建成功不替代[部署总览 §8](deployment.md#8-投产前的演练)的目标服务器验证。发布时使用能识别版本的 tag（§2.5），下面以 `release-arm64` 为例。
 
 ### 2.3 从别处导入
 
 构建机与服务器不是同一台时走这节；同一台则构建完直接进 §3。这节服务器不构建镜像，所以[部署总览 §2.5](deployment.md#25-代码到服务器上) 里加了 `--no-web-src` 的包也可以用——它带 `deploy/compose.prod.yaml`，够起容器。
 
-服务器不能直连镜像仓库时，在构建机导出再上传：
+先将镜像导出成文件。以下命令在 Windows PowerShell、Linux 或 WSL 均可执行；使用 `docker save -o`，避免通过 PowerShell 的文本管道传输二进制归档。将 `<服务器>` 替换为 SSH 目标：
 
 ```sh
-docker save seeai:<tag> | gzip > seeai-<tag>.tar.gz
-scp seeai-<tag>.tar.gz <服务器>:/tmp/
+docker save -o seeai-release-arm64.tar seeai:release-arm64
+scp seeai-release-arm64.tar <服务器>:/tmp/
+scp deploy/compose.prod.yaml <服务器>:/tmp/seeai-compose.prod.yaml
 ```
 
-`<tag>` 要换成实际值；`<服务器>` 的写法与端口参数见[部署总览 §2.5](deployment.md#25-代码到服务器上)。
+记录并核对归档的 SHA-256。Windows 构建机执行 `Get-FileHash ./seeai-release-arm64.tar -Algorithm SHA256`；Linux/WSL 构建机执行 `sha256sum seeai-release-arm64.tar`。不要把开发 `.env` 随镜像归档或 Compose 文件上传，生产配置按 §3 单独准备。
 
-服务器上导入：
+以下命令在生产 Linux 服务器执行。先核对归档哈希与构建机记录一致，再导入镜像，并把 Compose 文件放到固定位置：
 
 ```sh
-gzip -dc /tmp/seeai-<tag>.tar.gz | sudo docker load
+uname -m
+sha256sum /tmp/seeai-release-arm64.tar
+sudo docker load -i /tmp/seeai-release-arm64.tar
+sudo docker image inspect seeai:release-arm64 --format '{{.Os}}/{{.Architecture}}'
+sudo install -d -m 755 /opt/seeai/deploy
+sudo install -m 644 /tmp/seeai-compose.prod.yaml /opt/seeai/deploy/compose.prod.yaml
+cd /opt/seeai
 ```
+
+`uname -m` 的 `aarch64` 对应 `linux/arm64`，`x86_64` 对应 `linux/amd64`。生产应运行匹配架构的镜像。服务器无需检出完整仓库；镜像、Compose 文件与 §3 的配置文件足够启动两个应用进程。
+
 
 ### 2.4 从镜像仓库拉取
 
@@ -113,10 +162,15 @@ sudo docker pull <仓库>/seeai:<tag>
 
 `deploy/compose.prod.yaml` 只起两个应用进程，PostgreSQL 与 Redis 外置，连接串放在各自的 `env_file`。两份 env 的**内容**见[部署总览 §4](deployment.md#4-配置)——容器方式由 compose 把 `API_BIND` 覆盖成 `0.0.0.0:8081`。
 
+连接串必须从容器内可达。容器里的 `127.0.0.1` 指向本容器，不能直接复制 systemd 示例中的回环数据库地址来访问宿主数据库；填写容器可访问的数据库主机地址，并配置数据库监听、访问规则与防火墙。Redis 启用时同样处理。
+
+以下命令在服务器部署根执行，§2.3 的示例为 `/opt/seeai`。首次创建 env 文件后按配置文档填写；升级时保留现有文件，不重复执行写空文件的 `install /dev/null`。`<tag>` 替换为已导入的标签，例如 `release-arm64`。
+
 ```sh
 sudo install -d -m 750 /etc/seeai
 sudo install -m 600 /dev/null /etc/seeai/api.env     # 按部署总览 §4 填
 sudo install -m 600 /dev/null /etc/seeai/worker.env
+sudo env SEEAI_TAG=<tag> docker compose -f deploy/compose.prod.yaml config --quiet
 sudo env SEEAI_TAG=<tag> docker compose -f deploy/compose.prod.yaml up -d
 ```
 
@@ -158,7 +212,7 @@ sudo apt-get install -y docker-compose-v2
 
 面板对话框不让指定构建上下文，所以提交后要核对日志首行 `Sending build context to Docker daemon`，并确认 `COPY . .` 那一步不报错——上下文不是仓库根时这一步会失败。Rust release 构建耗时较长，面板对话框未必等得到结束；等不到就改用终端跑 §2.2 的命令。
 
-**导入镜像**：在别的机器构建后把 `.tar.gz` 传上来，面板「导入镜像」等于 §2.3 的 `docker load`。
+**导入镜像**：在别的机器构建后把镜像归档传上来，面板「导入镜像」对应 §2.3 的 `docker load`；本节命令使用 `.tar`。
 
 **env 文件**：`env_file` 写死为 `/etc/seeai/api.env` 与 `/etc/seeai/worker.env`（§3），与仓库目录无关。面板文件管理器切到根目录后可以编辑 `/etc/seeai/`。
 

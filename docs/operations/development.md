@@ -133,6 +133,8 @@ npm --prefix apps/web run e2e
 
 ## 9. 这一节之外
 
+- 在开发构建机生成生产发布包：见[传统部署构建与安装](production.md#1-构建)。Linux/WSL 构建要满足服务器架构、系统库及前端绝对路径要求。
+- 在 Windows Docker Desktop 或 Linux/WSL 预构建镜像：见[容器构建与传输](production-docker.md#22-在本机构建)，包含 x86_64/ARM64、导出、上传和服务器导入步骤。
 - 生产怎么部署、面向哪些风险、投产前做什么演练：见[部署总览与基础准备](deployment.md)。
 - 各配置项在生产下的取值与理由：见[配置项](configuration.md)。
 - 备份与恢复：见[部署总览 §7](deployment.md#7-备份)。

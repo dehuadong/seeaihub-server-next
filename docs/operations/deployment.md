@@ -80,6 +80,8 @@ sudo certbot certonly --nginx -d admin.example.com -d app.example.com
 
 ### 2.5 代码到服务器上
 
+本节用于在服务器构建：上传的是源码与构建输入，`pack-deploy-tree.mjs` 不包含 Rust 编译产物。开发构建机直接交付产物时，按[systemd 发布包](production.md#13-在开发构建机生成发布包)或[容器镜像](production-docker.md#22-在本机构建)的构建与传输步骤操作，服务器无需检出完整仓库。
+
 有仓库访问权限时直接 clone 到部署根（部署根必须为空）：
 
 ```sh
@@ -129,7 +131,7 @@ sudo tar -xzf /tmp/seeai-deploy-<YYYYMMDD>.tar.gz -C /opt/seeai
 
 整包约 12 MB，打包后约 2.9 MB。`target/` 与 `apps/web/node_modules/` 不传，都在服务器上重新生成——`node_modules` 带平台相关二进制，传过去也不能用。`out-reference/`、`docs/`、`.agents/`、`.github/`、`scripts/` 与 e2e 的其余文件构建与运行都不读；`.env` 不传，生产配置见 §4。构建要从 crates.io 下载（在服务器上打前端时还要 npm registry），服务器连不上就先配镜像源。
 
-部署根里这些路径是运行时要读的（目录 755、文件 644 就够；容器方式在镜像里是同一套相对布局，根是 `/app`）：
+部署根里这些路径是运行时要读的（目录 755、普通文件 644、二进制 755；容器方式在镜像里是同一套相对布局，根是 `/app`）：
 
 | 路径 | 是什么 |
 | --- | --- |
@@ -156,7 +158,7 @@ Path::new(env!("CARGO_MANIFEST_DIR")).join("..").join("web").join("dist")
 - 构建时目录不存在 → 编译照过；运行时只会记一条 `no web build found; the API serves no front end` 警告，**两个界面都打不开**（API 与 `/v1/*` 仍然正常，所以很容易查错方向）；
 - 构建后把二进制搬到别处 → 它仍然去找**编译时那个绝对路径**下的 `apps/api/../web/dist`，**跟着二进制走的是编译时路径**，不是运行目录。
 
-所以要求只有一条：**服务启动时**，编译时那个**绝对路径**下要有 `apps/web/dist`。它不参与编译，在哪台机器上打都行；把二进制或整个目录搬到别的绝对路径都不行。
+**服务启动时，编译时那个绝对路径下必须有 `apps/web/dist`，并保留中间目录 `apps/api`。** 前端不参与 Rust 编译，可以在另一台机器构建。二进制可以移动，但移动它不会改变前端查找路径；只把整套文件搬到另一个绝对路径，界面仍会打不开。
 
 systemd 方式的编译期路径就是宿主上的部署根，所以**编译与运行必须在同一个绝对路径**下（[生产环境（systemd）](production.md)）。容器方式在镜像里构建，路径固定成 `/app`，跟着镜像走，宿主目录放哪都不影响（[生产环境（容器）](production-docker.md)）。
 
