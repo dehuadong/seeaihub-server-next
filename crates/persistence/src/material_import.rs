@@ -8,11 +8,11 @@
 //!
 //! 幂等靠**既有的身份键**，不靠"按名字找"：同一份素材跑两次，四张表都不产生第二行。
 //!
-//! 素材里的 `consumer_rates_cny` / `reference_cost_microusd` / `cost_basis` / `floor_amounts`
-//! 与顶层 `markup_bps` **一律不导入**：那是**运营的定价**，随发布物按候选给、落在
-//! `publication.runtime_revisions` 的定价列上，不属于这四张表。导入它们等于让一份工程素材顶掉
-//! 运营的价。`_comment` / `_status` / `_evidence` 是说明字段；顶层 `gateway_model` 也不在这里落地
-//! ——对客名由运营发布时自己填，导入不建立 Gateway Model。
+//! 素材里的 `consumer_rates_cny` / `cost_basis` 与顶层 `markup_bps` **一律不导入**：那是**运营的
+//! 定价**（或由计价形态唯一推导的两态），随发布物按候选给、落在 `publication.runtime_revisions`
+//! 的定价列上，不属于这四张表。导入它们等于让一份工程素材顶掉运营的价。`_comment` / `_status` /
+//! `_evidence` 是说明字段；顶层 `gateway_model` 也不在这里落地——对客名由运营发布时自己填，
+//! 导入不建立 Gateway Model。
 //!
 //! 例外是顶层的 `consumer_reference_rates`：它是**对客 token 四档初始价的参考价目**，属工程师声明的
 //! 模型价目（不是运营的定价），因此与合同同层导入、写进 `catalog.vendor_models`，一个模型一份
@@ -20,6 +20,11 @@
 //!
 //! 素材里的 `cost_currency` 落 `supply.offerings.cost_currency`：它是**渠道事实**（这条通路收的钱是
 //! 哪个币种），与供给的技术定义同层；发布期按候选取它，缺了才要求发布命令显式给出（设计 0012 §3）。
+//!
+//! `floor_amounts`（保底表）与 `reference_cost_microusd`（渠道参考成本）同样落 `supply.offerings`：
+//! 它们是**渠道侧的成本事实**，而运营表单不出现成本字段（Spec 0001 V-D12），引用式发布只能从这条
+//! 供给读它们。只认发布命令会让 `upstream_declared` 候选的保底表永远进不了修订，受理只剩平台兜底额
+//! （工作项 #89）。
 
 use crate::{database_error, to_i64};
 use seeai_application::{ApplicationError, ConsumerReferenceRates};
@@ -380,8 +385,9 @@ async fn upsert_offering(
         INSERT INTO supply.offerings
             (id, vendor_model_id, channel_id, adapter_key, provider_model_id,
              restrictions, carrier_schema, parameter_mapping, enabled,
-             formula, cost_unit_price_microusd, cost_currency)
-        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11)
+             formula, cost_unit_price_microusd, cost_currency,
+             floor_amounts, reference_cost_microusd)
+        VALUES ($1, $2, $3, $4, $5, $6, $7, $8, true, $9, $10, $11, $12, $13)
         ON CONFLICT (vendor_model_id, channel_id) DO UPDATE SET
             adapter_key = EXCLUDED.adapter_key,
             provider_model_id = EXCLUDED.provider_model_id,
@@ -391,7 +397,10 @@ async fn upsert_offering(
             formula = EXCLUDED.formula,
             cost_unit_price_microusd = EXCLUDED.cost_unit_price_microusd,
             -- 素材是供给定义的属主：它没写成本币种就是没有，导入照实写回去（含清空）。
-            cost_currency = EXCLUDED.cost_currency
+            cost_currency = EXCLUDED.cost_currency,
+            -- 保底表与参考成本同样是素材的属主：没写就是没有，照实写回（含清空）。
+            floor_amounts = EXCLUDED.floor_amounts,
+            reference_cost_microusd = EXCLUDED.reference_cost_microusd
         RETURNING id
         "#,
     )
@@ -406,6 +415,8 @@ async fn upsert_offering(
     .bind(offering.formula.as_str())
     .bind(offering.cost_unit_price_microusd.map(to_i64).transpose()?)
     .bind(offering.cost_currency.as_deref())
+    .bind(&offering.floor_amounts)
+    .bind(offering.reference_cost_microusd.map(to_i64).transpose()?)
     .fetch_one(&mut *conn)
     .await
     .map_err(database_error)?;
@@ -575,6 +586,12 @@ struct MaterialOffering {
     /// 该供给声明的**成本币种**（渠道事实）：上游声明金额或单价是哪个币种的钱。
     #[serde(default)]
     cost_currency: Option<String>,
+    /// 该供给的**保底表**（渠道事实，CNY/张）：受理时算预授权额的查表依据。
+    #[serde(default)]
+    floor_amounts: Option<Value>,
+    /// 该供给的**渠道参考成本**（渠道事实，原币种微单位）：只作定价参考。
+    #[serde(default)]
+    reference_cost_microusd: Option<u64>,
 }
 
 #[derive(Debug, Deserialize)]

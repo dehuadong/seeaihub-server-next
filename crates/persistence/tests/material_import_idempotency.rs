@@ -429,3 +429,61 @@ async fn a_material_without_a_type_is_rejected_without_writing_a_row() {
     drop(repository);
     drop_isolated_database(&database_name).await;
 }
+
+/// 渠道侧的成本事实（保底表、参考成本）落 `supply.offerings`：素材是它们的属主。
+///
+/// 运营表单里不出现成本字段（Spec 0001 V-D12），引用式发布只能从这条供给读它们；只认发布命令会让
+/// `upstream_declared` 候选的保底表永远进不了修订，受理只剩平台兜底额（工作项 #89）。
+#[tokio::test]
+#[ignore = "requires a PostgreSQL server via HTTP_CONTRACT_DATABASE_URL; derives a throwaway database"]
+async fn the_channel_cost_facts_land_on_the_offering_rows() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let repository = PgHubRepository::connect(&database_url, 2)
+        .await
+        .expect("the isolated database");
+    repository.migrate().await.expect("the migrations apply");
+    let pool = repository.pool().clone();
+
+    import_supply_materials(&pool, &material_dir(), &repo_public_docs())
+        .await
+        .expect("the material imports");
+
+    let rows = sqlx::query(
+        "SELECT vm.native_model_id, o.floor_amounts, o.reference_cost_microusd
+         FROM supply.offerings o
+         JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+         ORDER BY vm.native_model_id, o.provider_model_id",
+    )
+    .fetch_all(&pool)
+    .await
+    .expect("the offering rows");
+
+    assert!(!rows.is_empty(), "素材导入必须写出供给行");
+    for row in &rows {
+        let model: String = row.try_get("native_model_id").expect("native_model_id");
+        let floor: Value = row.try_get("floor_amounts").expect("floor_amounts");
+        let reference_cost: i64 = row
+            .try_get("reference_cost_microusd")
+            .expect("reference_cost_microusd");
+        assert_eq!(reference_cost, 11_354, "{model} 的参考成本必须落行");
+        assert_eq!(
+            floor["amounts"]["1K"],
+            json!(160_000),
+            "{model} 的 1K 保底额必须落行"
+        );
+        assert_eq!(
+            floor["amounts"]["2K"],
+            json!(250_000),
+            "{model} 的 2K 保底额必须落行"
+        );
+        assert_eq!(
+            floor["cap_microusd"],
+            json!(300_000),
+            "{model} 的封顶保底值必须落行"
+        );
+    }
+
+    drop(pool);
+    drop(repository);
+    drop_isolated_database(&database_name).await;
+}

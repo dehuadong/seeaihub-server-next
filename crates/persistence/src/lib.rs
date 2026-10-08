@@ -893,11 +893,10 @@ impl HubRepository for PgHubRepository {
         // 关联键是 `offering_id`（`0001` 的表形），且费率是**追加**形态：改费率写新行、旧行留着
         // 给已在那个时刻发布过的修订引用。
         //
-        // 成本币种**不在 `supply.offerings` 里**（`0013` 只加了 `formula` 与单价）：它是发布期按
-        // 候选声明的东西，落点是 Price Plan 的币种或修订的 `cost_currency` 映射。所以这里按
-        // "实际生效的那个"取：有 Price Plan 就是它的币种，否则取这条供给最近一次发布声明的币种。
-        // 按张 / 按次计价的供给两条都不能少——缺了它，引用式发布填不出草稿的成本币种，会被
-        // "必须显式声明成本币种"拒掉。
+        // 成本币种、保底表与参考成本都落 `supply.offerings`（迁移 `0044` / `0046`）：它们是**渠道事实**，
+        // 素材导入是它们的属主。成本币种另按"实际生效的那个"兜底——有 Price Plan 就是它的币种，
+        // 否则取这条供给最近一次发布声明的币种；按张 / 按次计价的供给两条都不能少，缺了它引用式发布
+        // 填不出草稿的成本币种，会被"必须显式声明成本币种"拒掉。
         if offering_ids.is_empty() {
             return Ok(Vec::new());
         }
@@ -910,6 +909,7 @@ impl HubRepository for PgHubRepository {
             SELECT
                 o.id AS offering_id, o.adapter_key, o.provider_model_id, o.restrictions,
                 o.carrier_schema, o.parameter_mapping, o.formula, o.cost_unit_price_microusd,
+                o.floor_amounts, o.reference_cost_microusd,
                 vm.consumer_reference_rates, o.cost_currency AS offering_cost_currency,
                 vm.vendor_id, vm.native_model_id, vm.native_revision, vm.model_type,
                 vm.capability_schema,
@@ -1019,6 +1019,12 @@ impl HubRepository for PgHubRepository {
                     cost_currency,
                     cost_unit_price_microusd: row
                         .try_get::<Option<i64>, _>("cost_unit_price_microusd")
+                        .map_err(database_error)?
+                        .map(to_u64)
+                        .transpose()?,
+                    floor_amounts: row.try_get("floor_amounts").map_err(database_error)?,
+                    reference_cost_microusd: row
+                        .try_get::<Option<i64>, _>("reference_cost_microusd")
                         .map_err(database_error)?
                         .map(to_u64)
                         .transpose()?,

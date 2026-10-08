@@ -5753,15 +5753,19 @@ impl RuntimeService {
                     .clone()
                     .or_else(|| found.cost_currency.clone())
                     .or_else(|| found.plan.as_ref().map(|plan| plan.currency.clone())),
-                reference_cost_microusd: reference.reference_cost_microusd,
+                // 参考成本、保底表与成本口径都由服务端定，不要运营给：它们是**渠道侧的成本事实**，
+                // 不是"运营的选择"。前两样缺省取被引用那行的值（素材导入是它们的属主，迁移 `0046`）——
+                // 运营表单里没有成本字段（Spec 0001 V-D12），只认发布命令会让 `upstream_declared`
+                // 候选的保底表永远进不了修订，受理只剩平台兜底额（工作项 #89）。
+                //
+                // `cost_basis` 两态由计价形态唯一决定（渠道终态给金额就是 `declared`，否则平台按用量
+                // 自算就是 `computed`）；保底表两边都没有时是空表（没声明保底），不报错——报错会把
+                // 运营挡在门外去猜一个他无从知道的枚举值，那正是这次改动要收掉的东西。
+                reference_cost_microusd: reference
+                    .reference_cost_microusd
+                    .or(found.reference_cost_microusd),
                 consumer_rates_cny: reference.consumer_rates_cny.clone(),
                 consumer_formula: reference.consumer_formula.clone(),
-                // **成本口径与保底表也由服务端定**，不要运营给：这两样是渠道与结算的事实，而且
-                // 它们不是"运营的选择"——`cost_basis` 两态由计价形态唯一决定（渠道终态给金额就是
-                // `declared`，否则平台按用量自算就是 `computed`）；保底表缺省是空表（没声明保底）。
-                //
-                // 为什么不能留给"没给就报错"：运营给参考成本只是给一个**定价参考**，而报错会把他挡在
-                // 门外去猜一个他无从知道的枚举值——那正是这次改动要收掉的东西。
                 cost_basis: Some(
                     if found.formula == "upstream_declared" {
                         "declared"
@@ -5775,6 +5779,7 @@ impl RuntimeService {
                     reference
                         .floor_amounts
                         .clone()
+                        .or_else(|| found.floor_amounts.clone())
                         .unwrap_or_else(|| Value::Object(serde_json::Map::new())),
                 ),
             })
@@ -6426,6 +6431,15 @@ pub struct ReferencedOffering {
     /// 它是**渠道怎么结算**的事实，不是运营的决定——运营给的是对客卖多少钱。所以引用式发布里它缺省取
     /// 行上的值，不由 `OfferingReference` 携带（携带就等于允许运营改渠道成本，毛利口径会跟着漂）。
     pub cost_unit_price_microusd: Option<u64>,
+    /// 这条供给声明的**保底表**（CNY/张，按 `(size, quality)` 与该供给每张封顶值）。
+    ///
+    /// 与成本单价同一类：**渠道侧的成本事实**，运营表单里不出现（Spec 0001 V-D12），所以引用式发布
+    /// 缺省取行上的值。缺了它，受理只能回落平台兜底额，预授权形同虚设（工作项 #89）。
+    pub floor_amounts: Option<Value>,
+    /// 这条供给声明的**渠道参考成本**（**原币种**微单位，币种取 `cost_currency`）。
+    ///
+    /// 只作定价参考；它同时是"这条候选带定价"的判据之一——缺了它发布期不产出定价块，保底表也跟着丢。
+    pub reference_cost_microusd: Option<u64>,
 }
 
 /// 一条**可被运营选中**的 Offering：引用式发布里那个 `offering_id` 指向的东西。

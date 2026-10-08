@@ -96,6 +96,11 @@ fn imported_projection(material: &Material) -> Value {
                     "image_output_microusd_per_million": plan.image_output_microusd_per_million,
                     "source_url": plan.source_url,
                 })),
+                // 渠道侧的成本事实也进这四张表（`cost_currency` 迁移 `0044`；保底表与参考成本
+                // 迁移 `0046`）：素材是它们的属主，改它们就该改变导入看见的东西。
+                "cost_currency": offering.cost_currency,
+                "floor_amounts": offering.floor_amounts,
+                "reference_cost_microusd": offering.reference_cost_microusd,
             }))
             .collect::<Vec<_>>(),
     })
@@ -164,7 +169,8 @@ fn the_bootstrap_materials_parse_into_their_offerings() {
 /// 运营的定价不进这四张表：改那些字段不该改变导入看见的任何东西。
 ///
 /// 它们是随发布物按候选给的价（`publication.runtime_revisions` 的定价列），素材里那份只是写素材时
-/// 顺手留下的测试值。拿它当导入输入，等于让一份工程素材顶掉运营的价。
+/// 顺手留下的测试值。拿它当导入输入，等于让一份工程素材顶掉运营的价。保底表与参考成本**不在这组里**：
+/// 它们是渠道侧的成本事实，属主就是素材（迁移 `0046`，见下一条用例）。
 #[test]
 fn the_operators_pricing_is_invisible_to_the_import() {
     let path = material_dir().join("gpt-image-2.5-flare.json");
@@ -174,13 +180,35 @@ fn the_operators_pricing_is_invisible_to_the_import() {
     let mut changed: Value = serde_json::from_str(&text).expect("the material is json");
     changed["markup_bps"] = json!(9999);
     changed["offerings"][0]["consumer_rates_cny"] = json!({ "text_input_micros_per_million": 1 });
-    changed["offerings"][0]["reference_cost_microusd"] = json!(1);
-    changed["offerings"][0]["cost_basis"] = json!("declared");
-    changed["offerings"][0]["floor_amounts"] = json!({ "cap_microusd": 1 });
+    changed["offerings"][0]["cost_basis"] = json!("computed");
     let edited: Material =
         serde_json::from_value(changed).expect("the edited material still parses");
 
     assert_eq!(imported_projection(&original), imported_projection(&edited));
+}
+
+/// 渠道侧的成本事实进 `supply.offerings`：保底表与参考成本改了就改变导入看见的东西。
+///
+/// 运营表单里不出现成本字段（Spec 0001 V-D12），引用式发布只能从这条供给读它们；只认发布命令会让
+/// `upstream_declared` 候选的保底表永远进不了修订，受理只剩平台兜底额（工作项 #89）。
+#[test]
+fn the_channel_cost_facts_are_imported() {
+    let path = material_dir().join("gpt-image-2.5-flare.json");
+    let text = std::fs::read_to_string(&path).expect("a material file");
+    let original: Material = serde_json::from_str(&text).expect("the material parses");
+    assert!(
+        original.offerings[0].floor_amounts.is_some()
+            && original.offerings[0].reference_cost_microusd.is_some(),
+        "素材必须声明保底表与参考成本，否则这条用例验不到东西"
+    );
+
+    let mut changed: Value = serde_json::from_str(&text).expect("the material is json");
+    changed["offerings"][0]["floor_amounts"] = json!({ "amounts": { "1K": 1 }, "cap_microusd": 1 });
+    changed["offerings"][0]["reference_cost_microusd"] = json!(1);
+    let edited: Material =
+        serde_json::from_value(changed).expect("the edited material still parses");
+
+    assert_ne!(imported_projection(&original), imported_projection(&edited));
 }
 
 /// 一条素材供给：只给参与形状校验的那几个字段，其余取最小可用值。
@@ -196,6 +224,8 @@ fn material_offering(formula: PricingFormula, unit: Option<u64>, plan: bool) -> 
         parameter_mapping: json!({}),
         formula,
         cost_unit_price_microusd: unit,
+        floor_amounts: None,
+        reference_cost_microusd: None,
         price_plan: plan.then(|| MaterialPricePlan {
             currency: "USD".to_owned(),
             text_input_microusd_per_million: 1,

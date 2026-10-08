@@ -486,6 +486,121 @@ async fn a_referenced_publication_derives_the_cost_basis_from_the_channel_formul
     drop_isolated_database(&database_name).await;
 }
 
+/// 引用式发布（运营只给 `offering_id`）也要把**保底表与参考成本**带进修订：它们是渠道侧的成本事实，
+/// 来源是被引用那条供给的行（素材导入写入，迁移 `0046`），不是运营在表单里填的（Spec 0001 V-D12）。
+///
+/// 缺了保底表，受理只能回落平台兜底额：实测那次 1K 请求只冻 0.02 元，而素材声明的是 0.16 元，
+/// 准入闸门「余额 ≥ 保底额」形同虚设（工作项 #89）。保底表 → 保底额那条链路（档位 → 封顶值 →
+/// 平台兜底）由 `cases_funds` 的既有用例覆盖；这条守的是"表进不进修订"。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_referenced_publication_carries_the_channel_floor_table() {
+    let (database_url, database_name) = isolated_database_url().await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let client = Client::new();
+    wait_until_ready(&client, &base_url, &admin_token).await;
+    let pool = PgPool::connect(&database_url)
+        .await
+        .expect("contract database");
+
+    let model = "referenced-floor-model";
+    let contract = surface_schema(json!({
+        "model": {"const": model},
+        "prompt": {"type": "string", "minLength": 1}
+    }));
+    let mut full = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
+    full["base_url"] = json!("https://floor.example.com");
+    assert_eq!(
+        publish_candidates(
+            &client,
+            &base_url,
+            &admin_token,
+            model,
+            Some(contract),
+            vec![full]
+        )
+        .await,
+        StatusCode::OK,
+        "先把那条可被引用的 Offering 造出来"
+    );
+    let offering_id: Uuid = sqlx::query_scalar(
+        "SELECT o.id FROM supply.offerings o
+         JOIN catalog.vendor_models vm ON vm.id = o.vendor_model_id
+         WHERE vm.native_model_id = $1",
+    )
+    .bind(model)
+    .fetch_one(&pool)
+    .await
+    .expect("the offering the operators will reference");
+
+    // 素材导入写进行上的那两样。这里直接写库：导入那一段由 `seeai-persistence` 的真库用例
+    // `the_channel_cost_facts_land_on_the_offering_rows` 覆盖，这条只验发布路径读不读它。
+    sqlx::query(
+        "UPDATE supply.offerings
+         SET floor_amounts = $2, reference_cost_microusd = 11_354
+         WHERE id = $1",
+    )
+    .bind(offering_id)
+    .bind(json!({ "amounts": { "1K": 160_000, "2K": 250_000 }, "cap_microusd": 300_000 }))
+    .execute(&pool)
+    .await
+    .expect("the channel cost facts on the offering row");
+
+    // 运营只给"选了哪条"与倍率：一个成本字段都不给。
+    let gateway = "referenced-floor-gateway";
+    let body = json!({
+        "gateway_model": gateway,
+        "actor": "contract-test",
+        "markup_bps": 2_400,
+        "references": [{ "offering_id": offering_id }]
+    });
+    let response = client
+        .post(format!("{base_url}/api/v1/runtime-revisions"))
+        .bearer_auth(&admin_token)
+        .json(&body)
+        .send()
+        .await
+        .expect("referenced publication");
+    let status = response.status();
+    let text = response.text().await.expect("referenced body");
+    assert_eq!(
+        status,
+        StatusCode::OK,
+        "只给 offering_id 也要能发出去：{text}"
+    );
+
+    // 修订上带的是行上那份保底表与参考成本，不是空表。
+    let published: Value = sqlx::query_scalar(
+        "SELECT jsonb_build_object(
+                    'floor_amounts', rr.floor_amounts -> re.offering_id::text,
+                    'reference_cost_microusd', rr.reference_cost_microusd -> re.offering_id::text)
+         FROM publication.runtime_entries re
+         JOIN publication.runtime_revisions rr ON rr.id = re.runtime_revision_id
+         WHERE re.active AND re.gateway_model = $1",
+    )
+    .bind(gateway)
+    .fetch_one(&pool)
+    .await
+    .expect("the published channel cost facts");
+    assert_eq!(
+        published["floor_amounts"]["amounts"]["1K"],
+        json!(160_000),
+        "保底表必须来自供给行：{published}"
+    );
+    assert_eq!(
+        published["floor_amounts"]["cap_microusd"],
+        json!(300_000),
+        "封顶保底值必须来自供给行：{published}"
+    );
+    assert_eq!(
+        published["reference_cost_microusd"],
+        json!(11_354),
+        "参考成本必须来自供给行：{published}"
+    );
+
+    drop_isolated_database(&database_name).await;
+}
+
 /// 省略渠道但上一版里没有同身份的候选：拒绝并点名，不用"最近的那条"顶替。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]

@@ -72,10 +72,12 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 | --- | --- | --- |
 | `catalog.vendor_models` | `(vendor_id, native_model_id, native_revision)` | 复用该行。**合同行不可变**，所以同一三元组下的内容必须一致；不一致则报错要求**换 `native_revision`**——"内容不同就新写一行"这条做不到，因为 `schema_hash` 已被迁移 `0006` 删除，唯一键就是这三元组 |
 | `supply.channels` | `(provider_kind, base_url, credential_env)` | 复用该行，**只更新 `enabled` 里的"新建时默认 true"**：启停是运营状态，导入不该把它顶回启用，所以实际是 `ON CONFLICT DO NOTHING` |
-| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`、`consumer_reference_rates`）。**不动 `enabled`** |
+| `supply.offerings` | `(vendor_model_id, channel_id)` | **更新**其技术定义（`adapter_key`、`provider_model_id`、`carrier_schema`、`parameter_mapping`、`restrictions`、`formula`、`cost_unit_price_microusd`、`consumer_reference_rates`）与**渠道侧的成本事实**（`cost_currency`、`floor_amounts`、`reference_cost_microusd`）。**不动 `enabled`** |
 | `pricing.price_plans` | `(offering_id, currency, source_url)` 且四档费率全同 | 复用；**费率变了才追加一行**（不是"每个时刻一行"——表上只有 `created_at`，没有生效时刻这一列） |
 
 **成本币种落 `supply.offerings.cost_currency`**：它是这条供给声明的渠道事实（素材里的 `cost_currency`），与供给的技术定义同层。它原先只由 Price Plan 的币种、或该供给最近一次发布在修订上声明的币种承接；没有价目表、又还没发布过的供给于是**一处来源都没有**——引用式发布只能撞"必须声明成本币种"的拒绝，运营在界面上也无从补录（工作项 #81）。引用式发布因此按"Price Plan 币种 → 供给声明的成本币种 → 最近一次发布声明的币种"兜底（见 §4）。
+
+**保底表与渠道参考成本同样落 `supply.offerings`**（`floor_amounts`、`reference_cost_microusd`，迁移 `0046`）：它们是渠道侧的成本事实，而运营表单里不出现成本字段（[`0001`](../specs/0001-admin-and-customer-consoles.md) V-D12），引用式发布只能从这条供给读它们。只认发布命令会让 `upstream_declared` 候选的保底表永远进不了修订，受理只剩平台兜底额（工作项 #89）。
 
 **对客参考价目（`consumer_reference_rates`）是模型级的一份，落 `catalog.vendor_models` 那一列**：它是"该 vendor／模型已知价目"的来源，对客 token 四档的初始价取它（[`0007`](./0007-pricing-floor-and-settlement.md) §2），不是成本参数——所以它不随 Price Plan 走，也不随合同冻结；缺了不影响导入与发布。写它的两条路规则不同：**素材是它的属主**，素材没写就是没有，导入照实写回（含清空）；**内联发布的顶层字段省略它时不抹掉已有的值**——那条路是改价的兼容形状，省略一个模型属性不该把它清掉。
 
