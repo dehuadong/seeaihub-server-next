@@ -123,17 +123,36 @@ sudo cargo build --release -p seeai-api -p seeai-worker
 
 不想在服务器上装 Node 时，前端在本地打好即可：`npm --prefix apps/web ci && npm --prefix apps/web run build`，把生成的 `apps/web/dist/` 整个传到 `<部署根>/apps/web/dist/`。产物是静态文件，引用 `/assets/...` 这类站内绝对路径，没有构建期配置，换机器与换目录都不影响；服务器上那两步 `npm ci`、`npm run build` 随之省掉，但 `dist/` 仍要在服务启动前就位（§1.1）。
 
-没有仓库访问权限时不用 `git clone`，把下面这些传上去即可（约 5 MB）：
+没有仓库访问权限时不用 `git clone`，把下面这些传上去即可。一个包，systemd 与容器两条路线都用它，部署方式在服务器上再定：
 
 | 传什么 | 为什么 |
 | --- | --- |
 | `Cargo.toml`、`Cargo.lock` | workspace 清单与锁定版本 |
 | `crates/` | 9 个 crate；[workspace](../../Cargo.toml) 清单里列出的都要在，缺一个 cargo 报错 |
 | `apps/api/`、`apps/worker/` | 两个二进制的源码 |
-| `apps/web/` 的 `src/`、`console.html`、`portal.html`、`package.json`、`package-lock.json`、`tsconfig.json`、`vite.config.ts`、`e2e/check-bundle-isolation.mjs` | 在服务器上打前端时的输入（最后一个是 `npm run build` 的一环，漏了会失败）；本地已打好 `dist/` 时改传 `apps/web/dist/` 即可，这行全部省掉 |
 | `migrations/` | 编译期嵌入二进制 |
 | `public-docs/`、`config/bootstrap/` | 运行期读 |
-| `deploy/systemd/` | 装到 `/etc/systemd/system/` 的两个单元 |
+| `deploy/systemd/` | systemd 路线：装到 `/etc/systemd/system/` 的两个单元 |
+| `Dockerfile`、`.dockerignore`、`deploy/compose.prod.yaml` | 容器路线：在部署根 `docker build`，再 compose 起容器 |
+| `apps/web/dist/` | 本地打好的前端产物，服务器不装 Node 时直接用它 |
+| `apps/web/` 的 `src/`、`console.html`、`portal.html`、`package.json`、`package-lock.json`、`tsconfig.json`、`vite.config.ts`、`e2e/check-bundle-isolation.mjs` | 在服务器上打前端、或镜像内构建时的输入（最后一个是 `npm run build` 的一环，漏了会失败） |
+
+在有仓库的那台机器上打包，清单由 `scripts/deploy/pack-deploy-tree.mjs` 逐项核对：路径缺失、[workspace](../../Cargo.toml) 成员没被覆盖、或 `Dockerfile` 的 `COPY` 要读的路径没进包，它都报错退出，不出一份缺东西的包；`apps/web/dist` 比前端源码旧就警告。
+
+```sh
+node scripts/deploy/pack-deploy-tree.mjs
+```
+
+服务器上解包到部署根，`Cargo.toml`、`crates/` 等直接落在部署根下，没有多一层目录：
+
+```sh
+sudo install -d -m 755 /opt/seeai
+sudo tar -xzf seeai-deploy-<YYYYMMDD>.tar.gz -C /opt/seeai
+```
+
+之后按路线二选一：systemd 用本节前面的命令（`npm ci`、`npm run build`、`cargo build`），包里已有 `dist` 时前两条省掉；容器在部署根 `docker build`，再 compose 起容器（[生产环境（容器）](production-docker.md)）。编译期路径因此固定成 `<部署根>`，编译后不能再搬这棵树（§1.1）。
+
+整包约 12 MB，打包后约 2.9 MB。
 
 `target/` 与 `apps/web/node_modules/` 不传，都在服务器上重新生成——`node_modules` 带平台相关二进制，传过去也不能用。`out-reference/`、`docs/`、`.agents/`、`.github/`、`scripts/` 与 e2e 的其余文件构建与运行都不读；`.env` 不传，生产配置在 `/etc/seeai/`（§2.3）。构建要从 crates.io 下载（在服务器上打前端时还要 npm registry），服务器连不上就先配镜像源。
 
