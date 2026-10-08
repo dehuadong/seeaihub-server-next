@@ -133,6 +133,6 @@ npm --prefix apps/web run e2e
 
 ## 9. 这一节之外
 
-- 生产怎么部署、面向哪些风险、投产前做什么演练：见[生产环境](production.md)。
+- 生产怎么部署、面向哪些风险、投产前做什么演练：见[部署总览与基础准备](deployment.md)。
 - 各配置项在生产下的取值与理由：见[配置项](configuration.md)。
-- 备份与恢复：见[生产环境](production.md) §6。
+- 备份与恢复：见[部署总览 §7](deployment.md#7-备份)。

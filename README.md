@@ -20,9 +20,10 @@
 | --- | --- |
 | **API 使用文档**（模型查询、各模型说明、素材上传与错误处理） | 对客读 `GET /v1/docs/README.md`（入口，索引下面三份）、`GET /v1/docs/authentication.md`、`GET /v1/docs/uploads/images.md`、`GET /v1/docs/http-errors.md`；源码在 [`public-docs/`](public-docs/README.md) |
 | **怎么跑起来**（开发环境：依赖、配置、构建、两个起点、常见坑） | [`docs/operations/development.md`](docs/operations/development.md) |
-| **怎么上生产**（构建、部署、反代与主机分发、systemd、备份、投产演练） | [`docs/operations/production.md`](docs/operations/production.md) |
+| **怎么上生产**（部署总览、服务器基础准备、硬约束、反代与主机分发、备份、投产演练） | [`docs/operations/deployment.md`](docs/operations/deployment.md) |
+| **传统部署**（systemd：构建、两个单元、升级） | [`docs/operations/production.md`](docs/operations/production.md) |
+| **容器部署**（镜像准备、运行、宝塔面板、升级与回退） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
-| **容器部署**（Dockerfile、compose、镜像准备与升级、宝塔面板） | [`docs/operations/production-docker.md`](docs/operations/production-docker.md) |
 | **素材与模型升级教程**（改素材后怎么生效、合同变更为什么要升修订、本地库怎么处理） | [`docs/tutorials/supply-materials.md`](docs/tutorials/supply-materials.md) |
 | **架构治理**：分层职责、依赖方向、边界规则（R1–R5）与扩展纪律 | [`docs/architecture.md`](docs/architecture.md) |
 | 分层规则的**依据、边界细则与例外理由** | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
@@ -59,7 +60,7 @@ cargo run -p seeai-worker            # 另开一个终端
 
 参考图与遮罩是**参数值**：只收 `http(s)` 公网 URL；本地文件先经上传端点换成公网 URL。平台不落盘、不校验其内容——上游不接受就会报错。
 
-**逐项说明与常见坑见 [`docs/operations/development.md`](docs/operations/development.md)；生产部署见 [`docs/operations/production.md`](docs/operations/production.md)。**
+**逐项说明与常见坑见 [`docs/operations/development.md`](docs/operations/development.md)；生产部署见 [`docs/operations/deployment.md`](docs/operations/deployment.md)。**
 
 ## 验证
 
@@ -84,4 +85,4 @@ npm --prefix apps/web run e2e
 
 它们**都不调用真实上游**：假上游在进程内监听 `127.0.0.1`；只有显式授权的受控实测才会发真实计费调用（见 [`docs/verification/`](docs/verification/)）。
 
-投产前该做什么演练、每条判据是什么，见 [`docs/operations/production.md`](docs/operations/production.md) §7。
+投产前该做什么演练、每条判据是什么，见 [`docs/operations/deployment.md`](docs/operations/deployment.md) §8。

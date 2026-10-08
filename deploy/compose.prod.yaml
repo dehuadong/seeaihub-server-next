@@ -1,5 +1,5 @@
 # 生产容器编排：只起两个应用进程，PostgreSQL 与 Redis 外置，由 DATABASE_URL / REDIS_URL 指过去。
-# TLS 与 Host 透传仍由宿主 nginx 负责（docs/operations/production.md §2.4），所以 API 只发布到宿主回环。
+# TLS 与 Host 透传仍由宿主 nginx 负责（docs/operations/deployment.md §5），所以 API 只发布到宿主回环。
 #
 #   SEEAI_TAG=<镜像 tag> docker compose -f deploy/compose.prod.yaml up -d
 x-seeai-app: &seeai-app

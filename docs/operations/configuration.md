@@ -1,6 +1,6 @@
 # 配置项
 
-两个进程的配置**只从环境变量读**，没有配置文件。值怎么送进进程（systemd `EnvironmentFile`、密钥系统、开发机 `.env`）见[生产环境](production.md) §2.3 与[开发环境](development.md) §3。
+两个进程的配置**只从环境变量读**，没有配置文件。值怎么送进进程（systemd `EnvironmentFile`、容器 `env_file`、密钥系统、开发机 `.env`）见[部署总览与基础准备](deployment.md) §4 与[开发环境](development.md) §3。
 
 每个变量按"不设会怎样"分三类：
 
@@ -14,9 +14,9 @@
 
 | 变量 | 缺省 | 生产怎么取 |
 | --- | --- | --- |
-| `DATABASE_URL` | 无（**必填**） | 两个进程都读。指向生产库，用户需 DDL 权限（[生产环境](production.md) §1.3） |
+| `DATABASE_URL` | 无（**必填**） | 两个进程都读。指向生产库，用户需 DDL 权限（[部署总览 §3.3](deployment.md#33-数据库用户要有-ddl-权限且迁移会自动跑)） |
 | `API_BIND` | `127.0.0.1:8081` | 监听地址。反代与 API 同机时保持回环；只有反代在不同机器或网络命名空间里，才需要用 `0.0.0.0:8081` 并配防火墙 |
-| `ADMIN_TOKEN` | 无（**必填**） | 强随机串，按密钥管理（[生产环境](production.md) §1.4） |
+| `ADMIN_TOKEN` | 无（**必填**） | 强随机串，按密钥管理（[部署总览 §3.4](deployment.md#34-admin_token-是必填的共享凭据它不指向具体的人)） |
 | `SEE_BASEURL` | 无（**必填**） | 平台对客基址，只写源、不带结尾斜杠（如 `https://app.example.com`）。模型说明与公共使用文档的链接按它写成绝对地址；从请求主机取会把管理端地址写进不可变版本 |
 | `ADMIN_EMAIL` / `ADMIN_PASSWORD` | 无 | 用来建/更新那个管理员账号。**不设＝运营后台登录不可用**（共享令牌仍能调接口）；生产应配上 |
 | `WORKER_ID` | `worker-local-1` | **每个 worker 实例必须唯一**（租约按它归属）。多实例不显式给不同值＝共用同一个 ID，租约会互相抢 |
@@ -36,7 +36,7 @@
 | `GENERATION_RATE_LIMIT_WINDOW_MS` | `60000` | 限流窗口（即默认每分钟 60 次） |
 | `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` | `10` | 公开鉴权端点（`<ENDPOINT>` 取 `REGISTER` / `LOGIN` / `REDEEM`）每窗口的失败尝试上限；超限对客 `429 rate_limit_exceeded` 带 `Retry-After` |
 | `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS` | `60000` | 上述三个端点各自的计数窗口 |
-| `AUTH_SOURCE_HEADER` | 不设 | 公开鉴权来源维采信的受信头（如 `x-real-ip`）；**不设时退回连接对端地址**。采信它要求 API 不能被绕过代理直连，见 [生产运维 §2.4](production.md#24-反向代理与-tls) |
+| `AUTH_SOURCE_HEADER` | 不设 | 公开鉴权来源维采信的受信头（如 `x-real-ip`）；**不设时退回连接对端地址**。采信它要求 API 不能被绕过代理直连，见 [部署总览 §5](deployment.md#5-反向代理与-tls) |
 | `GENERATION_SYNC_WAIT_SECONDS` | `PROVIDER_TIMEOUT_SECONDS + 30` | 对客同步等待窗口。**必须 ≥ `PROVIDER_TIMEOUT_SECONDS`**，否则启动时拒绝并点名 |
 | `PROVIDER_TIMEOUT_SECONDS` | 按合同最大输出张数算出 | 上游调用超时上限：`基数 + max(0, n − 含张数) × 每张`。显式设了就以它为准 |
 | `PROVIDER_TIMEOUT_BASE_SECONDS` | `180` | 超时链的固定基数 |
@@ -150,7 +150,7 @@ Worker 每轮跑异常对账：接管租约过期的 v1 执行、按已知句柄
 
 **凭证只从环境变量读**，数据库只存变量名，日志与响应里不出现。缺哪个渠道的密钥，那一次执行会失败——不是在启动时失败。API 在受理之后、发出外部请求之前按该渠道的 `credential_env` 现场读取；对账 Worker 只在需要重查上游状态时读同一份。
 
-**怎么送进去**：生产用 systemd 的 `EnvironmentFile`（或由密钥系统在启动前渲染它），文件属服务账号、`chmod 600`；本地可以 `export` 或写开发机 `.env`。手动 `export` 只活在当前 shell，**机器重启后要重新 set**，所以它只适合本地，不是生产手段（见[生产环境](production.md) §2.3）。
+**怎么送进去**：生产用 systemd 的 `EnvironmentFile` 或容器的 `env_file`（或由密钥系统在启动前渲染它），文件属服务账号、`chmod 600`；本地可以 `export` 或写开发机 `.env`。手动 `export` 只活在当前 shell，**机器重启后要重新 set**，所以它只适合本地，不是生产手段（见[部署总览 §4](deployment.md#4-配置)）。
 
 ## 6. 供给素材导入
 
