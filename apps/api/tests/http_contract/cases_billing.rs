@@ -1320,3 +1320,119 @@ async fn usage_charges_match_the_capture_entries_and_adjustments_stay_separate()
 
     harness.cleanup().await;
 }
+
+/// 读侧遇到非整积分时按**绝对值**向上取整（Spec 0002 §1、A10）。
+///
+/// 绕过写入口直接改库，造出对客读可能遇到的两种非整积分：已结算余额差 1 微元（写入方漏取整留下的行），以及
+/// 一条没有写入口、也不改余额的正式调整行（账实核对会发现它与余额不一致；读侧对它只取整，不改账）。把读侧
+/// 的取整改成截断，两处断言都会失败。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_non_whole_point_amount_rounds_up_on_the_customer_read() {
+    let harness = Harness::start_with_draft(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+    )
+    .await;
+    let client = Client::new();
+
+    let (account_id, _api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    let account_uuid = Uuid::parse_str(&account_id).expect("account id");
+    let email = "non-whole-points@example.com";
+    let password = "a-long-enough-password";
+    assert_eq!(
+        client
+            .post(format!("{}/api/v1/customers", harness.base_url))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({"email": email, "password": password, "account_id": account_id}))
+            .send()
+            .await
+            .expect("open customer request")
+            .status(),
+        StatusCode::CREATED
+    );
+    let session = client
+        .post(format!("{}/v1/customer/sessions", harness.base_url))
+        .json(&json!({"email": email, "password": password}))
+        .send()
+        .await
+        .expect("customer login request")
+        .json::<Value>()
+        .await
+        .expect("login body")["token"]
+        .as_str()
+        .expect("session token")
+        .to_owned();
+
+    // 整积分的账上金额原样给出：读侧的取整对合规行不动一个数。
+    let account = client
+        .get(format!("{}/v1/customer/account", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(account["balance_points"], json!(1_000), "{account}");
+
+    // 差 1 微元不足 1 积分：向上取整到 1001（截断会给 1000）。
+    sqlx::query("UPDATE ledger.accounts SET balance_microusd = balance_microusd + 1 WHERE id = $1")
+        .bind(account_uuid)
+        .execute(&harness.pool)
+        .await
+        .expect("make the settled balance a non-whole number of points");
+    let account = client
+        .get(format!("{}/v1/customer/account", harness.base_url))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("account request")
+        .json::<Value>()
+        .await
+        .expect("account body");
+    assert_eq!(
+        account["balance_points"],
+        json!(1_001),
+        "1000001 微元向上取整到 1001 积分：{account}"
+    );
+    assert_eq!(account["held_points"], json!(0), "{account}");
+    assert_eq!(account["available_points"], json!(1_001), "{account}");
+
+    // 负数按绝对值向上取整：-1500 微元 → -2 积分（截断会给 -1）。
+    sqlx::query(
+        "INSERT INTO ledger.entries (id, account_id, job_id, kind, amount_microusd, business_key)
+         VALUES ($1,$2,NULL,'adjustment',$3,$4)",
+    )
+    .bind(Uuid::new_v4())
+    .bind(account_uuid)
+    .bind(-1_500_i64)
+    .bind(format!("non-whole-points:{}", Uuid::new_v4()))
+    .execute(&harness.pool)
+    .await
+    .expect("seed a non-whole adjustment");
+    let ledger = client
+        .get(format!(
+            "{}/v1/customer/ledger?kind=adjustment",
+            harness.base_url
+        ))
+        .bearer_auth(&session)
+        .send()
+        .await
+        .expect("ledger request")
+        .json::<Value>()
+        .await
+        .expect("ledger body");
+    let entries = ledger["entries"].as_array().expect("entries");
+    assert_eq!(entries.len(), 1, "只该有那一条非整积分的调整：{ledger}");
+    assert_eq!(
+        entries[0]["amount_points"],
+        json!(-2),
+        "-1500 微元按绝对值向上取整到 -2 积分：{ledger}"
+    );
+
+    harness.cleanup().await;
+}
