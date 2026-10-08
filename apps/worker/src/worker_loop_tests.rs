@@ -510,9 +510,6 @@ impl HubRepository for EmptyQueueRepository {
     ) -> Result<(Uuid, AccountId), ApplicationError> {
         unimplemented!()
     }
-    async fn daily_spend_microusd(&self, _account_id: AccountId) -> Result<u64, ApplicationError> {
-        unimplemented!()
-    }
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {

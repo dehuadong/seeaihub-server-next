@@ -62,9 +62,6 @@ pub use request_timeout::{
 mod retry;
 pub use retry::{DEFAULT_BACKOFF_BASE_MS, DEFAULT_MAX_ATTEMPTS, MAX_BACKOFF_SECONDS, RetryPolicy};
 
-mod cost_ceiling;
-pub use cost_ceiling::{RequestCostCeiling, single_request_cost_cny};
-
 mod request_fingerprint;
 pub use request_fingerprint::{
     FINGERPRINT_KEY_LEN, RequestFingerprintInput, RequestFingerprintKeys, idempotency_key_digest,
@@ -1567,96 +1564,6 @@ fn counts_as_auth_failure(error: &ApplicationError) -> bool {
     )
 }
 
-/// 每账户**当天已经花掉**多少（CNY 微单位）的**上限配置**：**不设就是不限**（`None`）。
-///
-/// 判据本身——每天一行的已完成实收合计、成功结算在写 `capture` 的同一事务累加、受理只读
-/// 当天一行而不扫历史流水、且不读缓存——归 [`HubRepository::daily_spend_microusd`]；
-/// 它为什么是"运营取值而不是产品档位"归 `docs/design/0013-account-funds-and-reservations.md` §4。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenerationDailySpendLimit {
-    /// 一个自然日（UTC）内允许扣掉的总额度，单位 CNY 微单位；`None` = 不限。
-    pub max_daily_spend_microusd: Option<u64>,
-}
-
-impl GenerationDailySpendLimit {
-    /// 运维默认值：**不限**。
-    #[must_use]
-    pub fn default_limit() -> Self {
-        Self {
-            max_daily_spend_microusd: None,
-        }
-    }
-
-    /// 给了上限就必须是正数：0 等于"这个账户一次都不许花"，那不是额度、是关停；真要关停应当走
-    /// 账户与密钥那条路，而不是把额度设成 0 让每个请求都撞在一个说不清的错误上。
-    pub fn new(max_daily_spend_microusd: Option<u64>) -> Result<Self, ApplicationError> {
-        if max_daily_spend_microusd == Some(0) {
-            return Err(ApplicationError::Configuration(
-                "the daily spend limit must be positive".to_owned(),
-            ));
-        }
-        Ok(Self {
-            max_daily_spend_microusd,
-        })
-    }
-
-    /// 从环境变量读运维取值：`GENERATION_MAX_DAILY_SPEND_MICROUSD`；**没给或给空就是不限**。
-    ///
-    /// 读不出来（不是整数、或不是合法 UTF-8）是**配置错误**，不是"不限"：护栏静默失效比配错更糟。
-    pub fn from_env() -> Result<Self, ApplicationError> {
-        let limit = match std::env::var("GENERATION_MAX_DAILY_SPEND_MICROUSD") {
-            Err(std::env::VarError::NotPresent) => None,
-            Err(std::env::VarError::NotUnicode(_)) => {
-                return Err(ApplicationError::Configuration(
-                    "GENERATION_MAX_DAILY_SPEND_MICROUSD must be valid UTF-8".to_owned(),
-                ));
-            }
-            Ok(value) if value.trim().is_empty() => None,
-            Ok(value) => Some(value.trim().parse::<u64>().map_err(|_| {
-                ApplicationError::Configuration(
-                    "GENERATION_MAX_DAILY_SPEND_MICROUSD must be an integer".to_owned(),
-                )
-            })?),
-        };
-        // 报错点名那个变量：运维看的是部署面，`new` 自己的措辞不带变量名。
-        Self::new(limit).map_err(|_| {
-            ApplicationError::Configuration(
-                "GENERATION_MAX_DAILY_SPEND_MICROUSD must be positive when it is set".to_owned(),
-            )
-        })
-    }
-}
-
-/// 判这次受理会不会把账户当天花超，并在超了时给出"到次日零点还有多久"。
-///
-/// 判据是 `spent_microusd >= limit`：**已花到顶**就拒，而不是"要超过才拒"——额度是一天的
-/// 天花板，花到正好等于天花板时，今天已经没有余量再受理一次了。
-///
-/// `retry_after` 是**到当天结束**的秒数，不是某个窗口的长度：配额按自然日恢复，消费者要的
-/// 答案就是"明天零点之后再来"。向上取整到秒由对客那一层做，这里不提前取整，否则一个
-/// "还有 0.4 秒"的余量会被写成 1 秒以外的值、或干脆写成 0。
-fn daily_spend_limit_error(
-    max_daily_spend_microusd: u64,
-    spent_microusd: u64,
-    now: DateTime<Utc>,
-) -> Option<ApplicationError> {
-    if spent_microusd < max_daily_spend_microusd {
-        return None;
-    }
-    let next_day = (now.date_naive() + ChronoDuration::days(1))
-        .and_hms_opt(0, 0, 0)
-        .map(|naive| DateTime::<Utc>::from_naive_utc_and_offset(naive, Utc));
-    let retry_after = next_day
-        .map(|next_day| next_day - now)
-        .and_then(|remaining| remaining.to_std().ok())
-        // 时钟落在当天最后一刻时余量可能不足 1 纳秒：给 1 毫秒，不给出 0——0 会被对客那一层
-        // 当成"没有值"或"立刻可重试"，两种都不是事实。
-        .unwrap_or_else(|| Duration::from_millis(1));
-    Some(ApplicationError::DailySpendLimitExceeded {
-        retry_after: retry_after.max(Duration::from_millis(1)),
-    })
-}
-
 impl CreateImageGenerationRequest {
     /// 这个请求属于哪条图片分支：有图无遮罩=图生图、两者都有=带遮罩、都没=文生图。
     ///
@@ -2566,14 +2473,6 @@ pub enum ApplicationError {
     /// 表达不了这次请求，是平台的供给面不够宽——对客必须说成平台侧故障，不是参数错。
     #[error("no eligible offering: {0}")]
     NoEligibleOffering(String),
-    /// 这次受理按该候选的计价形态算下来，可能花掉的上游成本超过了运营设的**单次请求成本上限**。
-    ///
-    /// 与 [`Self::InsufficientBalance`] 分开：那个是**客户**的钱不够，这个是**平台**自己划的护栏
-    /// ——请求本身没问题、客户的余额也够，是这次执行可能让平台付得太多（上限被调小、折算率变差、
-    /// 或发布物配错了）。对客必须是**平台侧故障**，不是"你余额不足"。
-    /// 带的是这次算出来的成本与上限本身，写给运营看（对客那层只说平台不可用）。
-    #[error("request cost ceiling exceeded: {0}")]
-    RequestCostCeilingExceeded(String),
     #[error("not found: {0}")]
     NotFound(String),
     #[error("conflict: {0}")]
@@ -2608,14 +2507,6 @@ pub enum ApplicationError {
     /// 窗口长度随错误一起给出，调用方才知道该说"多久之后再来"。
     #[error("rate limit exceeded; retry after {retry_after:?}")]
     RateLimitExceeded { retry_after: Duration },
-    /// 该账户**当天已经花掉**的钱达到了运营设的每日上限。
-    ///
-    /// 与 [`Self::RateLimitExceeded`]、[`Self::TooManyInFlight`] 三者互不相同，因为对客该做
-    /// 的事完全不同：那个是"这一分钟发得太密，等一下再发"、那个是"上一个还没跑完"、这个是
-    /// "今天的额度用完了，明天再来"——合成一个码，消费者只能盲目重试。
-    /// `retry_after` 是到次日零点（UTC）的秒数。
-    #[error("daily spend limit reached; retry after {retry_after:?}")]
-    DailySpendLimitExceeded { retry_after: Duration },
     #[error("configuration error: {0}")]
     Configuration(String),
     #[error("persistence error: {0}")]
@@ -2990,17 +2881,6 @@ pub trait HubRepository: Send + Sync {
     /// `revoked_at IS NULL`），因此认证路径每次都要走它。
     async fn api_key_identity(&self, key_hash: &str)
     -> Result<(Uuid, AccountId), ApplicationError>;
-
-    /// 该账户**当天（UTC 自然日）已完成实收**的合计（microusd）。
-    ///
-    /// 与在飞计数不同，这里问的是**事实**而不是计数：判据是 PostgreSQL 里每账户每 UTC 自然日
-    /// 一行的每日合计，成功结算在写 `capture` 的同一事务累加；受理只读当天一行，不扫历史流水
-    /// （`0002` §5）。它也不读缓存——缓存一份"今日累计"就得管它的失效与漂移，而漂移出来的数
-    /// 恰好会用来决定"要不要拒"，那种错不可接受（详情见 [`GenerationDailySpendLimit`]）。
-    ///
-    /// 刻意**不给缺省实现**：受理路径上的这道门必须每次都能拿到答案，一个"没实现就当 0
-    /// （今天还没花）"的缺省会让新仓库在无声无息中把上限关掉，而"少花钱"这件事没人会发现。
-    async fn daily_spend_microusd(&self, account_id: AccountId) -> Result<u64, ApplicationError>;
 
     async fn list_open_reconciliation_cases(
         &self,
@@ -5513,8 +5393,6 @@ pub struct RuntimeService {
     repository: Arc<dyn HubRepository>,
     adapters: Arc<dyn AdapterFactory>,
     acceleration: Arc<AccelerationService>,
-    /// 成本护栏：单次请求可能花掉的上游成本上限（运营取值，与受理侧**同一个数**）。
-    cost_ceiling: RequestCostCeiling,
     /// 平台对客基址：模型说明里的链接与示例按它写成绝对地址。它在**发布时**代入，所以取值必须在
     /// 发布之前定好；正文里存的是代入后的最终地址。
     public_base_url: String,
@@ -5532,18 +5410,8 @@ impl RuntimeService {
             repository,
             adapters,
             acceleration,
-            cost_ceiling: RequestCostCeiling::default_ceiling(),
             public_base_url,
         }
-    }
-
-    /// 装上运维给的**单次请求成本上限**。
-    ///
-    /// 上限是配置项：它随部署形态与上游价格变，所以由调用方给，而不是写死在这里。
-    #[must_use]
-    pub fn with_cost_ceiling(mut self, ceiling: RequestCostCeiling) -> Self {
-        self.cost_ceiling = ceiling;
-        self
     }
 
     /// 装上加速层：发布与启停都要失效该型号的 route 缓存。
@@ -5588,8 +5456,6 @@ impl RuntimeService {
             normalized.push(self.validate_offering(&contract, offering)?);
         }
         validate_supply_identities(&normalized)?;
-        self.validate_cost_ceiling(&native_model_id, &contract, &normalized)
-            .await?;
         let documentation_body = self
             .render_documentation(&command, &contract, &native_model_id)
             .await?;
@@ -6039,72 +5905,6 @@ impl RuntimeService {
             .await?;
         for gateway_model in affected {
             self.acceleration.invalidate_route(&gateway_model).await;
-        }
-        Ok(())
-    }
-
-    /// 发布期的**成本护栏**：任何一条候选的**最大单次成本**超过上限就拒整份发布。
-    ///
-    /// 判据按**合同允许的最大输出张数**算（见 [`single_request_cost_native`]）——发布期问的是
-    /// "这条供给最坏能花掉多少"，那正是合同允许的最坏情况。折算率取**此刻生效的那一行**：发布期
-    /// 没有"受理时刻"这个东西，而这道判据要的是"按今天的折算率看它是不是离谱"。
-    ///
-    /// **算不出成本的候选跳过**（没有参考成本、没有成本币种、或该币种没有生效折算率）：判不出
-    /// "有没有超"时不动它——当作"超了"会让旧形状的素材发不出去，当作 0 又等于静默放行。真正
-    /// 落地的那一笔由受理期那道兜底判。
-    ///
-    /// 整份发布一起拒，而不是"把超了的那条候选剔掉"：候选集是发布者给的一个整体（档位与权重
-    /// 合起来才是路由），替发布者删一条会让路由悄悄变成另一副样子。
-    async fn validate_cost_ceiling(
-        &self,
-        native_model_id: &str,
-        contract: &Value,
-        offerings: &[NormalizedOffering],
-    ) -> Result<(), ApplicationError> {
-        // 合同的 `n` 上限：模型级唯一一份，全平台的候选共用它。
-        let max_images = declared_output_images(native_model_id, contract)
-            .map(|declared| declared.maximum)
-            // 合同没声明 `n` = 这个模型收不到 `n`，一次请求只生成一张。
-            .unwrap_or(1);
-        // 折算率按币种取一次就够：同一份发布里的候选常常共用币种，而这是一条管理员路径，
-        // 不值得为每个候选各读一次汇率表。
-        let mut rates: BTreeMap<String, Option<FxRate>> = BTreeMap::new();
-        for (index, offering) in offerings.iter().enumerate() {
-            let Some(currency) = offering.cost_currency() else {
-                continue;
-            };
-            let fx_rate = match rates.get(currency) {
-                Some(rate) => rate.clone(),
-                None => {
-                    let rate = self.repository.effective_fx_rate(currency).await?;
-                    rates.insert(currency.to_owned(), rate.clone());
-                    rate
-                }
-            };
-            let Some(cost_cny) = single_request_cost_cny(
-                offering.formula,
-                offering.cost_unit_price_microusd,
-                offering
-                    .pricing
-                    .as_ref()
-                    .map(|pricing| pricing.reference_cost_microusd),
-                Some(currency),
-                fx_rate.as_ref(),
-                max_images,
-            ) else {
-                continue;
-            };
-            if self.cost_ceiling.exceeded_by(cost_cny) {
-                return Err(ApplicationError::Validation(format!(
-                    "offerings[{index}] ({} {}) may cost up to {cost_cny} microusd of upstream cost \
-                     for a single request (n up to {max_images}), over the ceiling of {} microusd \
-                     set by GENERATION_MAX_REQUEST_COST_MICROUSD: fix the candidate's pricing or \
-                     raise the ceiling",
-                    offering.provider_kind,
-                    offering.provider_model_id,
-                    self.cost_ceiling.max_request_cost_microusd()
-                )));
-            }
         }
         Ok(())
     }
@@ -7266,10 +7066,9 @@ fn contract_parameter_face(
 
 /// 按**合同自己**为某个整数参数声明的取值面（`type: integer` 与 `minimum` / `maximum`）校验它的值。
 ///
-/// 只对**输出张数** `n` 做这件事，理由是它与别的参数在平台这一侧的分量不同：这一次请求的超时窗口
-/// （按张数推导）与成本护栏（按张数乘单价）都拿它当输入，而它同时也是发给上游的"要几张"。放它
-/// 过去，合同里那句 `maximum` 就只是一句文档：调用方给 `n = 100`，平台按合同的 10 算超时与成本，
-/// 上游却可能真的生成 100 张。别的参数（`quality`、`seed`…）的取值仍然不在这里判——那是上游按
+/// 只对**输出张数** `n` 做这件事，理由是它与别的参数在平台这一侧的分量不同：这一次请求的**超时窗口**
+/// 按张数推导，而它同时也是发给上游的"要几张"。放它过去，合同里那句 `maximum` 就只是一句文档：
+/// 调用方给 `n = 100`，平台按合同的 10 算超时窗口，上游却可能真的生成 100 张。别的参数（`quality`、`seed`…）的取值仍然不在这里判——那是上游按
 /// 自己的 schema 处置的事，平台替它判会把"上游认得的取值"变成平台要维护的清单。
 ///
 /// 判据取自**合同自己那份声明**：不同型号声明不同的界（`config/bootstrap` 里顶层合同是 10，

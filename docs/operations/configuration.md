@@ -24,13 +24,11 @@
 | `CONSOLE_DEV_HOST` | 无 | **生产不要设**。它只为"本机没有域名可指"存在 |
 | `HEALTH_PROBE_TIMEOUT_MS` | `2000` | 探活超时。读不出或为 0 退回缺省 |
 
-## 2. 生成与成本护栏
+## 2. 生成护栏
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
-| `GENERATION_MAX_COST_MICROUSD` | `20000` | **兜底保底额**（CNY 微单位，`20000` = 0.02 元）。供给查不到保底额时用它算预授权额。三个 `*_MICROUSD` 变量的单位都是 **CNY 微单位**，名字里的 `usd` 是历史命名（[定价设计 §8](../design/0007-pricing-floor-and-settlement.md)） |
-| `GENERATION_MAX_REQUEST_COST_MICROUSD` | `10000000` | **单次请求的上游成本上限**（CNY 微单位，`10000000` = 10 元）。发布期与受理期各判一次。与上一项**不是同一个量** |
-| `GENERATION_MAX_DAILY_SPEND_MICROUSD` | **不设** | **每账户每日**扣费上限（CNY 微单位）。**不设即不限**；设了才按 UTC 自然日的已完成实收合计判定，超限对客 `429 daily_spend_limit_exceeded`。它是平台侧护栏、不是产品档位（[控制台之外的账户资金 Spec §5](../specs/0002-account-funds-and-reservations.md)） |
+| `GENERATION_MAX_COST_MICROUSD` | `20000` | **兜底保底额**（CNY 微单位，`20000` = 0.02 元）。供给查不到保底额时用它算预授权额。名字里的 `usd` 是历史命名（[定价设计 §8](../design/0007-pricing-floor-and-settlement.md)） |
 | `GENERATION_MAX_CONCURRENT_JOBS` | `1` | **每账户**同时能有多少个在跑的生成任务（**不是**每个 worker 的并发） |
 | `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | 受理侧限流（每窗口请求数） |
 | `GENERATION_RATE_LIMIT_WINDOW_MS` | `60000` | 限流窗口（即默认每分钟 60 次） |
@@ -49,7 +47,7 @@
 
 ### 直接同步执行
 
-两条图片入口在 API 进程内直连 Provider：认证与读取准入在消费正文前完成，不建生成 Job、Worker 不领取、结果只在本进程内存里。上面的超时链、上游超时与成本护栏继续生效；下表只列这条路自己的容量与期限。
+两条图片入口在 API 进程内直连 Provider：认证与读取准入在消费正文前完成，不建生成 Job、Worker 不领取、结果只在本进程内存里。上面的超时链与上游超时继续生效；下表只列这条路自己的容量与期限。
 
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |

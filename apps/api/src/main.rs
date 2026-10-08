@@ -19,16 +19,15 @@ use seeai_application::{
     AuthAttemptLimits, CachePolicy, CursorPosition, CustomerBillingQuery, CustomerLedgerQuery,
     CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope, CustomerUsageStatus, CustomerView,
     DirectExecutionError, DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService,
-    ExecutionLookup, ExecutionRepository, GatewayModelView, GeneratedImage,
-    GenerationDailySpendLimit, GenerationRateLimit, HISTORY_CURSOR_KEY_LEN, HistoryFilter,
-    HistoryStream, HubRepository, IdentityService, LedgerAuditor, LedgerEntryView,
-    MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter,
-    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
-    ProviderFailureView, PublicErrorCode, PublishRuntimeCommand, ReconciliationService,
-    RecordedRequestInput, RefundReconciliationCommand, RequestCostCeiling, RequestFingerprintKeys,
-    RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
-    UsageAmounts, decode_history_cursor, encode_history_cursor, invalid_history_cursor,
-    settle_reserve_from_env, with_admin_id,
+    ExecutionLookup, ExecutionRepository, GatewayModelView, GeneratedImage, GenerationRateLimit,
+    HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository, IdentityService,
+    LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES,
+    NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
+    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeCommand,
+    ReconciliationService, RecordedRequestInput, RefundReconciliationCommand,
+    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService,
+    SelectableOfferingView, UsageAmounts, decode_history_cursor, encode_history_cursor,
+    invalid_history_cursor, settle_reserve_from_env, with_admin_id,
 };
 use seeai_application::{
     ApiKeyIdentity, HeadObjectRequest, ImageUploadConfig, ImageUploadError, ImageUploadService,
@@ -343,10 +342,7 @@ async fn main() -> Result<()> {
         .with_ownership_lease(ownership_lease)
         // 请求内安全重投沿用旧 Worker 那一组运维取值（次数与退避基），不另立一套。
         .with_retry_policy(RetryPolicy::from_env().map_err(anyhow::Error::from)?)
-        // 每日扣费上限：GENERATION_MAX_DAILY_SPEND_MICROUSD，受理前按账户当日已花判定。
-        .with_daily_spend_limit(generation_daily_spend_limit()?)
-        .with_acceleration(acceleration.clone())
-        .with_cost_ceiling(cost_ceiling()?);
+        .with_acceleration(acceleration.clone());
         let max_memory_bytes =
             generation_env_usize("GENERATION_MAX_MEMORY_BYTES", DEFAULT_MAX_MEMORY_BYTES)?;
         // 单次执行的预留按各 Driver 声明的字节上限算：入口 wire、上游响应与编码膨胀可能同时存活，
@@ -512,8 +508,7 @@ async fn main() -> Result<()> {
             .with_rate_limit(acceleration.clone(), generation_rate_limit()?)
             .with_auth_attempt_limits(AuthAttemptLimits::from_env()?),
         runtime: RuntimeService::new(repository_port.clone(), adapters, see_base_url.clone())
-            .with_acceleration(acceleration.clone())
-            .with_cost_ceiling(cost_ceiling()?),
+            .with_acceleration(acceleration.clone()),
         reconciliation: ReconciliationService::new(repository_port.clone())
             .with_acceleration(acceleration.clone()),
         ledger_audit,
@@ -3930,14 +3925,13 @@ impl ApiError {
 
 impl From<ApplicationError> for ApiError {
     fn from(error: ApplicationError) -> Self {
-        // 两类"等一下再来"的错误要把等待时长带到对客响应上，所以它们在匹配之前先被取出来。
+        // "等一下再来"的错误要把等待时长带到对客响应上，所以它在匹配之前先被取出来。
         // `Retry-After` 不是"你错了"，是"什么时候再来"，消费者要的答案就在那个数里。
         let retry_after = match &error {
-            ApplicationError::DailySpendLimitExceeded { retry_after }
-            | ApplicationError::RateLimitExceeded { retry_after } => Some(*retry_after),
+            ApplicationError::RateLimitExceeded { retry_after } => Some(*retry_after),
             _ => None,
         };
-        // 两条平台侧故障有自己的 warn（它们更常见、更值得被看见），5xx 的兜底日志因此要避开它们，
+        // 平台侧故障那条路有自己的 warn（它更常见、更值得被看见），5xx 的兜底日志因此要避开它，
         // 否则同一个错误会有两条日志、其中一条还说不清是哪一类。
         let mut logged_as_warning = false;
         let (status, code) = match &error {
@@ -3951,14 +3945,6 @@ impl From<ApplicationError> for ApiError {
                 // 必须能被运营发现（"一条候选都承载不了"往往意味着发布时少声明了一个字段）。
                 logged_as_warning = true;
                 tracing::warn!(reason = %reason, "no offering can carry the request");
-                (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
-            }
-            ApplicationError::RequestCostCeilingExceeded(reason) => {
-                // 平台自己划的成本护栏挡住了这次执行：客户的余额可能够、请求本身也没错，是这次
-                // 执行可能让平台付得太多。同样发生在受理之前、没有 Job 可记，因此在这里留日志
-                // ——这道护栏撞上的时候，运营要么调上限，要么改那条候选的定价。
-                logged_as_warning = true;
-                tracing::warn!(reason = %reason, "the request cost ceiling rejected an acceptance");
                 (StatusCode::SERVICE_UNAVAILABLE, "platform_unavailable")
             }
             ApplicationError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
@@ -3985,11 +3971,6 @@ impl From<ApplicationError> for ApiError {
             // `retry_after` 提取带出去，`Retry-After` 头对两条路都成立。
             ApplicationError::RateLimitExceeded { .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
-            }
-            // 今天已经花到运营设的额度：与上面两个 429 各用各的码，消费者才分得清"慢点再来"
-            // "并发太多""今天到头了"。
-            ApplicationError::DailySpendLimitExceeded { .. } => {
-                (StatusCode::TOO_MANY_REQUESTS, "daily_spend_limit_exceeded")
             }
             ApplicationError::Configuration(_)
             | ApplicationError::Persistence(_)
@@ -4030,7 +4011,6 @@ fn error_category(error: &ApplicationError) -> &'static str {
         ApplicationError::Validation(_)
         | ApplicationError::InvalidParameter(_)
         | ApplicationError::NoEligibleOffering(_)
-        | ApplicationError::RequestCostCeilingExceeded(_)
         | ApplicationError::NotFound(_)
         | ApplicationError::Conflict(_)
         | ApplicationError::NameTaken(_)
@@ -4038,8 +4018,7 @@ fn error_category(error: &ApplicationError) -> &'static str {
         | ApplicationError::TooManyInFlight
         | ApplicationError::PlatformCapacityExhausted
         | ApplicationError::ExecutionDeadlineExceeded
-        | ApplicationError::RateLimitExceeded { .. }
-        | ApplicationError::DailySpendLimitExceeded { .. } => "request",
+        | ApplicationError::RateLimitExceeded { .. } => "request",
     }
 }
 
@@ -4335,25 +4314,6 @@ fn auth_source_header() -> Result<Option<header::HeaderName>> {
     let name = header::HeaderName::from_bytes(name.trim().as_bytes())
         .with_context(|| format!("AUTH_SOURCE_HEADER must be a valid header name: {name}"))?;
     Ok(Some(name))
-}
-
-/// 每账户每日扣费上限（**不设就是不限**）。读法与上面两项相同，一个环境变量：
-/// `GENERATION_MAX_DAILY_SPEND_MICROUSD`，单位 CNY 微单位（名字里的 `usd` 是历史命名，
-/// `docs/design/0007-pricing-floor-and-settlement.md` §8）。
-///
-/// 它与限流的读法相同、**判据不同**：限流读缓存里的计数，这一项每次都从账本聚合，因为"今天已经
-/// 花掉多少"是事实；不设时连那次聚合都不做。
-fn generation_daily_spend_limit() -> Result<GenerationDailySpendLimit> {
-    Ok(GenerationDailySpendLimit::from_env()?)
-}
-
-/// 单次请求的上游**成本上限**：`GENERATION_MAX_REQUEST_COST_MICROUSD`（CNY 微单位，默认
-/// `10000000` = 10 元；名字里的 `usd` 是历史命名，`docs/design/0007-pricing-floor-and-settlement.md` §8）。
-///
-/// 判据、两处判定与它的边界见 [`RequestCostCeiling`]。它与 `GENERATION_MAX_COST_MICROUSD` **不是
-/// 同一个量**：那个是查不到供给封顶保底值时的兜底**保底额**。
-fn cost_ceiling() -> Result<RequestCostCeiling> {
-    Ok(RequestCostCeiling::from_env()?)
 }
 
 /// 会话有效期：`SESSION_TTL_SECONDS`，缺省 12 小时。

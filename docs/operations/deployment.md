@@ -242,7 +242,7 @@ RUST_LOG=info
 
 上线还会踩的两条：
 
-- **超时链是启动时一起校验的**：API 与 Worker 都读已发布合同声明的最大输出张数，算一遍 `PROVIDER_TIMEOUT_*` 与 `GENERATION_SYNC_WAIT_SECONDS` 整条链，不一致就拒绝启动并点名——它不是"调大就更快"（见[生成与成本护栏](configuration.md#2-生成与成本护栏)）；
+- **超时链是启动时一起校验的**：API 与 Worker 都读已发布合同声明的最大输出张数，算一遍 `PROVIDER_TIMEOUT_*` 与 `GENERATION_SYNC_WAIT_SECONDS` 整条链，不一致就拒绝启动并点名——它不是"调大就更快"（见[生成护栏](configuration.md#2-生成护栏)）；
 - **渠道密钥两条进程都要有**：API 直接执行时读它，对账 Worker 重查上游状态时读同一份；凭证只从环境变量读，数据库只存变量名（见[渠道凭证](configuration.md#5-渠道凭证)）。
 
 会话与口令重置的有效期也是配置项（`SESSION_TTL_SECONDS`、`PASSWORD_RESET_TTL_SECONDS`），见[会话与口令](configuration.md#8-会话与口令)。

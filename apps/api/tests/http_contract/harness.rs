@@ -44,8 +44,6 @@ mod cases_auth_attempts;
 mod cases_billing;
 #[path = "cases_cache.rs"]
 mod cases_cache;
-#[path = "cases_cost_ceiling.rs"]
-mod cases_cost_ceiling;
 #[path = "cases_cost_facts.rs"]
 mod cases_cost_facts;
 #[path = "cases_customer_history.rs"]
@@ -1287,22 +1285,6 @@ async fn probe_api_startup_with_upload_env(
     probe_running_and_stderr(command).await
 }
 
-/// 起一个 API 进程，只额外给**每日扣费上限**那一个变量，回报"还在跑吗"与 stderr。
-///
-/// 基础必填项由 [`api_probe_command`] 配齐（它的工作目录在临时目录，不读仓库根的 `.env`），
-/// 所以这里给的那一个就是探针要探的那一个。
-async fn probe_api_startup_with_daily_spend_limit(
-    database_url: &str,
-    value: &str,
-) -> (bool, String) {
-    let mut command = api_probe_command(database_url, probe_port(), "daily-spend-probe-token");
-    command
-        .env("GENERATION_MAX_DAILY_SPEND_MICROUSD", value)
-        .stdout(Stdio::null())
-        .stderr(Stdio::piped());
-    probe_running_and_stderr(command).await
-}
-
 /// 起一个已经装配好的命令，等它要么退出一场配置错误、要么真的开始服务，并回报 stderr。
 ///
 /// 只用于"启动该失败/该成功"这一类判据：不查 `/health`、不写夹具，也不会把一个还在跑的探针
@@ -1343,27 +1325,19 @@ impl ApiRateLimit {
     }
 }
 
-/// API 进程的可选配置：**加速层**、**每把密钥的速率上限**、**每账户每日扣费上限**、**平台告警
-/// 出口**与**成本护栏**。
+/// API 进程的可选配置：**加速层**、**每把密钥的速率上限**与**平台告警出口**。
 ///
 /// 前两项绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流那一层
 /// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
-///
-/// 每日扣费上限**不**依赖缓存：它问的是账本上的事实，有没有加速层都从账本聚合，所以它可以单独配。
 /// 这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
 ///
 /// 平台告警出口（`PROVIDER_ALERT_WEBHOOK`）给账实核对用：核对**没有默认周期**，由用例显式触发
 /// （见 `trigger_ledger_audit`），出口只决定发现不符时外发到哪里。
-///
-/// 成本护栏是单次请求可能花掉的上游成本上限（`GENERATION_MAX_REQUEST_COST_MICROUSD`）。它由
-/// **发布期与受理期共用**，所以夹具自己那条候选必须在上限之下，否则连发布都过不去。
 #[derive(Default)]
 struct ApiProcessSettings {
     cache: Option<CacheFixture>,
     rate_limit: Option<ApiRateLimit>,
-    daily_spend_limit_microusd: Option<u64>,
     alert_webhook: Option<String>,
-    cost_ceiling_microusd: Option<u64>,
     /// 引导管理员账号用的邮箱与口令：给了就等价于运维在部署时配了 `ADMIN_EMAIL`/`ADMIN_PASSWORD`。
     ///
     /// 缺省**不配**——既有用例全都靠共享令牌，配了反而会多出一个账号；只有验登录那条链的用例才给。
@@ -1470,15 +1444,6 @@ impl ApiProcessSettings {
             ..Self::default()
         }
     }
-
-    /// 同 [`Self::with_cache`]，但把**每日扣费上限**调小。
-    fn with_cache_and_daily_spend_limit(cache: CacheFixture, limit_microusd: u64) -> Self {
-        Self {
-            cache: Some(cache),
-            daily_spend_limit_microusd: Some(limit_microusd),
-            ..Self::default()
-        }
-    }
 }
 
 /// 同 [`start_api`]，但可以给这个进程配上**加速层**（缓存）。
@@ -1577,22 +1542,6 @@ async fn start_api_with(
         }
         if let Some(name) = &settings.auth_source_header {
             command.env("AUTH_SOURCE_HEADER", name);
-        }
-        // 每日扣费上限**总是显式传给子进程**：没给就传空。它现在的语义是"不设即不限"，而"不设"
-        // 只有显式传空才盖得住仓库根的 `.env`——`dotenvy` 不覆盖已存在的变量，空值也算已存在。
-        // 不这么做，用例的行为会随开发者本机 `.env` 里那一行变（默认路径的 cwd 在仓库内）。
-        command.env(
-            "GENERATION_MAX_DAILY_SPEND_MICROUSD",
-            settings
-                .daily_spend_limit_microusd
-                .map(|limit| limit.to_string())
-                .unwrap_or_default(),
-        );
-        if let Some(ceiling_microusd) = settings.cost_ceiling_microusd {
-            command.env(
-                "GENERATION_MAX_REQUEST_COST_MICROUSD",
-                ceiling_microusd.to_string(),
-            );
         }
         if let Some(webhook) = &settings.alert_webhook {
             command.env("PROVIDER_ALERT_WEBHOOK", webhook);
@@ -2015,34 +1964,6 @@ impl Harness {
         .await
     }
 
-    /// 同 [`Self::start_with_cache`]，但把**每账户每日扣费上限**调小。
-    ///
-    /// 上限是**进程启动时**读的环境变量，所以要在起进程之前就定下来：想按"这笔实际花了多少"
-    /// 来定额度，就得先让那笔跑完（见用例里那次充值——余额与额度是两回事，用例把前者抬开，
-    /// 好让被拒的唯一理由就是"今天到头了"）。
-    async fn start_with_cache_and_daily_spend_limit(
-        draft: Value,
-        contract: Option<Value>,
-        behaviour: UpstreamBehaviour,
-        max_concurrent_jobs: u64,
-        sync_wait_seconds: u64,
-        cache: CacheFixture,
-        limit_microusd: u64,
-    ) -> Self {
-        Self::build(
-            draft,
-            contract,
-            behaviour,
-            max_concurrent_jobs,
-            sync_wait_seconds,
-            CaseSettings {
-                api: ApiProcessSettings::with_cache_and_daily_spend_limit(cache, limit_microusd),
-                ..CaseSettings::default()
-            },
-        )
-        .await
-    }
-
     /// 同 `start_with`，但给 API 进程配上**平台告警出口**（账实核对发现不符时外发到哪里）。
     ///
     /// 它**不**启缓存：核对读的是账本与余额，与加速层无关——顺带也就验了"没有缓存时这条核查
@@ -2061,33 +1982,6 @@ impl Harness {
             CaseSettings {
                 api: ApiProcessSettings {
                     alert_webhook: webhook,
-                    ..ApiProcessSettings::default()
-                },
-                ..CaseSettings::default()
-            },
-        )
-        .await
-    }
-
-    /// 同 [`Self::start_with_draft`]，但给 API 进程定下**单次请求成本上限**。
-    ///
-    /// 上限是**进程启动时**读的环境变量，发布期与受理期判的是同一个数：夹具那条候选因此必须在
-    /// 上限之下（发布才过得去），用例再去看"上限挡住的是什么"。
-    async fn start_with_cost_ceiling(
-        draft: Value,
-        behaviour: UpstreamBehaviour,
-        max_concurrent_jobs: u64,
-        ceiling_microusd: u64,
-    ) -> Self {
-        Self::build(
-            draft,
-            None,
-            behaviour,
-            max_concurrent_jobs,
-            30,
-            CaseSettings {
-                api: ApiProcessSettings {
-                    cost_ceiling_microusd: Some(ceiling_microusd),
                     ..ApiProcessSettings::default()
                 },
                 ..CaseSettings::default()
@@ -3796,7 +3690,7 @@ async fn republish_candidate(
 /// 承载面沿用夹具那条默认候选（同一份合同、同一份承载面），所以重新发布它不会撞上"合同不可变"。
 ///
 /// 按张 / 按次是**成本**形态；对客形态是另一件事，必须显式给一种。这里给按 token 四档与一份向量，
-/// 让这些用例只看成本侧的路径（成本护栏、成本事实）不被对客形态挡住。
+/// 让这些用例只看成本侧的路径（成本事实）不被对客形态挡住。
 fn unit_candidate(formula: &str, unit_price_microusd: u64, currency: &str) -> Value {
     let mut draft = candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]);
     draft["formula"] = Value::String(formula.to_owned());

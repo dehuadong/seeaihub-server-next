@@ -590,300 +590,77 @@ async fn platform_account(pool: &PgPool) -> Uuid {
         .expect("the migrations seed exactly one platform account")
 }
 
-/// **每日扣费上限**：账户当天已经从账本上扣掉的钱达到运营设的上限时，新的受理在**受理前**被拒
-/// ——对客是 `429` + 一个与速率、并发都不同的码 + `Retry-After`（到次日零点的秒数）。
+/// 单次请求的上游成本远超旧的 10 元上限也不拒：受理的金额判定只有余额那一道。
 ///
-/// 全程**一个进程、一个账户**，额度在启动时就定死（这是配置项的本性）；变的只有账本：第一笔
-/// 真实执行结算之后，额度的去路上被补了一笔当天的扣费，于是**同一次额度下**，前一个请求受理
-/// 、后一个请求被拒。这一前一后就是"判据是账本、而且每次受理都重新读"的证据：如果实现把今日
-/// 累计缓存在某个地方（或只在启动时算一次），第二次请求会照旧拿到 200。
-///
-/// 余额这条干扰项被**显式**排除掉：受理前先给账户充一大笔，于是第二次请求除了"当天花超了"
-/// 没有别的理由被拒（否则它会先撞上"余额不足"，用例就变成了在验另一件事）。
-///
-/// 进程配着缓存，但配额与缓存无关：这不只是断言——被拒的那次在缓存里**一条**配额计数都不许
-/// 留下（缓存里那份数迟早会与账本对不上，而"今天花超了没有"不能拿它去判）。反过来说，限流
-/// 那条"缓存不可用时放行"的规矩是给保护机制定的，不能顺手把配额也变成"缓存挂了就不设限"。
-///
-/// 没测到的：**次日恢复**。要验它得让受理进程的时钟跨过 UTC 零点，或把"当天"做成可注入的
-/// 参数——前者这个执行环境里做不到，后者要给受理路径加一个只为测试存在的参数。所以"明天零点
-/// 之后照常受理"这条**没有**被覆盖，只有 `Retry-After` 落在合理区间（≤ 一天的秒数）间接钉了
-/// 它的口径。
+/// 按张计价的候选单价 1 美元/张（按 7.1 折算约 7.1 元）：发布期按合同允许的最大张数算约 71 元、
+/// 这一次的 2 张约 14.2 元——两处都在旧上限（10 元）之上。账户余额够就必须受理：发布与受理都不该
+/// 有以成本为理由的判定。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code() {
-    /// 这次给账户配的每日额度（1 美元等值）：比第一笔真实扣费（几十 microusd）大得多，好让
-    /// "额度之内的那笔"先跑通，再让"补一笔当天的扣费"把它正好用掉。
-    const DAILY_LIMIT: u64 = 1_000_000;
-
-    let harness = Harness::start_with_cache_and_daily_spend_limit(
+async fn a_request_whose_upstream_cost_is_far_above_the_old_ceiling_is_accepted() {
+    // 用 `start_with_draft`：它那条发布占的不是 `route-test-1`，下面这次重新发布才落得成新修订。
+    let harness = Harness::start_with_draft(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
-        30,
-        CacheFixture::start(CacheSettings::default()).await,
-        DAILY_LIMIT,
     )
     .await;
-    let client = Client::new();
-    // 余额这道门先抬开：下面要拒的理由只该是"今天花超了"。额度与余额不是一回事，把两者
-    // 都压在临界值上会让用例说不清是被哪一条拒的。
-    let credited = client
-        .post(format!(
-            "{}/api/v1/accounts/{}/credits",
-            harness.base_url, harness.account_id
-        ))
-        .bearer_auth(&harness.admin_token)
-        .json(&json!({
-            "amount_microusd": 100_000_000_u64,
-            "business_key": format!("daily-cap-credit-{}", Uuid::new_v4()),
-        }))
-        .send()
-        .await
-        .expect("credit fixture");
-    assert_eq!(credited.status(), StatusCode::NO_CONTENT);
-
-    // 第一笔：正常跑完并结算，账本上因此留下当天真实的扣费——额度的去路上有了一笔。
-    let key = format!("daily-cap-{}", Uuid::new_v4());
-    let (status, body) = harness
-        .sync_json(
-            "/v1/images/generations",
-            &key,
-            route_request(harness.model, "still inside the day's allowance"),
+    // 合同里声明 `n`（上限 10 张）：发布期按 1 美元 × 10 张 ≈ 71 元判，这一次要 2 张 ≈ 14.2 元。
+    // 不声明它，`n` 会在受理前被按合同过滤掉，这条用例就只是在测一张图。
+    let contract = surface_schema(json!({
+        "model": {"const": Harness::MODEL},
+        "prompt": {"type": "string", "minLength": 1},
+        "n": {"type": "integer", "minimum": 1, "maximum": 10, "default": 1}
+    }));
+    let mut draft = unit_candidate("per_image", 1_000_000, "USD");
+    draft["carrier_schema"] = contract.clone();
+    // 假上游的地址：不写回夹具里那个占位地址，请求会去连一个不存在的端口。
+    draft["base_url"] = Value::String(harness.upstream_base_url.clone());
+    assert_eq!(
+        publish_on_revision(
+            &harness,
+            Harness::MODEL,
+            "route-test-2",
+            contract,
+            vec![draft],
+            Some(2_000),
         )
+        .await,
+        StatusCode::OK,
+        "最坏单次成本远高于 10 元的候选必须发得出去"
+    );
+
+    let key = format!("no-cost-ceiling-{}", Uuid::new_v4());
+    let mut request = route_request(harness.model, "cost far above the old ceiling");
+    request["n"] = json!(2);
+    let (status, body) = harness
+        .sync_json("/v1/images/generations", &key, request)
         .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("每日额度之内的那一笔", &body);
+    assert_eq!(status, StatusCode::OK, "余额够就必须受理：{body}");
+    assert_sync_success("成本远超旧上限的一次请求", &body);
+    // 这一次必须真的带 2 张，否则"成本判据"这件事根本没被走到：保底额按 2K 档 0.25 元 × 2 张。
     let (job_id, state) = harness.job(&key).await;
-    assert_eq!(state, "succeeded", "第一笔必须真的跑完并结算");
-    let captured = -harness.captured_microusd(job_id).await;
-    assert!(captured > 0, "结算必须真的扣了钱，实得 {captured}");
-    assert!(
-        captured < DAILY_LIMIT as i64,
-        "第一笔必须在额度之内，否则试不出'先过后拒'：扣了 {captured}，额度 {DAILY_LIMIT}"
-    );
-    let account_id = Uuid::parse_str(&harness.account_id).expect("account id");
-    // 限额的判据是**每日合计那一行**，不是历史流水的求和：这里直接读那一行。
-    let daily_total = |pool: &PgPool, account_id: Uuid| {
-        let pool = pool.clone();
-        async move {
-            sqlx::query_scalar::<_, i64>(
-                "SELECT COALESCE(settled_microusd, 0)::bigint FROM ledger.daily_spend
-                 WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date",
-            )
-            .bind(account_id)
-            .fetch_one(&pool)
-            .await
-            .expect("当日合计的读取")
-        }
-    };
-    assert_eq!(
-        daily_total(&harness.pool, account_id).await,
-        captured,
-        "成功结算在同一事务把实收累加进当天那一行"
-    );
-
-    // **限额检查不扫历史流水**：往账本里补一笔当天的扣费（比额度还大），但**不**碰当天合计。
-    // 若受理还按流水求和，这一笔就会把下一次请求挡在门外；只读当天那一行的实现则照常受理。
-    let history_only = DAILY_LIMIT as i64 * 2;
-    sqlx::query(
-        "INSERT INTO ledger.entries (id, account_id, job_id, kind, amount_microusd, business_key)
-         VALUES ($1,$2,$3,'capture',$4,$5)",
-    )
-    .bind(Uuid::new_v4())
-    .bind(account_id)
-    .bind(job_id)
-    .bind(-history_only)
-    .bind(format!("job:{job_id}:daily-cap-history-fixture"))
-    .execute(&harness.pool)
-    .await
-    .expect("seed a charge that only exists in the history");
-    assert_eq!(
-        daily_total(&harness.pool, account_id).await,
-        captured,
-        "历史流水不会改变当天合计"
-    );
-
-    // 第二次：额度内照常受理并结算——它证明限额没有去汇总那笔历史流水。
-    let second_key = format!("daily-cap-inside-{}", Uuid::new_v4());
-    let (status, body) = harness
-        .sync_json(
-            "/v1/images/generations",
-            &second_key,
-            route_request(harness.model, "history alone does not spend the day"),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "got {body}");
-    assert_sync_success("历史流水不参与限额", &body);
-    let (_, second_state) = harness.job(&second_key).await;
-    assert_eq!(second_state, "succeeded", "第二笔必须真的跑完并结算");
-    let second_captured = daily_total(&harness.pool, account_id).await - captured;
-    assert!(second_captured > 0, "第二笔结算必须真的加了当天合计");
-
-    // 再把当天合计正好顶到额度：判据是这一行，不是账本上的历史分录。
-    sqlx::query(
-        "UPDATE ledger.daily_spend SET settled_microusd = $2
-         WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date",
-    )
-    .bind(account_id)
-    .bind(DAILY_LIMIT as i64)
-    .execute(&harness.pool)
-    .await
-    .expect("fill the day's settled total up to the limit");
-    assert_eq!(
-        daily_total(&harness.pool, account_id).await,
-        DAILY_LIMIT as i64,
-        "当天合计现在正好等于额度"
-    );
-
-    // 第三次：同一个账户、新的幂等键。余额是充裕的（刚充过），所以被拒的唯一理由就是它。
-    let response = client
-        .post(format!("{}/v1/images/generations", harness.base_url))
-        .bearer_auth(&harness.api_key)
-        .header("idempotency-key", format!("daily-cap-{}", Uuid::new_v4()))
-        .json(&route_request(harness.model, "the day is already spent"))
-        .send()
-        .await
-        .expect("request at the daily cap");
-    let status = response.status();
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let rejected: Value =
-        serde_json::from_str(&response.text().await.expect("capped response body"))
-            .expect("capped response is JSON");
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "got {rejected}");
-    assert_eq!(
-        rejected["error"]["code"].as_str(),
-        Some("daily_spend_limit_exceeded"),
-        "今天到头了必须是它自己的码：{rejected}"
-    );
-    // 三个 429 各说各的事，混成一个码消费者就只能盲目重试。
-    for other in ["rate_limit_exceeded", "too_many_in_flight"] {
-        assert_ne!(
-            rejected["error"]["code"].as_str(),
-            Some(other),
-            "每日扣费上限不能复用 `{other}` 这个码"
-        );
-    }
-    assert_public_only("每日扣费上限", &rejected);
-    // 到次日零点的秒数：1 秒到一整天之间。下界排掉 0/缺失（那等于没说什么时候能回来），
-    // 上界排掉"按某个固定的窗口长度给"或算到别处去的实现。
-    let seconds: u64 = retry_after
-        .expect("超限必须给出 Retry-After")
-        .parse()
-        .expect("Retry-After 是秒数");
-    assert!(
-        (1..=86_400).contains(&seconds),
-        "Retry-After 是到次日零点的秒数，实得 {seconds}"
-    );
-
-    // 被拒的这次**没有留下任何东西**：没建 Job、没扣款——判在受理之前，钱与执行都不该动。
-    let jobs: i64 =
-        sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
-            .bind(account_id)
+    assert_eq!(state, "succeeded");
+    let held: i64 =
+        sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE id = $1")
+            .bind(job_id)
             .fetch_one(&harness.pool)
             .await
-            .expect("job count at the cap");
-    assert_eq!(jobs, 2, "被拒的那次不许建 Job");
-    // 账本上是两次结算的实收，加上用例补的那笔**只存在于历史里**的扣费。被拒的那次连预授权
-    // 都没有——它根本没走到扣款那一步。留意 `hold` / `release` 都不算"花掉的钱"。
-    let dump: Vec<(String, i64)> = sqlx::query_as(
-        "SELECT kind, amount_microusd FROM ledger.entries WHERE account_id = $1 ORDER BY created_at",
-    )
-    .bind(account_id)
-    .fetch_all(&harness.pool)
-    .await
-    .expect("ledger dump");
-    let count_of = |kind: &str| dump.iter().filter(|(name, _)| name == kind).count();
-    assert_eq!(
-        count_of("capture"),
-        3,
-        "账本上是两次结算的实收与那笔历史扣费：被拒的那次没有扣款；实得 {dump:?}"
-    );
-    // 预授权**不进资金流水**（`0002` §3）：这里只有入账与实收两种科目。
-    assert_eq!(count_of("hold"), 0, "预授权不进资金流水；实得 {dump:?}");
-    assert_eq!(count_of("release"), 0, "释放不进资金流水；实得 {dump:?}");
-    assert_eq!(
-        database_balance(&harness, &harness.account_id).await,
-        1_000_000 + 100_000_000 - captured - second_captured,
-        "余额被两次真实结算动过（那笔历史分录不改余额）"
-    );
-    // 配额**不写缓存**：被拒的这次哪怕进程配着缓存，也不该留下任何一条"今天的累计"。
-    {
-        let state = harness.cache().state.lock().expect("cache state lock");
-        let quota_keys: Vec<String> = state
-            .keys()
-            .filter(|key| {
-                let key = key.to_ascii_lowercase();
-                key.contains("spend") || key.contains("daily") || key.contains("quota")
-            })
-            .cloned()
-            .collect();
-        assert!(
-            quota_keys.is_empty(),
-            "每日扣费上限问的是账本上的事实，不许在缓存里留一份计数：{quota_keys:?}"
-        );
-    }
+            .expect("the frozen hold");
+    assert_eq!(held, 500_000, "这一次要 2 张：2K 档 0.25 元 × 2");
 
-    harness.cleanup().await;
-}
-
-/// 不设每日上限就是不限（Spec `0002` §5）。
-///
-/// 夹具把这一项**显式传空**（`harness` 总是传，见它那里的注释）。这里把当日已花那一行顶到远超
-/// 旧默认值（`50000000` 微元 = 50 元）的数，请求仍必须受理——不是 `429 daily_spend_limit_exceeded`。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn without_a_daily_spend_limit_the_day_total_does_not_reject() {
-    let harness = Harness::start(UpstreamBehaviour::aihubmix(SyncImageShape::Url)).await;
-    let account_id = Uuid::parse_str(&harness.account_id).expect("account id");
-    // 判据是**每日合计那一行**，不是历史流水的求和：直接把它顶到 1000 元。
-    sqlx::query(
-        "INSERT INTO ledger.daily_spend (account_id, day, settled_microusd)
-         VALUES ($1, (now() AT TIME ZONE 'UTC')::date, 1_000_000_000)
-         ON CONFLICT (account_id, day) DO UPDATE SET settled_microusd = EXCLUDED.settled_microusd",
-    )
-    .bind(account_id)
-    .execute(&harness.pool)
-    .await
-    .expect("seed the day total");
-
-    let key = format!("no-daily-limit-{}", Uuid::new_v4());
+    // 同一天的第二笔：当日已完成实收已经不是任何闸门的判据，它照样受理。
+    let second = format!("no-cost-ceiling-second-{}", Uuid::new_v4());
     let (status, body) = harness
         .sync_json(
             "/v1/images/generations",
-            &key,
-            route_request(harness.model, "no daily limit contract"),
+            &second,
+            route_request(harness.model, "second request on the same day"),
         )
         .await;
-    assert_eq!(status, StatusCode::OK, "不设上限就不该按当日合计拒：{body}");
-    assert_sync_success("不设每日上限时的那一笔", &body);
+    assert_eq!(status, StatusCode::OK, "当天已经花掉多少不拦下一笔：{body}");
+    assert_sync_success("同一天的第二笔", &body);
 
     harness.cleanup().await;
-}
-
-/// 额度配成 `0` 是配置错误，不是"这个账户不许花"：进程必须拒绝启动并点名那个变量。
-///
-/// 同一个探针换成空串必须起得来——否则上面那条断言可能只是"别的必填项没配"。
-#[tokio::test]
-#[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn a_zero_daily_spend_limit_refuses_to_start_by_name() {
-    let database_url = std::env::var("HTTP_CONTRACT_DATABASE_URL")
-        .expect("HTTP_CONTRACT_DATABASE_URL is required for the ignored contract test");
-    let (running, stderr) = probe_api_startup_with_daily_spend_limit(&database_url, "0").await;
-    assert!(
-        !running,
-        "0 不是额度、是配置错误，进程必须拒绝启动；stderr: {stderr}"
-    );
-    assert!(
-        stderr.contains("GENERATION_MAX_DAILY_SPEND_MICROUSD"),
-        "报错要点名那个变量；stderr: {stderr}"
-    );
-
-    let (running, stderr) = probe_api_startup_with_daily_spend_limit(&database_url, "").await;
-    assert!(running, "空串是不限，进程必须起得来；stderr: {stderr}");
 }

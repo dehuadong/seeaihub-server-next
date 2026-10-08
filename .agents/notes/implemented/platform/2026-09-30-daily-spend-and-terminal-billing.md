@@ -15,9 +15,11 @@ verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo 
 
 ## 决定
 
-合同（合计记什么、归属规则、限额语义）归 [`0013` §4–§5](../../../../docs/design/0013-account-funds-and-reservations.md)；这里只记本次实现选定的机制。
+合同（归属规则、账单口径）归 [`0013` §4](../../../../docs/design/0013-account-funds-and-reservations.md)；这里只记本次实现选定的机制。
 
-- `ledger.daily_spend` 主键 `(account_id, day)`，以正数记已完成实收；结算在写 `capture` 的同一事务按 `(now() AT TIME ZONE 'UTC')::date` upsert 累加，零实收不写；受理只读当天一行、缺行视为 0。
+**每日消费合计这一半已删除**：`ledger.daily_spend` 与结算时那次累加随每日扣费上限一起删除（迁移 `0047`），理由见[受理没有金额型护栏](./2026-10-09-no-amount-based-admission-guards.md)。本条余下关于 `terminal_at` 与跨天账单归属的部分仍然有效。
+
+- ~~`ledger.daily_spend`~~（已删除，见上）主键 `(account_id, day)`，以正数记已完成实收；结算在写 `capture` 的同一事务按 `(now() AT TIME ZONE 'UTC')::date` upsert 累加，零实收不写；受理只读当天一行、缺行视为 0。
 - `generation.jobs.terminal_at` 的落点：`succeeded` 在 `complete_job`、`failed` 在 `fail_job`、人工解除对账在 `refund_reconciliation`，各与自己那次状态变更同事务；`canceled` 当前没有写入方，`reconciliation_required` 不是领域终态（`JobState::is_terminal`），留空。
 - 用量按 `terminal_at IS NOT NULL` 与否分两支（不用 `COALESCE`，否则两个索引都用不上）；逐笔扣费改成该 Job 的 `capture` 标量子查询，不再带流水时间过滤；对客与管理员用量响应都新增 `terminal_at`。
 - 账单的请求数与张数按 `terminal_at` 归属，`charged_microusd` 仍按 `capture` / `adjustment` 的入账时刻求和。
@@ -32,14 +34,14 @@ verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo 
 
 ## 后果
 
-- 本次不做历史回填（[`0002` §6](../../../../docs/specs/0002-account-funds-and-reservations.md)）：既有 Job 的 `terminal_at` 为空、既有 `capture` 不进 `daily_spend`。这些账户当天的限额从 0 重新计起，直到新的结算累加；历史 Job 在用量里按受理时刻显示，扣费仍来自它自己的 `capture`。
-- 每日合计只由结算写入，受理与余额读取不碰它；账实核查仍按账户核对 `balance = SUM(entries)` 与 `held = SUM(active holds)`，与每日合计无关。
-- 新增一张表与四个索引；受理路径从"按流水聚合"改为一次主键点查。
+- 本次不做历史回填（[`0002` §6](../../../../docs/specs/0002-account-funds-and-reservations.md)）：既有 Job 的 `terminal_at` 为空。历史 Job 在用量里按受理时刻显示，扣费仍来自它自己的 `capture`。
+- 账实核查按账户核对 `balance = SUM(entries)` 与 `held = SUM(active holds)`，与这次加的表无关。
+- 新增四索引；受理路径从"按流水聚合"改为一次主键点查。
 
 ## 验证
 
 - `cargo fmt --check` 通过。
 - `cargo test -p seeai-application -p seeai-persistence`：application 141、persistence 7，全通过。
-- 合同套件（本地 PG `seeai_contract` + 进程内假 Redis）：`cases_cost_facts`、`cases_billing`、`cases_public_surface` 共 23 passed / 0 failed。改写 `a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code`，补一笔只存在于历史流水的当天扣费后仍受理、把当天合计顶到额度才 429；新增 `a_settlement_after_midnight_is_billed_on_the_day_it_settled` 钉住成功结算的 `terminal_at` 与 `capture.created_at` 同事务、跨 UTC 日按结算日归属用量与账单；新增 `usage_charges_match_the_capture_entries_and_adjustments_stay_separate` 钉住已完成用量逐笔扣费等于 `capture` 求和、正式调整单独列示后账单净额等于扣费加调整。`cases_identity`、`cases_pricing` 共 29 passed / 0 failed。
-- 索引按实际执行计划核定：在临时库 `seeai_explain` 上应用完整迁移链并灌入 2 万 Job、1 万 capture、1.2 万日合计行后 `EXPLAIN (ANALYZE)`——用量走两个 jobs 索引的 BitmapOr 与 `entries_capture_job`，账单请求数走 `jobs_account_terminal_at` Index Only Scan、扣费走 `entries_account_created_at`，当日合计走 `daily_spend_pkey`。
+- 合同套件（本地 PG `seeai_contract` + 进程内假 Redis）：`cases_cost_facts`、`cases_billing`、`cases_public_surface` 共 23 passed / 0 failed。（该条改写出的 `a_reached_daily_spend_cap_rejects_new_requests_with_its_own_code` 已随每日上限一起删除，见[受理没有金额型护栏](./2026-10-09-no-amount-based-admission-guards.md)；）新增 `a_settlement_after_midnight_is_billed_on_the_day_it_settled` 钉住成功结算的 `terminal_at` 与 `capture.created_at` 同事务、跨 UTC 日按结算日归属用量与账单；新增 `usage_charges_match_the_capture_entries_and_adjustments_stay_separate` 钉住已完成用量逐笔扣费等于 `capture` 求和、正式调整单独列示后账单净额等于扣费加调整。`cases_identity`、`cases_pricing` 共 29 passed / 0 failed。
+- 索引按实际执行计划核定：在临时库 `seeai_explain` 上应用完整迁移链并灌入 2 万 Job、1 万 capture、1.2 万日合计行后 `EXPLAIN (ANALYZE)`——用量走两个 jobs 索引的 BitmapOr 与 `entries_capture_job`，账单请求数走 `jobs_account_terminal_at` Index Only Scan、扣费走 `entries_account_created_at`，当日合计走 `daily_spend_pkey`（该表已随每日上限删除）。
 - 全量 Rust 门禁与 e2e 未在本地重跑：前者按仓库约定交 CI，后者本次不动前端。

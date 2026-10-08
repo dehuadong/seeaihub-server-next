@@ -586,10 +586,6 @@ impl HubRepository for AuditRepository {
         unused_repository()
     }
 
-    async fn daily_spend_microusd(&self, _account_id: AccountId) -> Result<u64, ApplicationError> {
-        unused_repository()
-    }
-
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {

@@ -185,7 +185,7 @@ PriceSnapshot {
 - **兜底链**：① 供给档位查表（像素型 `size` 先按该供给的档位像素表归位，缺失时按最长边阈值，§6）⇒ ② `size=auto` 取 `2K` 档 ⇒ ③ 该供给每张封顶值 ⇒ ④ **平台级默认 `GENERATION_MAX_COST_MICROUSD`**（**每一层都乘 `n`**）（快照里**缺 `hold_microusd`** 时——已受理的历史 Job，或迁移后仍生效但**没有定价**的旧修订受理出的新 Job，§3）。
 - **它的正当用途就是这一条**：**连供给封顶保底值都没有时的兜底保底额**——不是"超限即拒"的门槛。
 
-**受理闸门按可用额判定**：`已结算余额 − 持有中 >= $保底额` 不成立 ⇒ `insufficient_balance`，对客 402，不产生 Job、不改变资金。`GENERATION_MAX_COST_MICROUSD` 在查得到供给保底额时不参与受理；平台成本护栏另见[运维底线与运行面](0009-operational-baseline.md) §7。
+**受理闸门按可用额判定**：`已结算余额 − 持有中 >= $保底额` 不成立 ⇒ `insufficient_balance`，对客 402，不产生 Job、不改变资金。`GENERATION_MAX_COST_MICROUSD` 在查得到供给保底额时不参与受理。
 
 **这一处已就地修订 `ADR-0009`**：它写"预授权金额与计价口径是两个量，不得互相推导：预授权由调用方给出的 `max_cost_microusd` 决定，不由候选价格反算"。本设计的读法不同（预授权由**供给维度的保底表**查得，不由候选价格反算，也不由调用方自报），而且该句现状与仓库也不一致（预授权额由服务端按供给保底表给出）。修订已落地（2026-09-22 追加"预授权/上限条款"修订说明，见 `docs/adr/0009`），结果见 §10。
 
@@ -221,7 +221,7 @@ PriceSnapshot {
 - **售价 = 按候选发布的四档对客费率向量 `consumer_rates_cny`**（初始值按"该 vendor/模型已知的渠道价目 × 倍率 × 折算率"设定/推导、运营可改，**以 CNY 表达**），**按命中候选取、随修订发布并随 Job 快照冻结**；`reference_cost_microusd` **只作定价参考，不是售价的被乘数**（§2/§4）；
 - **保底额是 CNY**：OpenAI 系 **1K = ¥0.16 / 2K = ¥0.25 / 4K = ¥0.3**（**币种＝CNY，已确认**，[`0006`](./0006-gateway-models-and-consumer-surface.md) §1.6 与本文 §6）；
 - **快照写清两条线**：**售价 / 保底 / 扣费记 CNY**；**成本记原币种金额 + 币种 + 当时汇率 + 折算后 CNY**（毛利用）——两条线分开，便于核对；
-- **既有列名与运维取值的币种语义**：`ledger.accounts.balance_microusd`、`GENERATION_MAX_COST_MICROUSD`、`GENERATION_MAX_REQUEST_COST_MICROUSD` 与 `GENERATION_MAX_DAILY_SPEND_MICROUSD` 的**币种语义为 CNY**（名字里的 `usd` 是历史命名；实施时可按需改名，语义以本节为准）；`reference_cost_microusd` / `provider_cost_microusd` 的 `_microusd` 同样是**历史命名**，其币种是**该候选 / 该次执行的 `cost_currency`**（§5/§7），**不假定 USD**。
+- **既有列名与运维取值的币种语义**：`ledger.accounts.balance_microusd`、`GENERATION_MAX_COST_MICROUSD` 的**币种语义为 CNY**（名字里的 `usd` 是历史命名；实施时可按需改名，语义以本节为准）；`reference_cost_microusd` / `provider_cost_microusd` 的 `_microusd` 同样是**历史命名**，其币种是**该候选 / 该次执行的 `cost_currency`**（§5/§7），**不假定 USD**。
 
 ## 9. 记录与日志：六项信息现在落在哪
 
@@ -269,7 +269,7 @@ PriceSnapshot {
 ### 范围边界（不待决，归其他工作项）
 
 - **对外价策略与具体数值**（含是否分档、加价系数与汇率的具体取值）归 [`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)；
-- **成本护栏**（服务端成本上限一类的运营护栏）不在本份（见 [运维底线与运行面](./0009-operational-baseline.md) §7）——本份只把**客户余额**当受理上限（§6）；
+- 本份只把**客户余额**当受理上限（§6）——受理没有"售价或成本高过某个固定数就拒"的第二道金额闸门；
 - **成本进账本与账实核对**不在本份——本份只落**成本事实**，供算毛利（§5/§7）；账本那一侧（`cost` 科目、平台账户、核对任务）见 `crates/persistence`。
 
 ### 需要 ADR 的决定

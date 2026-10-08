@@ -37,13 +37,11 @@ use crate::{
     ApplicationError, BalanceSource, BeginSubmission, CancelUnsubmitted, CostInputs,
     CreateImageGenerationRequest, CredentialProvider, DirectExecutionLimits, ExecutionFinalization,
     ExecutionLookup, ExecutionReplay, ExecutionRepository, FailOrReconcileExecution,
-    FailureDisposition, GenerationDailySpendLimit, HubRepository, LateFacts, PublicErrorCode,
-    RequestCostCeiling, RequestFingerprintInput, RequestFingerprintKeys, RequestTimeoutPolicy,
-    RetryPolicy, RouteChoice, RoutingDecision, SettleExecution, contract_parameter_face,
-    daily_spend_limit_error, failure_provider_cost, freeze_offering_pricing,
+    FailureDisposition, HubRepository, LateFacts, PublicErrorCode, RequestFingerprintInput,
+    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision,
+    SettleExecution, contract_parameter_face, failure_provider_cost, freeze_offering_pricing,
     idempotency_key_digest, provider_cost_fact, public_error_code, requested_image_count,
-    select_candidate, select_candidate_with_strategy, single_request_cost_cny,
-    validate_idempotency_key,
+    select_candidate, select_candidate_with_strategy, validate_idempotency_key,
 };
 
 /// 直接执行总期限里预留给证据持久化、结算与提交确认的默认预算（秒）。
@@ -332,16 +330,8 @@ pub struct DirectExecutionService {
     settle_reserve: Duration,
     /// 本次执行所有权的租约时长：随 BeginSubmission 落库，并与 Supervisor 的续约间隔同源。
     ownership_lease: ChronoDuration,
-    cost_ceiling: RequestCostCeiling,
     /// 可证明上游未受理时的请求内重投策略（次数与退避），与旧路径共用同一组配置。
     retry_policy: RetryPolicy,
-    /// 该账户**当天**最多能花掉多少（CNY 微单位，运营取值，见 [`GenerationDailySpendLimit`]）；
-    /// `None` = **不限**（没配这个环境变量时的默认）。
-    ///
-    /// 它与两个容量名额守的不是同一件事：名额守的是"同时在跑几个"，这道守的是"今天已经花掉多少钱"
-    /// （花钱可以是完全串行的，两个名额计数都看不见它）。判据见
-    /// [`HubRepository::daily_spend_microusd`]：问的是当日已完成实收的合计，不是任何计数器。
-    max_daily_spend_microusd: Option<u64>,
     /// 加速层：受理、结算与失败收尾都改余额，提交后要把新余额写穿缓存。
     acceleration: Arc<AccelerationService>,
 }
@@ -370,24 +360,11 @@ impl DirectExecutionService {
             limits,
             settle_reserve: Duration::from_secs(DEFAULT_SETTLE_RESERVE_SECONDS),
             ownership_lease: ChronoDuration::seconds(DEFAULT_EXECUTION_LEASE_SECONDS),
-            cost_ceiling: RequestCostCeiling::default_ceiling(),
             // 缺省就是开着的请求内重投（次数有限、退避有上限）：关掉要显式配
             // GENERATION_RETRY_MAX_ATTEMPTS=1，与旧路径同一条纪律。
             retry_policy: RetryPolicy::default(),
-            max_daily_spend_microusd: GenerationDailySpendLimit::default_limit()
-                .max_daily_spend_microusd,
             acceleration,
         }
-    }
-
-    /// 装上运维给的**每日扣费上限**。
-    ///
-    /// 上限是配置项：它随部署形态与客户分级变，所以由调用方给，而不是写死在这里；**没配就是不限**
-    /// （[`GenerationDailySpendLimit::default_limit`]）。
-    #[must_use]
-    pub fn with_daily_spend_limit(mut self, limit: GenerationDailySpendLimit) -> Self {
-        self.max_daily_spend_microusd = limit.max_daily_spend_microusd;
-        self
     }
 
     /// 装上运维给的结算预留预算 `R`。
@@ -401,13 +378,6 @@ impl DirectExecutionService {
     #[must_use]
     pub fn with_ownership_lease(mut self, lease: ChronoDuration) -> Self {
         self.ownership_lease = lease;
-        self
-    }
-
-    /// 装上运维给的单次请求成本上限。
-    #[must_use]
-    pub fn with_cost_ceiling(mut self, cost_ceiling: RequestCostCeiling) -> Self {
-        self.cost_ceiling = cost_ceiling;
         self
     }
 
@@ -505,21 +475,6 @@ impl DirectExecutionService {
             &mut offering,
         )
         .await?;
-        if let Some(cost_cny) = single_request_cost_cny(
-            offering.price_snapshot.formula,
-            offering.price_snapshot.cost_unit_price_microusd,
-            offering.price_snapshot.reference_cost_microusd,
-            offering.price_snapshot.cost_currency.as_deref(),
-            offering.price_snapshot.fx_rate.as_ref(),
-            requested_image_count(&native_parameters),
-        ) && self.cost_ceiling.exceeded_by(cost_cny)
-        {
-            return Err(ApplicationError::RequestCostCeilingExceeded(format!(
-                "offering {} could cost up to {cost_cny} microusd of upstream cost for this request",
-                offering.offering_id
-            ))
-            .into());
-        }
         let input = Arc::new(build_gateway_input(
             &offering,
             branch,
@@ -545,28 +500,6 @@ impl DirectExecutionService {
             );
             return Err(DirectExecutionError::RequestTimeout);
         }
-        // 每日扣费上限：与两个容量名额是**三道不同的门**——账户名额守"同时在跑几个"、渠道名额守
-        // "上游未决任务有几个"，这道守的是"今天已经花掉多少钱"（花钱可以是完全串行的，两个计数
-        // 都看不见它）。判据见 [`HubRepository::daily_spend_microusd`]，超限按既有的 429 语义回。
-        // **没配就是不限**：不设时连那次当日合计都不读。
-        //
-        // 它**放在 admit 事务之外**，理由是这道门与那笔扣减本来就不可能原子：当日合计只在**结算**
-        // 那一笔里累加，而结算发生在受理之后很久，任何事务边界都圈不住"受理到结算"这段窗口；
-        // 事务内再读一次不会让判定更准，只会把"到次日零点还有多久"这条对客事实（由
-        // [`daily_spend_limit_error`] 按唯一一处规则算出）搬进 SQL 再写一遍。读的仍是已提交的
-        // 权威事实，位置取在**受理之前**：不建 Job、不占 Hold、不占渠道名额。
-        if let Some(limit_microusd) = self.max_daily_spend_microusd {
-            let spent_microusd = self
-                .repository
-                .daily_spend_microusd(request.account_id)
-                .await?;
-            if let Some(rejected) =
-                daily_spend_limit_error(limit_microusd, spent_microusd, Utc::now())
-            {
-                return Err(rejected.into());
-            }
-        }
-
         let outcome = self
             .executions
             .admit(AdmitExecution {

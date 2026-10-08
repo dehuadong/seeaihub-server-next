@@ -84,7 +84,7 @@
 
 ## 6. 技术设计
 
-本次修订由[模型类型设计](../design/0020-model-type.md)承接；素材与发布的落库沿用[平台模型发布设计](../design/0012-platform-model-publishing.md)，目录字段沿用[网关模型与对客面设计](../design/0006-gateway-models-and-consumer-surface.md) §2.1，账单汇总的取数沿用[账户资金设计](../design/0013-account-funds-and-reservations.md) §5。
+本次修订由[模型类型设计](../design/0020-model-type.md)承接；素材与发布的落库沿用[平台模型发布设计](../design/0012-platform-model-publishing.md)，目录字段沿用[网关模型与对客面设计](../design/0006-gateway-models-and-consumer-surface.md) §2.1，账单汇总的取数沿用[账户资金设计](../design/0013-account-funds-and-reservations.md) §4。
 
 ## 7. 修订记录
 

@@ -451,8 +451,7 @@ async fn a_referenced_publication_derives_the_cost_basis_from_the_channel_formul
         "markup_bps": 2_400,
         "references": [{
             "offering_id": offering_id,
-            // 给一个小值：这条要验的是"成本口径由服务端推出来"，不是单请求成本上限
-            // （那条上限由 `GENERATION_MAX_REQUEST_COST_MICROUSD` 兜着，另有用例管它）。
+            // 给一个小值：这条要验的是"成本口径由服务端推出来"。
             "reference_cost_microusd": 120_000_u64
         }]
     });

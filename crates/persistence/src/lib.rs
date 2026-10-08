@@ -18,7 +18,6 @@
 //! | `generation.execution_capacity` | 渠道全局未决任务槽位；账户执行名额不在此表 | `ExecutionRepository` 的 `admit`、确定终态时释放、`reap_unsubmitted_admissions` 回收孤儿 |
 //! | `generation.late_facts` | 晚到事实收件箱：原提交者在执行 token 失效后交付的有界事实 | `ExecutionRepository` 的 `offer_late_facts` / `claim_unconsumed_late_facts` / `mark_late_fact_consumed` |
 //! | `ledger.accounts` / `ledger.holds` / `ledger.entries` | 已结算余额、占用、预授权与账目；账户分消费者与平台两类 | `ExecutionRepository` 的 `admit` / `settle` / `fail_or_reconcile` / `refund_reconciliation` |
-//! | `ledger.daily_spend` | 每账户每 UTC 自然日一行的已完成实收合计，每日消费限额的判据 | `ExecutionRepository::settle` |
 //! | `identity.api_keys` | API Key 摘要 | `IdentityService` |
 //! | `operations.reconciliation_cases` / `audit_events` | 待人工处置的案例与审计（审计也承载缓存对账发现的覆盖） | `ExecutionRepository::fail_or_reconcile`、`ReconciliationService`、`AccelerationService`、`LedgerAuditor` |
 //!
@@ -2590,25 +2589,6 @@ impl HubRepository for PgHubRepository {
         Ok((identity.0, AccountId(identity.1)))
     }
 
-    async fn daily_spend_microusd(&self, account_id: AccountId) -> Result<u64, ApplicationError> {
-        // **读当天那一行每日合计**：受理不逐次汇总历史资金流水（`0013` §4）。合计只由成功结算
-        // 在写 `capture` 的同一事务累加，缺行就是 0；"今天"的边界由**事实的书写者**（数据库）
-        // 划，而不是受理进程的本地时区。
-        let spent: i64 = sqlx::query_scalar(
-            r#"
-            SELECT COALESCE((
-                SELECT settled_microusd FROM ledger.daily_spend
-                WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date
-            ), 0)::bigint
-            "#,
-        )
-        .bind(account_id.0)
-        .fetch_one(&self.pool)
-        .await
-        .map_err(database_error)?;
-        Ok(u64::try_from(spent).unwrap_or(0))
-    }
-
     async fn list_open_reconciliation_cases(
         &self,
     ) -> Result<Vec<ReconciliationCaseView>, ApplicationError> {
@@ -4548,7 +4528,7 @@ impl ExecutionRepository for PgHubRepository {
         .execute(&mut *transaction)
         .await
         .map_err(database_error)?;
-        // 真实收支才记流水、零额不写；每日合计与 capture 同一事务累加（结算日，0013 §4）。
+        // 真实收支才记流水、零额不写。
         if charge > 0 {
             insert_ledger_entry(
                 &mut transaction,
@@ -4559,20 +4539,6 @@ impl ExecutionRepository for PgHubRepository {
                 &format!("job:{job_id}:capture"),
             )
             .await?;
-            sqlx::query(
-                r#"
-                INSERT INTO ledger.daily_spend (account_id, day, settled_microusd)
-                VALUES ($1, (now() AT TIME ZONE 'UTC')::date, $2)
-                ON CONFLICT (account_id, day) DO UPDATE
-                SET settled_microusd = ledger.daily_spend.settled_microusd + EXCLUDED.settled_microusd,
-                    updated_at = now()
-                "#,
-            )
-            .bind(account_id.0)
-            .bind(charge)
-            .execute(&mut *transaction)
-            .await
-            .map_err(database_error)?;
         }
         // 渠道容量槽位随确定终态释放，与终态同事务（RFC 0017 §6）。
         release_channel_slot(&mut transaction, job_id).await?;

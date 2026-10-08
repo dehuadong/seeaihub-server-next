@@ -849,39 +849,6 @@ async fn a_settlement_after_midnight_is_billed_on_the_day_it_settled() {
         "结算日的扣费就是那笔 capture"
     );
 
-    // 每日合计那一行：实收必须落在**结算日**，受理日那一行不受影响（A8）。受理时刻是这次结算
-    // **之前**改的，所以"按受理日入桶"的实现会把这笔实收写到前天，下面第一处 `day` 断言就会失败。
-    let daily_rows: Vec<(chrono::NaiveDate, i64)> = sqlx::query_as(
-        "SELECT day, settled_microusd FROM ledger.daily_spend WHERE account_id = $1 ORDER BY day",
-    )
-    .bind(Uuid::parse_str(&account_id).expect("account id"))
-    .fetch_all(&harness.pool)
-    .await
-    .expect("daily spend rows");
-    assert_eq!(
-        daily_rows.len(),
-        1,
-        "这个账户只有一笔结算，每日合计只该有一行：{daily_rows:?}"
-    );
-    assert_eq!(
-        daily_rows[0].0, today,
-        "实收必须入结算日那一行，而不是受理日：{daily_rows:?}"
-    );
-    assert_eq!(
-        daily_rows[0].1, -capture,
-        "结算日那一行的合计就是这笔实收（正数记实收）：{daily_rows:?}"
-    );
-    let request_day_total: i64 = sqlx::query_scalar(
-        "SELECT COALESCE(SUM(settled_microusd), 0)::bigint FROM ledger.daily_spend
-         WHERE account_id = $1 AND day = $2",
-    )
-    .bind(Uuid::parse_str(&account_id).expect("account id"))
-    .bind(today - chrono::Duration::days(2))
-    .fetch_one(&harness.pool)
-    .await
-    .expect("acceptance-day daily total");
-    assert_eq!(request_day_total, 0, "受理日那一行不该被这笔跨天结算改到");
-
     let request_day_usage = client
         .get(format!(
             "{}/v1/customer/usage?since={request_day}&until={settled_day}&limit=100",

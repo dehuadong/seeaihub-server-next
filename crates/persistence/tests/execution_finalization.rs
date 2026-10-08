@@ -420,15 +420,6 @@ async fn settle_commits_the_ledger_once_and_releases_the_channel_slot() {
         capture.try_get::<String, _>("business_key").expect("key"),
         format!("job:{job_id}:capture")
     );
-    let daily: i64 = sqlx::query_scalar(
-        "SELECT settled_microusd FROM ledger.daily_spend
-         WHERE account_id = $1 AND day = (now() AT TIME ZONE 'UTC')::date",
-    )
-    .bind(fixture.account_id.0)
-    .fetch_one(&pool)
-    .await
-    .expect("the daily total");
-    assert_eq!(daily, 800, "the capture accumulates into the daily total");
 
     // 渠道容量槽位随终态释放。
     let slot = sqlx::query(

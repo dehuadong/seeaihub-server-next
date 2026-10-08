@@ -16,7 +16,7 @@ verification: `cargo test -p seeai-api --bin seeai-api`（5 passed，含本件�
 ## 决定
 
 - 5xx 兜底路径留一条 **ERROR**：带 `category`（`configuration` / `persistence` / `reconciliation`，一眼看出该去查哪一层）与 `error`（完整错误内容）。
-- **两个平台侧故障（503 `platform_unavailable`）不重复记**：它们各有更具体的 `warn`（"一条候选都承载不了"、"成本护栏拦下"），再补一条 ERROR 会让同一个错误有两条日志，其中一条还说不清是哪一类。
+- **平台侧故障（503 `platform_unavailable`）不重复记**：它已有更具体的 `warn`（"一条候选都承载不了"），再补一条 ERROR 会让同一个错误有两条日志，其中一条还说不清是哪一类。
 - 对客文案与状态码一字不动：5xx 仍然只回 `The server could not complete the request`。4xx 不落这类日志——那是调用方自己的问题，数量由调用方决定。
 
 ## 备选方案

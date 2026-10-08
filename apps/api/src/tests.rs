@@ -143,8 +143,8 @@ fn a_server_error_is_logged_with_its_category_and_message() {
     );
 }
 
-/// 平台侧故障的两条路各自已有更具体的 warn（"一条候选都承载不了"、"成本护栏拦下"），兜底那条
-/// ERROR 不能再打一遍：同一个错误两条日志，其中一条还说不清是哪一类。
+/// 平台侧故障那条路（"一条候选都承载不了"）已有更具体的 warn，兜底那条 ERROR 不能再打一遍：
+/// 同一个错误两条日志，其中一条还说不清是哪一类。
 #[test]
 fn the_platform_side_failures_keep_their_own_warning() {
     let logs = CapturedLogs::default();
@@ -157,18 +157,12 @@ fn the_platform_side_failures_keep_their_own_warning() {
     let no_offering: ApiError =
         ApplicationError::NoEligibleOffering("no candidate can carry this request".to_owned())
             .into();
-    let ceiling: ApiError = ApplicationError::RequestCostCeilingExceeded(
-        "this request could cost 12000000 microusd".to_owned(),
-    )
-    .into();
-
     assert_eq!(no_offering.status, 503);
-    assert_eq!(ceiling.status, 503);
     assert_eq!(no_offering.code, "platform_unavailable");
     assert_eq!(
         logs.text(),
         "",
-        "这两条已有自己的 warn，不该再被 ERROR 记一遍"
+        "这条已有自己的 warn，不该再被 ERROR 记一遍"
     );
 }
 

@@ -3,7 +3,7 @@
 生效修订: v1
 状态: 待接受
 承接: [运营后台与对客自助控制台 Spec v19](../specs/0001-admin-and-customer-consoles.md) C5、C7–C10、C15、D5、V-C15、V-D5、V-D13–V-D14（v19 把 C9、C10 的用量改为按模型类型给出，取值归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)）
-依赖: [账户资金 Spec v4](../specs/0002-account-funds-and-reservations.md) §3–§5；[账户资金设计](0013-account-funds-and-reservations.md) §3、§5；[身份与控制台设计](0010-identity-and-consoles.md) §4.5–§4.6
+依赖: [账户资金 Spec v4](../specs/0002-account-funds-and-reservations.md) §3–§5；[账户资金设计](0013-account-funds-and-reservations.md) §3–§4；[身份与控制台设计](0010-identity-and-consoles.md) §4.5–§4.6
 
 # 客户控制台独立页面与历史记录浏览
 
