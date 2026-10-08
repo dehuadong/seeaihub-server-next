@@ -29,9 +29,9 @@
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
 | `GENERATION_MAX_COST_MICROUSD` | `20000` | **兜底保底额**（CNY 微单位，`20000` = 0.02 元）：只有查不到该供给的保底表时，才用它算这次请求要预扣多少。名字里的 `usd` 是历史命名 |
-| `GENERATION_MAX_CONCURRENT_JOBS` | `1` | **每账户**同时能有多少个在跑的生成任务（不是每个 worker 的并发） |
-| `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | 受理侧限流（每窗口请求数） |
-| `GENERATION_RATE_LIMIT_WINDOW_MS` | `60000` | 限流窗口（即默认每分钟 60 次） |
+| `GENERATION_MAX_CONCURRENT_JOBS` | `1` | **每账户**同时在跑的生成任务上限。受理时数库里该账户处于 `admitted` / `executing` 的 Job（多副本共用这一个数）；到上限回 `429 too_many_in_flight`。它管"同时"，不管"多久发一次"——等前一个跑完再发下一个不受它约束 |
+| `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | **每把 API Key** 每窗口能提交的生成请求数（请求进来就计数，与它跑多久无关）。计数落在缓存里；超限回 `429 rate_limit_exceeded` 带 `Retry-After`（本窗口剩余秒数）。缓存不可用时**放行**——它是保护机制，不是准入 |
+| `GENERATION_RATE_LIMIT_WINDOW_MS` | `60000` | 上一项的窗口长度（缺省 60 秒，即每分钟 60 次） |
 | `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` | `10` | 公开鉴权端点（`<ENDPOINT>` 取 `REGISTER` / `LOGIN` / `REDEEM`）每窗口的失败尝试上限；超限对客 `429 rate_limit_exceeded` 带 `Retry-After` |
 | `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS` | `60000` | 上述三个端点各自的计数窗口 |
 | `AUTH_SOURCE_HEADER` | 不设 | 公开鉴权来源维采信的受信头（如 `x-real-ip`）；**不设时退回连接对端地址**。采信它要求 API 不能被绕过代理直连——直连时这个头谁都能写 |
