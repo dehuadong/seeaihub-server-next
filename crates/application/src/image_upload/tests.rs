@@ -204,7 +204,7 @@ async fn upload_writes_then_verifies_and_returns_the_public_url() {
     let service = service(storage.clone(), credentials.clone(), 3);
 
     let uploaded = service
-        .upload(account(), &bytes, Some("image/png"), &NeverCancelled)
+        .upload(account(), &bytes, &NeverCancelled)
         .await
         .expect("a successful upload");
 
@@ -244,11 +244,11 @@ async fn upload_resolves_credentials_on_every_request() {
     let credentials = Arc::new(FakeCredentials::working());
     let service = service(storage, credentials.clone(), 3);
     service
-        .upload(account(), &bytes, None, &NeverCancelled)
+        .upload(account(), &bytes, &NeverCancelled)
         .await
         .expect("the first upload");
     service
-        .upload(account(), &bytes, None, &NeverCancelled)
+        .upload(account(), &bytes, &NeverCancelled)
         .await
         .expect("the second upload");
     assert_eq!(credentials.references().len(), 4);
@@ -260,9 +260,7 @@ async fn upload_without_storage_configuration_is_unavailable() {
     let credentials = Arc::new(FakeCredentials::working());
     let service = ImageUploadService::new(storage.clone(), credentials, config(None, 3));
     assert_eq!(
-        service
-            .upload(account(), &png(), None, &NeverCancelled)
-            .await,
+        service.upload(account(), &png(), &NeverCancelled).await,
         Err(ImageUploadError::UploadStorageUnavailable)
     );
     assert!(storage.put_keys().is_empty());
@@ -273,12 +271,12 @@ async fn upload_rejects_unrecognized_and_oversized_content_before_writing() {
     let storage = Arc::new(FakeStorage::default());
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
     assert_eq!(
-        service.upload(account(), &[], None, &NeverCancelled).await,
+        service.upload(account(), &[], &NeverCancelled).await,
         Err(ImageUploadError::UnsupportedMediaType)
     );
     assert_eq!(
         service
-            .upload(account(), b"not an image", None, &NeverCancelled)
+            .upload(account(), b"not an image", &NeverCancelled)
             .await,
         Err(ImageUploadError::UnsupportedMediaType)
     );
@@ -286,23 +284,8 @@ async fn upload_rejects_unrecognized_and_oversized_content_before_writing() {
     let mut oversized = vec![0_u8; usize::try_from(MAX_UPLOAD_BYTES).expect("the limit")];
     oversized[0..8].copy_from_slice(&[0x89, b'P', b'N', b'G', 0x0D, 0x0A, 0x1A, 0x0A]);
     assert_eq!(
-        service
-            .upload(account(), &oversized, None, &NeverCancelled)
-            .await,
+        service.upload(account(), &oversized, &NeverCancelled).await,
         Err(ImageUploadError::ImageTooLarge)
-    );
-    assert!(storage.put_keys().is_empty());
-}
-
-#[tokio::test]
-async fn upload_rejects_a_declared_content_type_that_disagrees_with_the_magic_bytes() {
-    let storage = Arc::new(FakeStorage::default());
-    let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
-    assert_eq!(
-        service
-            .upload(account(), &png(), Some("image/jpeg"), &NeverCancelled)
-            .await,
-        Err(ImageUploadError::MediaTypeMismatch)
     );
     assert!(storage.put_keys().is_empty());
 }
@@ -323,7 +306,7 @@ async fn upload_retries_the_same_object_key_on_retryable_failures() {
         .push_back(Ok(metadata(bytes.len(), "image/png")));
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
     let uploaded = service
-        .upload(account(), &bytes, None, &NeverCancelled)
+        .upload(account(), &bytes, &NeverCancelled)
         .await
         .expect("a retried upload");
     let keys = storage.put_keys();
@@ -345,9 +328,7 @@ async fn upload_stops_after_the_attempt_limit() {
     ]));
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 2);
     assert_eq!(
-        service
-            .upload(account(), &png(), None, &NeverCancelled)
-            .await,
+        service.upload(account(), &png(), &NeverCancelled).await,
         Err(ImageUploadError::ObjectStoreUnavailable)
     );
     assert_eq!(storage.put_keys().len(), 2);
@@ -361,9 +342,7 @@ async fn upload_does_not_retry_terminal_failures() {
     ]));
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
     assert_eq!(
-        service
-            .upload(account(), &png(), None, &NeverCancelled)
-            .await,
+        service.upload(account(), &png(), &NeverCancelled).await,
         Err(ImageUploadError::ObjectStoreUnavailable)
     );
     assert_eq!(storage.put_keys().len(), 1);
@@ -378,9 +357,7 @@ async fn upload_fails_closed_when_head_metadata_disagrees() {
     ))]));
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
     assert_eq!(
-        service
-            .upload(account(), &bytes, None, &NeverCancelled)
-            .await,
+        service.upload(account(), &bytes, &NeverCancelled).await,
         Err(ImageUploadError::ObjectStoreUnavailable)
     );
     assert_eq!(storage.put_keys().len(), 1);
@@ -397,7 +374,7 @@ async fn upload_retries_head_without_writing_the_object_again() {
     ]));
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
     service
-        .upload(account(), &bytes, None, &NeverCancelled)
+        .upload(account(), &bytes, &NeverCancelled)
         .await
         .expect("a successful upload after a head retry");
     assert_eq!(storage.put_keys().len(), 1, "the object is written once");
@@ -409,9 +386,7 @@ async fn upload_maps_a_credential_configuration_failure_to_storage_unavailable()
     let storage = Arc::new(FakeStorage::default());
     let service = service(storage.clone(), Arc::new(FakeCredentials::failing()), 3);
     assert_eq!(
-        service
-            .upload(account(), &png(), None, &NeverCancelled)
-            .await,
+        service.upload(account(), &png(), &NeverCancelled).await,
         Err(ImageUploadError::UploadStorageUnavailable)
     );
     assert!(storage.put_keys().is_empty());
@@ -429,7 +404,7 @@ async fn upload_stops_when_the_client_left_before_a_retry() {
     let service = service(storage.clone(), Arc::new(FakeCredentials::working()), 3);
     let cancelled = FlagCancellation(Arc::new(AtomicBool::new(true)));
     assert_eq!(
-        service.upload(account(), &bytes, None, &cancelled).await,
+        service.upload(account(), &bytes, &cancelled).await,
         Err(ImageUploadError::ClientDisconnected)
     );
     assert!(storage.put_keys().is_empty());

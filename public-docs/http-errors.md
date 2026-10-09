@@ -21,7 +21,7 @@
 | `400` | 生成：`missing_model`、`invalid_parameter`、`validation_error` | 请求格式或参数不符合要求，检查模型名、必填字段和参数组合。 |
 | `400` | 生成：`public_image_url_required` | 参考图与遮罩必须是公网 `http(s)` URL。 |
 | `400` | 生成：`content_rejected` | 提交的内容被拒绝，修改内容后再提交。 |
-| `400` | 上传：`invalid_multipart`、`unsupported_media_type`、`media_type_mismatch` | 按上传说明修正表单与图片文件。 |
+| `400` | 上传：`invalid_multipart`、`unsupported_media_type` | 按上传说明修正表单与图片文件。 |
 | `401` | 上传、生成：`authorization_required`、`invalid_api_key` | 检查 `Authorization: Bearer ...` 与密钥有效性。 |
 | `402` | 生成：`insufficient_balance` | 余额不足，充值后再提交。 |
 | `404` | 生成：`not_found` | 模型不存在或当前不可调用，重新查询目录。 |

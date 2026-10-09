@@ -18,7 +18,7 @@ curl -X POST "$BASE_URL/v1/uploads/images" \
   -F "file=@./reference.png"
 ```
 
-支持 JPEG、PNG、WebP。文件必须严格小于 20 MiB（20971520 字节）；空文件不支持。文件部件声明了 `Content-Type` 时，声明必须与实际内容一致。
+支持 JPEG、PNG、WebP。文件必须严格小于 20 MiB（20971520 字节）；空文件不支持。类型由**文件内容**判定：文件部件声明的 `Content-Type` 与文件名都不影响受理（按扩展名填错声明也照常受理），返回的对象键扩展名由服务端判定的类型决定。
 
 ## 成功响应
 
@@ -48,7 +48,6 @@ curl -X POST "$BASE_URL/v1/uploads/images" \
 | --- | --- | --- |
 | `400` | `invalid_multipart` | 检查表单编码，恰好提交一个带文件名的 `file` 部件。 |
 | `400` | `unsupported_media_type` | 使用非空的 JPEG、PNG 或 WebP 图片。 |
-| `400` | `media_type_mismatch` | 修正文件部件声明的类型，使其与内容一致。 |
 | `408` | `request_timeout` | 请求正文上传过慢；改善连接后重新上传。 |
 | `413` | `image_too_large` / `request_too_large` | 缩小文件或请求体。 |
 | `429` | `upload_busy` | 上传并发或内存预算已满；按 `Retry-After` 等待后再上传。 |

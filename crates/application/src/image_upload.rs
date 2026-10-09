@@ -327,9 +327,6 @@ pub enum ImageUploadError {
     /// 类型不在允许范围、0 字节或魔数无法识别。
     #[error("the uploaded file type is not accepted")]
     UnsupportedMediaType,
-    /// 声明的 `Content-Type` 与魔数判定不一致。
-    #[error("the declared content type does not match the file content")]
-    MediaTypeMismatch,
     /// 单文件达到或超过 20 MiB。
     #[error("the uploaded file is too large")]
     ImageTooLarge,
@@ -393,7 +390,6 @@ impl ImageUploadService {
         &self,
         account_id: AccountId,
         bytes: &[u8],
-        declared_content_type: Option<&str>,
         cancellation: &dyn UploadCancellation,
     ) -> Result<UploadedImage, ImageUploadError> {
         let storage = self
@@ -406,13 +402,9 @@ impl ImageUploadService {
         if !within_single_file_limit(byte_length) {
             return Err(ImageUploadError::ImageTooLarge);
         }
+        // 受理只看内容：类型由魔数判定，调用方声明的 `Content-Type` 与文件名/扩展名都不参与判定。
         let media_type = UploadMediaType::from_magic_bytes(bytes)
             .ok_or(ImageUploadError::UnsupportedMediaType)?;
-        if let Some(declared) = declared_content_type
-            && declared != media_type.canonical_mime()
-        {
-            return Err(ImageUploadError::MediaTypeMismatch);
-        }
         // 访问密钥按请求解析：两条固定引用各取一次，密钥只作调用参数，不存进服务对象。
         let access_key_id = self.resolve(UPLOAD_STORAGE_ACCESS_KEY_ID_ENV)?;
         let access_key_secret = self.resolve(UPLOAD_STORAGE_ACCESS_KEY_SECRET_ENV)?;

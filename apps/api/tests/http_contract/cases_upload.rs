@@ -400,32 +400,57 @@ async fn a_body_over_sixteen_mib_is_accepted_by_the_upload_route_limit() {
     harness.cleanup().await;
 }
 
-/// A4：白名单外的类型、0 字节、声明与内容不一致都在写入前被拒；不声明 Content-Type 时不做比较。
+/// 受理只看内容：白名单外的类型与 0 字节在写入前被拒；**部件声明的 `Content-Type` 与文件名都不参与判定**。
+///
+/// 两个方向各来一次（PNG 字节配 `image/jpeg` 声明、JPEG 字节配 `image/png` 声明与 `.png` 文件名），
+/// 断言 `media_type` 与对象键扩展名都跟着魔数走——客户端按扩展名填声明是常态，声明不该决定受理。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn unsupported_and_mismatched_media_are_rejected_before_writing() {
+async fn unsupported_media_is_rejected_while_declaration_and_extension_are_ignored() {
     let harness =
         Harness::start_with_upload_storage(upload_storage(), UpstreamBehaviour::apimart()).await;
 
+    // 0 字节：魔数认不出。
     let (status, body) = harness
         .upload(file_part(&[], "empty.png", Some("image/png")))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(upload_error_code(&body), "unsupported_media_type");
 
+    // 不是图片。
     let (status, body) = harness
         .upload(file_part(b"not an image", "text.png", Some("image/png")))
         .await;
     assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
     assert_eq!(upload_error_code(&body), "unsupported_media_type");
 
+    // PNG 内容、文件名 `.jpg`、声明 `image/jpeg`：照样受理，类型与对象键都按魔数走。
     let (status, body) = harness
         .upload(file_part(PNG_FIXTURE, "wrong.jpg", Some("image/jpeg")))
         .await;
-    assert_eq!(status, StatusCode::BAD_REQUEST, "{body}");
-    assert_eq!(upload_error_code(&body), "media_type_mismatch");
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["media_type"], json!("image/png"), "{body}");
+    assert!(
+        body["url"].as_str().unwrap_or_default().ends_with(".png"),
+        "对象键扩展名按魔数反推：{body}"
+    );
 
-    // 不声明 Content-Type：不做一致性比较，media_type 仍取魔数判定值。
+    // JPEG 内容、文件名 `.png`、声明 `image/png`（客户端按扩展名就会这么填）：照样受理，存成 `.jpg`。
+    let (status, body) = harness
+        .upload(file_part(
+            JPEG_FIXTURE,
+            "seedream4_5_imagesToimage_2.png",
+            Some("image/png"),
+        ))
+        .await;
+    assert_eq!(status, StatusCode::OK, "{body}");
+    assert_eq!(body["media_type"], json!("image/jpeg"), "{body}");
+    assert!(
+        body["url"].as_str().unwrap_or_default().ends_with(".jpg"),
+        "对象键扩展名按魔数反推：{body}"
+    );
+
+    // 不声明 `Content-Type` 时同样只看魔数。
     let (status, body) = harness
         .upload(file_part(PNG_FIXTURE, "undeclared.png", None))
         .await;
@@ -439,8 +464,8 @@ async fn unsupported_and_mismatched_media_are_rejected_before_writing() {
             .iter()
             .filter(|(method, ..)| method == "PUT")
             .count()
-            == 1,
-        "只有最后那次合法上传写了对象"
+            == 3,
+        "三次合法上传各写一个对象，被拒的两次没有写"
     );
     harness.cleanup().await;
 }

@@ -3332,12 +3332,7 @@ async fn upload_image(
     let uploaded = match state
         .upload
         .service
-        .upload(
-            account_id,
-            &file.bytes,
-            file.declared_content_type.as_deref(),
-            cancellation,
-        )
+        .upload(account_id, &file.bytes, cancellation)
         .await
     {
         Ok(uploaded) => uploaded,
@@ -3361,10 +3356,9 @@ fn client_disconnected() -> StatusCode {
     StatusCode::from_u16(499).unwrap_or(StatusCode::INTERNAL_SERVER_ERROR)
 }
 
-/// 一次上传请求解析出的文件：字节与部件声明的 `Content-Type`。
+/// 一次上传请求解析出的文件：只有字节。
 struct UploadFile {
     bytes: Vec<u8>,
-    declared_content_type: Option<String>,
 }
 
 /// 读上传的 multipart：恰好一个带文件名的 `file` 部件，其余部件一律拒绝。
@@ -3389,11 +3383,9 @@ async fn read_upload_file(multipart: &mut Multipart) -> Result<UploadFile, ApiEr
                 "the request may carry only one file part named file",
             ));
         }
-        let declared_content_type = field.content_type().map(str::to_owned);
         let bytes = field.bytes().await.map_err(upload_multipart_error)?;
         file = Some(UploadFile {
             bytes: bytes.to_vec(),
-            declared_content_type,
         });
     }
     file.ok_or_else(|| invalid_multipart("the request must carry a file part named file"))
@@ -3437,9 +3429,6 @@ fn upload_error(error: ImageUploadError) -> ApiError {
     match error {
         ImageUploadError::UnsupportedMediaType => {
             ApiError::bad_request("unsupported_media_type", message)
-        }
-        ImageUploadError::MediaTypeMismatch => {
-            ApiError::bad_request("media_type_mismatch", message)
         }
         ImageUploadError::ImageTooLarge => ApiError {
             status: StatusCode::PAYLOAD_TOO_LARGE,

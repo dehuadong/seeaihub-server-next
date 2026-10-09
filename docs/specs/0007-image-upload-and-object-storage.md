@@ -1,6 +1,6 @@
 主题: 图片上传与对象存储
-当前修订: v4
-生效修订: v4
+当前修订: v5
+生效修订: v5
 状态: 已接受
 依赖: [同步图片网关 Spec v3](0005-synchronous-image-gateway.md)（§1 输入图片只收公网 URL）、[图片透传决定](../adr/0019-images-pass-through-without-asset-storage.md)、[参考图上传决定](../adr/0022-reference-image-upload-endpoint.md)
 
@@ -53,9 +53,8 @@
 | 单文件字节 | 严格小于 20 MiB（20971520 字节） | `413 image_too_large` |
 | 请求体字节 | 单文件上限加 multipart 协议余量，上限值由服务端配置 | `413 request_too_large` |
 | 文件类型 | JPEG、PNG、WebP | `400 unsupported_media_type` |
-| 声明与内容一致 | 文件部件声明了 `Content-Type` 时，它必须等于内容魔数判定的规范 MIME；没声明则不做这一比较 | `400 media_type_mismatch` |
 
-准入只看内容魔数：规范 MIME 由魔数判定，调用方文件名的扩展名不影响受理；对象键的扩展名由服务端判定的规范 MIME 反推（§4）。0 字节文件因魔数无法识别，按 `400 unsupported_media_type` 拒绝。
+准入只看内容魔数：规范 MIME 由魔数判定，调用方**声明的 `Content-Type` 与文件名的扩展名都不影响受理**；对象键的扩展名由服务端判定的规范 MIME 反推（§4）。0 字节文件因魔数无法识别，按 `400 unsupported_media_type` 拒绝。
 
 单文件上限是固定值，不随部署配置变化。
 
@@ -80,7 +79,6 @@
 | 凭证无效或缺失 | `401` | `invalid_api_key` |
 | 非 multipart、缺 boundary、部件不符 §2.2 | `400` | `invalid_multipart` |
 | 类型不在允许范围、0 字节、魔数无法识别 | `400` | `unsupported_media_type` |
-| 声明的 `Content-Type` 与魔数不一致 | `400` | `media_type_mismatch` |
 | 单文件达到或超过 20 MiB | `413` | `image_too_large` |
 | 请求体超过上传路由的请求体上限（声明的 `Content-Length`，或流式读取到同一上限） | `413` | `request_too_large` |
 | 正文慢读超时（受理前） | `408` | `request_timeout` |
@@ -129,7 +127,7 @@
 | A2 | 上传一张合法 PNG 返回 `200`，`media_type` 是服务端判定的 `image/png`；用无凭证的客户端读返回的 `url` 能取到与上传一致的字节。 |
 | A3a | 单文件字节严格小于 20 MiB 通过、等于 20 MiB 返回 `413 image_too_large`；声明的 `Content-Length` 超过上传路由的请求体上限时在零正文读取的情况下返回平台错误信封 `413 request_too_large`，流式读取到同一上限时同样返回平台错误信封 `413 request_too_large`，都不是框架的裸 `413`。 |
 | A3b | 单文件合法、整个请求体超过全局 16 MiB 正文上限且不超过上传路由上限的 multipart 请求被受理：返回 `200` 并写入对象，受理前不返回 `413`。 |
-| A4 | 白名单外的类型、0 字节文件、魔数与声明的 `Content-Type` 不一致都在写入前被拒（`400`），对象存储没有新对象；文件部件不声明 `Content-Type` 时不做一致性比较，`media_type` 仍取魔数判定值。 |
+| A4 | 白名单外的类型与 0 字节文件在写入前被拒（`400`），对象存储没有新对象；部件声明的 `Content-Type` 与文件名都不参与判定（受理与类型取值见 A10）。 |
 | A5 | 对象键形如 `reference-media/{调用者账户 id}/{uuid}.{ext}`，第一段是鉴权得到的调用者账户，不含调用方文件名；同一次上传的两次调用产生不同的键。 |
 | A6 | 无效 API Key 返回 `401 invalid_api_key` 且不读正文、不写对象；同一把 API Key 在 60 秒内连续上传 **61** 张全部成功，没有一次 `rate_limit_exceeded`；本机上传并发满或上传内存预算耗尽返回 `429 upload_busy`。 |
 | A7 | 上传前后账户余额、资金占用、执行记录条数与账本条目不变：上传不计费、不计量、不限配额，也不产生执行记录与账目。 |
@@ -148,3 +146,4 @@
 | v3 | §4、§9 | 对象键的第一段由写入时的 UTC 日期改为调用者账户 id：键形如 `reference-media/{调用者账户 id}/{uuid}.{ext}`，同账号的素材归在同一前缀下；A5 同步。 | 已接受／v3 |
 | v2 | §1–§9 | 上传素材只走阿里云 OSS，region / bucket / 可选 endpoint / 访问密钥全部来自部署侧环境变量：没有管理端页面、存储表与激活动作，配置整组缺失时上传返回 `503 upload_storage_unavailable` 且进程照常启动，形状不合法在启动期拒绝并点名，启动期不做活体探测；术语改为「上传存储」（英文 Upload Storage）；上传速率用独立命名空间，不挤占生成的每 API Key 配额；bucket 名按阿里云规则禁用点号，region 给出合法形状，endpoint 是部署侧可改的含 scheme 的 origin（真实 OSS 必须 `https`，loopback 允许 `http`）；密钥成对读取、不完整按形状不合法处理；错误码区分"未配置"与"对象存储故障"；补 HEAD 核验不一致、缺 `Content-Type` 声明与两个 `file` 部件的判据；签名机制、对象键构造与桶匿名可读的自检步骤移入设计，Spec 只留可观察判据；新增 A9（`408` 慢读的对象副作用）、A10（准入只看魔数）与 A3b（单文件合法、整体超过全局 16 MiB 正文上限且不超过上传路由上限的请求必须受理），原 A3 的请求体超限判据保留为 A3a；A1 补密钥解析 `Configuration` 类错误的兜底判据，A8 补对象存储终态 `4xx` 的不重试与不返回 URL 判据，新增 A11（`invalid_multipart` 的请求形态判据）。 | 已接受／v2 |
 | v4 | §2.1、§5、A6 | 上传不再有按 API Key 的请求级速率限制：删掉 `UPLOAD_RATE_LIMIT_*` 与那行 `429 rate_limit_exceeded` 判据；过载保护只剩本机上传并发与内存预算（`429 upload_busy`）。 | 已接受／v4 |
+| v5 | §3、§5、A4 | 受理只看内容：删掉"部件声明的 `Content-Type` 必须与魔数一致"这条判据与 `400 media_type_mismatch`；声明与文件名都不参与判定。 | 已接受／v5 |
