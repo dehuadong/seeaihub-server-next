@@ -5,9 +5,22 @@
 ## 按改动面选证据
 
 - 每处改动选择能挡住回归的**最小**证据：Rust 改动运行相关 crate 的定向用例，传输或协议改动补对客端到端；Agent Note 运行 `node scripts/decisions/check.mjs`；其他代理文档检查本地链接、运行 `git diff --check` 并按写作规则审阅。
+- **Rust 改动按层选命令**（后两条**串行**跑，本机依赖与库怎么起见 [`../operations/development.md`](../operations/development.md) §2／§7）：
+
+  ```sh
+  cargo check -p <crate>                                     # 反馈：只做类型与借用检查
+  cargo test -p <crate> --lib                                # 进程内单元用例
+  HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract \
+    cargo test -p seeai-persistence -- --ignored --test-threads=1
+  HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract \
+    cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 <过滤词>
+  npm --prefix apps/web run e2e                              # 浏览器层（自己拉起空库、产物与 API）
+  ```
+
+- **"单元层全绿"不是验收证据**：需要真实数据库、真实 Redis 或独立子进程的用例都带 `#[ignore]`，普通 `cargo test` 只编译不执行它们。声称交付前，按上面的层拿到对得上验收条件的证据（见技能 `verify`）。
 - **要提交或推送，不构成把已经通过的检查再跑一遍的理由。** 根 `AGENTS.md` 里的三条命令是完整 Rust 门禁，按改动面需要时运行，不是每次提交的仪式。
 - **只报告实际跑过的命令**：没跑就写没跑，不用「应该没问题」代替证据。
-- **Rust 全量门禁由 CI 承担**（[`.github/workflows/ci.yml`](../../.github/workflows/ci.yml)）：CI 在 Ubuntu 上运行格式、Clippy、Workspace 测试与 ignored HTTP 合同测试。文档、Agent Note 与技能仍按上一条在本地验证。本地重复跑 Rust 全量只用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
+- **Rust 全量门禁由 CI 承担**，划分是三份流水线：[`ci.yml`](../../.github/workflows/ci.yml) 的 rust job 依次跑格式、Clippy（`-D warnings`）、Workspace 测试与两条 `--ignored` 层（契约、端口），web-e2e job 跑浏览器层（构建产物 + 真实后端）；[`docs.yml`](../../.github/workflows/docs.yml) 单独跑 Agent Note 与记录里的链接检查。纯文档路径被 `ci.yml` 的 `paths-ignore` 排除，所以文档、记录与技能改动**只有** docs 流水线在管，本地仍按上一条验证。本地重复跑 Rust 全量只用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
 
 ## 提交
 
