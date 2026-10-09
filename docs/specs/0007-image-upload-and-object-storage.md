@@ -1,5 +1,5 @@
 主题: 图片上传与对象存储
-当前修订: v3
+当前修订: v4
 生效修订: v3
 状态: 已接受
 依赖: [同步图片网关 Spec v3](0005-synchronous-image-gateway.md)（§1 输入图片只收公网 URL）、[图片透传决定](../adr/0019-images-pass-through-without-asset-storage.md)、[参考图上传决定](../adr/0022-reference-image-upload-endpoint.md)
@@ -26,7 +26,7 @@
 
 用平台客户 API Key 鉴权，与生成接口同一套凭证与校验；无效凭证返回 `401 invalid_api_key`，且发生在读取正文之前。认证之后、消费正文之前取本机上传读取许可与上传内存预算，两者任一取不到返回 `429 upload_busy`，不排队等待。
 
-请求级速率用**独立命名空间**计数：按 API Key 分别计，不挤占生成接口的每 API Key 配额，超限返回 `429 rate_limit_exceeded`。限值来自服务端配置的 `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` 与 `UPLOAD_RATE_LIMIT_WINDOW_MS`，默认值在实施时定。
+上传**不设请求级速率限制**：平台不按 API Key 计每分钟上传次数。上传的过载保护是**本机上传并发与内存预算**，超出回 `429 upload_busy`。
 
 ### 2.2 请求
 
@@ -84,7 +84,6 @@
 | 单文件达到或超过 20 MiB | `413` | `image_too_large` |
 | 请求体超过上传路由的请求体上限（声明的 `Content-Length`，或流式读取到同一上限） | `413` | `request_too_large` |
 | 正文慢读超时（受理前） | `408` | `request_timeout` |
-| 请求级速率超限 | `429` | `rate_limit_exceeded` |
 | 本机上传并发满或上传内存预算耗尽 | `429` | `upload_busy` |
 | 上传存储未配置（全部上传存储变量都不存在），或密钥解析返回 `Configuration` 类错误 | `503` | `upload_storage_unavailable` |
 | 对象存储不可达、超时、`5xx`、限流重试耗尽、对象键相撞、写入后元数据核验不一致、返回终态 `4xx`（`401`、`403`、`404`、`409` 与其他 `4xx`） | `503` | `object_store_unavailable` |
@@ -132,7 +131,7 @@
 | A3b | 单文件合法、整个请求体超过全局 16 MiB 正文上限且不超过上传路由上限的 multipart 请求被受理：返回 `200` 并写入对象，受理前不返回 `413`。 |
 | A4 | 白名单外的类型、0 字节文件、魔数与声明的 `Content-Type` 不一致都在写入前被拒（`400`），对象存储没有新对象；文件部件不声明 `Content-Type` 时不做一致性比较，`media_type` 仍取魔数判定值。 |
 | A5 | 对象键形如 `reference-media/{调用者账户 id}/{uuid}.{ext}`，第一段是鉴权得到的调用者账户，不含调用方文件名；同一次上传的两次调用产生不同的键。 |
-| A6 | 无效 API Key 返回 `401 invalid_api_key` 且不读正文、不写对象；上传速率超限返回 `429 rate_limit_exceeded`；本机上传并发满或上传内存预算耗尽返回 `429 upload_busy`；上传速率不占用生成接口的每 API Key 配额。 |
+| A6 | 无效 API Key 返回 `401 invalid_api_key` 且不读正文、不写对象；同一把 API Key 在 60 秒内连续上传 **61** 张（原来的每分钟上限是 60）全部成功，没有一次 `rate_limit_exceeded`；本机上传并发满或上传内存预算耗尽返回 `429 upload_busy`。 |
 | A7 | 上传前后账户余额、资金占用、执行记录条数与账本条目不变：上传不计费、不计量、不限配额，也不产生执行记录与账目。 |
 | A8 | 对象存储返回可重试错误时按同一对象键重试；重试耗尽返回 `503 object_store_unavailable`；对象存储返回终态 `4xx`（`401`、`403`、`404`、`409` 与其他 `4xx`）时不重试、返回 `503 object_store_unavailable` 且不返回 URL；写入后元数据核验不一致同样返回 `503 object_store_unavailable` 且不返回 URL；日志、trace 与响应不含密钥、签名与对象字节。 |
 | A9 | 正文慢读超时（受理前）返回 `408 request_timeout`，此时没有对象被写入；写入开始后客户端断开是服务端观测事实，不构成对客错误码：服务端不为已断开的请求返回 URL，已写入的对象成为孤儿、平台不为它产生 URL，账户与账本不变。 |
@@ -148,3 +147,4 @@
 | v1 | 全文 | 建立上传端点的鉴权、请求与响应形态、大小与类型上限、错误码与重试合同，公网 URL 的语义与有效性边界（桶的匿名可读是激活判据），平台不承担保留期与删除，以及对象存储（今称上传存储）的公开配置、健康判据、激活语义与管理端端点。 | 已接受／v1 |
 | v3 | §4、§9 | 对象键的第一段由写入时的 UTC 日期改为调用者账户 id：键形如 `reference-media/{调用者账户 id}/{uuid}.{ext}`，同账号的素材归在同一前缀下；A5 同步。 | 已接受／v3 |
 | v2 | §1–§9 | 上传素材只走阿里云 OSS，region / bucket / 可选 endpoint / 访问密钥全部来自部署侧环境变量：没有管理端页面、存储表与激活动作，配置整组缺失时上传返回 `503 upload_storage_unavailable` 且进程照常启动，形状不合法在启动期拒绝并点名，启动期不做活体探测；术语改为「上传存储」（英文 Upload Storage）；上传速率用独立命名空间，不挤占生成的每 API Key 配额；bucket 名按阿里云规则禁用点号，region 给出合法形状，endpoint 是部署侧可改的含 scheme 的 origin（真实 OSS 必须 `https`，loopback 允许 `http`）；密钥成对读取、不完整按形状不合法处理；错误码区分"未配置"与"对象存储故障"；补 HEAD 核验不一致、缺 `Content-Type` 声明与两个 `file` 部件的判据；签名机制、对象键构造与桶匿名可读的自检步骤移入设计，Spec 只留可观察判据；新增 A9（`408` 慢读的对象副作用）、A10（准入只看魔数）与 A3b（单文件合法、整体超过全局 16 MiB 正文上限且不超过上传路由上限的请求必须受理），原 A3 的请求体超限判据保留为 A3a；A1 补密钥解析 `Configuration` 类错误的兜底判据，A8 补对象存储终态 `4xx` 的不重试与不返回 URL 判据，新增 A11（`invalid_multipart` 的请求形态判据）。 | 已接受／v2 |
+| v4 | §2.1、§5、A6 | 上传不再有按 API Key 的请求级速率限制：删掉 `UPLOAD_RATE_LIMIT_*` 与那行 `429 rate_limit_exceeded` 判据；过载保护只剩本机上传并发与内存预算（`429 upload_busy`）。 | 待评审／无 |
