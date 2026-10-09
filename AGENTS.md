@@ -106,6 +106,7 @@ cargo test -p seeai-persistence -- --ignored --test-threads=1                # �
 playwright test e2e 参阅 `apps/web/AGENTS.md`
 
 ## 通用约定
+- 已经完成的工作项Spec／RFC 记的是过去的实现方式，不是未来实现的决策依据。
 - 未经批准不发起任何计费调用
 - 未经批准不自主选择渠道模型
 - 当需要记录持久的ADR架构设计决策时必须获得用户确认
