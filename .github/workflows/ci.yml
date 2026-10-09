@@ -40,9 +40,6 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
-    env:
-      # CI 很少重编同一个 crate：增量缓存只占缓存空间，关掉。
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
       # 缓存 Rust 构建产物与 crate 下载：这份工作区全量编译一次很贵（几十个 crate + 一个很大的
@@ -55,16 +52,16 @@ jobs:
         with:
           components: rustfmt, clippy
       - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets --all-features --locked -- -D warnings
-      - run: cargo test --workspace --all-features --locked
+      - run: cargo clippy --workspace --all-targets --all-features -- -D warnings
+      - run: cargo test --workspace --all-features
       # 其中有按 pg_stat_database 提交计数验"Provider 等待期间不查库"的用例：并发跑时
       # 目标库的计数会被同时进行的其它用例扰动，读数不再可比；串行跑才稳定。
-      - run: cargo test -p seeai-api --test http_contract --locked -- --ignored --test-threads=1
+      - run: cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1
         env:
           HTTP_CONTRACT_DATABASE_URL: postgres://seeai:seeai@127.0.0.1:5432/seeai_contract
       # 端口层的真库用例（受理/提交/收尾/晚到事实）也在这一层跑：它们同样需要真实 PostgreSQL，
       # 普通 cargo test 会把它们跳过，只有显式 --ignored 才会执行。
-      - run: cargo test -p seeai-persistence --locked -- --ignored --test-threads=1
+      - run: cargo test -p seeai-persistence -- --ignored --test-threads=1
         env:
           HTTP_CONTRACT_DATABASE_URL: postgres://seeai:seeai@127.0.0.1:5432/seeai_contract
 
@@ -87,14 +84,8 @@ jobs:
           --health-interval 2s
           --health-timeout 2s
           --health-retries 30
-    env:
-      CARGO_INCREMENTAL: "0"
     steps:
       - uses: actions/checkout@v7
-      # webServer 会 `cargo run -p seeai-api`：这一层每次都要编整个工作区，缓存少了它这一层最贵。
-      - uses: Swatinem/rust-cache@v2
-        with:
-          cache-targets: true
       # 要 Rust 工具链是因为 webServer 会 `cargo run -p seeai-api`：这一层验的是**真实后端**托管的
       # **真实产物**，不是桩出来的响应。
       - uses: dtolnay/rust-toolchain@stable

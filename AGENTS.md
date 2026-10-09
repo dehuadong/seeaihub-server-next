@@ -39,12 +39,26 @@ cargo test --workspace --all-features
 
 本地全量检查仅用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
 
-第三条**只编译不执行**带 `#[ignore]` 的用例（真库、真进程、Redis），而验收证据往往正在那一层：
-跑哪一层、推之前核对什么见 [`docs/agents/git.md`](docs/agents/git.md)，本机依赖与那两个库怎么起着见
-[`docs/operations/development.md`](docs/operations/development.md) §2／§7。
+这三条与 CI 的前三步逐字一致，但它们**只覆盖进程内的单元用例**：需要真实 PostgreSQL、真实
+Redis 或独立子进程的用例都带 `#[ignore]`（全仓 348 条），第三条命令会编译它们却一条都不跑
+（输出里那些 `0 passed` 的测试二进制就是它们）。CI 额外跑两层：
 
-本机只编"这次要验的目标"（`cargo check -p <crate>`；单个 `--test` 加过滤词），`--workspace --all-targets`
-留给 CI。构建慢、`target/` 变大时按技能 `rust-build-budget` 做——别顺手 `cargo clean`。
+```sh
+cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1   # 契约层（真库真进程）
+cargo test -p seeai-persistence -- --ignored --test-threads=1                # 端口层（真库）
+```
+
+两条都要 `HTTP_CONTRACT_DATABASE_URL`（本机指 `seeai_contract` 库）且**串行**跑。所以"三条全绿"
+只说明编译与单元层没问题，不等于验收成立；要验行为，按改动面挑上面两层的过滤词跑。
+
+本机只编"这次要验的目标"：反馈用 `cargo check -p <crate>`；用例用 `cargo test -p <crate> --lib`，或
+`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 <过滤词>`。
+`--workspace --all-targets` 会把每个 crate 的每个测试二进制都编一遍——那是 CI 的事（开发 profile 已去掉
+依赖的调试信息，但 `target/debug` 仍会随每次改动增长）。
+
+`target/` 变大时**不要**顺手 `cargo clean`（它连增量缓存一起清掉，下一次全量重编很慢）：先删
+`target/debug/incremental`（可再生成），或 `cargo clean -p <crate>` 只清一个 crate；要按时间清可装
+`cargo-sweep` 跑 `cargo sweep --time 30`。
 
 真实 Provider 测试必须显式启用并限制调用次数；普通测试不得产生外部费用。
 

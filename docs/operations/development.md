@@ -106,14 +106,7 @@ cargo clippy --workspace --all-targets --all-features -- -D warnings
 cargo test --workspace --all-features
 ```
 
-上面三条**不含**带 `#[ignore]` 的用例（真库、真进程、Redis）——它们只会被编译。端口层那一组：
-
-```sh
-HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract \
-  cargo test -p seeai-persistence -- --ignored --test-threads=1
-```
-
-契约用例也默认被 `#[ignore]`，需要一个**可连接的空库**（它会自己派生独立库，**不要指向开发库**）：
+契约用例默认被 `#[ignore]`，需要一个**可连接的空库**（它会自己派生独立库，**不要指向开发库**）：
 
 ```sh
 HTTP_CONTRACT_DATABASE_URL=postgres://seeai:seeai@127.0.0.1:5432/seeai_contract \
@@ -137,8 +130,6 @@ npm --prefix apps/web run e2e
 | 发布平台模型时说"没有生效的折算率" | 先录该渠道币种的折算率（后台「折算率」页，或 `PUT /api/v1/fx-rates`） |
 | 请求受理了却一直不完成 | `seeai-worker` 没在跑（它才是领取 Job 的那个进程） |
 | 脚本里 `*.localhost` 连不上 | Node 不解析 `.localhost`，改直连 `127.0.0.1` |
-| `cargo` 越来越慢、`target/` 涨到十几个 G | 开发 profile 默认给依赖留完整调试信息，`--workspace --all-targets` 又会把每个测试二进制都编一遍；只编这次要验的目标，清理与提速见技能 `rust-build-budget` |
-| 顺手 `cargo clean` 之后第一次编特别久 | 整清连增量缓存一起删了；下次用 `rm -rf target/debug/incremental` 或 `cargo clean -p <crate>` |
 
 ## 9. 这一节之外
 
