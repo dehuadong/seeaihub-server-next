@@ -1,25 +1,25 @@
 ---
 name: domain-modeling
-description: Build and sharpen a project's domain model. Use when discussing codebase terminology, writing or editing a CONTEXT.md, or recording a durable decision in its selected owner.
+description: Build and sharpen a project's domain model. Use when discussing codebase terminology, writing or editing a GLOSSARY.md, or recording a durable decision in its selected owner.
 ---
 
 # Domain Modeling
 
-Actively build and sharpen the project's domain model as you design. This is the *active* discipline: challenging terms, inventing edge-case scenarios, and writing the glossary and decisions down the moment they crystallise. (Merely *reading* `CONTEXT.md` for vocabulary is not this skill: that's a one-line habit any skill can do. This skill is for when you're changing the model, not just consuming it.)
+Actively build and sharpen the project's domain model as you design. This is the *active* discipline: challenging terms, inventing edge-case scenarios, and writing the glossary and decisions down the moment they crystallise. (Merely *reading* `GLOSSARY.md` for vocabulary is not this skill: that's a one-line habit any skill can do. This skill is for when you're changing the model, not just consuming it.)
 
 ## File structure
 
 Follow the document ownership entry referenced by project instructions for glossary paths and decisions applicable to the model being discussed. If a required input's owner or scope is unclear, report the configuration gap.
 
-Resolve the repository management root from project instructions, using the Git top-level only as a fallback. Working inside a subproject does not change it. A root `CONTEXT-MAP.md` selects domain documents when the repository has multiple contexts. Do not create a separate record system per context or derive record categories automatically from contexts.
+Resolve the repository management root from project instructions, using the Git top-level only as a fallback. Working inside a subproject does not change it. A root `GLOSSARY-MAP.md` selects domain documents when the repository has multiple contexts. Do not create a separate record system per context or derive record categories automatically from contexts.
 
-A single-context project may use a root `CONTEXT.md`. A root `CONTEXT-MAP.md`, when present, points to the selected contexts' glossaries; context paths need not be under `src/`. Resolve decision paths separately from the document ownership entry and, for Agent Notes, its configured record roots. Create a glossary or decision record only when there is content for its selected owner. Use the `adr` skill when a separate architecture decision record is warranted.
+A single-context project may use a root `GLOSSARY.md`. A root `GLOSSARY-MAP.md`, when present, points to the selected contexts' glossaries; context paths need not be under `src/`. Resolve decision paths separately from the document ownership entry and, for Agent Notes, its configured record roots. Create a glossary or decision record only when there is content for its selected owner. Use the `adr` skill when a separate architecture decision record is warranted.
 
 ## During the session
 
 ### Challenge against the glossary
 
-When the user uses a term that conflicts with the existing language in `CONTEXT.md`, call it out immediately. "Your glossary defines 'cancellation' as X, but you seem to mean Y. Which is it?"
+When the user uses a term that conflicts with the existing language in `GLOSSARY.md`, call it out immediately. "Your glossary defines 'cancellation' as X, but you seem to mean Y. Which is it?"
 
 ### Sharpen fuzzy language
 
@@ -33,11 +33,11 @@ When domain relationships are being discussed, stress-test them with specific sc
 
 When the user states how something works, check whether the code agrees. If you find a contradiction, surface it: "Your code cancels entire Orders, but you just said partial cancellation is possible. Which is right?"
 
-### Update CONTEXT.md inline
+### Update GLOSSARY.md inline
 
-When a term is resolved, update `CONTEXT.md` right there. Don't batch these up: capture them as they happen. Use the format in [CONTEXT-FORMAT.md](./CONTEXT-FORMAT.md).
+When a term is resolved, update `GLOSSARY.md` right there. Don't batch these up: capture them as they happen. Use the format in [GLOSSARY-FORMAT.md](./GLOSSARY-FORMAT.md).
 
-`CONTEXT.md` should be totally devoid of implementation details. Do not treat `CONTEXT.md` as a spec, a scratch pad, or a repository for implementation decisions. It is a glossary and nothing else.
+`GLOSSARY.md` should be totally devoid of implementation details. Do not treat `GLOSSARY.md` as a spec, a scratch pad, or a repository for implementation decisions. It is a glossary and nothing else.
 
 ### Record standalone architecture decisions sparingly
 

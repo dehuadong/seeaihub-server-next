@@ -31,7 +31,7 @@ For each failure, establish the contract expectation, trigger, observed behavior
 
 - **Implementation defect** — fix the implementation.
 - **Verification defect** — fix the incorrect check.
-- **Contract ambiguity or defect** — return affected work to `planning`; material contract decisions require the appropriate approval.
+- **Contract ambiguity or defect** — stop affected work and follow the project's discussion, authorization, and gate rules before returning to `planning`; material contract decisions require the appropriate approval.
 - **Environment or tooling failure** — fix within authorization or report what prevents further verification.
 - **Pre-existing failure** — record its acceptance impact and ownership; do not automatically expand the repair scope or disregard a required condition it prevents from passing.
 
@@ -57,4 +57,4 @@ Determine the overall result from the current required conditions:
 
 ### Completion
 
-Only final PASS completes the engineering work. Update the authoritative work item using the project's completion convention after successful verification. A finished verification attempt, implementation, or review alone does not justify marking work complete.
+Only final PASS completes the engineering work. Update the authoritative work item using the project's completion convention after successful verification. Where required by the project's decision-record lifecycle, transition applicable decision records to `implemented` only after final PASS. A finished verification attempt, implementation, or review alone does not justify these completion updates.

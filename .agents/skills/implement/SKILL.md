@@ -9,7 +9,7 @@ description: Implement authorized work after the project's Implementation Gate p
 
 Implement the selected scope of the identified Proposal or existing work item. Resolve its issue ID, URL or file path and the requirements and design sections it references before coding.
 
-Before implementation, check the scope and acceptance conditions, required decisions and review/approval evidence, unresolved blockers, and execution authorization for that scope under project rules. Reuse valid evidence without requesting confirmation again. Sync already agreed scope and decisions to their existing owners; unresolved material decisions return to the project's Planning stage. Document status or location alone does not establish readiness or authorization.
+Before implementation, check the scope and acceptance conditions, required decisions and review/approval evidence, unresolved blockers, and execution authorization for that scope under project rules. Reuse valid evidence without requesting confirmation again. Sync already agreed scope and decisions to their existing owners; route unresolved material decisions through the project's discussion, authorization, and gate rules before returning to Planning. Document status or location alone does not establish readiness or authorization.
 
 For a review-only request, use the `code-review` skill without entering implementation or requiring its gate. Deliver findings and coverage limitations; do not automatically fix changes or advance their workflow status. The implementation correction and completion rules apply only to authorized implementation.
 
@@ -29,11 +29,11 @@ Implement against the selected work item's scope, acceptance conditions, referen
 
 Use established architecture, conventions, interfaces, and domain language unless the authoritative design explicitly changes them.
 
-If implementation exposes a material unresolved product, domain, architectural, interface, compatibility, or other contract decision, return to the project's Planning stage rather than inventing it during implementation.
+If implementation exposes a material unresolved product, domain, architectural, interface, compatibility, or other contract decision, stop affected implementation and follow the project's discussion, authorization, and gate rules to return it to Planning.
 
 ### Implementation-time testing
 
-Write or update tests as appropriate for the change. Use test-first development when it improves feedback or helps establish behavior clearly.
+Write or update tests as appropriate for the change. Use test-first development when it improves feedback or helps establish behavior clearly; when adopting it, load the `tdd` skill and follow its workflow.
 
 Run focused tests and relevant static checks while working.
 
@@ -49,7 +49,7 @@ During authorized implementation, resolve material findings by ownership:
 | ----------------------------------------------------------------- | -------------------------------------- |
 | Current implementation is missing or violates the agreed contract | Fix in the current implementation      |
 | Additional execution unit is needed within the same agreed work   | Add or update an implementation ticket |
-| Product or technical contract must change or was never resolved   | Return to the project's Planning stage                       |
+| Product or technical contract must change or was never resolved   | Follow project gates and authorization to return to Planning |
 | Issue is unrelated to the agreed work                             | Do not expand scope automatically      |
 
 There is no "fix it while we're here" path for unrelated work.
@@ -68,4 +68,4 @@ Implementation is complete when:
 
 For authorized end-to-end work, continue to the project's Verify stage after these conditions hold; do not wait for another instruction to verify.
 
-Update the identified work item's implementation progress using the project's workflow convention. Keep final delivery completion and any decision-record transition to `implemented` for successful final verification.
+Update the identified work item's implementation progress using the project's workflow convention. Leave final delivery completion and decision-record completion updates to the project's Verify stage.
