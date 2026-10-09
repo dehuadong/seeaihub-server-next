@@ -7,25 +7,24 @@
 | 工作项 | 状态 | 说明 |
 | --- | --- | --- |
 | [#94](https://github.com/dehuadong/seeaihub-server-next/issues/94) | 已关闭（complete） | 并发名额按「账户 × 网关模型」判定、落在模型行、编辑路径（模型卡片 `PATCH`）能设。提交 `71ef330`；设计记录 [网关模型的并发名额](../notes/implemented/platform/2026-10-08-gateway-model-concurrency-quota.md)。 |
-| [#99](https://github.com/dehuadong/seeaihub-server-next/issues/99) | **已获授权，实施中（2026-10-08）** | 上架时也能设名额；**删掉 `GENERATION_MAX_CONCURRENT_JOBS`**；列改 `NOT NULL`（回填 1）。Spec `0001` v25 与 `0005` v7 已接受；设计记录 [并发名额在上架时给出](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md) 随本次交付迁入 `implemented/`。 |
+| [#99](https://github.com/dehuadong/seeaihub-server-next/issues/99) | **已交付并验证、已关闭**（提交 `bd2c26b`） | 上架时也能设名额；删掉 `GENERATION_MAX_CONCURRENT_JOBS`；列改 `NOT NULL`（回填 1）。Spec `0001` v25 与 `0005` v7 已接受；设计记录与验证表见 [并发名额在上架时给出](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md)。 |
 | [#97](https://github.com/dehuadong/seeaihub-server-next/issues/97) | **已获授权（与 #99 同一句），待实施** | 删掉客户请求限流（生成侧与上传侧两处），不做速率配额；它的 Spec/设计修订还没起草（实施前先在 Planning 里固化）。 |
 | #95 / #96 | 已关闭（取消） | 速率配额、以及"标签即组名"的分组管理，都不做。 |
 | [#91](https://github.com/dehuadong/seeaihub-server-next/issues/91) | 已被 `b733d82` 修掉 | 合同夹具不再读仓库根 `.env`；可以直接关。 |
 
 ## 2. 下一步（建议顺序）
 
-1. **拿执行授权**：只有用户明确输入「批准，执行实现」才算授权。**不要从"需要解决""继续""你看着办"里推断**——本会话在这个点上被用户纠正过两次。
-2. **接受 #99 的两份 Spec 草稿**（现在 `生效修订` 未动、修订行标"待评审／无"）：接受＝进位 `生效修订`、修订行改"已接受／vN"，并同步工作项的决策记录。
-3. **过 Implementation Gate**（`docs/agents/engineering.md` §2），加载 `implement` 技能，按 #99 的「实施步骤」与设计记录的「决定」落地。**动手前先把设计记录里「同步到属主的改动」清单做完**，其中包含 `docs/operations/deployment.md` §3.3 与它的两份衍生（`production.md`、`production-docker.md`）——它们现在写着"升级＝先部署后观察、没有单独的迁移步骤"，照做会把容量静默降到 1。
-4. 实现完成 → `code-review`（Standards／Spec 两轴）→ `verify`（真库 + 真浏览器）→ 提交推送 → 关 #99。
-5. #97 是另一件工作：等用户授权后从 Planning 起步（它的方案在第一轮里已被用户改过两次，见 issue 正文）。
+1. **#99 已完成**（`bd2c26b`）：进程配置里不再有名额来源，名额在**上架或编辑**时由运营给。全貌读工作项 #99 与那份 implemented 记录。
+2. **#97 已获授权（与 #99 同一句），但它的合同还没固化**：用户两次改过它的方案（先"删掉用户限流"、再"不搞速率配额"），而 Spec `0007`／Spec `0005` §4／design `0009` §3 与 `0021` 里仍写着"限值来自 `UPLOAD_RATE_LIMIT_*`／`GENERATION_RATE_LIMIT_*`"。所以下一步是**先走 Planning**：起草两份 Spec 的修订与设计记录、跑 Plan Review 收敛，再动手删限流。
+3. #91 可直接关（已被 `b733d82` 修掉）。
 
 ## 3. 关键文件（下一步会碰到的）
 
 - 工作项与决策记录：[#99](https://github.com/dehuadong/seeaihub-server-next/issues/99)（范围、验收、三轮 Plan Review 的发现与修正都在正文）。
 - 设计：[proposed Note](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md)（写入形状、无窗口 RUNBOOK、审计口径、边界与类型收紧、验证切入点）。
 - 合同草稿：[`docs/specs/0001-admin-and-customer-consoles.md`](../../docs/specs/0001-admin-and-customer-consoles.md)（M1／M2／V-D17／V-D18）、[`docs/specs/0005-synchronous-image-gateway.md`](../../docs/specs/0005-synchronous-image-gateway.md)（§6）。
-- 实施会改到：`migrations/`（**新迁移**：回填 1 → `SET NOT NULL` → 重写列注释；已应用的 `0048` 不许改）、`crates/persistence/src/lib.rs`（发布事务与设置接口）、`crates/application/src/lib.rs`（`DirectExecutionLimits`／`ActiveOfferings`／发布命令）、`apps/api/src/main.rs`（env 读取、`AppState`、读面、`PATCH`）、`apps/web/src/console/*`（发布抽屉、改价态、卡片文案、`client.ts`）、`apps/api/tests/http_contract/harness.rs`（并发形参改走发布命令）。
+- #97 的规划要先读：`docs/specs/0007-*.md`（上传与素材）、`docs/specs/0005-*.md` §4、`docs/design/0009-operational-baseline.md` §3、`docs/design/0021-*.md`，以及 `crates/application/src/lib.rs` 的限流端口与 `apps/api/src/main.rs` 的两个环境变量。
+- 实施会改到（#99 已完成，留作参考）：`migrations/`（**新迁移**：回填 1 → `SET NOT NULL` → 重写列注释；已应用的 `0048` 不许改）、`crates/persistence/src/lib.rs`（发布事务与设置接口）、`crates/application/src/lib.rs`（`DirectExecutionLimits`／`ActiveOfferings`／发布命令）、`apps/api/src/main.rs`（env 读取、`AppState`、读面、`PATCH`）、`apps/web/src/console/*`（发布抽屉、改价态、卡片文案、`client.ts`）、`apps/api/tests/http_contract/harness.rs`（并发形参改走发布命令）。
 - 契约与运维文档：`docs/design/0006`（§2.2 读示例、§2.3/§2.4）、`docs/design/0012`（v4）、`docs/design/0017`（v3）、`docs/design/0009` §3、`CONTEXT.md`、`docs/operations/configuration.md`、`.env.example`、`docs/operations/deployment.md` §3.3 与两份衍生。
 
 ## 4. 本机环境与验证命令
