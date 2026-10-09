@@ -3,7 +3,7 @@ title: 受理路径的容量测量：先定饱和资源，再定缓存
 status: proposed
 created: 2026-10-09
 updated: 2026-10-09
-approval: 用户 2026-10-09 授权 `/planning`，范围限定为重挂提案 #83 的基线与设计这组容量测量；本记录是待批准草案，测量本身尚未执行
+approval: 用户 2026-10-09 授权 `/planning`（范围限定为重挂基线与设计这组测量），随后授权实施该范围；测量已执行，观测与结论记在 `docs/verification/admission-path-capacity.md`。设计里要的五个数有两个未取到（见该留档），所以本记录保持 proposed，等这两个数或改后的验收条件定下来再转 implemented
 ---
 
 # Agent Note：受理路径的容量测量：先定饱和资源，再定缓存
