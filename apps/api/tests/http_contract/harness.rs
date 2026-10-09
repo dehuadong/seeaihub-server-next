@@ -1297,38 +1297,13 @@ async fn probe_running_and_stderr(mut command: Command) -> (bool, String) {
     (running, stderr)
 }
 
-/// 一次用例要给 API 进程配的**速率上限**（每把 API Key）。
-///
-/// 默认那一套是每分钟 60 次，用例要观察"超限被拒"就得把它调到 1 次——按默认值跑，光是把上限
-/// 撞到就要先发 61 次请求。字段直接就是那两个环境变量的值。
-#[derive(Debug, Clone, Copy)]
-struct ApiRateLimit {
-    requests_per_window: u64,
-    window_ms: u64,
-}
-
-impl ApiRateLimit {
-    /// 一个窗口只放一次：第二次请求必然越限，用例不必等到 60 次。
-    fn once_per(window_ms: u64) -> Self {
-        Self {
-            requests_per_window: 1,
-            window_ms,
-        }
-    }
-}
-
-/// API 进程的可选配置：**加速层**、**每把密钥的速率上限**与**平台告警出口**。
-///
-/// 前两项绑在一起，是因为速率计数就落在加速层的缓存端口上：没有缓存时计数无处可落，限流那一层
-/// 也就无从谈起（见 `AccelerationService::consume_request_slot`）。
-/// 这也正是它与速率上限分开成两个字段的原因——它们只是碰巧都读环境变量。
+/// API 进程的可选配置：**加速层**、**平台告警出口**与其余按用例压小的取值。
 ///
 /// 平台告警出口（`PROVIDER_ALERT_WEBHOOK`）给账实核对用：核对**没有默认周期**，由用例显式触发
 /// （见 `trigger_ledger_audit`），出口只决定发现不符时外发到哪里。
 #[derive(Default)]
 struct ApiProcessSettings {
     cache: Option<CacheFixture>,
-    rate_limit: Option<ApiRateLimit>,
     alert_webhook: Option<String>,
     /// 引导管理员账号用的邮箱与口令：给了就等价于运维在部署时配了 `ADMIN_EMAIL`/`ADMIN_PASSWORD`。
     ///
@@ -1380,8 +1355,6 @@ struct UploadStorageFixture {
     slow_read_timeout_seconds: Option<u64>,
     retry_max_attempts: Option<u32>,
     retry_backoff_base_seconds: Option<u64>,
-    /// 每 API Key 每窗口的上传请求数与窗口毫秒数。
-    rate_limit: Option<(u64, u64)>,
 }
 
 impl UploadStorageFixture {
@@ -1405,19 +1378,10 @@ struct CaseSettings {
 }
 
 impl ApiProcessSettings {
-    /// 配置好加速层，并用默认的速率上限（每分钟 60 次）。
+    /// 配置好加速层。
     fn with_cache(cache: CacheFixture) -> Self {
         Self {
             cache: Some(cache),
-            ..Self::default()
-        }
-    }
-
-    /// 同 [`Self::with_cache`]，但把速率上限也调小。
-    fn with_cache_and_rate_limit(cache: CacheFixture, rate_limit: ApiRateLimit) -> Self {
-        Self {
-            cache: Some(cache),
-            rate_limit: Some(rate_limit),
             ..Self::default()
         }
     }
@@ -1504,17 +1468,6 @@ async fn start_api_with(
         apply_cache_env(&mut command, settings.cache.as_ref());
         if let Some(limit) = settings.channel_max_in_flight {
             command.env("GENERATION_MAX_CHANNEL_IN_FLIGHT", limit.to_string());
-        }
-        if let Some(rate_limit) = settings.rate_limit {
-            command
-                .env(
-                    "GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW",
-                    rate_limit.requests_per_window.to_string(),
-                )
-                .env(
-                    "GENERATION_RATE_LIMIT_WINDOW_MS",
-                    rate_limit.window_ms.to_string(),
-                );
         }
         if let Some((failures, window_ms)) = settings.auth_attempt_limit {
             // 三个端点各自一份上限与窗口：用例把三份都压到同一个量级，端点之间仍互不占用。
@@ -1847,9 +1800,10 @@ impl Harness {
         .await
     }
 
-    /// 同 [`Self::start_with_upload_storage`]，但给 API 配上**加速层**（假 Redis）。
+    /// 同 [`Self::start_with_upload_storage`]，另外配一个加速层缓存。
     ///
-    /// 上传的每 API Key 限流与生成的限流一样落在缓存上：没有缓存时计数无处可落，限流不生效。
+    /// 上传这条路上曾经有一层按密钥的速率计数，它落在缓存里：用例要证明那一层不在了，就得让缓存
+    /// 配上——没有缓存时它本来就不生效。
     async fn start_with_upload_storage_and_cache(
         upload: UploadStorageFixture,
         behaviour: UpstreamBehaviour,
@@ -1924,31 +1878,6 @@ impl Harness {
             sync_wait_seconds,
             CaseSettings {
                 api: ApiProcessSettings::with_cache(cache),
-                ..CaseSettings::default()
-            },
-        )
-        .await
-    }
-
-    /// 同 [`Self::start_with_cache`]，但把**每把密钥的速率上限**也调小：用例因此不必发满默认的
-    /// 每分钟 60 次，第二次请求就能看到越限那条路。
-    async fn start_with_cache_and_rate_limit(
-        draft: Value,
-        contract: Option<Value>,
-        behaviour: UpstreamBehaviour,
-        max_concurrent_jobs: u64,
-        sync_wait_seconds: u64,
-        cache: CacheFixture,
-        rate_limit: ApiRateLimit,
-    ) -> Self {
-        Self::build(
-            draft,
-            contract,
-            behaviour,
-            max_concurrent_jobs,
-            sync_wait_seconds,
-            CaseSettings {
-                api: ApiProcessSettings::with_cache_and_rate_limit(cache, rate_limit),
                 ..CaseSettings::default()
             },
         )
@@ -3313,8 +3242,8 @@ async fn wait_until_ready(client: &Client, base_url: &str, admin_token: &str) {
 /// 等计数窗口的剩余时间够放下 `margin_ms`；不够就先等到下一个窗口开头之后 100 毫秒（正好停在
 /// 边界上会又变成"贴着边界"）。
 ///
-/// 计数键里带着窗口号、TTL 只给本窗口剩余时间，窗口按钟点等分（与实现的 `rate_limit_window`
-/// 用同一套钟和窗口长度）。序列跨过边界时，边界之后的判定读到的是归零的计数，断言就会时好时坏。
+/// 计数键里带着窗口号、TTL 只给本窗口剩余时间，窗口按钟点等分（与实现里那套
+/// 窗口算法用同一套钟和窗口长度）。序列跨过边界时，边界之后的判定读到的是归零的计数，断言就会时好时坏。
 /// 余量够时不等，所以正常跑法不引入等待；对齐之后同一窗口内的判定是确定的，不必为此改窗口取值
 /// 或放松断言。
 async fn wait_for_window_margin(window_ms: u64, margin_ms: u64) {
@@ -4007,11 +3936,6 @@ impl CacheFixture {
         );
     }
 
-    /// 直接删一条（绕过服务）：用例用它构造"这条值不在了"（例如到了别的限流窗口）。
-    fn delete(&self, key: &str) {
-        self.state.lock().expect("cache state lock").remove(key);
-    }
-
     /// 关掉这个缓存服务：监听与已建立的连接一起断，客户端会看到连接被重置。
     fn stop(&self) {
         if let Ok(mut listener) = self.listener.lock()
@@ -4087,7 +4011,7 @@ impl CacheFixture {
 }
 
 /// 上传存储的全部环境变量：显式移除它们，让"没配"是真的没配（本机 `.env` 或 shell 里可能有）。
-const UPLOAD_ENV_NAMES: [&str; 14] = [
+const UPLOAD_ENV_NAMES: [&str; 12] = [
     "UPLOAD_STORAGE_REGION",
     "UPLOAD_STORAGE_BUCKET",
     "UPLOAD_STORAGE_ENDPOINT",
@@ -4098,8 +4022,6 @@ const UPLOAD_ENV_NAMES: [&str; 14] = [
     "UPLOAD_MAX_BUFFER_BYTES",
     "UPLOAD_REQUEST_TIMEOUT_SECONDS",
     "UPLOAD_SLOW_READ_TIMEOUT_SECONDS",
-    "UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW",
-    "UPLOAD_RATE_LIMIT_WINDOW_MS",
     "UPLOAD_RETRY_MAX_ATTEMPTS",
     "UPLOAD_RETRY_BACKOFF_BASE_SECONDS",
 ];
@@ -4166,14 +4088,6 @@ fn apply_upload_env(command: &mut Command, upload: Option<&UploadStorageFixture>
             upload
                 .retry_backoff_base_seconds
                 .map(|value| value.to_string()),
-        ),
-        (
-            "UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW",
-            upload.rate_limit.map(|value| value.0.to_string()),
-        ),
-        (
-            "UPLOAD_RATE_LIMIT_WINDOW_MS",
-            upload.rate_limit.map(|value| value.1.to_string()),
         ),
     ] {
         if let Some(value) = value {

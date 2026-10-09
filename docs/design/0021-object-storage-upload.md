@@ -1,7 +1,7 @@
 主题: 对象存储上传：模块划分、签名与上传存储配置
-当前修订: v3
+当前修订: v4
 状态: 已接受
-承接: [图片上传与对象存储 Spec v2](../specs/0007-image-upload-and-object-storage.md) §2–§8；并与[同步图片网关 Spec v3](../specs/0005-synchronous-image-gateway.md) §1、§3 的输入图片形态收敛同一变更实施；生成入口的指纹输入域与验收见 Spec 0005 §4、§8（A12）。
+承接: [图片上传与对象存储 Spec v4](../specs/0007-image-upload-and-object-storage.md) §2–§8；并与[同步图片网关 Spec v8](../specs/0005-synchronous-image-gateway.md) §1、§3 的输入图片形态收敛同一变更实施；生成入口的指纹输入域与验收见 Spec 0005 §4、§8（A12）。
 依赖: [架构治理](../architecture.md)、[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md)、[同步网关设计](0017-synchronous-image-gateway.md) §2、[图片透传决定](../adr/0019-images-pass-through-without-asset-storage.md)（结果侧不落盘与只有同步形态的结论继续适用）、[参考图上传决定](../adr/0022-reference-image-upload-endpoint.md)
 
 # 对象存储上传：模块划分、签名与上传存储配置
@@ -25,7 +25,7 @@
 
 上传的本机许可、字节预算与断开检测落在 [`apps/api/src/supervisor.rs`](../../apps/api/src/supervisor.rs)：在现有 Supervisor 上加**第二套上传读名额与独立字节预算**（`UPLOAD_SLOTS` / `UPLOAD_MAX_BUFFER_BYTES`），不挤占生成的 `GENERATION_READ_SLOTS` / `GENERATION_MAX_MEMORY_BYTES`；装配期做上传侧容量组合校验，`UPLOAD_SLOTS × 单次上传预留 ≤ UPLOAD_MAX_BUFFER_BYTES`，其中单次上传预留就是 `UPLOAD_MAX_REQUEST_BYTES`、不另立常数，配不出可用容量就拒绝启动。上传正文的慢读超时取独立的 `UPLOAD_SLOW_READ_TIMEOUT_SECONDS`，不复用生成的 `GENERATION_SLOW_READ_TIMEOUT_SECONDS`（对应 Spec 0007 A9 的受理前 `408`）。连接断开监视与停机排空是进程级机制（连接注册表、Supervisor），上传与生成共用，不新建模块。上传的读取许可或内存预算任一取不到都对客返回 `429 upload_busy`，不排队：上传是一次性、可稍后重试的独立操作，回 `429` 比生成侧容量不足的 `503 platform_unavailable`（[Spec 0005](../specs/0005-synchronous-image-gateway.md) §3）更准确，调用方也能按 `Retry-After` 稍后重试。
 
-上传的请求级限流复用既有的每 API Key 计数机制（[`AccelerationService::consume_request_slot`](../../crates/application/src/lib.rs) 读写的缓存窗口计数），但用独立键前缀：生成是 `rate_limit:{key_id}:{window}`，上传是 `upload_rate_limit:{key_id}:{window}`，两边的窗口计数互不相干，上传不挤占生成的每 API Key 配额。计数仍在缓存、缓存不可用时放行，语义与生成一致；上传的窗口与次数上限由 `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` 与 `UPLOAD_RATE_LIMIT_WINDOW_MS` 给出（§3）。
+上传**没有请求级速率限制**：平台不按 API Key 计每分钟上传次数。上传的过载保护是**本机上传并发与内存预算**（§3），超出回 `429 upload_busy`；缓存里只有余额快照、公开鉴权端点计数与 route 条目这几个命名空间。
 
 ## 2. 生成入口的输入形态收敛
 
@@ -55,8 +55,6 @@ AIHubMix 的取图路径形态不变：它的 edits 端点要文件部件，所�
 | 环境变量（本机上限） | `UPLOAD_MAX_BUFFER_BYTES` | 本机上传内存预算，取值在实施时定 |
 | 环境变量（本机上限） | `UPLOAD_REQUEST_TIMEOUT_SECONDS` | 单次写入的对象存储请求超时，取值在实施时定 |
 | 环境变量（本机上限） | `UPLOAD_SLOW_READ_TIMEOUT_SECONDS` | 上传正文从开始接收到读完的上限，超时按受理前 `408 request_timeout` 终止；取值在实施时定 |
-| 环境变量（上传限流） | `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` | 每 API Key 每窗口允许的上传请求数；默认值在实施时定 |
-| 环境变量（上传限流） | `UPLOAD_RATE_LIMIT_WINDOW_MS` | 上传限流窗口的毫秒数；默认值在实施时定 |
 | 环境变量（上传重试） | `UPLOAD_RETRY_MAX_ATTEMPTS` | 单次上传写入的总尝试次数上限；取值在实施时定 |
 | 环境变量（上传重试） | `UPLOAD_RETRY_BACKOFF_BASE_SECONDS` | 固定退避基准秒数，对象存储未给出 `Retry-After` 时按它等待；取值在实施时定 |
 
@@ -149,7 +147,7 @@ AIHubMix 的取图路径形态不变：它的 edits 端点要文件部件，所�
 3. 应用用例：`ImageUploadService`（校验媒体与上限、构造对象键、写入、元数据核验、组装结果）与配置装载。验证：用假对象存储端口覆盖成功、各失败分类、重试耗尽与禁覆盖冲突；配置整组缺失时上传返回 `503 upload_storage_unavailable`；断言上传不触碰资金与执行记录端口；断言密钥按请求解析、不落进服务对象或日志。进程是否拒绝启动不在本片断言。
 4. API 与进程装配：客户侧上传路由自带正文上限（路由级 `DefaultBodyLimit::max(UPLOAD_MAX_REQUEST_BYTES)`，不受合并后 app 的全局 16 MiB 正文上限约束），其超限拒绝映射成平台错误信封 `413 request_too_large`；[`apps/api/src/main.rs`](../../apps/api/src/main.rs) 装配期调用 `ImageUploadService` 的配置装载，形状不合法即拒绝启动；[`apps/api/src/supervisor.rs`](../../apps/api/src/supervisor.rs) 加第二套上传读名额与独立字节预算，含 `UPLOAD_SLOTS × UPLOAD_MAX_REQUEST_BYTES ≤ UPLOAD_MAX_BUFFER_BYTES` 组合校验。验证：`apps/api/tests/http_contract/` 的端到端用例加进程内假对象存储，覆盖 Spec 0007 的 A1–A11（A3 拆为 A3a 与 A3b），并必须真发一个整体合法、请求体超过全局 16 MiB 的 multipart 请求（单文件仍在 20 MiB 上限内）证明 A3b——路由级 `DefaultBodyLimit` 覆盖了全局 16 MiB 正文上限，不能只靠声明 `Content-Length`；进程级启动拒绝用例对齐 `harness.rs` 的 `probe_api_startup_*` 形态；断言无效凭证在正文前被拒、上传前后账户与账本不变。
 5. 生成入口收敛与用例同步：`interpret_current_inputs` 只构造公网 URL 形态，`data:` URL、multipart 文件部件与其余非法取值被拒，拒绝发生在幂等预查之后；删除 `InputImage::DataUrl` 与 `from_raw`、adapter 侧的 `DataUrl` 分支、APIMart 的内联上传通路、对应用例与 harness 的上传闸门（§2）。测试面跟着收：仓库里 `data:image` 约 82 处、横跨 22 个文件，至少点名 `apps/api/tests/http_contract/cases_identity.rs`（新增 `/v1` 路由会被它打红，需补探针体）、`cases_aihubmix.rs`、`cases_apimart.rs`、`cases_direct_execution.rs`（含峰值 RSS 用例与 `one_execution_reservation_bytes()`，那组预算常数按 data URL 实测钉的，需重定）、`cases_parameters.rs`、`cases_parameter_mapping.rs`、`cases_retry.rs`、`cases_routing.rs`、`cases_kill_matrix.rs`，以及 `crates/domain/src/image_parameters/tests.rs`、`crates/application/src/tests/request_preparation.rs`，和直接引用被删变体的四个文件：`crates/application/src/direct_execution/tests.rs`（构造 `InputImage::DataUrl` 的夹具）、`crates/adapter-sdk/src/gateway/tests.rs`（约 5 处 data URL 取值与 `InputImage::DataUrl` 断言）、`crates/adapter-aihubmix/src/tests.rs`（约 18 处 data URL 取值）与 `apps/api/src/tests.rs`（`max_wire_request_body()` 按 data URL 贴入口上限构造，另有两处 `InputImage::from_raw`）。这四个文件直接引用被删的变体，处理边界见 §2。验证：端到端用例覆盖 Spec 0005 的 A12 与 A2，含以 `data:` URL 受理的历史记录在改版后仍按原记录回应。
-6. 文档、配置与残留说法同步（这些「当前状态」文档在实现落地前继续描述代码事实，实施时才改）：落点不手抄——新文件（`crates/domain/src/upload_media.rs`、`crates/application/src/image_upload.rs`、`crates/adapter-object-storage`）与 `apps/api/src/supervisor.rs` 第二套名额由源码本身承载；根 `CONTEXT.md` 增补上传存储与对象键的术语；`docs/operations/configuration.md` §10 与 `.env.example` 增补 §3 的变量与取值形态，其中 `UPLOAD_SLOW_READ_TIMEOUT_SECONDS`、`UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW`、`UPLOAD_RATE_LIMIT_WINDOW_MS`、`UPLOAD_RETRY_MAX_ATTEMPTS`、`UPLOAD_RETRY_BACKOFF_BASE_SECONDS` 至少点名前五条（环境变量的属主是配置文档，§3 是设计侧拥有取值域的完整清单，待同步的上传变量共 10 条）；`docs/operations/production.md` §2.4 的反向代理正文上限同步为盖住上传路由的 `UPLOAD_MAX_REQUEST_BYTES`，不能只按生成入口的 16 MiB 写（Spec 0007 §8）；新增 `docs/verification/object-storage-upload.md` 受控验证清单（真实桶四步自检、平台签名的受控探针上传、canonical URI 必查项与对象清理，运行方式见该清单）；清掉两份 Spec 之外的旧说法（`README.md`、`docs/design/0002`、`docs/design/0004`、`docs/design/0017`、`docs/design/0018`、`docs/facts/channel-facts.md` 的平台侧叙述）与代码注释里收敛前的 data URL 说法（`crates/application/src/request_fingerprint.rs`、`crates/application/src/direct_execution.rs`、`apps/api/src/main.rs`）。验证：本片新增与改写的相对链接逐条解析、章节引用与被引文件的实际章节号一致；上面点到名的「当前状态」文档里不再有把 `data:` URL 或 multipart 文件部件当生成入口合法取值的现行叙述，也没有与本变更冲突的对象存储「不存在这一层」的说法；`docs/operations/configuration.md` §10 与 `.env.example` 的变量集合与 §3 表一致，五条要点名的变量都在。
+6. 文档、配置与残留说法同步（这些「当前状态」文档在实现落地前继续描述代码事实，实施时才改）：落点不手抄——新文件（`crates/domain/src/upload_media.rs`、`crates/application/src/image_upload.rs`、`crates/adapter-object-storage`）与 `apps/api/src/supervisor.rs` 第二套名额由源码本身承载；根 `CONTEXT.md` 增补上传存储与对象键的术语；`docs/operations/configuration.md` §10 与 `.env.example` 增补 §3 的变量与取值形态，其中 `UPLOAD_SLOTS`、`UPLOAD_SLOW_READ_TIMEOUT_SECONDS`、`UPLOAD_RETRY_MAX_ATTEMPTS`、`UPLOAD_RETRY_BACKOFF_BASE_SECONDS`、`UPLOAD_MAX_REQUEST_BYTES` 至少点名前五条（环境变量的属主是配置文档，§3 是设计侧拥有取值域的完整清单）；`docs/operations/production.md` §2.4 的反向代理正文上限同步为盖住上传路由的 `UPLOAD_MAX_REQUEST_BYTES`，不能只按生成入口的 16 MiB 写（Spec 0007 §8）；新增 `docs/verification/object-storage-upload.md` 受控验证清单（真实桶四步自检、平台签名的受控探针上传、canonical URI 必查项与对象清理，运行方式见该清单）；清掉两份 Spec 之外的旧说法（`README.md`、`docs/design/0002`、`docs/design/0004`、`docs/design/0017`、`docs/design/0018`、`docs/facts/channel-facts.md` 的平台侧叙述）与代码注释里收敛前的 data URL 说法（`crates/application/src/request_fingerprint.rs`、`crates/application/src/direct_execution.rs`、`apps/api/src/main.rs`）。验证：本片新增与改写的相对链接逐条解析、章节引用与被引文件的实际章节号一致；上面点到名的「当前状态」文档里不再有把 `data:` URL 或 multipart 文件部件当生成入口合法取值的现行叙述，也没有与本变更冲突的对象存储「不存在这一层」的说法；`docs/operations/configuration.md` §10 与 `.env.example` 的变量集合与 §3 表一致，五条要点名的变量都在。
 
 第 1→2→3→4 片按端口依赖串行（第 2 片定义端口与 DTO，第 3 片消费它）；第 5 片与第 4 片改同一批入口文件，必须串行实施，不能并行编辑；第 5 片与第 6 片同样改同一批文件（用例与文档），也必须串行。
 

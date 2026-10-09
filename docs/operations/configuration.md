@@ -29,8 +29,6 @@
 | 变量 | 缺省 | 说明 |
 | --- | --- | --- |
 | `GENERATION_MAX_COST_MICROUSD` | `20000` | **兜底保底额**（CNY 微单位，`20000` = 0.02 元）：只有查不到该供给的保底表时，才用它算这次请求要预扣多少。名字里的 `usd` 是历史命名 |
-| `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | **每把 API Key** 每窗口能提交的生成请求数（请求进来就计数，与它跑多久无关）。计数落在缓存里；超限回 `429 rate_limit_exceeded` 带 `Retry-After`（本窗口剩余秒数）。缓存不可用时**放行**——它是保护机制，不是准入 |
-| `GENERATION_RATE_LIMIT_WINDOW_MS` | `60000` | 上一项的窗口长度（缺省 60 秒，即每分钟 60 次） |
 | `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` | `10` | 公开鉴权端点（`<ENDPOINT>` 取 `REGISTER` / `LOGIN` / `REDEEM`）每窗口的失败尝试上限；超限对客 `429 rate_limit_exceeded` 带 `Retry-After` |
 | `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS` | `60000` | 上述三个端点各自的计数窗口 |
 | `AUTH_SOURCE_HEADER` | 不设 | 公开鉴权来源维采信的受信头（如 `x-real-ip`）；**不设时退回连接对端地址**。采信它要求 API 不能被绕过代理直连——直连时这个头谁都能写 |
@@ -137,7 +135,7 @@ Worker 每轮跑异常对账：接管租约过期的执行、按已知句柄只�
 
 缓存**不是事实来源**：余额以数据库为准，不可达时读写都当未命中，不挂住请求。所以 Redis 故障是**降级**，不是故障。取值理由见[加速层](../../.agents/notes/implemented/platform/2026-09-22-redis-acceleration-layer.md)与[余额缓存的版本守卫](../../.agents/notes/implemented/platform/2026-09-30-account-balance-cache-version-guard.md)。
 
-受理**不从缓存取候选**：直接执行每次受理直读数据库的 `supply` 候选查询。缓存里只放提交后的余额快照（写穿）、每把 API Key 的速率计数、公开鉴权端点的失败尝试计数（按端点、来源与身份），以及历史 route 条目——后者由对账器按修订标识与网关模型开关清理，并写 `cache.route_invalidated` 审计。
+受理**不从缓存取候选**：直接执行每次受理直读数据库的 `supply` 候选查询。缓存里只放提交后的余额快照（写穿）、公开鉴权端点的失败尝试计数（按端点、来源与身份），以及历史 route 条目——后者由对账器按修订标识与网关模型开关清理，并写 `cache.route_invalidated` 审计。
 
 ## 5. 渠道凭证
 
@@ -214,8 +212,6 @@ Worker 每轮跑异常对账：接管租约过期的执行、按已知句柄只�
 | `UPLOAD_MAX_BUFFER_BYTES` | `100663296`（96 MiB） | 本机上传内存预算 |
 | `UPLOAD_REQUEST_TIMEOUT_SECONDS` | `30` | 单次写对象存储的请求超时 |
 | `UPLOAD_SLOW_READ_TIMEOUT_SECONDS` | `30` | 上传正文从开始接收到读完的上限；超时在受理前回 `408 request_timeout`，此时没有对象被写入 |
-| `UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW` | `60` | 每 API Key 每窗口允许的上传请求数。上传的计数键与生成分开，不挤占生成的每 API Key 配额；超限回 `429 rate_limit_exceeded` |
-| `UPLOAD_RATE_LIMIT_WINDOW_MS` | `60000` | 上传限流窗口的毫秒数 |
 | `UPLOAD_RETRY_MAX_ATTEMPTS` | `3` | 单次上传写入的总尝试次数上限 |
 | `UPLOAD_RETRY_BACKOFF_BASE_SECONDS` | `1` | 固定退避基准秒数；对象存储未给出有界整数秒 `Retry-After` 时按它等待 |
 

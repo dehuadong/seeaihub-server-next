@@ -165,7 +165,6 @@ fn config(storage: Option<UploadStorageConfig>, retry_max_attempts: u32) -> Imag
         slow_read_timeout: Duration::from_secs(1),
         retry_max_attempts,
         retry_backoff_base: Duration::from_millis(1),
-        rate_limit: GenerationRateLimit::default_limit(),
     }
 }
 

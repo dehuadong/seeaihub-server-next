@@ -1,5 +1,5 @@
 主题: 同步图片网关执行与异常对账
-当前修订: v3
+当前修订: v4
 状态: 已接受
 承接: [同步图片网关 Spec v1](../specs/0005-synchronous-image-gateway.md) §1–§8
 依赖: [架构治理](../architecture.md)、[合同与映射](0005-vendor-model-contract-and-offering-mapping.md)、[定价结算](0007-pricing-floor-and-settlement.md)、[账户资金](0013-account-funds-and-reservations.md)
@@ -126,7 +126,6 @@ API Supervisor 拥有每个新执行任务、token、内存输入、permit 与 o
 
 | 资源 | 控制机制 | 生命周期 |
 | --- | --- | --- |
-| 每 API Key 请求速率 | Redis 原子计数脚本与 TTL；失败按现有规则放行 | 固定窗口；本机准入兜住降级负载 |
 | 本机正文读取与解析 | 在 Body extractor 前 `try_acquire` permit，按字节限额读取；拒绝不排无界等待 | 从接收正文到输入移入执行；Body 慢读有超时 |
 | 本机执行与峰值内存 | 固定执行槽位与字节预算；配置允许最大请求+最大响应+解析/编码副本时预留足够额度 | 覆盖执行、断开后收尾及响应发送；不能执行一结束就释放全部内存许可 |
 | 账户在某模型上的并发 | PostgreSQL（按 `generation.jobs` 计数），与受理同事务、账户行锁下判定；名额取自该模型行（列必填，运营在发布或编辑时给） | 正常执行与中间安全重试；终态或转对账释放，不代替 Hold |

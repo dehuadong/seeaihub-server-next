@@ -835,250 +835,124 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     harness.cleanup().await;
 }
 
-/// **每把密钥的每分钟请求数**：窗口内超过上限 ⇒ 429 且带 `Retry-After`；到了别的窗口恢复正常。
+/// **平台不按 API Key 的请求速率拒绝**（Spec 0005 A14、Spec 0004 A11）：同一把密钥连发 **61** 次
+/// 生成请求（原来的每分钟上限是 60）全部被受理，没有一次 `rate_limit_exceeded`。
 ///
-/// 上限调到 1 次，第二次请求就能看到越限那条路，不必发满默认的 60 次。
+/// 61 次分四波并发发出（每波 16 条，低于渠道全局未决上限），整段跑在同一个 60 秒窗口里；串行
+/// 发完要等每条的同步窗口，会把它们分散到窗口之外，"同一窗口"这个前提就不成立了。
 ///
-/// 两次请求要在同一个窗口里，所以先等出足够的窗口余量（见 [`wait_for_window_margin`]）：贴着
-/// 边界跑的话，第二次请求可能落到下一个窗口，断言就会时好时坏。
-///
-/// "别的窗口"用**删掉这条计数**来构造，而不是等窗口过去：键里带着窗口序号，计数消失就等于到了
-/// 别的窗口；删掉之后从 1 重新数起，它同时验了各窗口各算各的。
-///
-/// 计数落在**缓存**里，所以夹具可以直接读它、删它：这也顺带证明判定真的走了缓存。
-///
-/// 窗口取 60 秒而不是 10 秒：第一次请求在窗口里要等同步窗口到期（装置给的下限是 10 秒），窗口太短
-/// 的话第二次请求会落到**下一个**窗口里，那时计数从 1 重新数起，越限就看不到了。窗口长度是本用例
-/// 自己选的，放松它不改变要验的判定。
+/// 它同时证明缓存里不再有每密钥的速率计数：那一层已经没有地方可落。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn requests_above_the_per_key_rate_limit_are_rejected_with_retry_after() {
-    const WINDOW_MS: u64 = 60_000;
-    // 两次请求加清理要在窗口里跑完：第一次请求在窗口里要等同步窗口到期，余量按 30 秒取。
-    const WINDOW_MARGIN_MS: u64 = 30_000;
+async fn many_requests_in_one_window_are_all_accepted() {
+    const REQUESTS: usize = 61;
+    const WAVE: usize = 16;
 
-    let harness = Harness::start_with_cache_and_rate_limit(
+    // 本机执行名额与渠道未决上限都抬到 64：这条用例要验的是"没有按请求速率的拒绝"，
+    // 不该被容量闸门挡住（那两者回 503，与本用例的判据无关）。
+    let harness = Harness::build(
         candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
         None,
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
         64,
         1,
-        CacheFixture::start(CacheSettings::default()).await,
-        ApiRateLimit::once_per(WINDOW_MS),
+        CaseSettings {
+            api: ApiProcessSettings {
+                cache: Some(CacheFixture::start(CacheSettings::default()).await),
+                // 本机执行名额按"内存预算 ÷ 单次预留"推导：给足预算，并发 16 就不会撞容量。
+                max_memory_bytes: Some(64 * 1024 * 1024 * 1024),
+                channel_max_in_flight: Some(64),
+                ..ApiProcessSettings::default()
+            },
+            markup_bps: None,
+        },
     )
     .await;
     let client = Client::new();
     assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
-    let (account_id, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-
-    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
-
-    let first = post_json(
+    let (account_id, api_key) = funded_account(
+        &client,
         &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &format!("rate-first-{}", Uuid::new_v4()),
-        &route_request(harness.model, "the first request of this window"),
+        &harness.admin_token,
+        200_000_000,
     )
     .await;
-    assert_eq!(first.0, StatusCode::GATEWAY_TIMEOUT, "got {}", first.1);
-    // 计数落缓存：键里带着"哪把密钥 + 哪个窗口"，值是那个窗口已经数到几。
-    let counter_key = {
-        let state = harness.cache().state.lock().expect("cache state lock");
-        let (key, value) = state
-            .iter()
-            .find(|(key, _)| key.starts_with("rate_limit:"))
-            .map(|(key, entry)| (key.clone(), entry.value.clone()))
-            .expect("速率计数必须落在缓存里");
-        assert_eq!(
-            serde_json::from_str::<Value>(&value).expect("cache values are JSON")["count"],
-            json!(1),
-            "第一次请求数到 1：{value}"
-        );
-        key
-    };
 
-    // 同一个窗口里的第二次：越限。对客要能把它与"并发超限"分开，并知道多久之后能再来。
-    let response = client
-        .post(format!("{}/v1/images/generations", harness.base_url))
-        .bearer_auth(&api_key)
-        .header("idempotency-key", format!("rate-second-{}", Uuid::new_v4()))
-        .json(&route_request(
-            harness.model,
-            "the second request of this window",
-        ))
-        .send()
-        .await
-        .expect("rate limited request");
-    let status = response.status();
-    let retry_after = response
-        .headers()
-        .get("retry-after")
-        .and_then(|value| value.to_str().ok())
-        .map(str::to_owned);
-    let body: Value =
-        serde_json::from_str(&response.text().await.expect("rate limited response body"))
-            .expect("rate limited response is JSON");
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "got {body}");
-    // 与"并发超限"用不同的码：那个是"上一个还没跑完"，这个是"这一分钟发得太密"。
-    assert_eq!(body["error"]["code"], json!("rate_limit_exceeded"));
-    let retry_after = retry_after.expect("越限必须给出 Retry-After");
-    let seconds: u64 = retry_after.parse().expect("Retry-After 是秒数");
-    assert!(
-        (1..=WINDOW_MS / 1_000).contains(&seconds),
-        "Retry-After 是到下一个窗口的秒数，落在 1..=窗口长度 里，实得 {seconds}"
-    );
+    let started = std::time::Instant::now();
+    let mut sent = 0;
+    while sent < REQUESTS {
+        let mut handles = Vec::new();
+        for index in sent..(sent + WAVE).min(REQUESTS) {
+            let base_url = harness.base_url.clone();
+            let api_key = api_key.clone();
+            let key = format!("no-rate-limit-{index}-{}", Uuid::new_v4());
+            let request = route_request(harness.model, &format!("burst {index}"));
+            handles.push(tokio::spawn(async move {
+                post_json(
+                    &base_url,
+                    &api_key,
+                    "/v1/images/generations",
+                    &key,
+                    &request,
+                )
+                .await
+            }));
+        }
+        for (offset, handle) in handles.into_iter().enumerate() {
+            let (status, body) = handle.await.expect("a burst request");
+            assert_ne!(
+                status,
+                StatusCode::TOO_MANY_REQUESTS,
+                "第 {} 次被拒了：{body}",
+                sent + offset
+            );
+            assert_ne!(
+                body["error"]["code"],
+                json!("rate_limit_exceeded"),
+                "不该再有按请求速率的拒绝：{body}"
+            );
+            // 受理之后在上游那一步失败是预期的；容量与余额那两种说明根本没被受理。
+            assert_ne!(
+                body["error"]["code"],
+                json!("platform_unavailable"),
+                "第 {} 次没被受理（容量）：{status} {body}",
+                sent + offset
+            );
+            assert_ne!(
+                body["error"]["code"],
+                json!("insufficient_balance"),
+                "第 {} 次没被受理（余额）：{status} {body}",
+                sent + offset
+            );
+        }
+        sent += WAVE;
+    }
 
-    // 别的窗口：这条计数不在，于是从 1 重新数起——请求照常受理。
-    harness.cache().delete(&counter_key);
-    let next = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &format!("rate-next-window-{}", Uuid::new_v4()),
-        &route_request(harness.model, "the next window"),
-    )
-    .await;
-    assert!(
-        next.0.is_server_error(),
-        "别的窗口里照常受理（受理之后在上游那一步失败）：{}",
-        next.1
-    );
-
-    // 两次受理各占一笔预授权：只有被限流拒掉的那一次既没建 Job 也没扣款。确切数由定价决定，
-    // 所以从库里读出来比对着算。
-    let hold: i64 =
-        sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE account_id = $1")
-            .bind(Uuid::parse_str(&account_id).expect("account id"))
-            .fetch_one(&harness.pool)
-            .await
-            .expect("受理必然记下这次的预授权额");
-    // 预授权是同一次请求内的中间态：两次受理最后都收尾了，所以占用归零、余额没被预授权动过
-    // （实收按对客费率向量结算，两次都失败在上游时实收为零）。被限流拒的那次连 Job 都没有。
-    let _ = hold;
-    assert_eq!(database_balance(&harness, &account_id).await, 1_000_000);
-    let held_total: i64 =
-        sqlx::query_scalar("SELECT held_microusd FROM ledger.accounts WHERE id = $1")
-            .bind(Uuid::parse_str(&account_id).expect("account id"))
-            .fetch_one(&harness.pool)
-            .await
-            .expect("account held");
-    assert_eq!(held_total, 0, "在飞结束后占用应当归零");
+    // 每一次都被受理、每一次留下一个 Job。
     let jobs: i64 =
         sqlx::query_scalar("SELECT count(*) FROM generation.jobs WHERE account_id = $1")
             .bind(Uuid::parse_str(&account_id).expect("account id"))
             .fetch_one(&harness.pool)
             .await
             .expect("job count");
-    assert_eq!(
-        jobs, 2,
-        "受理了两次（本窗口一次、别的窗口一次），越限拒掉的那次没有留下 Job"
+    assert_eq!(jobs, REQUESTS as i64, "61 次都要被受理");
+
+    // 61 次要落在同一个 60 秒窗口里：跨窗口的话"每窗口 60 次"这种限流也能放过它们。
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(60),
+        "这批请求要在同一个 60 秒窗口里跑完，实际用了 {:?}",
+        started.elapsed()
     );
 
-    harness.cleanup().await;
-}
-
-/// **缓存不可用时限流放行**：计数已经数到上限，但缓存服务停掉之后同一个窗口里的请求照样过去。
-///
-/// 这条是"限流是保护不是准入"的落地：读不到计数就当作这个窗口还没数过。反过来（读不到就拒）
-/// 会让加速层的一次降级把全部请求拒掉——一次降级放大成一次故障。
-///
-/// 判定分两层：响应**不是** 429，而且缓存里那条计数的值也没被改过——写入同样失败了，请求却
-/// 照样走到了钱那一关。因此它证明的是"缓存整条不可用时限流放行"，而不是"计数恰好没读到"。
-#[tokio::test]
-#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn an_unavailable_cache_lets_requests_through_instead_of_rate_limiting_them() {
-    let harness = Harness::start_with_cache_and_rate_limit(
-        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
-        None,
-        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
-        64,
-        1,
-        CacheFixture::start(CacheSettings::default()).await,
-        ApiRateLimit::once_per(3_000),
-    )
-    .await;
-    let client = Client::new();
-    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
-    let (account_id, api_key) =
-        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-
-    // 第一个请求把速率计数数到 1（上限也是 1），并占住一笔预授权。
-    let (first, first_body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &format!("limit-down-first-{}", Uuid::new_v4()),
-        &route_request(harness.model, "fills this window"),
-    )
-    .await;
-    assert_eq!(first, StatusCode::GATEWAY_TIMEOUT, "got {first_body}");
-    let hold: i64 =
-        sqlx::query_scalar("SELECT max_cost_microusd FROM generation.jobs WHERE account_id = $1")
-            .bind(Uuid::parse_str(&account_id).expect("account id"))
-            .fetch_one(&harness.pool)
-            .await
-            .expect("受理必然记下这次的预授权额");
-
-    // 记下这条计数（键 + 值），等会儿要比对"缓存不可用期间的请求没有改动它"。
-    let counter = {
+    // 缓存里没有按密钥的速率计数：公开鉴权端点的失败尝试键（`rate_limit:auth:…`）不算。
+    let counters = {
         let state = harness.cache().state.lock().expect("cache state lock");
         state
-            .iter()
-            .find(|(key, _)| key.starts_with("rate_limit:"))
-            .map(|(key, entry)| (key.clone(), entry.value.clone()))
-            .expect("速率计数必须落在缓存里")
+            .keys()
+            .filter(|key| key.starts_with("rate_limit:") && !key.starts_with("rate_limit:auth:"))
+            .count()
     };
-
-    harness.cache().stop();
-    // 把余额压到保底额以下（而不是靠"充值数减保底额"这种算术）：这样第二个请求能走到扣款那一关，
-    // 但一定扣不动——它被拒只能是钱的事，不会是限流。
-    assert!(hold > 1, "保底额太小，构造不出'钱不够'的情形：{hold}");
-    sqlx::query("UPDATE ledger.accounts SET balance_microusd = $2 WHERE id = $1")
-        .bind(Uuid::parse_str(&account_id).expect("account id"))
-        .bind(hold - 1)
-        .execute(&harness.pool)
-        .await
-        .expect("lower the balance below the hold");
-
-    // 同一个窗口里的第二次：计数读不出来，于是**放行**。
-    let key = format!("limit-down-second-{}", Uuid::new_v4());
-    let (status, body) = post_json(
-        &harness.base_url,
-        &api_key,
-        "/v1/images/generations",
-        &key,
-        &route_request(harness.model, "the cache is gone"),
-    )
-    .await;
-    assert_ne!(
-        status,
-        StatusCode::TOO_MANY_REQUESTS,
-        "缓存不可用时限流必须放行：{body}"
-    );
-    assert_eq!(
-        body["error"]["code"],
-        json!("insufficient_balance"),
-        "它必须真的走到扣款那一步：{body}"
-    );
-    let jobs: i64 = sqlx::query_scalar(
-        "SELECT count(*) FROM generation.jobs WHERE idempotency_key_digest = $1",
-    )
-    .bind(idempotency_key_digest(&key))
-    .fetch_one(&harness.pool)
-    .await
-    .expect("job count");
-    assert_eq!(
-        jobs, 0,
-        "余额不够的受理不建 Job，但它是被钱拒的，不是被限流拒的"
-    );
-    let counter_now = harness.cache().raw(&counter.0);
-    assert_eq!(
-        counter_now.as_deref(),
-        Some(counter.1.as_str()),
-        "缓存不可用期间写入也失败：计数没有被改动，请求却照样过去了"
-    );
+    assert_eq!(counters, 0, "缓存里不再有按密钥的速率计数");
 
     harness.cleanup().await;
 }

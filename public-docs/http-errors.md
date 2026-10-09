@@ -31,7 +31,7 @@
 | `409` | 生成：`result_not_retained` | 原请求已完成并结算，图片无法重放；新键代表新的计费请求。 |
 | `413` | 上传：`image_too_large`、`request_too_large`；生成请求体也可能过大 | 缩小文件或请求体。 |
 | `415` | JSON 生成入口 | 检查 `Content-Type: application/json`。响应可能是普通文本。 |
-| `429` | 上传、生成：`rate_limit_exceeded`；生成：`too_many_in_flight`；上传：`upload_busy` | 请求过密或并发已满；响应带 `Retry-After` 时按其秒数等待。 |
+| `429` | 生成：`too_many_in_flight`；上传：`upload_busy`；公开登录类端点：`rate_limit_exceeded` | 并发已满（按模型）或尝试过密（公开登录类端点）；响应带 `Retry-After` 时按其秒数等待。 |
 | `500` | 查询、上传、生成：`internal_error` | 服务内部故障。生成失败时保存原幂等键，避免重复提交。 |
 | `502` | 生成：`outcome_unknown` | 结果或费用未确认，保持原幂等键，不要自动换键重试。 |
 | `502` | 生成：`platform_unavailable` | 本次生成未能完成。 |

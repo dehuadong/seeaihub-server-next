@@ -556,47 +556,41 @@ async fn an_exhausted_upload_slot_returns_429_upload_busy() {
     harness.cleanup().await;
 }
 
-/// A6：上传速率用独立命名空间，不挤占生成的每 API Key 配额。
+/// A6：平台不按 API Key 的上传请求速率拒绝——同一把密钥连发 **61** 张全部成功，没有一次
+/// `rate_limit_exceeded`。
 ///
-/// 两次上传之间夹着一次生成，这段要在同一个窗口里跑完：CI 运行 37553143246 的日志里约 1 秒，
-/// 余量取 5 秒（见 [`wait_for_window_margin`]）。
+/// 上传的过载保护只剩本机上传并发与内存预算（超出回 `429 upload_busy`），以及对象存储自己的失败面。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn the_upload_rate_limit_does_not_spend_the_generation_quota() {
-    const WINDOW_MS: u64 = 60_000;
-    const WINDOW_MARGIN_MS: u64 = 5_000;
+async fn many_uploads_in_a_row_are_all_accepted() {
+    const UPLOADS: usize = 61;
 
-    let cache = CacheFixture::start(CacheSettings::default()).await;
-    let mut upload = upload_storage();
-    upload.rate_limit = Some((1, WINDOW_MS));
-    let harness =
-        Harness::start_with_upload_storage_and_cache(upload, UpstreamBehaviour::apimart(), cache)
+    // 带上缓存：上传那一层速率计数原本落在缓存里，不配缓存这条用例证明不了什么。
+    let harness = Harness::start_with_upload_storage_and_cache(
+        upload_storage(),
+        UpstreamBehaviour::apimart(),
+        CacheFixture::start(CacheSettings::default()).await,
+    )
+    .await;
+
+    for index in 0..UPLOADS {
+        let (status, body) = harness
+            .upload(file_part(PNG_FIXTURE, "burst.png", Some("image/png")))
             .await;
-    wait_for_window_margin(WINDOW_MS, WINDOW_MARGIN_MS).await;
+        assert_eq!(status, StatusCode::OK, "第 {index} 张被拒：{body}");
+        assert!(body["url"].as_str().is_some(), "上传成功要回 URL：{body}");
+    }
 
-    let (status, body) = harness
-        .upload(file_part(PNG_FIXTURE, "one.png", Some("image/png")))
-        .await;
-    assert_eq!(status, StatusCode::OK, "{body}");
+    // 缓存里没有上传的速率计数：那一层已经没有地方可落。
+    let counters = {
+        let state = harness.cache().state.lock().expect("cache state lock");
+        state
+            .keys()
+            .filter(|key| key.starts_with("upload_rate_limit:"))
+            .count()
+    };
+    assert_eq!(counters, 0, "缓存里不再有上传的速率计数");
 
-    // 生成配额仍是空的：上传没有占用它。
-    let key = format!("upload-namespace-{}", Uuid::new_v4());
-    let (status, body) = harness
-        .sync_json(
-            "/v1/images/generations",
-            &key,
-            route_request(harness.model, "namespace probe"),
-        )
-        .await;
-    assert_eq!(status, StatusCode::OK, "上传不挤占生成的配额：{body}");
-    assert_sync_success("上传之后的生成", &body);
-
-    // 上传命名空间的第二个请求越限。
-    let (status, body) = harness
-        .upload(file_part(PNG_FIXTURE, "two.png", Some("image/png")))
-        .await;
-    assert_eq!(status, StatusCode::TOO_MANY_REQUESTS, "{body}");
-    assert_eq!(upload_error_code(&body), "rate_limit_exceeded");
     harness.cleanup().await;
 }
 

@@ -83,7 +83,6 @@ pub use execution_reconciliation::{
 mod image_upload;
 pub use image_upload::{
     DEFAULT_UPLOAD_MAX_BUFFER_BYTES, DEFAULT_UPLOAD_MAX_REQUEST_BYTES,
-    DEFAULT_UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW, DEFAULT_UPLOAD_RATE_LIMIT_WINDOW_MS,
     DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECONDS, DEFAULT_UPLOAD_RETRY_BACKOFF_BASE_SECONDS,
     DEFAULT_UPLOAD_RETRY_MAX_ATTEMPTS, DEFAULT_UPLOAD_SLOTS,
     DEFAULT_UPLOAD_SLOW_READ_TIMEOUT_SECONDS, HeadObjectRequest, ImageUploadConfig,
@@ -1348,61 +1347,8 @@ pub struct CreateImageGenerationRequest {
     pub idempotency_key: String,
 }
 
-/// 每把 API Key 的请求速率上限：**一个窗口**内允许多少次请求，以及这个窗口有多长。
-///
-/// 默认是"每分钟 60 次"，取的是运维口径而不是产品口径：它要挡住的是**一把密钥刷满整个平台**这种
-/// 形态（脚本没退避、密钥被贴进别人的工具里），不是给正常调用方设精算过的档位。因此这个数只保证
-/// "明显异常的密度必然被挡"，正常用量离它很远；要按客户分级，改的是部署期的环境变量，不是这里。
-///
-/// 计数落在缓存里、且**缓存不可用时放行**，理由见 [`AccelerationService::consume_request_slot`]。
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct GenerationRateLimit {
-    pub max_requests: u64,
-    pub window: Duration,
-}
-
-impl GenerationRateLimit {
-    /// 运维默认值：每分钟 60 次。
-    #[must_use]
-    pub fn default_limit() -> Self {
-        Self {
-            max_requests: 60,
-            window: Duration::from_secs(60),
-        }
-    }
-
-    pub fn new(max_requests: u64, window: Duration) -> Result<Self, ApplicationError> {
-        if max_requests == 0 {
-            return Err(ApplicationError::Configuration(
-                "the generation rate limit must allow at least one request per window".to_owned(),
-            ));
-        }
-        // 窗口为 0 时"每个窗口的次数"没有意义，而且 `set` 的存活时间会变成 0。
-        if window.is_zero() {
-            return Err(ApplicationError::Configuration(
-                "the generation rate limit window must be positive".to_owned(),
-            ));
-        }
-        Ok(Self {
-            max_requests,
-            window,
-        })
-    }
-
-    /// 从环境变量读运维取值：`GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` 与
-    /// `GENERATION_RATE_LIMIT_WINDOW_MS`，两项都没给就用默认值。
-    ///
-    /// 窗口按**毫秒**读，好让部署与用例能配到秒以下的窗口；默认值仍是设计里那个"每分钟"。
-    pub fn from_env() -> Result<Self, ApplicationError> {
-        Self::new(
-            rate_limit_env("GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW", 60)?,
-            Duration::from_millis(rate_limit_env("GENERATION_RATE_LIMIT_WINDOW_MS", 60_000)?),
-        )
-    }
-}
-
-/// 读一个"次数"或"毫秒数"的整数参数；没给或给空取默认值。
-fn rate_limit_env(name: &str, default: u64) -> Result<u64, ApplicationError> {
+/// 读一个"次数"或"毫秒数"的整数参数（公开鉴权端点的失败尝试上限用它）；没给或给空取默认值。
+fn limit_env(name: &str, default: u64) -> Result<u64, ApplicationError> {
     match std::env::var(name) {
         Ok(value) if !value.trim().is_empty() => value
             .trim()
@@ -1414,7 +1360,7 @@ fn rate_limit_env(name: &str, default: u64) -> Result<u64, ApplicationError> {
 
 /// 公开鉴权端点的失败尝试上限（次数与窗口）。
 ///
-/// 与 [`GenerationRateLimit`] 同样是**运维取值**：上限与窗口随部署形态变，有可直接使用的缺省值。
+/// 它是**运维取值**：上限与窗口随部署形态变，有可直接使用的缺省值。
 /// 计的是**失败次数**而不是请求数——成功的尝试不累计；判定在受理之前，写入在服务端判定失败之后。
 /// 计数落在缓存里、缓存不可用时放行，理由见 [`AccelerationService::auth_attempt_allowed`]。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1458,11 +1404,11 @@ impl AuthAttemptLimit {
         let defaults = Self::default_limit();
         let prefix = endpoint.env_prefix();
         Self::new(
-            rate_limit_env(
+            limit_env(
                 &format!("{prefix}_FAILURES_PER_WINDOW"),
                 defaults.max_failures,
             )?,
-            Duration::from_millis(rate_limit_env(
+            Duration::from_millis(limit_env(
                 &format!("{prefix}_WINDOW_MS"),
                 u64::try_from(defaults.window.as_millis()).unwrap_or(u64::MAX),
             )?),
@@ -3558,8 +3504,8 @@ impl PricingService {
 
 /// 认证成功后这个调用方是谁：**哪个账户**、以及**哪把密钥**。
 ///
-/// 密钥标识单独带出来，是因为限流、审计、排障都以"哪把密钥"为单位：一个账户可以有多把密钥，
-/// 按账户限流会让一把失控的密钥拖住同一账户的其它密钥。密钥标识本身不含明文，它本来就是
+/// 密钥标识单独带出来，是因为审计与排障以"哪把密钥"为单位：一个账户可以有多把密钥，吊销与
+/// 调用记录都按它定位。密钥标识本身不含明文，它本来就是
 /// 管理员吊销时要用的那个 id。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ApiKeyIdentity {
@@ -3580,46 +3526,33 @@ struct AuthAttemptContext {
 #[derive(Clone)]
 pub struct IdentityService {
     repository: Arc<dyn HubRepository>,
-    /// 加速层：认证路径**每次**读库换账户（吊销要即刻生效），只把**速率计数**放进缓存；
-    /// 计数怎么判、缓存挂了怎么办，见 [`AccelerationService::consume_request_slot`]。
+    /// 加速层：认证路径**每次**读库换账户（吊销要即刻生效），只把公开鉴权端点的失败尝试计数
+    /// 放进缓存；计数怎么判、缓存挂了怎么办，见 [`AccelerationService::auth_attempt_allowed`]。
     acceleration: Arc<AccelerationService>,
-    /// 每把密钥的请求速率上限。
-    rate_limit: GenerationRateLimit,
     /// 公开鉴权端点（客户注册、登录、重置码兑换）各自的上限与窗口。
     auth_attempt_limits: AuthAttemptLimits,
 }
 
 impl IdentityService {
-    /// 没有加速层、也没有额外配置的认证：速率计数没有缓存可落，于是不设限。
+    /// 没有加速层的认证：失败尝试计数没有缓存可落，于是不设限。
     #[must_use]
     pub fn new(repository: Arc<dyn HubRepository>) -> Self {
         let acceleration = Arc::new(AccelerationService::disabled(repository.clone()));
         Self {
             repository,
             acceleration,
-            rate_limit: GenerationRateLimit::default_limit(),
             auth_attempt_limits: AuthAttemptLimits::default_limits(),
         }
     }
 
-    /// 装上加速层与运维给的速率上限。**上限是配置项**：它随部署形态变（内部工具、压测、
-    /// 单机开发各要一个数），所以由调用方给，而不是写死在这里。
-    ///
-    /// 加速层没配缓存（[`AccelerationService::disabled`]）时速率计数无处可落，限流**不生效**：
-    /// 调用方要按部署事实把这件事讲出来（见 `apps/api` 启动时那条日志），别让它静悄悄地不发生。
+    /// 装上加速层。
     #[must_use]
-    pub fn with_rate_limit(
-        mut self,
-        acceleration: Arc<AccelerationService>,
-        rate_limit: GenerationRateLimit,
-    ) -> Self {
+    pub fn with_acceleration(mut self, acceleration: Arc<AccelerationService>) -> Self {
         self.acceleration = acceleration;
-        self.rate_limit = rate_limit;
         self
     }
 
-    /// 装上公开鉴权端点各自的上限与窗口。与 [`Self::with_rate_limit`] 分开，是因为两者的判据不同：
-    /// 那个数每密钥的**请求数**，这个数来源与身份的**失败次数**。
+    /// 装上公开鉴权端点各自的上限与窗口：它数的是来源与身份的**失败次数**。
     #[must_use]
     pub fn with_auth_attempt_limits(mut self, limits: AuthAttemptLimits) -> Self {
         self.auth_attempt_limits = limits;
@@ -4315,28 +4248,20 @@ impl IdentityService {
         }
     }
 
-    /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里；读到了就为这把密钥占一个
-    /// 当前窗口的速率名额。
+    /// 认证：把明文密钥哈希之后**每次**读库换账户，吊销判定就在那条读里。
     ///
     /// 刻意**不**缓存"这把密钥还有效吗"：吊销的语义是"立刻停止使用"，任何缓存都会让吊销在 TTL
     /// 内不生效——而吊销恰恰是那种"多延迟一秒都在放行不该放行的请求"的动作。这里一次唯一索引点查
     /// 很便宜，用它换"吊销即生效"是划算的。
     ///
-    /// 速率判定放在这里、而不是生成流程里面：它只依赖"哪把密钥"，是入口就能判的事；放进生成流程
-    /// 等于让每个入口各自记得调用一次。被吊销的密钥读不到账户，因此也**不占**速率名额。
+    /// 只认凭证：平台不设客户请求速率配额，认证不做任何计数；被吊销的密钥在这里就查不到。
     pub async fn authenticate(&self, plaintext: &str) -> Result<ApiKeyIdentity, ApplicationError> {
-        let identity = self.authenticate_identity(plaintext).await?;
-        // 窗口按进程时钟取：窗口只是"多久算一轮"，时钟漂移只会让某一轮稍长或稍短，不会让计数
-        // 跑到别的键或别的窗口上去；为它多打一次数据库不值。
-        self.acceleration
-            .consume_request_slot(identity.key_id, self.rate_limit, Utc::now())
-            .await?;
-        Ok(identity)
+        self.authenticate_identity(plaintext).await
     }
 
-    /// 只认身份、不占**生成**的速率名额：上传端点用同一套凭证校验，速率走自己的独立命名空间。
+    /// 只认身份：上传端点用同一套凭证校验。
     ///
-    /// 吊销仍然即刻生效——这条读同样每次都查库；它只是不把这次请求计进生成的每 API Key 配额。
+    /// 吊销即刻生效——这条读每次都查库。
     pub async fn authenticate_identity(
         &self,
         plaintext: &str,
@@ -4650,7 +4575,7 @@ impl RoutePolicyService {
 ///
 /// **语义只到这里为止**：键名、值长什么样、什么时候能拿缓存下结论，全在
 /// [`AccelerationService`] 里；实现只负责把这三条命令发给缓存服务。接口这么窄是故意的——
-/// 一旦让实现方也懂"余额"与"限流窗口"，两边的语义就会各自漂移，而漂移的表现是"缓存说的和
+/// 一旦让实现方也懂"余额"与"计数窗口"，两边的语义就会各自漂移，而漂移的表现是"缓存说的和
 /// 数据库说的不一样"。
 ///
 /// 所有方法都可能失败。调用方一律把失败当"这次没命中"，回源数据库：缓存出问题不该让任何
@@ -4793,13 +4718,13 @@ pub struct ReconcileReport {
     pub routes_invalidated: u64,
 }
 
-/// 速率计数缓存的值：**哪个窗口**、这个窗口里已经数到几。
+/// 缓存里的计数值：**哪个窗口**、这个窗口里已经数到几（公开鉴权端点的失败尝试用它）。
 ///
 /// 窗口标识一起存进去，是因为键的存活时间由缓存自己管、与窗口边界只是"差不多同时"：缓存里可能
 /// 留着上一个窗口的键（时钟有偏差、写入失败过）。比对窗口标识把这种残留判成"这个窗口从零开始"，
 /// 而不是把上个窗口的次数接着往下数——计数偏高会拒掉本来合规的请求。
 #[derive(Debug, Serialize, Deserialize)]
-struct CachedRateLimit {
+struct CachedCounter {
     window: i64,
     count: u64,
 }
@@ -4865,90 +4790,8 @@ impl AccelerationService {
         format!("user_balance:{account_id}")
     }
 
-    /// 速率计数的键：**密钥标识 + 窗口序号**。窗口写进键里，跨窗口因此天然是一份新计数，
-    /// 不依赖上一次写入的存活时间算得准。
-    fn rate_limit_key(key_id: Uuid, window: i64) -> String {
-        format!("rate_limit:{key_id}:{window}")
-    }
-
-    /// 上传端点的速率计数键：与生成同形状，但前缀是 `upload_rate_limit:`，两个命名空间各自计数。
-    fn upload_rate_limit_key(key_id: Uuid, window: i64) -> String {
-        format!("upload_rate_limit:{key_id}:{window}")
-    }
-
-    /// 为这把密钥占用当前窗口的一个名额。返回 `Err` 表示这个窗口已经用满，并带上"多久之后
-    /// 可以再来"。
-    ///
-    /// 计数落在**缓存**里：限流是保护机制、不是业务事实，写库会把每个请求变成一次写——而限流要挡
-    /// 的恰恰是"请求很多"这种形态，用它自己把数据库写满是最糟的失败方式。
-    ///
-    /// **缓存不可用时放行。** 限流是保护，不是准入：读不到计数就当作"这个窗口还没数过"，把请求
-    /// 放过去。反过来（读不到就拒）会让加速层的一次降级直接把全部请求拒掉——一次降级放大成一次
-    /// 故障。同理，写入失败只记日志：那一笔少数的请求会过去，下一个请求接着读不到、接着放行，
-    /// 直到缓存回来为止；宁可少挡几次，也不要拒掉合规的调用方。
-    ///
-    /// 计数**不是严格原子**的：`CacheStore` 只有读写两条命令（没有 `INCR`），并发请求可能读到同
-    /// 一个数再各自写回，于是这个窗口里实际能过去的请求可能比上限多几个。这是刻意的取舍——限流
-    /// 要挡的是数量级上的异常（脚本没退避），不是精确的第 61 次；为此把缓存接口撑大、让实现方也懂
-    /// "计数"反而会把两边的语义各自漂移（见 [`CacheStore`]）。
-    ///
-    /// `now` 由调用方给：窗口只是"多久算一轮"，时钟漂移的唯一后果是某一轮稍长或稍短，不改变
-    /// "计数在缓存、缓存挂了就放行"这两条。
-    pub async fn consume_request_slot(
-        &self,
-        key_id: Uuid,
-        limit: GenerationRateLimit,
-        now: DateTime<Utc>,
-    ) -> Result<(), ApplicationError> {
-        let window = self.rate_limit_window(limit.window, now);
-        self.consume_rate_limit_slot(Self::rate_limit_key(key_id, window), window, limit, now)
-            .await
-    }
-
-    /// 上传端点的每 API Key 限流：与生成**同一个计数机制**，但键前缀是 `upload_rate_limit:`。
-    ///
-    /// 两个命名空间各自计数，上传不挤占生成的每 API Key 配额；降级与判定语义与
-    /// [`Self::consume_request_slot`] 一致。
-    pub async fn consume_upload_request_slot(
-        &self,
-        key_id: Uuid,
-        limit: GenerationRateLimit,
-        now: DateTime<Utc>,
-    ) -> Result<(), ApplicationError> {
-        let window = self.rate_limit_window(limit.window, now);
-        self.consume_rate_limit_slot(
-            Self::upload_rate_limit_key(key_id, window),
-            window,
-            limit,
-            now,
-        )
-        .await
-    }
-
-    /// 在一个已经算好的窗口键上占一个名额：生成与上传共用这套读写与判定。
-    async fn consume_rate_limit_slot(
-        &self,
-        key: String,
-        window: i64,
-        limit: GenerationRateLimit,
-        now: DateTime<Utc>,
-    ) -> Result<(), ApplicationError> {
-        let count = self.read_counter(&key, window).await.saturating_add(1);
-        self.write(
-            &key,
-            &json!({ "window": window, "count": count }).to_string(),
-            self.rate_limit_ttl(limit.window, now),
-        )
-        .await;
-        if count > limit.max_requests {
-            return Err(ApplicationError::RateLimitExceeded {
-                retry_after: self.rate_limit_retry_after(limit.window, now),
-            });
-        }
-        Ok(())
-    }
-
-    /// 公开鉴权端点的计数键：**端点 + 维度 + 摘要 + 窗口序号**，与每密钥速率的形状一致。
+    /// 公开鉴权端点的计数键：**端点 + 维度 + 摘要 + 窗口序号**。窗口写进键里，跨窗口天然是一份
+    /// 新计数，不依赖上一次写入的存活时间算得准。
     ///
     /// 端点进键：三个端点各自计数、各自配置上限与窗口（Spec 0004 §1 S5、设计 0016 §3）。
     fn auth_attempt_key(
@@ -4968,8 +4811,7 @@ impl AccelerationService {
 
     /// 这一来源/身份在当前窗口还能不能尝试。已到上限就返回带剩余等待时长的拒绝。
     ///
-    /// 判定在**受理之前**：等待期内即使凭据正确也被拒。降级与每密钥速率同一条（见
-    /// [`Self::consume_request_slot`]）。
+    /// 判定在**受理之前**：等待期内即使凭据正确也被拒。计数落在缓存里、缓存不可用时放行。
     pub async fn auth_attempt_allowed(
         &self,
         endpoint: AuthAttemptEndpoint,
@@ -4978,7 +4820,7 @@ impl AccelerationService {
         limit: AuthAttemptLimit,
         now: DateTime<Utc>,
     ) -> Result<(), ApplicationError> {
-        let window = self.rate_limit_window(limit.window, now);
+        let window = self.counter_window(limit.window, now);
         let count = self
             .read_counter(
                 &Self::auth_attempt_key(endpoint, scope, digest, window),
@@ -4987,7 +4829,7 @@ impl AccelerationService {
             .await;
         if count >= limit.max_failures {
             return Err(ApplicationError::RateLimitExceeded {
-                retry_after: self.rate_limit_retry_after(limit.window, now),
+                retry_after: self.counter_retry_after(limit.window, now),
             });
         }
         Ok(())
@@ -5002,7 +4844,7 @@ impl AccelerationService {
         limit: AuthAttemptLimit,
         now: DateTime<Utc>,
     ) {
-        let window = self.rate_limit_window(limit.window, now);
+        let window = self.counter_window(limit.window, now);
         let count = self
             .read_counter(
                 &Self::auth_attempt_key(endpoint, scope, digest, window),
@@ -5013,13 +4855,13 @@ impl AccelerationService {
         self.write(
             &Self::auth_attempt_key(endpoint, scope, digest, window),
             &json!({ "window": window, "count": count }).to_string(),
-            self.rate_limit_ttl(limit.window, now),
+            self.counter_ttl(limit.window, now),
         )
         .await;
     }
 
     /// 这次请求落在第几个窗口。窗口按钟点等分，序号本身没有含义，只用来判断"是不是同一个窗口"。
-    fn rate_limit_window(&self, window: Duration, now: DateTime<Utc>) -> i64 {
+    fn counter_window(&self, window: Duration, now: DateTime<Utc>) -> i64 {
         let millis = u64::try_from(window.as_millis()).unwrap_or(u64::MAX).max(1);
         let now_millis = now.timestamp_millis().max(0) as u64;
         (now_millis / millis) as i64
@@ -5027,13 +4869,13 @@ impl AccelerationService {
 
     /// 这条计数该活多久：本窗口剩下的时间。窗口一过它就该消失——留着只会让下一个窗口的第一次
     /// 写入多一次"读到旧值"的机会。至少 1 毫秒：存活时间为 0 会被缓存当成非法命令。
-    fn rate_limit_ttl(&self, window: Duration, now: DateTime<Utc>) -> Duration {
+    fn counter_ttl(&self, window: Duration, now: DateTime<Utc>) -> Duration {
         let remaining = self.window_remaining(window, now);
         remaining.max(Duration::from_millis(1))
     }
 
     /// 到下一个窗口还有多久（对客的 `Retry-After`）。
-    fn rate_limit_retry_after(&self, window: Duration, now: DateTime<Utc>) -> Duration {
+    fn counter_retry_after(&self, window: Duration, now: DateTime<Utc>) -> Duration {
         // 据实取值，不四舍五入到窗口长度：窗口只剩 2 秒时告诉调用方"等 2 秒"，它才真的能接着用。
         self.window_remaining(window, now)
             .max(Duration::from_millis(1))
@@ -5047,12 +4889,12 @@ impl AccelerationService {
 
     /// 读一个窗口里的计数；缓存不可用、值不存在、读不出来或属于别的窗口都算 **0**。
     ///
-    /// 往"还没数过"退化而不往高里算：取舍见 [`Self::consume_request_slot`]。
+    /// 往"还没数过"退化而不往高里算，宁可少挡几次也不拒掉合规的调用方。
     async fn read_counter(&self, key: &str, window: i64) -> u64 {
         let Some(raw) = self.read(key).await else {
             return 0;
         };
-        match serde_json::from_str::<CachedRateLimit>(&raw) {
+        match serde_json::from_str::<CachedCounter>(&raw) {
             Ok(cached) if cached.window == window => cached.count,
             Ok(_) => 0,
             Err(error) => {
@@ -5313,8 +5155,8 @@ impl AccelerationService {
         }
     }
 
-    /// 写一条缓存值。失败只记一条日志：写的是提交后的余额快照与限流计数，两者的正确性都不依赖
-    /// 缓存（余额以数据库为准，限流是保护机制），所以写失败不改变任何结果。
+    /// 写一条缓存值。失败只记一条日志：写的是提交后的余额快照与失败尝试计数，两者的正确性都不
+    /// 依赖缓存（余额以数据库为准，计数是保护机制），所以写失败不改变任何结果。
     async fn write(&self, key: &str, value: &str, ttl: Duration) {
         let Some(cache) = self.cache.as_ref() else {
             return;

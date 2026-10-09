@@ -1,5 +1,5 @@
 主题: 客户公开认证页面与找回导航
-当前修订: v1
+当前修订: v2
 状态: 已接受
 承接: [客户认证页面 Spec v1](../specs/0004-customer-authentication-pages.md) §1–§5
 依赖: [客户导航设计](0014-customer-console-navigation-and-history.md) §4–§5；[身份设计](0010-identity-and-consoles.md) §4.2、§4.5–§4.6
@@ -38,9 +38,9 @@
 
 重置码的消费与密码写入在[现有应用实现](../../crates/application/src/lib.rs)中分两步完成，因此服务端失败也可能已经消费重置码。本设计不调整后端事务，不能向用户保证失败可继续使用旧码；结果未知反馈让用户先验证新密码或取得新码。该既有机制的权衡与后果由[本次记录](../../.agents/notes/implemented/platform/2026-10-03-customer-authentication-pages.md)保留。
 
-公开鉴权端点的有界尝试限制（Spec S5）复用既有加速层计数：固定窗口、`CacheStore` 的读写与 TTL、读不到就当这一窗口还没数过、写失败只记日志，与每 API Key 的速率判定是同一套原语，不新建计数设施。计数键沿用既有“命名空间 + 窗口号”的形状，形如 `rate_limit:auth:{endpoint}:{scope}:{digest}:{window}`：`endpoint` 取 `register`、`login` 或 `redeem`（三个端点各自计数，互不占用额度），`scope` 取 `source`（来源）或 `identity`（身份），`digest` 是来源地址与规范化身份的摘要——键里不出现邮箱或地址原文，与凭据不进存储同一道理。计数落在与每密钥速率相同的层：[认证用例](../../crates/application/src/lib.rs)在受理前读键判定（已到上限直接返回 429 与剩余等待时长，不再做密码校验或兑换），在服务端判定失败后写同一键，成功尝试不写。
+公开鉴权端点的有界尝试限制（Spec S5）复用加速层计数：固定窗口、`CacheStore` 的读写与 TTL、读不到就当这一窗口还没数过、写失败只记日志，不新建计数设施。计数键沿用既有“命名空间 + 窗口号”的形状，形如 `rate_limit:auth:{endpoint}:{scope}:{digest}:{window}`：`endpoint` 取 `register`、`login` 或 `redeem`（三个端点各自计数，互不占用额度），`scope` 取 `source`（来源）或 `identity`（身份），`digest` 是来源地址与规范化身份的摘要——键里不出现邮箱或地址原文，与凭据不进存储同一道理。计数落在认证用例这一层：[认证用例](../../crates/application/src/lib.rs)在受理前读键判定（已到上限直接返回 429 与剩余等待时长，不再做密码校验或兑换），在服务端判定失败后写同一键，成功尝试不写。
 
-既有 `consume_request_slot` 是“每请求占一个名额、键为密钥标识”的调用点，本设计在它旁边新增按失败记数的判定与写入调用点，不改它；与既有每密钥速率不同的是它**计失败次数而不是请求数**，判定与写入分处一次请求的两端。三个端点的身份口径：注册与登录用提交的邮箱，兑换用重置码所属客户；重置码不存在或已用时没有身份维，该次失败只计来源维。拒绝结果与计数都不区分邮箱是否存在、重置码是否存在或已用，因此计数不能按“这个身份是否存在”分流。等待时长按当前窗口剩余时间给，沿用既有 `Retry-After` 头与 `rate_limit_exceeded` 错误码；`CacheStore` 没有 `INCR`，读改写仍不是严格原子，沿用既有取舍——要挡的是数量级异常，不是精确的第 N 次。三个端点各自的上限与窗口是运维取值，读法沿用既有速率上限的整数环境变量与缺省值模式：`AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` 与 `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS`，`<ENDPOINT>` 取 `REGISTER`、`LOGIN` 或 `REDEEM`。降级沿用既有规则：缓存不可用或读到不可读的值时不拒绝请求，按“这一窗口还没数过”继续；`REDIS_URL` 为空时这层不生效，这是部署期可见的事实，不写成“无缓存也强制”。
+失败尝试限制计的是**失败次数而不是请求数**，判定与写入分处一次请求的两端；它只用缓存这一层原语，与客户请求速率无关。三个端点的身份口径：注册与登录用提交的邮箱，兑换用重置码所属客户；重置码不存在或已用时没有身份维，该次失败只计来源维。拒绝结果与计数都不区分邮箱是否存在、重置码是否存在或已用，因此计数不能按“这个身份是否存在”分流。等待时长按当前窗口剩余时间给，沿用既有 `Retry-After` 头与 `rate_limit_exceeded` 错误码；`CacheStore` 没有 `INCR`，读改写仍不是严格原子，沿用既有取舍——要挡的是数量级异常，不是精确的第 N 次。三个端点各自的上限与窗口是运维取值，读法是整数环境变量加缺省值：`AUTH_ATTEMPT_LIMIT_<ENDPOINT>_FAILURES_PER_WINDOW` 与 `AUTH_ATTEMPT_LIMIT_<ENDPOINT>_WINDOW_MS`，`<ENDPOINT>` 取 `REGISTER`、`LOGIN` 或 `REDEEM`。降级沿用既有规则：缓存不可用或读到不可读的值时不拒绝请求，按“这一窗口还没数过”继续；`REDIS_URL` 为空时这层不生效，这是部署期可见的事实，不写成“无缓存也强制”。
 
 来源维需要一个权威的客户端地址：连接层把**连接对端地址**挂进请求扩展，这是唯一不能由调用方自带的来源；生产在 nginx 之后时对端是代理本身，因此在 API 进程配 `AUTH_SOURCE_HEADER`（例如 `x-real-ip`，[反向代理配置](../operations/deployment.md#5-反向代理与-tls)已用 `$remote_addr` 覆盖写它）后采信该头，未配置时退回对端地址。`X-Forwarded-For` 的最左值可以由客户端自带，不采信。采信头的前提是 API 不能被绕过代理直连（否则同一个头同样可伪造），这是部署期边界。该信任边界的取舍与备选由[本次记录](../../.agents/notes/implemented/platform/2026-10-05-public-auth-attempt-limits.md)保留。
 

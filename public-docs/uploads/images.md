@@ -51,7 +51,7 @@ curl -X POST "$BASE_URL/v1/uploads/images" \
 | `400` | `media_type_mismatch` | 修正文件部件声明的类型，使其与内容一致。 |
 | `408` | `request_timeout` | 请求正文上传过慢；改善连接后重新上传。 |
 | `413` | `image_too_large` / `request_too_large` | 缩小文件或请求体。 |
-| `429` | `rate_limit_exceeded` / `upload_busy` | 按 `Retry-After` 等待后再上传。 |
+| `429` | `upload_busy` | 上传并发或内存预算已满；按 `Retry-After` 等待后再上传。 |
 | `503` | `upload_storage_unavailable` / `object_store_unavailable` | 上传服务暂不可用；稍后再上传，或使用已有的公网图片 URL。 |
 
 鉴权与其他错误参见 [API Key 鉴权]({{SEE_BASEURL}}/v1/docs/authentication.md)和 [HTTP 状态码和错误处理]({{SEE_BASEURL}}/v1/docs/http-errors.md)。上传未返回 URL 时，不要把本地文件路径作为图片参数提交。

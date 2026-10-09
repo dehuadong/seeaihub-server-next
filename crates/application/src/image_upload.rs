@@ -6,7 +6,7 @@
 //! 行为合同由[图片上传与对象存储 Spec](../../docs/specs/0007-image-upload-and-object-storage.md)拥有，
 //! 取值域、启动期形状校验与签名机制由[对象存储上传设计](../../docs/design/0021-object-storage-upload.md)拥有。
 
-use crate::{ApplicationError, CredentialProvider, GenerationRateLimit};
+use crate::{ApplicationError, CredentialProvider};
 use async_trait::async_trait;
 use seeai_adapter_sdk::ProviderCredential;
 use seeai_domain::{
@@ -31,10 +31,6 @@ pub const DEFAULT_UPLOAD_MAX_BUFFER_BYTES: usize = 96 * 1024 * 1024;
 pub const DEFAULT_UPLOAD_REQUEST_TIMEOUT_SECONDS: u64 = 30;
 /// 上传正文慢读上限的缺省值（秒）。
 pub const DEFAULT_UPLOAD_SLOW_READ_TIMEOUT_SECONDS: u64 = 30;
-/// 每 API Key 每窗口允许的上传请求数缺省值。
-pub const DEFAULT_UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW: u64 = 60;
-/// 上传限流窗口的毫秒缺省值。
-pub const DEFAULT_UPLOAD_RATE_LIMIT_WINDOW_MS: u64 = 60_000;
 /// 单次上传写入的总尝试次数上限缺省值。
 pub const DEFAULT_UPLOAD_RETRY_MAX_ATTEMPTS: u32 = 3;
 /// 固定退避基准秒数的缺省值。
@@ -210,7 +206,7 @@ impl UploadStorageConfig {
     }
 }
 
-/// 上传端点的全部配置：存储、上限、超时、重试与限流。
+/// 上传端点的全部配置：存储、上限、超时与重试。
 #[derive(Debug, Clone)]
 pub struct ImageUploadConfig {
     /// 整组上传存储变量都不给时为 `None`：进程照常启动，上传端点对该请求回
@@ -230,8 +226,6 @@ pub struct ImageUploadConfig {
     pub retry_max_attempts: u32,
     /// 固定退避基准。
     pub retry_backoff_base: Duration,
-    /// 上传的每 API Key 限流（独立命名空间，不挤占生成的配额）。
-    pub rate_limit: GenerationRateLimit,
 }
 
 impl ImageUploadConfig {
@@ -297,16 +291,6 @@ impl ImageUploadConfig {
                 "UPLOAD_RETRY_BACKOFF_BASE_SECONDS must be positive".to_owned(),
             ));
         }
-        let rate_limit = GenerationRateLimit::new(
-            upload_env_u64(
-                "UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW",
-                DEFAULT_UPLOAD_RATE_LIMIT_REQUESTS_PER_WINDOW,
-            )?,
-            Duration::from_millis(upload_env_u64(
-                "UPLOAD_RATE_LIMIT_WINDOW_MS",
-                DEFAULT_UPLOAD_RATE_LIMIT_WINDOW_MS,
-            )?),
-        )?;
         Ok(Self {
             storage: UploadStorageConfig::from_env()?,
             max_request_bytes: usize::try_from(max_request_bytes).map_err(|_| {
@@ -330,7 +314,6 @@ impl ImageUploadConfig {
                 ApplicationError::Configuration("UPLOAD_RETRY_MAX_ATTEMPTS is too large".to_owned())
             })?,
             retry_backoff_base: Duration::from_secs(retry_backoff_base),
-            rate_limit,
         })
     }
 }

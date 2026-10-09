@@ -9,6 +9,8 @@ verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-
 
 # Agent Note：Redis 加速层：纯加速的路由与余额缓存
 
+> **失效范围（2026-10-08）**：本记录里"每把 API Key 的请求速率计数"这一用途**已作废**——平台取消了客户请求速率配额，`rate_limit:` 与 `upload_rate_limit:` 两个命名空间不再写入。取代记录见[删掉客户请求限流](../../proposed/platform/2026-10-08-drop-client-rate-limits.md)。仍然有效的部分：余额快照的写穿与对账、route 条目的失效清理，以及"缓存语义留在用例层"这条分工。
+
 ## 问题
 
 受理一次生成要读两样东西：该网关模型的候选集（连合同、承载面、参数映射与定价）与账户余额。候选集是只读发布数据、余额是每个请求都要判一次的账本事实，两者都在 PostgreSQL 里，而这两条读处在每个请求的关键路径上。
@@ -21,7 +23,7 @@ verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-
 
 按 `docs/design/0008-routing-strategy-and-caching.md` §7 落地，范围见工单 [#19](https://github.com/dehuadong/seeaihub-server-next/issues/19)：
 
-- **端口与实现分开**：`crates/application` 有 `CacheStore` 端口（`GET` / `SET … PX` / `DEL`）与 `AccelerationService`（键名、值形状、写穿、失效清理、对账）；`crates/cache-redis` 只把这三条命令发给 Redis，连接惰性建立、单次操作带超时（`CACHE_OPERATION_TIMEOUT_MS`，默认 200 毫秒），任何失败都返回错误，由用例层当"未命中"。缓存语义留在用例层，是为了不让"余额"与"限流计数"的语义在实现方各自漂移。
+- **端口与实现分开**：`crates/application` 有 `CacheStore` 端口（`GET` / `SET … PX` / `DEL`）与 `AccelerationService`（键名、值形状、写穿、失效清理、对账）；`crates/cache-redis` 只把这三条命令发给 Redis，连接惰性建立、单次操作带超时（`CACHE_OPERATION_TIMEOUT_MS`，默认 200 毫秒），任何失败都返回错误，由用例层当"未命中"。缓存语义留在用例层，是为了不让"余额"与"计数"的语义在实现方各自漂移。
 - **route 条目只剩失效清理**：`route:<gateway_model>` 的历史值是候选集 + 写它那次发布的修订标识，受理期已不再读它——直接执行每次受理都直读数据库取候选（生效发布条目 + 启用的供给与渠道由取数 SQL 一次判完）。发布与启停入口在事务提交后删除该键，对账器按修订标识与网关模型开关删除陈旧条目并写 `cache.route_invalidated` 审计。
 - **写穿**：充值、受理占用、结算、失败减占用与对账解除五条改动账户金额的路径，都在事务提交后把**变更后的快照**写进 `user_balance:<account_id>`（不用 `DECRBY`），写入时间取数据库给出的 `updated_at`。为此 `HubRepository` 的这几条写路径用 `RETURNING` 返回 `BalanceChange`（账户、余额、占用、可用额、版本与数据库时刻），幂等重放与"保留预授权的失败收尾"返回当前余额。
 - **预检可拒绝但必留审计（已由 [新记录](2026-09-30-account-balance-cache-version-guard.md) 取代）**：缓存条目来源是写穿路径（`db_commit`）**且**写入时间落在新鲜窗口内**且**这次不是重放，才允许在余额低于保底额时提前回 402；拒绝前先写 `operations.audit_events`（缓存余额、写入时间、来源、本次保底额、网关模型），审计写不下去就不拒绝，交给数据库的条件更新。

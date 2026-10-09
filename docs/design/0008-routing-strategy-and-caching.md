@@ -1,12 +1,12 @@
 主题: 路由策略层与缓存（运营后台设计之三）
-当前修订: v1
+当前修订: v2
 状态: 路由与非账务缓存规则保留；账户金额缓存与资金判定由 [`0013`](0013-account-funds-and-reservations.md) 承接
 来源: 工作项「运营后台：平台网关模型、对客定价与路由权重」与提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)；原单文件的 §4、§5、§7 与 §10 的路由部分
 依赖: [`0006`](./0006-gateway-models-and-consumer-surface.md)（网关模型与对客面）、[`0007`](./0007-pricing-floor-and-settlement.md)（定价、保底与结算）；`ADR-0003`、`ADR-0009`、`ADR-0011`、`ADR-0015`、`ADR-0017`、`ADR-0020`
 
 # 路由策略层与缓存
 
-本文是运营后台工作的技术设计之三，承载**路由策略层与缓存**：候选怎么排（`routing_priority`）、同档怎么分流（`weight`）、在一批合格候选里挑哪一条由**运营配置的策略**决定（`route_policies`），以及 Redis 作为余额与限流的**纯加速层**。网关模型与对客面见 [`0006`](./0006-gateway-models-and-consumer-surface.md)，定价与结算见 [`0007`](./0007-pricing-floor-and-settlement.md)。**本文只承载设计决策与边界**：改动点、迁移与验收清单归各切片工单（切片总表见 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)）。
+本文是运营后台工作的技术设计之三，承载**路由策略层与缓存**：候选怎么排（`routing_priority`）、同档怎么分流（`weight`）、在一批合格候选里挑哪一条由**运营配置的策略**决定（`route_policies`），以及 Redis 作为余额快照与 route 条目的**纯加速层**。网关模型与对客面见 [`0006`](./0006-gateway-models-and-consumer-surface.md)，定价与结算见 [`0007`](./0007-pricing-floor-and-settlement.md)。**本文只承载设计决策与边界**：改动点、迁移与验收清单归各切片工单（切片总表见 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)）。
 
 候选路由由本文负责。账户金额快照、Redis 与 PostgreSQL 的一致性由[账户资金设计](0013-account-funds-and-reservations.md) §3 负责；route 条目不再是选路输入，只有失效清理与对账审计（§7）。
 
@@ -192,7 +192,7 @@ API Key 认证每次读 `identity.api_keys`，不进缓存：吊销要即刻生�
 
 ### 7.7 引入成本与风险
 
-Redis 是可选运行时依赖。不可用时余额读写、速率计数与 route 清理都当未命中，业务事实一律以 PostgreSQL 为准；账户金额缓存的版本与写入失败语义见[账户资金设计](0013-account-funds-and-reservations.md) §3。
+Redis 是可选运行时依赖。不可用时余额读写与 route 清理都当未命中，业务事实一律以 PostgreSQL 为准；账户金额缓存的版本与写入失败语义见[账户资金设计](0013-account-funds-and-reservations.md) §3。
 
 ## 8. 决策归属与 ADR
 

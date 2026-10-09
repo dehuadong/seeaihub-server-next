@@ -19,15 +19,15 @@ use seeai_application::{
     AuthAttemptLimits, CachePolicy, CursorPosition, CustomerBillingQuery, CustomerLedgerQuery,
     CustomerUsageKind, CustomerUsageQuery, CustomerUsageScope, CustomerUsageStatus, CustomerView,
     DirectExecutionError, DirectExecutionLimits, DirectExecutionRequest, DirectExecutionService,
-    ExecutionLookup, ExecutionRepository, GatewayModelView, GeneratedImage, GenerationRateLimit,
-    HISTORY_CURSOR_KEY_LEN, HistoryFilter, HistoryStream, HubRepository, IdentityService,
-    LedgerAuditor, LedgerEntryView, MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES,
-    NewFxRate, PlatformAlerter, PricingService, ProviderCostGapView, ProviderFailureKind,
-    ProviderFailureQuery, ProviderFailureView, PublicErrorCode, PublishRuntimeCommand,
-    ReconciliationService, RecordedRequestInput, RefundReconciliationCommand,
-    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService,
-    SelectableOfferingView, UsageAmounts, decode_history_cursor, encode_history_cursor,
-    invalid_history_cursor, settle_reserve_from_env, with_admin_id,
+    ExecutionLookup, ExecutionRepository, GatewayModelView, GeneratedImage, HISTORY_CURSOR_KEY_LEN,
+    HistoryFilter, HistoryStream, HubRepository, IdentityService, LedgerAuditor, LedgerEntryView,
+    MAX_OPERATIONAL_LIMIT, NO_CONTRACT_MAX_OUTPUT_IMAGES, NewFxRate, PlatformAlerter,
+    PricingService, ProviderCostGapView, ProviderFailureKind, ProviderFailureQuery,
+    ProviderFailureView, PublicErrorCode, PublishRuntimeCommand, ReconciliationService,
+    RecordedRequestInput, RefundReconciliationCommand, RequestFingerprintKeys,
+    RequestTimeoutPolicy, RetryPolicy, RoutePolicyService, RuntimeService, SelectableOfferingView,
+    UsageAmounts, decode_history_cursor, encode_history_cursor, invalid_history_cursor,
+    settle_reserve_from_env, with_admin_id,
 };
 use seeai_application::{
     ApiKeyIdentity, HeadObjectRequest, ImageUploadConfig, ImageUploadError, ImageUploadService,
@@ -72,12 +72,10 @@ struct DirectGeneration {
     request_json_limits: RequestJsonLimits,
 }
 
-/// 上传端点随进程装配的一份用例、限流与配置。
+/// 上传端点随进程装配的服务与配置。
 #[derive(Clone)]
 struct ImageUpload {
     service: Arc<ImageUploadService>,
-    /// 上传的每 API Key 限流走独立命名空间，不挤占生成的配额。
-    acceleration: Arc<AccelerationService>,
     config: Arc<ImageUploadConfig>,
 }
 
@@ -287,8 +285,8 @@ async fn main() -> Result<()> {
             Arc::new(AihubmixAdapterFactory),
             Arc::new(ApimartAdapterFactory),
         ]));
-    // 加速层：`REDIS_URL` 没配就是没有缓存——那时这一层是空操作（余额写穿、速率计数都不落缓存），
-    // 行为与没有它时逐位相同。配了但连不上只是写不进、读不到，业务事实一律以数据库为准。
+    // 加速层：`REDIS_URL` 没配就是没有缓存——那时这一层是空操作（余额写穿、失败尝试计数都不落
+    // 缓存），行为与没有它时逐位相同。配了但连不上只是写不进、读不到，业务事实一律以数据库为准。
     let acceleration = match RedisCache::from_env()? {
         Some(cache) => {
             info!("cache acceleration layer enabled");
@@ -304,12 +302,6 @@ async fn main() -> Result<()> {
     // 服务，本进程在，兜底就在。
     if acceleration.is_enabled() {
         tokio::spawn(acceleration.clone().run_reconciler());
-    } else {
-        // 速率计数就落在这个缓存上：没有缓存时它无处可落，限流这一层等于不生效（见
-        // `AccelerationService::consume_request_slot`）。这是部署期看得见的事实，不是静默降级。
-        tracing::warn!(
-            "no cache service configured; the per-API-key rate limit does not apply in this process"
-        );
     }
 
     // 上传端点与上传存储的配置：整组上传存储变量都不给＝未配置，进程照常启动；只给一部分或
@@ -479,7 +471,6 @@ async fn main() -> Result<()> {
                 Arc::new(EnvironmentCredentialProvider),
                 upload_config.clone(),
             )),
-            acceleration: acceleration.clone(),
             config: Arc::new(upload_config.clone()),
         })
     };
@@ -504,7 +495,7 @@ async fn main() -> Result<()> {
     let state = AppState {
         admin_token,
         identity: IdentityService::new(repository_port.clone())
-            .with_rate_limit(acceleration.clone(), generation_rate_limit()?)
+            .with_acceleration(acceleration.clone())
             .with_auth_attempt_limits(AuthAttemptLimits::from_env()?),
         runtime: RuntimeService::new(repository_port.clone(), adapters, see_base_url.clone())
             .with_acceleration(acceleration.clone()),
@@ -608,7 +599,7 @@ async fn main() -> Result<()> {
             state.clone(),
             require_admin_middleware,
         ));
-    // 图片入口的入口中间件：认证、速率与本机读取准入都在**消费正文之前**完成，账户放进 request
+    // 图片入口的入口中间件：认证与本机读取准入都在**消费正文之前**完成，账户放进 request
     // extension，handler 不再自己认证。
     let image_routes = Router::new()
         .route("/v1/images/generations", post(generate_image))
@@ -618,8 +609,8 @@ async fn main() -> Result<()> {
             state.clone(),
             require_generation_access,
         ));
-    // 上传入口：路由级正文上限盖过合并后的全局 16 MiB 上限（Spec 0007 §2.2）；认证、上传速率与
-    // 本机上传读取许可都在消费正文之前完成。
+    // 上传入口：路由级正文上限盖过合并后的全局 16 MiB 上限（Spec 0007 §2.2）；认证与本机上传
+    // 读取许可都在消费正文之前完成。
     let upload_routes = Router::new()
         .route("/v1/uploads/images", post(upload_image))
         .route_layer(DefaultBodyLimit::max(state.upload.config.max_request_bytes))
@@ -3240,10 +3231,10 @@ async fn require_generation_access(
     request: axum::extract::Request,
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
-    // 总期限 D 从收到请求头起算：认证、速率与读取准入都算在它里面（RFC 0017 §6）。
+    // 总期限 D 从收到请求头起算：认证与读取准入都算在它里面（RFC 0017 §6）。
     let received_at = tokio::time::Instant::now();
     let direct = state.direct.clone();
-    // 认证与速率在消费正文之前完成；读取准入也在这里取，取不到直接拒绝，不排队。
+    // 认证在消费正文之前完成；读取准入也在这里取，取不到直接拒绝，不排队。
     let account_id = authenticate(&state, request.headers()).await?;
     let read = direct
         .supervisor
@@ -3270,7 +3261,7 @@ struct UploadImageResponse {
     byte_length: u64,
 }
 
-/// 上传入口的认证与准入：认证、独立命名空间的速率、本机上传读取许可都在消费正文之前完成。
+/// 上传入口的认证与准入：认证与本机上传读取许可都在消费正文之前完成。
 ///
 /// 读取许可在中间件里持有到 handler 结束，因此正文读取与写入都在它的名额与预算之下；取不到就
 /// 直接 429 upload_busy，不排队。
@@ -3280,12 +3271,6 @@ async fn require_upload_access(
     next: axum::middleware::Next,
 ) -> Result<axum::response::Response, ApiError> {
     let identity = authenticate_upload(&state, request.headers()).await?;
-    state
-        .upload
-        .acceleration
-        .consume_upload_request_slot(identity.key_id, state.upload.config.rate_limit, Utc::now())
-        .await
-        .map_err(ApiError::from)?;
     let _lease = state
         .direct
         .supervisor
@@ -3310,7 +3295,7 @@ async fn require_upload_access(
     Ok(next.run(request).await)
 }
 
-/// 上传端点的认证：与生成同一套凭证校验，但不占生成的速率名额（速率走独立命名空间）。
+/// 上传端点的认证：与生成入口同一套凭证校验。
 async fn authenticate_upload(
     state: &AppState,
     headers: &HeaderMap,
@@ -3846,16 +3831,7 @@ async fn authenticate(state: &AppState, headers: &HeaderMap) -> Result<AccountId
     let token = bearer_token(headers)?;
     match state.identity.authenticate(token).await {
         Ok(identity) => Ok(identity.account_id),
-        // 速率超限是"你是谁我们知道了，但现在太密"，与"这把密钥无效"要分开：混成 401 会让
-        // 调用方以为该换密钥，而它其实只需要等一会儿。
-        Err(ApplicationError::RateLimitExceeded { retry_after }) => Err(ApiError {
-            status: StatusCode::TOO_MANY_REQUESTS,
-            code: "rate_limit_exceeded",
-            message: "too many requests for this API key; retry after the seconds in the \
-                      Retry-After header"
-                .to_owned(),
-            retry_after: Some(retry_after),
-        }),
+        // 凭证不合格一律 401：密钥认证这条路上没有别的拒绝。
         Err(_) => Err(invalid_api_key()),
     }
 }
@@ -4025,8 +4001,8 @@ impl From<ApplicationError> for ApiError {
             ApplicationError::ExecutionDeadlineExceeded => {
                 (StatusCode::GATEWAY_TIMEOUT, "request_timeout")
             }
-            // 速率超限（每密钥速率，或公开鉴权端点的失败尝试）都是"太密了"：等待时长由上面的
-            // `retry_after` 提取带出去，`Retry-After` 头对两条路都成立。
+            // 失败尝试超限（公开鉴权端点）是"太密了"：等待时长由上面的 `retry_after` 提取带出去，
+            // 随 `Retry-After` 头回。
             ApplicationError::RateLimitExceeded { .. } => {
                 (StatusCode::TOO_MANY_REQUESTS, "rate_limit_exceeded")
             }
@@ -4338,15 +4314,6 @@ fn generation_env_u64(name: &str, default: u64) -> Result<u64> {
             .with_context(|| format!("{name} must be an integer")),
         _ => Ok(default),
     }
-}
-
-/// 每把 API Key 的请求速率上限（默认每分钟 60 次）。读法与上一项相同，两个环境变量：
-/// `GENERATION_RATE_LIMIT_REQUESTS_PER_WINDOW` 与 `GENERATION_RATE_LIMIT_WINDOW_MS`。
-///
-/// 它是**运维取值**，不是产品档位：不同部署（内部工具、压测、开发机）要挡住的数量级差得很远，
-/// 所以留成部署期可调，而不是写死在代码里。
-fn generation_rate_limit() -> Result<GenerationRateLimit> {
-    Ok(GenerationRateLimit::from_env()?)
 }
 
 /// 公开鉴权端点来源维采信哪个受信头：`AUTH_SOURCE_HEADER`（例如 `x-real-ip`）。
