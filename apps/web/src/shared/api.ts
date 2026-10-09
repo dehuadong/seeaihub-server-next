@@ -120,7 +120,7 @@ function preview(text: string): string {
 /// 把服务端的错误答复翻成**对界面用户可执行**的话。
 ///
 /// 服务端的文案是给调用方（程序）看的英文，直接铺在界面上对人不友好；而登录/改口令这类端点又故意
-/// 不区分"邮箱不存在"与"口令不对"（`docs/specs/0001-admin-and-customer-consoles.md` §4.1），
+/// 不区分"邮箱不存在"与"口令不对"（`docs/contracts/0001-admin-and-customer-consoles.md` §4.1），
 /// 所以这里也只能给一句不区分的话。不认识的错误原样透出——编一句更含糊的会丢掉排查线索。
 function messageFor(status: number, failure: ApiErrorBody | null, raw: string): string {
   // 403 在管理面只有一个含义：**这次凭据不被接受**（会话过期、被吊销，或拿的是共享令牌而这条端点

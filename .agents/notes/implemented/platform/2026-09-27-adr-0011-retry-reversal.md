@@ -15,6 +15,8 @@ verification: `node scripts/decisions/check.mjs` 通过；引用的提交 `4ecd3
 
 ## 决定
 
+> 失效范围（2026-10-09 核对）：生成创建请求重投机制已被同步网关的唯一直接执行路径取代。本记录只保留当时的真实理由与证据，不指导当前重投；现行行为见[同步图片网关合同](../../../../docs/contracts/0005-synchronous-image-gateway.md) §5–§6，技术承接缺口见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
+
 ADR-0011 正文重写为当前处置（三态分流：可证明未受理在额度内重投、`AcceptanceUnknown` 绝不重投、`NotRetryable` 失败），旧结论与它失效的原因搬进本记录：
 
 - **旧结论为什么不再成立**：它给的理由是结构性的——`generation.attempts` 有 `UNIQUE (job_id)`（一个 Job 只能容纳一次执行），`JobState` 也没有从 `submitting` 回到 `accepted`/`leased` 的边，因此"同一 Job 内的安全重投"在数据模型里不可表达。迁移 `0018` 去掉了那条唯一约束、加上 `attempt_no`（回填 1，并用 `UNIQUE (job_id, attempt_no)` 接住"同一 Job 内不许两次同号执行"），"这是第几次执行"因此可判定，重投变得可表达。

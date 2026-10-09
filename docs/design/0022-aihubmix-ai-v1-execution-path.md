@@ -1,3 +1,5 @@
+> 归属状态（2026-10-09）：本文件现行技术范围的权威已由[同主题 Agent Note](../../.agents/notes/implemented/platform/2026-10-06-aihubmix-ai-v1-execution-path.md)完整承接并经归属评审；历史实施计划与过时表述只作来源。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
+
 主题: AIHubMix 执行路径改走 /ai/v1：URL 参考图、任务标识与成本口径
 当前修订: v1
 状态: 已接受

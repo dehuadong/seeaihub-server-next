@@ -4,7 +4,7 @@
 //! request 是 Verb、canonical URI、canonical query、canonical headers、附加签名头列表与
 //! `UNSIGNED-PAYLOAD`。默认签名头集合是所有 `x-oss-*`、`content-type` 与
 //! `content-md5`，其余显式头进附加签名头；`host` 不进 canonical headers。规则与对拍
-//! 向量的唯一属主是[对象存储上传设计](../../../docs/design/0021-object-storage-upload.md) §5，
+//! 向量的唯一属主是[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)，
 //! 固定输入与期望值落档在 [`out-reference/oss-v4-signing-golden.md`](../../../out-reference/oss-v4-signing-golden.md)。
 
 use hmac::{Hmac, KeyInit, Mac};

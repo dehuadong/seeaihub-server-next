@@ -1,3 +1,5 @@
+> 归属状态（2026-10-09）：本文件现行技术范围的权威已由[同主题 Agent Note](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)完整承接并经归属评审；历史实施计划与过时表述只作来源。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
+
 主题: 对象存储上传：模块划分、签名与上传存储配置
 当前修订: v4
 状态: 已接受

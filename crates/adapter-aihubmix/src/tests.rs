@@ -590,7 +590,7 @@ fn a_failed_task_is_a_provider_error_with_its_amount() {
 }
 
 /// 完成态任务对象里的 `id` 落到 `provider_trace_id`：它就是这次执行的对账标识，
-/// 平台据此在审计与对账里认这一笔（[设计 0022](../../../docs/design/0022-aihubmix-ai-v1-execution-path.md) §3）。
+/// 平台据此在审计与对账里认这一笔（[设计 0022](../../../.agents/notes/implemented/platform/2026-10-06-aihubmix-ai-v1-execution-path.md)）。
 #[test]
 fn a_completed_task_keeps_its_id_as_the_provider_trace() {
     let body = serde_json::json!({

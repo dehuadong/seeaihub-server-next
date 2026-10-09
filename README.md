@@ -26,14 +26,16 @@
 | **全部配置项**（每个变量的缺省、含义、生产取值） | [`docs/operations/configuration.md`](docs/operations/configuration.md) |
 | **素材与模型升级教程**（改素材后怎么生效、合同变更为什么要升修订、本地库怎么处理） | [`docs/tutorials/supply-materials.md`](docs/tutorials/supply-materials.md) |
 | **架构治理**：分层职责、依赖方向、边界规则（R1–R5）与扩展纪律 | [`docs/architecture.md`](docs/architecture.md) |
-| 分层规则的**依据、边界细则与例外理由** | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
-| 持久决定 | [`docs/adr/`](docs/adr/) |
+| 分层规则的依据、边界细则与接受缺口 | [归属切换登记](docs/agents/document-ownership-transition.md#技术设计)；架构治理继续拥有现行边界 |
+| 长期技术提案、设计与决定 | [Agent Notes](.agents/notes/README.md)；有效范围统一从[文档入口](docs/AGENTS.md#历史归属切换)读取 |
+| 持续产品合同 | [`docs/contracts/`](docs/contracts/)；本次范围与验收归工作项 |
+| 历史 Spec、RFC、ADR 与未完成切换范围 | [归属切换登记](docs/agents/document-ownership-transition.md)，旧目录保留原文与历史身份 |
 | 领域词汇表 | [`GLOSSARY.md`](GLOSSARY.md) |
 | 各渠道的事实（端点、参数、计量与成本口径、实测记录） | [`docs/facts/channel-facts.md`](docs/facts/channel-facts.md) |
 | 受控验证与人工验收清单（步骤、停止条件、留档要求） | [`docs/verification/`](docs/verification/) |
-| 工程变更与交付记录 | [`.agents/notes/`](.agents/notes/) |
+| 工作范围、评审、批准与交付状态 | [GitHub Issue 配置](docs/agents/issue-tracker.md) |
 | 上游原始材料（文档、Schema 快照、实测响应） | [`out-reference/`](out-reference/) |
-| 后续提案与进度 | [seeaihub-server-next#1](https://github.com/dehuadong/seeaihub-server-next/issues/1)、[seeaihub-server-next#5](https://github.com/dehuadong/seeaihub-server-next/issues/5) |
+| 后续提案与进度 | [项目 Issues](https://github.com/dehuadong/seeaihub-server-next/issues)，复用同一工作的已有 Issue |
 
 ## 本地启动
 

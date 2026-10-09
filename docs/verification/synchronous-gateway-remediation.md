@@ -1,6 +1,6 @@
 # 同步图片网关整改验证
 
-本清单验证[整改设计](../design/0018-synchronous-gateway-remediation.md)对[同步网关 Spec v2](../specs/0005-synchronous-image-gateway.md#8-验收条件)（含 A11）的落实。它说明验证方法，不表示整改实现或以下用例已经通过。普通用例只使用本地假 Provider；生产清理、切换与真实 Provider 调用需要各自授权。
+本清单验证[整改设计](../design/0018-synchronous-gateway-remediation.md)对[同步网关 Spec v2](../contracts/0005-synchronous-image-gateway.md#8-验收条件)（含 A11）的落实。它说明验证方法，不表示整改实现或以下用例已经通过。普通用例只使用本地假 Provider；生产清理、切换与真实 Provider 调用需要各自授权。
 
 ## 1. 故障与验收映射
 
@@ -70,7 +70,7 @@ A8 在多 API 副本下观察模型/渠道全局计数与本机资源上限；�
 
 A9 使用本清单第 4.2 节旧库升级用例，另覆盖旧在飞任务排空/转对账与容量登记及历史载荷清理证据。
 
-A10 核对管理端/客户调用记录只依赖最小投影，字段无请求/图片；金额、跨 UTC 日、失败成本缺口、人工解除及正式调整沿用[账户资金 Spec](../specs/0002-account-funds-and-reservations.md)。
+A10 核对管理端/客户调用记录只依赖最小投影，字段无请求/图片；金额、跨 UTC 日、失败成本缺口、人工解除及正式调整沿用[账户资金 Spec](../contracts/0002-account-funds-and-reservations.md)。
 
 ## 6. 证据记录要求
 
@@ -199,7 +199,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 
 三条都不启 Worker：`200` 本身就是"这条路不依赖 Worker 生成队列或结果轮询"的判据。前两条各钉一种上游形态（`url` 原样交回、`b64_json` 与 `STANDARD.encode(PNG_FIXTURE)` 逐字相等）；第三条把两条入口放在同一个进程里跑通，另覆盖公网 URL 参考图、data URL 参考图与 multipart 文件部件三种输入形态。
 
-生成入口已收敛：`/v1/images/edits` 与 `/v1/images/generations` 现在接受同一个 JSON 请求，multipart 正文不再被接受（[Spec 0005](../specs/0005-synchronous-image-gateway.md) v4）。上表的 `edits` 行记录的是收敛前那一次运行。
+生成入口已收敛：`/v1/images/edits` 与 `/v1/images/generations` 现在接受同一个 JSON 请求，multipart 正文不再被接受（[Spec 0005](../contracts/0005-synchronous-image-gateway.md) v4）。上表的 `edits` 行记录的是收敛前那一次运行。
 
 ### A5
 
@@ -226,7 +226,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 
 ## 11. A5 子进程强杀矩阵的实施证据
 
-本节记录 [Spec 0005 §8](../specs/0005-synchronous-image-gateway.md) A5 的进程级强杀取证。用例在 `apps/api/tests/http_contract/cases_kill_matrix.rs`（7 条，全部 `#[ignore]`），基线 `7923fb4`，改动未提交。
+本节记录 [Spec 0005 §8](../contracts/0005-synchronous-image-gateway.md) A5 的进程级强杀取证。用例在 `apps/api/tests/http_contract/cases_kill_matrix.rs`（7 条，全部 `#[ignore]`），基线 `7923fb4`，改动未提交。
 
 第 10 节缺的是"运行到某一格再真的 SIGKILL"那一半，这里补上；恢复那一半复用第 10 节的数据库级用例。恢复跑的是生产同一份 `ExecutionReconciliationService` 与真渠道 Driver（`AdapterRegistry` 装 AIHubMix / APIMart 工厂），在测试进程里对着被杀进程的那个一次性库。验收只连进程内假上游，没有调用任何真实 Provider。
 
@@ -265,7 +265,7 @@ R2 候选计划（仍持有映射后的完整参数）、R1 对账独立上限�
 | 取得证据后／结算提交前 | `sigkill_after_the_evidence_arrives_before_the_settlement_commit_settles_once` | 上游停住第一次查询 → 锁 Job 行 → 放行带证据的终态 → 锁等待（结算事务） | 句柄已入库、查询 1、capture 0 | 终止等锁后端 → 放锁 → 推租约过期 → Worker 一轮 | `taken_over = 1`、`settled = 1`；`succeeded`；capture 1；Hold 0；槽位 `released`；案例 0；生成 1、查询 2 | passed |
 | 结算提交后 | `sigkill_after_the_settlement_commit_replays_as_result_not_retained` | 上游收到 AIHubMix 生成请求 → 武装余额写回闸门 → 放行 → 等写回被停住 | capture 1、Job `succeeded`、Hold 0（提交已落、响应未交） | 杀 → 另起一个 API 副本连同一库 → 同键同正文重发 | `409 result_not_retained`；capture 仍为 1；生成计数仍为 1 | passed |
 
-「提交前（已写提交声明、生成请求未发）」一格**退役**，不按 passed 计：它的屏障是 APIMart 的内联上传（`POST /v1/uploads/images`），生成入口收敛为只收公网 URL 后这条通路连同夹具的上传闸门一起删除（[设计 0021](../design/0021-object-storage-upload.md) §2），该状态在进程外没有可钉的屏障。该格要证的恢复结论由「提交中／接受后句柄未写入」格承担。
+「提交前（已写提交声明、生成请求未发）」一格**退役**，不按 passed 计：它的屏障是 APIMart 的内联上传（`POST /v1/uploads/images`），生成入口收敛为只收公网 URL 后这条通路连同夹具的上传闸门一起删除（[设计 0021](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)），该状态在进程外没有可钉的屏障。该格要证的恢复结论由「提交中／接受后句柄未写入」格承担。
 
 ### 我实际跑过的命令与结果
 

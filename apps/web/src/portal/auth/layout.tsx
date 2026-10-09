@@ -1,7 +1,7 @@
 import { Card, Flex, Typography } from 'antd';
 import type { ReactNode } from 'react';
 
-/// 三个公开认证页面共用的窄内容区与标题层级（`docs/specs/0004` §2）。
+/// 三个公开认证页面共用的窄内容区与标题层级（`docs/contracts/0004` §2）。
 ///
 /// 只负责品牌、页面标题、内容宽度与导航呈现；各页面拥有自己的表单、错误与提交状态。
 export function AuthLayout({

@@ -1,6 +1,6 @@
 # Issue tracker: GitHub
 
-本仓库的 Proposal 与实施工作项以 GitHub Issues 为权威存放位置，所有 Issue 操作使用 `gh` CLI。工作项单向链接仓库内的 PRD、Spec、RFC、ADR 与 Agent Note；仓库工件不反向引用 Issue。独立 Spec 位于 `docs/specs/`，不在 Issue 正文复制。
+本仓库的 Proposal 与实施工作项以 GitHub Issues 为权威存放位置，所有 Issue 操作使用 `gh` CLI。工作项拥有本次范围、产品行为与验收、评审和批准证据，并链接长期技术设计的 Agent Note。跨工作项合同按需引用登记的独立产品合同及适用修订，不在 Issue 复制正文。位置与历史例外统一读取 [`docs/AGENTS.md`](../AGENTS.md#历史归属切换)，新工作不再新建 RFC 或 ADR。
 
 ## Conventions
 
@@ -16,7 +16,7 @@
 
 ## Proposal workflow
 
-Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/seeaihub-server-next#<n>`）作为工作标识。同一工作复用已有 issue，不重复创建；独立的 Spec、RFC 与其他文档留在 [`docs/AGENTS.md`](../AGENTS.md#文档分层) 定义的位置并链接，不复制正文。Proposal 负责本次选定的交付范围、规划状态和批准证据；详细产品范围与验收由适用 Spec 拥有，没有独立 Spec 的小改动才由 Proposal 直接承载。
+Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/seeaihub-server-next#<n>`）作为工作标识。同一工作复用已有 issue，不重复创建。Proposal 写全本次范围、产品行为与验收、规划状态、评审和批准证据；持续合同及技术设计只链接其登记属主，明确本次适用修订与范围。规模大小不决定是否另建 Spec，只有跨工作项持续合同才需要独立属主。
 
 工作状态用标签表示，不用正文状态字段：
 
@@ -30,7 +30,7 @@ Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/see
 
 Plan Review 结论与批准证据写入该 issue 的决策/批准依据段，或链接的评审批次，并引用相关需求与设计。只有所需评审与批准齐备、且选定范围没有阻塞性决定或依赖时，才进入 `ready`；`in-progress` 仅在项目规则下取得执行授权后开始；交付并完成最终验证后进入 `complete`。就绪性丢失时，把受影响工作退回 `planning` 并记录阻塞原因；否决时记录决定。工作状态之外，批准与执行授权仍分别遵循项目指令（见仓库根 `AGENTS.md`）。
 
-历史来源：上游总体提案 `dehuadong/seeaihub#674` 及其技术设计 v1–v5 由上游仓库保留，只作为冻结的产品与架构来源，不承担本仓库后续提案或进度。本仓库的承接总览为 `dehuadong/seeaihub-server-next#1`，实现映射登记在 `docs/design/0001-image-generation.md`，后续新工作全部进入本仓库跟踪器。
+历史来源：上游总体提案 `dehuadong/seeaihub#674` 及其技术设计 v1–v5 由上游仓库保留，只作为冻结的产品与架构来源，不承担本仓库后续提案或进度。本仓库的承接总览为 `dehuadong/seeaihub-server-next#1`，初期实现映射在冻结的历史设计中保留；有效属主从 [`docs/AGENTS.md`](../AGENTS.md#历史归属切换) 读取。后续新工作全部进入本仓库跟踪器。
 
 ### 提案的每条范围条目都要有归宿
 

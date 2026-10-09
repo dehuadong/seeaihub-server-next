@@ -1,3 +1,5 @@
+> 归属状态（2026-10-09）：本文件为未接受且已移出原阶段的历史草案，不作为现行实施依据；恢复该范围先在工作项核对事实、范围与设计接受证据。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
+
 主题: 火山方舟 Doubao Seedream 供给与计量计价泛化
 当前修订: v1
 状态: 待评审；**已移出第二阶段范围**（2026-09-19，见工作项 `dehuadong/seeaihub-server-next#2` 的规划范围）——它是「引入另一个 Vendor 的 Vendor Model」这一**独立工作项**的设计草案，不属于「同一 Vendor Model 由多个 Provider 供应」的范畴

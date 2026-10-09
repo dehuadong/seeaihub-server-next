@@ -185,7 +185,7 @@ function Portal() {
 /// 与运营后台同一套主题与语言：两边的组件库与观感一致，运维与客户看到的不是两种东西。
 ///
 /// 这个入口**只引客户侧的模块**：管理端的页面与它的取数封装都不在这里的依赖图里，所以产物里不会
-/// 出现管理端代码（`docs/specs/0001-admin-and-customer-consoles.md` §5 的 V-D6）。构建末尾的隔离核对
+/// 出现管理端代码（`docs/contracts/0001-admin-and-customer-consoles.md` §5 的 V-D6）。构建末尾的隔离核对
 /// 会验证这一点。
 export function PortalApp() {
   return (

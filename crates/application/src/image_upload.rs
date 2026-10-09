@@ -3,8 +3,8 @@
 //! 上传存储是平台自己调用的**外部服务**，不是生成上游：它没有 Offering、不进 Runtime Revision、
 //! 不参与选路，也不产生执行记录、资金占用与计量。端口是 `ObjectStorage`（只有 PUT 与 HEAD
 //! 两个操作），访问密钥经既有 `CredentialProvider` **按请求**解析，密钥只作调用参数传给端口。
-//! 行为合同由[图片上传与对象存储 Spec](../../docs/specs/0007-image-upload-and-object-storage.md)拥有，
-//! 取值域、启动期形状校验与签名机制由[对象存储上传设计](../../docs/design/0021-object-storage-upload.md)拥有。
+//! 行为合同由[图片上传与对象存储 Spec](../../../docs/contracts/0007-image-upload-and-object-storage.md)拥有，
+//! 取值域、启动期形状校验与签名机制由[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)拥有。
 
 use crate::{ApplicationError, CredentialProvider};
 use async_trait::async_trait;
@@ -68,7 +68,7 @@ pub struct ObjectMetadata {
 
 /// 上传路径要用的对象存储操作：只有 PUT 与 HEAD，不发 GET、也不签发预签名 URL。
 ///
-/// 失败分类由[对象存储上传设计](../../docs/design/0021-object-storage-upload.md) §7 判定，实现方
+/// 失败分类由[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md) 判定，实现方
 /// 只做 HTTP 状态到 [`UploadWriteFailure`] 的映射，重试编排在应用层。
 #[async_trait]
 pub trait ObjectStorage: Send + Sync {
@@ -320,7 +320,7 @@ impl ImageUploadConfig {
 
 /// 上传失败到对客结果的收口。
 ///
-/// 对客错误码见[图片上传与对象存储 Spec](../../docs/specs/0007-image-upload-and-object-storage.md) §5；
+/// 对客错误码见[图片上传与对象存储 Spec](../../../docs/contracts/0007-image-upload-and-object-storage.md) §5；
 /// 客户端断开不对客返回错误码，只是服务端观测事实。
 #[derive(Debug, Clone, PartialEq, Eq, Error)]
 pub enum ImageUploadError {

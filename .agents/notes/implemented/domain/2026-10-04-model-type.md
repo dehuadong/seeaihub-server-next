@@ -2,7 +2,7 @@
 title: 模型类型：事实落点与用量展示口径
 status: implemented
 created: 2026-10-04
-updated: 2026-10-05
+updated: 2026-10-09
 approval: 用户 2026-10-04 在讨论中确认模型加 type（image/video/chat）、由素材声明、对外客户端据此判断用量单位，并明确不按类型做发布闸门、账单与用量按类型分开给量而不相加；合同与设计随后接受（Spec 0006 v1 生效、设计 0020 v1 已接受），执行实现获授权
 verification: 迁移回填 the_model_type_migration_backfills_existing_vendor_models；素材导入 a_material_must_declare_a_known_type、importing_the_same_material_twice_adds_no_rows、changing_the_type_of_an_existing_revision_is_rejected、a_material_without_a_type_is_rejected_without_writing_a_row；发布归一 normalize_rejects_an_inline_publication_without_a_known_type；接口合同 cases_model_type.rs 六条；账务读 cases_billing/cases_pricing/cases_cost_facts；浏览器 portal-history.spec.ts 六条；cargo check --workspace --all-targets、cargo fmt --all -- --check、npm run typecheck、npm run build、node scripts/decisions/check.mjs 通过
 ---
@@ -15,13 +15,33 @@ verification: 迁移回填 the_model_type_migration_backfills_existing_vendor_mo
 
 ## 决定
 
-行为由[模型类型 Spec](../../../../docs/specs/0006-model-type-and-usage-records.md)拥有，取数与展示由[模型类型设计](../../../../docs/design/0020-model-type.md)拥有。术语「模型类型」记在[词汇表](../../../../GLOSSARY.md)。本记录保存选择理由、备选与后果，不重复合同。
+行为归登记的[模型类型合同](../../../../docs/contracts/0006-model-type-and-usage-records.md)，本记录承接类型事实、发布、取数与展示的完整技术设计。术语「模型类型」记在[词汇表](../../../../GLOSSARY.md)。[历史设计 0020](../../../../docs/design/0020-model-type.md)保留为来源；归属接受结果见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
 
 类型挂在 Vendor Model 上，与合同同层同生命周期，来源是工程侧的发布素材。理由：类型是上游模型自身的事实（`gpt-image-2.5` 就是图片模型），不是运营的定价或打包选择；素材已经在声明这个模型的合同，类型与它同类。运营的发布页只做「选模型、排候选、给价」，多一个手填字段就多一处可以填错而与模型实际不符的地方。
 
 用量记录与账单汇总的类型都不给 Job 加列：Job 已经冻结 `vendor_model_id`，而 Vendor Model 行按身份不可变，读取时连过去拿到的就是受理当时那一行。这样网关模型以后改绑到别的 Vendor Model 也不会污染历史记录，同时省掉一次迁移与回填。用量事实（张 / 秒 / token）由各自执行路径在结算时写落点，读取只装配，不重算。
 
 用量按类型分开给：图片给张数，视频给秒数，对话给输入与输出 token；账单汇总是同一区间内各类型各自的合计，不合并成单个数。张、秒、token 是三种量，相加得不到有意义的数；分开之后每一列都能与逐条记录对上。
+
+## 技术设计
+
+### 类型存储与发布
+
+`catalog.vendor_models.model_type` 是必填字段，取值 `image`、`video`、`chat`，具名 CHECK 为 `vendor_models_model_type_known`。类型与合同按 `(vendor_id, native_model_id, native_revision)` 不可变。历史迁移 `0041` 将既有图片模型回填为 `image` 后设为非空，不留列默认值；新行显式给类型。
+
+素材顶层 `type` 由导入用例在写入前校验，缺失或未知取值的诊断点名素材与型号；同一身份已存在时比对类型与合同，差异拒绝，不覆盖。引用式发布从被引用 Offering 所属的 Vendor Model 取类型与合同，运营不另填；内联发布要求顶层明确给合法 `type`，没有逐候选回退。类型不参与受理、路由或可调用目录判据。
+
+### 目录与历史读取
+
+目录投影从 Vendor Model 取类型，只在既有目录字段上增加 `type`；OpenAI 标准字段由[模型列表合同](../../../../docs/contracts/0009-openai-compatible-model-list.md)规定。用量通过 Job 冻结的 `vendor_model_id` 连接不可变模型行，不从网关模型当前绑定反推，不给 Job 建第二份类型列。
+
+用量在仓储中统一装配为 `CustomerUsageView` 与 `UsageAmounts`，`images`、`seconds`、`input_tokens`、`output_tokens` 为可缺省的整数值。图片取持久化 `image_count`，缺失沿用 `Some(0)`；视频秒数和对话 token 在各自执行路径尚无落点时保持缺失。客户与管理员共用用量装配，分别拥有行投影与外层响应，权限与翻页规则不合并。对客调用标识与状态的后续规则归[响应信封 Note](../platform/2026-10-07-consumer-response-envelope-and-points.md)，不沿用旧设计中“不回 Job 标识”的历史表述。
+
+### 汇总与界面
+
+账单按受理时模型类型分别聚合同一区间的已结束记录，扣费净额与时间谓词由资金合同规定，不合并不同单位。图片记录只贡献图片总量；视频即使经图片路径产生图片，也不计入图片汇总。某类型没有量时省略其键。
+
+共享用量模块拥有类型、字段与显示单位的映射，客户用量、账单和管理端调用明细共同使用。图片以张显示，视频以秒显示，对话分别显示输入与输出 token；缺失显示「—」，图片处理中或未产出的既有零张语义保留。响应和前端共用同一用量行类型，目录类型只镜像 API 返回值。
 
 ## 备选方案
 
@@ -35,7 +55,7 @@ verification: 迁移回填 the_model_type_migration_backfills_existing_vendor_mo
 
 - 视频秒数与对话 token 的落点在其执行路径落地前不存在，非图片类型的记录只能显示占位。类型字段先就位是有意的：客户端据此判断用量单位的规则不必等执行路径。
 - 类型取值收在三种，将来接入音频或其他模态要加迁移与取值面；取值面收敛是刻意的，不预留没有事实支撑的取值。
-- 类型不是计费口径。同一条渠道按 token 计量量计价的图片模型（[AIHubMix 素材](../../../../config/bootstrap/gpt-image-2.5-flare.json)）类型仍是 `image`，用量记录显示张数，收费仍按对客计价形态与冻结快照计算；两者混起来会让客户以为按张扣费。
+- 类型不是计费口径。同一条渠道按声明金额计价的图片模型（[AIHubMix 素材](../../../../config/bootstrap/gpt-image-2.5-flare.json)）类型仍是 `image`，用量记录显示张数，收费仍按对客计价形态与冻结快照计算；两者混起来会让客户以为按张扣费。
 
 ## 验证
 

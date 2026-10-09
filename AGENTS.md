@@ -12,7 +12,7 @@
 
 ### Discuss
 
-使用 Discuss 理解问题，结合现有代码、文档、ADRs、RFCs 和项目约束形成解决方案，并消除足够的歧义，以判断下一阶段。
+使用 Discuss 理解问题，结合现有代码、文档入口登记的有效合同与设计及项目约束形成解决方案，并消除足够的歧义，以判断下一阶段。
 
 讨论不是被动访谈。优先自行分析已有项目上下文，而不是把可判断的问题交给用户。
 
@@ -55,7 +55,7 @@
 ## 事实与安全
 
 - PostgreSQL 是业务事实权威；缓存不是事实来源。
-- 图片不落盘：请求里的图就是参数值（只收公网 URL；本地文件先经 `POST /v1/uploads/images` 换成公网 URL），结果按渠道原形回（`url` 或 `b64_json`）。合同见[同步图片网关 Spec](docs/specs/0005-synchronous-image-gateway.md) §1、§3。
+- 图片不落盘：请求里的图就是参数值（只收公网 URL；本地文件先经 `POST /v1/uploads/images` 换成公网 URL），结果按渠道原形回（`url` 或 `b64_json`）。合同归属与有效范围见[文档入口](docs/AGENTS.md#历史归属切换)。
 - Provider 凭证只从环境变量读取，不写入配置、日志、响应或测试 fixture。
 - Provider 创建请求状态不确定时进入 `reconciliation_required`，不得自动重提。
 - 模型 Schema、Offering、Channel、Price Plan 经不可变 Runtime Revision 发布；请求与 Job 固定受理时版本。
@@ -108,7 +108,7 @@ playwright test e2e 参阅 `apps/web/AGENTS.md`
 ## 通用约定
 - 未经批准不发起任何计费调用
 - 未经批准不自主选择渠道模型
-- 当需要记录持久的ADR架构设计决策时必须获得用户确认
+- 新的持久架构决定必须获得用户确认，记录属主按 `docs/AGENTS.md` 选择
 - Rust 全量门禁交给 CI，不在本地重跑：本地只按改动面跑能挡住这次回归的最小证据，文档、Agent Note 与技能按各自约定检查；没跑的检查就说没跑。跑哪些、什么时候跑、推之前核对什么见 [`docs/agents/git.md`](docs/agents/git.md)
 - 测试不写在源码文件里：源码文件只留 `#[cfg(test)] mod tests;`，用例放同级的 `tests.rs`（`src/lib.rs`、`src/main.rs` 用 `src/tests.rs`，`src/<模块>.rs` 用 `src/<模块>/tests.rs`），多了就在对应 `tests/` 子目录里按主题分文件；生产代码的可见性不为测试放宽，夹具可放宽到测试模块内部；只有需要真实数据库、真实 Redis 或独立进程的端到端用例才进 crate 的 `tests/`（测试夹具自身的检查随夹具同处），`#[ignore]` 必须写明前置条件
 
@@ -118,9 +118,9 @@ playwright test e2e 参阅 `apps/web/AGENTS.md`
 
 | 文档 | 职责 |
 | --- | --- |
-| `docs/agents/engineering.md` | 工程流程的阶段编排、门禁与返回路径 |
+| `docs/agents/GATES.md` | 工程流程的阶段编排、门禁与返回路径 |
 | `docs/agents/issue-tracker.md` | Proposal 与工单：GitHub Issues 为准、工作状态标签、PR 分诊 |
-| `docs/agents/domain.md` | 领域工程判断：读什么、术语纪律、冲突标注、ADR 准入与引用 |
+| `docs/agents/domain.md` | 领域工程判断：读什么、术语纪律、冲突标注、独立架构记录准入与引用 |
 | `docs/AGENTS.md` | 文档标准：文档分层、位置、职责、正文与注释的写法、slop 清单 |
 | `docs/agents/git.md` | 提交与推送：提交粒度与信息、推送前跑哪些证据、历史改写 |
 | `.agents/notes/` | Agent Note：记录范围、生命周期、文件骨架与检查（`README.md` 与 `AGENTS.md`） |

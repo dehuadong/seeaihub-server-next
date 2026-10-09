@@ -276,7 +276,7 @@ server {
     # 请求体上限要同时盖住两条入口：生成入口 16 MiB（参考图与遮罩只以公网 URL 文本随正文提交），
     # 上传路由的 UPLOAD_MAX_REQUEST_BYTES（默认 21 MiB，单文件上限 20 MiB 加 multipart 协议余量）。
     # nginx 默认 1m 会先在它这里 413。示例 22m 盖住两者；上传上限的合同见
-    # docs/specs/0007-image-upload-and-object-storage.md §2.2。
+    # docs/contracts/0007-image-upload-and-object-storage.md §2.2。
     client_max_body_size 22m;
 
     # 一次生成对客是同步的，最长等到 GENERATION_SYNC_WAIT_SECONDS 才回；nginx 默认 60s 会提前切断。
@@ -303,7 +303,7 @@ sudo nginx -t && sudo systemctl reload nginx
 
 - 两个域名共用一份配置：分发由 API 按 `Host` 决定，反代不区分；**别把 `Host` 改写成 `127.0.0.1`**，否则运营后台打不开；
 - `client_max_body_size` 要同时盖住生成入口的 16 MiB 正文上限与上传路由的 `UPLOAD_MAX_REQUEST_BYTES`（默认 21 MiB；示例 `22m`）；`proxy_read_timeout` 不小于 `GENERATION_SYNC_WAIT_SECONDS`（默认是 `PROVIDER_TIMEOUT_SECONDS + 30`）；
-- 上限不足时上传请求会被反向代理先回 `413`；上传路由的上限合同与失败后果见[图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §2.2；
+- 上限不足时上传请求会被反向代理先回 `413`；上传路由的上限合同与失败后果见[图片上传与对象存储 Spec](../contracts/0007-image-upload-and-object-storage.md) §2.2；
 - API 绑在回环（`API_BIND=127.0.0.1:8081`），只让 nginx 够得到；证书按 §2.4 签发，路径要与上面的 `ssl_certificate` 一致；
 - 公开鉴权端点的来源维默认用**连接对端地址**；部署在反代之后时对端是 nginx 本身，要在 API 进程配
   `AUTH_SOURCE_HEADER=x-real-ip`（nginx 用 `$remote_addr` 覆盖写它）才能区分真实客户端。**采信这个头

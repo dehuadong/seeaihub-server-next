@@ -1,5 +1,5 @@
 /// 客户控制台的地址定义：五个受保护页面（`docs/design/0014` §1）与三个公开认证页面
-/// （`docs/specs/0004` §2）。这里**不引 React**：Vite 开发服务在 `vite.config.ts` 里读它，把无扩展名
+/// （`docs/contracts/0004` §2）。这里**不引 React**：Vite 开发服务在 `vite.config.ts` 里读它，把无扩展名
 /// 的深链回退到 `portal.html`；生产那条由 API 的静态兜底做（`apps/api/src/main.rs` 的 `serve_from`）。
 /// 两处落回同一组地址，地址改了这里也改。
 export const PORTAL_PATHS = {

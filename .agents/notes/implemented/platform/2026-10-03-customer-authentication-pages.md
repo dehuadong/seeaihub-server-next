@@ -15,7 +15,7 @@ verification: npx playwright test e2e/portal-auth.spec.ts e2e/portal-self-servic
 
 ## 决定
 
-行为由[客户认证 Spec](../../../../docs/specs/0004-customer-authentication-pages.md)拥有，组件、路由和请求处理由[认证页面 RFC](../../../../docs/design/0016-customer-authentication-pages.md)拥有。本记录保存选择理由、备选与后果，不重复合同。
+行为由[客户认证 Spec](../../../../docs/contracts/0004-customer-authentication-pages.md)拥有，组件、路由和请求处理由[认证页面 RFC](../../../../docs/design/0016-customer-authentication-pages.md)拥有。本记录保存选择理由、备选与后果，不重复合同。
 
 三个独立地址让刷新与前进后退恢复当前任务；注册保留为登录页的局部切换，不扩成注册流程改版。回跳目标存当前标签页的受保护地址与恰好一对日期区间（`since`/`until`），目标不进入认证地址。重置兑换只认 204，其余 2xx 归为结果未知；共享传输新增可选 `expectedStatus`，默认行为不变。
 

@@ -13,7 +13,7 @@ verification: 见正文「验证」。`cd apps/web && npx playwright test` 全�
 
 客户控制台概览此前显示「已结算余额」（`balance_microusd`）：它是**大于等于**客户实际能花的钱的那个数——请求受理时先按保底额占住一部分额度（**Held Amount**），这个数却不动。两处后果：客户拿它估「还能发多少请求」，会在余额闸门处被拒（`402 insufficient_balance`）而看不出为什么；新账户的 `0 元` 又容易被读成「充值没到账 / 额度用完」。
 
-产品行为归[控制台 Spec v16](../../../../docs/specs/0001-admin-and-customer-consoles.md) C7、C15、§4.3、V-C6、V-D5、V-D14 与[账户资金 Spec v4](../../../../docs/specs/0002-account-funds-and-reservations.md) §4、§7（A7）；术语归 [`GLOSSARY.md`](../../../../GLOSSARY.md) 的 **Customer Balance**。本记录只写这次变更独有的理由、备选、后果与验证。
+产品行为归[控制台 Spec v16](../../../../docs/contracts/0001-admin-and-customer-consoles.md) C7、C15、§4.3、V-C6、V-D5、V-D14 与[账户资金 Spec v4](../../../../docs/contracts/0002-account-funds-and-reservations.md) §4、§7（A7）；术语归 [`GLOSSARY.md`](../../../../GLOSSARY.md) 的 **Customer Balance**。本记录只写这次变更独有的理由、备选、后果与验证。
 
 ## 决定
 

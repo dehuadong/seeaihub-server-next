@@ -2,8 +2,8 @@
 //!
 //! 这一层只有纯类型与纯函数：不依赖 HTTP、对象存储、数据库与环境变量。准入只看**内容魔数**，
 //! 调用方声明的文件名与 `Content-Type` 都不影响判型；对象键的扩展名由判出的规范 MIME 反推。
-//! 取值域与机制由[对象存储上传设计](../../docs/design/0021-object-storage-upload.md)拥有，
-//! 对客行为合同由[图片上传与对象存储 Spec](../../docs/specs/0007-image-upload-and-object-storage.md)拥有。
+//! 取值域与机制由[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)拥有，
+//! 对客行为合同由[图片上传与对象存储 Spec](../../../docs/contracts/0007-image-upload-and-object-storage.md)拥有。
 
 use crate::AccountId;
 use uuid::Uuid;
@@ -93,7 +93,7 @@ pub fn new_object_key(account_id: AccountId, media_type: UploadMediaType) -> Str
 
 /// 一次对象存储写入的失败分类：决定编排层重试同一对象键还是终止。
 ///
-/// 分类由[对象存储上传设计](../../docs/design/0021-object-storage-upload.md) §7 的表判定：
+/// 分类由[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md) 的表判定：
 /// 传输网络错误、连接超时、对象存储 `408` / `429` / `5xx` 可重试；凭证无效、
 /// 权限不足、bucket 或 region 不可访问、禁止覆盖相撞、元数据核验不一致与其他 `4xx` 是终态。
 /// 两类对客都是 `503 object_store_unavailable`，差别只在要不要按同一对象键重试。

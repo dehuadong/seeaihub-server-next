@@ -8,7 +8,7 @@
 //!
 //! **按账户触发，不默认全库重算**：核对一次只问一个账户的两条等式——
 //! `balance = SUM(entries)` 与 `held = SUM(active holds)`；没有默认周期，也不扫全库
-//! （`docs/specs/0002-account-funds-and-reservations.md` §5）。触发入口是管理员按账户发起的核查，
+//! （`docs/contracts/0002-account-funds-and-reservations.md` §5）。触发入口是管理员按账户发起的核查，
 //! 由后台任务执行，不在受理、结算或余额读取的请求路径上。
 //!
 //! **只发现，不改账**：不一致时只外发一条平台侧告警、建一条对账案例。余额与账本的任何改动都是

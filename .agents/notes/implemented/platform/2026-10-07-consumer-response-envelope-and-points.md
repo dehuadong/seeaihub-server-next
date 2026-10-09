@@ -24,9 +24,9 @@ verification: cargo fmt/clippy/test、真库端到端 16 模块 181 passed、Pla
 - 对客响应类型与 Adapter 的内部类型分开：Adapter 的内部结果类型承载“地址列表 + 渠道给的过期时刻”或“内联 base64”，对客 wire 类型归 `apps/api`。
 - 成功件带上该笔实收，随内存成功事实一起交回 `apps/api`，不读库、不重放。
 
-**积分是对客金额单位，单位与取整合同归 [Spec 0002 §1、§2、§4](../../../../docs/specs/0002-account-funds-and-reservations.md)。** 换算落在两处：算定边界把实收与保底额向上取整后落账，读边界再向上取整一次——账上的金额本来恒为整积分，读侧那次是兜底，非整积分的历史或异常行会被取整并记一条错误，不静默截断、也不在请求路径里 panic。内部账本、费率与计价形态不动。
+**积分是对客金额单位，单位与取整合同归 [Spec 0002 §1、§2、§4](../../../../docs/contracts/0002-account-funds-and-reservations.md)。** 换算落在两处：算定边界把实收与保底额向上取整后落账，读边界再向上取整一次——账上的金额本来恒为整积分，读侧那次是兜底，非整积分的历史或异常行会被取整并记一条错误，不静默截断、也不在请求路径里 panic。内部账本、费率与计价形态不动。
 
-合同由 [Spec 0005 §1、§3](../../../../docs/specs/0005-synchronous-image-gateway.md) 与 [Spec 0002 §1、§2、§4、§5](../../../../docs/specs/0002-account-funds-and-reservations.md) 拥有；术语见 [GLOSSARY.md](../../../../GLOSSARY.md) 的 Result Envelope、Generation Job 与 Consumer Point。
+合同由 [Spec 0005 §1、§3](../../../../docs/contracts/0005-synchronous-image-gateway.md) 与 [Spec 0002 §1、§2、§4、§5](../../../../docs/contracts/0002-account-funds-and-reservations.md) 拥有；术语见 [GLOSSARY.md](../../../../GLOSSARY.md) 的 Result Envelope、Generation Job 与 Consumer Point。
 
 ## 备选方案
 

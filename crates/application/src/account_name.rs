@@ -1,4 +1,4 @@
-//! 账户名称的规则与自动生成（[账户名称 Spec](../../../docs/specs/0003-account-names-and-login-identities.md) §2）。
+//! 账户名称的规则与自动生成（[账户名称 Spec](../../../docs/contracts/0003-account-names-and-login-identities.md) §2）。
 //!
 //! 名称是账户资料：可重复、可被运营与该账户的客户本人修改，不参与认证、授权、路由或金额计算。
 //! 这里的两个公开函数是**唯一的规则实现**——API 只负责区分“省略”与“显式 `null`”，持久化只负责写库，

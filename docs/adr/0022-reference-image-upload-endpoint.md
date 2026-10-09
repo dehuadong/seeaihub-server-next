@@ -1,3 +1,5 @@
+> 归属状态（2026-10-09）：本文件的现行技术决定由[参考图上传 Note](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)完整承接；产品行为归图片上传与同步图片网关合同。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
+
 ---
 status: accepted
 ---

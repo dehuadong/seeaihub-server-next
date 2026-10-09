@@ -2,7 +2,7 @@
 //!
 //! 这一层只做请求构造、V4 签名（header 模式）、有界传输与 HTTP 状态到失败分类的映射：不读环境
 //! 变量、不认数据库、不做重试编排（重试在应用层），也不发 GET 或签发预签名 URL。访问密钥只作
-//! 调用参数，不进日志。签名规则与对拍向量见[对象存储上传设计](../../docs/design/0021-object-storage-upload.md) §5。
+//! 调用参数，不进日志。签名规则与对拍向量见[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)。
 
 mod signing;
 mod transport;

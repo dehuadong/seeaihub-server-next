@@ -2,7 +2,7 @@
 
 工程师写的发布素材（`config/bootstrap/*.json`）是渠道、供给、厂商模型合同与模型说明的来源。升级素材 = 改素材文件、随新版本一起发布、按需重新发布受影响的模型。本文写这三步各自怎么走、什么情况下服务起不来，以及本地开发库怎么处理。
 
-素材按身份键幂等导入的完整规则与理由归 [`docs/design/0012-platform-model-publishing.md`](../design/0012-platform-model-publishing.md) §3；模型说明的合同与版本保证归 [`docs/specs/0008-model-usage-documentation.md`](../specs/0008-model-usage-documentation.md)。
+素材按身份键幂等导入的完整规则与理由归 [`docs/design/0012-platform-model-publishing.md`](../design/0012-platform-model-publishing.md) §3；模型说明的合同与版本保证归 [`docs/contracts/0008-model-usage-documentation.md`](../contracts/0008-model-usage-documentation.md)。
 
 ## 1. 素材什么时候导入
 
