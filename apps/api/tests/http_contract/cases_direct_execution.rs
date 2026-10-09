@@ -835,9 +835,9 @@ async fn direct_slow_provider_does_not_occupy_a_database_connection() {
 
 /// A8：并发数可以超过 API 自身的连接池上限，说明等待 Provider 时不占连接。
 ///
-/// API 进程的连接池上限固定是 10（见 `PgHubRepository::connect(&database_url, 10)`）。这里同时发
-/// 16 个请求并等它们**都**到达假上游；如果有连接跨 Provider 等待被独占，最多只有 10 个能同时等，
-/// 第 11 个起会卡在池上。再用 `/health` 的 `SELECT 1` 确认等待期间池仍可服务新请求。
+/// API 进程的连接池上限是 `DATABASE_MAX_CONNECTIONS`（缺省 10）。这里同时发 16 个请求并等它们
+/// **都**到达假上游；如果有连接跨 Provider 等待被独占，最多只有池上限那么多个能同时等，再往后会
+/// 卡在池上。再用 `/health` 的 `SELECT 1` 确认等待期间池仍可服务新请求。
 #[tokio::test]
 #[ignore = "requires a PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn direct_slow_provider_keeps_more_requests_than_pool_connections_in_flight() {

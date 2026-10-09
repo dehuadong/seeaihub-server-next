@@ -161,12 +161,46 @@ pub async fn max_declared_output_images(
     }
 }
 
+/// 连接池上限的缺省值：进程没配 `DATABASE_MAX_CONNECTIONS` 时用它。
+///
+/// 它只保证"不配这一项时行为与它存在之前逐位相同"；配多大由部署决定，配置项的属主是
+/// `docs/operations/configuration.md`。池是**全进程共用**的：生成、上传、控制台与管理端读走同一个
+/// 池，所以这个数不是"生成能并发多少"，而是"本进程同时在数据库里能做多少事"。
+///
+/// 名字带 `DATABASE_`：API 进程另有一个同名的 `DEFAULT_MAX_CONNECTIONS`（`API_MAX_CONNECTIONS`，
+/// HTTP 连接上限 1024），两者不是一回事。
+pub const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
+
+/// 解析 `DATABASE_MAX_CONNECTIONS` 的取值：**没给或给空**取 [`DEFAULT_DATABASE_MAX_CONNECTIONS`]，
+/// 非整数或 `0` 报错。
+///
+/// `0` 不当作"用缺省"：sqlx 会把它当成"永远借不到连接"，请求会一直排到获取超时，表现为整个进程
+/// 不可用。那是个配错的部署，不是一个可以替它拿主意的缺省。
+pub fn parse_max_connections(raw: Option<&str>) -> Result<u32, ApplicationError> {
+    let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
+        return Ok(DEFAULT_DATABASE_MAX_CONNECTIONS);
+    };
+    match raw.parse::<u32>() {
+        Ok(value) if value > 0 => Ok(value),
+        _ => Err(ApplicationError::Configuration(format!(
+            "DATABASE_MAX_CONNECTIONS must be a positive integer, got {raw}"
+        ))),
+    }
+}
+
+/// 从环境变量读连接池上限。两个进程各自读一次，取值口径与 [`parse_max_connections`] 相同。
+pub fn max_connections_from_env() -> Result<u32, ApplicationError> {
+    parse_max_connections(std::env::var("DATABASE_MAX_CONNECTIONS").ok().as_deref())
+}
+
 #[derive(Debug, Clone)]
 pub struct PgHubRepository {
     pool: PgPool,
 }
 
 impl PgHubRepository {
+    /// 按给定上限建池。其余参数取 sqlx 缺省：`acquire_timeout` 30 秒（池满时**排队等待**，不是
+    /// 快速失败）、`min_connections` 0、`idle_timeout` 10 分钟、`max_lifetime` 30 分钟。
     pub async fn connect(
         database_url: &str,
         max_connections: u32,
@@ -6752,3 +6786,6 @@ fn contract_carrier_hash(contract: &Value, carrier: &Value) -> Result<String, Ap
     .map_err(|error| ApplicationError::Validation(error.to_string()))?;
     Ok(hex::encode(Sha256::digest(bytes)))
 }
+
+#[cfg(test)]
+mod tests;

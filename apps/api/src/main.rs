@@ -42,7 +42,7 @@ use seeai_domain::{
 };
 use seeai_persistence::{
     PgHubRepository, material_import::import_supply_materials_from_env,
-    material_import::public_docs_dir, max_declared_output_images,
+    material_import::public_docs_dir, max_connections_from_env, max_declared_output_images,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -241,7 +241,8 @@ async fn main() -> Result<()> {
     // 主机、读取走对客主机，从请求头取会把管理端地址写进不可变版本，所以必须显式配置、启动即校验。
     let see_base_url = required_env("SEE_BASEURL")?;
     seeai_application::model_document::validate_base_url(&see_base_url)?;
-    let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
+    let max_connections = max_connections_from_env()?;
+    let repository = Arc::new(PgHubRepository::connect(&database_url, max_connections).await?);
     repository.migrate().await?;
     // 供给素材的幂等导入（**工程侧**的动作）：渠道与 Offering 的来源是工程师写的素材。目录由
     // `SUPPLY_MATERIAL_DIR` 给，**不设时默认 `config/bootstrap`**（仓库、systemd 与 Docker 镜像
@@ -276,6 +277,10 @@ async fn main() -> Result<()> {
         declared_by = declared_by.as_deref().unwrap_or("no active contract"),
         undecodable_contracts = undecodable,
         "the timeout chain is consistent"
+    );
+    info!(
+        database_max_connections = max_connections,
+        "the database pool is sized"
     );
     let execution_port: Arc<dyn ExecutionRepository> = repository.clone();
     let repository_port: Arc<dyn HubRepository> = repository;

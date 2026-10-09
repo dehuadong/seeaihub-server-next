@@ -11,7 +11,7 @@ use seeai_application::{
     RequestTimeoutPolicy, RetryPolicy,
 };
 use seeai_cache_redis::RedisCache;
-use seeai_persistence::{PgHubRepository, max_declared_output_images};
+use seeai_persistence::{PgHubRepository, max_connections_from_env, max_declared_output_images};
 use std::{env, future::Future, num::NonZeroU64, pin::Pin, sync::Arc, task::Poll, time::Duration};
 use tracing::{error, info};
 use tracing_subscriber::EnvFilter;
@@ -41,7 +41,8 @@ async fn main() -> Result<()> {
     let database_url = required_env("DATABASE_URL")?;
     let worker_id = env::var("WORKER_ID").unwrap_or_else(|_| "worker-local-1".to_owned());
     let poll_interval = Duration::from_millis(parse_env("WORKER_POLL_INTERVAL_MS", 1_000_u64)?);
-    let repository = Arc::new(PgHubRepository::connect(&database_url, 10).await?);
+    let repository =
+        Arc::new(PgHubRepository::connect(&database_url, max_connections_from_env()?).await?);
     repository.migrate().await?;
     // 超时链整条校验：输出张数上限取自**合同自己声明的取值面**（读库，所以要连库之后才知道），
     // 比较因此比的是"合同允许的最大一档请求"。对客窗口短于上游超时是消费者拿到 504、上游照样
