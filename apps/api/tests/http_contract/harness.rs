@@ -44,6 +44,8 @@ mod cases_auth_attempts;
 mod cases_billing;
 #[path = "cases_cache.rs"]
 mod cases_cache;
+#[path = "cases_capacity_measurement.rs"]
+mod cases_capacity_measurement;
 #[path = "cases_cost_facts.rs"]
 mod cases_cost_facts;
 #[path = "cases_customer_history.rs"]
@@ -1346,6 +1348,9 @@ struct ApiProcessSettings {
     /// 上传存储夹具：给了就在起进程时配上假对象存储（region/bucket/密钥固定，endpoint 由
     /// `Harness::build` 填）。缺省不配——进程按"上传存储未配置"启动，上传端点回 503。
     upload_storage: Option<UploadStorageFixture>,
+    /// PostgreSQL 连接池上限（`DATABASE_MAX_CONNECTIONS`）：容量测量要靠它把池这一轴扫出来。
+    /// 缺省不配，进程取缺省。
+    database_max_connections: Option<u32>,
 }
 
 /// 一次用例的上传存储夹具：假对象存储的行为与进程级上传上限。
@@ -1531,6 +1536,14 @@ async fn start_api_with(
         if let Some(bytes) = settings.max_memory_bytes {
             command.env("GENERATION_MAX_MEMORY_BYTES", bytes.to_string());
         }
+        // 池上限显式给：不给时置空，进程取缺省——否则本机 shell 里导出的同名变量会漏进每个用例。
+        command.env(
+            "DATABASE_MAX_CONNECTIONS",
+            settings
+                .database_max_connections
+                .map(|max| max.to_string())
+                .unwrap_or_default(),
+        );
         // 请求结构上限：只配用例明确要压的那几条，其余留给进程的推导默认值。
         for (name, value) in [
             (
