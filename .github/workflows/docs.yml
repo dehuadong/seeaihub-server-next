@@ -1,0 +1,35 @@
+name: docs
+
+# 纯文档与 Agent Note 的检查：这类改动被 `ci.yml` 的 `paths-ignore` 排除在外，于是记录的格式与
+# 记录里的相对链接此前**没有任何流水线**在管。这里只跑那两个检查器本身，不需要 Rust 工具链。
+on:
+  push:
+    paths:
+      - 'docs/**'
+      - '.agents/**'
+      - '**/*.md'
+      - 'scripts/decisions/**'
+      - '.github/workflows/docs.yml'
+  pull_request:
+    paths:
+      - 'docs/**'
+      - '.agents/**'
+      - '**/*.md'
+      - 'scripts/decisions/**'
+      - '.github/workflows/docs.yml'
+
+concurrency:
+  group: docs-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  notes:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+      # 校验 Agent Note 的生命周期、元数据、章节与它们的相对链接（规则见 .agents/notes/README.md）。
+      - run: node scripts/decisions/check.mjs

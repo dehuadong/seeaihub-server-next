@@ -39,6 +39,18 @@ cargo test --workspace --all-features
 
 本地全量检查仅用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
 
+这三条与 CI 的前三步逐字一致，但它们**只覆盖进程内的单元用例**：需要真实 PostgreSQL、真实
+Redis 或独立子进程的用例都带 `#[ignore]`（全仓 348 条），第三条命令会编译它们却一条都不跑
+（输出里那些 `0 passed` 的测试二进制就是它们）。CI 额外跑两层：
+
+```sh
+cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1   # 契约层（真库真进程）
+cargo test -p seeai-persistence -- --ignored --test-threads=1                # 端口层（真库）
+```
+
+两条都要 `HTTP_CONTRACT_DATABASE_URL`（本机指 `seeai_contract` 库）且**串行**跑。所以"三条全绿"
+只说明编译与单元层没问题，不等于验收成立；要验行为，按改动面挑上面两层的过滤词跑。
+
 本机只编"这次要验的目标"：反馈用 `cargo check -p <crate>`；用例用 `cargo test -p <crate> --lib`，或
 `cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 <过滤词>`。
 `--workspace --all-targets` 会把每个 crate 的每个测试二进制都编一遍——那是 CI 的事（开发 profile 已去掉
