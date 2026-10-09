@@ -16,7 +16,7 @@ approval: 用户接受 Spec 0005 §7 的收费与重复调用边界并给出原�
 
 ## 提案
 
-长期合同由[同步网关 Spec](../../../../docs/contracts/0005-synchronous-image-gateway.md)拥有，执行、容量、Adapter 接口和迁移由[同步网关 RFC](../../../../docs/design/0017-synchronous-image-gateway.md)拥有。本记录仅保存选择理由、备选及有意承担的后果；不创建未经确认的永久 ADR。接受后应在此前透传记录补充本记录链接，标明其内部执行选择被部分取代。
+历史合同依据见[历史同步网关 Spec](../../../../docs/specs/0005-synchronous-image-gateway.md)，执行、容量、Adapter 接口和迁移由[同步网关 RFC](../../../../docs/design/0017-synchronous-image-gateway.md)拥有。本记录仅保存选择理由、备选及有意承担的后果；不创建未经确认的永久 ADR。接受后应在此前透传记录补充本记录链接，标明其内部执行选择被部分取代。
 
 直接执行使请求不必跨进程恢复，能够取消为 Worker 保存正文及 API 反复查询大结果的要求。PostgreSQL 继续拥有预授权、证据、金额与异常事实；将 payload 与账务命令分成不同类型，比“约定不要写字段”更容易阻止再次引入正文存储。
 
@@ -37,7 +37,7 @@ approval: 用户接受 Spec 0005 §7 的收费与重复调用边界并给出原�
 
 ## 验收条件
 
-可判定验收统一见 [Spec §8](../../../../docs/contracts/0005-synchronous-image-gateway.md#8-验收条件)，性能与故障证据切入点见 [RFC §8](../../../../docs/design/0017-synchronous-image-gateway.md#8-验证与性能证据)。历史清理须覆盖已存在的内联参数与结果，不能只证明新请求没有写入。
+可判定验收统一见 [历史Spec §8](../../../../docs/specs/0005-synchronous-image-gateway.md#8-验收条件)，性能与故障证据切入点见 [RFC §8](../../../../docs/design/0017-synchronous-image-gateway.md#8-验证与性能证据)。历史清理须覆盖已存在的内联参数与结果，不能只证明新请求没有写入。
 
 本次整改的故障证据与剩余验收覆盖见[整改验证清单](../../../../docs/verification/synchronous-gateway-remediation.md)。清单是执行步骤，不表示实现已通过，也不沿用此前局部测试为整改完成证据。
 

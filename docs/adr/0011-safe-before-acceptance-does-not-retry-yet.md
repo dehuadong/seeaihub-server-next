@@ -1,4 +1,4 @@
-> 归属状态（2026-10-09）：生成请求重投范围已失效，当前创建不重发；RetrySafety 的事实分类不授予重投能力。现行行为见[同步图片网关合同](../contracts/0005-synchronous-image-gateway.md) §5–§6；长期执行设计仍有承接缺口。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
+> 归属状态（2026-10-09）：生成请求重投范围已失效，当前创建不重发；RetrySafety 的事实分类不授予重投能力。当前安全规则见[根项目指令](../../AGENTS.md#事实与安全)；历史行为依据见[归档同步图片网关 Spec](../specs/0005-synchronous-image-gateway.md) §5–§6；长期执行设计仍有承接缺口。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
 
 ---
 status: accepted

@@ -15,7 +15,7 @@ verification: HTTP_CONTRACT_DATABASE_URL=... cargo test -p seeai-api --test http
 
 ## 决定
 
-行为由[客户认证 Spec](../../../../docs/contracts/0004-customer-authentication-pages.md) §1 S5 与 §5 A11 拥有；计数的键形、判定与写入落点、降级规则由[认证页面设计](../../../../docs/design/0016-customer-authentication-pages.md) §3 拥有，本记录不重复。
+历史行为依据见[历史客户认证 Spec](../../../../docs/specs/0004-customer-authentication-pages.md) §1 S5 与 §5 A11；计数的键形、判定与写入落点、降级规则由[认证页面设计](../../../../docs/design/0016-customer-authentication-pages.md) §3 拥有，本记录不重复。
 
 本记录保存**来源维的信任边界选择**。[连接层](../../../../apps/api/src/supervisor/connection.rs)给的连接对端地址不可伪造；生产 API 在 nginx 之后时对端是代理本身，因此由运维显式配置采信哪个受信头（`AUTH_SOURCE_HEADER`，例如 `x-real-ip`），未配置时退回对端地址。不采信 `X-Forwarded-For` 的最左值，因为它由客户端自带。
 

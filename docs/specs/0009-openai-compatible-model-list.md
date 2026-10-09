@@ -1,4 +1,4 @@
-> 归属状态（2026-10-09）：本文件在全部原生效修订范围的权威已由[同名持续合同](../contracts/0009-openai-compatible-model-list.md)替代。 全部映射与未决影响见[归属切换登记](../agents/document-ownership-transition.md)。以下原文与状态头保留其历史身份，不扩大本文权威。
+> 归属状态（2026-10-09）：本文件是原地保留的归档资料，原修订与状态头只说明历史，不拥有新工作的行为与验收，也不授予实施授权。未来依赖工作先在对应 Proposal/Issue 确认适用范围和验收；具体承接尚未完成，见[归属切换登记](../agents/document-ownership-transition.md#历史产品合同)。
 
 主题: OpenAI 兼容的模型列表
 当前修订: v1

@@ -4,8 +4,7 @@ import { ReloadOutlined } from '@ant-design/icons';
 
 /// 管理端一页的骨架：标题 + 说明 + 右上角重取 + 三态内容。
 ///
-/// 放在 `console/` 而不是共享层：它用的是 Ant Design，而客户控制台不该把 antd 打进自己的产物里
-/// （`docs/contracts/0001-admin-and-customer-consoles.md` §5 的 V-D6：客户入口产物里不含管理界面的代码）。
+/// 放在 `console/` 而不是共享层：它用的是 Ant Design，而客户控制台不该把 antd 打进自己的产物里；客户入口产物里不含管理界面的代码。
 /// 共享层只留与渲染无关的取数封装。
 export function ConsolePage(props: {
   title: string;

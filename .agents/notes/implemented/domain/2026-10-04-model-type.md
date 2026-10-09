@@ -15,7 +15,7 @@ verification: 迁移回填 the_model_type_migration_backfills_existing_vendor_mo
 
 ## 决定
 
-行为归登记的[模型类型合同](../../../../docs/contracts/0006-model-type-and-usage-records.md)，本记录承接类型事实、发布、取数与展示的完整技术设计。术语「模型类型」记在[词汇表](../../../../GLOSSARY.md)。[历史设计 0020](../../../../docs/design/0020-model-type.md)保留为来源；归属接受结果见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
+历史行为依据见[历史模型类型合同](../../../../docs/specs/0006-model-type-and-usage-records.md)，本记录承接类型事实、发布、取数与展示的完整技术设计。术语「模型类型」记在[词汇表](../../../../GLOSSARY.md)。[历史设计 0020](../../../../docs/design/0020-model-type.md)保留为来源；归属接受结果见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
 
 类型挂在 Vendor Model 上，与合同同层同生命周期，来源是工程侧的发布素材。理由：类型是上游模型自身的事实（`gpt-image-2.5` 就是图片模型），不是运营的定价或打包选择；素材已经在声明这个模型的合同，类型与它同类。运营的发布页只做「选模型、排候选、给价」，多一个手填字段就多一处可以填错而与模型实际不符的地方。
 
@@ -33,7 +33,7 @@ verification: 迁移回填 the_model_type_migration_backfills_existing_vendor_mo
 
 ### 目录与历史读取
 
-目录投影从 Vendor Model 取类型，只在既有目录字段上增加 `type`；OpenAI 标准字段由[模型列表合同](../../../../docs/contracts/0009-openai-compatible-model-list.md)规定。用量通过 Job 冻结的 `vendor_model_id` 连接不可变模型行，不从网关模型当前绑定反推，不给 Job 建第二份类型列。
+目录投影从 Vendor Model 取类型，只在既有目录字段上增加 `type`；OpenAI 标准字段的历史行为见[历史模型列表合同](../../../../docs/specs/0009-openai-compatible-model-list.md)。新工作的标准字段与兼容范围在对应 Issue 确认。用量通过 Job 冻结的 `vendor_model_id` 连接不可变模型行，不从网关模型当前绑定反推，不给 Job 建第二份类型列。
 
 用量在仓储中统一装配为 `CustomerUsageView` 与 `UsageAmounts`，`images`、`seconds`、`input_tokens`、`output_tokens` 为可缺省的整数值。图片取持久化 `image_count`，缺失沿用 `Some(0)`；视频秒数和对话 token 在各自执行路径尚无落点时保持缺失。客户与管理员共用用量装配，分别拥有行投影与外层响应，权限与翻页规则不合并。对客调用标识与状态的后续规则归[响应信封 Note](../platform/2026-10-07-consumer-response-envelope-and-points.md)，不沿用旧设计中“不回 Job 标识”的历史表述。
 

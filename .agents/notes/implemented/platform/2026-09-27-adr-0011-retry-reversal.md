@@ -15,7 +15,7 @@ verification: `node scripts/decisions/check.mjs` 通过；引用的提交 `4ecd3
 
 ## 决定
 
-> 失效范围（2026-10-09 核对）：生成创建请求重投机制已被同步网关的唯一直接执行路径取代。本记录只保留当时的真实理由与证据，不指导当前重投；现行行为见[同步图片网关合同](../../../../docs/contracts/0005-synchronous-image-gateway.md) §5–§6，技术承接缺口见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
+> 失效范围（2026-10-09 核对）：生成创建请求重投机制已被同步网关的唯一直接执行路径取代。本记录只保留当时的真实理由与证据，不指导当前重投；历史行为依据见[历史同步图片网关合同](../../../../docs/specs/0005-synchronous-image-gateway.md) §5–§6，技术承接缺口见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
 
 ADR-0011 正文重写为当前处置（三态分流：可证明未受理在额度内重投、`AcceptanceUnknown` 绝不重投、`NotRetryable` 失败），旧结论与它失效的原因搬进本记录：
 

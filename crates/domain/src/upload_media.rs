@@ -2,8 +2,7 @@
 //!
 //! 这一层只有纯类型与纯函数：不依赖 HTTP、对象存储、数据库与环境变量。准入只看**内容魔数**，
 //! 调用方声明的文件名与 `Content-Type` 都不影响判型；对象键的扩展名由判出的规范 MIME 反推。
-//! 取值域与机制由[对象存储上传设计](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)拥有，
-//! 对客行为合同由[图片上传与对象存储 Spec](../../../docs/contracts/0007-image-upload-and-object-storage.md)拥有。
+//! 取值域与机制的设计理由见[对象存储上传记录](../../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)。
 
 use crate::AccountId;
 use uuid::Uuid;

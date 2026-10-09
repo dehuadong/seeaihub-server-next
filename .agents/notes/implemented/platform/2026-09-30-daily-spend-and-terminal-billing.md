@@ -34,7 +34,7 @@ verification: 见正文「验证」。本地通过 `cargo fmt --check`、`cargo 
 
 ## 后果
 
-- 本次不做历史回填（[`0002` §6](../../../../docs/contracts/0002-account-funds-and-reservations.md)）：既有 Job 的 `terminal_at` 为空。历史 Job 在用量里按受理时刻显示，扣费仍来自它自己的 `capture`。
+- 本次不做历史回填（[历史`0002` §6](../../../../docs/specs/0002-account-funds-and-reservations.md)）：既有 Job 的 `terminal_at` 为空。历史 Job 在用量里按受理时刻显示，扣费仍来自它自己的 `capture`。
 - 账实核查按账户核对 `balance = SUM(entries)` 与 `held = SUM(active holds)`，与这次加的表无关。
 - 新增四索引；受理路径从"按流水聚合"改为一次主键点查。
 

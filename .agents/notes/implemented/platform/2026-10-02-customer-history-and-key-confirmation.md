@@ -13,7 +13,7 @@ verification: 见正文「验证」。`cd apps/web && npx playwright test` 全�
 
 客户控制台的调用记录与资金流水只给“最近 50 条”：没有日期区间、没有类别筛选、也没有继续翻页的入口；接口层的两个读只认 `since`/`until`/`limit`，`truncated` 还只是“本页是否满”的猜测。另外，仍需对账的请求（`reconciliation_required`）在对客用量里被映射成“未产出”，而合同要求它一直显示“处理中”；API Key 的吊销没有确认，一次性明文也没有关闭入口。
 
-页面与历史查询的设计不在本记录：[客户控制台设计 §2–§3](../../../../docs/design/0014-customer-console-navigation-and-history.md) 拥有参数、分组与翻页；金额与终态时刻归属由[账户资金 Spec §5](../../../../docs/contracts/0002-account-funds-and-reservations.md) 拥有。
+页面与历史查询的设计不在本记录：[客户控制台设计 §2–§3](../../../../docs/design/0014-customer-console-navigation-and-history.md) 拥有参数、分组与翻页；金额与终态时刻的历史依据见[历史账户资金 Spec §5](../../../../docs/specs/0002-account-funds-and-reservations.md)。
 
 ## 决定
 

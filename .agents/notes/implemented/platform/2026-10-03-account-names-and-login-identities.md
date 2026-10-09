@@ -17,7 +17,7 @@ verification: 见正文「验证」。`cargo test -p seeai-api --test http_contr
 
 ## 决定
 
-产品行为归[账户名称 Spec v2](../../../../docs/contracts/0003-account-names-and-login-identities.md)（已接受），持久化、生成规则、关联读、预览与发布顺序归[名称与登录开通设计](../../../../docs/design/0015-account-names-and-login-identities.md)。名称放在账户上，使无登录身份的账户仍能识别服务对象。
+历史产品行为依据见[历史账户名称 Spec v2](../../../../docs/specs/0003-account-names-and-login-identities.md)（已接受），持久化、生成规则、关联读、预览与发布顺序归[名称与登录开通设计](../../../../docs/design/0015-account-names-and-login-identities.md)。名称放在账户上，使无登录身份的账户仍能识别服务对象。
 
 账户 id 的铸造上提到 application 用例（三条新建路径），生成函数才拿得到 id；生成在服务端一处实现（`crates/application/src/account_name.rs`），API、Web 与持久化都不各自拼名称。**名称始终存在，留空即生成**：有登录邮箱时是 `<邮箱本地部分>_<账户 id 前 4 位>`（`zhangsan@example.com` → `zhangsan_3f9a`，本地部分超 95 字符截断、含被拒字符回退），没有邮箱时是 `账户_<账户 id 前 8 位>`（`账户_3f9a2b1c`）。名称由**运营和客户本人**都能改：客户改自己账户的名称走客户会话的 `PUT /v1/customer/account/name` 与账户设置页字段，运营走账户详情里的改名；两边都不能清空，同时改按后写覆盖。
 

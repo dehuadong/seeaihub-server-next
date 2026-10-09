@@ -11,7 +11,7 @@ verification: 见正文「验证」。`apps/web` 的 `npm run typecheck`、`npm 
 
 ## 问题
 
-[控制台 Spec v14 C15](../../../../docs/contracts/0001-admin-and-customer-consoles.md) 要求客户控制台提供五个独立页面与固定导航，D5 要求未登录直达内部地址只显示登录、登录后回到原页面，且凭据不进 URL；[设计 0014 §1](../../../../docs/design/0014-customer-console-navigation-and-history.md) 给出五条地址。原来的客户入口是单页加标签页（`src/portal/Dashboard.tsx`），概览与明细堆在一起，地址不能标识页面，刷新与前进后退都落回同一页。
+[历史控制台 Spec v14 C15](../../../../docs/specs/0001-admin-and-customer-consoles.md) 要求客户控制台提供五个独立页面与固定导航，D5 要求未登录直达内部地址只显示登录、登录后回到原页面，且凭据不进 URL；[设计 0014 §1](../../../../docs/design/0014-customer-console-navigation-and-history.md) 给出五条地址。原来的客户入口是单页加标签页（`src/portal/Dashboard.tsx`），概览与明细堆在一起，地址不能标识页面，刷新与前进后退都落回同一页。
 
 ## 决定
 

@@ -15,7 +15,7 @@ verification: HTTP_CONTRACT_DATABASE_URL=... cargo test -p seeai-api --test http
 
 ## 决定
 
-行为由[控制台 Spec](../../../../docs/contracts/0001-admin-and-customer-consoles.md) A6、C2、C13 与 §6 不变式拥有。本记录保存落地方式与后果。
+历史行为依据见[历史控制台 Spec](../../../../docs/specs/0001-admin-and-customer-consoles.md) A6、C2、C13 与 §6 不变式。本记录保存落地方式与后果。
 
 跨两张表的唯一性不能靠单个唯一索引。会写入身份的四条路径（自助注册、运营开户、管理员引导、按邮箱 upsert 管理员口令）在**同一事务**里：
 

@@ -3,9 +3,6 @@
 //! 记录落在 generation.jobs / generation.attempts：由 API 在内存里直接执行，图片与请求参数只在
 //! 内存里经过。阶段名与 JobState 互不复用，存储列直接存字符串；记录只保存最小执行与账务事实，
 //! 不保存请求或响应业务载荷。
-//!
-//! 规则见 docs/contracts/0005-synchronous-image-gateway.md 的 §2–§6 与
-//! docs/design/0017-synchronous-image-gateway.md 的 §3、§5。
 
 use serde::{Deserialize, Serialize};
 use std::fmt::{Debug, Display, Formatter};

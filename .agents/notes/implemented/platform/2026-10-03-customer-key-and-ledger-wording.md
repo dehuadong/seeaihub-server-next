@@ -13,13 +13,13 @@ verification: 见正文「验证」。`cargo test -p seeai-api --test http_contr
 
 三处界面把平台内部的动作或科目摆到了不该看到它们的人面前。前两处的病根是"运营做不到"：**运营判断不了客户是否正在正常使用**一把密钥，也**拿不到要吊销的标识**——明文只在签发响应里出现一次，库里只有摘要，界面又不回显，于是那个"填标识再吊销"的表单实际上没有可用的输入。第三处（客户侧）违反 [`apps/web/AGENTS.md`](../../../../apps/web/AGENTS.md) 的约定：不要把系统内部逻辑带到客户侧。逐条看：
 
-1. **运营端有"吊销 API Key"**：账户详情的 API Key 模块摆着一个"要吊销的密钥标识 + 吊销"表单，而它需要的输入运营根本拿不到（[控制台 Spec](../../../../docs/contracts/0001-admin-and-customer-consoles.md) C5）。这个表单是一把没有把手可握的枪。
+1. **运营端有"吊销 API Key"**：账户详情的 API Key 模块摆着一个"要吊销的密钥标识 + 吊销"表单，而它需要的输入运营根本拿不到（[历史控制台 Spec](../../../../docs/specs/0001-admin-and-customer-consoles.md) C5）。这个表单是一把没有把手可握的枪。
 2. **客户侧新建密钥时显示"密钥标识"**：它存在的唯一理由是让人抄下来去吊销，而客户吊销自己的密钥是在列表那一行点「吊销」，根本不需要抄标识。
 3. **客户侧资金流水用「实际扣费」「资金调整」**：那是账本的分录类别（`capture`／`adjustment`）。「实际」是平台内部相对预授权说的；「资金调整」是运营做账的说法。客户看到的是"平台在跟我讲它自己的账"。
 
 ## 决定
 
-产品规则归[控制台 Spec v18](../../../../docs/contracts/0001-admin-and-customer-consoles.md)（M5、C5、C8、V-C3、V-D14、V-D16），界面归属与文案归[设计 0011](../../../../docs/design/0011-console-information-architecture.md) §4.3、[设计 0014](../../../../docs/design/0014-customer-console-navigation-and-history.md) §3/§4。
+历史产品规则依据见[历史控制台 Spec v18](../../../../docs/specs/0001-admin-and-customer-consoles.md)（M5、C5、C8、V-C3、V-D14、V-D16），界面归属与文案归[设计 0011](../../../../docs/design/0011-console-information-architecture.md) §4.3、[设计 0014](../../../../docs/design/0014-customer-console-navigation-and-history.md) §3/§4。
 
 - **运营端不再有吊销能力**：账户详情的 API Key 模块只剩"签发"与一次性明文（明文在**弹窗**里、只有密钥本身、关闭即清）。管理面**不再提供** `DELETE /api/v1/api-keys/{key_id}`——用户明确选了"界面与接口一起去掉"，不留界面上没有、接口还活着的能力。客户按自己会话吊销（`DELETE /v1/customer/api-keys/{key_id}`）是唯一的吊销路径。
 - **客户侧新建密钥**：明文在**弹窗**里，内容只有密钥本身与"只显示这一次，现在抄走"的提示，按钮是「取消」；不再显示密钥标识。列表里的「吊销」按行操作、照旧先确认。

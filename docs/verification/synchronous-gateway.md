@@ -1,6 +1,6 @@
 # 同步图片网关的验收证据清单
 
-- **用途**：执行 [Spec 0005](../contracts/0005-synchronous-image-gateway.md) 的 A1–A10 与 [RFC 0017](../design/0017-synchronous-image-gateway.md) §8 的证据采集。验收条件归该 Spec 拥有，本文只列命令、用例与剩余步骤，不重复条件。
+- **用途**：执行 [历史Spec 0005](../specs/0005-synchronous-image-gateway.md) 的 A1–A10 与 [RFC 0017](../design/0017-synchronous-image-gateway.md) §8 的证据采集。历史验收条件保留在归档 Spec，本文只列当时的命令、用例与剩余步骤；新工作的验收由对应 Issue 明确。
 - **读者**：执行验收的人。
 - **前置**：本机 PostgreSQL 与 `HTTP_CONTRACT_DATABASE_URL`；假上游由测试夹具提供，无真实计费调用。
 - **记录方式**：结论写进本节末尾或对应工作项评论。

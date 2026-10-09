@@ -1,7 +1,7 @@
 import { PORTAL_PATHS, PORTAL_ROUTES } from './paths';
 import { rangeFromSearch } from './dates';
 
-/// 登录回跳目标：受保护地址 + 认可的日期区间（`docs/contracts/0004` §3、`docs/design/0016` §2）。
+/// 登录回跳目标：受保护地址 + 认可的日期区间。
 ///
 /// 只存在当前标签页 `sessionStorage` 的独立客户键里，认证 URL 不带 `returnTo` 参数。识别、保存、
 /// 读取、消费、清除都在这里收口，客户页面与认证页不分别实现；读取时**重新校验**——同源存储里的

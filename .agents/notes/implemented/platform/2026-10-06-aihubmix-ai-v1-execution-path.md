@@ -11,7 +11,7 @@ verification: `cargo test -p seeai-adapter-aihubmix --lib`（22 条，含端点�
 
 ## 问题
 
-对客合同要求参考图与遮罩只收公网 URL、平台不下载（[同步图片网关 Spec](../../../../docs/contracts/0005-synchronous-image-gateway.md) §1、§3）。而 AIHubMix 原来的编辑端点 `POST /v1/images/edits` **只收文件部件**：单值 `image` 与数组 `image[]` 传字符串都被上游拒（2026-10-06 实测，`invalid_type`：`expected one of an array of files or file, but got a string instead`）。所以那条路上要么平台把 URL 取成字节（内存过一手、并占对客同步窗口），要么换端点。
+对客合同要求参考图与遮罩只收公网 URL、平台不下载（[历史同步图片网关 Spec](../../../../docs/specs/0005-synchronous-image-gateway.md) §1、§3）。而 AIHubMix 原来的编辑端点 `POST /v1/images/edits` **只收文件部件**：单值 `image` 与数组 `image[]` 传字符串都被上游拒（2026-10-06 实测，`invalid_type`：`expected one of an array of files or file, but got a string instead`）。所以那条路上要么平台把 URL 取成字节（内存过一手、并占对客同步窗口），要么换端点。
 
 同一渠道的 `/ai/v1/images/generations` 把参考图声明成**媒体引用**（公网 URL 字符串或 `{url}`），一个端点同时覆盖文生图与图生图；它的同步响应是完成态任务对象，带内联 `b64_json`、上游任务 id 与 `usage.cost`。本记录完整拥有当前技术设计，[设计 0022](../../../../docs/design/0022-aihubmix-ai-v1-execution-path.md)只保留历史来源；归属接受结果见[切换登记](../../../../docs/agents/document-ownership-transition.md)。
 
@@ -40,7 +40,7 @@ Adapter 使用 JSON 同步提交，不设置 `async`，不使用 Webhook。厂�
 
 响应本身是终态任务对象。只解析 `output[].b64_json` 的内联图片，不取 `content_url`，不下载、不转存结果；任务对象的 `id` 写到 Attempt 的 `provider_trace_id`，用于审计。异步任务只有需要平台凭据的结果 URL，不能满足本路径的结果边界。没有等待前就取得的句柄，也没有按任务列表、轮询、Webhook 或启发式匹配恢复丢失响应的机制。
 
-成功件内存事实经平台结算确认后交给 API 响应投影；渠道任务 id 不替代平台调用 id。对客信封与积分由[同步网关合同](../../../../docs/contracts/0005-synchronous-image-gateway.md)和[响应信封 Note](2026-10-07-consumer-response-envelope-and-points.md)拥有，渠道形态不决定平台信封。
+成功件内存事实经平台结算确认后交给 API 响应投影；渠道任务 id 不替代平台调用 id。对客信封与积分的历史行为见[历史同步网关合同](../../../../docs/specs/0005-synchronous-image-gateway.md)；技术理由见[响应信封 Note](2026-10-07-consumer-response-envelope-and-points.md)，新工作的响应行为与验收归对应 Issue，渠道形态不决定平台信封。
 
 ### 证据、能力与失败
 

@@ -17,7 +17,7 @@ verification: 见正文「验证」。`cargo test -p seeai-api --test http_contr
 
 ## 决定
 
-产品规则归[账户名称 Spec v3](../../../../docs/contracts/0003-account-names-and-login-identities.md)（N1、N3、N6），持久化与冲突处理归[设计 0015](../../../../docs/design/0015-account-names-and-login-identities.md) §1–§3、§5。
+历史产品规则依据见[历史账户名称 Spec v3](../../../../docs/specs/0003-account-names-and-login-identities.md)（N1、N3、N6），持久化与冲突处理归[设计 0015](../../../../docs/design/0015-account-names-and-login-identities.md) §1–§3、§5。
 
 - **唯一性区分大小写**，覆盖全部账户（含平台账户那一行）：唯一索引建在 `name` 上，只有逐字符完全相同的名称才算撞名；`Star` 与 `star` 是两个名称。这是用户在同一天否掉"大小写不敏感"之后定的口径——先按 `lower(name)` 落地过一版，随后由迁移 `0030` 换成 `name`（见「后果」里的迁移顺序）。
 - 名称**筛选**仍是大小写不敏感的子串匹配（运营输入小写也能找到大写的账户）；那是查找便利，与唯一性无关。

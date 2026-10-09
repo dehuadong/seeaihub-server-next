@@ -1,6 +1,6 @@
 # Issue tracker: GitHub
 
-本仓库的 Proposal 与实施工作项以 GitHub Issues 为权威存放位置，所有 Issue 操作使用 `gh` CLI。工作项拥有本次范围、产品行为与验收、评审和批准证据，并链接长期技术设计的 Agent Note。跨工作项合同按需引用登记的独立产品合同及适用修订，不在 Issue 复制正文。位置与历史例外统一读取 [`docs/AGENTS.md`](../AGENTS.md#历史归属切换)，新工作不再新建 RFC 或 ADR。
+本仓库的 Proposal 与实施工作项以 GitHub Issues 为权威存放位置，所有 Issue 操作使用 `gh` CLI。工作项拥有本次范围、产品行为与验收、评审和批准证据，并链接长期技术设计的 Agent Note。旧 Spec 只作历史资料；沿用历史行为时，工作项写清选定范围与完整验收，不能只链接旧文件来代替本次合同。位置与历史例外统一读取 [`docs/AGENTS.md`](../AGENTS.md#历史归属切换)，新工作不再新建 Spec、RFC 或 ADR。
 
 ## Conventions
 
@@ -16,7 +16,7 @@
 
 ## Proposal workflow
 
-Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/seeaihub-server-next#<n>`）作为工作标识。同一工作复用已有 issue，不重复创建。Proposal 写全本次范围、产品行为与验收、规划状态、评审和批准证据；持续合同及技术设计只链接其登记属主，明确本次适用修订与范围。规模大小不决定是否另建 Spec，只有跨工作项持续合同才需要独立属主。
+Proposal 是一个 GitHub issue，以 URL 或仓库限定编号（`dehuadong/seeaihub-server-next#<n>`）作为工作标识。同一工作复用已有 issue，不重复创建。Proposal 写全本次范围、产品行为与验收、规划状态、评审和批准证据；技术设计链接其 Agent Note 及适用范围。跨工作项沿用的行为也由工作项确认，不另建产品合同目录。
 
 工作状态用标签表示，不用正文状态字段：
 

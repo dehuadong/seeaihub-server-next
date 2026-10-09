@@ -1,9 +1,9 @@
 # 上传存储（阿里云 OSS）部署自检执行清单
 
-- **用途**：在启用上传前证明部署侧的桶满足[图片上传与对象存储 Spec](../contracts/0007-image-upload-and-object-storage.md) §8 的匿名可读前置条件，并核对桶配置与平台签名在真实服务端可用。
+- **用途**：在启用上传前证明部署侧的桶满足[历史图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8 的匿名可读前置条件，并核对桶配置与平台签名在真实服务端可用。
 - **性质**：部署侧在真实桶上执行的清单；产生的探针对象与上传对象是外部副作用，不是本平台的业务事实。
 - **前置**：上传存储变量已配齐（见本文 §1）；有对象存储控制台或命令行工具；§4 另需服务的对外地址（下面写作 `$BASE`）、一个平台客户 API Key（下面写作 `$API_KEY`）与显式批准。
-- **边界**：本文只列执行步骤与停止条件；合同归上述 Spec，机制与四步自检归[对象存储上传设计](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)。平台的上传路径只有 PUT 与 HEAD 两个操作，不发 GET，也不签发预签名 URL：下面的核验读回与匿名读用对象存储控制台或命令行工具完成。自检不是运行期健康检查，平台在启动或运行期都不探测桶。
+- **边界**：本文只列执行步骤与停止条件；上述 Spec 保留历史行为依据，新工作的行为与验收由对应 Issue 明确，机制与四步自检归[对象存储上传设计](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md)。平台的上传路径只有 PUT 与 HEAD 两个操作，不发 GET，也不签发预签名 URL：下面的核验读回与匿名读用对象存储控制台或命令行工具完成。自检不是运行期健康检查，平台在启动或运行期都不探测桶。
 
 ## 1. 配置形状检查
 
@@ -29,7 +29,7 @@ curl -sS -o probe-readback.bin -w '%{http_code}\n' "$PUBLIC_URL"
 # 期望 200，且 probe-readback.bin 与写入的探针字节逐字节相同
 ```
 
-- 公网 URL 取哪种寻址形态、`{endpoint-host}` 与寻址形态的关系见[图片上传与对象存储 Spec](../contracts/0007-image-upload-and-object-storage.md) §6；这里只确认不带凭证的客户端读的是归属该 endpoint 的形态（真实 OSS 虚拟主机式，显式 loopback 端点 path-style）。
+- 公网 URL 取哪种寻址形态、`{endpoint-host}` 与寻址形态的关系见[历史图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §6；这里只确认不带凭证的客户端读的是归属该 endpoint 的形态（真实 OSS 虚拟主机式，显式 loopback 端点 path-style）。
 - 对象清理：记录本次创建的探针对象键，在对象存储控制台按自己的保留策略清理；平台不代删、不续期。
 
 ## 4. 平台签名的真实服务端联调（需显式批准）
@@ -51,7 +51,7 @@ curl -sS -X POST "$BASE/v1/uploads/images" \
 ## 失败时看什么
 
 - `401`、`403`、`404`：密钥写错、权限不足（平台的上传路径需要 PUT 与 HEAD 两个权限）或 bucket / region 写错；对照[对象存储上传设计](../../.agents/notes/implemented/platform/2026-10-04-reference-image-upload.md) 的失败分类表。
-- 平台上传返回 `200` 但匿名读不到：按[图片上传与对象存储 Spec](../contracts/0007-image-upload-and-object-storage.md) §8 处置。
+- 平台上传返回 `200` 但匿名读不到：按[历史图片上传与对象存储 Spec](../specs/0007-image-upload-and-object-storage.md) §8 处置。
 - 平台上传被服务端拒签名：核对 canonical URI 是否含 bucket、签名头集合是否为全部 `x-oss-*` 加 `content-type` / `content-md5`、`x-oss-date` 是否为当前 UTC。
 - 自检失败不产生任何状态变更：不写健康状态、不改配置、不建执行记录、不动账务；处置是部署侧改配置后重跑。
 

@@ -28,7 +28,7 @@
 | **架构治理**：分层职责、依赖方向、边界规则（R1–R5）与扩展纪律 | [`docs/architecture.md`](docs/architecture.md) |
 | 分层规则的依据、边界细则与接受缺口 | [归属切换登记](docs/agents/document-ownership-transition.md#技术设计)；架构治理继续拥有现行边界 |
 | 长期技术提案、设计与决定 | [Agent Notes](.agents/notes/README.md)；有效范围统一从[文档入口](docs/AGENTS.md#历史归属切换)读取 |
-| 持续产品合同 | [`docs/contracts/`](docs/contracts/)；本次范围与验收归工作项 |
+| 新工作的产品行为、范围与验收 | [GitHub Issue 配置](docs/agents/issue-tracker.md)；旧 Spec 只作归档资料 |
 | 历史 Spec、RFC、ADR 与未完成切换范围 | [归属切换登记](docs/agents/document-ownership-transition.md)，旧目录保留原文与历史身份 |
 | 领域词汇表 | [`GLOSSARY.md`](GLOSSARY.md) |
 | 各渠道的事实（端点、参数、计量与成本口径、实测记录） | [`docs/facts/channel-facts.md`](docs/facts/channel-facts.md) |
