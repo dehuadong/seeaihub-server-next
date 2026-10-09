@@ -169,14 +169,14 @@ pub async fn max_declared_output_images(
 ///
 /// 名字带 `DATABASE_`：API 进程另有一个同名的 `DEFAULT_MAX_CONNECTIONS`（`API_MAX_CONNECTIONS`，
 /// HTTP 连接上限 1024），两者不是一回事。
-pub const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
+pub(crate) const DEFAULT_DATABASE_MAX_CONNECTIONS: u32 = 10;
 
 /// 解析 `DATABASE_MAX_CONNECTIONS` 的取值：**没给或给空**取 [`DEFAULT_DATABASE_MAX_CONNECTIONS`]，
 /// 非整数或 `0` 报错。
 ///
 /// `0` 不当作"用缺省"：sqlx 会把它当成"永远借不到连接"，请求会一直排到获取超时，表现为整个进程
 /// 不可用。那是个配错的部署，不是一个可以替它拿主意的缺省。
-pub fn parse_max_connections(raw: Option<&str>) -> Result<u32, ApplicationError> {
+pub(crate) fn parse_max_connections(raw: Option<&str>) -> Result<u32, ApplicationError> {
     let Some(raw) = raw.map(str::trim).filter(|value| !value.is_empty()) else {
         return Ok(DEFAULT_DATABASE_MAX_CONNECTIONS);
     };

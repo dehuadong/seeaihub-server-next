@@ -23,6 +23,8 @@ const MEASURE_CHANNEL_IN_FLIGHT: u64 = 256;
 const MEASURE_MODEL_QUOTA: u64 = 64;
 /// 测量账户的余额（CNY 微单位）：一轮扫描最多约 2500 次受理，每次保底额不到 0.1 元。
 const MEASURE_ACCOUNT_CREDIT_MICROUSD: u64 = 1_000_000_000;
+/// 后端数采样间隔：不空闲后端数按它累加，乘出来就是这一档的连接占用时间。
+const SAMPLE_INTERVAL: Duration = Duration::from_millis(50);
 
 /// 一档负载的观测。延迟分位只统计**成功**请求。
 struct Cell {
@@ -43,6 +45,8 @@ struct Cell {
     cpu_busy_permille: Option<u64>,
     read_load: usize,
     reads_done: usize,
+    /// 每请求的连接占用时间（后端秒 ÷ 请求数）：不空闲后端数按采样间隔累加出来的。
+    connection_seconds_per_request: f64,
     /// 这一档里每张表被访问的次数，摊到每次请求上（降序，只留非零项）。
     table_accesses: Vec<(String, f64)>,
 }
@@ -65,7 +69,8 @@ impl Cell {
         format!(
             "delay={:>5}ms pool={:>2} accounts={:>2} concurrency={:>2} read_load={:>2} | \
              total={:>6.2}s throughput={:>6.2}/s mean={:>6.1}ms p50={:>6.1}ms p95={:>6.1}ms \
-             p99={:>6.1}ms | backends={}/{} commits={:>6} reads={:>5} cpu={} | failures={}",
+             p99={:>6.1}ms | backends={}/{} conn={:>5.1}ms commits={:>6} reads={:>5} cpu={} | \
+             failures={}",
             self.delay_ms,
             self.pool,
             self.accounts,
@@ -79,6 +84,7 @@ impl Cell {
             self.p99.as_secs_f64() * 1_000.0,
             self.backends_idle,
             self.backends_peak,
+            self.connection_seconds_per_request * 1_000.0,
             self.commits,
             self.reads_done,
             cpu,
@@ -95,17 +101,6 @@ impl Cell {
             .collect::<Vec<_>>()
             .join(" ")
     }
-}
-
-/// 排序后的样本在 `percentile`（0–1）处的取值：取向上取整那一档。
-///
-/// 空样本返回零：一档全被拒时没有延迟可报，那不是测量失败——拒本身就是这一档的结论。
-fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
-    if sorted.is_empty() {
-        return Duration::ZERO;
-    }
-    let index = (sorted.len() as f64 * percentile).ceil() as usize - 1;
-    sorted[index.min(sorted.len() - 1)]
 }
 
 /// 跑一档：`concurrency` 个并发、`SAMPLES` 次尝试，返回这一档的观测。
@@ -132,11 +127,13 @@ async fn measure_cell(
 
     let stop = Arc::new(AtomicBool::new(false));
     let peak = Arc::new(AtomicUsize::new(0));
+    let busy_samples = Arc::new(AtomicUsize::new(0));
     let sampler = tokio::spawn(sample_backends(
         harness.admin_pool.clone(),
         harness.database_name.clone(),
         stop.clone(),
         peak.clone(),
+        busy_samples.clone(),
     ));
     let reads_done = Arc::new(AtomicUsize::new(0));
     let readers = (read_load > 0).then(|| {
@@ -227,6 +224,9 @@ async fn measure_cell(
         cpu_busy_permille,
         read_load,
         reads_done: reads_done.load(Ordering::Relaxed),
+        connection_seconds_per_request: busy_samples.load(Ordering::Relaxed) as f64
+            * SAMPLE_INTERVAL.as_secs_f64()
+            / f64::from(count),
         table_accesses,
     }
 }
@@ -301,12 +301,27 @@ async fn sample_backends(
     database: String,
     stop: Arc<AtomicBool>,
     peak: Arc<AtomicUsize>,
+    busy_samples: Arc<AtomicUsize>,
 ) {
     while !stop.load(Ordering::Relaxed) {
         let count = case_backends(&admin, &database).await;
         peak.fetch_max(usize::try_from(count).unwrap_or(0), Ordering::Relaxed);
-        tokio::time::sleep(Duration::from_millis(50)).await;
+        // 不空闲的后端数按采样累加：乘上采样间隔就是这一档的连接占用时间（后端秒）。
+        let busy = case_busy_backends(&admin, &database).await;
+        busy_samples.fetch_add(usize::try_from(busy).unwrap_or(0), Ordering::Relaxed);
+        tokio::time::sleep(SAMPLE_INTERVAL).await;
     }
+}
+
+/// 这个一次性库上**不空闲**的后端连接数。
+async fn case_busy_backends(admin: &sqlx::PgPool, database: &str) -> i64 {
+    sqlx::query_scalar(
+        "SELECT count(*) FROM pg_stat_activity WHERE datname = $1 AND state <> 'idle'",
+    )
+    .bind(database)
+    .fetch_one(admin)
+    .await
+    .expect("read the busy backend count")
 }
 
 /// 这个一次性库上现在的后端连接数（含夹具自己的池）。

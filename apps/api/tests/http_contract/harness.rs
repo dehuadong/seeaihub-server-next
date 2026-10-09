@@ -3120,6 +3120,18 @@ fn collect_documentation_fields(
     }
 }
 
+/// 排序后的样本在 `percentile`（0–1）处的取值：取向上取整那一档。
+///
+/// 空样本返回零：一档全被拒时没有延迟可报，那不是测量失败——拒本身就是这一档的结论。
+/// 性能基线与容量测量共用这一处，分位口径不会各自漂移。
+fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
+    if sorted.is_empty() {
+        return Duration::ZERO;
+    }
+    let index = (sorted.len() as f64 * percentile).ceil() as usize - 1;
+    sorted[index.min(sorted.len() - 1)]
+}
+
 /// 测试构造体：模型 + 提示词（幂等键另走请求头）。
 fn route_request(model: &str, prompt: &str) -> Value {
     json!({"model": model, "prompt": prompt})

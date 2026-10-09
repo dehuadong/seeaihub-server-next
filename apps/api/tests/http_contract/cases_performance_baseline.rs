@@ -8,12 +8,6 @@
 
 use super::*;
 
-/// 排序后的样本在 percentile（0–1）处的取值：取向上取整那一档（基线与耗时拆分同一口径）。
-fn percentile(sorted: &[Duration], percentile: f64) -> Duration {
-    let index = (sorted.len() as f64 * percentile).ceil() as usize - 1;
-    sorted[index.min(sorted.len() - 1)]
-}
-
 /// 一组样本的均值与 p95。
 fn mean_and_p95(mut samples: Vec<Duration>) -> (Duration, Duration) {
     samples.sort();

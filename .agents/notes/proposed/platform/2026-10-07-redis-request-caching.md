@@ -16,7 +16,7 @@ approval: 用户 2026-10-09 要求复审缓存的必要性与可行性并给出�
 
 **第一，余额缓存没有任何请求路径读者。** `AccelerationService::read_balance` 只在写穿时的版本闸门与对账器里被调用（[lib.rs](../../../../crates/application/src/lib.rs)）；管理员与客户端的余额读一律走数据库。所以 `user_balance:<account_id>` 今天只产生成本：每次资金变动后多一次 `SELECT` 加两次 Redis 往返，全部 await 在响应路径上。
 
-**第二，PostgreSQL 连接池固定 10 条，生产改不了。** 它是字面量，出现在第一次提交里，只设了 `max_connections`；`min_connections`、`acquire_timeout`、`idle_timeout`、`max_lifetime` 全取 sqlx 缺省（0 / 30 秒 / 10 分钟 / 30 分钟），见 [main.rs](../../../../apps/api/src/main.rs) 与 [persistence](../../../../crates/persistence/src/lib.rs)。仓库里没有这个数的推导记录，也没有配置项。缺省的 30 秒获取超时意味着池满时请求**排队等待**而不是快速失败。
+**第二，PostgreSQL 连接池上限现在是配置项，缺省 10。** 它原本是第一次提交里写死的字面量，只设了 `max_connections`；`min_connections`、`acquire_timeout`、`idle_timeout`、`max_lifetime` 全取 sqlx 缺省（0 / 30 秒 / 10 分钟 / 30 分钟），见 [persistence](../../../../crates/persistence/src/lib.rs)。现在两个进程各自读 `DATABASE_MAX_CONNECTIONS`（缺省 10、配 `0` 拒绝启动），属主是 `docs/operations/configuration.md`。缺省的 30 秒获取超时意味着池满时请求**排队等待**而不是快速失败。
 
 **第三，本机缺省并发上限是 4，不是 10。** `GENERATION_EXECUTION_SLOTS` 由内存预算推导（2 GiB ÷ 437 MiB），`GENERATION_READ_SLOTS` 与 `GENERATION_SEND_SLOTS` 各 64。也就是说：稳态下同时在飞的执行只有 4 个，每个只在数据库阶段占连接，上游调用期间不占。**缺省配置下连接池不是先饱和的那个资源。**
 
@@ -39,9 +39,15 @@ approval: 用户 2026-10-09 要求复审缓存的必要性与可行性并给出�
 2. 它的结果能同步失效——写入口集中、变动低频；
 3. 被省下的资源**确实是瓶颈**，有实测的饱和证据。
 
-第 3 条现在**没有证据，而且测量结果对它不利**：并发 8–32、上游延迟 0–200 毫秒下，把连接池从 10 提到 64 不改变吞吐，整机 CPU 在 1.6%–20.2% 之间，先饱和的是受理事务里按渠道串行化的那一段（[观测](2026-10-09-admission-path-capacity-measurement.md) 指向的[记录](../../../../docs/verification/admission-path-capacity.md)）。也就是说被省下的那个资源不是瓶颈。
+第 3 条现在**没有证据，而且测量结果对它不利**：并发 8–32、上游延迟 0–200 毫秒下，把连接池从 10 提到 64 的吞吐差异两个方向都有、幅度在 10% 量级，落在同一档重复跑的散布里；整机 CPU 在 1.9%–15.1% 之间。**先饱和的不是连接池**——这一条是判定了的；它到底是什么还没判定，缺渠道数那一轴（[记录](../../../../docs/verification/admission-path-capacity.md)）。也就是说被省下的那个资源不是瓶颈。
 
-所以本轮的结论是**有条件成立，且当前不满足**：设计可以做，但按已有证据，第 2、3、4 节没有要缓解的瓶颈；第 7 节的故障边界与第 5 节把余额缓存移出响应路径不依赖这条证据，可以先做。
+所以本轮的结论是**有条件成立，且当前不满足**。
+
+**据此定的范围（用户 2026-10-09 把这条决定交给我做）**：
+
+- **第 5 节保留一半**：把余额缓存移出响应路径。它不依赖瓶颈证据——删掉的是一次 `SELECT` 加两次 Redis 往返，而那个缓存在请求路径上没有任何读者。**注意**：这一改会让「写穿在响应返回前完成」不再成立，`docs/design/0008` §7.3 与既有验收用例 `cache_write_through_makes_the_balance_visible_after_every_write` 要跟着改，不是纯实现改动。
+- **第 2、3、4 节本轮不做**，设计保留。触发条件：出现实测的读侧瓶颈（池真的成为限制，或渠道轴测出别的结论）。
+- **第 7 节不做**：Redis 不进请求路径，就没有这个前置需求。
 
 ### 2 API Key 身份缓存
 
