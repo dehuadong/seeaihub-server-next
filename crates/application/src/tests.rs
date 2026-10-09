@@ -4,6 +4,7 @@ use seeai_domain::{
     ChannelId, OfferingId, PricePlanId, PriceSnapshot, RuntimeRevisionId, TokenUsage, VendorModelId,
 };
 
+mod balance_writes;
 mod candidate_plan;
 mod carrier_validation;
 mod contract_face;

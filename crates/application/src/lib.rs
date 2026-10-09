@@ -25,11 +25,13 @@ use serde_json::{Map, Value, json};
 use sha2::{Digest, Sha256};
 use std::{
     borrow::Cow,
-    collections::{BTreeMap, BTreeSet, HashSet},
+    collections::{BTreeMap, BTreeSet, HashMap, HashSet},
     sync::Arc,
+    sync::atomic::{AtomicU64, Ordering},
     time::Duration,
 };
 use thiserror::Error;
+use tokio::sync::Notify;
 use uuid::Uuid;
 
 mod alerts;
@@ -1853,12 +1855,22 @@ pub struct SettleExecution {
 ///
 /// `stage` 是 Job 落库的阶段；`charge_microusd` 是账本上已提交的实收——成功是 `capture` 的金额，
 /// 失败与对账为 0。提交结果未知时先拿它确认，再决定是否重试同一幂等收尾（RFC 0017 §3）。
+///
+/// `balance` 是这次收尾用 `RETURNING` 把账户那一行提交后的值带回来的快照。它存在，是为了让缓存
+/// 写穿不必再 `SELECT` 一次：资金事务本来就锁着那一行、改着那一行，顺手带回结果是零成本。
+///
+/// `None` 有两种：**没有改动账户**（重放、可重试失败、结果未知）与**改动过但这次读不到那一行**
+/// ——后者只有确认已提交的收尾（[`Self::read_finalization`]）：提交结果不明时它按 Job/Attempt
+/// 只读确认，确认得到的就是一次已经提交、已经改过余额的收尾，而那条 `RETURNING` 的结果当时没有
+/// 留下来。这一格不补查数据库（那正是 R2 要拿掉的那次 `SELECT`），改由下一轮对账按版本覆盖回来
+/// （`docs/design/0008` §7.5）。
 #[derive(Debug, Clone)]
 pub struct ExecutionFinalization {
     pub job_id: JobId,
     pub attempt_id: AttemptId,
     pub stage: ExecutionStage,
     pub charge_microusd: u64,
+    pub balance: Option<BalanceChange>,
 }
 
 /// `fail_or_reconcile` 的失败处置，决定 Job 终态与占用、容量是否释放。
@@ -3417,9 +3429,7 @@ impl ReconciliationService {
             ));
         }
         let change = self.repository.refund_reconciliation(command).await?;
-        self.acceleration
-            .write_balance(&change, BalanceSource::DbCommit)
-            .await;
+        self.acceleration.enqueue_balance(change);
         Ok(())
     }
 }
@@ -4344,9 +4354,7 @@ impl AccountsService {
                 }
             }
         };
-        self.acceleration
-            .write_balance(&change, BalanceSource::DbCommit)
-            .await;
+        self.acceleration.enqueue_balance(change);
         Ok(account_id)
     }
 
@@ -4376,9 +4384,7 @@ impl AccountsService {
             .repository
             .credit_account(account_id, amount_microusd, business_key, actor)
             .await?;
-        self.acceleration
-            .write_balance(&change, BalanceSource::DbCommit)
-            .await;
+        self.acceleration.enqueue_balance(change);
         Ok(())
     }
 
@@ -4742,6 +4748,71 @@ pub struct AccelerationService {
     repository: Arc<dyn HubRepository>,
     cache: Option<Arc<dyn CacheStore>>,
     policy: CachePolicy,
+    /// 待写的余额快照：响应路径只往这里放，Redis 的读与写在 [`Self::run_balance_writer`] 里做。
+    balance_writes: Arc<BalanceWrites>,
+}
+
+/// 余额快照的待写队列：**按账户合并、容量有界、丢弃时计数**。
+///
+/// 响应路径只调 [`Self::enqueue`]：加锁、按账户覆盖、返回。那里既不查库也不等 Redis，所以用户
+/// 等待的那段时间不为缓存付任何代价。同一账户只留版本最高的一份——队列本身就是"按账户合并"。
+///
+/// 满了就丢并让计数加一。余额快照是**可恢复**的：数据库是事实来源，下一次事务或对账会再写一遍；
+/// 丢一条待写通知不改变任何资金结果。
+struct BalanceWrites {
+    pending: std::sync::Mutex<HashMap<AccountId, BalanceChange>>,
+    capacity: usize,
+    dropped: AtomicU64,
+    notify: Notify,
+}
+
+/// 待写队列的容量：按账户数算。取 1024 是因为它远大于热账户数，又不至于让一次突发无限堆积。
+const BALANCE_WRITE_QUEUE_CAPACITY: usize = 1024;
+
+impl BalanceWrites {
+    fn new() -> Self {
+        Self {
+            pending: std::sync::Mutex::new(HashMap::new()),
+            capacity: BALANCE_WRITE_QUEUE_CAPACITY,
+            dropped: AtomicU64::new(0),
+            notify: Notify::new(),
+        }
+    }
+
+    /// 放一份快照进去。已有同账户且版本更高的，这次直接丢——旧值写回去也没有意义。
+    fn enqueue(&self, change: BalanceChange) {
+        let mut pending = self.lock();
+        match pending.get_mut(&change.account_id) {
+            Some(existing) if existing.version > change.version => return,
+            Some(existing) => *existing = change,
+            None => {
+                if pending.len() >= self.capacity {
+                    self.dropped.fetch_add(1, Ordering::Relaxed);
+                    return;
+                }
+                pending.insert(change.account_id, change);
+            }
+        }
+        drop(pending);
+        self.notify.notify_one();
+    }
+
+    /// 取走当前全部待写快照。一次取整批，突发自然被合并成一轮写。
+    fn drain(&self) -> Vec<BalanceChange> {
+        std::mem::take(&mut *self.lock()).into_values().collect()
+    }
+
+    /// 锁中毒不当作致命：里面的数据是快照，取出来继续用比让缓存整条坏掉好。
+    fn lock(&self) -> std::sync::MutexGuard<'_, HashMap<AccountId, BalanceChange>> {
+        self.pending
+            .lock()
+            .unwrap_or_else(|error| error.into_inner())
+    }
+
+    #[must_use]
+    fn dropped(&self) -> u64 {
+        self.dropped.load(Ordering::Relaxed)
+    }
 }
 
 impl AccelerationService {
@@ -4755,6 +4826,7 @@ impl AccelerationService {
             repository,
             cache: None,
             policy: CachePolicy::default_policy(),
+            balance_writes: Arc::new(BalanceWrites::new()),
         }
     }
 
@@ -4768,6 +4840,7 @@ impl AccelerationService {
             repository,
             cache: Some(cache),
             policy,
+            balance_writes: Arc::new(BalanceWrites::new()),
         }
     }
 
@@ -4904,6 +4977,49 @@ impl AccelerationService {
                     "the cached counter is unreadable; counting this window from zero"
                 );
                 0
+            }
+        }
+    }
+
+    /// 把一份**数据库事务已经提交**的余额快照放进待写队列，不等 Redis。
+    ///
+    /// 响应路径只调这一个：它不查库、不等 Redis，所以那次请求不为缓存多付一次往返。真正的写由
+    /// [`Self::run_balance_writer`] 在后台做。缓存没启用时它是空操作——那时连队列都不该进。
+    pub fn enqueue_balance(&self, change: BalanceChange) {
+        if !self.is_enabled() {
+            return;
+        }
+        self.balance_writes.enqueue(change);
+    }
+
+    /// 待写队列被丢弃的条数：队列满时丢的是**可恢复**的提醒，不是资金事实。供观测与用例断言。
+    #[must_use]
+    pub fn dropped_balance_writes(&self) -> u64 {
+        self.balance_writes.dropped()
+    }
+
+    /// 后台写队列的循环：由进程在启动时挂起来，与请求路径无关。
+    ///
+    /// 每轮取走当前全部待写快照（同账户已被合并成一份），逐份写穿。缓存没启用时直接返回。
+    pub async fn run_balance_writer(self: Arc<Self>) {
+        if !self.is_enabled() {
+            return;
+        }
+        // 只报**新增**的丢弃：计数是累计的，每轮照读会在溢出一次之后每轮都告警。
+        let mut warned = 0_u64;
+        loop {
+            self.balance_writes.notify.notified().await;
+            for change in self.balance_writes.drain() {
+                self.write_balance(&change, BalanceSource::DbCommit).await;
+            }
+            let dropped = self.dropped_balance_writes();
+            if dropped > warned {
+                tracing::warn!(
+                    dropped_balance_writes = dropped - warned,
+                    total_dropped_balance_writes = dropped,
+                    "the balance write queue overflowed; those refreshes are recoverable"
+                );
+                warned = dropped;
             }
         }
     }

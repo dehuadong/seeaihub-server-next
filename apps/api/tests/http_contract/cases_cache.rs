@@ -180,11 +180,14 @@ async fn the_ledger_view_and_the_consumer_account_read_the_database_not_the_cach
     harness.cleanup().await;
 }
 
-/// **写穿**：充值、受理预授权扣减、结算三条路径都在数据库提交之后把余额写进缓存。
+/// **写穿**：充值、受理预授权扣减、结算三条路径都在数据库提交之后由后台队列把余额写进缓存。
 ///
-/// 一次用例把三条路径都走一遍：充值后缓存立刻是充值后的值；不跑 Worker 发一次请求（同步入口
-/// 超时，但 Job 已经受理、预授权已经扣），缓存跟着变成"初始 − 保底额"；再起 Worker 把同一个 Job
-/// 跑完，缓存变成结算后的余额。每一步都与数据库逐位比对。
+/// 一次用例把三条路径都走一遍：充值后缓存在有限窗口内变成充值后的值；不跑 Worker 发一次请求
+/// （同步入口超时，但 Job 已经受理、预授权已经扣），缓存跟着变成"初始 − 保底额"；再起 Worker 把
+/// 同一个 Job 跑完，缓存变成结算后的余额。每一步都与数据库逐位比对。
+///
+/// 写穿搬进后台队列之后，**"接口返回时缓存已经是新值"不再是合同**（`0008` §7.3）。所以这里等的
+/// 是"缓存版本追上数据库那一行"，而不是"返回即有"。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn cache_write_through_makes_the_balance_visible_after_every_write() {
@@ -208,13 +211,11 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         "带定价的发布必须成功"
     );
 
-    // ① 充值：提交后立刻可见。
+    // ① 充值：提交后由后台队列写出去。写穿不再等在这次请求里，所以这里等它落定，而不是
+    // 假设"返回即有"。
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let cached = harness
-        .cache()
-        .balance(&account_id)
-        .expect("充值之后缓存里必须立刻有余额");
+    let cached = await_write_through(&harness, &account_id).await;
     assert_eq!(cached["balance_microusd"], json!(1_000_000));
     assert_eq!(
         cached["held_microusd"],
@@ -268,7 +269,7 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
     let job_id = job_id.expect("受理之后必须看得到 active 的预授权");
-    let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
+    let cached = await_write_through(&harness, &account_id).await;
     assert_eq!(
         cached["balance_microusd"],
         json!(1_000_000),
@@ -306,7 +307,7 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
         1_000_000 - 97_000,
         "实收按上游声明的金额加价算，落账取整到整积分"
     );
-    let cached = harness.cache().balance(&account_id).expect("结算之后缓存");
+    let cached = await_write_through(&harness, &account_id).await;
     assert_eq!(cached["balance_microusd"], json!(settled));
     assert_eq!(
         cached["held_microusd"],
@@ -420,7 +421,7 @@ async fn a_stale_balance_entry_never_rejects() {
     assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
+    let fresh = await_write_through(&harness, &account_id).await;
     let written_at = fresh["written_at"].clone();
 
     // ① 来源是对账写回：它只保证"与数据库一致"，不构成"刚有一笔钱变动过"的证据。
@@ -492,7 +493,7 @@ async fn a_fresh_cache_shortfall_does_not_reject_without_the_database() {
     assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
-    let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
+    let fresh = await_write_through(&harness, &account_id).await;
     let written_at = fresh["written_at"].clone();
     // 缓存落后于充值：新鲜、写穿来源，但可用额比 2K 档的保底额 ¥0.25 还少；数据库说够。
     harness
@@ -552,7 +553,7 @@ async fn a_cache_that_says_there_is_enough_still_lets_the_database_refuse() {
     // 余额低于 2K 档的保底额 ¥0.25：数据库这一侧本来就不够。
     let (account_id, api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 100_000).await;
-    let fresh = harness.cache().balance(&account_id).expect("充值之后缓存");
+    let fresh = await_write_through(&harness, &account_id).await;
     let written_at = fresh["written_at"].clone();
     // 缓存被改成一个充足、新鲜的数：它不能成为"可以受理"的依据。
     harness
@@ -627,7 +628,9 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
             "source": "db_commit",
         }),
     );
-    // 再充一笔：数据库版本只到 1，写回是"旧版本"，必须被拒绝。
+    // 再充一笔：数据库版本只到 1，写回是"旧版本"，必须被拒绝。先记下到达基线——充值之后要等的
+    // 是**这次充值触发的那一条**写回到达，基线取晚了就只能等一条永远不来的写回。
+    let arrivals = harness.cache().balance_write_arrivals();
     let response = client
         .post(format!(
             "{}/api/v1/accounts/{account_id}/credits",
@@ -643,6 +646,12 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
         .expect("credit");
     assert_eq!(response.status(), StatusCode::NO_CONTENT);
 
+    // 写回是后台队列做的：等它**真的到达**假 Redis（而不是等一段时间），否则"缓存没变"这句
+    // 在后一种情况下也会通过——那就成了空转。到达的那一条必须被版本闸门挡下。
+    harness
+        .cache()
+        .wait_for_balance_write_arrivals(arrivals + 1)
+        .await;
     let cached = harness.cache().balance(&account_id).expect("缓存还在");
     assert_eq!(
         cached["version"],
@@ -714,7 +723,7 @@ async fn a_replayed_request_is_never_refused_by_the_cached_balance() {
     }
     assert!(in_flight, "第一笔必须在飞，重放才有意义");
     // 受理**不改变已结算余额**（占用记在 `held`），所以缓存里仍是 300000。
-    let cached = harness.cache().balance(&account_id).expect("受理之后缓存");
+    let cached = await_write_through(&harness, &account_id).await;
     assert_eq!(
         cached["balance_microusd"],
         json!(300_000),
@@ -806,7 +815,7 @@ async fn the_reconciler_overwrites_corrupted_entries_from_the_database() {
     .await;
     assert_eq!(status, StatusCode::OK, "got {body}");
     let settled = database_balance(&harness, &account_id).await;
-    let fresh = harness.cache().balance(&account_id).expect("结算之后缓存");
+    let fresh = await_write_through(&harness, &account_id).await;
     harness
         .cache()
         .corrupt_balance(&account_id, 1, "db_commit", fresh["written_at"].clone());

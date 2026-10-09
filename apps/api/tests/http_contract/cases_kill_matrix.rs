@@ -763,9 +763,9 @@ async fn sigkill_after_the_evidence_arrives_before_the_settlement_commit_settles
 
 /// **格 6：结算提交后（COMMIT 已落、写回缓存没回来、响应还没交出去）**。
 ///
-/// 注入点：同步渠道（AIHubMix）一次上游调用就带回图片与计量。用例在假上游收到生成请求之后再武
-/// 装余额写回闸门，然后放行：结算提交、`refresh_balance` 写回缓存时被停住——此刻账上已经有实收，
-/// 客户端还没拿到响应。
+/// 注入点：同步渠道（AIHubMix）一次上游调用就带回图片与计量。用例在假上游收到生成请求之后先
+/// 等受理那次写回落定，再武装余额写回闸门，然后放行：结算提交、后台队列写回缓存时被停住——
+/// 此刻账上已经有实收，客户端还没拿到响应。
 ///
 /// 恢复：重启一个 API 副本（不重发、不重算），同键重发按 §4 回 `409 result_not_retained`；
 /// 生成请求计数与实收分录都还是 1。这格是"结算提交后强杀"的进程级取证。
@@ -804,9 +804,12 @@ async fn sigkill_after_the_settlement_commit_replays_as_result_not_retained() {
     let body = route_request(harness.model, "kill after the settlement commit");
     let request = spawn_generation(&harness, key.clone(), body.clone());
 
-    // 屏障 1：生成请求已经发出（此刻受理时那次余额写回早过去了）。
+    // 屏障 1：生成请求已经发出。
     harness.gate().wait_for_arrival(1).await;
-    // 屏障 2：武装余额写回闸门，再放行上游响应——下一次余额写回必然是结算之后那一次。
+    // 屏障 2：先等受理那一次的写回落定——写回现在走后台队列，不先排空它，闸门抓到的可能是
+    // 受理那一次而不是结算那一次。
+    await_write_through(&harness, &account_id.to_string()).await;
+    // 屏障 3：武装余额写回闸门，再放行上游响应——下一次余额写回必然是结算之后那一次。
     harness.cache().hold_next_balance_write();
     harness.gate().release_all();
     harness.cache().wait_for_balance_write_hold().await;

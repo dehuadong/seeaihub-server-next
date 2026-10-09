@@ -135,7 +135,11 @@ async fn main() -> Result<()> {
     )
     .with_policy(reconciliation_policy)
     .with_retry_policy(retry_policy)
-    .with_acceleration(acceleration);
+    .with_acceleration(acceleration.clone());
+    // 余额写穿的后台一半：受理、结算与失败收尾都把快照交给它，这里不排空队列就会积着不写。
+    if acceleration.is_enabled() {
+        tokio::spawn(acceleration.clone().run_balance_writer());
+    }
     if let Some((alerter, _)) = &alerting {
         reconciliation = reconciliation.with_platform_alerts(alerter.clone());
     }

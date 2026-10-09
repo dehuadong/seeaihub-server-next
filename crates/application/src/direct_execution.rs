@@ -34,7 +34,7 @@ use thiserror::Error;
 
 use crate::{
     AccelerationService, AdapterFactory, AdmitExecution, AdmitOffering, AdmitOutcome,
-    ApplicationError, BalanceSource, BeginSubmission, CancelUnsubmitted, CostInputs,
+    ApplicationError, BalanceChange, BeginSubmission, CancelUnsubmitted, CostInputs,
     CreateImageGenerationRequest, CredentialProvider, DirectExecutionLimits, ExecutionFinalization,
     ExecutionLookup, ExecutionReplay, ExecutionRepository, FailOrReconcileExecution,
     FailureDisposition, HubRepository, LateFacts, PublicErrorCode, RequestFingerprintInput,
@@ -528,10 +528,9 @@ impl DirectExecutionService {
             .await?;
         let (job_id, fencing_token) = match outcome {
             AdmitOutcome::Admitted { job, balance } => {
-                // 预授权扣减已经提交：把变更后的余额写进缓存（RFC 0017 §3）。
-                self.acceleration
-                    .write_balance(&balance, BalanceSource::DbCommit)
-                    .await;
+                // 预授权扣减已经提交：受理事务自带 RETURNING 快照，交给后台写队列即可，
+                // 这次请求不为缓存多等一次 Redis（RFC 0017 §3）。
+                self.acceleration.enqueue_balance(balance);
                 (job.job_id, job.fencing_token)
             }
             AdmitOutcome::Replayed(replay) => {
@@ -570,7 +569,7 @@ impl DirectExecutionService {
             // 已经 accepted/unknown 的 Attempt 会让它冲突，那时不声称释放成功。
             if let Some(refused) = call.gate.stop_reason() {
                 return self
-                    .release_unsubmitted(request.account_id, job_id, call, fencing_token, refused)
+                    .release_unsubmitted(job_id, call, fencing_token, refused)
                     .await;
             }
             let started = self
@@ -598,13 +597,12 @@ impl DirectExecutionService {
                 && let Some(refused) = call.gate.stop_reason()
             {
                 return self
-                    .release_unsubmitted(request.account_id, job_id, call, fencing_token, refused)
+                    .release_unsubmitted(job_id, call, fencing_token, refused)
                     .await;
             }
             // 提交声明已落、但外部预算已到：这一次不发任何外部调用，直接释放，按 504 request_timeout。
             if deadline.is_expired() {
                 self.record_failure(
-                    request.account_id,
                     job_id,
                     attempt_id,
                     &call.execution_owner,
@@ -634,7 +632,6 @@ impl DirectExecutionService {
                 Ok(output) => {
                     return self
                         .finish_success(
-                            request.account_id,
                             job_id,
                             attempt_id,
                             &call.execution_owner,
@@ -662,7 +659,6 @@ impl DirectExecutionService {
                                 && deadline.remaining() > backoff;
                         if can_retry {
                             self.record_failure(
-                                request.account_id,
                                 job_id,
                                 attempt_id,
                                 &call.execution_owner,
@@ -685,7 +681,6 @@ impl DirectExecutionService {
                             tokio::time::sleep(backoff).await;
                             if call.gate.is_stopped() || deadline.is_expired() {
                                 self.record_failure(
-                                    request.account_id,
                                     job_id,
                                     attempt_id,
                                     &call.execution_owner,
@@ -708,7 +703,6 @@ impl DirectExecutionService {
                             || deadline.is_expired()
                             || deadline.remaining() <= backoff;
                         self.record_failure(
-                            request.account_id,
                             job_id,
                             attempt_id,
                             &call.execution_owner,
@@ -727,7 +721,6 @@ impl DirectExecutionService {
                         return Err(DirectExecutionError::OriginalFailure { code: error_code });
                     }
                     self.record_failure(
-                        request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
@@ -765,7 +758,6 @@ impl DirectExecutionService {
                     )
                     .await;
                     self.record_failure(
-                        request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
@@ -786,7 +778,6 @@ impl DirectExecutionService {
                     // 请求在交给渠道之前就被挡下：这次执行没有成本可采，也不再重投。
                     tracing::warn!(job_id = %job_id, reason = %message, "the adapter rejected this request");
                     self.record_failure(
-                        request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
@@ -812,17 +803,10 @@ impl DirectExecutionService {
                         && let Some(refused) = context.stop_reason()
                     {
                         return self
-                            .release_unsubmitted(
-                                request.account_id,
-                                job_id,
-                                call,
-                                fencing_token,
-                                refused,
-                            )
+                            .release_unsubmitted(job_id, call, fencing_token, refused)
                             .await;
                     }
                     self.record_failure(
-                        request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
@@ -842,7 +826,6 @@ impl DirectExecutionService {
                     // 名额，交异常对账处置（RFC 0017 §5）。两种取消事实到这里完全同解——
                     // 已经发出的调用既不能撤回，也不该按旧事实改写。
                     self.record_failure(
-                        request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
@@ -860,7 +843,6 @@ impl DirectExecutionService {
                 Err(AdapterError::QueryAccountingUnsupported) => {
                     // 一次性 execute 不该报这个：防御性地按平台侧确定失败处置，不再重投。
                     self.record_failure(
-                        request.account_id,
                         job_id,
                         attempt_id,
                         &call.execution_owner,
@@ -1021,7 +1003,6 @@ impl DirectExecutionService {
     #[allow(clippy::too_many_arguments)]
     async fn finish_success(
         &self,
-        account_id: AccountId,
         job_id: JobId,
         attempt_id: AttemptId,
         execution_owner: &str,
@@ -1045,7 +1026,6 @@ impl DirectExecutionService {
             let provider_cost =
                 failure_provider_cost(snapshot, Some(&output.accounting_facts.provider_cost));
             self.record_failure(
-                account_id,
                 job_id,
                 attempt_id,
                 execution_owner,
@@ -1067,7 +1047,6 @@ impl DirectExecutionService {
             let provider_cost =
                 failure_provider_cost(snapshot, Some(&output.accounting_facts.provider_cost));
             self.record_failure(
-                account_id,
                 job_id,
                 attempt_id,
                 execution_owner,
@@ -1152,7 +1131,7 @@ impl DirectExecutionService {
                 return Err(error);
             }
         };
-        self.refresh_balance(account_id).await;
+        self.enqueue_balance(finalization.balance);
         if finalization.stage != ExecutionStage::Succeeded {
             // 结算没有落成成功：不许把图片当成功交回；事实仍交回收件端口。
             self.hand_off_late_facts(
@@ -1270,7 +1249,6 @@ impl DirectExecutionService {
     /// 确认释放之后返回 504 request_timeout：这次请求确定没有提交给渠道。
     async fn release_unsubmitted(
         &self,
-        account_id: AccountId,
         job_id: JobId,
         call: &DirectExecutionCall,
         fencing_token: FencingToken,
@@ -1284,8 +1262,8 @@ impl DirectExecutionService {
             })
             .await
         {
-            Ok(_) => {
-                self.refresh_balance(account_id).await;
+            Ok(finalization) => {
+                self.enqueue_balance(finalization.balance);
                 tracing::info!(
                     job_id = %job_id,
                     reason = ?refused,
@@ -1375,7 +1353,6 @@ impl DirectExecutionService {
     #[allow(clippy::too_many_arguments)]
     async fn record_failure(
         &self,
-        account_id: AccountId,
         job_id: JobId,
         attempt_id: AttemptId,
         execution_owner: &str,
@@ -1397,19 +1374,22 @@ impl DirectExecutionService {
             provider_cost.clone(),
             provider_trace_id.clone(),
         );
-        if let Err(error) = self.finalize_failure(command).await {
-            self.hand_off_late_facts(
-                job_id,
-                attempt_id,
-                receipt_credential,
-                provider_trace_id,
-                provider_cost,
-                late,
-            )
-            .await;
-            return Err(error);
-        }
-        self.refresh_balance(account_id).await;
+        let finalized = match self.finalize_failure(command).await {
+            Ok(finalized) => finalized,
+            Err(error) => {
+                self.hand_off_late_facts(
+                    job_id,
+                    attempt_id,
+                    receipt_credential,
+                    provider_trace_id,
+                    provider_cost,
+                    late,
+                )
+                .await;
+                return Err(error);
+            }
+        };
+        self.enqueue_balance(finalized.balance);
         Ok(())
     }
 
@@ -1465,19 +1445,14 @@ impl DirectExecutionService {
         );
     }
 
-    /// 提交后把数据库的当前余额写穿缓存（RFC 0017 §3）。读不到只记日志：缓存不是事实来源。
-    async fn refresh_balance(&self, account_id: AccountId) {
-        match self.repository.read_account_balance(account_id).await {
-            Ok(change) => {
-                self.acceleration
-                    .write_balance(&change, BalanceSource::DbCommit)
-                    .await;
-            }
-            Err(error) => tracing::warn!(
-                account_id = %account_id,
-                error = %error,
-                "could not read the account balance to refresh the cache"
-            ),
+    /// 把收尾事务带回来的余额快照交给后台写队列。
+    ///
+    /// 这里**不查库、不等 Redis**：快照由资金事务的 `RETURNING` 顺手带回，写由
+    /// [`AccelerationService::run_balance_writer`] 在后台做。没有改动账户的收尾给 `None`，
+    /// 那时没有快照要刷新（RFC 0017 §3）。
+    fn enqueue_balance(&self, balance: Option<BalanceChange>) {
+        if let Some(balance) = balance {
+            self.acceleration.enqueue_balance(balance);
         }
     }
 }

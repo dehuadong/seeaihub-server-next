@@ -3828,6 +3828,11 @@ impl CacheSettings {
 struct BalanceWriteGate {
     armed: AtomicBool,
     held: AtomicUsize,
+    /// **到达**过的余额写回条数，与有没有武装无关。
+    ///
+    /// 用例靠它把"写回试过了、但被版本闸门挡下"与"写回根本没发生"分开：只等一段时间再断言
+    /// 缓存没变，在后一种情况下也会通过。
+    arrived: AtomicUsize,
     notify: tokio::sync::Notify,
 }
 
@@ -3835,6 +3840,37 @@ impl BalanceWriteGate {
     /// 武装：下一条余额写回停住。
     fn arm(&self) {
         self.armed.store(true, Ordering::SeqCst);
+    }
+
+    /// 到达计数：某次写回已经发到假 Redis 上。
+    fn arrivals(&self) -> usize {
+        self.arrived.load(Ordering::SeqCst)
+    }
+
+    /// 等到达计数越过 `target`。**有上限**：没等到就 panic，不能让用例挂着占住串行测试。
+    async fn wait_for_arrivals(&self, target: usize) {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            if self.arrived.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            let notified = self.notify.notified();
+            if self.arrived.load(Ordering::SeqCst) >= target {
+                return;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "10 秒内没有等到第 {target} 条余额写回到达假 Redis"
+            );
+            let _ = tokio::time::timeout_at(deadline, notified).await;
+        }
+    }
+
+    /// 一条落在余额缓存上的命令到了：记一次到达。GET（版本闸门）与 SET（写回）都算——版本被
+    /// 挡下时只发生 GET，拿 SET 当到达信号会永远等不到。
+    fn arrive(&self) {
+        self.arrived.fetch_add(1, Ordering::SeqCst);
+        self.notify.notify_waiters();
     }
 
     /// 请求侧：已经武装就原子地卸下并置信号，调用方随后永不应答。
@@ -3871,6 +3907,15 @@ fn is_balance_write(args: &[String]) -> bool {
             .is_some_and(|key| key.starts_with("user_balance:"))
 }
 
+/// 是不是落在余额缓存上的命令：读版本闸门的 `GET` 或写回的 `SET`。
+fn is_balance_command(args: &[String]) -> bool {
+    args.first()
+        .is_some_and(|name| name.eq_ignore_ascii_case("GET") || name.eq_ignore_ascii_case("SET"))
+        && args
+            .get(1)
+            .is_some_and(|key| key.starts_with("user_balance:"))
+}
+
 /// 假 Redis 里的一条：值 + 过期时刻（`None` 表示不过期）。
 struct CacheEntry {
     value: String,
@@ -3889,6 +3934,27 @@ struct CacheFixture {
     listener: Mutex<Option<tokio::task::JoinHandle<()>>>,
     /// 余额写回闸门：强杀矩阵要卡在"结算已提交、缓存写回未回"时用它。
     balance_write_gate: Arc<BalanceWriteGate>,
+}
+
+/// 等**余额写穿**落到缓存里：按账户的版本追上数据库那一行为止。
+///
+/// 写穿走后台队列，返回时它可能还没写完，所以读侧不能假设"接口返回即有缓存"。正常在一毫秒内
+/// 到；上限 10 秒，超过说明后台写没跑起来——那是真的坏了，不是慢。
+async fn await_write_through(harness: &Harness, account_id: &str) -> Value {
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+    loop {
+        let database = database_version(harness, account_id).await;
+        if let Some(cached) = harness.cache().balance(account_id)
+            && cached["version"] == json!(database)
+        {
+            return cached;
+        }
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "10 秒内缓存里的版本没有追上数据库那一行"
+        );
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
 }
 
 impl CacheFixture {
@@ -4037,6 +4103,16 @@ impl CacheFixture {
     /// 等那条被停住的余额写回真的到点。到点时结算事务已经提交、响应还没交出去。
     async fn wait_for_balance_write_hold(&self) {
         self.balance_write_gate.wait_until_held().await;
+    }
+
+    /// 已经到达假 Redis 的余额写回条数。
+    fn balance_write_arrivals(&self) -> usize {
+        self.balance_write_gate.arrivals()
+    }
+
+    /// 等到余额写回确实到达过（越过 `target` 条）。用它证明"试过了"，而不是"等了一会儿"。
+    async fn wait_for_balance_write_arrivals(&self, target: usize) {
+        self.balance_write_gate.wait_for_arrivals(target).await;
     }
 }
 
@@ -4188,6 +4264,9 @@ async fn serve_fake_redis(
             let mut buffer = vec![0_u8; length + 2];
             reader.read_exact(&mut buffer).await?;
             args.push(String::from_utf8_lossy(&buffer[..length]).into_owned());
+        }
+        if is_balance_command(&args) {
+            balance_write_gate.arrive();
         }
         if is_balance_write(&args) && balance_write_gate.take_hold() {
             // 模拟余额写回阻塞：连接保持打开但一条应答都不写。用例把缓存命令上限调长到等得起，

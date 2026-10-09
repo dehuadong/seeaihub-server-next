@@ -4327,23 +4327,27 @@ impl ExecutionRepository for PgHubRepository {
         .await
         .map_err(database_error)?;
         // 确定无需收费：只把占用从占用合计里去掉，不动已结算余额、不写对客流水。
-        let updated = sqlx::query(
+        // 只把占用从占用合计里去掉，不动已结算余额、不写对客流水。RETURNING 把提交后的快照
+        // 顺手带回来，缓存写穿因此不必再查一次库。
+        let balance_row = sqlx::query(
             r#"
             UPDATE ledger.accounts
             SET held_microusd = held_microusd - $2,
                 version = version + 1,
                 updated_at = now()
             WHERE id = $1
+            RETURNING balance_microusd, held_microusd,
+                      balance_microusd - held_microusd AS available_microusd,
+                      version, updated_at
             "#,
         )
         .bind(account_id.0)
         .bind(hold_amount)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(ApplicationError::NotFound(format!("account {account_id}")));
-        }
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+        let balance = balance_change(&balance_row, account_id)?;
         release_channel_slot(&mut transaction, job_id).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(ExecutionFinalization {
@@ -4351,6 +4355,7 @@ impl ExecutionRepository for PgHubRepository {
             attempt_id,
             stage: ExecutionStage::Failed,
             charge_microusd: 0,
+            balance: Some(balance),
         })
     }
 
@@ -4649,7 +4654,7 @@ impl ExecutionRepository for PgHubRepository {
         .map_err(database_error)?;
         // 账户：只按实收减少余额，同时按预授权额去掉占用。实收可高于预授权额，差额把余额扣成负数
         // （透支在结算吸收）；低于预授权额时未花的部分只恢复可用额，不产生退款。
-        let updated = sqlx::query(
+        let balance_row = sqlx::query(
             r#"
             UPDATE ledger.accounts
             SET balance_microusd = balance_microusd - $2,
@@ -4657,17 +4662,19 @@ impl ExecutionRepository for PgHubRepository {
                 version = version + 1,
                 updated_at = now()
             WHERE id = $1
+            RETURNING balance_microusd, held_microusd,
+                      balance_microusd - held_microusd AS available_microusd,
+                      version, updated_at
             "#,
         )
         .bind(account_id.0)
         .bind(charge)
         .bind(hold_amount)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
-        .map_err(database_error)?;
-        if updated.rows_affected() != 1 {
-            return Err(ApplicationError::NotFound(format!("account {account_id}")));
-        }
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+        let balance = balance_change(&balance_row, account_id)?;
         sqlx::query(
             "UPDATE ledger.holds SET status = 'captured', updated_at = now() WHERE id = $1 AND status = 'active'",
         )
@@ -4695,6 +4702,7 @@ impl ExecutionRepository for PgHubRepository {
             attempt_id,
             stage: ExecutionStage::Succeeded,
             charge_microusd,
+            balance: Some(balance),
         })
     }
 
@@ -4729,6 +4737,8 @@ impl ExecutionRepository for PgHubRepository {
                 false,
             ),
         };
+        // 只有确定失败会动账户那一行；只有那时才带回快照给缓存写穿。
+        let mut released_balance: Option<BalanceChange> = None;
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let job = sqlx::query(
             r#"
@@ -4904,23 +4914,25 @@ impl ExecutionRepository for PgHubRepository {
             .await
             .map_err(database_error)?;
             // 确定无需收费：只把占用从占用合计里去掉，不动已结算余额、不写对客流水。
-            let updated = sqlx::query(
+            let balance_row = sqlx::query(
                 r#"
                 UPDATE ledger.accounts
                 SET held_microusd = held_microusd - $2,
                     version = version + 1,
                     updated_at = now()
                 WHERE id = $1
+                RETURNING balance_microusd, held_microusd,
+                          balance_microusd - held_microusd AS available_microusd,
+                          version, updated_at
                 "#,
             )
             .bind(account_id.0)
             .bind(hold_amount)
-            .execute(&mut *transaction)
+            .fetch_optional(&mut *transaction)
             .await
-            .map_err(database_error)?;
-            if updated.rows_affected() != 1 {
-                return Err(ApplicationError::NotFound(format!("account {account_id}")));
-            }
+            .map_err(database_error)?
+            .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+            released_balance = Some(balance_change(&balance_row, account_id)?);
             release_channel_slot(&mut transaction, job_id).await?;
         } else if disposition == FailureDisposition::Unknown {
             // 结果未知：占用与槽位都保留，只建对账案例。理由用平台生成的有界文案，不含渠道原文。
@@ -4951,6 +4963,7 @@ impl ExecutionRepository for PgHubRepository {
             attempt_id,
             stage: target_state.unwrap_or(ExecutionStage::Executing),
             charge_microusd: 0,
+            balance: released_balance,
         })
     }
 
@@ -5676,6 +5689,8 @@ async fn committed_finalization(
         attempt_id,
         stage,
         charge_microusd: to_u64(charge)?,
+        // 确认已提交的收尾：这次没有改账户，没有快照要刷新。
+        balance: None,
     })
 }
 

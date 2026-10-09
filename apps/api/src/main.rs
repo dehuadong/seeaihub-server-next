@@ -307,6 +307,8 @@ async fn main() -> Result<()> {
     // 服务，本进程在，兜底就在。
     if acceleration.is_enabled() {
         tokio::spawn(acceleration.clone().run_reconciler());
+        // 余额写穿的后台一半：请求路径只把快照放进队列，Redis 的读写在这里做，用户不为它等待。
+        tokio::spawn(acceleration.clone().run_balance_writer());
     }
 
     // 上传端点与上传存储的配置：整组上传存储变量都不给＝未配置，进程照常启动；只给一部分或
