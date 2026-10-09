@@ -43,6 +43,8 @@ struct Cell {
     cpu_busy_permille: Option<u64>,
     read_load: usize,
     reads_done: usize,
+    /// 这一档里每张表被访问的次数，摊到每次请求上（降序，只留非零项）。
+    table_accesses: Vec<(String, f64)>,
 }
 
 impl Cell {
@@ -83,6 +85,16 @@ impl Cell {
             failures,
         )
     }
+
+    /// 表访问那一行：`表名×每请求次数`，只列前六张。
+    fn table_access_line(&self) -> String {
+        self.table_accesses
+            .iter()
+            .take(6)
+            .map(|(table, per_request)| format!("{table}x{per_request:.1}"))
+            .collect::<Vec<_>>()
+            .join(" ")
+    }
 }
 
 /// 排序后的样本在 `percentile`（0–1）处的取值：取向上取整那一档。
@@ -115,6 +127,7 @@ async fn measure_cell(
 ) -> Cell {
     let backends_idle = case_backends(&harness.admin_pool, &harness.database_name).await;
     let commits_before = committed(&harness.admin_pool, &harness.database_name).await;
+    let scans_before = table_scans(&harness.pool).await;
     let cpu_before = cpu_snapshot();
 
     let stop = Arc::new(AtomicBool::new(false));
@@ -186,12 +199,16 @@ async fn measure_cell(
             let _ = reader.await;
         }
     }
+    // 表扫描计数按约 1 秒的粒度成批可见：等一拍再读，否则最后一秒的访问会算到下一档头上。
+    tokio::time::sleep(Duration::from_millis(1_200)).await;
+    let after_scans = table_scans(&harness.pool).await;
     let commits = committed(&harness.admin_pool, &harness.database_name).await - commits_before;
     let cpu_busy_permille = cpu_busy_permille(cpu_before, cpu_snapshot());
 
     latencies.sort();
     let count = u32::try_from(latencies.len()).unwrap_or(u32::MAX).max(1);
     let mean = latencies.iter().sum::<Duration>() / count;
+    let table_accesses = table_access_deltas(&scans_before, &after_scans, count);
     Cell {
         delay_ms,
         concurrency,
@@ -210,7 +227,45 @@ async fn measure_cell(
         cpu_busy_permille,
         read_load,
         reads_done: reads_done.load(Ordering::Relaxed),
+        table_accesses,
     }
+}
+
+/// 这个一次性库每张用户表的扫描次数（顺序 + 索引）。
+async fn table_scans(pool: &sqlx::PgPool) -> BTreeMap<String, i64> {
+    let rows: Vec<(String, i64)> = sqlx::query_as(
+        "SELECT relname, seq_scan + idx_scan FROM pg_stat_user_tables ORDER BY relname",
+    )
+    .fetch_all(pool)
+    .await
+    .expect("read the table scan counters");
+    rows.into_iter().collect()
+}
+
+/// 一档里每张表被访问了多少次，摊到**每次请求**上；只留非零项，按次数降序。
+///
+/// 这是「每请求 SQL 条数与分类」能拿到的最近似的一层：`pg_stat_statements` 在本机没加载，语句级
+/// 计数缺席，表级扫描计数是公开可读的替代。
+fn table_access_deltas(
+    before: &BTreeMap<String, i64>,
+    after: &BTreeMap<String, i64>,
+    requests: u32,
+) -> Vec<(String, f64)> {
+    let mut deltas: Vec<(String, f64)> = after
+        .iter()
+        .filter_map(|(table, scans)| {
+            let delta = scans - before.get(table).copied().unwrap_or(0);
+            (delta > 0).then(|| (table.clone(), delta as f64 / f64::from(requests)))
+        })
+        .collect();
+    deltas.sort_by(|left, right| {
+        right
+            .1
+            .partial_cmp(&left.1)
+            .unwrap_or(std::cmp::Ordering::Equal)
+            .then_with(|| left.0.cmp(&right.0))
+    });
+    deltas
 }
 
 /// 非生成流量：`read_load` 路并发反复读目录，直到 `stop` 置位。返回完成次数。
@@ -367,6 +422,7 @@ async fn sweep(
     for &concurrency in concurrencies {
         let cell = measure_cell(&harness, &keys, delay_ms, concurrency, pool, read_load).await;
         println!("{}", cell.summary());
+        println!("  table accesses per request: {}", cell.table_access_line());
     }
     harness.cleanup().await;
 }
