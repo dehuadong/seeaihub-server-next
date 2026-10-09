@@ -39,6 +39,15 @@ cargo test --workspace --all-features
 
 本地全量检查仅用于用户明确要求、排查 CI 失败，或改动确实横跨整个仓库。
 
+本机只编"这次要验的目标"：反馈用 `cargo check -p <crate>`；用例用 `cargo test -p <crate> --lib`，或
+`cargo test -p seeai-api --test http_contract -- --ignored --test-threads=1 <过滤词>`。
+`--workspace --all-targets` 会把每个 crate 的每个测试二进制都编一遍——那是 CI 的事（开发 profile 已去掉
+依赖的调试信息，但 `target/debug` 仍会随每次改动增长）。
+
+`target/` 变大时**不要**顺手 `cargo clean`（它连增量缓存一起清掉，下一次全量重编很慢）：先删
+`target/debug/incremental`（可再生成），或 `cargo clean -p <crate>` 只清一个 crate；要按时间清可装
+`cargo-sweep` 跑 `cargo sweep --time 30`。
+
 真实 Provider 测试必须显式启用并限制调用次数；普通测试不得产生外部费用。
 
 文档、Agent Note 与技能按改动范围在本地检查。已通过且仍适用的检查，不因提交或推送重复运行。只报告实际跑过的命令。

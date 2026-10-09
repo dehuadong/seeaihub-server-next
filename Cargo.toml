@@ -61,3 +61,14 @@ unsafe_code = "forbid"
 dbg_macro = "deny"
 todo = "deny"
 unwrap_used = "deny"
+
+# 开发与测试 profile：**依赖不留调试信息**，自己的 crate 只留"文件:行号"。
+#
+# 为什么：默认 `debug = 2` 把每个依赖的完整调试信息写进 `target/debug`，这类工作区里它是磁盘占用
+# 的主要来源（十几 GB），链接与写盘也随它变慢；`line-tables-only` 足够让 panic 回溯指到自己代码的
+# 行号。要钻进依赖里单步调试时，临时把这两段去掉再编一次即可（会触发一次依赖重编）。
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false

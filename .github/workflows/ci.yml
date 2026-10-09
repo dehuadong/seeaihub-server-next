@@ -42,6 +42,12 @@ jobs:
           --health-retries 30
     steps:
       - uses: actions/checkout@v7
+      # 缓存 Rust 构建产物与 crate 下载：这份工作区全量编译一次很贵（几十个 crate + 一个很大的
+      # 契约测试二进制），命中缓存时把重复编译省掉。push 与 PR 各自一份，key 里带 Cargo.lock 指纹。
+      - uses: Swatinem/rust-cache@v2
+        with:
+          # 契约测试与 e2e 的产物都在 target/debug：默认只缓存部分目录，这里显式带上。
+          cache-targets: true
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
