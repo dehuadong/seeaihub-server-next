@@ -625,6 +625,7 @@ async fn a_request_whose_upstream_cost_is_far_above_the_old_ceiling_is_accepted(
             contract,
             vec![draft],
             Some(2_000),
+            None,
         )
         .await,
         StatusCode::OK,

@@ -383,7 +383,7 @@ async fn sigkill_before_the_submission_declaration_reaps_the_orphan_admission() 
     // 这一格回收时记录里没有原平台错误码（进程死在受理与提交之间，没有任何 Provider 事实），
     // 因此按既有回退口径投影 `502 platform_unavailable`。这不是重发未知请求：上游计数仍是 0。
     let (replica_url, replica) = harness
-        .start_replica(4, KILL_SYNC_WAIT_SECONDS, &ApiProcessSettings::default())
+        .start_replica(KILL_SYNC_WAIT_SECONDS, &ApiProcessSettings::default())
         .await;
     let (status, replay) = post_json(
         &replica_url,
@@ -829,7 +829,7 @@ async fn sigkill_after_the_settlement_commit_replays_as_result_not_retained() {
 
     // 恢复：另一个 API 副本对着同一个库跑，同键重发只投影原记录。
     let (replica_url, replica) = harness
-        .start_replica(4, KILL_SYNC_WAIT_SECONDS, &ApiProcessSettings::default())
+        .start_replica(KILL_SYNC_WAIT_SECONDS, &ApiProcessSettings::default())
         .await;
     let (status, replay) = post_json(
         &replica_url,

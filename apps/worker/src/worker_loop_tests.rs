@@ -341,7 +341,7 @@ impl HubRepository for EmptyQueueRepository {
         &self,
         _gateway_model: &str,
         _enabled: Option<bool>,
-        _max_concurrent_jobs: Option<Option<u32>>,
+        _max_concurrent_jobs: Option<u32>,
         _actor: &str,
     ) -> Result<(), ApplicationError> {
         unimplemented!()

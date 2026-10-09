@@ -254,6 +254,7 @@ impl HubRepository for PgHubRepository {
             gateway_model,
             native_revision,
             model_type,
+            max_concurrent_jobs,
             actor,
             capability_schema,
             documentation_body,
@@ -655,20 +656,75 @@ impl HubRepository for PgHubRepository {
             .await
             .map_err(database_error)?;
         }
-        // 该名字**首次发布成功**时落一行运维开关（`enabled` 默认 true），此后只由 PATCH 改它。
-        // 定义（合同、候选集、定价）不进这张表：那些是修订的内容，存第二份就等于造第二个权威。
-        sqlx::query(
-            r#"
-            INSERT INTO publication.gateway_models (gateway_model, updated_by)
-            VALUES ($1, $2)
-            ON CONFLICT (gateway_model) DO NOTHING
-            "#,
+        // 该名字**首次发布成功**时落一行运维开关（`enabled` 默认 true）与并发名额；此后开关只由
+        // PATCH 改、名额由发布命令或 PATCH 改。定义（合同、候选集、定价）不进这张表：那些是修订的
+        // 内容，存第二份就等于造第二个权威。
+        //
+        // 名额的语义（见 Agent Note「并发名额在上架时给出」）：命令给了就写它；命令没给时**新建**的
+        // 模型按平台固定值 1，**已有**的模型保持现值。先锁行拿到旧值（审计要写改前改后，也用于区分
+        // 新建与已有），再分两条写——用原始绑定参数，不用 `EXCLUDED`（它省略时带的是新行的 1，
+        // 会把已有模型的名额悄悄重置）。SET 不含 `enabled`：重新发布不能把停用的模型悄悄打开。
+        let current_max: Option<Option<i32>> = sqlx::query_scalar(
+            "SELECT max_concurrent_jobs FROM publication.gateway_models \
+             WHERE gateway_model = $1 FOR UPDATE",
         )
         .bind(&gateway_model)
-        .bind(&actor)
-        .execute(&mut *transaction)
+        .fetch_optional(&mut *transaction)
         .await
         .map_err(database_error)?;
+        match current_max {
+            None => {
+                // `ON CONFLICT`：两个并发发布同一个**新**名字时，行不存在时那次 `FOR UPDATE` 不加锁，
+                // 后一个会撞唯一键——旧实现靠 `DO NOTHING` 幂等，这里保持同样的幂等（命令给了值就写它，
+                // 没给就保留对方写下的 1），并且不碰对方的开关与时间戳。
+                sqlx::query(
+                    r#"
+                    INSERT INTO publication.gateway_models
+                        (gateway_model, max_concurrent_jobs, updated_by)
+                    VALUES ($1, COALESCE($2, 1), $3)
+                    ON CONFLICT (gateway_model) DO UPDATE
+                        SET max_concurrent_jobs =
+                            COALESCE($2, publication.gateway_models.max_concurrent_jobs)
+                    "#,
+                )
+                .bind(&gateway_model)
+                .bind(max_concurrent_jobs.map(quota_column_value).transpose()?)
+                .bind(&actor)
+                .execute(&mut *transaction)
+                .await
+                .map_err(database_error)?;
+            }
+            Some(current) => {
+                // 命令没给名额就什么都不写（时间戳也不动）。
+                if let Some(value) = max_concurrent_jobs {
+                    let value = quota_column_value(value)?;
+                    if Some(value) != current {
+                        sqlx::query(
+                            r#"
+                            UPDATE publication.gateway_models
+                            SET max_concurrent_jobs = $2, updated_at = now(), updated_by = $3
+                            WHERE gateway_model = $1
+                            "#,
+                        )
+                        .bind(&gateway_model)
+                        .bind(value)
+                        .bind(&actor)
+                        .execute(&mut *transaction)
+                        .await
+                        .map_err(database_error)?;
+                        insert_audit(
+                            &mut transaction,
+                            &actor,
+                            "gateway_model.set_max_concurrent_jobs",
+                            "gateway_model",
+                            &gateway_model,
+                            &serde_json::json!({"before": current, "after": value}),
+                        )
+                        .await?;
+                    }
+                }
+            }
+        }
         // 模型使用文档与合同、候选在同一个事务里原子生效：正文已由 Application 渲染好，这里只落库。
         // 一个 Runtime Revision 一条文档，正文不可变（Spec 0008 §4）。
         sqlx::query(
@@ -765,8 +821,9 @@ impl HubRepository for PgHubRepository {
         for row in &rows {
             // 名额是**模型级**的：同一模型的所有候选读出来都是同一个值，取第一行即可。
             if max_concurrent_jobs.is_none() {
-                max_concurrent_jobs =
-                    quota_from_column(row.try_get("max_concurrent_jobs").map_err(database_error)?)?;
+                max_concurrent_jobs = Some(quota_from_column(
+                    row.try_get("max_concurrent_jobs").map_err(database_error)?,
+                )?);
             }
             candidates.push(row_to_candidate(row)?);
         }
@@ -1424,7 +1481,7 @@ impl HubRepository for PgHubRepository {
         &self,
         gateway_model: &str,
         enabled: Option<bool>,
-        max_concurrent_jobs: Option<Option<u32>>,
+        max_concurrent_jobs: Option<u32>,
         actor: &str,
     ) -> Result<(), ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
@@ -1456,10 +1513,10 @@ impl HubRepository for PgHubRepository {
         // 只改这两列：运维开关与并发名额。定义（合同、候选集）不在这里，改了它等于绕过发布——
         // 那会让"Job 固定受理时版本"失去依据。名额与开关同类：运行状态，不是定义。
         let next_enabled = enabled.unwrap_or(current_enabled);
+        // 给了就设成它（列必填，不再有"清成缺省"）；省略＝这次不改。
         let next_max = match max_concurrent_jobs {
             None => current_max,
-            Some(None) => None,
-            Some(Some(value)) => Some(quota_column_value(value)?),
+            Some(value) => Some(quota_column_value(value)?),
         };
         sqlx::query(
             r#"
@@ -3838,7 +3895,7 @@ impl ExecutionRepository for PgHubRepository {
         .ok_or(ApplicationError::InsufficientBalance)?;
         // 并发名额按「账户 × 这个网关模型」数：admitted/executing 计入，对账态不是占用名额的在飞执行，
         // 不计。不同模型互不占名额。账户行已被上面那条 UPDATE 锁住，同账户的并发受理在这里排队，
-        // 计数因此不会漏掉在飞的。名额由调用方解析后传入（模型的值或部署缺省），这里不兜缺省。
+        // 计数因此不会漏掉在飞的。名额由调用方从模型行读出来传入，这里不兜缺省。
         let in_flight: i64 = sqlx::query_scalar(
             r#"
             SELECT count(*) FROM generation.jobs
@@ -6221,18 +6278,14 @@ async fn insert_platform_cost(
     .await
 }
 
-/// 读列里的并发名额：`NULL`＝未设（用部署缺省）。列的 `CHECK` 与接口层校验保证它落在范围内；
-/// 真读到范围外的值就报错，**不静默放大**成一个巨大的名额。
-fn quota_from_column(value: Option<i32>) -> Result<Option<u32>, ApplicationError> {
-    value
-        .map(|value| {
-            u32::try_from(value).map_err(|_| {
-                ApplicationError::Persistence(format!(
-                    "max_concurrent_jobs {value} in the database does not fit a u32"
-                ))
-            })
-        })
-        .transpose()
+/// 读列里的并发名额。列是必填的，`CHECK` 与接口层校验保证它落在范围内；真读到范围外的值就报错，
+/// **不静默放大**成一个巨大的名额。
+fn quota_from_column(value: i32) -> Result<u32, ApplicationError> {
+    u32::try_from(value).map_err(|_| {
+        ApplicationError::Persistence(format!(
+            "max_concurrent_jobs {value} in the database does not fit a u32"
+        ))
+    })
 }
 
 /// 名额落列（`integer`）：范围校验在接口层（对客 400），这里只做最后一道不静默的转换。

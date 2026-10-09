@@ -545,7 +545,7 @@ async fn gateway_model_naming_migration_backfills_existing_publications() {
     .expect("legacy document material");
 
     // 5) 迁移后立刻可读、可停用：走管理端接口（不起 Worker，也不连上游）。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 1).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     // 启动补齐：既有模型不需要重新发布就拿到当前文档，目录里每条都有可读地址。
@@ -1941,13 +1941,14 @@ async fn the_model_type_migration_backfills_existing_vendor_models() {
     drop_isolated_database(&database_name).await;
 }
 
-/// **升级不改变各模型的生效名额**（工作项 #94）。
+/// **并发名额改成必填，切换可以没有降流窗口**（工作项 #99）。
 ///
-/// 名额列可空、没有回填：已经上架过的模型升上来是"未设"，生效值仍是部署缺省——与升级前那个
-/// 部署级上限是同一个数，所以升级不会静默改容。下限是库层的最后一道：0 与负数落不进去。
+/// 造两条存量行：一条已经用 `PATCH` 把现值**钉住**（升级前的推荐顺序），一条是 `NULL`（没钉）。
+/// 升级后：被钉的保持它、没钉的按平台固定值 1、列变 `NOT NULL`；列注释不再写"`NULL`＝用部署缺省"；
+/// 库层 `CHECK` 仍拒 0 与负数。
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
-async fn the_model_quota_migration_leaves_existing_models_unset() {
+async fn the_quota_required_migration_backfills_one_and_keeps_pinned_values() {
     let (database_url, database_name) = isolated_database_url().await;
     let pool = PgPool::connect(&database_url)
         .await
@@ -1955,7 +1956,7 @@ async fn the_model_quota_migration_leaves_existing_models_unset() {
     let migrations = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("../../migrations");
 
     // 1) 只应用这次改动之前的迁移。
-    let staged = stage_migrations(&migrations, "0048", "model-quota");
+    let staged = stage_migrations(&migrations, "0049", "quota-required");
     sqlx::migrate::Migrator::new(staged)
         .await
         .expect("early migrator")
@@ -1963,13 +1964,16 @@ async fn the_model_quota_migration_leaves_existing_models_unset() {
         .await
         .expect("early migrations apply");
 
-    // 2) 旧数据：一个已经上架过的网关模型（这张表没有别的外键，一行就够）。
-    sqlx::query("INSERT INTO publication.gateway_models (gateway_model) VALUES ('legacy-model')")
-        .execute(&pool)
-        .await
-        .expect("legacy gateway model");
+    // 2) 旧数据：一条已钉住现值、一条还是 NULL（那时表示"用部署缺省"）。
+    sqlx::query(
+        "INSERT INTO publication.gateway_models (gateway_model, max_concurrent_jobs)
+         VALUES ('legacy-pinned', 5), ('legacy-unset', NULL)",
+    )
+    .execute(&pool)
+    .await
+    .expect("legacy gateway models");
 
-    // 3) 补上整批迁移（含 0048）。
+    // 3) 补上整批迁移（含 0049）。
     sqlx::migrate::Migrator::new(migrations)
         .await
         .expect("full migrator")
@@ -1977,25 +1981,54 @@ async fn the_model_quota_migration_leaves_existing_models_unset() {
         .await
         .expect("the full set applies on a database that already has rows");
 
-    // 4) 存量行还在、开关没变、名额是"未设"。
-    let row: (bool, Option<i32>) = sqlx::query_as(
-        "SELECT enabled, max_concurrent_jobs FROM publication.gateway_models
-         WHERE gateway_model = 'legacy-model'",
+    // 4) 被钉住的保持 5；没钉的按平台固定值 1。
+    let pinned: i32 = sqlx::query_scalar(
+        "SELECT max_concurrent_jobs FROM publication.gateway_models
+         WHERE gateway_model = 'legacy-pinned'",
     )
     .fetch_one(&pool)
     .await
-    .expect("the legacy row survives");
-    assert!(row.0, "迁移不该改掉运维开关");
-    assert_eq!(
-        row.1, None,
-        "存量模型是未设名额（生效值仍是部署缺省），不是被回填成 1"
+    .expect("the pinned row survives");
+    assert_eq!(pinned, 5, "升级前钉住的现值必须保持");
+    let unset: i32 = sqlx::query_scalar(
+        "SELECT max_concurrent_jobs FROM publication.gateway_models
+         WHERE gateway_model = 'legacy-unset'",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the unset row survives");
+    assert_eq!(unset, 1, "没钉住的按平台固定值 1");
+
+    // 5) 列变必填：再插 NULL 必须被拒。
+    let null_rejected = sqlx::query(
+        "INSERT INTO publication.gateway_models (gateway_model, max_concurrent_jobs)
+         VALUES ('legacy-null-again', NULL)",
+    )
+    .execute(&pool)
+    .await;
+    assert!(null_rejected.is_err(), "列已是 NOT NULL，NULL 必须被拒");
+
+    // 6) 列注释不再写"NULL＝用部署缺省"。
+    let comment: Option<String> = sqlx::query_scalar(
+        "SELECT col_description('publication.gateway_models'::regclass,
+                                 (SELECT attnum FROM pg_attribute
+                                   WHERE attrelid = 'publication.gateway_models'::regclass
+                                     AND attname = 'max_concurrent_jobs'))",
+    )
+    .fetch_one(&pool)
+    .await
+    .expect("the column comment");
+    let comment = comment.unwrap_or_default();
+    assert!(
+        !comment.contains("NULL"),
+        "列注释要说清必填，不能再写 NULL＝用部署缺省：{comment}"
     );
 
-    // 5) 库层是最后一道：0 与负数落不进这一列。
+    // 7) 库层是最后一道：0 与负数落不进这一列。
     for value in [0, -1] {
         let rejected = sqlx::query(
             "UPDATE publication.gateway_models SET max_concurrent_jobs = $1
-             WHERE gateway_model = 'legacy-model'",
+             WHERE gateway_model = 'legacy-pinned'",
         )
         .bind(value)
         .execute(&pool)

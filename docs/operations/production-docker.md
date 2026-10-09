@@ -181,7 +181,7 @@ sudo env SEEAI_TAG=<tag> docker compose -f deploy/compose.prod.yaml up -d
 - API 容器内 `API_BIND=0.0.0.0:8081`（端口映射要求），宿主只发布到 `127.0.0.1:8081`，外部由 nginx 进；
 - worker 每个实例的 `WORKER_ID` 必须唯一（租约按它归属）。`--scale` 会让所有副本共用同一份 `worker.env`，要跑多个 worker 就复制成不同的 service，或各给一份 env 文件；
 - `stop_grace_period: 720s`：API 对齐 `GENERATION_SYNC_WAIT_SECONDS`、worker 对齐 `PROVIDER_TIMEOUT_SECONDS`（各以部署配置为准）；进程处理 SIGTERM，容器默认也发 SIGTERM（[部署总览 §6](deployment.md#6-探活与优雅停机)）；
-- 多个副本同时冷启动会争迁移锁，只表现为其中一个启动稍慢（[部署总览 §3.3](deployment.md#33-数据库用户要有-ddl-权限且迁移会自动跑)）。
+- 多个副本同时冷启动会争迁移锁，只表现为其中一个启动稍慢（[部署总览 §3.3](deployment.md#33-数据库用户要有-ddl-权限且迁移会自动跑)）。**例外**：迁移 `0049` 会把没有名额的模型回填成 1 并当场对所有副本生效，要保留更大并发就先在升级前逐个模型钉值（同 §3.3）。
 
 ```sh
 sudo docker compose -f deploy/compose.prod.yaml ps

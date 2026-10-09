@@ -8,7 +8,7 @@ use super::*;
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn health_reports_ok_when_the_database_is_reachable() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -33,7 +33,7 @@ async fn health_reports_ok_when_the_database_is_reachable() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn health_reports_unhealthy_once_the_database_is_gone() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -74,7 +74,7 @@ async fn health_reports_unhealthy_once_the_database_is_gone() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn public_surface_has_no_async_task_protocol() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 

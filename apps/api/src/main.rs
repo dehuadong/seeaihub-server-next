@@ -163,9 +163,6 @@ struct AppState {
     auth_source_header: Option<header::HeaderName>,
     /// 平台对客基址（`SEE_BASEURL`）：公共使用文档的链接按它写成绝对地址。
     see_base_url: String,
-    /// 并发名额的部署缺省（`GENERATION_MAX_CONCURRENT_JOBS`）：管理端读面要回显它，
-    /// 运营才看得出"模型没设名额时实际生效多少"。
-    max_concurrent_jobs_default: u64,
 }
 
 impl AppState {
@@ -319,9 +316,6 @@ async fn main() -> Result<()> {
     // 形状不合法＝拒绝启动并点名变量。对象存储只有阿里云 OSS 一种，不读数据库、不做活体探测。
     let upload_config = ImageUploadConfig::from_env().map_err(anyhow::Error::from)?;
 
-    // 并发名额的部署缺省：既进执行侧（模型没设名额时用它），也进管理端读面。
-    let max_concurrent_jobs_default = generation_max_concurrent_jobs()?;
-
     // 图片生成只有这一条执行路径：本进程直接调 Provider，不建生成 Job、不轮询结果。指纹密钥与
     // 渠道凭证在这里无条件读取，缺任何一项都拒绝启动——不存在"关掉它就走旧路径"的开关。
     let direct_execution = {
@@ -339,7 +333,6 @@ async fn main() -> Result<()> {
             keys,
             timeouts,
             DirectExecutionLimits {
-                default_max_concurrent_jobs: max_concurrent_jobs_default,
                 max_channel_in_flight: generation_max_channel_in_flight()?,
                 default_hold_microusd: generation_max_cost_microusd()?,
             },
@@ -510,7 +503,6 @@ async fn main() -> Result<()> {
     let ledger_audit = Arc::new(ledger_audit);
     let state = AppState {
         admin_token,
-        max_concurrent_jobs_default,
         identity: IdentityService::new(repository_port.clone())
             .with_rate_limit(acceleration.clone(), generation_rate_limit()?)
             .with_auth_attempt_limits(AuthAttemptLimits::from_env()?),
@@ -2460,6 +2452,16 @@ async fn publish_runtime(
     State(state): State<AppState>,
     Json(mut command): Json<PublishRuntimeCommand>,
 ) -> Result<Json<seeai_domain::PublishedRevision>, ApiError> {
+    // 并发名额落的是 `integer` 列：在这里就把 0 与超出列宽的值拒成 400 并点名，
+    // 否则会落到库层 `CHECK`／落列转换上变成 500（`PATCH` 那条同一套判据）。
+    if let Some(value) = command.max_concurrent_jobs
+        && !(1..=i32::MAX as u32).contains(&value)
+    {
+        return Err(ApiError::bad_request(
+            "invalid_parameter",
+            "max_concurrent_jobs must be a positive integer that fits the column (omit it to use the platform default of 1 for a new model, or to keep an existing model's value)",
+        ));
+    }
     command.actor = "admin-api".to_owned();
     resolve_inline_documentation(&mut command)?;
     Ok(Json(state.runtime.publish(command).await?))
@@ -2873,8 +2875,6 @@ fn markdown_response(body: String) -> axum::response::Response {
 #[derive(Debug, Serialize)]
 struct GatewayModelsResponse {
     gateway_models: Vec<GatewayModelView>,
-    /// 模型没设并发名额时生效的部署缺省；运营要看得见"留空实际是多少"。
-    max_concurrent_jobs_default: u64,
 }
 
 /// 管理员读：当前有生效定义的网关模型，一条一项，带候选清单与运维开关。
@@ -2887,24 +2887,23 @@ async fn list_gateway_models(
 ) -> Result<Json<GatewayModelsResponse>, ApiError> {
     Ok(Json(GatewayModelsResponse {
         gateway_models: state.runtime.gateway_models().await?,
-        max_concurrent_jobs_default: state.max_concurrent_jobs_default,
     }))
 }
 
-/// 运维开关与并发名额的请求体：**可变位只有这两个**。
+/// 运维开关与并发名额的请求体：**可变位只有这两个**（名额还有发布命令那个写入方）。
 ///
 /// `deny_unknown_fields`：把"想顺手改候选/改合同"的请求直接拒掉，而不是静默忽略——
 /// 忽略会让调用方以为改成功了，而定义只能由发布产生。
 ///
 /// 两个字段都可省略（省略＝这次不改），便于只改一项；但**都省略就是 400**：没有要改的东西。
-/// `enabled` 要布尔、`max_concurrent_jobs` 要正整数或 `null`——`null` 表示清成"用部署缺省"。
+/// `enabled` 要布尔；`max_concurrent_jobs` 给了就必须是正整数（列必填，`null` 与 0、负数一样被拒）。
 #[derive(Debug, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SetGatewayModelSettingsBody {
     /// 省略＝这次不改；给布尔＝设成它；给 `null` 拒（开关不是一个能被"清空"的值）。
     #[serde(default, deserialize_with = "deserialize_optional_field")]
     enabled: Option<Option<bool>>,
-    /// 省略＝这次不改；给正整数＝设成它；给 `null`＝清成"用部署缺省"。
+    /// 省略＝这次不改；给正整数＝设成它；`null` 与 0、负数、超上界一样被拒（列必填）。
     ///
     /// 用 `i64` 接住 0 与负数：交给 `u32` 解出来的 422 只说"类型不符"，看不出是哪个字段的问题。
     #[serde(default, deserialize_with = "deserialize_optional_field")]
@@ -2914,8 +2913,8 @@ struct SetGatewayModelSettingsBody {
 /// 管理员写：改一个网关模型的运维开关与并发名额（可只改一项）。
 ///
 /// 关闭的语义：该名字从对客目录消失、受理得到"模型不存在"；**已受理的 Job 不受影响**
-/// （它们固定的是受理时那一版）。名额的语义：`null` 清成"用部署缺省"，给 1 到列宽上限之间的
-/// 正整数就设成它；0、负数与超范围的值都在这里拒成 400 并点名该字段（不落到库层的 `CHECK`）。
+/// （它们固定的是受理时那一版）。名额的语义：省略＝不改，给 1 到列宽上限之间的正整数就设成它；
+/// `null`、0、负数与超范围的值都在这里拒成 400 并点名该字段（不落到库层的 `CHECK`）。
 /// 没有发布过的名字是 404——这里不创建任何东西。
 async fn set_gateway_model_settings(
     State(state): State<AppState>,
@@ -2932,16 +2931,23 @@ async fn set_gateway_model_settings(
             ));
         }
     };
+    // 名额：省略＝这次不改（启停按钮只发 `{enabled}`，这条必须成立）；给了就必须是正整数。
+    // 列是必填的，所以 `null` 不再是"清成缺省"，而是参数错误。
     let max_concurrent_jobs = match body.max_concurrent_jobs {
         None => None,
-        Some(None) => Some(None),
+        Some(None) => {
+            return Err(ApiError::bad_request(
+                "invalid_parameter",
+                "max_concurrent_jobs must be a positive integer, not null (it is required for every model)",
+            ));
+        }
         Some(Some(value)) => match u32::try_from(value) {
             // 落的是 `integer` 列：超出它的正整数也在这里拒，别到库层变成 500。
-            Ok(value) if (1..=i32::MAX as u32).contains(&value) => Some(Some(value)),
+            Ok(value) if (1..=i32::MAX as u32).contains(&value) => Some(value),
             _ => {
                 return Err(ApiError::bad_request(
                     "invalid_parameter",
-                    "max_concurrent_jobs must be a positive integer (omit it to keep the current value, send null to use the deployment default)",
+                    "max_concurrent_jobs must be a positive integer (omit it to keep the current value)",
                 ));
             }
         },
@@ -4135,20 +4141,6 @@ fn generation_max_cost_microusd() -> Result<u64> {
             .parse::<u64>()
             .context("GENERATION_MAX_COST_MICROUSD must be an integer"),
         _ => Ok(20_000),
-    }
-}
-
-/// 并发名额的**部署缺省**（默认 1）：每个账户在每个网关模型上同时在跑的生成任务上限。
-///
-/// 名额本身挂在模型上（`publication.gateway_models.max_concurrent_jobs`，运营在模型页设置）；
-/// 模型没设时用这里的数。变量名保留历史命名。
-fn generation_max_concurrent_jobs() -> Result<u64> {
-    match env::var("GENERATION_MAX_CONCURRENT_JOBS") {
-        Ok(value) if !value.trim().is_empty() => value
-            .trim()
-            .parse::<u64>()
-            .context("GENERATION_MAX_CONCURRENT_JOBS must be an integer"),
-        _ => Ok(1),
     }
 }
 

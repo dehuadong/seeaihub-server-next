@@ -223,7 +223,7 @@ async fn the_auth_waiting_period_rejects_correct_credentials_then_recovers() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn without_a_cache_the_auth_attempt_limit_does_not_apply() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 

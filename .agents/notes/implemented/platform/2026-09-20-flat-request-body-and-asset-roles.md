@@ -67,8 +67,9 @@ verification: 2026-09-20 本地：`cargo fmt --check`、`cargo clippy --workspac
   `generation.jobs` 与 `publication.runtime_entries` 的 `native_model_id` 改成 `gateway_model`
   （两者当时同值，改名只写清角色，不改取值）。
 - **同一账户在**同一个网关模型**上的在飞任务数上限**：名额由运营按模型设置
-  （`publication.gateway_models.max_concurrent_jobs`），模型没设时用部署缺省
-  `GENERATION_MAX_CONCURRENT_JOBS`（默认 1）。受理时在同一事务里数一次该账户在该模型上
+  （`publication.gateway_models.max_concurrent_jobs`，**必填**），由运营在发布或编辑时给；
+  发布命令没给时新建的模型按平台固定值 1（进程配置不再是名额来源，见
+  [并发名额在上架时给出](./2026-10-08-quota-set-at-publish.md)）。受理时在同一事务里数一次该账户在该模型上
   `admitted`/`executing` 的 Job，到名额回 `429 too_many_in_flight`
   （`ApplicationError::TooManyInFlight`）。额度按**账户 × 模型**算，不是按端点——用户 2026-09-20
   的裁定是"针对端点先设计成 1 个并发数"；2026-10-08 用户指出"一个图片任务挡住同一账户的视频

@@ -289,6 +289,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
             contract.clone(),
             vec![first.clone(), second.clone()],
             Some(2_000),
+            None,
         )
         .await,
         StatusCode::OK,
@@ -353,6 +354,7 @@ async fn the_charge_follows_the_hit_candidate_and_ignores_the_reference_cost() {
             vec![first, repriced],
             // 命中的那条按上游声明的金额加价，倍率是它的对客价来源。
             Some(2_000),
+            None,
         )
         .await,
         StatusCode::OK

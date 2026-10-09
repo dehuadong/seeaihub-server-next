@@ -60,8 +60,8 @@ export class AdminClient {
     return this.send(`/api/v1/gateway-models/${encodeURIComponent(gatewayModel)}`, 'PATCH', { enabled });
   }
 
-  /// 只改并发名额：`null`＝清成"用部署缺省"。
-  setGatewayModelConcurrency(gatewayModel: string, maxConcurrentJobs: number | null): Promise<void> {
+  /// 只改并发名额（必填的正整数）。
+  setGatewayModelConcurrency(gatewayModel: string, maxConcurrentJobs: number): Promise<void> {
     return this.send(`/api/v1/gateway-models/${encodeURIComponent(gatewayModel)}`, 'PATCH', {
       max_concurrent_jobs: maxConcurrentJobs,
     });

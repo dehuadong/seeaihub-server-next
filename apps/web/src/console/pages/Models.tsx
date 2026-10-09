@@ -75,17 +75,13 @@ export function ModelsPage({
     }
   }
 
-  /// 保存并发名额：留空＝清成"用部署缺省"（发 `null`，不是 0）。
-  async function saveQuota(model: GatewayModel, value: number | null | undefined) {
+  /// 保存并发名额：必填的正整数（列是 NOT NULL，没有"清成缺省"这一态）。
+  async function saveQuota(model: GatewayModel, value: number) {
     setQuotaBusy(model.gateway_model);
     setFailure(null);
     try {
-      await client.setGatewayModelConcurrency(model.gateway_model, value ?? null);
-      message.success(
-        value === null || value === undefined
-          ? '已改回"用部署缺省"'
-          : `并发名额已设为 ${value}`,
-      );
+      await client.setGatewayModelConcurrency(model.gateway_model, value);
+      message.success(`并发名额已设为 ${value}`);
       models.reload();
     } catch (error) {
       setFailure(error instanceof Error ? error.message : String(error));
@@ -95,14 +91,8 @@ export function ModelsPage({
   }
 
   const list = models.data?.gateway_models ?? [];
-  /// 部署缺省由 API 顶层给（缺省值只有服务端知道）；数据没到时只说"用部署缺省"，不编一个数。
-  const defaultQuota = models.data?.max_concurrent_jobs_default;
-  const quotaText = (value: number | null) =>
-    value !== null
-      ? `${value}（每账户）`
-      : defaultQuota === undefined
-        ? '用部署缺省'
-        : `用部署缺省（${defaultQuota}）`;
+  /// 名额是必填的具体数字：没有"用部署缺省"这一层，也不在客户端编一个数。
+  const quotaText = (value: number) => `${value}（每账户）`;
 
   return (
     <ConsolePage
@@ -212,21 +202,21 @@ export function ModelsPage({
             <Form
               layout="inline"
               style={{ marginTop: 12 }}
-              key={`${model.gateway_model}:${model.max_concurrent_jobs ?? 'default'}`}
-              initialValues={{ max_concurrent_jobs: model.max_concurrent_jobs ?? undefined }}
-              onFinish={(values: { max_concurrent_jobs?: number | null }) =>
+              key={`${model.gateway_model}:${model.max_concurrent_jobs}`}
+              initialValues={{ max_concurrent_jobs: model.max_concurrent_jobs }}
+              onFinish={(values: { max_concurrent_jobs: number }) =>
                 saveQuota(model, values.max_concurrent_jobs)
               }
             >
               <Form.Item
                 name="max_concurrent_jobs"
                 label="并发名额"
-                tooltip="每个账户在这个模型上同时在跑的上限；留空＝用部署缺省"
+                tooltip="每个账户在这个模型上同时在跑的上限（必填）；一次一任务填 1"
                 rules={[
                   {
                     // 不在控件层夹住非法值（`min` 会把 0 悄悄压成 1）：点保存时点名拒掉。
                     validator: (_rule, value: number | null | undefined) =>
-                      value === undefined || value === null || value >= 1
+                      value !== undefined && value !== null && value >= 1
                         ? Promise.resolve()
                         : Promise.reject(new Error('并发名额至少 1')),
                   },
@@ -236,7 +226,7 @@ export function ModelsPage({
                   data-testid={`models-quota-input-${model.gateway_model}`}
                   precision={0}
                   style={{ width: 120 }}
-                  placeholder={quotaText(null)}
+                  placeholder="1"
                 />
               </Form.Item>
               <Form.Item>

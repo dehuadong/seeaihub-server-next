@@ -12,7 +12,7 @@ use super::*;
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_publication_may_omit_the_channel_and_inherit_it_from_the_current_revision() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -122,7 +122,7 @@ async fn a_publication_may_omit_the_channel_and_inherit_it_from_the_current_revi
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_published_revision_keeps_its_offering_definition_when_the_channel_changes() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -218,7 +218,7 @@ async fn a_published_revision_keeps_its_offering_definition_when_the_channel_cha
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_referenced_publication_freezes_the_offering_row_it_points_at() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -406,7 +406,7 @@ async fn a_referenced_publication_freezes_the_offering_row_it_points_at() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_referenced_publication_derives_the_cost_basis_from_the_channel_formula() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -495,7 +495,7 @@ async fn a_referenced_publication_derives_the_cost_basis_from_the_channel_formul
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_referenced_publication_carries_the_channel_floor_table() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -605,7 +605,7 @@ async fn a_referenced_publication_carries_the_channel_floor_table() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn an_incremental_publication_without_a_matching_previous_offering_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -658,7 +658,7 @@ async fn an_incremental_publication_without_a_matching_previous_offering_is_reje
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn concurrent_publications_of_one_gateway_model_leave_a_single_active_revision() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 1).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -737,7 +737,7 @@ async fn concurrent_publications_of_one_gateway_model_leave_a_single_active_revi
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_carriers() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -933,7 +933,7 @@ async fn stage_two_bootstrap_material_publishes_one_contract_with_per_candidate_
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn carrier_field_outside_the_contract_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -1007,7 +1007,7 @@ async fn carrier_field_outside_the_contract_is_rejected() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn combination_constraints_naming_undeclared_fields_are_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -1099,7 +1099,7 @@ async fn combination_constraints_naming_undeclared_fields_are_rejected() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn carrier_field_the_driver_cannot_write_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -1148,7 +1148,7 @@ async fn carrier_field_the_driver_cannot_write_is_rejected() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idempotent() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -1240,7 +1240,7 @@ async fn contract_rows_are_immutable_and_republishing_the_same_revision_is_idemp
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn defaults_the_carrier_cannot_carry_are_rejected_at_publication() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 1).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -1330,7 +1330,7 @@ async fn defaults_the_carrier_cannot_carry_are_rejected_at_publication() {
 async fn the_model_catalog_lists_only_callable_models_with_their_published_contract() {
     let (database_url, database_name) = isolated_database_url().await;
     // 同步入口在这个用例里只用来验"停用之后真的调不了"；那一步在受理前就失败，不会等超时。
-    let (base_url, admin_token, _process) = start_api(&database_url, 1, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 1).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -1553,7 +1553,7 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
     )
     .await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 60).await;
     wait_until_ready(&client, &base_url, &admin_token).await;
     // 素材带保底表，受理闸门是"余额 ≥ 保底额"：账户要付得起它，才看得到发布与受理本身的行为。
     let account = create_account_with_credit(&client, &base_url, &admin_token, 1_000_000).await;
@@ -1674,11 +1674,10 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
         .expect("the admin model list is an object");
     assert_eq!(
         top.len(),
-        2,
-        "管理端清单的顶层字段只有模型数组与并发名额的部署缺省：{admin}"
+        1,
+        "管理端清单只有一个顶层字段（名额没有部署缺省这一层）：{admin}"
     );
     assert!(top.contains_key("gateway_models"), "{admin}");
-    assert!(top.contains_key("max_concurrent_jobs_default"), "{admin}");
     let listed = admin["gateway_models"]
         .as_array()
         .expect("gateway_models is an array");
@@ -1686,11 +1685,12 @@ async fn gateway_model_naming_keeps_the_vendor_name_off_the_consumer_surface() {
     let view = &listed[0];
     assert_eq!(view["gateway_model"], GATEWAY);
     assert_eq!(view["enabled"], true);
-    // 存量模型没有单独设名额：回 `null`，生效值由顶层那个部署缺省给。
-    assert_eq!(
-        view["max_concurrent_jobs"],
-        Value::Null,
-        "没设名额的模型回 null：{admin}"
+    // 名额是必填的具体数字：没有"未设"这一态。
+    assert!(
+        view["max_concurrent_jobs"]
+            .as_u64()
+            .is_some_and(|value| value >= 1),
+        "每个模型都有名额数字：{admin}"
     );
     assert_eq!(view["vendor_id"], "OpenAI");
     assert_eq!(view["native_model_id"], NATIVE, "厂商原生名只在管理端出现");
@@ -1896,7 +1896,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
         UpstreamBehaviour::aihubmix(SyncImageShape::Url),
     )
     .await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 60, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 60).await;
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
     let api_key = issue_key(&client, &base_url, &admin_token, &account).await;
@@ -2094,7 +2094,7 @@ async fn legacy_material_without_a_gateway_name_falls_back_to_the_vendor_name() 
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn publication_without_the_offering_array_is_rejected() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -2251,7 +2251,7 @@ async fn the_rate_effective_at_acceptance_is_frozen_and_a_missing_rate_blocks_pu
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn publication_requires_a_pricing_formula_that_matches_its_parameters() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -2825,7 +2825,7 @@ async fn the_supply_switches_take_only_enabled_and_need_admin_credentials() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_reference_to_an_offering_outside_the_supply_table_is_rejected_by_name() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -2870,7 +2870,7 @@ async fn a_reference_to_an_offering_outside_the_supply_table_is_rejected_by_name
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_reference_to_a_disabled_offering_is_rejected_by_name() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -2992,7 +2992,7 @@ async fn a_reference_to_a_disabled_offering_is_rejected_by_name() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_selectable_offering_list_carries_the_selection_key_without_deployment_facts() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)
@@ -3311,7 +3311,7 @@ async fn a_token_priced_form_requires_a_channel_that_provides_token_usage() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_offering_list_reports_the_channel_capabilities() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 

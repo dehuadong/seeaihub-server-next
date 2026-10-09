@@ -12,7 +12,7 @@ use serde_json::json;
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn every_admin_endpoint_requires_credentials() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -130,7 +130,7 @@ fn credential_variants() -> Vec<(&'static str, Option<(String, String)>)> {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -305,7 +305,7 @@ async fn accounts_can_be_found_by_email_or_tag_without_knowing_the_identifier() 
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn account_and_customer_details_are_readable_by_identifier() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 

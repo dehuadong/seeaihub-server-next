@@ -50,8 +50,6 @@ Object.assign(env, {
   DATABASE_URL: process.env.SEEAI_E2E_DATABASE ?? 'postgres://seeai:seeai@127.0.0.1:5432/seeai_e2e',
   API_BIND: process.env.SEEAI_E2E_API_BIND ?? '0.0.0.0:8090',
   ADMIN_TOKEN: process.env.SEEAI_E2E_ADMIN_TOKEN ?? 'e2e-shared-token',
-  // 并发名额的部署缺省：用例断言"用部署缺省（1）"，所以要钉住它，不能由宿主 shell 决定。
-  GENERATION_MAX_CONCURRENT_JOBS: process.env.SEEAI_E2E_MAX_CONCURRENT_JOBS ?? '1',
   // 平台对客基址：模型说明与公共文档的链接按它写成绝对地址（生产必配，缺了起不来）。
   SEE_BASEURL: process.env.SEEAI_E2E_BASE_URL ?? 'http://app.localhost:8090',
   ADMIN_EMAIL: process.env.SEEAI_E2E_ADMIN_EMAIL ?? 'ops@example.com',

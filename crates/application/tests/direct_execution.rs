@@ -381,6 +381,7 @@ async fn publish(repository: &Arc<PgHubRepository>, factory: Arc<dyn AdapterFact
     );
     runtime
         .publish(PublishRuntimeCommand {
+            max_concurrent_jobs: None,
             vendor_id: Some("fake-vendor".to_owned()),
             native_model_id: Some("gw".to_owned()),
             gateway_model: Some("gw".to_owned()),
@@ -755,7 +756,6 @@ fn build_service(
         keys,
         test_timeouts(),
         DirectExecutionLimits {
-            default_max_concurrent_jobs: 8,
             max_channel_in_flight: 8,
             default_hold_microusd: 1_000,
         },

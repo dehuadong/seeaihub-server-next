@@ -11,7 +11,7 @@ async fn multiple_active_offerings_route_by_priority() {
     let (database_url, database_name) = isolated_database_url().await;
     // 候选的入口是 `127.0.0.1:1`（连不上）：请求"受理得下来、执行必然失败"，正好只看选路；
     // 窗口给足，别让总期限抢在重投之前把请求收成 504。
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -229,7 +229,7 @@ async fn multiple_active_offerings_route_by_priority() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn routing_weight_splits_within_a_tier_and_is_replayable() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let pool = PgPool::connect(&database_url)

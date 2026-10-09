@@ -10,7 +10,7 @@ async fn a_field_a_carrier_cannot_carry_skips_it_and_fails_platform_side_when_no
     let (database_url, database_name) = isolated_database_url().await;
     // 候选的入口是 `127.0.0.1:1`（连不上），所以这些请求"受理得下来、执行必然失败"——
     // 正好用来只看受理与选路；同步窗口给足，别让总期限抢在重投之前把请求收成 504。
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -338,7 +338,7 @@ async fn a_size_combination_the_profile_lacks_makes_the_candidate_ineligible() {
     let (database_url, database_name) = isolated_database_url().await;
     // 候选的入口是 `127.0.0.1:1`（连不上），所以这些请求"受理得下来、执行必然失败"——
     // 正好用来只看受理与选路；同步窗口给足，别让总期限抢在重投之前把请求收成 504。
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -513,7 +513,7 @@ async fn the_auto_size_is_passed_through_and_never_converted() {
     let (database_url, database_name) = isolated_database_url().await;
     // 候选的入口是 `127.0.0.1:1`（连不上），所以这些请求"受理得下来、执行必然失败"——
     // 正好用来只看受理与选路；同步窗口给足，别让总期限抢在重投之前把请求收成 504。
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -782,7 +782,7 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
     let (database_url, database_name) = isolated_database_url().await;
     // 候选的入口是 `127.0.0.1:1`（连不上），所以这些请求"受理得下来、执行必然失败"——
     // 正好用来只看受理与选路；同步窗口给足，别让总期限抢在重投之前把请求收成 504。
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -982,7 +982,7 @@ async fn an_enum_map_value_reaches_the_upstream_and_an_unmapped_one_skips_the_ca
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn an_image_the_contract_never_declared_is_rejected_as_an_invalid_parameter() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
     let account = create_account(&client, &base_url, &admin_token).await;
@@ -1085,7 +1085,7 @@ async fn the_2_5_materials_route_by_carrier_surface_and_wire_names() {
     .await;
     let apimart_upstream =
         start_fake_upstream_with(apimart_calls.clone(), UpstreamBehaviour::apimart()).await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 30, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 30).await;
     wait_until_ready(&client, &base_url, &admin_token).await;
     // 这条用例连发四次请求，而素材带着**测试价**（AIHubMix 的四档对客费率 = 成本单价 × 倍率
     // 1.2 × 折算率 7.1；APIMart 那条按上游声明的金额乘同一条乘法）与保底表：受理闸门是

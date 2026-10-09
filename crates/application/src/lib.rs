@@ -92,14 +92,11 @@ pub use image_upload::{
     UPLOAD_STORAGE_ACCESS_KEY_SECRET_ENV, UploadCancellation, UploadStorageConfig, UploadedImage,
 };
 
-/// 直接执行的并发缺省与平台兜底保底额：运营取值，随调用传入。
+/// 直接执行的渠道容量与平台兜底保底额：运营取值，随调用传入。
 ///
-/// **并发名额本身不在进程配置里**：它挂在网关模型那一行上（`publication.gateway_models`），由运营
-/// 设置、随受理读出来；这里给的只是"模型没有设值时"的缺省。
+/// **并发名额不在这里**：它挂在网关模型那一行上（`publication.gateway_models`，必填），随受理读出来。
 #[derive(Debug, Clone, Copy)]
 pub struct DirectExecutionLimits {
-    /// 网关模型没设并发名额时用的缺省（每账户、每网关模型）。
-    pub default_max_concurrent_jobs: u64,
     /// 该渠道全局允许的未决任务数。
     pub max_channel_in_flight: u64,
     /// 候选没有发布保底表时的平台兜底保底额（CNY 微单位）。
@@ -177,6 +174,10 @@ pub struct PublishRuntimeCommand {
     /// 候选集合，没有它就没有可发布的东西。
     #[serde(default)]
     pub offerings: Option<Vec<OfferingDraft>>,
+    /// **并发名额**（每个账户在该模型上同时在跑的上限）：给了就写进该模型的**运行状态**；
+    /// 不给时新建的模型按平台固定值 1、已存在的模型保持现值。它不进修订，不从进程配置读。
+    #[serde(default)]
+    pub max_concurrent_jobs: Option<u32>,
     /// **加价系数**（基点，避免浮点）：**每个网关模型一个**，随修订发布、随 Job 快照冻结。
     ///
     /// 它不放在可变的开关表里：定价是修订的内容——放进可变表就等于"改价不用发布"，而
@@ -259,6 +260,12 @@ pub struct PublishRuntimeRequest {
     pub consumer_reference_rates: Option<ConsumerReferenceRates>,
     /// 加价系数（基点）：随修订发布、随 Job 快照冻结；没有候选带定价时为 `None`。
     pub markup_bps: Option<i32>,
+    /// 这次发布要落给该网关模型的**并发名额**（每个账户在该模型上同时在跑的上限）。
+    ///
+    /// 它是**运行状态**（`publication.gateway_models`），不进修订、不进快照、不进候选，也不随
+    /// Runtime Revision 冻结。`None`＝命令没给：新建的模型按**平台固定值 1**，已存在的模型保持现值。
+    /// 唯一从进程配置读名额的做法已经删除。
+    pub max_concurrent_jobs: Option<u32>,
     /// 候选的**技术定义**从哪里取：`true` = 由被引用的 Offering 行决定（引用式发布），`false` = 用
     /// 请求里内联的那些值（老形状）。仓储据此决定发布时写进条目快照的是哪一份。
     pub definitions_from_offerings: bool,
@@ -509,6 +516,7 @@ impl PublishRuntimeCommand {
             native_model_id,
             gateway_model,
             native_revision,
+            max_concurrent_jobs: self.max_concurrent_jobs,
             model_type: self.model_type.unwrap_or_default(),
             actor: self.actor,
             capability_schema,
@@ -1670,13 +1678,16 @@ pub struct AdmitOffering {
 
 /// 一次受理要用的**模型级**读：该网关模型当前生效修订的候选，加上挂在模型行上的并发名额。
 ///
+/// 名额（列是 `NOT NULL`）没有"用缺省"这一层：进程配置里也没有名额来源。
+///
 /// 名额放在这里、**不放进 [`OfferingCandidate`]**：候选是发布物的一部分（发布接口原样回显它），
 /// 运营的运行期设置不该出现在发布面；发布事务也是先写条目再写模型行，发布路径填不出它。
 #[derive(Debug, Clone)]
 pub struct ActiveOfferings {
     /// 该模型的 active 候选，按 `routing_priority` 升序。
     pub candidates: Vec<OfferingCandidate>,
-    /// 该模型的并发名额；`None`＝用部署缺省（[`DirectExecutionLimits::default_max_concurrent_jobs`]）。
+    /// 该模型的并发名额。列必填，所以**有候选时它一定有值**；候选为空时是 `None`——那条路会立刻
+    /// 返回"模型不存在"（`NotFound`），用不到名额。
     pub max_concurrent_jobs: Option<u32>,
 }
 
@@ -1700,7 +1711,7 @@ pub struct AdmitExecution {
     pub request_digest_key_version: i16,
     /// 本次预授权额（保底额，CNY 微单位），由定价侧算定并随快照冻结。
     pub max_cost_microusd: u64,
-    /// 该账户**在这个网关模型上**同时允许的在飞执行数（已解析：模型的值或部署缺省）。
+    /// 该账户**在这个网关模型上**同时允许的在飞执行数（取自模型行，必填）。
     pub max_in_flight: u64,
     /// 该渠道全局允许的未决任务数。
     pub max_channel_in_flight: u64,
@@ -2431,8 +2442,8 @@ pub struct GatewayModelView {
     pub gateway_model: String,
     /// 运维开关：关掉之后它从对客目录消失、受理得到"模型不存在"；已受理的 Job 不受影响。
     pub enabled: bool,
-    /// 每个账户在该模型上同时在跑的上限；`None`＝用部署缺省。由运营设置，改完即时生效。
-    pub max_concurrent_jobs: Option<u32>,
+    /// 每个账户在该模型上同时在跑的上限（必填）。由运营在发布或编辑时给，改完即时生效。
+    pub max_concurrent_jobs: u32,
     pub vendor_id: String,
     /// 厂商原生名：**只在管理端出现**，对客面看不到它。
     pub native_model_id: String,
@@ -2658,14 +2669,14 @@ pub trait HubRepository: Send + Sync {
     /// 管理员写：只改运维开关与并发名额，按改了什么各写一条审计事件。
     ///
     /// `enabled`：`None`＝这次不改，`Some(v)`＝设成 v。
-    /// `max_concurrent_jobs`：`None`＝这次不改，`Some(None)`＝清成"用部署缺省"，`Some(Some(n))`＝设成 n。
+    /// `max_concurrent_jobs`：`None`＝这次不改，`Some(n)`＝设成 n（列必填，没有"清成缺省"这一态）。
     /// 两个都是 `None` 由调用方拒掉（没有要改的东西）。没发布过的名字返回
     /// [`ApplicationError::NotFound`]：定义只能由发布产生，这里**不创建**任何东西。
     async fn set_gateway_model_settings(
         &self,
         gateway_model: &str,
         enabled: Option<bool>,
-        max_concurrent_jobs: Option<Option<u32>>,
+        max_concurrent_jobs: Option<u32>,
         actor: &str,
     ) -> Result<(), ApplicationError>;
 
@@ -5700,6 +5711,8 @@ impl RuntimeService {
             native_revision: Some(first.native_revision.clone()),
             model_type: Some(first.model_type.clone()),
             capability_schema: Some(first.capability_schema.clone()),
+            // 引用式发布不带名额：省略即"不动已有的值"（新建的模型按平台固定值 1）。
+            max_concurrent_jobs: None,
             // 引用式发布的文档读同一厂商模型已导入的素材，命令里不带。
             documentation: None,
             // 对客参考价目同理：它已经在那个厂商模型行上了，这次发布不重报（省略即保留）。
@@ -5881,7 +5894,7 @@ impl RuntimeService {
         &self,
         gateway_model: &str,
         enabled: Option<bool>,
-        max_concurrent_jobs: Option<Option<u32>>,
+        max_concurrent_jobs: Option<u32>,
         actor: &str,
     ) -> Result<(), ApplicationError> {
         self.repository

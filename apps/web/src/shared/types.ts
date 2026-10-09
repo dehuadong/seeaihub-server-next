@@ -40,8 +40,8 @@ export interface GatewayModelCandidate {
 export interface GatewayModel {
   gateway_model: string;
   enabled: boolean;
-  /// 每个账户在这个模型上同时在跑的上限；`null`＝用部署缺省。
-  max_concurrent_jobs: number | null;
+  /// 每个账户在这个模型上同时在跑的上限（必填，由运营在发布或编辑时给）。
+  max_concurrent_jobs: number;
   vendor_id: string;
   /// 厂商原生名：只在管理端出现，对客面看不到。
   native_model_id: string;
@@ -57,8 +57,6 @@ export interface GatewayModel {
 
 export interface GatewayModelsResponse {
   gateway_models: GatewayModel[];
-  /// 模型没设并发名额时生效的部署缺省。
-  max_concurrent_jobs_default: number;
 }
 
 /// 一条**可被运营选中**的供给：发布平台模型时那个 `offering_id` 指向的东西。

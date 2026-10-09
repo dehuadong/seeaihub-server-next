@@ -1052,15 +1052,10 @@ impl Drop for ApiProcess {
 ///
 /// 这两行是**夹具**，不是生产默认值：`USD` 的数值只在本用例里成立，`CNY` 那一行是 1:1
 /// （同币种折算按定义就是 1）。要验"没有折算率的币种发布被拒"的用例用一个**没被种下**的币种。
-async fn start_api(
-    database_url: &str,
-    sync_wait_seconds: u64,
-    max_concurrent_jobs: u64,
-) -> (String, String, ApiProcess) {
+async fn start_api(database_url: &str, sync_wait_seconds: u64) -> (String, String, ApiProcess) {
     start_api_with(
         database_url,
         sync_wait_seconds,
-        max_concurrent_jobs,
         &ApiProcessSettings::default(),
     )
     .await
@@ -1078,7 +1073,6 @@ async fn start_api_with_admin(
     start_api_with(
         database_url,
         2,
-        64,
         &ApiProcessSettings {
             admin_credentials: Some((email.to_owned(), password.to_owned())),
             ..ApiProcessSettings::default()
@@ -1099,7 +1093,6 @@ async fn start_api_with_auth_attempts(
     start_api_with(
         database_url,
         2,
-        64,
         &ApiProcessSettings::with_cache_and_auth_attempt_limit(cache, failures, window_ms),
     )
     .await
@@ -1118,7 +1111,6 @@ fn api_probe_command(database_url: &str, port: u16, admin_token: &str) -> Comman
         .env("ADMIN_TOKEN", admin_token)
         .env("SEE_BASEURL", "http://api.contract.test")
         .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
-        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
         .env("PROVIDER_TIMEOUT_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
@@ -1210,7 +1202,6 @@ async fn probe_api_startup_with_cursor_key(
         .env("SEE_BASEURL", "http://api.contract.test")
         .env("ADMIN_EMAIL", "cursor-key-probe@example.com")
         .env("ADMIN_PASSWORD", "a-long-enough-password")
-        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
         .env("PROVIDER_TIMEOUT_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_INCLUDED_IMAGES", "1")
@@ -1251,7 +1242,6 @@ async fn probe_api_startup_with_execution_capacity(
         .env("CUSTOMER_HISTORY_CURSOR_KEY", CONTRACT_CURSOR_KEY)
         // 供给素材的导入与这条判据无关，显式关掉，探针只探容量组合。
         .env("SUPPLY_MATERIAL_DIR", "")
-        .env("GENERATION_MAX_CONCURRENT_JOBS", "1")
         .env("GENERATION_SYNC_WAIT_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_SECONDS", "30")
         .env("PROVIDER_TIMEOUT_BASE_SECONDS", "30")
@@ -1457,7 +1447,6 @@ impl ApiProcessSettings {
 async fn start_api_with(
     database_url: &str,
     sync_wait_seconds: u64,
-    max_concurrent_jobs: u64,
     settings: &ApiProcessSettings,
 ) -> (String, String, ApiProcess) {
     const ATTEMPTS: usize = 5;
@@ -1498,10 +1487,6 @@ async fn start_api_with(
             .env(
                 "PUBLIC_DOCS_DIR",
                 std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../public-docs"),
-            )
-            .env(
-                "GENERATION_MAX_CONCURRENT_JOBS",
-                max_concurrent_jobs.to_string(),
             )
             .env(
                 "GENERATION_SYNC_WAIT_SECONDS",
@@ -2082,13 +2067,10 @@ impl Harness {
             }
             None => None,
         };
-        let (base_url, admin_token, process) = start_api_with(
-            &database_url,
-            sync_wait_seconds,
-            max_concurrent_jobs,
-            &settings.api,
-        )
-        .await;
+        // 名额已经由本次发布命令给出（`max_concurrent_jobs` 形参走 publish），进程配置里没有它。
+        let _ = max_concurrent_jobs;
+        let (base_url, admin_token, process) =
+            start_api_with(&database_url, sync_wait_seconds, &settings.api).await;
         let client = Client::new();
         wait_until_ready(&client, &base_url, &admin_token).await;
         // 夹具账户要**付得起这次发布带的那份保底额**：素材带定价之后，受理闸门（余额 ≥ 保底额）
@@ -2118,7 +2100,7 @@ impl Harness {
             .as_object()
             .cloned()
             .expect("published candidate must declare a wire surface");
-        let published = publish_candidates_with_markup(
+        let published = publish_candidates_with_quota(
             &client,
             &base_url,
             &admin_token,
@@ -2126,6 +2108,7 @@ impl Harness {
             contract,
             vec![draft],
             settings.markup_bps,
+            Some(u32::try_from(max_concurrent_jobs).unwrap_or(u32::MAX)),
         )
         .await;
         assert_eq!(published, StatusCode::OK, "publication must succeed");
@@ -2158,17 +2141,11 @@ impl Harness {
     /// 句柄，丢弃句柄即结束它。
     async fn start_replica(
         &self,
-        max_concurrent_jobs: u64,
         sync_wait_seconds: u64,
         settings: &ApiProcessSettings,
     ) -> (String, ApiProcess) {
-        let (base_url, _admin_token, process) = start_api_with(
-            &self.database_url,
-            sync_wait_seconds,
-            max_concurrent_jobs,
-            settings,
-        )
-        .await;
+        let (base_url, _admin_token, process) =
+            start_api_with(&self.database_url, sync_wait_seconds, settings).await;
         (base_url, process)
     }
 
@@ -3007,6 +2984,31 @@ async fn publish_candidates_with_markup(
     offerings: Vec<Value>,
     markup_bps: Option<i32>,
 ) -> StatusCode {
+    publish_candidates_with_quota(
+        client,
+        base_url,
+        admin_token,
+        model,
+        contract,
+        offerings,
+        markup_bps,
+        None,
+    )
+    .await
+}
+
+/// 同 [`publish_candidates_with_markup`]，另可带并发名额（夹具按用例需要给出）。
+#[allow(clippy::too_many_arguments)]
+async fn publish_candidates_with_quota(
+    client: &Client,
+    base_url: &str,
+    admin_token: &str,
+    model: &str,
+    contract: Option<Value>,
+    offerings: Vec<Value>,
+    markup_bps: Option<i32>,
+    max_concurrent_jobs: Option<u32>,
+) -> StatusCode {
     // 按上游声明金额计价（`consumer_formula: upstream_declared`）的候选，对客价靠修订级倍率算
     // 出来，缺了发布期就拒；夹具走这条发布路径时补一个默认值。**故意不给倍率**的用例各自直接
     // 组发布体，不受这里影响。
@@ -3016,7 +3018,14 @@ async fn publish_candidates_with_markup(
             .any(|offering| offering["consumer_formula"] == json!("upstream_declared"))
             .then_some(2000)
     });
-    let body = publication_body(model, "route-test-1", contract, offerings, markup_bps);
+    let body = publication_body_with_quota(
+        model,
+        "route-test-1",
+        contract,
+        offerings,
+        markup_bps,
+        max_concurrent_jobs,
+    );
     let response = client
         .post(format!("{base_url}/api/v1/runtime-revisions"))
         .bearer_auth(admin_token)
@@ -3043,8 +3052,16 @@ async fn publish_on_revision(
     contract: Value,
     offerings: Vec<Value>,
     markup_bps: Option<i32>,
+    max_concurrent_jobs: Option<u32>,
 ) -> StatusCode {
-    let body = publication_body(model, revision, Some(contract), offerings, markup_bps);
+    let body = publication_body_with_quota(
+        model,
+        revision,
+        Some(contract),
+        offerings,
+        markup_bps,
+        max_concurrent_jobs,
+    );
     let response = Client::new()
         .post(format!("{}/api/v1/runtime-revisions", harness.base_url))
         .bearer_auth(&harness.admin_token)
@@ -3068,8 +3085,23 @@ fn publication_body(
     model: &str,
     revision: &str,
     contract: Option<Value>,
+    offerings: Vec<Value>,
+    markup_bps: Option<i32>,
+) -> Value {
+    publication_body_with_quota(model, revision, contract, offerings, markup_bps, None)
+}
+
+/// 同 [`publication_body`]，另可带上**并发名额**（`None`＝发布命令不给它）。
+///
+/// 并发名额是模型行上的运行状态（列必填）：命令不给时新建的模型按平台固定值 1。夹具用它把
+/// "这套用例需要多大并发"写进发布命令——进程配置里已经没有名额来源。
+fn publication_body_with_quota(
+    model: &str,
+    revision: &str,
+    contract: Option<Value>,
     mut offerings: Vec<Value>,
     markup_bps: Option<i32>,
+    max_concurrent_jobs: Option<u32>,
 ) -> Value {
     for offering in &mut offerings {
         let surface = if offering
@@ -3097,6 +3129,9 @@ fn publication_body(
     }
     if let Some(markup_bps) = markup_bps {
         body["markup_bps"] = json!(markup_bps);
+    }
+    if let Some(max_concurrent_jobs) = max_concurrent_jobs {
+        body["max_concurrent_jobs"] = json!(max_concurrent_jobs);
     }
     // 内联发布也要带文档素材：没有它发布会被拒（Spec 0008 §4）。夹具按同版合同生成一份最小素材。
     let contract = body

@@ -131,7 +131,7 @@ DATABASE_URL=... WORKER_ID=worker-1 seeai-worker
 
 ## 3. 升级与重启
 
-- 迁移在两个进程启动时自动跑（[部署总览 §3.3](deployment.md#33-数据库用户要有-ddl-权限且迁移会自动跑)）。服务器构建时更新 `/opt/seeai` 里的代码并重新构建；开发构建机出包时按 §1.4 停止服务并安装新包，再执行 `sudo systemctl start seeai-api seeai-worker`，按[部署总览 §8](deployment.md#8-投产前的演练)验证；
+- 迁移在两个进程启动时自动跑（[部署总览 §3.3](deployment.md#33-数据库用户要有-ddl-权限且迁移会自动跑)）。**例外**：把并发名额改成必填的迁移 `0049` 会把没有名额的模型回填成 1，**对所有副本当场生效**——要保留更大并发的部署，先在升级**之前**用模型页（或 `PATCH /api/v1/gateway-models/{model}`）把现值逐个钉到模型上，再升级；见 §3.3 的同一段。服务器构建时更新 `/opt/seeai` 里的代码并重新构建；开发构建机出包时按 §1.4 停止服务并安装新包，再执行 `sudo systemctl start seeai-api seeai-worker`，按[部署总览 §8](deployment.md#8-投产前的演练)验证；
 - `systemctl restart seeai-api` 发 `SIGINT`、走排空（[部署总览 §6](deployment.md#6-探活与优雅停机)），不需要单独的停机脚本；多实例逐台重启，避免全部同时冷启动去争迁移锁（争锁只表现为启动稍慢）；
 - 应用回退用上一版代码重新构建，或按 §1.4 重新安装保留的上一版发布包；启动前确认旧程序与当前数据库结构兼容。数据库迁移只进不退，回退数据库只能从备份恢复（[部署总览 §3.3](deployment.md#33-数据库用户要有-ddl-权限且迁移会自动跑)）。升级前先做一次备份（[部署总览 §7](deployment.md#7-备份)）；
 - 单元文件有改动时重新装到 `/etc/systemd/system/` 再 `systemctl daemon-reload`（§2）——更新代码只覆盖 `/opt/seeai`，不动 `/etc`。

@@ -117,6 +117,7 @@ pub(super) fn schema(model: &str) -> Value {
 
 pub(super) fn base_command() -> PublishRuntimeCommand {
     PublishRuntimeCommand {
+        max_concurrent_jobs: None,
         vendor_id: Some("OpenAI".to_owned()),
         native_model_id: Some("gpt-image-2.5-flare".to_owned()),
         gateway_model: None,

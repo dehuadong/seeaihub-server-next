@@ -249,6 +249,7 @@ async fn republish_requiring_style(harness: &Harness) {
             vec![draft],
             // 有候选按上游声明的金额计价，修订级倍率是它的对客价来源。
             Some(2_000),
+            None,
         )
         .await,
         StatusCode::OK,
@@ -1164,7 +1165,6 @@ async fn two_api_replicas_share_the_account_and_channel_capacity() {
     // 第二个副本与本装置同一个库、同一组上限，但有自己的进程与连接池。
     let (peer_base, peer) = harness
         .start_replica(
-            1,
             30,
             &ApiProcessSettings {
                 channel_max_in_flight: Some(1),

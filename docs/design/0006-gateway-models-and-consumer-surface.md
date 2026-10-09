@@ -115,12 +115,11 @@
 
 ```json
 {
-  "max_concurrent_jobs_default": 1,
   "gateway_models": [
     {
       "gateway_model": "gpt-image-2.5-plus",
       "enabled": true,
-      "max_concurrent_jobs": null,
+      "max_concurrent_jobs": 1,
       "vendor_id": "OpenAI",
       "native_model_id": "gpt-image-2.5-sunburst",
       "native_revision": "2026-09-20-contract-1.0",
@@ -153,9 +152,9 @@
 1. **`ADR-0009` 要求候选集永远来自同一个 Revision**（"一次发布携带该型号完整有序的候选集合，发布即原子替换"）。分步 CRUD 会让"先加候选 A、再加候选 B"中间出现**半套候选**的生效窗口。
 2. **`ADR-0003` 要求 Job 受理时固定版本**。草稿态会引入第三个状态（草稿 / 生效 / 历史）与"现在对客生效的到底是哪一份"的歧义。
 3. **任何一步失败都会留下不一致的对外目录**（目录里已有该模型，候选却没配齐），而目录一旦列出就必须真的受理得起来（`docs/design/0005` §8.1 的取数判据）。
-4. **可变位只有两个**：`PATCH /api/v1/gateway-models/{name}` 只允许改 `enabled` 与 `max_concurrent_jobs`（每个账户在该模型上同时在跑的上限；留空＝用部署缺省）。两者和 `supply.channels.enabled` / `supply.offerings.enabled` 同类——是**运行状态**，不是定义；`ADR-0009` 也把 `active` 当"按型号全局可变的事实"处理。因此它不构成"分步 CRUD"。
+4. **可变位只有两个**：`enabled` 与 `max_concurrent_jobs`（每个账户在该模型上同时在跑的上限，**必填**）。`max_concurrent_jobs` 有两个写入方：发布命令（可选带它）与 `PATCH /api/v1/gateway-models/{name}`；两者都只改运行状态，不进修订。两者和 `supply.channels.enabled` / `supply.offerings.enabled` 同类——是**运行状态**，不是定义；`ADR-0009` 也把 `active` 当"按型号全局可变的事实"处理。因此它不构成"分步 CRUD"。
 
-`PATCH` 的语义：关闭 → 该名字从 `GET /v1/models` 消失、受理得到"模型不存在"（现有 `select_candidate` 在无候选时返回 `NotFound`）；已受理的 Job 不受影响（`ADR-0003`）。并发名额：省略＝不改、`null`＝清成“用部署缺省”、给值＝设成它（0 或负数拒绝；两个字段都不给＝400）；未知字段仍拒。请求里给了 `enabled` 就写一条 `gateway_model.set_enabled`、给了名额就写一条 `gateway_model.set_max_concurrent_jobs`（空改动也记一笔：运营点过一次保存这件事本身要看得到），都落在 `operations.audit_events`。读面在每个模型上给原值 `max_concurrent_jobs`（可为 `null`），并在**响应顶层**给一次部署缺省 `max_concurrent_jobs_default`——否则运营看不出实际生效多少。
+`PATCH` 的语义：关闭 → 该名字从 `GET /v1/models` 消失、受理得到"模型不存在"（现有 `select_candidate` 在无候选时返回 `NotFound`）；已受理的 Job 不受影响（`ADR-0003`）。并发名额：省略＝不改、给正整数＝设成它（列必填，没有"清成缺省"这一态；`null`、0、负数与超出列宽的正整数一律 400 并点名；两个字段都不给＝400）；未知字段仍拒。请求里给了 `enabled` 就写一条 `gateway_model.set_enabled`、给了名额就写一条 `gateway_model.set_max_concurrent_jobs`（空改动也记一笔：运营点过一次保存这件事本身要看得到），都落在 `operations.audit_events`。读面在每个模型上给具体数字 `max_concurrent_jobs`（必填，没有"未设"这一态）。发布命令省略名额时：**新建**的模型按平台固定值 1、**已有**的模型保持现值（`SET` 不含 `enabled`，重新发布不能把停用的模型悄悄打开）。
 
 ### 2.5 管理员读：查看余额
 

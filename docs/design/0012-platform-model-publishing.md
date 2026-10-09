@@ -1,5 +1,5 @@
 主题: 平台模型发布：可选择的 Offering 与选择式发布
-当前修订: v3
+当前修订: v4
 状态: 待评审
 来源: 提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 范围第 2 条；承接 Spec [`0001`](../specs/0001-admin-and-customer-consoles.md) §5.3 的 V-D8/V-D9
 依赖: [`0006`](./0006-gateway-models-and-consumer-surface.md)（网关模型对象）、[`0007`](./0007-pricing-floor-and-settlement.md)（定价归属）、[`0005`](./0005-vendor-model-contract-and-offering-mapping.md)（合同/承载面/映射分层）；[`CONTEXT.md`](../../CONTEXT.md)（Offering / Gateway Model / 供应商模型名）；`ADR-0003`、`ADR-0009`、`ADR-0015`
@@ -104,6 +104,8 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 **发布期还校验渠道能力**：对客形态选"上游声明金额 × 倍率"的候选（成本形态或对客形态是 `upstream_declared`）要求这条 Offering 的驱动器 `AdapterDescriptor::declares_cost` 为真，即上游响应里真的会带金额；对客形态选"按 token 四档"的候选要求 `provides_token_usage` 为真，即成功件真的给得出四分项用量——给不出就算不出对客价。两条能力随可选清单一起回给界面（`SelectableOfferingView::declares_cost` 与 `provides_token_usage`），对客形态的下拉据此过滤：给不出的形态不摆出来，不让运营选一个发不出去的东西。各条渠道给什么以 [`docs/facts/channel-facts.md`](../facts/channel-facts.md) 为准（AIHubMix 走 `/ai/v1` 同步，只回上游声明的 `usage.cost`、没有 token 分项；APIMart 回四分项用量）。把形态写反了就在这里点名驱动器拒绝，不等到受理或结算才发现收不到金额。
 
 命令仍保持"完整、有序的候选集合"这条性质（`ADR-0009`）：运营提交的是他这次要的**那组 Offering 引用**，原子替换的是这组引用与它们的价。
+
+**发布命令还可选带 `max_concurrent_jobs`**（每个账户在该模型上同时在跑的上限）：它落的是**运行状态**（`publication.gateway_models`），**不进这次修订**——不进条目、不进快照、不进发布响应。给值就写它；不给时新建的模型按平台固定值 1、已存在的模型保持现值（`SET` 不含 `enabled`）。写值与发布在**同一个事务**里（工作项 #99；机制见 [并发名额在上架时给出](../../.agents/notes/implemented/platform/2026-10-08-quota-set-at-publish.md)）。
 
 ## 5. 已发布修订不受 Offering 后续改动影响
 

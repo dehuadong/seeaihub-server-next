@@ -184,7 +184,7 @@ async fn the_operator_cannot_open_a_customer_with_an_admin_email() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn seeding_an_admin_with_a_customer_email_fails_and_names_it() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -215,7 +215,7 @@ async fn seeding_an_admin_with_a_customer_email_fails_and_names_it() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn a_registration_cannot_slip_past_a_concurrent_admin_claim() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -276,7 +276,7 @@ async fn a_registration_cannot_slip_past_a_concurrent_admin_claim() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn concurrent_registrations_with_the_same_email_yield_one_winner() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 
@@ -307,7 +307,7 @@ async fn concurrent_registrations_with_the_same_email_yield_one_winner() {
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn the_repository_refuses_to_upsert_an_admin_on_a_customer_email() {
     let (database_url, database_name) = isolated_database_url().await;
-    let (base_url, admin_token, _process) = start_api(&database_url, 2, 64).await;
+    let (base_url, admin_token, _process) = start_api(&database_url, 2).await;
     let client = Client::new();
     wait_until_ready(&client, &base_url, &admin_token).await;
 

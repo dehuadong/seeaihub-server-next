@@ -7,8 +7,8 @@
 | 工作项 | 状态 | 说明 |
 | --- | --- | --- |
 | [#94](https://github.com/dehuadong/seeaihub-server-next/issues/94) | 已关闭（complete） | 并发名额按「账户 × 网关模型」判定、落在模型行、编辑路径（模型卡片 `PATCH`）能设。提交 `71ef330`；设计记录 [网关模型的并发名额](../notes/implemented/platform/2026-10-08-gateway-model-concurrency-quota.md)。 |
-| [#99](https://github.com/dehuadong/seeaihub-server-next/issues/99) | **Planning 已完成，未获执行授权** | 上架时也能设名额；**删掉 `GENERATION_MAX_CONCURRENT_JOBS`**（进程配置不再有名额来源）；列改 `NOT NULL`（回填 1）。设计记录 [并发名额在上架时给出](../notes/proposed/platform/2026-10-08-quota-set-at-publish.md)（proposed）。 |
-| [#97](https://github.com/dehuadong/seeaihub-server-next/issues/97) | 未进 Planning（等授权） | 删掉客户请求限流（生成侧与上传侧两处），不做速率配额。 |
+| [#99](https://github.com/dehuadong/seeaihub-server-next/issues/99) | **已获授权，实施中（2026-10-08）** | 上架时也能设名额；**删掉 `GENERATION_MAX_CONCURRENT_JOBS`**；列改 `NOT NULL`（回填 1）。Spec `0001` v25 与 `0005` v7 已接受；设计记录 [并发名额在上架时给出](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md) 随本次交付迁入 `implemented/`。 |
+| [#97](https://github.com/dehuadong/seeaihub-server-next/issues/97) | **已获授权（与 #99 同一句），待实施** | 删掉客户请求限流（生成侧与上传侧两处），不做速率配额；它的 Spec/设计修订还没起草（实施前先在 Planning 里固化）。 |
 | #95 / #96 | 已关闭（取消） | 速率配额、以及"标签即组名"的分组管理，都不做。 |
 | [#91](https://github.com/dehuadong/seeaihub-server-next/issues/91) | 已被 `b733d82` 修掉 | 合同夹具不再读仓库根 `.env`；可以直接关。 |
 
@@ -23,7 +23,7 @@
 ## 3. 关键文件（下一步会碰到的）
 
 - 工作项与决策记录：[#99](https://github.com/dehuadong/seeaihub-server-next/issues/99)（范围、验收、三轮 Plan Review 的发现与修正都在正文）。
-- 设计：[proposed Note](../notes/proposed/platform/2026-10-08-quota-set-at-publish.md)（写入形状、无窗口 RUNBOOK、审计口径、边界与类型收紧、验证切入点）。
+- 设计：[proposed Note](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md)（写入形状、无窗口 RUNBOOK、审计口径、边界与类型收紧、验证切入点）。
 - 合同草稿：[`docs/specs/0001-admin-and-customer-consoles.md`](../../docs/specs/0001-admin-and-customer-consoles.md)（M1／M2／V-D17／V-D18）、[`docs/specs/0005-synchronous-image-gateway.md`](../../docs/specs/0005-synchronous-image-gateway.md)（§6）。
 - 实施会改到：`migrations/`（**新迁移**：回填 1 → `SET NOT NULL` → 重写列注释；已应用的 `0048` 不许改）、`crates/persistence/src/lib.rs`（发布事务与设置接口）、`crates/application/src/lib.rs`（`DirectExecutionLimits`／`ActiveOfferings`／发布命令）、`apps/api/src/main.rs`（env 读取、`AppState`、读面、`PATCH`）、`apps/web/src/console/*`（发布抽屉、改价态、卡片文案、`client.ts`）、`apps/api/tests/http_contract/harness.rs`（并发形参改走发布命令）。
 - 契约与运维文档：`docs/design/0006`（§2.2 读示例、§2.3/§2.4）、`docs/design/0012`（v4）、`docs/design/0017`（v3）、`docs/design/0009` §3、`CONTEXT.md`、`docs/operations/configuration.md`、`.env.example`、`docs/operations/deployment.md` §3.3 与两份衍生。

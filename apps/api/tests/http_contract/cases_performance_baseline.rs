@@ -250,8 +250,13 @@ async fn direct_execution_gateway_overhead_split() {
         delay_ms: UPSTREAM_DELAY_MS,
         ..UpstreamBehaviour::aihubmix(SyncImageShape::Url)
     };
-    let harness =
-        Harness::start_direct(draft, behaviour, MAX_CONCURRENT_JOBS_DEFAULT, SYNC_WAIT_SECONDS).await;
+    let harness = Harness::start_direct(
+        draft,
+        behaviour,
+        MAX_CONCURRENT_JOBS_DEFAULT,
+        SYNC_WAIT_SECONDS,
+    )
+    .await;
     let (_, api_key) = funded_account(
         &Client::new(),
         &harness.base_url,

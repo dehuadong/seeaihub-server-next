@@ -100,6 +100,9 @@ export function PlatformModelPanel({
   const [name, setName] = useState('');
   const [vendor, setVendor] = useState<string | null>(null);
   const [markupBps, setMarkupBps] = useState(2000);
+  /// 并发名额：只有运营改过才随发布命令发送（型号名是自由文本，重发已有模型时不能因预填钉住它）。
+  const [quota, setQuota] = useState<number | null>(null);
+  const [quotaTouched, setQuotaTouched] = useState(false);
   const [selected, setSelected] = useState<Selected[]>([]);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
@@ -236,6 +239,9 @@ export function PlatformModelPanel({
     setName(model.gateway_model);
     setVendor(model.vendor_id);
     setMarkupBps(model.markup_bps ?? 2000);
+    // 改价态显示该模型当前的名额；没碰过就不发送（一次改价不会改名额）。
+    setQuota(model.max_concurrent_jobs);
+    setQuotaTouched(false);
     const modelMultiplier = 1 + (model.markup_bps ?? 2000) / 10000;
     setSelected(
       model.candidates.map((candidate, index) => {
@@ -344,9 +350,24 @@ export function PlatformModelPanel({
     }
   }
 
+  /// 名额那一格的说明：命中已有模型时显示它当前的值（只作提示，不写回表单）。
+  function quotaHint(): string {
+    const existing = models.data?.gateway_models.find(
+      (item) => item.gateway_model === name.trim(),
+    )?.max_concurrent_jobs;
+    if (quotaTouched) {
+      // 碰过但清空了：这一格不会被发送，说清它当前什么都不做。
+      return quota === null
+        ? '空着就不发这个字段（不改名额）'
+        : '会随本次发布写入';
+    }
+    if (existing !== undefined) return `该模型当前是 ${existing}；不改就不发这个字段`;
+    return '留空＝新建的模型按 1（一次一任务）';
+  }
+
   /// 按表单拼出**引用式**发布命令。只有商务字段：引用、档位、权重、对客形态与对客价。
   function buildCommand(): Record<string, unknown> {
-    return {
+    const command: Record<string, unknown> = {
       gateway_model: name.trim(),
       markup_bps: markupBps,
       actor: 'admin-console',
@@ -374,6 +395,10 @@ export function PlatformModelPanel({
         return reference;
       }),
     };
+    // 只有运营**改过**这个字段才发送：否则重发一个已有模型会把它当前的名额覆盖成表单里的值。
+    // 留空不发送＝新建的模型按平台固定值 1、已有的保持现值。
+    if (quotaTouched && quota !== null) command.max_concurrent_jobs = quota;
+    return command;
   }
 
   async function publish() {
@@ -462,6 +487,21 @@ export function PlatformModelPanel({
             <Typography.Text type="secondary">
               每个平台模型一个。倍率 = 1 + {markupBps}/10000
             </Typography.Text>
+          </div>
+          <div style={{ minWidth: 220 }}>
+            <Typography.Text type="secondary">并发名额</Typography.Text>
+            <InputNumber
+              data-testid="platform-quota"
+              style={{ width: '100%' }}
+              value={quota}
+              precision={0}
+              placeholder="1（一次一任务）"
+              onChange={(value) => {
+                setQuota(value === null || value === undefined ? null : Number(value));
+                setQuotaTouched(true);
+              }}
+            />
+            <Typography.Text type="secondary">{quotaHint()}</Typography.Text>
           </div>
         </Flex>
       </Panel>

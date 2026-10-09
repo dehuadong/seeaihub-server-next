@@ -433,7 +433,7 @@ impl DirectExecutionService {
         }
         // 合同是模型级唯一一份：先读候选取合同，按它过滤出"已识别的参数"，指纹在选路与候选
         // 截断之前形成，且不依赖当前价格、候选或修订（Spec 0005 §4）。
-        // 候选与并发名额来自**同一次**读：名额挂在模型行上，由运营设置；模型没设时用进程缺省。
+        // 候选与并发名额来自**同一次**读：名额挂在模型行上，由运营在发布或编辑时给。
         let active = self.repository.active_offering(&request.model).await?;
         let max_concurrent_jobs = active.max_concurrent_jobs;
         let candidates = active.candidates;
@@ -444,6 +444,13 @@ impl DirectExecutionService {
             ))
             .into());
         }
+        // 有名额才有得判：候选为空时上面已经 404，走到这里的模型一定有值。
+        let max_concurrent_jobs = max_concurrent_jobs.ok_or_else(|| {
+            ApplicationError::Persistence(format!(
+                "active candidates for model {} carry no concurrency quota",
+                request.model
+            ))
+        })?;
         let contract_parameters = Value::Object(contract_parameter_face(
             &routing_input,
             &candidates[0].capability_schema,
@@ -515,9 +522,7 @@ impl DirectExecutionService {
                 request_digest,
                 request_digest_key_version: self.keys.current_request_key_version(),
                 max_cost_microusd: hold_microusd,
-                max_in_flight: max_concurrent_jobs
-                    .map(u64::from)
-                    .unwrap_or(self.limits.default_max_concurrent_jobs),
+                max_in_flight: u64::from(max_concurrent_jobs),
                 max_channel_in_flight: self.limits.max_channel_in_flight,
             })
             .await?;
