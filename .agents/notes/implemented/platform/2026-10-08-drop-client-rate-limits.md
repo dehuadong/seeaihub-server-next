@@ -1,9 +1,10 @@
 ---
 title: 删掉客户请求限流：不做速率配额
-status: proposed
+status: implemented
 created: 2026-10-08
 updated: 2026-10-08
-approval: 产品口径由用户定：2026-10-08 明确「还是把用户的限流取消吧，不搞速率配额」，并否掉了只删生成侧的第一版方案，要求两侧都删且不加替代。
+approval: 产品口径由用户定：2026-10-08 明确「还是把用户的限流取消吧，不搞速率配额」，并否掉了只删生成侧的第一版方案，要求两侧都删且不加替代；随后输入「批准，执行实现」授权实施。Plan Review 三轴 + 收敛轮、Implementation Review 两轴与收敛轮均通过。
+verification: 2026-10-08 本地：`cargo fmt --check`；`cargo clippy --workspace --all-targets` 干净；`cargo check --workspace --all-targets`；真库契约 `cases_cache`（含新用例 `many_requests_in_one_window_are_all_accepted`）11/11、`cases_upload`（含 `many_uploads_in_a_row_are_all_accepted`）、`cases_auth_attempts` 全绿，三组连同 `cases_direct_execution`、`cases_identity` 共 85 passed；`cargo test -p seeai-application --lib` 176、`-p seeai-persistence --lib` 16。
 ---
 
 # Agent Note：删掉客户请求限流：不做速率配额
@@ -17,7 +18,7 @@ approval: 产品口径由用户定：2026-10-08 明确「还是把用户的限�
 
 用户要求：**不做速率配额，把这两处都删掉**，并且不加任何替代的速率限制。
 
-## 提案
+## 决定
 
 1. **两侧都删**：`GenerationRateLimit` 与上传那套限值类型、四个环境变量、`AccelerationService::consume_request_slot` 的限流分支与 `consume_upload_request_slot`、`IdentityService::authenticate` 里那次占名额、缓存键助手（`rate_limit_key` / `upload_rate_limit_key` / `consume_rate_limit_slot`）、以及"没有缓存时限流不生效"的启动 warn；`authenticate_identity` 与上传路径上"不占速率名额"的注释与内部文档链接（`[GenerationRateLimit]`、`[Self::consume_request_slot]`）同时清掉，不留指向已删项的引用。认证本身不变（仍然验密钥、仍然点查账户；它不读余额，余额是受理路径的事）。
 2. **保留防撞库的失败尝试限制**（`AUTH_ATTEMPT_LIMIT_*`）：它是保护**公开鉴权端点**的安全机制，不是客户配额，与"每分钟调多少次生成"无关。`429 rate_limit_exceeded` 这个对客码因此仍然存在，只是只剩它用；`Retry-After` 的语义不变。
@@ -34,7 +35,7 @@ approval: 产品口径由用户定：2026-10-08 明确「还是把用户的限�
 - **保留代码、只把计数改成恒不超限**：落选。死代码 + 一个永不生效的配置项，比删掉更容易在下次改动里复活。
 - **用队列代替拒绝**（超限排队等）：落选。那会把"快速失败"变成"无界等待"，且与"不做速率配额"无关，属另一个产品决定。
 
-## 风险
+## 后果
 
 - **过载保护弱一层**：速率限制是"每个调用方最多多快"，删掉之后只剩"同时在跑多少"与"渠道/本机容量"。容量闸门不依赖缓存、按账户与渠道判定，因此**不会**出现"缓存挂了就没人挡"的局面；但一个账号可以在名额内尽可能快地反复调用，直到占满并发名额或渠道容量。
 - **账户读取端点靠连接数兜底**：`GET /v1/account`（客户读自己的余额与账户）此前也吃这一层的计数，删掉之后它没有自己的并发名额或读名额——同一把有效密钥可以连续打它，每次两下数据库读（点查密钥 + 读余额）。上限只剩连接池（`API_MAX_CONNECTIONS`）与数据库容量。用户的要求是"完全不搞速率配额"，因此这里**有意不另加界**；真出现异常调用，处理方式是吊销密钥，需要更硬的界时再作为一个新的决定提出。
@@ -42,13 +43,15 @@ approval: 产品口径由用户定：2026-10-08 明确「还是把用户的限�
 - **对客语义变化**：`http-errors.md` 里"请求过密"的说法必须同步，否则对客文档承诺了不再存在的限制。
 - **用例面**：`cases_cache.rs` 与 `cases_upload.rs` 里各有一条断言限流 429 的用例要删或改写；`cases_auth_attempts.rs` 那条**保留不动**（它验证的是防撞库）。
 
-## 验收条件
+## 验证
 
-| 交付事实 | 预期证据 |
+| 交付事实 | 证据（真库 + 真进程，2026-10-08） |
 | --- | --- |
-| 同一把 API Key 连续快速调生成不再被拒 | `cases_cache.rs` 里那条限流用例改写成：同一把 Key 在 60 秒内连发 **61** 次（原来的每分钟上限是 60）全部被受理，没有一次 `rate_limit_exceeded` |
-| 上传同理 | `cases_upload.rs` 里那条改写为"连发多张不被拒"；`cases_cache.rs` 里断言 `rate_limit:` 计数存在的那条（不可用缓存时放行）整条删除——它验证的那一层没有了 |
-| 防撞库不变 | `cases_auth_attempts.rs` 那条 `429 rate_limit_exceeded` + `Retry-After` 用例不改、继续通过 |
+| 同一把 API Key 连发不再被拒 | `cases_cache::many_requests_in_one_window_are_all_accepted`：61 次全部被受理、61 个 Job、整段 <60 秒；真库通过 |
+| 上传同理 | `cases_upload::many_uploads_in_a_row_are_all_accepted`：带缓存连发 61 张全 200；真库通过 |
+| 防撞库不变 | `cases_auth_attempts` 全组不改、继续通过（含无缓存时不生效那条） |
 | 配置面与代码清干净 | **生产代码、环境变量读取与配置文档**里不再有 `GENERATION_RATE_LIMIT_*` / `UPLOAD_RATE_LIMIT_*`、`GenerationRateLimit`（生成与上传共用同一个类型）、两个 `consume_*` 方法与两个缓存键助手（历史记录里作为史实出现的名字不算）；`configuration.md` 与 `.env.example` 对应四行删除；启动日志不再有"限流不生效"的 warn |
 | 夹具与相邻用例收口 | `harness.rs` 的 `ApiProcessSettings.rate_limit`／`ApiRateLimit`／`with_cache_and_rate_limit`／上传夹具的限流字段与它们的 env 写入删掉；`crates/application/src/image_upload/tests.rs` 里的限流用例删掉 |
-| 容量闸门仍在 | 既有的并发名额（`cases_model_concurrency`）、渠道全局上限、本机读取容量与上传并发/内存预算用例继续通过 |
+| 容量闸门仍在 | `cases_direct_execution`、`cases_identity` 等相邻组继续通过（连同本次改动的三组共 85 passed）；`cargo clippy --workspace --all-targets` 与 `cargo check --workspace --all-targets` 干净；`cargo test -p seeai-application --lib` 176、`-p seeai-persistence --lib` 16 |
+
+另有一次组内运行出现过 `the_reconciler_overwrites_corrupted_entries_from_the_database` 失败，单独重跑与整组重跑均通过，判为偶发（与本变更无关的时序用例）。

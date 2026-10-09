@@ -9,7 +9,7 @@ verification: 验收合同为工单 [#19](https://github.com/dehuadong/seeaihub-
 
 # Agent Note：Redis 加速层：纯加速的路由与余额缓存
 
-> **失效范围（2026-10-08）**：本记录里"每把 API Key 的请求速率计数"这一用途**已作废**——平台取消了客户请求速率配额，`rate_limit:` 与 `upload_rate_limit:` 两个命名空间不再写入。取代记录见[删掉客户请求限流](../../proposed/platform/2026-10-08-drop-client-rate-limits.md)。仍然有效的部分：余额快照的写穿与对账、route 条目的失效清理，以及"缓存语义留在用例层"这条分工。
+> **失效范围（2026-10-08）**：本记录里"每把 API Key 的请求速率计数"这一用途**已作废**——平台取消了客户请求速率配额，`rate_limit:` 与 `upload_rate_limit:` 两个命名空间不再写入。取代记录见[删掉客户请求限流](../../implemented/platform/2026-10-08-drop-client-rate-limits.md)。仍然有效的部分：余额快照的写穿与对账、route 条目的失效清理，以及"缓存语义留在用例层"这条分工。
 
 ## 问题
 
