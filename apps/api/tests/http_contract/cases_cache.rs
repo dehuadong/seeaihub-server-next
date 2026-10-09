@@ -331,6 +331,60 @@ async fn cache_write_through_makes_the_balance_visible_after_every_write() {
 
 /// **停掉缓存服务，结果逐位相同**：同一场景跑两遍（配了缓存但把服务关掉 / 完全不配缓存），
 /// 实收、最终余额、Job 终态与对客响应体都逐位相同——降级是"全部回源数据库"，不是"另一条路径"。
+/// **写穿不占用响应等待**：把余额写回卡在假 Redis 上，充值接口仍然立刻返回。
+///
+/// 这条直接验 A1 的「请求路径少两次 Redis 往返」：写回被停住时接口还能返回，就说明它没等在那里。
+/// 缓存命令上限放宽到 10 秒，所以"接口等了写回"会明显超过 2 秒的上限而被抓住。
+#[tokio::test]
+#[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
+async fn a_stalled_balance_write_does_not_hold_up_the_response() {
+    let harness = Harness::start_with_cache(
+        candidate("AIHubMix", "aihubmix-image-v1", &["prompt_only"]),
+        None,
+        UpstreamBehaviour::aihubmix(SyncImageShape::Url),
+        64,
+        30,
+        CacheFixture::start(CacheSettings {
+            operation_timeout_ms: 10_000,
+            ..CacheSettings::default()
+        })
+        .await,
+    )
+    .await;
+    let client = Client::new();
+    assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
+    let (account_id, _api_key) =
+        funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    // 先等开户与首充那两次写回落定，闸门才一定抓到下面这一笔。
+    await_write_through(&harness, &account_id).await;
+
+    harness.cache().hold_next_balance_write();
+    let started = tokio::time::Instant::now();
+    let response = client
+        .post(format!(
+            "{}/api/v1/accounts/{account_id}/credits",
+            harness.base_url
+        ))
+        .bearer_auth(&harness.admin_token)
+        .json(&json!({
+            "amount_microusd": 500_000_u64,
+            "business_key": format!("cache-stalled-{}", Uuid::new_v4()),
+        }))
+        .send()
+        .await
+        .expect("credit");
+    let elapsed = started.elapsed();
+    assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "充值不该等余额写回，却用了 {elapsed:?}"
+    );
+    // 写回确实被停住了：不然上面那句可能只是因为压根没发生写回。
+    harness.cache().wait_for_balance_write_hold().await;
+
+    harness.cleanup().await;
+}
+
 #[tokio::test]
 #[ignore = "requires an empty PostgreSQL database via HTTP_CONTRACT_DATABASE_URL"]
 async fn stopping_the_cache_leaves_acceptance_and_settlement_bit_identical() {
