@@ -8,22 +8,22 @@
 | --- | --- | --- |
 | [#94](https://github.com/dehuadong/seeaihub-server-next/issues/94) | 已关闭（complete） | 并发名额按「账户 × 网关模型」判定、落在模型行、编辑路径（模型卡片 `PATCH`）能设。提交 `71ef330`；设计记录 [网关模型的并发名额](../notes/implemented/platform/2026-10-08-gateway-model-concurrency-quota.md)。 |
 | [#99](https://github.com/dehuadong/seeaihub-server-next/issues/99) | **已交付并验证、已关闭**（提交 `bd2c26b`） | 上架时也能设名额；删掉 `GENERATION_MAX_CONCURRENT_JOBS`；列改 `NOT NULL`（回填 1）。Spec `0001` v25 与 `0005` v7 已接受；设计记录与验证表见 [并发名额在上架时给出](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md)。 |
-| [#97](https://github.com/dehuadong/seeaihub-server-next/issues/97) | **已获授权（与 #99 同一句），待实施** | 删掉客户请求限流（生成侧与上传侧两处），不做速率配额；它的 Spec/设计修订还没起草（实施前先在 Planning 里固化）。 |
+| [#97](https://github.com/dehuadong/seeaihub-server-next/issues/97) | **已交付并验证、已关闭**（提交 `fc23dc6`／`79782d3`） | 删掉生成侧与上传侧两处客户请求限流，不做速率配额；防撞库的失败尝试限制保留。合同：Spec `0005` v8／`0007` v4／`0004` v2；记录见 [删掉客户请求限流](../notes/implemented/platform/2026-10-08-drop-client-rate-limits.md)。 |
 | #95 / #96 | 已关闭（取消） | 速率配额、以及"标签即组名"的分组管理，都不做。 |
-| [#91](https://github.com/dehuadong/seeaihub-server-next/issues/91) | 已被 `b733d82` 修掉 | 合同夹具不再读仓库根 `.env`；可以直接关。 |
+| [#91](https://github.com/dehuadong/seeaihub-server-next/issues/91) | 已关闭 | 合同夹具不再读仓库根 `.env`（提交 `b733d82`）。 |
 
 ## 2. 下一步（建议顺序）
 
 1. **#99 已完成**（`bd2c26b`）：进程配置里不再有名额来源，名额在**上架或编辑**时由运营给。全貌读工作项 #99 与那份 implemented 记录。
-2. **#97 的 Planning 已收敛，等执行授权**：方案是两侧（生成与上传）都删、不加替代；合同草稿在 Spec `0005` §3／§6／§8（当前 v8）、Spec `0007` §2.1／§5／A6（当前 v4）、Spec `0004` §5（当前 v2），设计在 design `0009` §3、`0021`（当前 v4）、`0016`、`0017` §6、`0008`，设计记录是 `.agents/notes/implemented/platform/2026-10-08-drop-client-rate-limits.md`。执行前先让用户接受这几份修订并给出执行授权。
-3. #91 可直接关（已被 `b733d82` 修掉）。
+2. **#97 也已交付**：生成侧与上传侧两处客户请求限流都删了，缓存里不再有那两个命名空间；防撞库的 `AUTH_ATTEMPT_LIMIT_*` 保留，`429 rate_limit_exceeded` 只剩公开鉴权端点用。验证见工作项 #97 与那份 implemented 记录。
+3. 当前没有待办工作项；#91 已关闭。
 
 ## 3. 关键文件（下一步会碰到的）
 
 - 工作项与决策记录：[#99](https://github.com/dehuadong/seeaihub-server-next/issues/99)（范围、验收、三轮 Plan Review 的发现与修正都在正文）。
 - 设计：[proposed Note](../notes/implemented/platform/2026-10-08-quota-set-at-publish.md)（写入形状、无窗口 RUNBOOK、审计口径、边界与类型收紧、验证切入点）。
 - 合同草稿：[`docs/specs/0001-admin-and-customer-consoles.md`](../../docs/specs/0001-admin-and-customer-consoles.md)（M1／M2／V-D17／V-D18）、[`docs/specs/0005-synchronous-image-gateway.md`](../../docs/specs/0005-synchronous-image-gateway.md)（§6）。
-- #97 的规划要先读：`docs/specs/0007-*.md`（上传与素材）、`docs/specs/0005-*.md` §4、`docs/design/0009-operational-baseline.md` §3、`docs/design/0021-*.md`，以及 `crates/application/src/lib.rs` 的限流端口与 `apps/api/src/main.rs` 的两个环境变量。
+- #97 的实现改动面（已交付，留作参考）：`crates/application/src/lib.rs`（限值类型与两个 `consume_*` 方法、缓存键助手、认证路径那次占名额）、`crates/application/src/image_upload.rs`（上传配置里的限值）、`apps/api/src/main.rs`（四个环境变量、启动 warn、上传状态）、`apps/api/tests/http_contract/harness.rs` 的限流夹具。
 - 实施会改到（#99 已完成，留作参考）：`migrations/`（**新迁移**：回填 1 → `SET NOT NULL` → 重写列注释；已应用的 `0048` 不许改）、`crates/persistence/src/lib.rs`（发布事务与设置接口）、`crates/application/src/lib.rs`（`DirectExecutionLimits`／`ActiveOfferings`／发布命令）、`apps/api/src/main.rs`（env 读取、`AppState`、读面、`PATCH`）、`apps/web/src/console/*`（发布抽屉、改价态、卡片文案、`client.ts`）、`apps/api/tests/http_contract/harness.rs`（并发形参改走发布命令）。
 - 契约与运维文档：`docs/design/0006`（§2.2 读示例、§2.3/§2.4）、`docs/design/0012`（v4）、`docs/design/0017`（v3）、`docs/design/0009` §3、`CONTEXT.md`、`docs/operations/configuration.md`、`.env.example`、`docs/operations/deployment.md` §3.3 与两份衍生。
 
