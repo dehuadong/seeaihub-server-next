@@ -44,7 +44,7 @@
 ## 这个会话定下的工作方式（继续照做）
 
 - **参考实现是对拍基准**：机制与签名向量以它为准。别从官方文档片段重新推导——官方页的 SK 是占位符，公布的派生值与签名**不可复现**，这一点已实测确认并写进设计。
-- **文档写当前状态**：README、`CONTEXT.md`、`docs/architecture.md`、根 `AGENTS.md`、代码注释、`docs/facts/`、`docs/operations/` 只描述代码事实；尚未实现的收敛合同只放 Spec 与设计，并注明"随实现落地"。
+- **文档写当前状态**：README、`GLOSSARY.md`、`docs/architecture.md`、根 `AGENTS.md`、代码注释、`docs/facts/`、`docs/operations/` 只描述代码事实；尚未实现的收敛合同只放 Spec 与设计，并注明"随实现落地"。
 - **一个事实一个家**：合同判据与失败后果只在 Spec 陈述，其他位置用链接；别在运维文档里重述合同。
 - **评审结论要记进工作项**，不能只留在提交信息里。
 - 提交与推送按 [`docs/agents/git.md`](../../docs/agents/git.md)：按改动面留证据后直接提交并推送 `main`，不走 PR。

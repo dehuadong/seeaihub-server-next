@@ -15,7 +15,7 @@ verification: 迁移回填 the_model_type_migration_backfills_existing_vendor_mo
 
 ## 决定
 
-行为由[模型类型 Spec](../../../../docs/specs/0006-model-type-and-usage-records.md)拥有，取数与展示由[模型类型设计](../../../../docs/design/0020-model-type.md)拥有。术语「模型类型」记在[词汇表](../../../../CONTEXT.md)。本记录保存选择理由、备选与后果，不重复合同。
+行为由[模型类型 Spec](../../../../docs/specs/0006-model-type-and-usage-records.md)拥有，取数与展示由[模型类型设计](../../../../docs/design/0020-model-type.md)拥有。术语「模型类型」记在[词汇表](../../../../GLOSSARY.md)。本记录保存选择理由、备选与后果，不重复合同。
 
 类型挂在 Vendor Model 上，与合同同层同生命周期，来源是工程侧的发布素材。理由：类型是上游模型自身的事实（`gpt-image-2.5` 就是图片模型），不是运营的定价或打包选择；素材已经在声明这个模型的合同，类型与它同类。运营的发布页只做「选模型、排候选、给价」，多一个手填字段就多一处可以填错而与模型实际不符的地方。
 

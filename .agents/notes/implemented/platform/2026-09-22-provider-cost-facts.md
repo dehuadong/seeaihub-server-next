@@ -75,6 +75,6 @@ verification: 验收合同为工单 [#15](https://github.com/dehuadong/seeaihub-
 - 决策：成本按渠道各自口径取数、金额不替代计量事实、缺字段不得猜测费用见 [`ADR-0006`](../../../../docs/adr/0006-no-settlement-without-metering-evidence.md)；PostgreSQL 是业务事实权威见 [`ADR-0003`](../../../../docs/adr/0003-postgresql-is-source-of-truth.md)。
 - 事实台账：AIHubMix 无金额字段与四档费率见 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 AIHubMix 费率节；APIMart 终态 `cost` 与实测样例见同文件的 APIMart 计量节。
 - 迁移：[`0008_attempt_provider_cost.sql`](../../../../migrations/0008_attempt_provider_cost.sql)。
-- 索引同步：[`docs/architecture.md`](../../../../docs/architecture.md) §4（一次请求怎么走）、§5（表）、§6（文件与迁移）；词汇表 [`CONTEXT.md`](../../../../CONTEXT.md) 新增 `Provider Cost`。
+- 索引同步：[`docs/architecture.md`](../../../../docs/architecture.md) §4（一次请求怎么走）、§5（表）、§6（文件与迁移）；词汇表 [`GLOSSARY.md`](../../../../GLOSSARY.md) 新增 `Provider Cost`。
 - 相邻记录：[网关模型命名层](../../implemented/platform/2026-09-22-gateway-model-naming.md)（本片不改命名层，只把成本事实落在执行尝试上）。
 - 工作项：提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 的 P2a 工单 [#15](https://github.com/dehuadong/seeaihub-server-next/issues/15)。

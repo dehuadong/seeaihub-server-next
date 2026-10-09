@@ -30,7 +30,7 @@ reason: 两家渠道的响应都返回四分项 token，且上游声明的金额
 
 ## 影响与去向
 
-- **领域层零改动**：只有 token 一种计量形态（见 `CONTEXT.md` 的 `Token Usage` 词条）；
+- **领域层零改动**：只有 token 一种计量形态（见 `GLOSSARY.md` 的 `Token Usage` 词条）；
 - 渠道侧事实（两家都返回分项 token；上游声明金额与按公开费率算出的金额不一致）登记在 [`docs/facts/channel-facts.md`](../../../../docs/facts/channel-facts.md) 的 APIMart 响应与计量节；
 - 本记录**取代**已退役的 `0012-provider-declared-charge-as-evidence`（2026-09-20 整改：那是一条被实测回答掉的**候选问题**，不是持久决定，因此移出 `docs/adr/`；历史全文见 git 历史）；
 - **不要重开这个问题**，除非将来出现一种只给金额、且金额可复现的上游来源。

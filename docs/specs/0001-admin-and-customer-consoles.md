@@ -8,7 +8,7 @@
 
 本文是这一能力的**行为合同**：管理员与对客各能看到什么、能做什么、失败时怎么表现、边界在哪里。技术实现由承接本 Spec 的 RFC 拥有（见 §8）；实施进度归工作项，不写在这里。
 
-术语沿用 [`CONTEXT.md`](../../CONTEXT.md)：**Gateway Model**、**Offering**、**Channel**、**Runtime Revision**、**Price Snapshot**、**API Key**、**Account**、**Ledger**、**Hold**。
+术语沿用 [`GLOSSARY.md`](../../GLOSSARY.md)：**Gateway Model**、**Offering**、**Channel**、**Runtime Revision**、**Price Snapshot**、**API Key**、**Account**、**Ledger**、**Hold**。
 
 ## 1. 目标
 

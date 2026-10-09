@@ -591,7 +591,7 @@ async fn parse_response(
     cost_currency: &str,
 ) -> Result<ProviderSuccess, AdapterError> {
     let status = response.status();
-    // 对账标识：上游的逐请求标识，只用于对账，不参与计价（见 CONTEXT.md 的 Generation Attempt）。
+    // 对账标识：上游的逐请求标识，只用于对账，不参与计价（见 GLOSSARY.md 的 Generation Attempt）。
     // 响应头可能带回 URL 或任意正文，入口就按有界标识构造，非法值按"没有可信 trace"丢弃。
     let provider_trace_id = response
         .headers()

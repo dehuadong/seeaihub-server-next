@@ -2161,7 +2161,7 @@ pub struct ApiKeyView {
 
 /// 对客的**一次生成请求**（用量记录里的一行）。
 ///
-/// 它是执行记录的**对客投影**，不是执行记录本身：[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job
+/// 它是执行记录的**对客投影**，不是执行记录本身：[`GLOSSARY.md`](../../GLOSSARY.md) 把 Generation Job
 /// 定为"对客不可见、不投射成对客协议"，所以这里**没有任务号与内部状态**——客户要看的是"什么时候、
 /// 什么型号、几张、扣了多少"，不是平台内部的任务标识。
 #[derive(Debug, Clone, Serialize, Deserialize)]

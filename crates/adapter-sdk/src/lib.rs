@@ -98,7 +98,7 @@ pub struct ProviderSuccess {
     pub usage: Option<TokenUsage>,
     pub response_digest: String,
     /// 上游逐请求标识（例如任务式上游的 task id），**只用于对账**：
-    /// 不参与计价，也不属于计量证据（见 `CONTEXT.md` 的 `Generation Attempt`）。
+    /// 不参与计价，也不属于计量证据（见 `GLOSSARY.md` 的 `Generation Attempt`）。
     ///
     /// 平台把它落到已存在的 `attempts.provider_trace_id` 列。注意：本仓库**只用它做人工
     /// 对账**，不用它自动把结果取回来（那需要另一套模型与列）——创建响应失联一律进对账。

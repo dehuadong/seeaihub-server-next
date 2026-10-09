@@ -153,7 +153,7 @@
 
 **为什么把账务拆成四条而不是一个聚合响应**：汇总与明细的"口径"不同——汇总必须按区间全量算，明细按上限截断；塞进一个响应里，改一次页大小就会让"明细求和等于汇总"这条验收条件失效（Spec V-C8）。拆开之后，每条端点的语义各自稳定，页面按需组合。
 
-**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`id`（这次调用的平台标识）、`status`、`created_at`、`terminal_at`、`type`（模型类型）与按类型的用量 `usage`、`charged_points`——**不含内部 Job 状态**。[`CONTEXT.md`](../../CONTEXT.md) 把 Generation Job 定为内部执行与审计记录、对客只暴露它的标识，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。模型类型与用量取值归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)，落地见[模型类型设计](0020-model-type.md) §4。
+**`usage` 只回对客能看的事实**：`gateway_model`、`kind`（同步生成 / 图片编辑）、`id`（这次调用的平台标识）、`status`、`created_at`、`terminal_at`、`type`（模型类型）与按类型的用量 `usage`、`charged_points`——**不含内部 Job 状态**。[`GLOSSARY.md`](../../GLOSSARY.md) 把 Generation Job 定为内部执行与审计记录、对客只暴露它的标识，所以这一条读是把执行记录**投影**成对客事实，不是把记录本身交出去；`kind` 取的是对客协议里本来就有的两类调用（`generation.jobs.branch` 的同步/编辑），不是内部任务类型。模型类型与用量取值归[模型类型 Spec](../specs/0006-model-type-and-usage-records.md)，落地见[模型类型设计](0020-model-type.md) §4。
 
 `status` 是收敛后的四值（`completed` / `failed` / `pending` / `canceled`），由内部 Job 状态与结算结果映射而来；未结案的 `reconciliation_required` 对客仍是 `pending`，不提前宣告失败。映射写在拥有它的读函数上，与既有对客错误改写同一条纪律（`ADR-0017`：内部状态与渠道错误取值不进对客响应）。`failed` 只说这次未产出，不改写渠道侧的错误细节。
 

@@ -7,7 +7,7 @@
 
 本文是运营后台工作的技术设计之一，承载**总览与对客面**：管理员用 API 定义平台网关模型 → 排候选顺序与权重 → 对客目录按网关模型名出牌 → 事后查得清。产品范围与验收归提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13)；改动点、迁移与验收清单归各切片工单（切片总表见 #13）；本文只承载设计决策与边界。
 
-术语一律沿用 `CONTEXT.md`：**Gateway Model**（平台型号名，对外的 `model`）、**Vendor Model**（厂商的模型产品）、**Offering**（一条可调用供给）、**Channel**、**Runtime Revision**、**Price Plan**、**Price Snapshot**、**Routing Priority**、**Metering Evidence**。本主题新引入的字段级说法：**渠道成本**（`ADR-0006` 的"成本按渠道各自的口径取数"）、**加价系数**、**汇率**、**保底额**——理由见 [`0007`](./0007-pricing-floor-and-settlement.md)；**策略**、**折扣率**与**账户标签**——理由见 [`0008`](./0008-routing-strategy-and-caching.md)。
+术语一律沿用 `GLOSSARY.md`：**Gateway Model**（平台型号名，对外的 `model`）、**Vendor Model**（厂商的模型产品）、**Offering**（一条可调用供给）、**Channel**、**Runtime Revision**、**Price Plan**、**Price Snapshot**、**Routing Priority**、**Metering Evidence**。本主题新引入的字段级说法：**渠道成本**（`ADR-0006` 的"成本按渠道各自的口径取数"）、**加价系数**、**汇率**、**保底额**——理由见 [`0007`](./0007-pricing-floor-and-settlement.md)；**策略**、**折扣率**与**账户标签**——理由见 [`0008`](./0008-routing-strategy-and-caching.md)。
 
 ## 0. 本主题的三份设计分工
 
@@ -25,7 +25,7 @@
 
 **网关模型 = 平台型号名 + 一个 Vendor Model Revision + 一组有序候选（Offering × Channel × 渠道模型名）+ 对客定价。**
 
-它是 `CONTEXT.md` 里 **Gateway Model** 词条的完整化：词条已经定下"平台型号名与厂商原生名、渠道模型名是三个分开的角色"，但**今天这三个角色在库里是同一个值**——发布时用 `native_model_id` 当平台型号名（`crates/persistence` 的 `publish_runtime` 里 `gateway_model: native_model_id.clone()`），迁移 `0004_gateway_model.sql` 的注释也写明"今天两者同值"。本设计要做的，就是把这个已经预留好的角色**真正拆开**。
+它是 `GLOSSARY.md` 里 **Gateway Model** 词条的完整化：词条已经定下"平台型号名与厂商原生名、渠道模型名是三个分开的角色"，但**今天这三个角色在库里是同一个值**——发布时用 `native_model_id` 当平台型号名（`crates/persistence` 的 `publish_runtime` 里 `gateway_model: native_model_id.clone()`），迁移 `0004_gateway_model.sql` 的注释也写明"今天两者同值"。本设计要做的，就是把这个已经预留好的角色**真正拆开**。
 
 ### 1.2 与现有对象的关系
 
@@ -189,7 +189,7 @@
 
 - **对外价策略与具体数值**（含是否分档、加价系数与汇率的具体取值）归 [`#5`](https://github.com/dehuadong/seeaihub-server-next/issues/5)——本主题只给机制；
 - 受理的金额闸门只有**客户余额**（[`0007`](./0007-pricing-floor-and-settlement.md) §6），没有服务端成本上限那道门；
-- **成本进账本与账实核对**不在本主题（见 `crates/persistence` 与 `CONTEXT.md` 的 `Platform Account`）；
+- **成本进账本与账实核对**不在本主题（见 `crates/persistence` 与 `GLOSSARY.md` 的 `Platform Account`）；
 - **运行期回退**（上游请求已发出之后改道另一条候选）归 [`#11`](https://github.com/dehuadong/seeaihub-server-next/issues/11)（[`0008`](./0008-routing-strategy-and-caching.md) §4）；
 - **调用记录查询接口**按用户口径不做（§3）。
 

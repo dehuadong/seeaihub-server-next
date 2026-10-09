@@ -113,7 +113,7 @@ verification: 2026-09-19 fmt、clippy（warnings 作为错误）、workspace 单
 5. **逐个发布素材会静默替换候选**：发布语义是"该模型全部 active 条目原子替换"，`routing_priority` 由候选数组下标决定。现成素材是每渠道一个文件、各含一个候选；**按文件逐个发布会让该模型只剩最后一个候选**。要表达"同一模型两个 Provider"必须把候选合并成一次发布（`apps/api/tests/http_contract/` 的用例即合并写法）。登记为 #6 的差距 G4。
 6. **三个"已声明未验证"参数**：素材声明了 `background`、`output_compression`、`user`，但实测的 `/v1/images/generations` 顶层参数集不含这三项且 `additionalProperties: false`，与 `docs/adr/0002`"未证实的参数不开启"不符。登记为 #6 的差距 G2（验证要花钱，须单独批准）。
 7. **路由规则是硬编码的**：运营方能配置的是**顺序**，不是**规则**。已记入 [`docs/adr/0009`](../../../../docs/adr/0009-multiple-active-offerings-and-routing.md) 的"待迁移的差距"节与 #6 的差距 G3。
-8. **`docs/adr/0002` 的补充决定被取代**：原"平台内部只认渠道自己的参数名、统一转换留给对外消费侧"已由 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代；Vendor Model Contract 与 Offering Parameter Mapping 已进入 `CONTEXT.md`。
+8. **`docs/adr/0002` 的补充决定被取代**：原"平台内部只认渠道自己的参数名、统一转换留给对外消费侧"已由 [`docs/adr/0015`](../../../../docs/adr/0015-vendor-model-contract-and-offering-parameter-mapping.md) 取代；Vendor Model Contract 与 Offering Parameter Mapping 已进入 `GLOSSARY.md`。
 9. **授权证据不可复核**：`#2` 的 38 条评论全部出自同一账号、无授权语句，见 frontmatter 的 approval 说明；不作为后续任务的持续授权。
 
 本次收口**未改动实现代码、未发起任何真实渠道调用**。

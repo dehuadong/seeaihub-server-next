@@ -42,7 +42,7 @@ verification: 2026-09-23 本地实际跑的：`cargo fmt --all` exit 0；`cargo 
 ## 后果
 
 - 发布数据的字段名变了（两份素材、发布期与受理期校验、校验文案、用例、`design/0005` 与 `design/0003` 的字段称呼）；**素材与校验必须同时改对**，否则发布会被直接拒——端到端那条"两份素材仍发布得出去"的用例正是这条验收。
-- `CONTEXT.md` 有了 `Input Reference` 词条，并在 `Reference Image / Mask` 里点明"今天唯一一种输入参考资源"。
+- `GLOSSARY.md` 有了 `Input Reference` 词条，并在 `Reference Image / Mask` 里点明"今天唯一一种输入参考资源"。
 - 图片的名字不留给将来的资源种类：视频、音频与图片加它们的混合输入接入时，各自声明各自的上限，**不复用** `max_reference_images`；扩展点写在 `docs/design/0005` §4 的 R3 边界。
 - 渠道侧真叫 `max_images` 而我们不控制的字段保留**渠道原名**（Doubao 的 `sequential_image_generation_options.max_images` 是输出语义）；仓库当前没有 Doubao adapter，故这个"保留原名并注明方向相反"暂无代码落点，将来写它时按输出张数对待。
 - `docs/adr/0009` 里"输入图张数"的表述语义正确、不含旧字段名，未改。
@@ -56,7 +56,7 @@ verification: 2026-09-23 本地实际跑的：`cargo fmt --all` exit 0；`cargo 
 
 ## 依据与关联
 
-- 术语：输入参考资源与它的数量上限见 [`CONTEXT.md`](../../../../CONTEXT.md) 的 `Input Reference`、`Reference Image / Mask` 两条。
+- 术语：输入参考资源与它的数量上限见 [`GLOSSARY.md`](../../../../GLOSSARY.md) 的 `Input Reference`、`Reference Image / Mask` 两条。
 - 字段落点：[`crates/adapter-sdk/src/lib.rs`](../../../../crates/adapter-sdk/src/lib.rs) 的 `AdapterDescriptor.max_reference_images`；发布期与受理期校验在 [`crates/application/src/lib.rs`](../../../../crates/application/src/lib.rs)；`restrictions` 与承载面的一致性规则、以及按资源种类扩展的 R3 边界见 [`docs/design/0005`](../../../../docs/design/0005-vendor-model-contract-and-offering-mapping.md) §4。
 - 输出张数上限的来源：[`crates/application/src/declared_images.rs`](../../../../crates/application/src/declared_images.rs)（读合同 `n.maximum`）；它与超时链的关系归并行的那件改动。
 - 渠道原名：[`out-reference/doubao/图片生成模型API调用指南.md`](../../../../out-reference/doubao/图片生成模型API调用指南.md)（原始材料，不随本件改动）；Doubao adapter 设计里对该字段的称呼见 [`docs/design/0003`](../../../../docs/design/0003-doubao-ark-image-adapter.md)。

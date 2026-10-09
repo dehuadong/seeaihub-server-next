@@ -25,7 +25,7 @@
 - 合同草稿：[`docs/specs/0001-admin-and-customer-consoles.md`](../../docs/specs/0001-admin-and-customer-consoles.md)（M1／M2／V-D17／V-D18）、[`docs/specs/0005-synchronous-image-gateway.md`](../../docs/specs/0005-synchronous-image-gateway.md)（§6）。
 - #97 的实现改动面（已交付，留作参考）：`crates/application/src/lib.rs`（限值类型与两个 `consume_*` 方法、缓存键助手、认证路径那次占名额）、`crates/application/src/image_upload.rs`（上传配置里的限值）、`apps/api/src/main.rs`（四个环境变量、启动 warn、上传状态）、`apps/api/tests/http_contract/harness.rs` 的限流夹具。
 - 实施会改到（#99 已完成，留作参考）：`migrations/`（**新迁移**：回填 1 → `SET NOT NULL` → 重写列注释；已应用的 `0048` 不许改）、`crates/persistence/src/lib.rs`（发布事务与设置接口）、`crates/application/src/lib.rs`（`DirectExecutionLimits`／`ActiveOfferings`／发布命令）、`apps/api/src/main.rs`（env 读取、`AppState`、读面、`PATCH`）、`apps/web/src/console/*`（发布抽屉、改价态、卡片文案、`client.ts`）、`apps/api/tests/http_contract/harness.rs`（并发形参改走发布命令）。
-- 契约与运维文档：`docs/design/0006`（§2.2 读示例、§2.3/§2.4）、`docs/design/0012`（v4）、`docs/design/0017`（v3）、`docs/design/0009` §3、`CONTEXT.md`、`docs/operations/configuration.md`、`.env.example`、`docs/operations/deployment.md` §3.3 与两份衍生。
+- 契约与运维文档：`docs/design/0006`（§2.2 读示例、§2.3/§2.4）、`docs/design/0012`（v4）、`docs/design/0017`（v3）、`docs/design/0009` §3、`GLOSSARY.md`、`docs/operations/configuration.md`、`.env.example`、`docs/operations/deployment.md` §3.3 与两份衍生。
 
 ## 4. 本机环境与验证命令
 
@@ -47,7 +47,7 @@
 - **同一个仓库有别的会话在推提交**（本会话期间出现过 `1`／`1`／`b733d82`／`1` 四个提交，其中一个改了 `AGENTS.md`）。提交时**逐个文件 `git add`**，复制别人的改动前先看 `git status`。
 - **不要用长 `sleep` 阻塞等评审**：把评审子代理派出去就回话，结果到了再处理；规划评审按三轴并行（Standards／Spec／Architecture），实现评审按两轴，每轮后确认发现是否落地。
 - **Agent Note 生命周期**：proposed → 交付并验证后才 `implemented`（并补 `verification` 字段、移动目录、修入站链接）；已交付记录不改写成相反结论，只标失效范围并互链（`.agents/notes/README.md`）。
-- **术语**：`CONTEXT.md` 是唯一词汇表；"模型并发名额"由运营按模型给，不写成运行时缺省。
+- **术语**：`GLOSSARY.md` 是唯一词汇表；"模型并发名额"由运营按模型给，不写成运行时缺省。
 - **汇报风格**：简体中文、简明、不抛技术选择题、不用黑话；实测优先于推测（用户反复强调）。
 
 ## 6. 建议加载的技能
@@ -56,5 +56,5 @@
 - `implement`——Implementation Gate 通过、写第一行实现代码之前。
 - `code-review`——实现完成、报告完成或提交之前（两轴并行）。
 - `verify`——审查通过、声称交付之前。
-- `domain-modeling`——改 `CONTEXT.md` 的模型并发名额词条时。
+- `domain-modeling`——改 `GLOSSARY.md` 的模型并发名额词条时。
 - `writing-for-agents`——若要改 `AGENTS.md` 或技能文档。

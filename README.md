@@ -28,7 +28,7 @@
 | **架构治理**：分层职责、依赖方向、边界规则（R1–R5）与扩展纪律 | [`docs/architecture.md`](docs/architecture.md) |
 | 分层规则的**依据、边界细则与例外理由** | [`docs/design/0004-layered-architecture.md`](docs/design/0004-layered-architecture.md) |
 | 持久决定 | [`docs/adr/`](docs/adr/) |
-| 领域词汇表 | [`CONTEXT.md`](CONTEXT.md) |
+| 领域词汇表 | [`GLOSSARY.md`](GLOSSARY.md) |
 | 各渠道的事实（端点、参数、计量与成本口径、实测记录） | [`docs/facts/channel-facts.md`](docs/facts/channel-facts.md) |
 | 受控验证与人工验收清单（步骤、停止条件、留档要求） | [`docs/verification/`](docs/verification/) |
 | 工程变更与交付记录 | [`.agents/notes/`](.agents/notes/) |

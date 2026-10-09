@@ -6,7 +6,7 @@
 
 # OpenAI 兼容的模型列表
 
-本 Spec 拥有 `GET /v1/models` 的 OpenAI 兼容响应形状：列表信封与每条模型的标准字段。目录的可见性判据与既有字段的来源归[控制台 Spec](0001-admin-and-customer-consoles.md)、[模型类型 Spec](0006-model-type-and-usage-records.md) 与[模型使用文档 Spec](0008-model-usage-documentation.md)；标准字段是既有字段的投射，不引入第二份事实。术语沿用 [CONTEXT.md](../../CONTEXT.md)。
+本 Spec 拥有 `GET /v1/models` 的 OpenAI 兼容响应形状：列表信封与每条模型的标准字段。目录的可见性判据与既有字段的来源归[控制台 Spec](0001-admin-and-customer-consoles.md)、[模型类型 Spec](0006-model-type-and-usage-records.md) 与[模型使用文档 Spec](0008-model-usage-documentation.md)；标准字段是既有字段的投射，不引入第二份事实。术语沿用 [GLOSSARY.md](../../GLOSSARY.md)。
 
 ## 1. 目的
 

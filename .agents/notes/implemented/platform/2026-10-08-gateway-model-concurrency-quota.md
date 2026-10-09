@@ -40,13 +40,13 @@ verification: 2026-10-08 本地：`cargo fmt --check`；`cargo clippy -p seeai-a
 - design `0006` §2.4（可变位从"只有 `enabled`"改成两个）与 §2.2 的读响应示例（模型内原值 + 顶层部署缺省）；design `0017` 升 v2、§6 容量表那行改成按模型；design `0009` §3 的容量维度改成"每账户在每个网关模型上的在飞 Job 数"，并去掉把并发说成"请求速率"的措辞。
 - Spec `0005` v6（§3、§6、§8 A4/A8）与控制台 Spec `0001` v24（M1、V-D17），都已接受。
 - `docs/operations/configuration.md`（环境变量的属主）与 `.env.example`：写清 `GENERATION_MAX_CONCURRENT_JOBS` 现在是**部署缺省**。
-- `CONTEXT.md`：Gateway Model 词条补"设它的并发名额"，新增**模型并发名额**（Model Concurrency Quota）词条。
+- `GLOSSARY.md`：Gateway Model 词条补"设它的并发名额"，新增**模型并发名额**（Model Concurrency Quota）词条。
 - `crates/persistence/src/lib.rs` 模块表：`publication.gateway_models` 一行扩成"运维开关与并发名额"，`generation.execution_capacity` 一行写明"账户在某模型上的并发名额不在此表"。
 - 两份已交付记录同步事实并链接本记录：[对客请求体扁平化…](./2026-09-20-flat-request-body-and-asset-roles.md) 的"额度按**账户**算"改成账户 × 模型；[不做按金额的受理闸门](./2026-10-09-no-amount-based-admission-guards.md) 的"每账户在飞名额"同理。
 
 ## 备选方案
 
-- **按模型类型的部署变量**（`GENERATION_MAX_CONCURRENT_JOBS_IMAGE` / `_VIDEO` / `_CHAT`）：落选。名额仍写在部署配置里，运营上架新模型时改不了它；而且"类型"是模型自身的事实，用它当配额维度会把类型拖进运行期策略（`CONTEXT.md` 的模型类型词条明确避免这一点）。
+- **按模型类型的部署变量**（`GENERATION_MAX_CONCURRENT_JOBS_IMAGE` / `_VIDEO` / `_CHAT`）：落选。名额仍写在部署配置里，运营上架新模型时改不了它；而且"类型"是模型自身的事实，用它当配额维度会把类型拖进运行期策略（`GLOSSARY.md` 的模型类型词条明确避免这一点）。
 - **挂在 Vendor Model 上**：落选。同一 Vendor Model 可以发布成多个网关模型（`ADR-0009`），名额是"运营给这个对客模型多少并发"，粒度比 Vendor Model 细。
 - **单独的配额表**（`publication.gateway_model_quotas` 之类）：落选。一个模型一行、一个可空整数，单独开表只多一次 JOIN 与一套生命周期。
 - **保持部署级、只把默认值调大**：落选。调大解决不了"一个模型占住所有模型"的形态。

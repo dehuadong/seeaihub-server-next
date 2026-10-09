@@ -50,7 +50,7 @@ verification: 端到端两条（`the_reconciliation_path_records_the_cost_fact_i
 
 ## 依据与关联
 
-- 账本落点与写入方见 [`docs/architecture.md`](../../../../docs/architecture.md) §5；术语见 [`CONTEXT.md`](../../../../CONTEXT.md) 的 `Platform Account`。
+- 账本落点与写入方见 [`docs/architecture.md`](../../../../docs/architecture.md) §5；术语见 [`GLOSSARY.md`](../../../../GLOSSARY.md) 的 `Platform Account`。
 - 成本事实本身的采集与三态（`computed` / `declared` / `unavailable`）见[渠道成本事实采集](./2026-09-22-provider-cost-facts.md)。
 - 账实核对（比对余额与分录之和，只发现不改账）见[账实核对](./2026-09-23-ledger-balance-audit.md)。
 - 金额不替代计量事实、缺证据不得猜测见 [`ADR-0006`](../../../../docs/adr/0006-no-settlement-without-metering-evidence.md)；PostgreSQL 是业务事实权威见 [`ADR-0003`](../../../../docs/adr/0003-postgresql-is-source-of-truth.md)。

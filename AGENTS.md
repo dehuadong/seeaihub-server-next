@@ -125,6 +125,6 @@ playwright test e2e 参阅 `apps/web/AGENTS.md`
 | `docs/agents/git.md` | 提交与推送：提交粒度与信息、推送前跑哪些证据、历史改写 |
 | `.agents/notes/` | Agent Note：记录范围、生命周期、文件骨架与检查（`README.md` 与 `AGENTS.md`） |
 
-本仓库是单上下文：仓库根 `CONTEXT.md` 是唯一词汇表，不存在 `CONTEXT-MAP.md`。
+本仓库是单上下文：仓库根 `GLOSSARY.md` 是唯一词汇表，不存在 `GLOSSARY-MAP.md`。
 
 重大工程变更与重要提案遵循 `.agents/notes/README.md`：改动时在同一变更里维护相关记录，并运行文档化检查。

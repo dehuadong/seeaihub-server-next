@@ -60,4 +60,4 @@ verification: 2026-09-20 本地最终工作树：`cargo fmt --all --check`、`ca
 
 ## 依据与关联
 
-决策 [`docs/adr/0019`](../../../../docs/adr/0019-images-pass-through-without-asset-storage.md)（取代 0008）、工单 [`#12`](https://github.com/dehuadong/seeaihub-server-next/issues/12)、[`docs/architecture.md`](../../../../docs/architecture.md)、[`docs/design/0002`](../../../../docs/design/0002-image-generation-tech-design.md)、[`CONTEXT.md`](../../../../CONTEXT.md)。上一版契约见 [对客请求体扁平化与 image/mask 角色化](./2026-09-20-flat-request-body-and-asset-roles.md)（其资产与异步部分已作废）。
+决策 [`docs/adr/0019`](../../../../docs/adr/0019-images-pass-through-without-asset-storage.md)（取代 0008）、工单 [`#12`](https://github.com/dehuadong/seeaihub-server-next/issues/12)、[`docs/architecture.md`](../../../../docs/architecture.md)、[`docs/design/0002`](../../../../docs/design/0002-image-generation-tech-design.md)、[`GLOSSARY.md`](../../../../GLOSSARY.md)。上一版契约见 [对客请求体扁平化与 image/mask 角色化](./2026-09-20-flat-request-body-and-asset-roles.md)（其资产与异步部分已作废）。

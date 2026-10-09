@@ -13,7 +13,7 @@ verification: 见正文「验证」。`cd apps/web && npx playwright test` 全�
 
 客户控制台概览此前显示「已结算余额」（`balance_microusd`）：它是**大于等于**客户实际能花的钱的那个数——请求受理时先按保底额占住一部分额度（**Held Amount**），这个数却不动。两处后果：客户拿它估「还能发多少请求」，会在余额闸门处被拒（`402 insufficient_balance`）而看不出为什么；新账户的 `0 元` 又容易被读成「充值没到账 / 额度用完」。
 
-产品行为归[控制台 Spec v16](../../../../docs/specs/0001-admin-and-customer-consoles.md) C7、C15、§4.3、V-C6、V-D5、V-D14 与[账户资金 Spec v4](../../../../docs/specs/0002-account-funds-and-reservations.md) §4、§7（A7）；术语归 [`CONTEXT.md`](../../../../CONTEXT.md) 的 **Customer Balance**。本记录只写这次变更独有的理由、备选、后果与验证。
+产品行为归[控制台 Spec v16](../../../../docs/specs/0001-admin-and-customer-consoles.md) C7、C15、§4.3、V-C6、V-D5、V-D14 与[账户资金 Spec v4](../../../../docs/specs/0002-account-funds-and-reservations.md) §4、§7（A7）；术语归 [`GLOSSARY.md`](../../../../GLOSSARY.md) 的 **Customer Balance**。本记录只写这次变更独有的理由、备选、后果与验证。
 
 ## 决定
 
@@ -31,7 +31,7 @@ verification: 见正文「验证」。`cd apps/web && npx playwright test` 全�
 ## 后果
 
 - 读数会在受理与结算之间变化，可能被读成「扣费不准」——接受这一点：客户侧不解释内部占用机制（那是平台内部的事，讲出来更像乱扣费），要核实就去调用记录与账单看逐笔事实。
-- 客户看到的读数**不承诺**本次请求必能受理：它是读取那一刻的值，受理以数据库当前值为准（[`CONTEXT.md`](../../../../CONTEXT.md) 的 **Consumer Insufficient Balance**）。
+- 客户看到的读数**不承诺**本次请求必能受理：它是读取那一刻的值，受理以数据库当前值为准（[`GLOSSARY.md`](../../../../GLOSSARY.md) 的 **Consumer Insufficient Balance**）。
 - 接口与字段形状都没变：对客账户读继续同时返回三个金额字段，管理员账户页继续分别展示三项；变的只是客户页面渲染哪一个、叫什么。
 - 术语表新增 **Customer Balance**，**Settled Balance** 与 **Held Amount** 的条目改成指向它——「已结算余额」这个名字从此只属于内部与管理员面。
 - 页面锚点随之改名（`portal-settled-balance` → `portal-balance`），浏览器用例文件改名 `portal-balance.spec.ts`，断言方向反转：受理时读数**变小**、释放后回到原值。

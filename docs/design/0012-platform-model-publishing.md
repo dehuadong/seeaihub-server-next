@@ -2,7 +2,7 @@
 当前修订: v4
 状态: 待评审
 来源: 提案 [#13](https://github.com/dehuadong/seeaihub-server-next/issues/13) 范围第 2 条；承接 Spec [`0001`](../specs/0001-admin-and-customer-consoles.md) §5.3 的 V-D8/V-D9
-依赖: [`0006`](./0006-gateway-models-and-consumer-surface.md)（网关模型对象）、[`0007`](./0007-pricing-floor-and-settlement.md)（定价归属）、[`0005`](./0005-vendor-model-contract-and-offering-mapping.md)（合同/承载面/映射分层）；[`CONTEXT.md`](../../CONTEXT.md)（Offering / Gateway Model / 供应商模型名）；`ADR-0003`、`ADR-0009`、`ADR-0015`
+依赖: [`0006`](./0006-gateway-models-and-consumer-surface.md)（网关模型对象）、[`0007`](./0007-pricing-floor-and-settlement.md)（定价归属）、[`0005`](./0005-vendor-model-contract-and-offering-mapping.md)（合同/承载面/映射分层）；[`GLOSSARY.md`](../../GLOSSARY.md)（Offering / Gateway Model / 供应商模型名）；`ADR-0003`、`ADR-0009`、`ADR-0015`
 
 # 平台模型发布：可选择的 Offering 与选择式发布
 
@@ -27,7 +27,7 @@
 
 ## 2. 运营能选的粒度是 Offering
 
-**Offering 就是"某厂商模型经某渠道、用某个供应商模型名提供"的那一条可调用供给**（`CONTEXT.md` 词条）。它由工程师配一次，之后长期存在、可被多个 Gateway Model 复用。
+**Offering 就是"某厂商模型经某渠道、用某个供应商模型名提供"的那一条可调用供给**（`GLOSSARY.md` 词条）。它由工程师配一次，之后长期存在、可被多个 Gateway Model 复用。
 
 一条 Offering 的构成与归属：
 
@@ -87,7 +87,7 @@ Offering 是**工程师配好的资产**。它由**已经存在的发布素材**
 
 **运营创建 Gateway Model 时至少选一条 Offering**：一条调不动的模型不是商品，没有任何入口能让它先占个名字。名字在首次发布时建立（`publication.gateway_models` 由发布事务插入），与 `0006` §1.6 的写入方一致。
 
-**这一条与 `CONTEXT.md` 的 Offering 词条有一处张力**：词条写"不随每次发布重写"，而这里允许导入更新它的技术定义。两者不冲突——**重写它的是工程师的导入，不是运营的发布**；运营的发布只引用。词条那句话的用意（运营不该在每次发布里重写技术定义）仍然成立，这里把"谁可以改它"写清。
+**这一条与 `GLOSSARY.md` 的 Offering 词条有一处张力**：词条写"不随每次发布重写"，而这里允许导入更新它的技术定义。两者不冲突——**重写它的是工程师的导入，不是运营的发布**；运营的发布只引用。词条那句话的用意（运营不该在每次发布里重写技术定义）仍然成立，这里把"谁可以改它"写清。
 
 ## 4. 发布：选 + 给价
 
