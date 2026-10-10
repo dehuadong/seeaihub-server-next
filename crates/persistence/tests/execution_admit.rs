@@ -195,11 +195,13 @@ async fn admit_is_atomic_idempotent_and_owns_a_channel_slot() {
         "a fresh job is admitted"
     );
     assert_eq!(
-        balance.held_microusd, 1000,
+        balance.expect("snapshot").held_microusd,
+        1000,
         "the hold is now on the account"
     );
     assert_eq!(
-        balance.available_microusd, 4000,
+        balance.expect("snapshot").available_microusd,
+        4000,
         "available = balance - held"
     );
 
@@ -420,8 +422,12 @@ async fn a_zero_hold_is_admitted_but_a_negative_available_still_rejects() {
     let AdmitOutcome::Admitted { job, balance } = admitted else {
         panic!("a fresh zero-hold request must be admitted, got {admitted:?}");
     };
-    assert_eq!(balance.held_microusd, 0, "a zero hold reserves nothing");
-    assert_eq!(balance.available_microusd, 0);
+    assert_eq!(
+        balance.expect("snapshot").held_microusd,
+        0,
+        "a zero hold reserves nothing"
+    );
+    assert_eq!(balance.expect("snapshot").available_microusd, 0);
     let holds = scalar(
         &pool,
         "SELECT count(*) FROM ledger.holds WHERE job_id = $1",

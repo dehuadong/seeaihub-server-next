@@ -457,7 +457,7 @@ impl HubRepository for AuditRepository {
         _tag: Option<&str>,
         _initial_credit_microusd: u64,
         _actor: &str,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         unused_repository()
     }
 
@@ -476,7 +476,7 @@ impl HubRepository for AuditRepository {
         _amount_microusd: u64,
         _business_key: &str,
         _actor: &str,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         unused_repository()
     }
 
@@ -602,7 +602,7 @@ impl HubRepository for AuditRepository {
     async fn refund_reconciliation(
         &self,
         _command: RefundReconciliationCommand,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         unused_repository()
     }
 

@@ -670,6 +670,9 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
     assert_eq!(publish_cache_priced(&harness).await, StatusCode::OK);
     let (account_id, _api_key) =
         funded_account(&client, &harness.base_url, &harness.admin_token, 1_000_000).await;
+    // 先等开户与首充那两次写回落定。不等就伪造缓存，晚到的那次写回会把伪造的版本覆盖掉，
+    // 后面这笔充值的版本反而比缓存里的高——闸门会放行，用例随机失败。
+    await_write_through(&harness, &account_id).await;
     // 缓存里放一条版本远高于数据库的快照：它代表"后提交的那次已经写回来了"。
     harness.cache().put_balance(
         &account_id,
@@ -682,30 +685,36 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
             "source": "db_commit",
         }),
     );
-    // 再充一笔：数据库版本只到 1，写回是"旧版本"，必须被拒绝。先记下到达基线——充值之后要等的
-    // 是**这次充值触发的那一条**写回到达，基线取晚了就只能等一条永远不来的写回。
+    // 再充一笔：数据库版本只到 1，写回是"旧版本"，必须被拒绝。
+    //
+    // 断言前要等到这次写回**处理完**，而不只是"命令到达"：版本判断发生在假 Redis 回完 `GET`
+    // 之后，只等到达就断言的话，闸门即使坏了也来得及通过。
+    //
+    // 判据是**下一条余额命令的到达**：写回队列单线程顺序处理，第 2 笔的 `GET` 只可能在第 1 笔的
+    // `write_balance` 返回之后发出。同账户两笔不会互相合并——第 1 笔到达时队列已经把它取走了，
+    // 第 2 笔进的是下一轮。
     let arrivals = harness.cache().balance_write_arrivals();
-    let response = client
-        .post(format!(
-            "{}/api/v1/accounts/{account_id}/credits",
-            harness.base_url
-        ))
-        .bearer_auth(&harness.admin_token)
-        .json(&json!({
-            "amount_microusd": 500_000_u64,
-            "business_key": format!("cache-order-{}", Uuid::new_v4()),
-        }))
-        .send()
-        .await
-        .expect("credit");
-    assert_eq!(response.status(), StatusCode::NO_CONTENT);
-
-    // 写回是后台队列做的：等它**真的到达**假 Redis（而不是等一段时间），否则"缓存没变"这句
-    // 在后一种情况下也会通过——那就成了空转。到达的那一条必须被版本闸门挡下。
-    harness
-        .cache()
-        .wait_for_balance_write_arrivals(arrivals + 1)
-        .await;
+    for round in 1..=2 {
+        let response = client
+            .post(format!(
+                "{}/api/v1/accounts/{account_id}/credits",
+                harness.base_url
+            ))
+            .bearer_auth(&harness.admin_token)
+            .json(&json!({
+                "amount_microusd": 500_000_u64,
+                "business_key": format!("cache-order-{round}-{}", Uuid::new_v4()),
+            }))
+            .send()
+            .await
+            .expect("credit");
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        // 第 1 笔到达即证明队列已经取走它；第 2 笔到达即证明第 1 笔已经处理完。
+        harness
+            .cache()
+            .wait_for_balance_write_arrivals(arrivals + round)
+            .await;
+    }
     let cached = harness.cache().balance(&account_id).expect("缓存还在");
     assert_eq!(
         cached["version"],
@@ -715,8 +724,8 @@ async fn an_older_snapshot_cannot_overwrite_a_newer_cached_version() {
     assert_eq!(cached["balance_microusd"], json!(777));
     assert_eq!(
         database_balance(&harness, &account_id).await,
-        1_500_000,
-        "数据库照常记下这次充值"
+        2_000_000,
+        "数据库照常记下这两笔充值"
     );
 
     harness.cleanup().await;

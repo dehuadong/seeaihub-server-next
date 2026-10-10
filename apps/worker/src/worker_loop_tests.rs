@@ -398,7 +398,7 @@ impl HubRepository for EmptyQueueRepository {
         _tag: Option<&str>,
         _initial_credit_microusd: u64,
         _actor: &str,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         unimplemented!()
     }
     async fn set_account_name(
@@ -416,7 +416,7 @@ impl HubRepository for EmptyQueueRepository {
         _amount_microusd: u64,
         _business_key: &str,
         _actor: &str,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         unimplemented!()
     }
     async fn read_account_balance(
@@ -525,7 +525,7 @@ impl HubRepository for EmptyQueueRepository {
     async fn refund_reconciliation(
         &self,
         _command: RefundReconciliationCommand,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         unimplemented!()
     }
     async fn account_ledger_mismatch(

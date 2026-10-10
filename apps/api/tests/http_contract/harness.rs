@@ -3823,7 +3823,10 @@ impl CacheSettings {
 /// 余额写回闸门：把 API 钉在"结算已经提交、写回缓存还没回来"那一格（A5 的结算提交后）。
 ///
 /// 只拦 `SET user_balance:…`——限流与路由缓存用别的键前缀，不该被这条闸门拦下。`arm` 之后
-/// **下一条**余额写回会被停住并置信号，用例据此确认"提交已经落库、响应还没交出去"。
+/// **下一条**余额写回会被停住并置信号。
+///
+/// 余额写回走后台队列，所以卡住它**卡不住 HTTP 响应**：用例只能用"提交已经落库"作停点，
+/// 不能再声称响应还没交出去。
 #[derive(Default)]
 struct BalanceWriteGate {
     armed: AtomicBool,
@@ -4100,12 +4103,15 @@ impl CacheFixture {
         self.balance_write_gate.arm();
     }
 
-    /// 等那条被停住的余额写回真的到点。到点时结算事务已经提交、响应还没交出去。
+    /// 等那条被停住的余额写回真的到点。到点时结算事务**已经提交**；响应有没有交出去不由它决定。
     async fn wait_for_balance_write_hold(&self) {
         self.balance_write_gate.wait_until_held().await;
     }
 
-    /// 已经到达假 Redis 的余额写回条数。
+    /// 落在余额缓存上的命令条数（`user_balance:` 上的 `GET` 与 `SET` 都算）。
+    ///
+    /// **它不区分来源**：对账循环的读也算在里面。用它的用例要保证自己的观察窗口远短于对账间隔
+    /// （夹具缺省 180 秒），否则对账的读会提前把计数推上去。
     fn balance_write_arrivals(&self) -> usize {
         self.balance_write_gate.arrivals()
     }
@@ -4270,7 +4276,7 @@ async fn serve_fake_redis(
         }
         if is_balance_write(&args) && balance_write_gate.take_hold() {
             // 模拟余额写回阻塞：连接保持打开但一条应答都不写。用例把缓存命令上限调长到等得起，
-            // 于是 API 停在这里——此刻结算事务已经提交、响应还没交出去（A5 的结算提交后）。
+            // 于是后台写回停在这里——此刻结算事务已经提交；响应在另一个任务里，不受它影响。
             std::future::pending::<()>().await;
         }
         let reply = fake_redis_command(&args, &state);

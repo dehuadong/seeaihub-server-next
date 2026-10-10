@@ -251,14 +251,36 @@ impl PgHubRepository {
         account_id: AccountId,
     ) -> Result<BalanceChange, ApplicationError> {
         let row = sqlx::query(
-            "SELECT balance_microusd, held_microusd,\n                    balance_microusd - held_microusd AS available_microusd,\n                    version, updated_at\n             FROM ledger.accounts WHERE id = $1",
+            r#"
+            SELECT balance_microusd, held_microusd, version, updated_at
+            FROM ledger.accounts WHERE id = $1
+            "#,
         )
         .bind(account_id.0)
-                .fetch_optional(&self.pool)
-                .await
-                .map_err(database_error)?
-                .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-        balance_change(&row, account_id)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+        BalanceColumns::from_row(&row)?.snapshot_required(account_id)
+    }
+
+    /// 读账户那一行的**原始金额列**。快照要不要、算不算得出来，由调用方决定。
+    async fn account_columns(
+        &self,
+        account_id: AccountId,
+    ) -> Result<BalanceColumns, ApplicationError> {
+        let row = sqlx::query(
+            r#"
+            SELECT balance_microusd, held_microusd, version, updated_at
+            FROM ledger.accounts WHERE id = $1
+            "#,
+        )
+        .bind(account_id.0)
+        .fetch_optional(&self.pool)
+        .await
+        .map_err(database_error)?
+        .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
+        BalanceColumns::from_row(&row)
     }
 
     /// 一次索引探测：账户这一行在不在。
@@ -2429,7 +2451,7 @@ impl HubRepository for PgHubRepository {
         tag: Option<&str>,
         initial_credit_microusd: u64,
         actor: &str,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         // 名称唯一（Spec `0003` N1）：先查一次给出说得清的冲突，索引负责并发那一次。
         if account_name_taken(&mut transaction, name, None).await? {
@@ -2441,7 +2463,6 @@ impl HubRepository for PgHubRepository {
             r#"
             INSERT INTO ledger.accounts (id, name, tag, balance_microusd) VALUES ($1, $2, $3, $4)
             RETURNING balance_microusd, held_microusd,
-                      balance_microusd - held_microusd AS available_microusd,
                       version, updated_at
             "#,
         )
@@ -2482,7 +2503,7 @@ impl HubRepository for PgHubRepository {
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
-        balance_change(&inserted, account_id)
+        Ok(BalanceColumns::from_row(&inserted)?.snapshot(account_id))
     }
 
     /// 改账户名称：资料与审计同一事务，审计记旧值与新值。
@@ -2536,7 +2557,7 @@ impl HubRepository for PgHubRepository {
         amount_microusd: u64,
         business_key: &str,
         actor: &str,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         if amount_microusd == 0 {
             return Err(ApplicationError::Validation(
                 "credit amount must be positive".to_owned(),
@@ -2567,7 +2588,6 @@ impl HubRepository for PgHubRepository {
                     updated_at = now()
                 WHERE id = $1
                 RETURNING balance_microusd, held_microusd,
-                          balance_microusd - held_microusd AS available_microusd,
                           version, updated_at
                 "#,
             )
@@ -2586,7 +2606,7 @@ impl HubRepository for PgHubRepository {
                 &serde_json::json!({"amount_microusd": amount_microusd, "business_key": business_key}),
             )
                 .await?;
-            balance_change(&updated, account_id)?
+            BalanceColumns::from_row(&updated)?.snapshot(account_id)
         } else {
             let existing = sqlx::query(
                 "SELECT account_id, kind, amount_microusd FROM ledger.entries WHERE business_key = $1",
@@ -2618,7 +2638,7 @@ impl HubRepository for PgHubRepository {
             .await
             .map_err(database_error)?
             .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-            balance_change(&current, account_id)?
+            BalanceColumns::from_row(&current)?.snapshot(account_id)
         };
         transaction.commit().await.map_err(database_error)?;
         Ok(change)
@@ -2637,7 +2657,6 @@ impl HubRepository for PgHubRepository {
         let rows = sqlx::query(
             r#"
             SELECT id, balance_microusd, held_microusd,
-                   balance_microusd - held_microusd AS available_microusd,
                    version, updated_at
             FROM ledger.accounts
             WHERE kind = 'consumer' AND updated_at >= now() - make_interval(secs => $1)
@@ -2648,7 +2667,14 @@ impl HubRepository for PgHubRepository {
         .fetch_all(&self.pool)
         .await
         .map_err(database_error)?;
-        rows.iter().map(balance_change_with_account).collect()
+        // 对账的喂数是缓存刷新：算不出可用额的那一行跳过并留下日志，不让它把整轮对账带崩。
+        rows.iter()
+            .filter_map(|row| match balance_snapshot_with_account(row) {
+                Ok(Some(snapshot)) => Some(Ok(snapshot)),
+                Ok(None) => None,
+                Err(error) => Some(Err(error)),
+            })
+            .collect()
     }
 
     async fn insert_audit_event(
@@ -2936,7 +2962,7 @@ impl HubRepository for PgHubRepository {
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,
-    ) -> Result<BalanceChange, ApplicationError> {
+    ) -> Result<Option<BalanceChange>, ApplicationError> {
         let mut transaction = self.pool.begin().await.map_err(database_error)?;
         let row = sqlx::query(
             r#"
@@ -2964,8 +2990,9 @@ impl HubRepository for PgHubRepository {
                 row.try_get("refund_business_key").map_err(database_error)?;
             if existing_key.as_deref() == Some(command.business_key.as_str()) {
                 transaction.commit().await.map_err(database_error)?;
-                // 重放：这次没有退款，但返回**当前**余额，让缓存刷成数据库的值。
-                return self.account_balance(account_id).await;
+                // 重放：这次没有退款，但返回**当前**余额，让缓存刷成数据库的值；算不出可用额
+                // 就跳过刷新，不把这条读变成失败。
+                return Ok(self.account_columns(account_id).await?.snapshot(account_id));
             }
             return Err(ApplicationError::Conflict(
                 "reconciliation case was already resolved differently".to_owned(),
@@ -2989,7 +3016,6 @@ impl HubRepository for PgHubRepository {
                 updated_at = now()
             WHERE id = $1
                 RETURNING balance_microusd, held_microusd,
-                          balance_microusd - held_microusd AS available_microusd,
                           version, updated_at
             "#,
         )
@@ -3056,7 +3082,7 @@ impl HubRepository for PgHubRepository {
         )
         .await?;
         transaction.commit().await.map_err(database_error)?;
-        balance_change(&released, account_id)
+        Ok(BalanceColumns::from_row(&released)?.snapshot(account_id))
     }
 
     async fn find_admin_by_email(
@@ -3917,7 +3943,6 @@ impl ExecutionRepository for PgHubRepository {
               AND kind = 'consumer'
               AND balance_microusd::numeric - held_microusd::numeric >= $2
             RETURNING balance_microusd, held_microusd,
-                      balance_microusd - held_microusd AS available_microusd,
                       version, updated_at
             "#,
         )
@@ -4044,7 +4069,7 @@ impl ExecutionRepository for PgHubRepository {
         .await
         .map_err(database_error)?;
         transaction.commit().await.map_err(database_error)?;
-        let balance = balance_change(&reserved, account_id)?;
+        let balance = BalanceColumns::from_row(&reserved)?.snapshot(account_id);
         Ok(AdmitOutcome::Admitted {
             job: AdmittedJob {
                 job_id,
@@ -4337,7 +4362,6 @@ impl ExecutionRepository for PgHubRepository {
                 updated_at = now()
             WHERE id = $1
             RETURNING balance_microusd, held_microusd,
-                      balance_microusd - held_microusd AS available_microusd,
                       version, updated_at
             "#,
         )
@@ -4347,7 +4371,7 @@ impl ExecutionRepository for PgHubRepository {
         .await
         .map_err(database_error)?
         .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-        let balance = balance_change(&balance_row, account_id)?;
+        let balance = BalanceColumns::from_row(&balance_row)?.snapshot(account_id);
         release_channel_slot(&mut transaction, job_id).await?;
         transaction.commit().await.map_err(database_error)?;
         Ok(ExecutionFinalization {
@@ -4355,7 +4379,7 @@ impl ExecutionRepository for PgHubRepository {
             attempt_id,
             stage: ExecutionStage::Failed,
             charge_microusd: 0,
-            balance: Some(balance),
+            balance,
         })
     }
 
@@ -4663,7 +4687,6 @@ impl ExecutionRepository for PgHubRepository {
                 updated_at = now()
             WHERE id = $1
             RETURNING balance_microusd, held_microusd,
-                      balance_microusd - held_microusd AS available_microusd,
                       version, updated_at
             "#,
         )
@@ -4674,7 +4697,7 @@ impl ExecutionRepository for PgHubRepository {
         .await
         .map_err(database_error)?
         .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-        let balance = balance_change(&balance_row, account_id)?;
+        let balance = BalanceColumns::from_row(&balance_row)?.snapshot(account_id);
         sqlx::query(
             "UPDATE ledger.holds SET status = 'captured', updated_at = now() WHERE id = $1 AND status = 'active'",
         )
@@ -4702,7 +4725,7 @@ impl ExecutionRepository for PgHubRepository {
             attempt_id,
             stage: ExecutionStage::Succeeded,
             charge_microusd,
-            balance: Some(balance),
+            balance,
         })
     }
 
@@ -4922,7 +4945,6 @@ impl ExecutionRepository for PgHubRepository {
                     updated_at = now()
                 WHERE id = $1
                 RETURNING balance_microusd, held_microusd,
-                          balance_microusd - held_microusd AS available_microusd,
                           version, updated_at
                 "#,
             )
@@ -4932,7 +4954,7 @@ impl ExecutionRepository for PgHubRepository {
             .await
             .map_err(database_error)?
             .ok_or_else(|| ApplicationError::NotFound(format!("account {account_id}")))?;
-            released_balance = Some(balance_change(&balance_row, account_id)?);
+            released_balance = BalanceColumns::from_row(&balance_row)?.snapshot(account_id);
             release_channel_slot(&mut transaction, job_id).await?;
         } else if disposition == FailureDisposition::Unknown {
             // 结果未知：占用与槽位都保留，只建对账案例。理由用平台生成的有界文案，不含渠道原文。
@@ -6119,29 +6141,83 @@ async fn referenced_definition(
     })
 }
 
-/// 读一行的余额与写入时刻，配上调用方手上的账户。
+/// 账户行的**原始金额列**，提交后读出来的那一份。
 ///
-/// `balance_microusd` 是 `bigint` 且**可以为负**（透支发生在结算）：这里不做非负校验，
-/// 负数必须原样读出来，否则"缓存里那个数"与账本就不一致了。
-fn balance_change(
-    row: &sqlx::postgres::PgRow,
-    account_id: AccountId,
-) -> Result<BalanceChange, ApplicationError> {
-    Ok(BalanceChange {
-        account_id,
-        balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
-        held_microusd: row.try_get("held_microusd").map_err(database_error)?,
-        available_microusd: row.try_get("available_microusd").map_err(database_error)?,
-        version: row.try_get("version").map_err(database_error)?,
-        updated_at: row.try_get("updated_at").map_err(database_error)?,
-    })
+/// 可用额（`balance - held`）**不在 SQL 里算**。两个 `bigint` 相减在极端负余额加占用时会溢出，
+/// 而写在资金语句的 `RETURNING` 里时，溢出会让那条 `UPDATE` 整个失败、事务回滚——缓存的一个派生
+/// 值不该有能力回滚资金提交。所以资金语句只带回原始列，派生值在这里、在提交之后算。
+///
+/// `balance_microusd` **可以为负**（透支发生在结算）：不做非负校验，负数必须原样读出来，否则
+/// "缓存里那个数"与账本就不一致。
+#[derive(Debug, Clone, Copy)]
+struct BalanceColumns {
+    balance_microusd: i64,
+    held_microusd: i64,
+    version: i64,
+    updated_at: DateTime<Utc>,
+}
+
+impl BalanceColumns {
+    fn from_row(row: &sqlx::postgres::PgRow) -> Result<Self, ApplicationError> {
+        Ok(Self {
+            balance_microusd: row.try_get("balance_microusd").map_err(database_error)?,
+            held_microusd: row.try_get("held_microusd").map_err(database_error)?,
+            version: row.try_get("version").map_err(database_error)?,
+            updated_at: row.try_get("updated_at").map_err(database_error)?,
+        })
+    }
+
+    fn available_microusd(&self) -> Option<i64> {
+        self.balance_microusd.checked_sub(self.held_microusd)
+    }
+
+    /// 缓存快照；可用额算不出来时 `None`。
+    ///
+    /// 跳过的是**这一次缓存刷新**，不是资金提交——那一行已经提交好了。
+    ///
+    /// 跳过的这一格**补不回来**：对账的喂数（[`HubRepository::accounts_updated_within`]）用的也是
+    /// 这个构造，它同样跳过这种账户，所以那一行不会进对账。这类账户的缓存会一直停在旧值上，直到
+    /// 金额回到可表示的范围。这条日志是它唯一的对外信号。
+    fn snapshot(&self, account_id: AccountId) -> Option<BalanceChange> {
+        let Some(available_microusd) = self.available_microusd() else {
+            tracing::warn!(
+                account_id = %account_id,
+                balance_microusd = self.balance_microusd,
+                held_microusd = self.held_microusd,
+                "the available amount does not fit in a 64-bit integer; skipping this cache refresh"
+            );
+            return None;
+        };
+        Some(BalanceChange {
+            account_id,
+            balance_microusd: self.balance_microusd,
+            held_microusd: self.held_microusd,
+            available_microusd,
+            version: self.version,
+            updated_at: self.updated_at,
+        })
+    }
+
+    /// 读路径要一个值：算不出来就报错。
+    ///
+    /// 读到这种账本身就是运营要处置的事，不该被静默跳过或截断——截断会给出一个假的可用额，而读它
+    /// 的人正是拿它核对的。
+    fn snapshot_required(&self, account_id: AccountId) -> Result<BalanceChange, ApplicationError> {
+        self.snapshot(account_id).ok_or_else(|| {
+            ApplicationError::Persistence(format!(
+                "account {account_id} has balance {} and held {}; their difference does not fit in a 64-bit integer",
+                self.balance_microusd, self.held_microusd
+            ))
+        })
+    }
 }
 
 /// 读一行的账户、余额与写入时刻（对账取数用：查询里带 `id`）。
-fn balance_change_with_account(
+fn balance_snapshot_with_account(
     row: &sqlx::postgres::PgRow,
-) -> Result<BalanceChange, ApplicationError> {
-    balance_change(row, AccountId(row.try_get("id").map_err(database_error)?))
+) -> Result<Option<BalanceChange>, ApplicationError> {
+    let account_id = AccountId(row.try_get("id").map_err(database_error)?);
+    Ok(BalanceColumns::from_row(row)?.snapshot(account_id))
 }
 
 /// 从一行分录还原一条流水。

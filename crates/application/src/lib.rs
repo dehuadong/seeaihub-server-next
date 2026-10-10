@@ -1759,7 +1759,8 @@ pub enum AdmitOutcome {
     /// 新建：最小 Job、Hold 与容量事实已同事务提交；余额是预授权扣减之后的值。
     Admitted {
         job: AdmittedJob,
-        balance: BalanceChange,
+        /// 预授权扣减之后的余额；可用额在 64 位整数里表示不出来时为 `None`。
+        balance: Option<BalanceChange>,
     },
     /// 同键同指纹的重放：**不新建、不占用**，只回原记录的投影。
     Replayed(ExecutionReplay),
@@ -2720,7 +2721,7 @@ pub trait HubRepository: Send + Sync {
         tag: Option<&str>,
         initial_credit_microusd: u64,
         actor: &str,
-    ) -> Result<BalanceChange, ApplicationError>;
+    ) -> Result<Option<BalanceChange>, ApplicationError>;
 
     /// 改账户名称。只动资料与审计，不碰余额、标签、凭据与历史；账户不存在返回 `NotFound`。
     async fn set_account_name(
@@ -2737,7 +2738,7 @@ pub trait HubRepository: Send + Sync {
         amount_microusd: u64,
         business_key: &str,
         actor: &str,
-    ) -> Result<BalanceChange, ApplicationError>;
+    ) -> Result<Option<BalanceChange>, ApplicationError>;
 
     /// 读账户**当前**的余额与写入时刻。
     ///
@@ -2884,7 +2885,7 @@ pub trait HubRepository: Send + Sync {
     async fn refund_reconciliation(
         &self,
         command: RefundReconciliationCommand,
-    ) -> Result<BalanceChange, ApplicationError>;
+    ) -> Result<Option<BalanceChange>, ApplicationError>;
 
     /// 某个账户的**当前值**与**它自己的明细**对不上时返回它（只读）。
     ///
@@ -4985,10 +4986,13 @@ impl AccelerationService {
     ///
     /// 响应路径只调这一个：它不查库、不等 Redis，所以那次请求不为缓存多付一次往返。真正的写由
     /// [`Self::run_balance_writer`] 在后台做。缓存没启用时它是空操作——那时连队列都不该进。
-    pub fn enqueue_balance(&self, change: BalanceChange) {
-        if !self.is_enabled() {
+    ///
+    /// `None` 表示这次收尾没有可刷新的快照：要么它没动账户那一行（重放、可重试失败、结果未知），
+    /// 要么可用额在 64 位整数里表示不出来。两种都不该拦住资金提交，所以这里只是不写。
+    pub fn enqueue_balance(&self, change: Option<BalanceChange>) {
+        let (Some(change), true) = (change, self.is_enabled()) else {
             return;
-        }
+        };
         self.balance_writes.enqueue(change);
     }
 

@@ -34,12 +34,12 @@ use thiserror::Error;
 
 use crate::{
     AccelerationService, AdapterFactory, AdmitExecution, AdmitOffering, AdmitOutcome,
-    ApplicationError, BalanceChange, BeginSubmission, CancelUnsubmitted, CostInputs,
-    CreateImageGenerationRequest, CredentialProvider, DirectExecutionLimits, ExecutionFinalization,
-    ExecutionLookup, ExecutionReplay, ExecutionRepository, FailOrReconcileExecution,
-    FailureDisposition, HubRepository, LateFacts, PublicErrorCode, RequestFingerprintInput,
-    RequestFingerprintKeys, RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision,
-    SettleExecution, contract_parameter_face, failure_provider_cost, freeze_offering_pricing,
+    ApplicationError, BeginSubmission, CancelUnsubmitted, CostInputs, CreateImageGenerationRequest,
+    CredentialProvider, DirectExecutionLimits, ExecutionFinalization, ExecutionLookup,
+    ExecutionReplay, ExecutionRepository, FailOrReconcileExecution, FailureDisposition,
+    HubRepository, LateFacts, PublicErrorCode, RequestFingerprintInput, RequestFingerprintKeys,
+    RequestTimeoutPolicy, RetryPolicy, RouteChoice, RoutingDecision, SettleExecution,
+    contract_parameter_face, failure_provider_cost, freeze_offering_pricing,
     idempotency_key_digest, provider_cost_fact, public_error_code, requested_image_count,
     select_candidate, select_candidate_with_strategy, validate_idempotency_key,
 };
@@ -1131,7 +1131,7 @@ impl DirectExecutionService {
                 return Err(error);
             }
         };
-        self.enqueue_balance(finalization.balance);
+        self.acceleration.enqueue_balance(finalization.balance);
         if finalization.stage != ExecutionStage::Succeeded {
             // 结算没有落成成功：不许把图片当成功交回；事实仍交回收件端口。
             self.hand_off_late_facts(
@@ -1263,7 +1263,7 @@ impl DirectExecutionService {
             .await
         {
             Ok(finalization) => {
-                self.enqueue_balance(finalization.balance);
+                self.acceleration.enqueue_balance(finalization.balance);
                 tracing::info!(
                     job_id = %job_id,
                     reason = ?refused,
@@ -1389,7 +1389,7 @@ impl DirectExecutionService {
                 return Err(error);
             }
         };
-        self.enqueue_balance(finalized.balance);
+        self.acceleration.enqueue_balance(finalized.balance);
         Ok(())
     }
 
@@ -1443,17 +1443,6 @@ impl DirectExecutionService {
             attempt_id = %attempt_id,
             "late facts could not be handed off within the bounded finalization budget"
         );
-    }
-
-    /// 把收尾事务带回来的余额快照交给后台写队列。
-    ///
-    /// 这里**不查库、不等 Redis**：快照由资金事务的 `RETURNING` 顺手带回，写由
-    /// [`AccelerationService::run_balance_writer`] 在后台做。没有改动账户的收尾给 `None`，
-    /// 那时没有快照要刷新（RFC 0017 §3）。
-    fn enqueue_balance(&self, balance: Option<BalanceChange>) {
-        if let Some(balance) = balance {
-            self.acceleration.enqueue_balance(balance);
-        }
     }
 }
 

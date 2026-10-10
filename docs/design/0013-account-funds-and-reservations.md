@@ -42,12 +42,12 @@ SET held_microusd = held_microusd + $hold,
 WHERE id = $account
   AND kind = 'consumer'
   AND balance_microusd::numeric - held_microusd::numeric >= $hold
-RETURNING balance_microusd, held_microusd,
-          balance_microusd - held_microusd AS available_microusd,
-          version;
+RETURNING balance_microusd, held_microusd, version;
 ```
 
 条件不成立返回现有 `insufficient_balance`。同事务插入 Job、路由判定与一条 `active` Hold；任何后续写入失败使占用回滚。幂等重放不执行条件更新。保底额为 0 且可用额为负时条件仍不成立。
+
+`RETURNING` 只带回原始金额列，**可用额在应用侧算**：`balance − held` 溢出 64 位整数时，写在 `RETURNING` 里会让这条资金语句整个失败；派生值不该有能力回滚资金提交。
 
 ### 2.3 成功结算
 
